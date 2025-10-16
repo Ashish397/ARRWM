@@ -130,14 +130,10 @@ class MultiTextDataset(Dataset):
 class VideoLatentCaptionDataset(Dataset):
     """Dataset pairing pre-encoded video latents with first-chunk captions."""
 
-    def __init__(self, latent_root: str, caption_root: str, num_frames: int = 21, frame_stride: int = 2):
-        from pathlib import Path
-        import json
-
+    def __init__(self, latent_root: str, caption_root: str, num_frames: int = 21):
         self.latent_root = Path(latent_root)
         self.caption_root = Path(caption_root)
         self.num_frames = num_frames
-        self.frame_stride = frame_stride
         self.samples: list[tuple[Path, str]] = []
 
         if not self.latent_root.exists():
@@ -145,30 +141,76 @@ class VideoLatentCaptionDataset(Dataset):
         if not self.caption_root.exists():
             raise FileNotFoundError(f"Caption root does not exist: {caption_root}")
 
-        for latent_path in sorted(self.latent_root.rglob('encoded_video_*.pt')):
+        latent_map: dict[Path, list[Path]] = {}
+        for latent_path in sorted(self.latent_root.rglob("encoded_video_*.pt")):
             if not latent_path.is_file():
                 continue
-            rel_dir = latent_path.parent.relative_to(self.latent_root)
-            caption_dir = self.caption_root / rel_dir
-            if not caption_dir.exists():
+            try:
+                rel_dir = latent_path.parent.relative_to(self.latent_root)
+            except ValueError:
                 continue
-            ride_name = latent_path.parent.name
-            candidates = sorted(caption_dir.glob(f"{ride_name}_video_captions_*.json"))
-            if not candidates:
+            latent_map.setdefault(rel_dir, []).append(latent_path)
+
+        caption_map: dict[Path, list[Path]] = {}
+        for caption_path in sorted(self.caption_root.rglob("*.json")):
+            if not caption_path.is_file():
                 continue
-            caption_path = candidates[0]
+            parent = caption_path.parent
+            try:
+                rel_dir = parent.relative_to(self.caption_root)
+            except ValueError:
+                continue
+            caption_map.setdefault(rel_dir, []).append(caption_path)
+
+        all_rel_dirs = sorted(set(latent_map.keys()) | set(caption_map.keys()))
+
+        for rel_dir in all_rel_dirs:
+            latent_paths = sorted(latent_map.get(rel_dir, []))
+            if not latent_paths:
+                print(f"{rel_dir}: video doesn't exist, skipping")
+                continue
+
+            caption_candidates = caption_map.get(rel_dir, [])
+            if not caption_candidates:
+                print(f"{rel_dir}: caption doesn't exist, skipping")
+                continue
+
+            caption_path = self._select_caption_path(rel_dir, caption_candidates)
+            if caption_path is None:
+                print(f"{rel_dir}: caption doesn't exist, skipping")
+                continue
+
             try:
                 with caption_path.open('r', encoding='utf-8') as f:
                     data = json.load(f)
-                caption = data.get('combined_analysis').strip() or ''
-                if not caption:
-                    continue
-            except Exception:
+            except Exception as exc:
+                print(f"{caption_path}: failed to load caption ({exc}), skipping")
                 continue
-            self.samples.append((latent_path, caption))
+
+            caption = (data.get('combined_analysis') or '').strip()
+            if not caption:
+                print(f"{caption_path}: combined_analysis missing, skipping")
+                continue
+
+            for latent_path in latent_paths:
+                self.samples.append((latent_path, caption))
 
         if not self.samples:
             raise RuntimeError('No paired latent/caption samples were found.')
+
+    @staticmethod
+    def _select_caption_path(rel_dir: Path, caption_paths: list[Path]):
+        ride_name = rel_dir.name
+        direct_name = f"{ride_name}.json"
+        for candidate in caption_paths:
+            if candidate.name == direct_name:
+                return candidate
+
+        prefix = f"{ride_name}_video_captions_"
+        matches = [p for p in caption_paths if p.name.startswith(prefix)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -177,13 +219,11 @@ class VideoLatentCaptionDataset(Dataset):
         import random
 
         latent_path, caption = self.samples[idx]
-        latents = torch.load(latent_path, map_location='cpu')
+        latents = torch.load(latent_path, map_location='cpu')[0]
         if not isinstance(latents, torch.Tensor) or latents.ndim != 4:
             raise ValueError(f'Unexpected latent format at {latent_path}')
-
-        latents = latents[::self.frame_stride]
         if latents.shape[0] == 0:
-            raise ValueError(f'Latent sequence empty after striding: {latent_path}')
+            raise ValueError(f'Latent sequence empty: {latent_path}')
 
         total = latents.shape[0]
         if total >= self.num_frames:
@@ -200,7 +240,6 @@ class VideoLatentCaptionDataset(Dataset):
             'prompts': caption,
             'real_latents': latents,
         }
-
 
 
 def cycle(dl):
