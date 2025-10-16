@@ -6,7 +6,7 @@ import random
 import re
 from pathlib import Path
 
-from utils.dataset import TextDataset, TwoTextDataset, cycle
+from utils.dataset import TextDataset, TwoTextDataset, VideoLatentCaptionDataset, cycle
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -14,7 +14,7 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import DMD, DMDSwitch
+from model import DMD, DMDSwitch, DMD2, DMD2Real
 from model.streaming_training import StreamingTrainingModel
 import torch
 import wandb
@@ -37,7 +37,7 @@ from pipeline import (
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
-from one_logger_utils import OneLoggerUtils
+# # from one_logger_utils import OneLoggerUtils  # Commented out - module not available
 import time
 
 class Trainer:
@@ -68,7 +68,7 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        self.use_one_logger = getattr(config, "use_one_logger", True)
+        self.use_one_logger = False #getattr(config, "use_one_logger", False)
         if self.is_main_process and not self.disable_wandb:
             wandb.login(
                 # host=config.wandb_host,
@@ -116,8 +116,9 @@ class Trainer:
                 "seq_length": getattr(config, "image_or_video_shape")[1] * getattr(config, "image_or_video_shape")[3] * getattr(config, "image_or_video_shape")[4],
                 "save_checkpoint_strategy": "sync",
             }
-            self.one_logger = OneLoggerUtils(one_logger_config)
-            self.one_logger.on_app_start(app_start_time = app_start_time)  
+            # self.one_logger = OneLoggerUtils(one_logger_config)  # Commented out - module not available
+            self.one_logger = None  # Disable one_logger functionality
+            # self.one_logger.on_app_start(app_start_time = app_start_time)  # Commented out - one_logger disabled  
         else:
             self.one_logger = None
 
@@ -125,16 +126,14 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_model_init_start()
 
-        if config.distribution_loss == "causvid":
-            self.model = CausVid(config, device=self.device)
-        elif config.distribution_loss == "dmd":
+        if config.distribution_loss == "dmd":
             self.model = DMD(config, device=self.device)
+        elif config.distribution_loss == "dmd2":
+            self.model = DMD2(config, device=self.device)
         elif config.distribution_loss == "dmd_switch":
             self.model = DMDSwitch(config, device=self.device)
-        elif config.distribution_loss == "dmd_window":
-            self.model = DMDWindow(config, device=self.device)
-        elif config.distribution_loss == "sid":
-            self.model = SiD(config, device=self.device)
+        elif config.distribution_loss == "dmd2real":
+            self.model = DMD2Real(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
 
@@ -390,6 +389,12 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
+        elif self.config.distribution_loss in ("dmd2", "dmd2real"):
+            dataset = VideoLatentCaptionDataset(
+                config.real_latent_root,
+                config.caption_root,
+                num_frames=getattr(config, "num_training_frames", 21),
+            )
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -415,6 +420,12 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
+            elif self.config.distribution_loss in ("dmd2", "dmd2real"):
+                val_dataset = VideoLatentCaptionDataset(
+                    config.real_latent_root,
+                    config.caption_root,
+                    num_frames=getattr(config, "num_training_frames", 21),
+                )
             else:
                 val_dataset = TextDataset(val_data_path)
 
@@ -820,7 +831,16 @@ class Trainer:
             torch.cuda.empty_cache()
 
         # Step 1: Get the next batch of text prompts
-        text_prompts = batch["prompts"]
+        text_prompts = batch.get("prompts")
+        if isinstance(text_prompts, str):
+            text_prompts = [text_prompts]
+
+        real_latents = batch.get("real_latents")
+        if real_latents is not None:
+            if isinstance(real_latents, torch.Tensor):
+                real_latents = real_latents.to(self.device, dtype=torch.float32)
+            else:
+                real_latents = torch.stack(real_latents).to(self.device, dtype=torch.float32)
 
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
@@ -842,17 +862,24 @@ class Trainer:
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
-            generator_loss, generator_log_dict = self.model.generator_loss(
+            generator_kwargs = dict(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=None,
-                initial_latent=None
+                initial_latent=None,
             )
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2real'):
+                generator_kwargs['real_latents'] = real_latents
+            generator_loss, generator_log_dict = self.model.generator_loss(**generator_kwargs)
 
             # Scale loss for gradient accumulation and backward
             scaled_generator_loss = generator_loss / self.gradient_accumulation_steps
             scaled_generator_loss.backward()
+            if hasattr(self.model, 'fake_score'):
+                for p in self.model.fake_score.parameters():
+                    if p.grad is not None:
+                        p.grad = None
             if LOG_GPU_MEMORY:
                 log_gpu_memory("After train_generator backward pass", device=self.device, rank=dist.get_rank())
             # Return original loss for logging
@@ -863,13 +890,16 @@ class Trainer:
         else:
             generator_log_dict = {}
 
-        critic_loss, critic_log_dict = self.model.critic_loss(
+        critic_kwargs = dict(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             clean_latent=None,
-            initial_latent=None
+            initial_latent=None,
         )
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2real'):
+            critic_kwargs['real_latents'] = real_latents
+        critic_loss, critic_log_dict = self.model.critic_loss(**critic_kwargs)
 
         # Scale loss for gradient accumulation and backward
         scaled_critic_loss = critic_loss / self.gradient_accumulation_steps

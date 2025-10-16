@@ -1,14 +1,16 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 from torch.utils.data import Dataset
-import numpy as np
 import torch
 import lmdb
 import json
 from pathlib import Path
 from PIL import Image
 import os
-import datasets
+try:
+    import datasets
+except ImportError:
+    datasets = None
 
 
 
@@ -94,6 +96,8 @@ class MultiTextDataset(Dataset):
     """
 
     def __init__(self, prompt_path: str, field: str = "prompts", cache_dir: str | None = None):
+        if datasets is None:
+            raise ImportError("The 'datasets' package is required for MultiTextDataset")
         self.ds = datasets.load_dataset(
             "json",
             data_files=prompt_path,
@@ -121,6 +125,82 @@ class MultiTextDataset(Dataset):
             "idx": idx,
             "prompts_list": self.ds[idx][self.field],  # List[str]
         }
+
+
+class VideoLatentCaptionDataset(Dataset):
+    """Dataset pairing pre-encoded video latents with first-chunk captions."""
+
+    def __init__(self, latent_root: str, caption_root: str, num_frames: int = 21, frame_stride: int = 2):
+        from pathlib import Path
+        import json
+
+        self.latent_root = Path(latent_root)
+        self.caption_root = Path(caption_root)
+        self.num_frames = num_frames
+        self.frame_stride = frame_stride
+        self.samples: list[tuple[Path, str]] = []
+
+        if not self.latent_root.exists():
+            raise FileNotFoundError(f"Latent root does not exist: {latent_root}")
+        if not self.caption_root.exists():
+            raise FileNotFoundError(f"Caption root does not exist: {caption_root}")
+
+        for latent_path in sorted(self.latent_root.rglob('encoded_video_*.pt')):
+            if not latent_path.is_file():
+                continue
+            rel_dir = latent_path.parent.relative_to(self.latent_root)
+            caption_dir = self.caption_root / rel_dir
+            if not caption_dir.exists():
+                continue
+            ride_name = latent_path.parent.name
+            candidates = sorted(caption_dir.glob(f"{ride_name}_video_captions_*.json"))
+            if not candidates:
+                continue
+            caption_path = candidates[0]
+            try:
+                with caption_path.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+                caption = data.get('combined_analysis').strip() or ''
+                if not caption:
+                    continue
+            except Exception:
+                continue
+            self.samples.append((latent_path, caption))
+
+        if not self.samples:
+            raise RuntimeError('No paired latent/caption samples were found.')
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        import random
+
+        latent_path, caption = self.samples[idx]
+        latents = torch.load(latent_path, map_location='cpu')
+        if not isinstance(latents, torch.Tensor) or latents.ndim != 4:
+            raise ValueError(f'Unexpected latent format at {latent_path}')
+
+        latents = latents[::self.frame_stride]
+        if latents.shape[0] == 0:
+            raise ValueError(f'Latent sequence empty after striding: {latent_path}')
+
+        total = latents.shape[0]
+        if total >= self.num_frames:
+            start_max = total - self.num_frames
+            start = random.randint(0, start_max) if start_max > 0 else 0
+            latents = latents[start:start + self.num_frames]
+        else:
+            repeat = self.num_frames - total
+            latents = torch.cat([latents, latents[-1:].repeat(repeat, 1, 1, 1)], dim=0)
+
+        latents = latents.contiguous().float()
+        return {
+            'idx': idx,
+            'prompts': caption,
+            'real_latents': latents,
+        }
+
 
 
 def cycle(dl):

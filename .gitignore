@@ -4,3 +4,8 @@ longlive_models
 wan_models
 
 videos
+checkpoints/
+logs/
+wandb/
+*.err
+*.out

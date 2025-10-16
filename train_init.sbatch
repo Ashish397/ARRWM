@@ -1,9 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=longlive-init
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:4
-#SBATCH --time=23:59:00
-#SBATCH --output=logs/%x_%j.out
+#SBATCH -J train_init_real
+#SBATCH -N 1
+#SBATCH --ntasks=4
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=16
+#SBATCH -t 22:00:00
+#SBATCH --requeue
+#SBATCH -o %x_%j.out
+#SBATCH -e %x_%j.err
+
+set -e -o pipefail
 
 # Change to the ARRWM directory where train.py is located
 cd /home/u5as/as1748.u5as/frodobots/ARRWM
@@ -31,6 +37,8 @@ export TRANSFORMERS_CACHE=$CACHE_DIR
 mkdir -p "$CACHE_DIR"
 
 echo "CONFIG=$CONFIG"
+echo "Starting training job on $(date)"
+echo "Job ID: $SLURM_JOB_ID"
 
 torchrun \
   --nproc_per_node=4 \
@@ -38,3 +46,5 @@ torchrun \
   --config_path $CONFIG \
   --logdir $LOGDIR \
   --wandb-save-dir $WANDB_SAVE_DIR
+
+echo "Training completed on $(date)"
