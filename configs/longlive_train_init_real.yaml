@@ -1,3 +1,4 @@
+config_name: 'dmd2-init-real'
 generator_ckpt: /scratch/u5as/as1748.u5as/frodobots/checkpoints/ode_init.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
@@ -31,8 +32,10 @@ beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 data_path: prompts/vidprom_filtered_extended.txt
-real_latent_root: /projects/u5as/frodobots_encoded
-caption_root: /projects/u5as/frodobots_captions
+real_latent_root: /projects/u5as/frodobots_encoded/train
+caption_root: /projects/u5as/frodobots_captions/train
+val_real_latent_root: /projects/u5as/frodobots_encoded/test
+val_caption_root: /projects/u5as/frodobots_captions/test
 batch_size: 1
 gradient_accumulation_steps: 1
 ema_weight: 0.99

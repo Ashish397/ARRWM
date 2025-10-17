@@ -2,8 +2,9 @@
 
 # Project path and config
 CONFIG=configs/longlive_train_long.yaml
-LOGDIR=logs
+LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs
 WANDB_SAVE_DIR=wandb
+EXPERIMENT_NAME="dmd2-long-$(date +%Y%m%d-%H%M%S)"
 
 # Ensure Hugging Face downloads use scratch space (larger quota than $HOME).
 CACHE_DIR='/scratch/u5as/as1748.u5as/frodobots/hf_cache'
@@ -20,4 +21,5 @@ torchrun \
   train.py \
   --config_path $CONFIG \
   --logdir $LOGDIR \
-  --wandb-save-dir $WANDB_SAVE_DIR
+  --wandb-save-dir $WANDB_SAVE_DIR \
+  --experiment-name "$EXPERIMENT_NAME"

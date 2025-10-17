@@ -16,8 +16,9 @@ cd /home/u5as/as1748.u5as/frodobots/ARRWM
 
 # Project path and config
 CONFIG=configs/longlive_train_init_real.yaml
-LOGDIR=logs
+LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs
 WANDB_SAVE_DIR=wandb
+EXPERIMENT_NAME="dmd2-init-$(date +%Y%m%d-%H%M%S)"
 
 # Activate arrwm conda environment
 if [ -f "$HOME/miniforge/etc/profile.d/conda.sh" ]; then
@@ -45,6 +46,7 @@ torchrun \
   train.py \
   --config_path $CONFIG \
   --logdir $LOGDIR \
-  --wandb-save-dir $WANDB_SAVE_DIR
+  --wandb-save-dir $WANDB_SAVE_DIR \
+  --experiment-name "$EXPERIMENT_NAME"
 
 echo "Training completed on $(date)"

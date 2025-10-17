@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--disable-wandb", action="store_true")
     parser.add_argument("--no-auto-resume", action="store_true", help="Disable auto resume from latest checkpoint in logdir")
     parser.add_argument("--no-one-logger", action="store_true", help="Disable One Logger (enabled by default)")
+    parser.add_argument("--experiment-name", type=str, default="", help="Name for the experiment in wandb")
 
     args = parser.parse_args()
 
@@ -29,7 +30,10 @@ def main():
 
     # get the filename of config_path
     # config_name = os.path.basename(args.config_path).split(".")[0]
-    config_name = os.path.dirname(args.config_path).split("/")[-1]
+    if args.experiment_name:
+        config_name = args.experiment_name
+    else:
+        config_name = os.path.dirname(args.config_path).split("/")[-1]
     config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir

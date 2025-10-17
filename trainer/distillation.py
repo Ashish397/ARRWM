@@ -421,9 +421,12 @@ class Trainer:
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
             elif self.config.distribution_loss in ("dmd2", "dmd2real"):
+                val_latent_root = getattr(config, "val_real_latent_root", None)
+                val_caption_root = getattr(config, "val_caption_root", None)
+
                 val_dataset = VideoLatentCaptionDataset(
-                    config.real_latent_root,
-                    config.caption_root,
+                    val_latent_root,
+                    val_caption_root,
                     num_frames=getattr(config, "num_training_frames", 21),
                 )
             else:
