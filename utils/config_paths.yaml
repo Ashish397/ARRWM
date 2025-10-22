@@ -1,0 +1,9 @@
+# Configuration file for ride_level_caption.py
+# This file sets the HuggingFace cache directory to use the scratch space
+
+# HuggingFace cache directory - points to scratch space with existing models
+hf_cache: /scratch/u5as/as1748.u5as/frodobots/hf_cache
+
+data_dir: /projects/u5as/frodobots
+captions_dir: ./captions
+analysis_dir: ./analysis
