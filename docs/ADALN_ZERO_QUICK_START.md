@@ -190,6 +190,13 @@ Create new config `configs/longlive_train_action.yaml`:
 # Then modify:
 distribution_loss: dmd2real_action  # Add 'action' keyword
 
+# Note: Don't put 'is_causal' in model_kwargs - it's passed separately
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+  # is_causal: true  ← DON'T add this here
+
 # Add action-related config
 action_config:
   action_dim: 512
