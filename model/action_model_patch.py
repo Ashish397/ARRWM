@@ -74,7 +74,7 @@ def patch_causal_wan_model_for_action(model):
         x = torch.cat(x)
         
         # ============ MODIFIED: Time embeddings + Action modulation ============
-        from wan.modules.utils import sinusoidal_embedding_1d
+        from wan.modules.model import sinusoidal_embedding_1d
         
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
