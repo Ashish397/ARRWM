@@ -144,8 +144,9 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
     def inference(
         self,
         noise: torch.Tensor,
-        text_prompts: list[str],
+        text_prompts: list[str] | None = None,
         *,
+        prompt_embeds: torch.Tensor | None = None,
         action_inputs: dict | None = None,  # 新增：动作相关的输入
         return_latents: bool = False,
         profile: bool = False,
@@ -156,7 +157,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         
         Args:
             noise: 输入噪声 [batch_size, num_output_frames, num_channels, height, width]
-            text_prompts: 文本提示列表
+            text_prompts: 文本提示列表（当 text_pre_encoded=False 时使用）
+            prompt_embeds: 预编码的文本嵌入（当 text_pre_encoded=True 时使用）
             action_inputs: 动作相关的输入字典，可以包含：
                 - 'target_actions': 目标动作序列
                 - 'action_embeddings': 预先计算的动作嵌入
@@ -172,14 +174,26 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        # 编码文本提示
-        conditional_dict = self.text_encoder(text_prompts=text_prompts)
+        # 编码文本提示或使用预编码的嵌入
+        if not self.text_pre_encoded:
+            if text_prompts is None:
+                raise ValueError("text_prompts must be provided when text_pre_encoded is False")
+            conditional_dict = self.text_encoder(text_prompts=text_prompts)
 
-        if low_memory:
-            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
-            move_model_to_device_with_memory_preservation(
-                self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation
-            )
+            if low_memory and self.text_encoder is not None:
+                gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
+                move_model_to_device_with_memory_preservation(
+                    self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation
+                )
+        else:
+            if prompt_embeds is None:
+                raise ValueError("prompt_embeds must be provided when text_pre_encoded is True")
+            if prompt_embeds.dim() == 2:
+                prompt_embeds = prompt_embeds.unsqueeze(0)
+            target_device = noise.device if not low_memory else torch.device("cpu")
+            conditional_dict = {
+                "prompt_embeds": prompt_embeds.to(device=target_device, dtype=noise.dtype)
+            }
 
         # 决定输出设备
         output_device = torch.device('cpu') if low_memory else noise.device
