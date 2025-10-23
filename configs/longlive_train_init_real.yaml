@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 config_name: 'init-real-dmd2mse-relative_test_6'
 text_pre_encoded: true
 negative_prompt_encoded_path: /projects/u5as/frodobots_captions/negative/longlive_train_init_real_negative_1.json
@@ -20,6 +21,9 @@ generator_mse_loss_weight: 0.1
 generator_mse_loss_weight_decay: 0.0
 adaptive_d_weight: false
 adaptive_d_weight_max: 10.0
+=======
+config_name: 'dmd2-init-real'
+>>>>>>> origin/action_injection
 generator_ckpt: /scratch/u5as/as1748.u5as/frodobots/checkpoints/ode_init.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
@@ -74,7 +78,11 @@ image_or_video_shape:
 - 16
 - 60
 - 104
+<<<<<<< HEAD
 distribution_loss: dmd2mse
+=======
+distribution_loss: dmd2real
+>>>>>>> origin/action_injection
 trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3

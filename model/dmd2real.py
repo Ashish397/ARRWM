@@ -68,9 +68,13 @@ class DMD2Real(SelfForcingModel):
 
         if hasattr(self.fake_score, "adding_cls_branch"):
             try:
+<<<<<<< HEAD
                 self.fake_score.adding_cls_branch(
                     time_embed_dim=1536 if self.concat_time_embeddings else 0
                 )
+=======
+                self.fake_score.adding_cls_branch()
+>>>>>>> origin/action_injection
             except Exception:
                 if dist.get_rank() == 0:
                     print("[Warning] Failed to add classification branch to fake_score.")
