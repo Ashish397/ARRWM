@@ -193,7 +193,7 @@ def select_control_window(
     if right_idx < left_idx:
         right_idx = left_idx
 
-    return controls[left_idx : right_idx + 1]
+    return controls[left_idx : right_idx]
 
 
 def compute_actions(

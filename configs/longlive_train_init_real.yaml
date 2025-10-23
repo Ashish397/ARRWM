@@ -1,4 +1,6 @@
 config_name: 'init-real-dmd2mse-relative_test_6'
+text_pre_encoded: true
+negative_prompt_encoded_path: /projects/u5as/frodobots_captions/negative/longlive_train_init_real_negative_1.json
 cls_on_clean_image: true
 gan_type: 'relative'
 relative_r1_weight: 0.0

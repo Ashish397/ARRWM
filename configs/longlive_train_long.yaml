@@ -6,6 +6,8 @@ real_name: Wan2.1-T2V-1.3B
 # real_name: Wan2.1-T2V-14B
 fake_name: Wan2.1-T2V-1.3B
 text_encoder_fsdp_wrap_strategy: size
+text_pre_encoded: true
+negative_prompt_encoded_path: /projects/u5as/frodobots_captions/negative/longlive_train_long_negative_1.json
 denoising_step_list:
 - 1000
 - 750

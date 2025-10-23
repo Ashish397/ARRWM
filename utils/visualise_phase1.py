@@ -134,22 +134,40 @@ def _select_rel_dir(
     return candidate_list[index]
 
 
-def _load_caption(caption_root: Path, rel_dir: Path) -> str:
+def _load_caption(caption_root: Path, rel_dir: Path, *, text_pre_encoded: bool = False, encoded_suffix: str = '_encoded') -> tuple[str, Optional[torch.Tensor]]:
     caption_dir = caption_root / rel_dir
     if not caption_dir.is_dir():
         raise RuntimeError(f"Caption directory missing: {caption_dir}")
 
-    caption_candidates = sorted(caption_dir.glob("*.json"))
-    caption_path = VideoLatentCaptionDataset._select_caption_path(rel_dir, caption_candidates)  # type: ignore[attr-defined]
-    if caption_path is None:
-        raise RuntimeError(f"No caption JSON found for {rel_dir} in {caption_dir}")
+    if text_pre_encoded:
+        encoded_candidates = sorted(caption_dir.glob(f"*{encoded_suffix}.json"))
+        if not encoded_candidates:
+            raise RuntimeError(f"No encoded caption JSON found for {rel_dir} in {caption_dir}")
+        encoded_path = encoded_candidates[0]
+        if len(encoded_candidates) > 1:
+            raise RuntimeError(f"Multiple encoded captions found for {rel_dir}, using {encoded_path}")
+
+        with encoded_path.open('r', encoding='utf-8') as efh:
+            encoded_payload = json.load(efh)
+        encoded_values = encoded_payload.get('caption_encoded')
+        if encoded_values is None:
+            raise RuntimeError(f"'caption_encoded' missing in {encoded_path}")
+        prompt_embeds = torch.tensor(encoded_values, dtype=torch.float32)
+
+    caption_candidates = sorted(caption_dir.glob('*InternVL3_8B.json'))
+    caption_path = caption_candidates[0]
+    if len(caption_candidates) > 1:
+        raise RuntimeError(f"Multiple caption JSON found for {rel_dir}, using {caption_path}")
 
     with caption_path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
     caption = (data.get("combined_analysis") or "").strip()
     if not caption:
         raise RuntimeError(f"Caption text missing in {caption_path}")
-    return caption
+    if prompt_embeds is not None:
+        return caption, prompt_embeds
+    else:
+        return caption, None
 
 
 def _load_generator_weights(
@@ -228,6 +246,7 @@ def main() -> None:
         base_cfg = OmegaConf.create({})
     user_cfg = OmegaConf.load(args.config_path)
     config = OmegaConf.merge(base_cfg, user_cfg)
+    text_pre_encoded = bool(getattr(config, 'text_pre_encoded', False))
 
     run_name = args.run or config.get("config_name", None) or Path(args.config_path).stem
     run_dir = None
@@ -246,8 +265,10 @@ def main() -> None:
         raise FileNotFoundError(f"Caption root not found: {caption_root}")
 
     rel_dir = _select_rel_dir(latent_root, args.ride_name, args.output_ride, args.output_index)
-    caption = _load_caption(caption_root, rel_dir)
+    caption, prompt_embeds = _load_caption(caption_root, rel_dir, text_pre_encoded=text_pre_encoded)
     print(f"[Info] Selected ride: {rel_dir} (caption length {len(caption)} characters)")
+    if text_pre_encoded and prompt_embeds is not None:
+        print(f"[Info] Loaded encoded caption embedding with shape {tuple(prompt_embeds.shape)}")
 
     prompt_text = " ".join(caption.splitlines())
     print(f"[Info] Prompt: {prompt_text}")
@@ -340,13 +361,18 @@ def main() -> None:
     pipeline = pipeline.to(dtype=dtype)
     pipeline.generator.to(device=device, dtype=dtype)
     pipeline.vae.to(device=device, dtype=dtype)
-    pipeline.text_encoder.to(device=device)
+    if getattr(pipeline, 'text_encoder', None) is not None:
+        pipeline.text_encoder.to(device=device)
 
     num_frames = args.num_frames or int(getattr(config, "num_training_frames", 21))
     noise = torch.randn(1, num_frames, 16, 60, 104, device=device, dtype=dtype)
     print(f"[Info] Generating {num_frames} frames on {device} with dtype {dtype}.")
 
-    video = pipeline.inference(noise=noise, text_prompts=[caption])
+    video = pipeline.inference(
+        noise=noise,
+        text_prompts=[caption] if not text_pre_encoded else None,
+        prompt_embeds=prompt_embeds if text_pre_encoded else None,
+    )
     if isinstance(video, tuple):
         video = video[0]
 

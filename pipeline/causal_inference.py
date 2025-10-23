@@ -25,7 +25,11 @@ class CausalInferencePipeline(torch.nn.Module):
             print(f"args.model_kwargs: {args.model_kwargs}")
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
-        self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
+        self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
+        if self.text_pre_encoded:
+            self.text_encoder = text_encoder  # may be provided externally
+        else:
+            self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
@@ -56,7 +60,9 @@ class CausalInferencePipeline(torch.nn.Module):
     def inference(
         self,
         noise: torch.Tensor,
-        text_prompts: List[str],
+        text_prompts: Optional[List[str]] = None,
+        *,
+        prompt_embeds: Optional[torch.Tensor] = None,
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
@@ -66,7 +72,8 @@ class CausalInferencePipeline(torch.nn.Module):
         Inputs:
             noise (torch.Tensor): The input noise tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
-            text_prompts (List[str]): The list of text prompts.
+            text_prompts (Optional[List[str]]): Raw text prompts when using the text encoder.
+            prompt_embeds (Optional[torch.Tensor]): Pre-encoded text embeddings when the text encoder is disabled.
             return_latents (bool): Whether to return the latents.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
@@ -77,13 +84,25 @@ class CausalInferencePipeline(torch.nn.Module):
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        conditional_dict = self.text_encoder(
-            text_prompts=text_prompts
-        )
+        if not self.text_pre_encoded:
+            if text_prompts is None:
+                raise ValueError("text_prompts must be provided when text_pre_encoded is False")
+            conditional_dict = self.text_encoder(
+                text_prompts=text_prompts
+            )
 
-        if low_memory:
-            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
-            move_model_to_device_with_memory_preservation(self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+            if low_memory and self.text_encoder is not None:
+                gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
+                move_model_to_device_with_memory_preservation(self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+        else:
+            if prompt_embeds is None:
+                raise ValueError("prompt_embeds must be provided when text_pre_encoded is True")
+            if prompt_embeds.dim() == 2:
+                prompt_embeds = prompt_embeds.unsqueeze(0)
+            target_device = noise.device if not low_memory else torch.device("cpu")
+            conditional_dict = {
+                "prompt_embeds": prompt_embeds.to(device=target_device, dtype=noise.dtype)
+            }
 
         # Decide the device for output based on low_memory (CPU for low-memory mode; otherwise GPU)
         output_device = torch.device('cpu') if low_memory else noise.device

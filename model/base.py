@@ -15,6 +15,7 @@ from utils.debug_option import DEBUG
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
+        self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
         self._initialize_models(args, device)
 
         self.device = device
@@ -39,8 +40,11 @@ class BaseModel(nn.Module):
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
         self.fake_score.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
-        self.text_encoder.requires_grad_(False)
+        if not self.text_pre_encoded:
+            self.text_encoder = WanTextEncoder()
+            self.text_encoder.requires_grad_(False)
+        else:
+            self.text_encoder = None
 
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)

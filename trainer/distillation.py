@@ -6,6 +6,7 @@ import random
 import math
 import re
 from pathlib import Path
+import json
 
 from utils.dataset import TextDataset, TwoTextDataset, VideoLatentCaptionDataset, cycle
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
@@ -60,6 +61,7 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+        self.text_pre_encoded = bool(getattr(config, "text_pre_encoded", False))
 
         # use a random seed for the training
         if config.seed == 0:
@@ -325,13 +327,14 @@ class Trainer:
             wrap_strategy=config.fake_score_fsdp_wrap_strategy
         )
 
-        self.model.text_encoder = fsdp_wrap(
-            self.model.text_encoder,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-            cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
-        )
+        if self.model.text_encoder is not None:
+            self.model.text_encoder = fsdp_wrap(
+                self.model.text_encoder,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
+                cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
+            )
         self.model.vae = self.model.vae.to(
             device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -403,6 +406,7 @@ class Trainer:
                 config.real_latent_root,
                 config.caption_root,
                 num_frames=getattr(config, "num_training_frames", 21),
+                text_pre_encoded=self.text_pre_encoded,
             )
         else:
             dataset = TextDataset(config.data_path)
@@ -437,6 +441,7 @@ class Trainer:
                     val_latent_root,
                     val_caption_root,
                     num_frames=getattr(config, "num_training_frames", 21),
+                    text_pre_encoded=self.text_pre_encoded,
                 )
             else:
                 val_dataset = TextDataset(val_data_path)
@@ -902,41 +907,99 @@ class Trainer:
             self.one_logger.on_save_checkpoint_success(global_step=self.step)
             self.one_logger.on_save_checkpoint_end(global_step=self.step)
 
+    def _load_preencoded_negative_prompt(self) -> torch.Tensor:
+        cached = getattr(self, '_cached_negative_prompt_embeds', None)
+        if cached is not None:
+            return cached
+
+        encoded_path = getattr(self.config, 'negative_prompt_encoded_path', None)
+        encoded_values = getattr(self.config, 'negative_prompt_encoded', None)
+        tensor: torch.Tensor | None = None
+
+        if encoded_path:
+            try:
+                with open(encoded_path, 'r', encoding='utf-8') as fh:
+                    payload = json.load(fh)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load negative prompt embeddings from {encoded_path}: {exc}") from exc
+            data = payload.get('caption_encoded')
+            if data is None:
+                raise ValueError(f"'caption_encoded' missing in negative prompt file {encoded_path}")
+            tensor = torch.tensor(data, dtype=torch.float32)
+        elif encoded_values is not None:
+            tensor = torch.tensor(encoded_values, dtype=torch.float32)
+
+        if tensor is None:
+            raise RuntimeError(f"Failed to load negative prompt embeddings from {encoded_path} or {encoded_values}")
+        elif tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim != 3:
+            raise ValueError(f'Unexpected negative prompt embedding shape {tensor.shape}')
+
+        self._cached_negative_prompt_embeds = tensor
+        return tensor
+
+    def _build_unconditional_from_preencoded(self, batch_size: int) -> dict:
+        negative = self._load_preencoded_negative_prompt()
+        if negative.shape[0] != batch_size:
+            negative = negative[:1].repeat(batch_size, 1, 1)
+        unconditional = negative.to(device=self.device, dtype=self.dtype)
+        return {'prompt_embeds': unconditional}
+
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
         if self.step % 5 == 0:
             torch.cuda.empty_cache()
 
-        # Step 1: Get the next batch of text prompts
-        text_prompts = batch.get("prompts")
-        if isinstance(text_prompts, str):
-            text_prompts = [text_prompts]
+        # Step 1: Get the next batch of text prompts / embeddings
+        if self.text_pre_encoded:
+            prompt_embeds = batch.get('prompt_embeds')
+            if prompt_embeds is None:
+                raise ValueError('Batch missing pre-encoded prompt embeddings while text_pre_encoded is enabled.')
+            if isinstance(prompt_embeds, list):
+                prompt_embeds = torch.stack(prompt_embeds)
+            elif isinstance(prompt_embeds, tuple):
+                prompt_embeds = torch.stack(list(prompt_embeds))
+            elif not isinstance(prompt_embeds, torch.Tensor):
+                prompt_embeds = torch.tensor(prompt_embeds, dtype=torch.float32)
+            prompt_embeds = prompt_embeds.to(self.device, dtype=self.dtype)
+            batch_size = prompt_embeds.shape[0]
+        else:
+            text_prompts = batch.get('prompts')
+            if text_prompts is None:
+                raise ValueError('Batch is missing text prompts.')
+            if isinstance(text_prompts, str):
+                text_prompts = [text_prompts]
+            batch_size = len(text_prompts)
 
-        real_latents = batch.get("real_latents")
+        real_latents = batch.get('real_latents')
         if real_latents is not None:
             if isinstance(real_latents, torch.Tensor):
                 real_latents = real_latents.to(self.device, dtype=torch.float32)
             else:
                 real_latents = torch.stack(real_latents).to(self.device, dtype=torch.float32)
 
-        batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
 
         # Step 2: Extract the conditional infos
         with torch.no_grad():
-            conditional_dict = self.model.text_encoder(
-                text_prompts=text_prompts)
-
-            if not getattr(self, "unconditional_dict", None):
-                unconditional_dict = self.model.text_encoder(
-                    text_prompts=[self.config.negative_prompt] * batch_size)
-                unconditional_dict = {k: v.detach()
-                                      for k, v in unconditional_dict.items()}
-                self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
+            if self.text_pre_encoded:
+                conditional_dict = {'prompt_embeds': prompt_embeds}
+                unconditional_dict = self._build_unconditional_from_preencoded(batch_size)
             else:
-                unconditional_dict = self.unconditional_dict
+                conditional_dict = self.model.text_encoder(
+                    text_prompts=text_prompts)
+
+                if not getattr(self, 'unconditional_dict', None):
+                    unconditional_dict = self.model.text_encoder(
+                        text_prompts=[self.config.negative_prompt] * batch_size)
+                    unconditional_dict = {k: v.detach()
+                                          for k, v in unconditional_dict.items()}
+                    self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
+                else:
+                    unconditional_dict = self.unconditional_dict
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
@@ -1001,8 +1064,15 @@ class Trainer:
 
         return critic_log_dict
 
-    def generate_video(self, pipeline, num_frames, prompts, image=None):
-        batch_size = len(prompts)
+    def generate_video(self, pipeline, num_frames, prompts, prompt_embeds=None, image=None):
+        if prompt_embeds is not None and not isinstance(prompt_embeds, torch.Tensor):
+            if isinstance(prompt_embeds, list):
+                prompt_embeds = torch.stack(prompt_embeds)
+            elif isinstance(prompt_embeds, tuple):
+                prompt_embeds = torch.stack(list(prompt_embeds))
+            else:
+                prompt_embeds = torch.tensor(prompt_embeds, dtype=torch.float32)
+        batch_size = prompt_embeds.shape[0] if isinstance(prompt_embeds, torch.Tensor) else len(prompts)
         if image is not None:
             image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device="cuda", dtype=torch.bfloat16)
 
@@ -1024,7 +1094,8 @@ class Trainer:
         with torch.no_grad():
             video, _ = pipeline.inference(
                 noise=sampled_noise,
-                text_prompts=prompts,
+                text_prompts=prompts if not self.text_pre_encoded else None,
+                prompt_embeds=prompt_embeds if self.text_pre_encoded else None,
                 return_latents=True,
             )
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
@@ -1077,14 +1148,29 @@ class Trainer:
         batch = next(self.dataloader)
 
         # Prepare conditional information
-        text_prompts = batch["prompts"]
         if self.config.i2v:
             image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
                 device=self.device, dtype=self.dtype)
         else:
             image_latent = None
 
-        batch_size = len(text_prompts)
+        if self.text_pre_encoded:
+            prompt_embeds = batch.get('prompt_embeds')
+            if prompt_embeds is None:
+                raise ValueError('Streaming batch missing prompt_embeds while text_pre_encoded is enabled.')
+            if isinstance(prompt_embeds, list):
+                prompt_embeds = torch.stack(prompt_embeds)
+            elif isinstance(prompt_embeds, tuple):
+                prompt_embeds = torch.stack(list(prompt_embeds))
+            elif not isinstance(prompt_embeds, torch.Tensor):
+                prompt_embeds = torch.tensor(prompt_embeds, dtype=torch.float32)
+            prompt_embeds = prompt_embeds.to(self.device, dtype=self.dtype)
+            batch_size = prompt_embeds.shape[0]
+        else:
+            text_prompts = batch.get('prompts')
+            if isinstance(text_prompts, str):
+                text_prompts = [text_prompts]
+            batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
         
@@ -1093,18 +1179,22 @@ class Trainer:
             print(f"[SeqTrain-Trainer] image_or_video_shape={image_or_video_shape}")
         
         with torch.no_grad():
-            conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
-            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                print(f"[SeqTrain-Trainer] Created and cached conditional_dict")
-            if not getattr(self, "unconditional_dict", None):
-                unconditional_dict = self.model.text_encoder(
-                    text_prompts=[self.config.negative_prompt] * batch_size)
-                unconditional_dict = {k: v.detach() for k, v in unconditional_dict.items()}
-                self.unconditional_dict = unconditional_dict
-                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                    print(f"[SeqTrain-Trainer] Created and cached unconditional_dict")
+            if self.text_pre_encoded:
+                conditional_dict = {'prompt_embeds': prompt_embeds}
+                unconditional_dict = self._build_unconditional_from_preencoded(batch_size)
             else:
-                unconditional_dict = self.unconditional_dict
+                conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
+                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                    print(f"[SeqTrain-Trainer] Created and cached conditional_dict")
+                if not getattr(self, 'unconditional_dict', None):
+                    unconditional_dict = self.model.text_encoder(
+                        text_prompts=[self.config.negative_prompt] * batch_size)
+                    unconditional_dict = {k: v.detach() for k, v in unconditional_dict.items()}
+                    self.unconditional_dict = unconditional_dict
+                    if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                        print(f"[SeqTrain-Trainer] Created and cached unconditional_dict")
+                else:
+                    unconditional_dict = self.unconditional_dict
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"streaming Training: After text encoding", device=self.device, rank=dist.get_rank())
@@ -1139,6 +1229,8 @@ class Trainer:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] Processing DMDSwitch info")
                 
+            if self.text_pre_encoded:
+                raise NotImplementedError('text_pre_encoded is not yet supported for DMDSwitch training.')
             with torch.no_grad():
                 switch_conditional_dict = self.model.text_encoder(
                     text_prompts=batch["switch_prompts"]
@@ -1666,6 +1758,7 @@ class Trainer:
         step_vis_dir = os.path.join(self.vis_output_dir, f"step_{self.step:07d}")
         os.makedirs(step_vis_dir, exist_ok=True)
         batch = self.fixed_vis_batch
+        prompt_embeds = batch.get('prompt_embeds') if isinstance(batch, dict) else None
         if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
             prompts = batch["prompts"]
             switch_prompts = batch["switch_prompts"]
@@ -1689,7 +1782,7 @@ class Trainer:
             if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
                 videos = self.generate_video_with_switch(self.vis_pipeline, vid_len, prompts, switch_prompts, switch_frame_index, image=image)
             else:
-                videos = self.generate_video(self.vis_pipeline, vid_len, prompts, image=image)
+                videos = self.generate_video(self.vis_pipeline, vid_len, prompts, prompt_embeds=prompt_embeds, image=image)
 
             # Save each sample
             for idx, video_np in enumerate(videos):
