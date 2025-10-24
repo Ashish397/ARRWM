@@ -6,7 +6,7 @@ from omegaconf import OmegaConf
 import wandb
 
 from trainer import ScoreDistillationTrainer
-
+from trainer import LoRADiffusionTrainer
 
 def main():
     parser = argparse.ArgumentParser()
@@ -43,6 +43,8 @@ def main():
 
     if config.trainer == "score_distillation":
         trainer = ScoreDistillationTrainer(config)
+    elif config.trainer == "lora_diffusion":
+        trainer = LoRADiffusionTrainer(config)
     trainer.train()
 
     wandb.finish()
