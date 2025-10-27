@@ -15,8 +15,17 @@ from utils.misc import (
     merge_dict_list
 )
 import torch.distributed as dist
-from omegaconf import OmegaConf
-from model import DMD, DMDSwitch, DMD2, DMD2MSE, DMD2Real, MSE_DMD, DMD2RealMSE, DMD2RealMSEDWT
+from omegaconf import OmegaConf, DictConfig
+from model import (
+    DMD,
+    DMDSwitch,
+    DMD2,
+    DMD2MSE,
+    DMD2Real,
+    MSE_DMD,
+    DMD2RealMSE,
+    DMD2RealMSELAM,
+)
 from model.streaming_training import StreamingTrainingModel
 import torch
 import wandb
@@ -141,6 +150,8 @@ class Trainer:
             self.model = DMD2MSE(config, device=self.device)
         elif config.distribution_loss == "dmd2realmse":
             self.model = DMD2RealMSE(config, device=self.device)
+        elif config.distribution_loss == "dmd2realmselam":
+            self.model = DMD2RealMSELAM(config, device=self.device)
         elif config.distribution_loss == "dmd2realmsedwt":
             self.model = DMD2RealMSEDWT(config, device=self.device)
         elif config.distribution_loss == "mse_dmd":
@@ -157,9 +168,38 @@ class Trainer:
         # ================================= LoRA Configuration =================================
         self.is_lora_enabled = False
         self.lora_config = None
+        # Track which sub-models have LoRA applied for loading/saving logic
+        self.apply_lora_to_critic = False
+        self.apply_lora_to_teacher = False
         if hasattr(config, 'adapter') and config.adapter is not None:
             self.is_lora_enabled = True
             self.lora_config = config.adapter
+            if isinstance(self.lora_config, DictConfig):
+                self.lora_config = OmegaConf.to_container(self.lora_config, resolve=True)
+            else:
+                # Ensure we have a dict-like structure we can safely query
+                self.lora_config = dict(self.lora_config)
+
+            self.apply_lora_to_critic = bool(self.lora_config.get('apply_to_critic', True))
+            self.apply_lora_to_teacher = bool(self.lora_config.get('apply_to_teacher', True))
+            generator_cfg = self._get_adapter_config('generator_adapter', default_adapter_name="default")
+            if generator_cfg is None:
+                raise ValueError("LoRA adapter configuration missing generator settings")
+            self.generator_adapter_name = generator_cfg["adapter_name"]
+            self.teacher_adapter_name = None
+            if self.apply_lora_to_teacher:
+                teacher_cfg = self._get_adapter_config('teacher_adapter', default_adapter_name="default")
+                if teacher_cfg is None:
+                    raise ValueError("apply_to_teacher=True requires a teacher_adapter configuration")
+                self.teacher_adapter_name = teacher_cfg["adapter_name"]
+            self.critic_adapter_name = None
+            if self.apply_lora_to_critic:
+                critic_cfg = self._get_adapter_config('critic_adapter', default_adapter_name="critic")
+                if critic_cfg is None:
+                    critic_cfg = self._get_adapter_config(None, default_adapter_name="critic")
+                if self.apply_lora_to_teacher and self.teacher_adapter_name and critic_cfg["adapter_name"] == self.teacher_adapter_name:
+                    critic_cfg["adapter_name"] = "critic"
+                self.critic_adapter_name = critic_cfg["adapter_name"]
             
             if self.is_main_process:
                 print(f"LoRA enabled with config: {self.lora_config}")
@@ -215,16 +255,27 @@ class Trainer:
             # 2. Apply LoRA wrapping now (after loading base model, before FSDP wrapping)
             if self.is_main_process:
                 print("Applying LoRA to models...")
-            self.model.generator.model = self._configure_lora_for_model(self.model.generator.model, "generator")
-            
-            # Configure LoRA for fake_score if needed
-            if getattr(self.lora_config, 'apply_to_critic', True):
-                self.model.fake_score.model = self._configure_lora_for_model(self.model.fake_score.model, "fake_score")
-                if self.is_main_process:
-                    print("LoRA applied to both generator and critic")
-            else:
-                if self.is_main_process:
-                    print("LoRA applied to generator only")
+            self.model.generator.model = self._configure_lora_for_model(
+                self.model.generator.model, "generator", trainable=True)
+
+            applied_targets = ["generator"]
+
+            if self.apply_lora_to_teacher:
+                self.model.real_score.model = self._configure_lora_for_model(
+                    self.model.real_score.model, "real_score", trainable=False)
+                applied_targets.append("teacher")
+            elif self.is_main_process:
+                print("LoRA not applied to teacher (real_score)")
+
+            if self.apply_lora_to_critic:
+                self.model.fake_score.model = self._configure_lora_for_model(
+                    self.model.fake_score.model, "fake_score", trainable=True)
+                applied_targets.append("critic")
+            elif self.is_main_process:
+                print("LoRA not applied to critic (fake_score)")
+
+            if self.is_main_process:
+                print(f"LoRA applied to: {', '.join(applied_targets)}")
             
             # 3. Load LoRA weights before FSDP wrapping (if a checkpoint is available)
             lora_checkpoint_path = None
@@ -234,10 +285,19 @@ class Trainer:
                 if latest_checkpoint:
                     try:
                         checkpoint = torch.load(latest_checkpoint, map_location="cpu")
-                        if "generator_lora" in checkpoint and "critic_lora" in checkpoint:
+                        expected_lora_keys = {"generator_lora"}
+                        if self.apply_lora_to_critic:
+                            expected_lora_keys.add("critic_lora")
+                        if self.apply_lora_to_teacher:
+                            expected_lora_keys.add("teacher_lora")
+
+                        missing_keys = [key for key in expected_lora_keys if key not in checkpoint]
+                        if "generator_lora" in checkpoint:
                             lora_checkpoint_path = latest_checkpoint
                             if self.is_main_process:
                                 print(f"Auto resume: Found LoRA checkpoint at {lora_checkpoint_path}")
+                                if missing_keys:
+                                    print(f"Auto resume warning: checkpoint missing LoRA keys {missing_keys}")
                         else:
                             raise ValueError(f"Checkpoint {latest_checkpoint} is not a LoRA checkpoint. "
                                            f"Found keys: {list(checkpoint.keys())}")
@@ -261,10 +321,19 @@ class Trainer:
                 if lora_ckpt_path:
                     try:
                         checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
-                        if "generator_lora" in checkpoint and "critic_lora" in checkpoint:
+                        expected_lora_keys = {"generator_lora"}
+                        if self.apply_lora_to_critic:
+                            expected_lora_keys.add("critic_lora")
+                        if self.apply_lora_to_teacher:
+                            expected_lora_keys.add("teacher_lora")
+
+                        missing_keys = [key for key in expected_lora_keys if key not in checkpoint]
+                        if "generator_lora" in checkpoint:
                             lora_checkpoint_path = lora_ckpt_path
                             if self.is_main_process:
                                 print(f"Using explicit LoRA checkpoint: {lora_checkpoint_path}")
+                                if missing_keys:
+                                    print(f"Explicit LoRA checkpoint warning: missing LoRA keys {missing_keys}")
                         else:
                             raise ValueError(f"Explicit LoRA checkpoint {lora_ckpt_path} is not a valid LoRA checkpoint. "
                                            f"Found keys: {list(checkpoint.keys())}")
@@ -286,16 +355,49 @@ class Trainer:
                 if "generator_lora" in lora_checkpoint:
                     if self.is_main_process:
                         print(f"Loading LoRA generator weights: {len(lora_checkpoint['generator_lora'])} keys in checkpoint")
-                    
                     # Use PEFT's set_peft_model_state_dict; it automatically aligns key names
-                    peft.set_peft_model_state_dict(self.model.generator.model, lora_checkpoint["generator_lora"])
+                    peft.set_peft_model_state_dict(
+                        self.model.generator.model,
+                        lora_checkpoint["generator_lora"],
+                        adapter_name=getattr(self, "generator_adapter_name", None),
+                    )
                 
+                if "teacher_lora" in lora_checkpoint:
+                    if self.apply_lora_to_teacher:
+                        if self.is_main_process:
+                            print(f"Loading LoRA teacher weights: {len(lora_checkpoint['teacher_lora'])} keys in checkpoint")
+                        teacher_adapter_name = self.teacher_adapter_name if self.teacher_adapter_name else None
+                        peft.set_peft_model_state_dict(
+                            self.model.real_score.model,
+                            lora_checkpoint["teacher_lora"],
+                            adapter_name=teacher_adapter_name,
+                        )
+                        if self.apply_lora_to_critic and teacher_adapter_name is not None:
+                            peft.set_peft_model_state_dict(
+                                self.model.fake_score.model,
+                                lora_checkpoint["teacher_lora"],
+                                adapter_name=teacher_adapter_name,
+                            )
+                    elif self.is_main_process:
+                        print("Teacher LoRA weights found in checkpoint, but apply_to_teacher=False; skipping load.")
+                elif self.apply_lora_to_teacher and self.is_main_process:
+                    print("Warning: LoRA checkpoint missing teacher_lora weights; continuing without loading teacher LoRA.")
+
                 if "critic_lora" in lora_checkpoint:
-                    if self.is_main_process:
-                        print(f"Loading LoRA critic weights: {len(lora_checkpoint['critic_lora'])} keys in checkpoint")
-                    
-                    # Use PEFT's set_peft_model_state_dict; it automatically aligns key names
-                    peft.set_peft_model_state_dict(self.model.fake_score.model, lora_checkpoint["critic_lora"])
+                    if self.apply_lora_to_critic:
+                        if self.is_main_process:
+                            print(f"Loading LoRA critic weights: {len(lora_checkpoint['critic_lora'])} keys in checkpoint")
+                        
+                        # Use PEFT's set_peft_model_state_dict; it automatically aligns key names
+                        peft.set_peft_model_state_dict(
+                            self.model.fake_score.model,
+                            lora_checkpoint["critic_lora"],
+                            adapter_name=self.critic_adapter_name if self.critic_adapter_name else None,
+                        )
+                    elif self.is_main_process:
+                        print("Critic LoRA weights found in checkpoint, but apply_to_critic=False; skipping load.")
+                elif self.apply_lora_to_critic and self.is_main_process:
+                    print("Warning: LoRA checkpoint missing critic_lora weights; continuing without loading critic LoRA.")
 
                 # Load training step
                 if "step" in lora_checkpoint:
@@ -383,9 +485,16 @@ class Trainer:
             weight_decay=config.weight_decay
         )
 
+        critic_params = [param for param in self.model.fake_score.parameters()
+                         if param.requires_grad]
+        if getattr(config, "distribution_loss", None) == "dmd2realmselam" and hasattr(self.model, "latent_action_model"):
+            critic_params.extend(
+                param
+                for param in self.model.latent_action_model.parameters()
+                if param.requires_grad
+            )
         self.critic_optimizer = torch.optim.AdamW(
-            [param for param in self.model.fake_score.parameters()
-             if param.requires_grad],
+            critic_params,
             lr=config.lr_critic if hasattr(config, "lr_critic") else config.lr,
             betas=(config.beta1_critic, config.beta2_critic),
             weight_decay=config.weight_decay
@@ -401,7 +510,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmsedwt", "mse_dmd"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmsedwt", "dmd2realmselam", "mse_dmd"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -433,7 +542,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmsedwt", "mse_dmd"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmsedwt", "dmd2realmselam", "mse_dmd"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -839,15 +948,31 @@ class Trainer:
 
         if self.is_lora_enabled:
             gen_lora_sd = self._gather_lora_state_dict(
-                self.model.generator.model)
-            crit_lora_sd = self._gather_lora_state_dict(
-                self.model.fake_score.model)
-
+                self.model.generator.model,
+                adapter_name=getattr(self, "generator_adapter_name", None),
+            )
             state_dict = {
                 "generator_lora": gen_lora_sd,
-                "critic_lora": crit_lora_sd,
                 "step": self.step,
             }
+
+            if self.apply_lora_to_critic:
+                crit_lora_sd = self._gather_lora_state_dict(
+                    self.model.fake_score.model,
+                    adapter_name=self.critic_adapter_name,
+                )
+                state_dict["critic_lora"] = crit_lora_sd
+            else:
+                state_dict["critic_lora"] = {}
+
+            if self.apply_lora_to_teacher:
+                teacher_lora_sd = self._gather_lora_state_dict(
+                    self.model.real_score.model,
+                    adapter_name=self.teacher_adapter_name,
+                )
+                state_dict["teacher_lora"] = teacher_lora_sd
+            else:
+                state_dict["teacher_lora"] = {}
         else:
             with FSDP.state_dict_type(
                 self.model.generator,
@@ -980,6 +1105,15 @@ class Trainer:
             else:
                 real_latents = torch.stack(real_latents).to(self.device, dtype=torch.float32)
 
+        actions = batch.get('actions')
+        if actions is not None:
+            if isinstance(actions, torch.Tensor):
+                actions = actions.to(self.device, dtype=torch.float32)
+            else:
+                actions = torch.stack(actions).to(self.device, dtype=torch.float32)
+        if getattr(self.config, 'distribution_loss', '') == 'dmd2realmselam' and actions is None:
+            raise ValueError('Batch is missing action annotations required for dmd2realmselam training.')
+
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
 
@@ -1010,8 +1144,10 @@ class Trainer:
                 clean_latent=None,
                 initial_latent=None,
             )
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmsedwt'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmsedwt', 'dmd2realmselam'):
                 generator_kwargs['real_latents'] = real_latents
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam',):
+                generator_kwargs['actions'] = actions
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd'):
                 generator_kwargs['clean_latent'] = real_latents
             generator_loss, generator_log_dict = self.model.generator_loss(**generator_kwargs)
@@ -1040,8 +1176,10 @@ class Trainer:
             clean_latent=None,
             initial_latent=None,
         )
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmsedwt'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmsedwt', 'dmd2realmselam'):
             critic_kwargs['real_latents'] = real_latents
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam',):
+            critic_kwargs['actions'] = actions
         if getattr(self.config, 'distribution_loss', '') in ('mse_dmd'):
             critic_kwargs['clean_latent'] = real_latents
         if train_generator:
@@ -1653,15 +1791,76 @@ class Trainer:
                         print(f"[WARNING] Failed to clean up one_logger: {cleanup_e}")
 
 
-    def _configure_lora_for_model(self, transformer, model_name):
-        """Configure LoRA for a WanDiffusionWrapper model"""
+    def _get_adapter_config(self, adapter_key=None, default_adapter_name="default"):
+        """Resolve adapter configuration from the global LoRA settings and optional overrides."""
+        if not self.lora_config:
+            return None
+
+        base_cfg = {}
+        for key, value in self.lora_config.items():
+            if isinstance(value, dict):
+                continue
+            if key in ("apply_to_critic", "apply_to_teacher"):
+                continue
+            base_cfg[key] = value
+
+        override_cfg = {}
+        if adapter_key:
+            override_cfg = self.lora_config.get(adapter_key, {}) or {}
+
+        def _get(key, default=None):
+            if key in override_cfg and override_cfg[key] is not None:
+                return override_cfg[key]
+            if key in base_cfg and base_cfg[key] is not None:
+                return base_cfg[key]
+            return default
+
+        adapter_cfg = {
+            "type": _get("type", "lora"),
+            "rank": _get("rank", 16),
+            "alpha": _get("alpha", None),
+            "dropout": _get("dropout", 0.0),
+            "verbose": bool(_get("verbose", False)),
+            "adapter_name": _get("adapter_name", default_adapter_name),
+        }
+
+        if adapter_cfg["alpha"] is None:
+            adapter_cfg["alpha"] = adapter_cfg["rank"]
+
+        return adapter_cfg
+
+    def _build_lora_config(self, adapter_cfg, target_modules, trainable):
+        if adapter_cfg["type"] != "lora":
+            raise NotImplementedError(f'Adapter type {adapter_cfg["type"]} is not implemented')
+
+        return peft.LoraConfig(
+            r=adapter_cfg["rank"],
+            lora_alpha=adapter_cfg["alpha"],
+            lora_dropout=adapter_cfg["dropout"],
+            target_modules=target_modules,
+            inference_mode=not trainable,
+        )
+
+    def _freeze_adapter_params(self, lora_model, adapter_name):
+        for name, param in lora_model.named_parameters():
+            if f".{adapter_name}." in name or name.endswith(f".{adapter_name}"):
+                param.requires_grad_(False)
+
+    def _configure_lora_for_model(self, transformer, model_name, trainable=True):
+        """Configure LoRA for a WanDiffusionWrapper model.
+
+        Args:
+            transformer: Wrapped WanDiffusion model to modify.
+            model_name: One of {'generator', 'fake_score', 'real_score'}.
+            trainable: Whether the injected LoRA parameters should require gradients.
+        """
         # Find all Linear modules in WanAttentionBlock modules
         target_linear_modules = set()
         
         # Define the specific modules we want to apply LoRA to
         if model_name == 'generator':
             adapter_target_modules = ['CausalWanAttentionBlock']
-        elif model_name == 'fake_score':
+        elif model_name in ('fake_score', 'real_score'):
             adapter_target_modules = ['WanAttentionBlock']
         else:
             raise ValueError(f"Invalid model name: {model_name}")
@@ -1676,34 +1875,81 @@ class Trainer:
         
         if self.is_main_process:
             print(f"LoRA target modules for {model_name}: {len(target_linear_modules)} Linear layers")
-            if getattr(self.lora_config, 'verbose', False):
-                for module_name in sorted(target_linear_modules):
-                    print(f"  - {module_name}")
         
-        # Create LoRA config
-        adapter_type = self.lora_config.get('type', 'lora')
-        if adapter_type == 'lora':
-            peft_config = peft.LoraConfig(
-                r=self.lora_config.get('rank', 16),
-                lora_alpha=self.lora_config.get('alpha', None) or self.lora_config.get('rank', 16),
-                lora_dropout=self.lora_config.get('dropout', 0.0),
-                target_modules=target_linear_modules,
-                # task_type="FEATURE_EXTRACTION"        # Remove this; not needed for diffusion models
-            )
+        adapter_sequence = []
+        if model_name == 'generator':
+            gen_cfg = self._get_adapter_config('generator_adapter', default_adapter_name="default")
+            if gen_cfg is None:
+                raise ValueError("Generator adapter configuration is required for LoRA training")
+            gen_cfg["adapter_name"] = getattr(self, "generator_adapter_name", gen_cfg["adapter_name"])
+            adapter_sequence.append((gen_cfg, bool(trainable)))
+        elif model_name == 'real_score':
+            teacher_cfg = self._get_adapter_config('teacher_adapter', default_adapter_name="default")
+            if teacher_cfg is None:
+                raise ValueError("Teacher adapter configuration is required when apply_to_teacher is True")
+            teacher_cfg["adapter_name"] = self.teacher_adapter_name or teacher_cfg["adapter_name"]
+            adapter_sequence.append((teacher_cfg, False))
+        elif model_name == 'fake_score':
+            if self.apply_lora_to_teacher:
+                teacher_cfg = self._get_adapter_config('teacher_adapter', default_adapter_name="default")
+                if teacher_cfg is None:
+                    raise ValueError("Teacher adapter configuration is required for stacked critic/teacher LoRA")
+                teacher_cfg["adapter_name"] = self.teacher_adapter_name or teacher_cfg["adapter_name"]
+                adapter_sequence.append((teacher_cfg, False))
+                teacher_adapter_name = teacher_cfg["adapter_name"]
+            else:
+                teacher_adapter_name = None
+
+            critic_cfg = self._get_adapter_config('critic_adapter', default_adapter_name="critic")
+            if critic_cfg is None:
+                critic_cfg = self._get_adapter_config(None, default_adapter_name="critic")
+            critic_cfg["adapter_name"] = self.critic_adapter_name or critic_cfg["adapter_name"]
+            adapter_sequence.append((critic_cfg, bool(trainable)))
         else:
-            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        
-        # Apply LoRA to the transformer
-        lora_model = peft.get_peft_model(transformer, peft_config)
+            raise ValueError(f"Invalid model name: {model_name}")
+
+        if not adapter_sequence:
+            raise ValueError(f"No LoRA adapters configured for model {model_name}")
+
+        first_cfg, first_trainable = adapter_sequence[0]
+        if self.is_main_process and first_cfg["verbose"]:
+            for module_name in sorted(target_linear_modules):
+                print(f"  - {module_name}")
+
+        peft_config = self._build_lora_config(first_cfg, target_linear_modules, first_trainable)
+        first_adapter_name = first_cfg["adapter_name"]
+        lora_model = peft.get_peft_model(transformer, peft_config, adapter_name=first_adapter_name)
+        if not first_trainable:
+            self._freeze_adapter_params(lora_model, first_adapter_name)
+
+        if len(adapter_sequence) > 1:
+            for adapter_cfg, adapter_trainable in adapter_sequence[1:]:
+                adapter_name = adapter_cfg["adapter_name"]
+                cfg = self._build_lora_config(adapter_cfg, target_linear_modules, adapter_trainable)
+                lora_model.add_adapter(adapter_name, cfg)
+                if not adapter_trainable:
+                    self._freeze_adapter_params(lora_model, adapter_name)
+
+            active_order = [cfg["adapter_name"] for cfg, _ in adapter_sequence]
+            lora_model.set_adapter(active_order)
+        else:
+            lora_model.set_adapter(first_adapter_name)
+
+        if not trainable:
+            # Ensure all LoRA parameters are frozen when entire module is inference-only
+            for adapter_cfg, _ in adapter_sequence:
+                self._freeze_adapter_params(lora_model, adapter_cfg["adapter_name"])
+            if self.is_main_process:
+                print(f"LoRA parameters for {model_name} frozen (inference-only).")
 
         if self.is_main_process:
-            print('peft_config', peft_config)
+            print(f"Configured LoRA adapters for {model_name}: {[cfg['adapter_name'] for cfg, _ in adapter_sequence]}")
             lora_model.print_trainable_parameters()
 
         return lora_model
 
 
-    def _gather_lora_state_dict(self, lora_model):
+    def _gather_lora_state_dict(self, lora_model, adapter_name=None):
         "On rank-0, gather FULL_STATE_DICT, then filter only LoRA weights"
         with FSDP.state_dict_type(
             lora_model,                       # lora_model contains nested FSDP submodules
@@ -1711,7 +1957,7 @@ class Trainer:
             FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
         ):
             full = lora_model.state_dict()
-        return get_peft_model_state_dict(lora_model, state_dict=full)
+        return get_peft_model_state_dict(lora_model, state_dict=full, adapter_name=adapter_name)
     
     # --------------------------------------------------------------------------------------------------------------
     # Visualization helpers

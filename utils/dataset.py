@@ -153,6 +153,7 @@ class VideoLatentCaptionDataset(Dataset):
         encoded_suffix: str = "_encoded",
         action_root: Optional[str] = None,
         action_variant: str = "input",
+        include_dir_substrings: Optional[list[str]] = None,
     ):
         self.latent_root = Path(latent_root)
         self.caption_root = Path(caption_root)
@@ -193,6 +194,23 @@ class VideoLatentCaptionDataset(Dataset):
             f"{self.action_variant}_actions_*.csv",
             f"{self.action_variant} actions",
         )
+
+        include_filters: Optional[tuple[str, ...]] = None
+        if include_dir_substrings:
+            include_filters = tuple(include_dir_substrings)
+
+            def _allowed(rel_dir: Path) -> bool:
+                rel_dir_str = str(rel_dir)
+                return any(substr in rel_dir_str for substr in include_filters)
+        else:
+            def _allowed(rel_dir: Path) -> bool:
+                return True
+
+        if include_filters is not None:
+            latent_map = {k: v for k, v in latent_map.items() if _allowed(k)}
+            encoded_map = {k: v for k, v in encoded_map.items() if _allowed(k)}
+            raw_map = {k: v for k, v in raw_map.items() if _allowed(k)}
+            actions_map = {k: v for k, v in actions_map.items() if _allowed(k)}
 
         self.samples: list["VideoLatentCaptionDataset.Sample"] = []
         all_dirs = sorted(

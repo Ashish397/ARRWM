@@ -28,10 +28,15 @@ class BaseModel(nn.Module):
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
-        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
-        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
-        self.local_attn_size = getattr(args, "model_kwargs", {}).get("local_attn_size", -1)
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        base_model_name = getattr(args, "model_name", None)
+        self.real_model_name = getattr(args, "real_name", base_model_name) or "Wan2.1-T2V-1.3B"
+        self.fake_model_name = getattr(args, "fake_name", base_model_name) or "Wan2.1-T2V-1.3B"
+
+        model_kwargs = self._to_dict(getattr(args, "model_kwargs", None))
+        self.local_attn_size = model_kwargs.get("local_attn_size", -1)
+        if "model_name" not in model_kwargs:
+            model_kwargs["model_name"] = self.real_model_name
+        self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
@@ -41,12 +46,12 @@ class BaseModel(nn.Module):
         self.fake_score.model.requires_grad_(True)
 
         if not self.text_pre_encoded:
-            self.text_encoder = WanTextEncoder()
+            self.text_encoder = WanTextEncoder(model_name=self.real_model_name)
             self.text_encoder.requires_grad_(False)
         else:
             self.text_encoder = None
 
-        self.vae = WanVAEWrapper()
+        self.vae = WanVAEWrapper(model_name=self.real_model_name)
         self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()
@@ -76,6 +81,7 @@ class BaseModel(nn.Module):
                 dtype=torch.long
             ).repeat(1, num_frame)
             return timestep
+
         else:
             timestep = torch.randint(
                 min_timestep,
@@ -100,6 +106,24 @@ class BaseModel(nn.Module):
                 timestep[:, :, 1:] = timestep[:, :, 0:1]
                 timestep = timestep.reshape(timestep.shape[0], -1)
             return timestep
+
+    @staticmethod
+    def _to_dict(maybe_cfg) -> dict:
+        if maybe_cfg is None:
+            return {}
+        if isinstance(maybe_cfg, dict):
+            return dict(maybe_cfg)
+        try:
+            from omegaconf import DictConfig, OmegaConf  # type: ignore
+        except ImportError:  # pragma: no cover
+            DictConfig = None  # type: ignore
+            OmegaConf = None  # type: ignore
+        else:
+            if isinstance(maybe_cfg, DictConfig):
+                return OmegaConf.to_container(maybe_cfg, resolve=True)  # type: ignore[return-value]
+        if hasattr(maybe_cfg, "items"):
+            return {k: v for k, v in maybe_cfg.items()}
+        return {}
 
 
 class SelfForcingModel(BaseModel):

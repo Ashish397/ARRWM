@@ -1,5 +1,5 @@
-config_name: wan-bidir-lora-pilot-send-gan-64
-load_checkpoint_config_name: wan-bidir-lora-pilot-send-gan-64
+config_name: wan-bidir-lora-no-gan-64
+load_checkpoint_config_name: wan-bidir-lora-no-gan-64
 
 independent_first_frame: false
 warp_denoising_step: false
@@ -16,7 +16,6 @@ log_interval: 10
 ckpt_interval: 300
 max_grad_norm: 1.0
 auto_resume: true
-max_checkpoints: 50
 allow_checkpoint_config_mismatch: true
 wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
 wandb_entity: ashish397-university-of-exeter
@@ -24,7 +23,8 @@ wandb_project: frodobots_wm
 wandb_group: bidirectional-lora
 wandb_tags:
   - bidirectional
-  - gan
+  - no-gan
+max_checkpoints: 50
 
 # LoRA adapter settings
 adapter:
@@ -46,10 +46,10 @@ gradient_accumulation_steps: 1
 sequential_sampling: false
 
 # Paths (override as needed)
-real_latent_root: /projects/u5as/frodobots_encoded/train/
-caption_root: /projects/u5as/frodobots_captions/train/
-val_real_latent_root: /projects/u5as/frodobots_encoded/test/
-val_caption_root: /projects/u5as/frodobots_captions/test/
+real_latent_root: /projects/u5as/frodobots_encoded/train
+caption_root: /projects/u5as/frodobots_captions/train
+val_real_latent_root: /projects/u5as/frodobots_encoded/test
+val_caption_root: /projects/u5as/frodobots_captions/test
 
 text_pre_encoded: true
 
@@ -65,30 +65,16 @@ num_train_timestep: 1000
 gradient_checkpointing: true
 num_workers: 24
 
-# GAN loss (latent PatchGAN) settings for 256
-enable_gan_loss: true
-gan_loss_weight: 0.1
-gan_use_adaptive_weight: false
-gan_adaptive_eps: 1.0e-04
-gan_adaptive_max_weight: 1000.0
-gan_discriminator_steps: 3
-gan_discriminator_kwargs:
-  in_channels: 16
-  base_channels: 256
-  num_layers: 6
-  channel_multiplier: 2
+# GAN loss (latent PatchGAN) settings
+enable_gan_loss: false
 
-
-# Dataset filtering (leave empty to use entire specified roots)
-include_dir_substrings: null
-val_include_dir_substrings: null
 model_kwargs:
   timestep_shift: 5.0
   local_attn_size: -1
   sink_size: 0
 
 # Logging
-logdir: /scratch/u5as/as1748.u5as/frodobots/lora_runs/bidirectional
+logdir: /scratch/u5as/as1748.u5as/frodobots/lora_runs/bidirectional_no_gan
 
 denoising_step_list:
 - 1000

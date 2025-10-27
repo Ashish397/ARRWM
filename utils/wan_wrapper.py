@@ -1,7 +1,8 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import types
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Union
 import torch
 from torch import nn
 
@@ -14,8 +15,18 @@ from wan.modules.causal_model import CausalWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        model_root: Optional[Union[str, Path]] = None,
+    ) -> None:
         super().__init__()
+
+        self.model_name = model_name or "Wan2.1-T2V-1.3B"
+        self.model_root = Path(model_root) if model_root is not None else Path("wan_models") / self.model_name
+        weights_path = self.model_root / "models_t5_umt5-xxl-enc-bf16.pth"
+        tokenizer_path = self.model_root / "google" / "umt5-xxl"
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -24,8 +35,11 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-                       map_location='cpu', weights_only=False)
+            torch.load(
+                str(weights_path),
+                map_location='cpu',
+                weights_only=False,
+            )
         )
         
         # Move text encoder to GPU if available
@@ -33,7 +47,10 @@ class WanTextEncoder(torch.nn.Module):
             self.text_encoder = self.text_encoder.cuda()
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=str(tokenizer_path),
+            seq_len=512,
+            clean='whitespace',
+        )
 
     @property
     def device(self):
@@ -58,7 +75,12 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        model_root: Optional[Union[str, Path]] = None,
+    ):
         super().__init__()
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -71,9 +93,13 @@ class WanVAEWrapper(torch.nn.Module):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
+        self.model_name = model_name or "Wan2.1-T2V-1.3B"
+        self.model_root = Path(model_root) if model_root is not None else Path("wan_models") / self.model_name
+        vae_checkpoint = self.model_root / "Wan2.1_VAE.pth"
+
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=str(vae_checkpoint),
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -127,6 +153,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             sink_size=0
     ):
         super().__init__()
+        self.model_name = model_name
+        self.model_root = Path("wan_models") / self.model_name
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(

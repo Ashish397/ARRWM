@@ -4,7 +4,7 @@ from .dmd2 import DMD2
 from .dmd2mse import DMD2MSE
 from .dmd2real import DMD2Real
 from .dmd2realmse import DMD2RealMSE
-from .dmd2realmsedwt import DMD2RealMSEDWT
+from .dmd2realmselam import DMD2RealMSELAM
 from .mse_dmd import MSE_DMD
 __all__ = [
     "DMD",
@@ -13,6 +13,6 @@ __all__ = [
     "DMD2MSE",
     "DMD2Real",
     "DMD2RealMSE",
-    "DMD2RealMSEDWT",
+    "DMD2RealMSELAM",
     "MSE_DMD",
 ]

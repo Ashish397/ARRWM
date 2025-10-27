@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=wan-bidir-lora
+#SBATCH --job-name=wan-bidir-lora-nogan
 #SBATCH --nodes=16
-#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=32
+#SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH --time=23:59:59
 #SBATCH --output=logs/%x_%j.out
@@ -14,10 +14,10 @@ set -e -o pipefail
 cd /home/u5as/as1748.u5as/frodobots/ARRWM
 
 # Project path and config
-CONFIG=configs/bidirectional_lora.yaml
-LOGDIR=/scratch/u5as/as1748.u5as/frodobots/retrain_64/logs
+CONFIG=configs/bidirectional_lora_no_gan.yaml
+LOGDIR=/scratch/u5as/as1748.u5as/frodobots/retrain_no_gan_64/logs
 WANDB_SAVE_DIR=wandb
-EXPERIMENT_NAME="retrain-$(date +%Y%m%d-%H%M%S)"
+EXPERIMENT_NAME="retrain-no-gan-$(date +%Y%m%d-%H%M%S)"
 
 
 # Activate arrwm conda environment
@@ -38,10 +38,6 @@ export TRANSFORMERS_CACHE=$CACHE_DIR
 mkdir -p "$CACHE_DIR"
 
 mkdir -p "$LOGDIR"
-
-# # Dataset filtering (leave empty to use entire specified roots)
-# INCLUDE_DIR_SUBSTRINGS=null
-# VAL_INCLUDE_DIR_SUBSTRINGS=null
 
 echo "CONFIG=$CONFIG"
 echo "Starting training job on $(date)"

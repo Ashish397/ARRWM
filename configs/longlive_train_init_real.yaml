@@ -28,6 +28,16 @@ real_name: Wan2.1-T2V-1.3B
 # real_name: Wan2.1-T2V-14B
 fake_name: Wan2.1-T2V-1.3B
 text_encoder_fsdp_wrap_strategy: size
+adapter:
+  type: "lora"
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  dtype: "bfloat16"
+  apply_to_critic: true
+  apply_to_teacher: true
+  verbose: false
+lora_ckpt:
 denoising_step_list:
 - 1000
 - 750
