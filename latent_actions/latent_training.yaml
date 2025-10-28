@@ -1,0 +1,8 @@
+{
+  "ensemble": {
+    "stacked": true,
+    "convolved": true,
+    "concatenated": true,
+    "subtracted": true
+  }
+}

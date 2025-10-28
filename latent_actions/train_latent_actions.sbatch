@@ -41,6 +41,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-2000}"
 LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 MIN_ACCURACY="${MIN_ACCURACY:-1.0}"
+CONFIG_PATH="${CONFIG_PATH:-latent_actions/latent_training.yaml}"
 
 # Directory for storing checkpoints and logs specific to this job.
 CHECKPOINT_BASE="${CHECKPOINT_BASE:-latent_actions/checkpoints}"
@@ -54,6 +55,7 @@ echo "Encoded root: $ENCODED_ROOT"
 echo "Actions root: $ACTIONS_ROOT"
 echo "Target split: $SPLIT"
 echo "Checkpoint directory: $CHECKPOINT_DIR"
+echo "Ensemble config: $CONFIG_PATH"
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -70,6 +72,7 @@ for ACTION_KIND in input output; do
     --actions-root "$ACTIONS_ROOT" \
     --split "$SPLIT" \
     --action-kind "$ACTION_KIND" \
+    --config "$CONFIG_PATH" \
     --pool-size "$POOL_SIZE" \
     --rounding "$ROUNDING" \
     --hidden-dims $HIDDEN_DIMS \

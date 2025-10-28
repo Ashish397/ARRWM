@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Train a latent action classifier that infers actions from consecutive states.
+"""Train an ensemble of latent action classifiers that infer actions from states.
 
 The script pairs encoded frame tensors (s_t, s_{t+1}) with either input or output
-actions and trains a small MLP to predict the corresponding action class. It
-expects the encoded tensors and action CSVs to share the same directory layout.
+actions and trains an ensemble of simple heads (stacked, convolved, concatenated,
+subtracted views) to predict the corresponding action class. It expects the
+encoded tensors and action CSVs to share the same directory layout and can be
+configured via `latent_actions/latent_training.yaml`.
 """
 
 from __future__ import annotations
@@ -11,9 +13,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -22,36 +23,29 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
-@dataclass
-class DatasetSample:
-    ride: str
-    feature: torch.Tensor
-    label: int
-
-
 class TransitionDataset(Dataset):
-    def __init__(self, samples: Sequence[DatasetSample]) -> None:
-        self._features = torch.stack([s.feature for s in samples])
-        self._labels = torch.tensor([s.label for s in samples], dtype=torch.long)
-        self._rides = [s.ride for s in samples]
+    def __init__(self, variant_names: Sequence[str], feature_tensors: Dict[str, torch.Tensor], labels: torch.Tensor, rides: List[str]) -> None:
+        self.variant_names = list(variant_names)
+        self._features = [feature_tensors[name] for name in self.variant_names]
+        self._labels = labels
+        self._rides = rides
 
     def __len__(self) -> int:
-        return self._features.shape[0]
+        return self._labels.shape[0]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._features[idx], self._labels[idx]
+    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        return [feat[idx] for feat in self._features], self._labels[idx]
 
     @property
     def labels(self) -> torch.Tensor:
         return self._labels
 
     @property
-    def features(self) -> torch.Tensor:
-        return self._features
-
-    @property
     def rides(self) -> List[str]:
         return list(self._rides)
+
+    def feature_tensors(self) -> Dict[str, torch.Tensor]:
+        return {name: feat for name, feat in zip(self.variant_names, self._features)}
 
 
 class MLPClassifier(nn.Module):
@@ -69,6 +63,47 @@ class MLPClassifier(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class ConvClassifier(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, hidden_dims: Sequence[int], dropout: float = 0.0) -> None:
+        super().__init__()
+        conv_hidden = max(32, min(256, in_channels * 2))
+        conv_out = max(64, conv_hidden)
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(in_channels, conv_hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(conv_hidden, conv_out, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = MLPClassifier(conv_out, hidden_dims, num_classes, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.feature_extractor(x)
+        flattened = features.flatten(start_dim=1)
+        return self.classifier(flattened)
+
+
+class EnsembleClassifier(nn.Module):
+    def __init__(
+        self,
+        variant_names: Sequence[str],
+        submodules: Dict[str, nn.Module],
+    ) -> None:
+        super().__init__()
+        self.variant_names = list(variant_names)
+        self.submodules = nn.ModuleDict(submodules)
+
+    def forward(self, *features: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        component_logits: Dict[str, torch.Tensor] = {}
+        logits_list: List[torch.Tensor] = []
+        for name, feature in zip(self.variant_names, features):
+            logits = self.submodules[name](feature)
+            component_logits[name] = logits
+            logits_list.append(logits)
+        stacked_logits = torch.stack(logits_list, dim=0)
+        return stacked_logits.mean(dim=0), component_logits
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +129,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional path to save the trained model state.")
     parser.add_argument("--device", type=str, default="auto", help="Training device ('cpu', 'cuda', or 'auto').")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("latent_actions/latent_training.yaml"),
+        help="Optional configuration file to control ensemble components (JSON-formatted YAML).",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +142,38 @@ def infer_device(arg: str) -> torch.device:
     if arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(arg)
+
+
+def load_config(path: Path) -> Dict[str, object]:
+    if not path:
+        return {}
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        content = handle.read().strip()
+        if not content:
+            return {}
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Configuration file {path} must contain JSON-compatible YAML content.") from exc
+
+
+def resolve_ensemble_flags(config: Dict[str, object]) -> Dict[str, bool]:
+    defaults = {
+        "stacked": True,
+        "convolved": True,
+        "concatenated": True,
+        "subtracted": True,
+    }
+    ensemble_cfg = config.get("ensemble") if isinstance(config, dict) else None
+    if isinstance(ensemble_cfg, dict):
+        overrides = {key: bool(value) for key, value in ensemble_cfg.items() if key in defaults}
+        defaults.update(overrides)
+    if not any(defaults.values()):
+        raise ValueError("Ensemble configuration disables all models; enable at least one.")
+    return defaults
+
 
 
 def find_action_files(actions_root: Path, split: str, action_kind: str, ride_ids: Optional[Sequence[str]]) -> List[Path]:
@@ -142,22 +215,24 @@ def load_tensor(encoded_path: Path) -> torch.Tensor:
     return tensor.float()
 
 
-def encode_state(state: torch.Tensor, pool_hw: int) -> torch.Tensor:
-    if state.dim() == 1:
-        return state
-    if state.dim() == 2:
-        return state.flatten()
+def pool_state(state: torch.Tensor, pool_hw: int) -> torch.Tensor:
     if state.dim() == 3:
-        pooled = F.adaptive_avg_pool2d(state, (pool_hw, pool_hw))
-        return pooled.reshape(-1)
+        return F.adaptive_avg_pool2d(state.unsqueeze(0), (pool_hw, pool_hw)).squeeze(0)
+    if state.dim() == 2:
+        return F.adaptive_avg_pool2d(state.unsqueeze(0).unsqueeze(0), (pool_hw, pool_hw)).squeeze(0).squeeze(0)
     raise ValueError(f"Unsupported state tensor with shape {tuple(state.shape)}")
 
 
-def build_feature_triplet(state_t: torch.Tensor, state_tp1: torch.Tensor, pool_hw: int) -> torch.Tensor:
-    feat_t = encode_state(state_t, pool_hw)
-    feat_tp1 = encode_state(state_tp1, pool_hw)
-    feat_delta = encode_state(state_tp1 - state_t, pool_hw)
-    return torch.cat([feat_t, feat_tp1, feat_delta], dim=0)
+def build_variant_feature(variant: str, state_t: torch.Tensor, state_tp1: torch.Tensor) -> torch.Tensor:
+    if variant == "stacked":
+        return torch.cat([state_t, state_tp1], dim=0).flatten()
+    if variant == "concatenated":
+        return torch.cat([state_t.flatten(), state_tp1.flatten()], dim=0)
+    if variant == "subtracted":
+        return (state_tp1 - state_t).flatten()
+    if variant == "convolved":
+        return torch.cat([state_t, state_tp1], dim=0)
+    raise KeyError(f"Unknown variant '{variant}'")
 
 
 def collect_samples(
@@ -166,11 +241,13 @@ def collect_samples(
     split: str,
     action_kind: str,
     ride_ids: Optional[Sequence[str]],
+    active_variants: Sequence[str],
     pool_hw: int,
     rounding: int,
 ) -> Tuple[TransitionDataset, torch.Tensor, List[str]]:
     action_csvs = find_action_files(actions_root, split, action_kind, ride_ids)
-    samples: List[DatasetSample] = []
+    variant_features: Dict[str, List[torch.Tensor]] = {name: [] for name in active_variants}
+    labels: List[int] = []
     rides_used: List[str] = []
     action_lookup: dict[Tuple[float, ...], int] = {}
     action_prototypes: List[np.ndarray] = []
@@ -187,7 +264,7 @@ def collect_samples(
 
         frame_ids, action_values = read_action_csv(action_csv)
         action_cursor = 0
-        start_sample_count = len(samples)
+        start_label_count = len(labels)
         for encoded_file in encoded_files:
             frames = load_tensor(encoded_file)
             if frames.dim() not in (3, 4):
@@ -202,24 +279,38 @@ def collect_samples(
 
             max_pairs = min(num_frames - 1, available_actions)
             for idx in range(max_pairs):
-                state_t = frames[idx]
-                state_tp1 = frames[idx + 1]
-                feature_vec = build_feature_triplet(state_t, state_tp1, pool_hw)
+                state_t = frames[idx].float()
+                state_tp1 = frames[idx + 1].float()
+                pooled_t = pool_state(state_t, pool_hw)
+                pooled_tp1 = pool_state(state_tp1, pool_hw)
+                for variant in active_variants:
+                    feature_tensor = build_variant_feature(variant, pooled_t, pooled_tp1)
+                    variant_features[variant].append(feature_tensor)
                 action_vec = action_values[action_cursor + idx]
                 class_id = assign_action_class(action_vec, action_lookup, action_prototypes, rounding)
-                samples.append(DatasetSample(ride=ride_name, feature=feature_vec, label=class_id))
+                labels.append(class_id)
                 rides_used.append(ride_name)
             action_cursor += max_pairs
 
-        if len(samples) == start_sample_count:
+        if len(labels) == start_label_count:
             raise ValueError(f"No frames loaded for ride '{ride_name}'")
 
-    if not samples:
+    if not labels:
         raise RuntimeError("No samples constructed from the provided data.")
     if not action_prototypes:
         raise RuntimeError("Failed to derive any unique actions from the provided CSV files.")
 
-    dataset = TransitionDataset(samples)
+    feature_tensors = {}
+    for variant_name, feature_list in variant_features.items():
+        if not feature_list:
+            continue
+        stacked = torch.stack(feature_list)
+        feature_tensors[variant_name] = stacked
+    missing_variants = [name for name in active_variants if name not in feature_tensors]
+    if missing_variants:
+        raise RuntimeError(f"No features were generated for variants: {missing_variants}")
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    dataset = TransitionDataset(active_variants, feature_tensors, labels_tensor, rides_used)
     action_tensor = torch.tensor(action_prototypes, dtype=torch.float32)
     return dataset, action_tensor, rides_used
 
@@ -270,38 +361,50 @@ def train_model(
     dataset: TransitionDataset,
     action_values: torch.Tensor,
     args: argparse.Namespace,
-) -> Tuple[MLPClassifier, float]:
+) -> Tuple[EnsembleClassifier, float]:
     device = infer_device(args.device)
-    model = MLPClassifier(dataset.features.shape[1], args.hidden_dims, action_values.shape[0], dropout=args.dropout)
-    model.to(device)
+    feature_map = dataset.feature_tensors()
+    submodules: Dict[str, nn.Module] = {}
+    for name in dataset.variant_names:
+        tensor = feature_map[name]
+        if tensor.dim() == 2:
+            input_dim = tensor.shape[1]
+            submodules[name] = MLPClassifier(input_dim, args.hidden_dims, action_values.shape[0], dropout=args.dropout)
+        elif tensor.dim() == 4:
+            _, in_channels, _, _ = tensor.shape
+            submodules[name] = ConvClassifier(in_channels, action_values.shape[0], args.hidden_dims, dropout=args.dropout)
+        else:
+            raise ValueError(f"Unsupported feature tensor rank {tensor.dim()} for variant '{name}'")
+
+    ensemble = EnsembleClassifier(dataset.variant_names, submodules).to(device)
     multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
     if multi_gpu:
-        model = nn.DataParallel(model)
+        ensemble = nn.DataParallel(ensemble)
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(ensemble.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     target_accuracy = args.min_accuracy
-    eval_features = dataset.features.to(device)
+    eval_features = [feature_map[name].to(device).float() for name in dataset.variant_names]
     eval_labels = dataset.labels.to(device)
     history_loss: List[float] = []
     history_acc: List[float] = []
 
     for epoch in range(1, args.max_epochs + 1):
-        model.train()
+        ensemble.train()
         for batch_features, batch_labels in loader:
-            batch_features = batch_features.to(device)
+            batch_tensors = [tensor.to(device).float() for tensor in batch_features]
             batch_labels = batch_labels.to(device)
             optimizer.zero_grad()
-            logits = model(batch_features)
+            logits, _ = ensemble(*batch_tensors)
             loss = criterion(logits, batch_labels)
             loss.backward()
             optimizer.step()
 
         with torch.no_grad():
-            model.eval()
-            logits = model(eval_features)
+            ensemble.eval()
+            logits, _ = ensemble(*eval_features)
             predictions = logits.argmax(dim=1)
             correct = (predictions == eval_labels).float().mean().item()
             loss_value = criterion(logits, eval_labels).item()
@@ -318,11 +421,18 @@ def train_model(
     if final_accuracy < target_accuracy:
         raise RuntimeError(f"Training accuracy {final_accuracy * 100:.2f}% did not reach required threshold {target_accuracy * 100:.2f}%.")
 
-    trained_model = model.module if isinstance(model, nn.DataParallel) else model
+    trained_model = ensemble.module if isinstance(ensemble, nn.DataParallel) else ensemble
     return trained_model, final_accuracy
 
 
-def save_checkpoint(path: Path, model: nn.Module, action_values: torch.Tensor, args: argparse.Namespace) -> None:
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    action_values: torch.Tensor,
+    args: argparse.Namespace,
+    variant_names: Sequence[str],
+    ensemble_flags: Dict[str, bool],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model_state": model.state_dict(),
@@ -331,6 +441,8 @@ def save_checkpoint(path: Path, model: nn.Module, action_values: torch.Tensor, a
         "pool_size": args.pool_size,
         "rounding": args.rounding,
         "action_kind": args.action_kind,
+        "variant_names": list(variant_names),
+        "ensemble_flags": ensemble_flags,
         "metadata": {
             "split": args.split,
             "lr": args.lr,
@@ -344,32 +456,38 @@ def save_checkpoint(path: Path, model: nn.Module, action_values: torch.Tensor, a
 
 def main() -> None:
     args = parse_args()
+    config = load_config(args.config)
+    ensemble_flags = resolve_ensemble_flags(config)
+    active_variants = [name for name, enabled in ensemble_flags.items() if enabled]
     dataset, action_values, rides = collect_samples(
         encoded_root=args.encoded_root,
         actions_root=args.actions_root,
         split=args.split,
         action_kind=args.action_kind,
         ride_ids=args.ride_ids,
+        active_variants=active_variants,
         pool_hw=args.pool_size,
         rounding=args.rounding,
     )
 
-    print(
-        json.dumps(
-            {
-                "num_samples": len(dataset),
-                "num_classes": int(action_values.shape[0]),
-                "feature_dim": int(dataset.features.shape[1]),
-                "rides": sorted(set(rides)),
-            },
-            indent=2,
-        )
-    )
+    feature_shapes = {
+        name: list(dataset.feature_tensors()[name].shape[1:])
+        for name in dataset.variant_names
+    }
+    summary = {
+        "num_samples": len(dataset),
+        "num_classes": int(action_values.shape[0]),
+        "variants": dataset.variant_names,
+        "feature_shapes": feature_shapes,
+        "ensemble_flags": ensemble_flags,
+        "rides": sorted(set(rides)),
+    }
+    print(json.dumps(summary, indent=2))
 
     model, accuracy = train_model(dataset, action_values, args)
 
     if args.checkpoint_path:
-        save_checkpoint(args.checkpoint_path, model, action_values, args)
+        save_checkpoint(args.checkpoint_path, model, action_values, args, dataset.variant_names, ensemble_flags)
 
     print(f"Training complete. Final accuracy: {accuracy * 100:.2f}%")
 
