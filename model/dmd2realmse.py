@@ -288,13 +288,13 @@ class DMD2RealMSE(SelfForcingModel):
         initial_latent: torch.Tensor = None,
         real_latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
-        """Train the generator using only the GAN objective (no teacher)."""
+        """Train the generator with DMD2 loss plus optional MSE and GAN terms."""
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: Before generator unroll", device=self.device, rank=dist.get_rank())
 
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         _t_gen_start = time.time()
-        pred_image, _, _, _ = self._run_generator(
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
@@ -305,9 +305,29 @@ class DMD2RealMSE(SelfForcingModel):
             log_gpu_memory("Generator loss: After generator unroll", device=self.device, rank=dist.get_rank())
 
         _t_loss_start = time.time()
-        log_dict = {"gen_time": gen_time}
+        dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
+            image_or_video=pred_image,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            gradient_mask=gradient_mask,
+            denoised_timestep_from=denoised_timestep_from,
+            denoised_timestep_to=denoised_timestep_to
+        )
+        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+            log_gpu_memory("Generator loss: After compute_distribution_matching_loss", device=self.device, rank=dist.get_rank())
+        try:
+            loss_val = dmd_loss.item()
+        except Exception:
+            loss_val = float("nan")
 
-        total_loss = None
+        total_loss = dmd_loss
+        log_dict = dict(dmd_log_dict)
+        log_dict.update({
+            "gen_time": gen_time,
+            "loss_time": loss_time,
+            "generator_dmd_loss": dmd_loss.detach(),
+        })
+
         if self.generator_mse_loss_weight > 0.0:
             mse_target = None
             if real_latents is not None:
@@ -335,18 +355,16 @@ class DMD2RealMSE(SelfForcingModel):
                 })
 
         if self.cls_on_clean_image and self.gan_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch"):
-            logits_fake = self._classifier_logits(pred_image, conditional_dict)
+            with self._freeze_fake_score_params():
+                logits_fake = self._classifier_logits(pred_image, conditional_dict)
             gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
-            total_loss = gan_loss if total_loss is None else total_loss + gan_loss
+            total_loss = total_loss + gan_loss
             log_dict.update({
                 "generator_gan_loss": gan_loss.detach(),
                 "generator_gan_logits": logits_fake.detach().mean(),
                 "generator_gan_real_prob": torch.sigmoid(logits_fake.detach()).mean(),
                 "generator_gan_logits_std": logits_fake.detach().std(unbiased=False),
             })
-
-        if total_loss is None:
-            raise RuntimeError("GAN loss is disabled but DMD2Real has no teacher-driven objective.")
 
         loss_time = time.time() - _t_loss_start
         log_dict["loss_time"] = loss_time

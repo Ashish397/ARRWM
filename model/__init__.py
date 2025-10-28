@@ -5,7 +5,9 @@ from .dmd2mse import DMD2MSE
 from .dmd2real import DMD2Real
 from .dmd2realmse import DMD2RealMSE
 from .dmd2realmselam import DMD2RealMSELAM
+from .dmd2realmse_vB import DMD2RealMSE_vB
 from .mse_dmd import MSE_DMD
+from .mse_dmd_lam import MSE_DMD_LAM
 __all__ = [
     "DMD",
     "DMDSwitch",
@@ -15,4 +17,5 @@ __all__ = [
     "DMD2RealMSE",
     "DMD2RealMSELAM",
     "MSE_DMD",
+    "MSE_DMD_LAM",
 ]

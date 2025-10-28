@@ -200,6 +200,28 @@ class WanDiffusionWrapper(torch.nn.Module):
         self._gan_ca_blocks.requires_grad_(True)
         # self.has_cls_branch = True
 
+    def adding_rgs_branch(self, atten_dim=1536, num_class=2, time_embed_dim=0) -> None:
+        # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
+        self._rgs_pred_branch = nn.Sequential(
+            # Input: [B, 384, 21, 60, 104]
+            nn.LayerNorm(atten_dim * 2 + time_embed_dim),
+            nn.Linear(atten_dim * 2 + time_embed_dim, 1536),
+            nn.SiLU(),
+            nn.Linear(atten_dim, num_class)
+        )
+        self._rgs_pred_branch.requires_grad_(True)
+        num_registers = 2
+        self._register_tokens_rgs = RegisterTokens(num_registers=num_registers, dim=atten_dim)
+        self._register_tokens_rgs.requires_grad_(True)
+
+        gan_ca_blocks = []
+        for _ in range(num_registers):
+            block = GanAttentionBlock()
+            gan_ca_blocks.append(block)
+        self._gan_ca_blocks_rgs = nn.ModuleList(gan_ca_blocks)
+        self._gan_ca_blocks_rgs.requires_grad_(True)
+        # self.has_rgs_branch = True
+
     def _convert_flow_pred_to_x0(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """
         Convert flow matching's prediction to x0 prediction.
@@ -256,6 +278,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
         classify_mode: Optional[bool] = False,
+        regress_mode: Optional[bool] = False,
         concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
@@ -302,6 +325,17 @@ class WanDiffusionWrapper(torch.nn.Module):
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
                         concat_time_embeddings=concat_time_embeddings
+                    )
+                    flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+                elif regress_mode:
+                    flow_pred, logits = self.model(
+                        noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                        t=input_timestep, context=prompt_embeds,
+                        seq_len=self.seq_len,
+                        regress_mode=True,
+                        register_tokens_rgs=self._register_tokens_rgs,
+                        rgs_pred_branch=self._rgs_pred_branch,
+                        gan_ca_blocks_rgs=self._gan_ca_blocks_rgs,
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:

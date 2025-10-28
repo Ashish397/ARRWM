@@ -23,8 +23,10 @@ from model import (
     DMD2MSE,
     DMD2Real,
     MSE_DMD,
+    MSE_DMD_LAM,
     DMD2RealMSE,
     DMD2RealMSELAM,
+    DMD2RealMSE_vB,
 )
 from model.streaming_training import StreamingTrainingModel
 import torch
@@ -148,6 +150,8 @@ class Trainer:
             self.model = DMD2Real(config, device=self.device)
         elif config.distribution_loss == "dmd2mse":
             self.model = DMD2MSE(config, device=self.device)
+        elif config.distribution_loss == "dmd2realmse_vB":
+            self.model = DMD2RealMSE_vB(config, device=self.device)
         elif config.distribution_loss == "dmd2realmse":
             self.model = DMD2RealMSE(config, device=self.device)
         elif config.distribution_loss == "dmd2realmselam":
@@ -156,6 +160,8 @@ class Trainer:
             self.model = DMD2RealMSEDWT(config, device=self.device)
         elif config.distribution_loss == "mse_dmd":
             self.model = MSE_DMD(config, device=self.device)
+        elif config.distribution_loss == "mse_dmd_lam":
+            self.model = MSE_DMD_LAM(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
 
@@ -510,7 +516,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmsedwt", "dmd2realmselam", "mse_dmd"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -542,7 +548,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmsedwt", "dmd2realmselam", "mse_dmd"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -1111,8 +1117,8 @@ class Trainer:
                 actions = actions.to(self.device, dtype=torch.float32)
             else:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
-        if getattr(self.config, 'distribution_loss', '') == 'dmd2realmselam' and actions is None:
-            raise ValueError('Batch is missing action annotations required for dmd2realmselam training.')
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam') and actions is None:
+            raise ValueError('Batch is missing action annotations required for action-guided training.')
 
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
@@ -1144,11 +1150,11 @@ class Trainer:
                 clean_latent=None,
                 initial_latent=None,
             )
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmsedwt', 'dmd2realmselam'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmse_vB', 'dmd2realmselam'):
                 generator_kwargs['real_latents'] = real_latents
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam',):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam'):
                 generator_kwargs['actions'] = actions
-            if getattr(self.config, 'distribution_loss', '') in ('mse_dmd'):
+            if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam'):
                 generator_kwargs['clean_latent'] = real_latents
             generator_loss, generator_log_dict = self.model.generator_loss(**generator_kwargs)
 
@@ -1176,11 +1182,11 @@ class Trainer:
             clean_latent=None,
             initial_latent=None,
         )
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmsedwt', 'dmd2realmselam'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmse_vB', 'dmd2realmselam'):
             critic_kwargs['real_latents'] = real_latents
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam',):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam'):
             critic_kwargs['actions'] = actions
-        if getattr(self.config, 'distribution_loss', '') in ('mse_dmd'):
+        if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam'):
             critic_kwargs['clean_latent'] = real_latents
         if train_generator:
             critic_kwargs['update_discriminator'] = True

@@ -11,7 +11,10 @@ dmd_loss_weight: 1.0
 dmd_loss_weight_decay: 0.0
 gan_loss_weight: 0.1
 gan_loss_weight_decay: 0.0
+action_loss_weight: 0.2
+action_loss_weight_decay: 0.0
 guidance_cls_loss_weight: 2.0
+guidance_rgs_loss_weight: 2.0
 diffusion_gan: True
 diffusion_gan_max_timestep: 400
 min_score_timestep: 100
