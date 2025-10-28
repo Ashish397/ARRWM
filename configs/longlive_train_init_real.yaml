@@ -38,8 +38,10 @@ adapter:
   dropout: 0.0
   dtype: "bfloat16"
   apply_to_critic: true
-  apply_to_teacher: true
   verbose: false
+
+teacher_lora: none
+teacher_lora_weights: ""
 lora_ckpt:
 denoising_step_list:
 - 1000

@@ -177,6 +177,9 @@ class Trainer:
         # Track which sub-models have LoRA applied for loading/saving logic
         self.apply_lora_to_critic = False
         self.apply_lora_to_teacher = False
+        self.teacher_lora_rank = None
+        self.teacher_lora_weights = None
+        self.teacher_adapter_name = None
         if hasattr(config, 'adapter') and config.adapter is not None:
             self.is_lora_enabled = True
             self.lora_config = config.adapter
@@ -187,24 +190,39 @@ class Trainer:
                 self.lora_config = dict(self.lora_config)
 
             self.apply_lora_to_critic = bool(self.lora_config.get('apply_to_critic', True))
-            self.apply_lora_to_teacher = bool(self.lora_config.get('apply_to_teacher', True))
+
+            teacher_lora_value = getattr(config, "teacher_lora", None)
+            if isinstance(teacher_lora_value, str):
+                teacher_lora_value = teacher_lora_value.strip()
+                if teacher_lora_value.lower() in {"", "none"}:
+                    teacher_lora_value = None
+            if teacher_lora_value is not None:
+                try:
+                    candidate_rank = int(teacher_lora_value)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"teacher_lora must be an integer rank or 'none', got {teacher_lora_value!r}"
+                    )
+                if candidate_rank <= 0:
+                    raise ValueError("teacher_lora rank must be a positive integer.")
+                self.teacher_lora_rank = candidate_rank
+                self.teacher_lora_weights = getattr(config, "teacher_lora_weights", None)
+                if not self.teacher_lora_weights:
+                    raise ValueError(
+                        "teacher_lora is set, but teacher_lora_weights was not provided in the config."
+                    )
+                self.teacher_adapter_name = "default"
+                self.apply_lora_to_teacher = True
+
             generator_cfg = self._get_adapter_config('generator_adapter', default_adapter_name="default")
             if generator_cfg is None:
                 raise ValueError("LoRA adapter configuration missing generator settings")
             self.generator_adapter_name = generator_cfg["adapter_name"]
-            self.teacher_adapter_name = None
-            if self.apply_lora_to_teacher:
-                teacher_cfg = self._get_adapter_config('teacher_adapter', default_adapter_name="default")
-                if teacher_cfg is None:
-                    raise ValueError("apply_to_teacher=True requires a teacher_adapter configuration")
-                self.teacher_adapter_name = teacher_cfg["adapter_name"]
             self.critic_adapter_name = None
             if self.apply_lora_to_critic:
                 critic_cfg = self._get_adapter_config('critic_adapter', default_adapter_name="critic")
                 if critic_cfg is None:
                     critic_cfg = self._get_adapter_config(None, default_adapter_name="critic")
-                if self.apply_lora_to_teacher and self.teacher_adapter_name and critic_cfg["adapter_name"] == self.teacher_adapter_name:
-                    critic_cfg["adapter_name"] = "critic"
                 self.critic_adapter_name = critic_cfg["adapter_name"]
             
             if self.is_main_process:
@@ -267,8 +285,8 @@ class Trainer:
             applied_targets = ["generator"]
 
             if self.apply_lora_to_teacher:
-                self.model.real_score.model = self._configure_lora_for_model(
-                    self.model.real_score.model, "real_score", trainable=False)
+                self.model.real_score.model = self._configure_teacher_lora(self.model.real_score.model)
+                self._load_pretrained_teacher_lora(self.model.real_score.model)
                 applied_targets.append("teacher")
             elif self.is_main_process:
                 print("LoRA not applied to teacher (real_score)")
@@ -372,18 +390,11 @@ class Trainer:
                     if self.apply_lora_to_teacher:
                         if self.is_main_process:
                             print(f"Loading LoRA teacher weights: {len(lora_checkpoint['teacher_lora'])} keys in checkpoint")
-                        teacher_adapter_name = self.teacher_adapter_name if self.teacher_adapter_name else None
                         peft.set_peft_model_state_dict(
                             self.model.real_score.model,
                             lora_checkpoint["teacher_lora"],
-                            adapter_name=teacher_adapter_name,
+                            adapter_name=self.teacher_adapter_name,
                         )
-                        if self.apply_lora_to_critic and teacher_adapter_name is not None:
-                            peft.set_peft_model_state_dict(
-                                self.model.fake_score.model,
-                                lora_checkpoint["teacher_lora"],
-                                adapter_name=teacher_adapter_name,
-                            )
                     elif self.is_main_process:
                         print("Teacher LoRA weights found in checkpoint, but apply_to_teacher=False; skipping load.")
                 elif self.apply_lora_to_teacher and self.is_main_process:
@@ -1853,106 +1864,129 @@ class Trainer:
                 param.requires_grad_(False)
 
     def _configure_lora_for_model(self, transformer, model_name, trainable=True):
-        """Configure LoRA for a WanDiffusionWrapper model.
-
-        Args:
-            transformer: Wrapped WanDiffusion model to modify.
-            model_name: One of {'generator', 'fake_score', 'real_score'}.
-            trainable: Whether the injected LoRA parameters should require gradients.
-        """
-        # Find all Linear modules in WanAttentionBlock modules
+        """Configure LoRA for generator or critic models."""
         target_linear_modules = set()
-        
-        # Define the specific modules we want to apply LoRA to
+
         if model_name == 'generator':
             adapter_target_modules = ['CausalWanAttentionBlock']
-        elif model_name in ('fake_score', 'real_score'):
+        elif model_name == 'fake_score':
             adapter_target_modules = ['WanAttentionBlock']
         else:
-            raise ValueError(f"Invalid model name: {model_name}")
-        
+            raise ValueError(f"Invalid model name for LoRA configuration: {model_name}")
+
         for name, module in transformer.named_modules():
             if module.__class__.__name__ in adapter_target_modules:
                 for full_submodule_name, submodule in module.named_modules(prefix=name):
                     if isinstance(submodule, torch.nn.Linear):
                         target_linear_modules.add(full_submodule_name)
-        
+
         target_linear_modules = list(target_linear_modules)
-        
+
+        if model_name == 'generator':
+            adapter_cfg = self._get_adapter_config('generator_adapter', default_adapter_name="default")
+            if adapter_cfg is None:
+                raise ValueError("Generator adapter configuration is required for LoRA training")
+            adapter_cfg["adapter_name"] = self.generator_adapter_name or adapter_cfg["adapter_name"]
+        else:  # fake_score
+            adapter_cfg = self._get_adapter_config('critic_adapter', default_adapter_name="critic")
+            if adapter_cfg is None:
+                adapter_cfg = self._get_adapter_config(None, default_adapter_name="critic")
+            adapter_cfg["adapter_name"] = self.critic_adapter_name or adapter_cfg["adapter_name"]
+
         if self.is_main_process:
             print(f"LoRA target modules for {model_name}: {len(target_linear_modules)} Linear layers")
-        
-        adapter_sequence = []
-        if model_name == 'generator':
-            gen_cfg = self._get_adapter_config('generator_adapter', default_adapter_name="default")
-            if gen_cfg is None:
-                raise ValueError("Generator adapter configuration is required for LoRA training")
-            gen_cfg["adapter_name"] = getattr(self, "generator_adapter_name", gen_cfg["adapter_name"])
-            adapter_sequence.append((gen_cfg, bool(trainable)))
-        elif model_name == 'real_score':
-            teacher_cfg = self._get_adapter_config('teacher_adapter', default_adapter_name="default")
-            if teacher_cfg is None:
-                raise ValueError("Teacher adapter configuration is required when apply_to_teacher is True")
-            teacher_cfg["adapter_name"] = self.teacher_adapter_name or teacher_cfg["adapter_name"]
-            adapter_sequence.append((teacher_cfg, False))
-        elif model_name == 'fake_score':
-            if self.apply_lora_to_teacher:
-                teacher_cfg = self._get_adapter_config('teacher_adapter', default_adapter_name="default")
-                if teacher_cfg is None:
-                    raise ValueError("Teacher adapter configuration is required for stacked critic/teacher LoRA")
-                teacher_cfg["adapter_name"] = self.teacher_adapter_name or teacher_cfg["adapter_name"]
-                adapter_sequence.append((teacher_cfg, False))
-                teacher_adapter_name = teacher_cfg["adapter_name"]
-            else:
-                teacher_adapter_name = None
+            if adapter_cfg.get("verbose"):
+                for module_name in sorted(target_linear_modules):
+                    print(f"  - {module_name}")
 
-            critic_cfg = self._get_adapter_config('critic_adapter', default_adapter_name="critic")
-            if critic_cfg is None:
-                critic_cfg = self._get_adapter_config(None, default_adapter_name="critic")
-            critic_cfg["adapter_name"] = self.critic_adapter_name or critic_cfg["adapter_name"]
-            adapter_sequence.append((critic_cfg, bool(trainable)))
-        else:
-            raise ValueError(f"Invalid model name: {model_name}")
-
-        if not adapter_sequence:
-            raise ValueError(f"No LoRA adapters configured for model {model_name}")
-
-        first_cfg, first_trainable = adapter_sequence[0]
-        if self.is_main_process and first_cfg["verbose"]:
-            for module_name in sorted(target_linear_modules):
-                print(f"  - {module_name}")
-
-        peft_config = self._build_lora_config(first_cfg, target_linear_modules, first_trainable)
-        first_adapter_name = first_cfg["adapter_name"]
-        lora_model = peft.get_peft_model(transformer, peft_config, adapter_name=first_adapter_name)
-        if not first_trainable:
-            self._freeze_adapter_params(lora_model, first_adapter_name)
-
-        if len(adapter_sequence) > 1:
-            for adapter_cfg, adapter_trainable in adapter_sequence[1:]:
-                adapter_name = adapter_cfg["adapter_name"]
-                cfg = self._build_lora_config(adapter_cfg, target_linear_modules, adapter_trainable)
-                lora_model.add_adapter(adapter_name, cfg)
-                if not adapter_trainable:
-                    self._freeze_adapter_params(lora_model, adapter_name)
-
-            active_order = [cfg["adapter_name"] for cfg, _ in adapter_sequence]
-            lora_model.set_adapter(active_order)
-        else:
-            lora_model.set_adapter(first_adapter_name)
+        peft_config = self._build_lora_config(adapter_cfg, target_linear_modules, trainable)
+        adapter_name = adapter_cfg["adapter_name"]
+        lora_model = peft.get_peft_model(transformer, peft_config, adapter_name=adapter_name)
 
         if not trainable:
-            # Ensure all LoRA parameters are frozen when entire module is inference-only
-            for adapter_cfg, _ in adapter_sequence:
-                self._freeze_adapter_params(lora_model, adapter_cfg["adapter_name"])
+            self._freeze_adapter_params(lora_model, adapter_name)
             if self.is_main_process:
                 print(f"LoRA parameters for {model_name} frozen (inference-only).")
 
         if self.is_main_process:
-            print(f"Configured LoRA adapters for {model_name}: {[cfg['adapter_name'] for cfg, _ in adapter_sequence]}")
+            print(f"Configured LoRA adapter '{adapter_name}' for {model_name}")
             lora_model.print_trainable_parameters()
 
         return lora_model
+
+    def _configure_teacher_lora(self, transformer):
+        if self.teacher_lora_rank is None or self.teacher_adapter_name is None:
+            raise RuntimeError("Teacher LoRA requested but configuration is incomplete.")
+
+        target_linear_modules = set()
+        for name, module in transformer.named_modules():
+            if module.__class__.__name__ in {"WanAttentionBlock", "CausalWanAttentionBlock"}:
+                for full_submodule_name, submodule in module.named_modules(prefix=name):
+                    if isinstance(submodule, torch.nn.Linear):
+                        target_linear_modules.add(full_submodule_name)
+
+        target_linear_modules = list(target_linear_modules)
+        if not target_linear_modules:
+            raise RuntimeError("Failed to locate Linear modules for teacher LoRA.")
+
+        adapter_cfg = {
+            "type": "lora",
+            "rank": self.teacher_lora_rank,
+            "alpha": self.teacher_lora_rank,
+            "dropout": 0.0,
+            "adapter_name": self.teacher_adapter_name,
+            "verbose": False,
+        }
+
+        if self.is_main_process:
+            print(
+                f"Teacher LoRA target modules: {len(target_linear_modules)} Linear layers "
+                f"(rank={self.teacher_lora_rank})"
+            )
+
+        peft_config = self._build_lora_config(adapter_cfg, target_linear_modules, trainable=False)
+        lora_model = peft.get_peft_model(transformer, peft_config, adapter_name=self.teacher_adapter_name)
+        self._freeze_adapter_params(lora_model, self.teacher_adapter_name)
+
+        if self.is_main_process:
+            print("Configured teacher LoRA adapter; parameters frozen for inference.")
+
+        return lora_model
+
+    def _load_pretrained_teacher_lora(self, lora_model):
+        if not self.teacher_lora_weights:
+            return
+
+        weights_path = Path(self.teacher_lora_weights).expanduser()
+        if not weights_path.exists():
+            raise FileNotFoundError(f"teacher_lora_weights path does not exist: {weights_path}")
+
+        if self.is_main_process:
+            print(f"Loading pretrained teacher LoRA weights from {weights_path}")
+
+        checkpoint = torch.load(weights_path, map_location="cpu")
+        if isinstance(checkpoint, dict):
+            if "lora" in checkpoint:
+                lora_state = checkpoint["lora"]
+            elif "teacher_lora" in checkpoint:
+                lora_state = checkpoint["teacher_lora"]
+            else:
+                lora_state = checkpoint
+        else:
+            raise ValueError(f"Unexpected format for teacher LoRA checkpoint: {type(checkpoint)}")
+
+        peft.set_peft_model_state_dict(
+            lora_model,
+            lora_state,
+            adapter_name=self.teacher_adapter_name,
+        )
+        self._freeze_adapter_params(lora_model, self.teacher_adapter_name)
+
+        if self.is_main_process:
+            print(
+                f"Loaded pretrained teacher LoRA ({len(lora_state)} tensors) "
+                f"into adapter '{self.teacher_adapter_name}'."
+            )
 
 
     def _gather_lora_state_dict(self, lora_model, adapter_name=None):

@@ -103,15 +103,12 @@ adapter:
   dropout: 0.0                # LoRA dropout rate
   dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
   apply_to_critic: true       # Whether to apply LoRA to critic/fake_score model
-  apply_to_teacher: true      # LoRA applied to teacher (real_score) for inference-only adapters
-  teacher_adapter:
-    adapter_name: "default"
-    rank: 64
-    alpha: 64
-    dropout: 0.0
   critic_adapter:
     adapter_name: "critic"
     rank: 256
     alpha: 256
     dropout: 0.0
   verbose: true              # Whether to print all target module names
+
+teacher_lora: none            # Set to 64/128/256 to enable teacher LoRA, or 'none' to disable
+teacher_lora_weights: ""      # Path to pretrained teacher LoRA weights (produced by diffusion LoRA finetuning)
