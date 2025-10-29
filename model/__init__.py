@@ -8,6 +8,7 @@ from .dmd2realmselam import DMD2RealMSELAM
 from .dmd2realmse_vB import DMD2RealMSE_vB
 from .mse_dmd import MSE_DMD
 from .mse_dmd_lam import MSE_DMD_LAM
+from .mse_dmd_lam_action import MSE_DMD_LAM_ACTION
 __all__ = [
     "DMD",
     "DMDSwitch",
@@ -18,4 +19,5 @@ __all__ = [
     "DMD2RealMSELAM",
     "MSE_DMD",
     "MSE_DMD_LAM",
+    "MSE_DMD_LAM_ACTION",
 ]
