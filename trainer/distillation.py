@@ -24,11 +24,13 @@ from model import (
     DMD2Real,
     MSE_DMD,
     MSE_DMD_LAM,
+    MSE_DMD_LAM_ACTION,
     DMD2RealMSE,
     DMD2RealMSELAM,
     DMD2RealMSE_vB,
 )
 from model.streaming_training import StreamingTrainingModel
+from latent_actions.train_latent_action_model import Action3DCNN
 import torch
 import wandb
 import time
@@ -162,6 +164,13 @@ class Trainer:
             self.model = MSE_DMD(config, device=self.device)
         elif config.distribution_loss == "mse_dmd_lam":
             self.model = MSE_DMD_LAM(config, device=self.device)
+        elif config.distribution_loss == "mse_dmd_lam_action":
+            latent_action_model = self._build_latent_action_model(config)
+            self.model = MSE_DMD_LAM_ACTION(
+                config,
+                device=self.device,
+                latent_action_model=latent_action_model,
+            )
         else:
             raise ValueError("Invalid distribution matching loss")
 
@@ -527,7 +536,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -559,7 +568,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -830,6 +839,74 @@ class Trainer:
             weight = self._action_loss_weight_start + (self._action_loss_weight_end - self._action_loss_weight_start) * progress
             self.model.action_loss_weight = weight
 
+    def _build_latent_action_model(self, config):
+        checkpoint_path = getattr(config, "latent_action_checkpoint", None)
+        dropout = float(getattr(config, "latent_action_dropout", 0.0))
+        hidden_dims_cfg = getattr(config, "latent_action_hidden_dims", (256, 128))
+        hidden_dims = list(hidden_dims_cfg) if hidden_dims_cfg else []
+        action_dim_cfg = getattr(
+            config,
+            "latent_action_action_dim",
+            getattr(config, "action_dim", getattr(config, "raw_action_dim", 2)),
+        )
+        in_channels_cfg = getattr(config, "latent_action_in_channels", None)
+
+        default_checkpoint = Path("/projects/u5as/frodobots_lam/latent_actions/checkpoints/1442126/best/input_actions_best.pt")
+        if not checkpoint_path:
+            if default_checkpoint.exists():
+                checkpoint_path = str(default_checkpoint)
+                if self.is_main_process:
+                    print(f"[latent_action] Using default checkpoint: {checkpoint_path}")
+            else:
+                checkpoint_path = None
+
+        state_dict = None
+        if checkpoint_path:
+            payload = torch.load(checkpoint_path, map_location="cpu")
+            state_dict = payload.get("model_state", payload)
+            if isinstance(payload, dict):
+                hidden_dims_payload = payload.get("hidden_dims")
+                if hidden_dims_payload:
+                    hidden_dims = list(hidden_dims_payload)
+                metadata = payload.get("metadata", {})
+                dropout = metadata.get("dropout", dropout)
+                action_dim_cfg = payload.get("action_dim", action_dim_cfg)
+
+            if "encoder.0.weight" not in state_dict:
+                raise KeyError(
+                    "Latent action checkpoint missing 'encoder.0.weight' needed to infer input channels."
+                )
+            in_channels_cfg = state_dict["encoder.0.weight"].shape[1]
+            if "head.-1.weight" in state_dict:
+                action_dim_cfg = state_dict["head.-1.weight"].shape[0]
+
+        if not hidden_dims:
+            hidden_dims = [256, 128]
+
+        if in_channels_cfg is None:
+            image_shape = getattr(config, "image_or_video_shape", None)
+            if not image_shape or len(image_shape) < 3:
+                raise ValueError(
+                    "latent_action_in_channels not provided and image_or_video_shape is invalid."
+                )
+            in_channels_cfg = int(image_shape[2])
+
+        action_dim = int(action_dim_cfg)
+        in_channels = int(in_channels_cfg)
+
+        latent_action_model = Action3DCNN(
+            in_channels=in_channels,
+            action_dim=action_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+        )
+
+        if state_dict is not None:
+            latent_action_model.load_state_dict(state_dict, strict=True)
+
+        latent_action_model.to(device=self.device, dtype=torch.float32)
+        latent_action_model.eval()
+        return latent_action_model
 
     def _move_optimizer_to_device(self, optimizer, device):
         """Move optimizer state to the specified device."""
@@ -1144,7 +1221,7 @@ class Trainer:
                 actions = actions.to(self.device, dtype=torch.float32)
             else:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam') and actions is None:
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam', 'mse_dmd_lam_action') and actions is None:
             raise ValueError('Batch is missing action annotations required for action-guided training.')
 
         image_or_video_shape = list(self.config.image_or_video_shape)
@@ -1179,9 +1256,9 @@ class Trainer:
             )
             if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmse_vB', 'dmd2realmselam'):
                 generator_kwargs['real_latents'] = real_latents
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['actions'] = actions
-            if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam'):
+            if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
             generator_loss, generator_log_dict = self.model.generator_loss(**generator_kwargs)
 
@@ -1211,9 +1288,9 @@ class Trainer:
         )
         if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmse_vB', 'dmd2realmselam'):
             critic_kwargs['real_latents'] = real_latents
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['actions'] = actions
-        if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam'):
+        if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['clean_latent'] = real_latents
         if train_generator:
             critic_kwargs['update_discriminator'] = True
