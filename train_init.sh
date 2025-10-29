@@ -19,7 +19,7 @@ fi
 conda activate arrwm
 
 # Project path and config
-CONFIG=configs/longlive_train_init_real.yaml
+CONFIG=configs/longlive_train_init_real_N_d2.yaml
 BASE_LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs
 EXPERIMENT_NAME=$(python - <<'PY_BLOCK'
 from omegaconf import OmegaConf

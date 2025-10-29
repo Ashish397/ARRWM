@@ -768,6 +768,18 @@ class Trainer:
         if hasattr(self.model, "gan_loss_weight"):
             self.model.gan_loss_weight = self._gan_weight_start
 
+        # Action loss weight schedule (linear). "decay" represents the total change applied across training.
+        self._action_loss_weight_start = float(getattr(self.config, "action_loss_weight", 0.0))
+        action_decay = getattr(self.config, "action_loss_weight_decay", None)
+        if action_decay is None:
+            self._action_loss_weight_end = self._action_loss_weight_start
+        else:
+            self._action_loss_weight_end = self._action_loss_weight_start - float(action_decay)
+        self._action_loss_weight_end = max(0.0, self._action_loss_weight_end)
+        self._action_schedule_enabled = abs(self._action_loss_weight_end - self._action_loss_weight_start) > 1e-8
+        if hasattr(self.model, "action_loss_weight"):
+            self.model.action_loss_weight = self._action_loss_weight_start
+
         # Generator MSE weight schedule (cosine). Positive decay reduces the weight, negative increases it.
         self._mse_weight_start = float(getattr(self.config, "generator_mse_loss_weight", 0.0))
         mse_decay = getattr(self.config, "generator_mse_loss_weight_decay", None)
@@ -813,6 +825,10 @@ class Trainer:
         if self._gan_schedule_enabled and hasattr(self.model, "gan_loss_weight"):
             weight = self._gan_weight_start + (self._gan_weight_end - self._gan_weight_start) * progress
             self.model.gan_loss_weight = weight
+
+        if self._action_schedule_enabled and hasattr(self.model, "action_loss_weight"):
+            weight = self._action_loss_weight_start + (self._action_loss_weight_end - self._action_loss_weight_start) * progress
+            self.model.action_loss_weight = weight
 
 
     def _move_optimizer_to_device(self, optimizer, device):
@@ -1748,6 +1764,8 @@ class Trainer:
                         wandb_loss_dict["dmd_loss_weight_current"] = float(self.model.dmd_loss_weight)
                     if hasattr(self.model, "gan_loss_weight"):
                         wandb_loss_dict["generator_gan_loss_weight_current"] = float(self.model.gan_loss_weight)
+                    if hasattr(self.model, "action_loss_weight"):
+                        wandb_loss_dict["generator_action_loss_weight_current"] = float(self.model.action_loss_weight)
 
                     if not self.disable_wandb and wandb_loss_dict:
                         wandb.log(wandb_loss_dict, step=self.step)

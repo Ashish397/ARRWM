@@ -201,19 +201,17 @@ def _collect_target_modules(transformer: torch.nn.Module) -> list[str]:
     return sorted(target)
 
 
-def _apply_lora_to_generator(generator: torch.nn.Module, adapter_cfg) -> torch.nn.Module:
+def _apply_lora_to_generator(generator: torch.nn.Module, adapter_cfg, rank: int) -> torch.nn.Module:
     target_modules = adapter_cfg.get("target_modules")
     if not target_modules:
         target_modules = _collect_target_modules(generator)
 
-    rank = int(adapter_cfg.get("rank", 16))
-    alpha = int(adapter_cfg.get("alpha", rank))
     dropout = float(adapter_cfg.get("dropout", 0.0))
     init_type = adapter_cfg.get("init_lora_weights", "gaussian")
 
     peft_config = peft.LoraConfig(
         r=rank,
-        lora_alpha=alpha,
+        lora_alpha=rank,
         lora_dropout=dropout,
         target_modules=target_modules,
         init_lora_weights=init_type,
@@ -313,6 +311,7 @@ def _generate_videos(
     seed: Optional[int],
     device: torch.device,
     overwrite: bool,
+    rank: int,
 ) -> None:
     torch.set_grad_enabled(False)
     if seed is not None:
@@ -324,7 +323,7 @@ def _generate_videos(
     adapter_cfg = OmegaConf.to_container(config.adapter, resolve=True)
     if not isinstance(adapter_cfg, dict):
         raise TypeError("config.adapter must resolve to a mapping for LoRA configuration.")
-    generator.model = _apply_lora_to_generator(generator.model, adapter_cfg)
+    generator.model = _apply_lora_to_generator(generator.model, adapter_cfg, rank)
     step = _load_lora_weights(generator.model, checkpoint_path)
 
     generator.to(device=device)
@@ -401,6 +400,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-key", default=DEFAULT_EMBEDDING_KEY, help="JSON key containing the encoded caption tensor.")
     parser.add_argument("--max-samples", type=int, help="Limit the number of prompts to process.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip samples that already have an output video.")
+    parser.add_argument("--rank", type=int, help="Rank of the LoRA adapter.")
     return parser.parse_args()
 
 
@@ -460,6 +460,7 @@ def main() -> None:
         seed=args.seed,
         device=device,
         overwrite=not args.skip_existing,
+        rank=args.rank,
     )
 
 

@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import time
+import math
 from contextlib import contextmanager
 
 from model.base import SelfForcingModel
@@ -69,7 +70,8 @@ class DMD2RealMSELAM(SelfForcingModel):
         self.diffusion_gan_max_timestep = getattr(args, "diffusion_gan_max_timestep", self.num_train_timestep)
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
         self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.0)
-        self.generator_mse_diff_loss_weight = getattr(args, "generator_mse_diff_loss_weight", 0.0)
+        self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
+        self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
 
         if hasattr(self.fake_score, "adding_cls_branch"):
             try:
@@ -80,10 +82,12 @@ class DMD2RealMSELAM(SelfForcingModel):
                 if dist.get_rank() == 0:
                     print("[Warning] Failed to add classification branch to fake_score.")
 
-        if hasattr(self.fake_score, "adding_rgs_branch"):
+        # Only initialize regression branch if action loss weights are non-zero
+        if (self.action_loss_weight > 0.0 or self.guidance_rgs_loss_weight > 0.0) and hasattr(self.fake_score, "adding_rgs_branch"):
             try:
                 self.fake_score.adding_rgs_branch(
-                    time_embed_dim=1536 if self.concat_time_embeddings else 0
+                    time_embed_dim=1536 if self.concat_time_embeddings else 0,
+                    num_frames=self.num_training_frames,
                 )
             except Exception:
                 if dist.get_rank() == 0:
@@ -257,7 +261,49 @@ class DMD2RealMSELAM(SelfForcingModel):
         )
 
         preds = outputs[-1]
-        return preds.squeeze(-1)
+        return preds
+
+    def _compute_motion_weights(self, reference: torch.Tensor) -> torch.Tensor:
+        if (not self.motion_enabled_loss) or reference.ndim < 5:
+            return torch.ones_like(reference, dtype=reference.dtype)
+
+        batch_size, num_frames = reference.shape[:2]
+        if num_frames <= 1:
+            return torch.ones_like(reference, dtype=reference.dtype)
+
+        c = max(self.motion_weight_c, 1.0)
+        ref = reference.detach()
+        diffs = torch.abs(ref[:, 1:] - ref[:, :-1])
+        diffs_flat = diffs.reshape(batch_size, num_frames - 1, -1).to(torch.float32)
+        weights_flat = torch.softmax(diffs_flat, dim=1)
+        log_c = math.log(c)
+        scaled_flat = torch.exp(weights_flat * log_c)
+        scaled = scaled_flat.reshape_as(diffs).to(dtype=reference.dtype, device=reference.device)
+
+        weights = torch.ones_like(reference, dtype=reference.dtype, device=reference.device)
+        weights[:, 1:] = scaled
+        return weights
+
+    def _motion_weighted_mse(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        gradient_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        error = (pred - target) ** 2
+
+        mask = None
+        if gradient_mask is not None:
+            mask = gradient_mask.to(torch.bool)
+
+        if self.motion_enabled_loss:
+            weights = self._compute_motion_weights(target)
+            error = error * weights.to(dtype=error.dtype, device=error.device)
+
+        if mask is not None:
+            error = error[mask]
+
+        return error.mean()
 
     def compute_distribution_matching_loss(
         self,
@@ -319,12 +365,12 @@ class DMD2RealMSELAM(SelfForcingModel):
                 unconditional_dict=unconditional_dict
             )
 
-        if gradient_mask is not None:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
-        else:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
+        target_latent = (original_latent.double() - grad.double()).detach()
+        dmd_loss = 0.5 * self._motion_weighted_mse(
+            pred=original_latent.double(),
+            target=target_latent,
+            gradient_mask=gradient_mask,
+        )
         return dmd_loss, dmd_log_dict
 
     def generator_loss(
@@ -393,9 +439,9 @@ class DMD2RealMSELAM(SelfForcingModel):
                 pred_for_mse = pred_image[:, :min_frames]
                 target_for_mse = mse_target[:, :min_frames]
 
-                mse_loss = F.mse_loss(
-                    pred_for_mse.float(),
-                    target_for_mse.float()
+                mse_loss = self._motion_weighted_mse(
+                    pred=pred_for_mse.float(),
+                    target=target_for_mse.float(),
                 )
                 weighted_mse_loss = mse_loss * self.generator_mse_loss_weight
                 total_loss = weighted_mse_loss if total_loss is None else total_loss + weighted_mse_loss
@@ -403,33 +449,6 @@ class DMD2RealMSELAM(SelfForcingModel):
                     "generator_mse_loss": weighted_mse_loss.detach(),
                     "generator_mse_raw": mse_loss.detach(),
                 })
-
-        if self.generator_mse_diff_loss_weight > 0.0:
-            mse_target = None
-            if real_latents is not None:
-                mse_target = real_latents
-            elif clean_latent is not None:
-                mse_target = clean_latent
-
-            if mse_target is not None:
-                mse_target = mse_target.to(device=pred_image.device, dtype=pred_image.dtype)
-
-                # Align number of frames if the targets include more temporal steps than the rollout
-                min_frames = min(pred_image.shape[1], mse_target.shape[1])
-                pred_for_mse = pred_image[:, 1:min_frames] - pred_image[:, :min_frames-1]
-                target_for_mse = mse_target[:, 1:min_frames] - mse_target[:, :min_frames-1]
-
-                mse_diff_loss = F.mse_loss(
-                    pred_for_mse.float(),
-                    target_for_mse.float()
-                )
-                weighted_mse_diff_loss = mse_diff_loss * self.generator_mse_diff_loss_weight
-                total_loss = weighted_mse_diff_loss if total_loss is None else total_loss + weighted_mse_diff_loss
-                log_dict.update({
-                    "generator_mse_diff_loss": weighted_mse_diff_loss.detach(),
-                    "generator_mse_diff_raw": mse_diff_loss.detach(),
-                })
-
 
         if self.gan_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch"):
             with self._freeze_fake_score_params():

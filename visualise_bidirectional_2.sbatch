@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=wan-bidir-visualise
-#SBATCH --nodes=12
+#SBATCH --job-name=wan-bidir-visualise-2
+#SBATCH --nodes=6
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH --time=02:00:00
@@ -14,9 +14,9 @@ mkdir -p "$LOG_DIR"
 
 cd /home/u5as/as1748.u5as/frodobots
 
-CHECKPOINT_STEPS=(7200 6000 5100 4500 3600 2000 900 300)
-LOG_ROOT_NAMES=(retrain_no_gan_256 retrain_no_gan_128 retrain_no_gan_64 retrain_128 retrain_64 retrain_32)
-RANK_ALPHAS=(256 256 64 128 64 128)
+CHECKPOINT_STEPS=(15000 14100 13200 12000 11100 10200 9000 8100)
+LOG_ROOT_NAMES=(retrain_no_gan_256 retrain_no_gan_128 retrain_no_gan_64)
+RANK_ALPHAS=(256 256 64)
 
 CONFIG=ARRWM/configs/bidirectional_inference.yaml
 SCRIPT=ARRWM/utils/visualise_retrain.py
@@ -48,7 +48,7 @@ CHECKPOINT_LIST="${CHECKPOINT_STEPS[*]}"
 LOG_ROOT_LIST="${LOG_ROOT_NAMES[*]}"
 RANK_LIST="${RANK_ALPHAS[*]}"
 
-srun --ntasks=$TOTAL_TASKS --gres=gpu:1 --cpus-per-task=4 --nodes=12 --distribution=block:block --exclusive \
+srun --ntasks=$TOTAL_TASKS --gres=gpu:1 --cpus-per-task=4 --nodes=6 --distribution=block:block --exclusive \
   bash -lc "set -e; source \"$HOME/miniforge/etc/profile.d/conda.sh\"; conda activate arrwm; STEPS=($CHECKPOINT_LIST); LOG_ROOTS=($LOG_ROOT_LIST); RANKS=($RANK_LIST); LOG_ROOT_IDX=\$((\$SLURM_PROCID / ${NUM_CHECKPOINTS})); STEP_IDX=\$((\$SLURM_PROCID % ${NUM_CHECKPOINTS})); LOG_ROOT_NAME=\${LOG_ROOTS[\$LOG_ROOT_IDX]}; STEP=\${STEPS[\$STEP_IDX]}; RANK_ALPHA=\${RANKS[\$LOG_ROOT_IDX]}; LOG_ROOT=/scratch/u5as/as1748.u5as/frodobots/\$LOG_ROOT_NAME/logs; OUTPUT_DIR=/scratch/u5as/as1748.u5as/frodobots/retrain_visualisations/\$LOG_ROOT_NAME; echo '[Rank' \$SLURM_PROCID '] Log root:' \$LOG_ROOT_NAME 'Checkpoint:' \$STEP 'Rank/Alpha:' \$RANK_ALPHA; python $SCRIPT --config-path $CONFIG --checkpoint-step \$STEP --input-dir $INPUT_DIR --skip-existing --logs-root \$LOG_ROOT --output-dir \$OUTPUT_DIR --rank \$RANK_ALPHA"
 
 echo "Completed all visualisations at $(date)"

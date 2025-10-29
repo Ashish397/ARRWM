@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
 import time
+import math
 import torch.distributed as dist
 from contextlib import contextmanager
 
@@ -16,17 +17,19 @@ class MSE_DMD_LAM(DMD):
         # weights for combined loss
         self.lambda_dmd = getattr(args, "lambda_dmd", 1.0)
         self.lambda_mse = getattr(args, "lambda_mse", 0.1)
-        self.lambda_mse_diff = getattr(args, "lambda_mse_diff", 0.0)
         self.diffusion_gan = getattr(args, "diffusion_gan", False)
         self.diffusion_gan_max_timestep = getattr(args, "diffusion_gan_max_timestep", self.num_train_timestep)
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
         self.action_loss_weight = float(getattr(args, "action_loss_weight", 0.0))
         self.guidance_rgs_loss_weight = float(getattr(args, "guidance_rgs_loss_weight", self.action_loss_weight))
+        self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
+        self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
 
         if (self.action_loss_weight > 0.0 or self.guidance_rgs_loss_weight > 0.0) and hasattr(self.fake_score, "adding_rgs_branch"):
             try:
                 self.fake_score.adding_rgs_branch(
-                    time_embed_dim=1536 if self.concat_time_embeddings else 0
+                    time_embed_dim=1536 if self.concat_time_embeddings else 0,
+                    num_frames=self.num_training_frames,
                 )
             except Exception:
                 if not dist.is_initialized() or dist.get_rank() == 0:
@@ -132,30 +135,19 @@ class MSE_DMD_LAM(DMD):
         grad_norm = torch.mean(torch.abs(grad)).detach()
 
         # DMD loss term (same as parent)
-        if gradient_mask is not None:
-            dmd_loss = 0.5 * F.mse_loss(
-                original_latent.double()[gradient_mask],
-                (original_latent.double() - grad.double()).detach()[gradient_mask],
-                reduction="mean",
-            )
-        else:
-            dmd_loss = 0.5 * F.mse_loss(
-                original_latent.double(),
-                (original_latent.double() - grad.double()).detach(),
-                reduction="mean",
-            )
+        target_latent = (original_latent.double() - grad.double()).detach()
+        dmd_loss = 0.5 * self._motion_weighted_mse(
+            pred=original_latent.double(),
+            target=target_latent,
+            gradient_mask=gradient_mask,
+        )
 
         # Distillation MSE term: align student's x0 with teacher's x0 (teacher-guided)
-        if gradient_mask is not None:
-            mse_term = F.mse_loss(
-                pred_fake_image.double()[gradient_mask],
-                pred_real_image.double()[gradient_mask],
-                reduction="mean",
-            )
-        else:
-            mse_term = F.mse_loss(
-                pred_fake_image.double(), pred_real_image.double(), reduction="mean"
-            )
+        mse_term = self._motion_weighted_mse(
+            pred=pred_fake_image.double(),
+            target=pred_real_image.double(),
+            gradient_mask=gradient_mask,
+        )
 
         log_dict = {
             "dmd_loss": dmd_loss.detach(),
@@ -232,7 +224,49 @@ class MSE_DMD_LAM(DMD):
         )
 
         preds = outputs[-1]
-        return preds.squeeze(-1)
+        return preds
+
+    def _compute_motion_weights(self, reference: torch.Tensor) -> torch.Tensor:
+        if (not self.motion_enabled_loss) or reference.ndim < 5:
+            return torch.ones_like(reference, dtype=reference.dtype)
+
+        batch_size, num_frames = reference.shape[:2]
+        if num_frames <= 1:
+            return torch.ones_like(reference, dtype=reference.dtype)
+
+        c = max(self.motion_weight_c, 1.0)
+        ref = reference.detach()
+        diffs = torch.abs(ref[:, 1:] - ref[:, :-1])
+        diffs_flat = diffs.reshape(batch_size, num_frames - 1, -1).to(torch.float32)
+        weights_flat = torch.softmax(diffs_flat, dim=1)
+        log_c = math.log(c)
+        scaled_flat = torch.exp(weights_flat * log_c)
+        scaled = scaled_flat.reshape_as(diffs).to(dtype=reference.dtype, device=reference.device)
+
+        weights = torch.ones_like(reference, dtype=reference.dtype, device=reference.device)
+        weights[:, 1:] = scaled
+        return weights
+
+    def _motion_weighted_mse(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        gradient_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        error = (pred - target) ** 2
+
+        mask = None
+        if gradient_mask is not None:
+            mask = gradient_mask.to(torch.bool)
+
+        if self.motion_enabled_loss:
+            weights = self._compute_motion_weights(target)
+            error = error * weights.to(dtype=error.dtype, device=error.device)
+
+        if mask is not None:
+            error = error[mask]
+
+        return error.mean()
 
     def generator_loss(
         self,
@@ -287,11 +321,12 @@ class MSE_DMD_LAM(DMD):
             min_frames = min(clean_latent.shape[1], pred_image.shape[1])
             clean_lat = clean_latent[:, :min_frames].to(dtype=pred_image.dtype, device=pred_image.device)
             pred_lat = pred_image[:, :min_frames]
-            if gradient_mask is not None:
-                mask = gradient_mask[:, :min_frames]
-                latents_mse = F.mse_loss(pred_lat[mask].double(), target=clean_lat[mask].double(), reduction="mean")
-            else:
-                latents_mse = F.mse_loss(pred_lat.double(), clean_lat.double(), reduction="mean")
+            mask = gradient_mask[:, :min_frames] if gradient_mask is not None else None
+            latents_mse = self._motion_weighted_mse(
+                pred=pred_lat.double(),
+                target=clean_lat.double(),
+                gradient_mask=mask,
+            )
         else:
             latents_mse = torch.zeros((), device=pred_image.device, dtype=pred_image.dtype)
 
@@ -306,16 +341,6 @@ class MSE_DMD_LAM(DMD):
 
         total_loss = self.lambda_dmd * dmd_loss + self.lambda_mse * latents_mse + action_loss
 
-        mse_diff_loss = torch.zeros((), device=pred_image.device, dtype=pred_image.dtype)
-        if self.lambda_mse_diff > 0.0 and clean_latent is not None:
-            min_frames = min(clean_latent.shape[1], pred_image.shape[1])
-            clean_lat = clean_latent[:, :min_frames].to(dtype=pred_image.dtype, device=pred_image.device)
-            pred_lat = pred_image[:, 1:min_frames] - pred_image[:, :min_frames-1]
-            clean_lat = clean_lat[:, 1:min_frames] - clean_lat[:, :min_frames-1]
-            mse_diff_loss = F.mse_loss(pred_lat, clean_lat, reduction="mean")
-            weighted_mse_diff_loss = mse_diff_loss * self.lambda_mse_diff
-            total_loss = total_loss + weighted_mse_diff_loss
-
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"Generator loss: After losses", device=self.device, rank=dist.get_rank())
         try:
@@ -329,7 +354,6 @@ class MSE_DMD_LAM(DMD):
             "generator_loss": total_loss.detach(),
             "latent_mse": latents_mse.detach(),
             "generator_act_loss": action_loss.detach(),
-            "generator_mse_diff_loss": mse_diff_loss.detach(),
         })
         return total_loss, dmd_log_dict
 
