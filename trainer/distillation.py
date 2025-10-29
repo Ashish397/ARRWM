@@ -906,8 +906,10 @@ class Trainer:
 
         latent_action_model.to(device=self.device, dtype=torch.float32)
         latent_action_model.eval()
+        for param in latent_action_model.parameters():
+            param.requires_grad_(False)
         return latent_action_model
-
+        
     def _move_optimizer_to_device(self, optimizer, device):
         """Move optimizer state to the specified device."""
         for state in optimizer.state.values():
