@@ -1821,6 +1821,8 @@ class Trainer:
                             "generator_adaptive_gan_weight",
                         ):
                             _collect_metric(generator_log_dict, metric)
+                        _collect_metric(generator_log_dict, "latent_action_loss", rename="action_loss")
+                        _collect_metric(generator_log_dict, "latent_action_loss_raw")
 
                     for metric in (
                         "critic_loss",
