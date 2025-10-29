@@ -12,8 +12,8 @@ model_kwargs:
 
 adapter:
   type: lora
-  rank: 128
-  alpha: 128
+  rank: None
+  alpha: None
   dropout: 0.0
   dtype: bfloat16
   verbose: false

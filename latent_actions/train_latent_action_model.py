@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Train an ensemble of latent action classifiers that infer actions from states.
+"""Streamed training for latent action regression models.
 
-The script pairs encoded frame tensors (s_t, s_{t+1}) with either input or output
-actions and trains an ensemble of simple heads (stacked, convolved, concatenated,
-subtracted views) to predict the corresponding action class. It expects the
-encoded tensors and action CSVs to share the same directory layout and can be
-configured via `latent_actions/latent_training.yaml`.
+The trainer repeatedly samples small, random subsets of rides, builds an
+in-memory dataset from those rides, fits a regression head that predicts the
+continuous action vector (e.g. linear/angular velocities), and then repeats with
+fresh data. This limits peak memory usage while still touching the full corpus
+over time. Metrics are logged to Weights & Biases if configured.
 """
 
 from __future__ import annotations
@@ -13,8 +13,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import random
+from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -22,310 +27,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-
-class TransitionDataset(Dataset):
-    def __init__(self, variant_names: Sequence[str], feature_tensors: Dict[str, torch.Tensor], labels: torch.Tensor, rides: List[str]) -> None:
-        self.variant_names = list(variant_names)
-        self._features = [feature_tensors[name] for name in self.variant_names]
-        self._labels = labels
-        self._rides = rides
-
-    def __len__(self) -> int:
-        return self._labels.shape[0]
-
-    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], torch.Tensor]:
-        return [feat[idx] for feat in self._features], self._labels[idx]
-
-    @property
-    def labels(self) -> torch.Tensor:
-        return self._labels
-
-    @property
-    def rides(self) -> List[str]:
-        return list(self._rides)
-
-    def feature_tensors(self) -> Dict[str, torch.Tensor]:
-        return {name: feat for name, feat in zip(self.variant_names, self._features)}
+try:
+    import wandb
+except ImportError:  # pragma: no cover - handled at runtime when wandb missing
+    wandb = None  # type: ignore
 
 
-class MLPClassifier(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: Sequence[int], num_classes: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        layers: List[nn.Module] = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.extend([nn.Linear(prev_dim, hidden_dim), nn.ReLU(inplace=True)])
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, num_classes))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class ConvClassifier(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int, hidden_dims: Sequence[int], dropout: float = 0.0) -> None:
-        super().__init__()
-        conv_hidden = max(32, min(256, in_channels * 2))
-        conv_out = max(64, conv_hidden)
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(in_channels, conv_hidden, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(conv_hidden, conv_out, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.classifier = MLPClassifier(conv_out, hidden_dims, num_classes, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.feature_extractor(x)
-        flattened = features.flatten(start_dim=1)
-        return self.classifier(flattened)
-
-
-class EnsembleClassifier(nn.Module):
-    def __init__(
-        self,
-        variant_names: Sequence[str],
-        submodules: Dict[str, nn.Module],
-    ) -> None:
-        super().__init__()
-        self.variant_names = list(variant_names)
-        self.submodules = nn.ModuleDict(submodules)
-
-    def forward(self, *features: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        component_logits: Dict[str, torch.Tensor] = {}
-        logits_list: List[torch.Tensor] = []
-        for name, feature in zip(self.variant_names, features):
-            logits = self.submodules[name](feature)
-            component_logits[name] = logits
-            logits_list.append(logits)
-        stacked_logits = torch.stack(logits_list, dim=0)
-        return stacked_logits.mean(dim=0), component_logits
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--encoded-root", type=Path, required=True, help="Root directory that contains encoded frame tensors.")
-    parser.add_argument("--actions-root", type=Path, required=True, help="Root directory that contains action CSV files.")
-    parser.add_argument("--split", type=str, default="train", help="Dataset split to use (e.g. train, test).")
-    parser.add_argument("--action-kind", type=str, choices=["input", "output"], default="input", help="Whether to use input_actions or output_actions CSVs.")
-    parser.add_argument("--ride-ids", type=str, nargs="*", default=None, help="Optional list of ride directory names to include.")
-    parser.add_argument("--pool-size", type=int, default=4, help="Spatial size for adaptive average pooling (per dimension).")
-    parser.add_argument("--rounding", type=int, default=5, help="Number of decimals retained when grouping identical actions.")
-    parser.add_argument("--hidden-dims", type=int, nargs="+", default=(256, 128), help="Hidden layer sizes for the MLP.")
-    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability applied after hidden layers.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training.")
-    parser.add_argument("--max-epochs", type=int, default=2000, help="Maximum number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for Adam.")
-    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay for Adam.")
-    parser.add_argument(
-        "--min-accuracy",
-        type=float,
-        default=1.0,
-        help="Required training accuracy threshold (use 1.0 to force perfect accuracy).",
-    )
-    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional path to save the trained model state.")
-    parser.add_argument("--device", type=str, default="auto", help="Training device ('cpu', 'cuda', or 'auto').")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("latent_actions/latent_training.yaml"),
-        help="Optional configuration file to control ensemble components (JSON-formatted YAML).",
-    )
-    return parser.parse_args()
-
-
-def infer_device(arg: str) -> torch.device:
-    if arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(arg)
-
-
-def load_config(path: Path) -> Dict[str, object]:
-    if not path:
-        return {}
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as handle:
-        content = handle.read().strip()
-        if not content:
-            return {}
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Configuration file {path} must contain JSON-compatible YAML content.") from exc
-
-
-def resolve_ensemble_flags(config: Dict[str, object]) -> Dict[str, bool]:
-    defaults = {
-        "stacked": True,
-        "convolved": True,
-        "concatenated": True,
-        "subtracted": True,
-    }
-    ensemble_cfg = config.get("ensemble") if isinstance(config, dict) else None
-    if isinstance(ensemble_cfg, dict):
-        overrides = {key: bool(value) for key, value in ensemble_cfg.items() if key in defaults}
-        defaults.update(overrides)
-    if not any(defaults.values()):
-        raise ValueError("Ensemble configuration disables all models; enable at least one.")
-    return defaults
-
-
-
-def find_action_files(actions_root: Path, split: str, action_kind: str, ride_ids: Optional[Sequence[str]]) -> List[Path]:
-    split_root = actions_root / split
-    if not split_root.exists():
-        raise FileNotFoundError(f"Actions split directory not found: {split_root}")
-    pattern = f"{action_kind}_actions_*.csv"
-    candidates = sorted(split_root.glob("output_rides_*/*/" + pattern))
-    if ride_ids:
-        ride_filters = set(ride_ids)
-        candidates = [path for path in candidates if path.parent.name in ride_filters]
-        if not candidates:
-            raise ValueError(f"No action files matched the requested ride ids: {ride_ids}")
-    if not candidates:
-        raise FileNotFoundError(f"No action CSVs matching pattern '{pattern}' found under {split_root}")
-    return candidates
-
-
-def load_tensor(encoded_path: Path) -> torch.Tensor:
-    tensor = torch.load(encoded_path, map_location="cpu")
-    if isinstance(tensor, dict):
-        # Some dumps may wrap the tensor under a specific key.
-        for value in tensor.values():
-            if isinstance(value, torch.Tensor):
-                tensor = value
-                break
-        else:
-            raise ValueError(f"No tensor found inside dictionary at {encoded_path}")
-    if isinstance(tensor, (list, tuple)):
-        if not tensor:
-            raise ValueError(f"Encoded tensor list is empty at {encoded_path}")
-        tensor = torch.stack([t if isinstance(t, torch.Tensor) else torch.tensor(t) for t in tensor])
-    if tensor.dim() == 5 and tensor.size(0) == 1:
-        tensor = tensor.squeeze(0)
-    if tensor.dim() == 4 and tensor.shape[0] <= 64 and tensor.shape[1] > tensor.shape[0]:
-        tensor = tensor.permute(1, 0, 2, 3)
-    if tensor.dim() < 3:
-        raise ValueError(f"Encoded tensor must have at least 3 dimensions, got shape {tuple(tensor.shape)} at {encoded_path}")
-    return tensor.float()
-
-
-def pool_state(state: torch.Tensor, pool_hw: int) -> torch.Tensor:
-    if state.dim() == 3:
-        return F.adaptive_avg_pool2d(state.unsqueeze(0), (pool_hw, pool_hw)).squeeze(0)
-    if state.dim() == 2:
-        return F.adaptive_avg_pool2d(state.unsqueeze(0).unsqueeze(0), (pool_hw, pool_hw)).squeeze(0).squeeze(0)
-    raise ValueError(f"Unsupported state tensor with shape {tuple(state.shape)}")
-
-
-def build_variant_feature(variant: str, state_t: torch.Tensor, state_tp1: torch.Tensor) -> torch.Tensor:
-    if variant == "stacked":
-        return torch.cat([state_t, state_tp1], dim=0).flatten()
-    if variant == "concatenated":
-        return torch.cat([state_t.flatten(), state_tp1.flatten()], dim=0)
-    if variant == "subtracted":
-        return (state_tp1 - state_t).flatten()
-    if variant == "convolved":
-        return torch.cat([state_t, state_tp1], dim=0)
-    raise KeyError(f"Unknown variant '{variant}'")
-
-
-def collect_samples(
-    encoded_root: Path,
-    actions_root: Path,
-    split: str,
-    action_kind: str,
-    ride_ids: Optional[Sequence[str]],
-    active_variants: Sequence[str],
-    pool_hw: int,
-    rounding: int,
-) -> Tuple[TransitionDataset, torch.Tensor, List[str]]:
-    action_csvs = find_action_files(actions_root, split, action_kind, ride_ids)
-    variant_features: Dict[str, List[torch.Tensor]] = {name: [] for name in active_variants}
-    labels: List[int] = []
-    rides_used: List[str] = []
-    action_lookup: dict[Tuple[float, ...], int] = {}
-    action_prototypes: List[np.ndarray] = []
-
-    for action_csv in action_csvs:
-        ride_dir = action_csv.parent
-        ride_name = ride_dir.name
-        relative = ride_dir.relative_to(actions_root / split)
-        encoded_dir = encoded_root / split / relative
-
-        encoded_files = sorted(encoded_dir.glob("encoded_video_*.pt"))
-        if not encoded_files:
-            raise FileNotFoundError(f"No encoded videos found for ride '{ride_name}' expected at {encoded_dir}")
-
-        frame_ids, action_values = read_action_csv(action_csv)
-        action_cursor = 0
-        start_label_count = len(labels)
-        for encoded_file in encoded_files:
-            frames = load_tensor(encoded_file)
-            if frames.dim() not in (3, 4):
-                raise ValueError(f"Unsupported encoded tensor rank {frames.dim()} at {encoded_file}")
-            num_frames = frames.shape[0]
-            if num_frames < 2:
-                continue
-
-            available_actions = action_values.shape[0] - action_cursor
-            if available_actions <= 0:
-                break
-
-            max_pairs = min(num_frames - 1, available_actions)
-            for idx in range(max_pairs):
-                state_t = frames[idx].float()
-                state_tp1 = frames[idx + 1].float()
-                pooled_t = pool_state(state_t, pool_hw)
-                pooled_tp1 = pool_state(state_tp1, pool_hw)
-                for variant in active_variants:
-                    feature_tensor = build_variant_feature(variant, pooled_t, pooled_tp1)
-                    variant_features[variant].append(feature_tensor)
-                action_vec = action_values[action_cursor + idx]
-                class_id = assign_action_class(action_vec, action_lookup, action_prototypes, rounding)
-                labels.append(class_id)
-                rides_used.append(ride_name)
-            action_cursor += max_pairs
-
-        if len(labels) == start_label_count:
-            raise ValueError(f"No frames loaded for ride '{ride_name}'")
-
-    if not labels:
-        raise RuntimeError("No samples constructed from the provided data.")
-    if not action_prototypes:
-        raise RuntimeError("Failed to derive any unique actions from the provided CSV files.")
-
-    feature_tensors = {}
-    for variant_name, feature_list in variant_features.items():
-        if not feature_list:
-            continue
-        stacked = torch.stack(feature_list)
-        feature_tensors[variant_name] = stacked
-    missing_variants = [name for name in active_variants if name not in feature_tensors]
-    if missing_variants:
-        raise RuntimeError(f"No features were generated for variants: {missing_variants}")
-    labels_tensor = torch.tensor(labels, dtype=torch.long)
-    dataset = TransitionDataset(active_variants, feature_tensors, labels_tensor, rides_used)
-    action_tensor = torch.tensor(action_prototypes, dtype=torch.float32)
-    return dataset, action_tensor, rides_used
-
-
-def assign_action_class(
-    action_vec: np.ndarray,
-    lookup: dict[Tuple[float, ...], int],
-    prototypes: List[np.ndarray],
-    rounding: int,
-) -> int:
-    key = tuple(np.round(action_vec, decimals=rounding).tolist())
-    if key not in lookup:
-        lookup[key] = len(prototypes)
-        prototypes.append(action_vec.astype(np.float32))
-    return lookup[key]
+# ---------------------------------------------------------------------------
+# Data utilities
 
 
 def read_action_csv(path: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -357,139 +66,594 @@ def read_action_csv(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return sorted_frames, sorted_actions
 
 
-def train_model(
-    dataset: TransitionDataset,
-    action_values: torch.Tensor,
-    args: argparse.Namespace,
-) -> Tuple[EnsembleClassifier, float]:
-    device = infer_device(args.device)
-    feature_map = dataset.feature_tensors()
-    submodules: Dict[str, nn.Module] = {}
-    for name in dataset.variant_names:
-        tensor = feature_map[name]
-        if tensor.dim() == 2:
-            input_dim = tensor.shape[1]
-            submodules[name] = MLPClassifier(input_dim, args.hidden_dims, action_values.shape[0], dropout=args.dropout)
-        elif tensor.dim() == 4:
-            _, in_channels, _, _ = tensor.shape
-            submodules[name] = ConvClassifier(in_channels, action_values.shape[0], args.hidden_dims, dropout=args.dropout)
-        else:
-            raise ValueError(f"Unsupported feature tensor rank {tensor.dim()} for variant '{name}'")
+def find_action_files(actions_root: Path, split: str, action_kind: str, ride_ids: Optional[Sequence[str]]) -> List[Path]:
+    split_root = actions_root / split
+    if not split_root.exists():
+        raise FileNotFoundError(f"Actions split directory not found: {split_root}")
+    pattern = f"{action_kind}_actions_*.csv"
+    candidates = sorted(split_root.glob("output_rides_*/*/" + pattern))
+    if ride_ids:
+        ride_filters = set(ride_ids)
+        candidates = [path for path in candidates if path.parent.name in ride_filters]
+        if not candidates:
+            raise ValueError(f"No action files matched the requested ride ids: {ride_ids}")
+    if not candidates:
+        raise FileNotFoundError(f"No action CSVs matching pattern '{pattern}' found under {split_root}")
+    return candidates
 
-    ensemble = EnsembleClassifier(dataset.variant_names, submodules).to(device)
-    multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
-    if multi_gpu:
-        ensemble = nn.DataParallel(ensemble)
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(ensemble.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    target_accuracy = args.min_accuracy
-    eval_features = [feature_map[name].to(device).float() for name in dataset.variant_names]
-    eval_labels = dataset.labels.to(device)
-    history_loss: List[float] = []
-    history_acc: List[float] = []
-
-    for epoch in range(1, args.max_epochs + 1):
-        ensemble.train()
-        for batch_features, batch_labels in loader:
-            batch_tensors = [tensor.to(device).float() for tensor in batch_features]
-            batch_labels = batch_labels.to(device)
-            optimizer.zero_grad()
-            logits, _ = ensemble(*batch_tensors)
-            loss = criterion(logits, batch_labels)
-            loss.backward()
-            optimizer.step()
-
-        with torch.no_grad():
-            ensemble.eval()
-            logits, _ = ensemble(*eval_features)
-            predictions = logits.argmax(dim=1)
-            correct = (predictions == eval_labels).float().mean().item()
-            loss_value = criterion(logits, eval_labels).item()
-            history_loss.append(loss_value)
-            history_acc.append(correct)
-            print(f"Epoch {epoch:04d} | loss={loss_value:.6f} | acc={correct * 100:.2f}%")
-            if correct >= target_accuracy:
-                print(f"Target accuracy {target_accuracy * 100:.2f}% reached at epoch {epoch}.")
+def load_tensor(encoded_path: Path) -> torch.Tensor:
+    tensor = torch.load(encoded_path, map_location="cpu")
+    if isinstance(tensor, dict):
+        for value in tensor.values():
+            if isinstance(value, torch.Tensor):
+                tensor = value
                 break
+        else:
+            raise ValueError(f"No tensor found inside dictionary at {encoded_path}")
+    if isinstance(tensor, (list, tuple)):
+        if not tensor:
+            raise ValueError(f"Encoded tensor list is empty at {encoded_path}")
+        tensor = torch.stack([t if isinstance(t, torch.Tensor) else torch.tensor(t) for t in tensor])
+    if tensor.dim() == 5 and tensor.size(0) == 1:
+        tensor = tensor.squeeze(0)
+    if tensor.dim() == 4 and tensor.shape[0] <= 64 and tensor.shape[1] > tensor.shape[0]:
+        tensor = tensor.permute(1, 0, 2, 3)
+    if tensor.dim() < 3:
+        raise ValueError(f"Encoded tensor must have at least 3 dimensions, got shape {tuple(tensor.shape)} at {encoded_path}")
+    return tensor.float()
+
+
+WINDOW_SIZE = 8
+ACTION_INDEX = WINDOW_SIZE - 2  # Predict action taken at frame index 6 (0-based)
+
+
+# ---------------------------------------------------------------------------
+# Dataset and streaming loader
+
+
+@dataclass
+class RideData:
+    ride_name: str
+    encoded_dir: Path
+    action_csv: Path
+
+
+class TransitionDataset(Dataset):
+    def __init__(self, features: torch.Tensor, targets: torch.Tensor) -> None:
+        self.features = features
+        self.targets = targets
+
+    def __len__(self) -> int:
+        return self.features.shape[0]
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.features[idx], self.targets[idx]
+
+
+def collect_rides(actions_root: Path, encoded_root: Path, split: str, action_kind: str, ride_ids: Optional[Sequence[str]]) -> List[RideData]:
+    action_paths = find_action_files(actions_root, split, action_kind, ride_ids)
+    rides: List[RideData] = []
+    for csv_path in action_paths:
+        ride_dir = csv_path.parent
+        ride_name = ride_dir.name
+        relative = ride_dir.relative_to(actions_root / split)
+        encoded_dir = encoded_root / split / relative
+        rides.append(RideData(ride_name=ride_name, encoded_dir=encoded_dir, action_csv=csv_path))
+    return rides
+
+
+def prepare_ride_samples(ride: RideData, pool_hw: int, action_dim: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    feature_list: List[torch.Tensor] = []
+    target_list: List[torch.Tensor] = []
+
+    encoded_files = sorted(ride.encoded_dir.glob("encoded_video_*.pt"))
+    if not encoded_files:
+        return feature_list, target_list
+
+    frame_segments: List[torch.Tensor] = []
+    for encoded_file in encoded_files:
+        frames = load_tensor(encoded_file)
+        if frames.dim() == 3:
+            frames = frames.unsqueeze(0)
+        frame_segments.append(frames)
+
+    if not frame_segments:
+        return feature_list, target_list
+
+    frames = torch.cat(frame_segments, dim=0).float()  # (T, C, H, W)
+    if pool_hw > 0:
+        frames = F.adaptive_avg_pool2d(frames, (pool_hw, pool_hw))
+
+    _, action_values = read_action_csv(ride.action_csv)
+    total_frames = frames.shape[0]
+    if total_frames < WINDOW_SIZE or action_values.shape[0] <= ACTION_INDEX:
+        return feature_list, target_list
+
+    max_windows = total_frames - WINDOW_SIZE + 1
+    max_actions = action_values.shape[0] - ACTION_INDEX
+    windows = min(max_windows, max_actions)
+    if windows <= 0:
+        return feature_list, target_list
+
+    for start in range(windows):
+        window_frames = frames[start : start + WINDOW_SIZE]  # (T, C, H, W)
+        window_tensor = window_frames.permute(1, 0, 2, 3).contiguous().clone()  # (C, T, H, W)
+        feature_list.append(window_tensor)
+        action_vec = action_values[start + ACTION_INDEX]
+        if action_vec.shape[0] != action_dim:
+            raise ValueError(
+                f"Action dimension mismatch for ride {ride.ride_name}: expected {action_dim}, got {action_vec.shape[0]}"
+            )
+        target_list.append(torch.from_numpy(action_vec.copy()).float())
+
+    return feature_list, target_list
+
+
+def load_chunk_dataset(
+    rides: Sequence[RideData],
+    pool_hw: int,
+    action_dim: int,
+    num_workers: int,
+) -> TransitionDataset:
+    feature_list: List[torch.Tensor] = []
+    target_list: List[torch.Tensor] = []
+
+    if num_workers <= 1:
+        for ride in rides:
+            ride_features, ride_targets = prepare_ride_samples(ride, pool_hw, action_dim)
+            feature_list.extend(ride_features)
+            target_list.extend(ride_targets)
     else:
-        print(f"Reached max epochs ({args.max_epochs}) with best accuracy {max(history_acc) * 100:.2f}%.")
+        with ThreadPoolExecutor(max_workers=min(num_workers, len(rides))) as executor:
+            futures = [executor.submit(prepare_ride_samples, ride, pool_hw, action_dim) for ride in rides]
+            for future in futures:
+                ride_features, ride_targets = future.result()
+                feature_list.extend(ride_features)
+                target_list.extend(ride_targets)
 
-    final_accuracy = history_acc[-1] if history_acc else 0.0
-    if final_accuracy < target_accuracy:
-        raise RuntimeError(f"Training accuracy {final_accuracy * 100:.2f}% did not reach required threshold {target_accuracy * 100:.2f}%.")
+    if not feature_list:
+        raise RuntimeError("Chunk loader failed to produce any samples; check that encoded videos exist for selected rides.")
 
-    trained_model = ensemble.module if isinstance(ensemble, nn.DataParallel) else ensemble
-    return trained_model, final_accuracy
+    c_sizes = [feat.shape[0] for feat in feature_list]
+    t_sizes = [feat.shape[1] for feat in feature_list]
+    h_sizes = [feat.shape[2] for feat in feature_list]
+    w_sizes = [feat.shape[3] for feat in feature_list]
+
+    max_c = max(c_sizes)
+    max_t = max(t_sizes)
+    max_h = max(h_sizes)
+    max_w = max(w_sizes)
+
+    features = torch.zeros(len(feature_list), max_c, max_t, max_h, max_w, dtype=torch.float32)
+    for idx, feat in enumerate(feature_list):
+        c, t, h, w = feat.shape
+        features[idx, :c, :t, :h, :w] = feat
+
+    targets = torch.stack(target_list).float()
+    return TransitionDataset(features, targets)
 
 
-def save_checkpoint(
-    path: Path,
+def chunk_iterator(rides: Sequence[RideData], chunk_size: int, infinite: bool = True) -> Iterator[List[RideData]]:
+    indices = list(range(len(rides)))
+    while True:
+        random.shuffle(indices)
+        for start in range(0, len(indices), chunk_size):
+            chunk = [rides[idx] for idx in indices[start : start + chunk_size]]
+            yield chunk
+        if not infinite:
+            break
+
+
+def evaluate_model(
     model: nn.Module,
-    action_values: torch.Tensor,
+    device: torch.device,
+    rides: Sequence[RideData],
     args: argparse.Namespace,
-    variant_names: Sequence[str],
-    ensemble_flags: Dict[str, bool],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "model_state": model.state_dict(),
-        "action_values": action_values,
-        "hidden_dims": list(args.hidden_dims),
-        "pool_size": args.pool_size,
-        "rounding": args.rounding,
-        "action_kind": args.action_kind,
-        "variant_names": list(variant_names),
-        "ensemble_flags": ensemble_flags,
-        "metadata": {
-            "split": args.split,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "max_epochs": args.max_epochs,
-        },
+    action_dim: int,
+    split_name: str,
+) -> Optional[Dict[str, float]]:
+    if not rides:
+        print(f"No rides provided for {split_name} evaluation.")
+        return None
+
+    eval_chunk = args.eval_chunk_size if args.eval_chunk_size > 0 else args.chunk_size
+    total_mse = 0.0
+    total_mae = 0.0
+    total_vectors = 0
+    total_samples = 0
+
+    previous_mode = model.training
+    model.eval()
+
+    for start in range(0, len(rides), eval_chunk):
+        batch_rides = rides[start : start + eval_chunk]
+        dataset = load_chunk_dataset(batch_rides, args.pool_size, action_dim, args.num_workers)
+        features = dataset.features.to(device)
+        targets = dataset.targets.to(device)
+        with torch.no_grad():
+            preds = model(features)
+            mse_sum = F.mse_loss(preds, targets, reduction="sum").item()
+            mae_sum = F.l1_loss(preds, targets, reduction="sum").item()
+        total_mse += mse_sum
+        total_mae += mae_sum
+        total_vectors += targets.numel()
+        total_samples += targets.shape[0]
+
+        del dataset, features, targets
+
+    if previous_mode:
+        model.train()
+
+    mean_mse = total_mse / max(1, total_vectors)
+    mean_mae = total_mae / max(1, total_vectors)
+    print(
+        f"{split_name.capitalize()} evaluation | samples={total_samples} | "
+        f"mse={mean_mse:.6f} | mae={mean_mae:.6f}"
+    )
+    return {
+        "mse": mean_mse,
+        "mae": mean_mae,
+        "samples": float(total_samples),
+        "vectors": float(total_vectors),
     }
-    torch.save(payload, path)
-    print(f"Checkpoint saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Model and training
+
+
+class Action3DCNN(nn.Module):
+    def __init__(self, in_channels: int, action_dim: int, hidden_dims: Sequence[int], dropout: float = 0.0) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv3d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=(1, 2, 2)),
+            nn.Conv3d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=(2, 2, 2)),
+            nn.Conv3d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
+            nn.Flatten(),
+        )
+
+        mlp_layers: List[nn.Module] = []
+        prev_dim = 256
+        for hidden_dim in hidden_dims:
+            mlp_layers.append(nn.Linear(prev_dim, hidden_dim))
+            mlp_layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                mlp_layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        mlp_layers.append(nn.Linear(prev_dim, action_dim))
+        self.head = nn.Sequential(*mlp_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(x)
+        return self.head(features)
+
+
+def infer_device(arg: str) -> torch.device:
+    if arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(arg)
+
+
+def scale_for_gpu(args: argparse.Namespace) -> None:
+    if args.device == "cpu":
+        return
+    if not torch.cuda.is_available():
+        return
+
+    device_count = torch.cuda.device_count()
+    total_mem_gb = []
+    gpu_names = []
+    for idx in range(device_count):
+        props = torch.cuda.get_device_properties(idx)
+        total_mem_gb.append(props.total_memory / (1024 ** 3))
+        gpu_names.append(props.name)
+
+    if not total_mem_gb:
+        return
+
+    min_mem = min(total_mem_gb)
+    max_mem = max(total_mem_gb)
+    canonical_name = gpu_names[0].upper()
+
+    scaled = False
+    if "H100" in canonical_name:
+        target_chunk = max(args.chunk_size, 32)
+        target_batch = max(args.batch_size, 2048)
+        if target_chunk != args.chunk_size or target_batch != args.batch_size:
+            args.chunk_size = target_chunk
+            args.batch_size = target_batch
+            scaled = True
+    else:
+        baseline_mem = 40.0  # GB reference (roughly A100 40GB)
+        scale_factor = max(1.0, min_mem / baseline_mem)
+        scaled_chunk = max(args.chunk_size, int(math.ceil(args.chunk_size * scale_factor)))
+        scaled_batch = max(args.batch_size, int(math.ceil(args.batch_size * scale_factor)))
+        if scaled_chunk != args.chunk_size or scaled_batch != args.batch_size:
+            args.chunk_size = scaled_chunk
+            args.batch_size = scaled_batch
+            scaled = True
+
+    if scaled:
+        mem_str = ", ".join(f"{mem:.1f}GB" for mem in total_mem_gb)
+        print(
+            f"Auto-scaled training sizes for GPUs [{mem_str}] "
+            f"(detected {gpu_names[0]}): chunk_size={args.chunk_size}, batch_size={args.batch_size}"
+        )
+
+
+def train_streaming(
+    args: argparse.Namespace,
+    rides: Sequence[RideData],
+    action_dim: int,
+) -> None:
+    device = infer_device(args.device)
+    model = None
+    optimizer: Optional[torch.optim.Optimizer] = None
+    criterion = nn.MSELoss()
+
+    if args.eval_split:
+        eval_ride_ids = set(args.eval_ride_ids) if args.eval_ride_ids else None
+        eval_rides = collect_rides(
+            actions_root=args.actions_root,
+            encoded_root=args.encoded_root,
+            split=args.eval_split,
+            action_kind=args.action_kind,
+            ride_ids=eval_ride_ids,
+        )
+    else:
+        eval_rides = []
+
+    run = None
+    if args.wandb_project:
+        if wandb is None:
+            raise RuntimeError("wandb is not installed but wandb logging is requested.")
+        wandb_config = {
+            **vars(args),
+            "num_rides": len(rides),
+            "action_dim": action_dim,
+            "eval_split": args.eval_split,
+            "eval_rides": len(eval_rides),
+        }
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.wandb_run_name or None,
+            group=args.wandb_group or None,
+            mode=args.wandb_mode,
+            config=wandb_config,
+        )
+
+    chunk_gen = chunk_iterator(rides, args.chunk_size, infinite=True)
+    total_chunks = 0
+    consecutive_hits = 0
+    best_mse = float("inf")
+    global_step = 0
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    input_channels: Optional[int] = None
+    train_metrics: Optional[Dict[str, float]] = None
+    eval_metrics: Optional[Dict[str, float]] = None
+
+    try:
+        while True:
+            if args.max_chunks and total_chunks >= args.max_chunks:
+                print(f"Reached max_chunks={args.max_chunks}, stopping.")
+                break
+
+            chunk_rides = next(chunk_gen)
+            chunk_names = [ride.ride_name for ride in chunk_rides]
+            print(f"\n=== Loading chunk #{total_chunks + 1} with rides: {chunk_names} ===")
+            dataset = load_chunk_dataset(chunk_rides, args.pool_size, action_dim, args.num_workers)
+            loader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                pin_memory=device.type == "cuda",
+            )
+
+            if model is None:
+                input_channels = dataset.features.shape[1]
+                model = Action3DCNN(input_channels, action_dim, args.hidden_dims, dropout=args.dropout).to(device)
+                if device.type == "cuda" and torch.cuda.device_count() > 1:
+                    model = nn.DataParallel(model)
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            elif input_channels is None:
+                input_channels = dataset.features.shape[1]
+
+            chunk_steps = 0
+            for epoch in range(args.chunk_epochs):
+                for features, targets in loader:
+                    features = features.to(device)
+                    targets = targets.to(device)
+                    optimizer.zero_grad()  # type: ignore
+                    logits = model(features)
+                    loss = criterion(logits, targets)
+                    loss.backward()
+                    optimizer.step()  # type: ignore
+                    chunk_steps += 1
+                    global_step += 1
+
+            with torch.no_grad():
+                model.eval()
+                features = dataset.features.to(device)
+                targets = dataset.targets.to(device)
+                logits = model(features)
+                mse = criterion(logits, targets).item()
+                mae = torch.mean(torch.abs(logits - targets)).item()
+                model.train()
+
+            if mse < best_mse or best_state is None:
+                base_model = model.module if isinstance(model, nn.DataParallel) else model
+                best_state = base_model.state_dict()
+                best_mse = mse
+            total_chunks += 1
+            if args.target_mse > 0:
+                consecutive_hits = consecutive_hits + 1 if mse <= args.target_mse else 0
+            else:
+                consecutive_hits = 0
+
+            print(
+                f"Chunk {total_chunks} | samples={len(dataset)} | "
+                f"mse={mse:.6f} | mae={mae:.6f} | "
+                f"consecutive_hits={consecutive_hits}"
+            )
+
+            if run:
+                wandb.log(
+                    {
+                        "chunk": total_chunks,
+                        "chunk_mse": mse,
+                        "chunk_mae": mae,
+                        "best_mse": best_mse,
+                        "consecutive_hits": consecutive_hits,
+                        "samples": len(dataset),
+                    },
+                    step=global_step,
+                )
+
+            if args.target_mse > 0 and consecutive_hits >= args.patience:
+                print(
+                    f"Target MSE {args.target_mse:.6f} reached for "
+                    f"{consecutive_hits} consecutive chunks. Stopping training."
+                )
+                break
+
+        if best_state is None or input_channels is None:
+            raise RuntimeError("Training did not produce a valid model state.")
+
+        eval_model = Action3DCNN(input_channels, action_dim, args.hidden_dims, dropout=args.dropout).to(device)
+        eval_model.load_state_dict(best_state)
+        if device.type == "cuda" and torch.cuda.device_count() > 1:
+            eval_model = nn.DataParallel(eval_model)
+
+        train_metrics = evaluate_model(eval_model, device, rides, args, action_dim, "train")
+        eval_metrics = evaluate_model(eval_model, device, eval_rides, args, action_dim, args.eval_split or "eval") if eval_rides else None
+
+        if run:
+            summary_log = {
+                "best_mse": best_mse,
+            }
+            if train_metrics:
+                summary_log.update(
+                    {
+                        "train_mse": train_metrics["mse"],
+                        "train_mae": train_metrics["mae"],
+                    }
+                )
+            if eval_metrics:
+                summary_log.update(
+                    {
+                        "eval_mse": eval_metrics["mse"],
+                        "eval_mae": eval_metrics["mae"],
+                    }
+                )
+            wandb.log(summary_log, step=global_step)
+
+    finally:
+        if run:
+            run.finish()
+
+    if args.checkpoint_path and best_state is not None:
+        path = args.checkpoint_path
+        if path.exists():
+            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            path = path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
+            print(f"Checkpoint path exists; writing new checkpoint to {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model_state": best_state,
+            "hidden_dims": list(args.hidden_dims),
+            "pool_size": args.pool_size,
+            "action_kind": args.action_kind,
+            "action_dim": action_dim,
+            "metadata": {
+                "split": args.split,
+                "chunk_size": args.chunk_size,
+                "chunk_epochs": args.chunk_epochs,
+                "patience": args.patience,
+                "target_mse": args.target_mse,
+                "best_mse": best_mse,
+                "total_chunks": total_chunks,
+                "eval_split": args.eval_split,
+            },
+            "evaluation": {
+                "train": train_metrics if train_metrics else {},
+                "eval": eval_metrics if eval_metrics else {},
+            },
+        }
+        torch.save(payload, path)
+        print(f"Checkpoint saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing / entrypoint
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--encoded-root", type=Path, required=True, help="Root directory that contains encoded frame tensors.")
+    parser.add_argument("--actions-root", type=Path, required=True, help="Root directory that contains action CSV files.")
+    parser.add_argument("--split", type=str, default="train", help="Dataset split to use (e.g. train, test).")
+    parser.add_argument("--action-kind", type=str, choices=["input", "output"], default="input", help="Which action CSVs to use.")
+    parser.add_argument("--ride-ids", type=str, nargs="*", default=None, help="Optional list of ride directory names to include.")
+    parser.add_argument("--pool-size", type=int, default=32, help="Spatial size for adaptive avg pooling before 3D encoding (set 0 to disable).")
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=(256, 128), help="Hidden layer sizes for the MLP.")
+    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability applied after hidden layers.")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training within each chunk.")
+    parser.add_argument("--chunk-size", type=int, default=8, help="Number of rides to include per streamed chunk.")
+    parser.add_argument("--chunk-epochs", type=int, default=1, help="Number of epochs to run on each chunk before sampling new rides.")
+    parser.add_argument("--max-chunks", type=int, default=0, help="Optional cap on total chunks processed (0 means unlimited).")
+    parser.add_argument("--patience", type=int, default=3, help="Stop once target MSE is met for this many consecutive chunks.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for Adam.")
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay for Adam.")
+    parser.add_argument("--target-mse", type=float, default=0.0, help="Optional target MSE for early stopping (<=0 disables early stop).")
+    parser.add_argument("--device", type=str, default="auto", help="Training device ('cpu', 'cuda', or 'auto').")
+    parser.add_argument("--num-workers", type=int, default=16, help="Number of worker threads for parallel data loading per chunk.")
+    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional path to save the trained model state.")
+    parser.add_argument("--eval-split", type=str, default="", help="Optional split name for evaluation (e.g. 'test').")
+    parser.add_argument("--eval-ride-ids", type=str, nargs="*", default=None, help="Optional specific rides for evaluation split.")
+    parser.add_argument("--eval-chunk-size", type=int, default=0, help="Chunk size for evaluation (0 reuses chunk-size).")
+
+    # Weights & Biases logging
+    parser.add_argument("--wandb-project", type=str, default="", help="W&B project name (set to enable logging).")
+    parser.add_argument("--wandb-entity", type=str, default="", help="Optional W&B entity/team.")
+    parser.add_argument("--wandb-run-name", type=str, default="", help="Optional W&B run name.")
+    parser.add_argument("--wandb-group", type=str, default="", help="Optional W&B group.")
+    parser.add_argument("--wandb-mode", type=str, default="online", help="W&B mode: online, offline, or disabled.")
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
-    ensemble_flags = resolve_ensemble_flags(config)
-    active_variants = [name for name, enabled in ensemble_flags.items() if enabled]
-    dataset, action_values, rides = collect_samples(
-        encoded_root=args.encoded_root,
+    scale_for_gpu(args)
+
+    rides = collect_rides(
         actions_root=args.actions_root,
+        encoded_root=args.encoded_root,
         split=args.split,
         action_kind=args.action_kind,
         ride_ids=args.ride_ids,
-        active_variants=active_variants,
-        pool_hw=args.pool_size,
-        rounding=args.rounding,
+    )
+    if len(rides) == 0:
+        raise RuntimeError("No rides found for the given configuration.")
+
+    sample_actions = read_action_csv(rides[0].action_csv)[1]
+    action_dim = sample_actions.shape[1]
+    print(f"Detected action dimension: {action_dim}")
+    print(
+        f"Window size: {WINDOW_SIZE} frames (predict action index {ACTION_INDEX}) | spatial pool size: {args.pool_size}"
     )
 
-    feature_shapes = {
-        name: list(dataset.feature_tensors()[name].shape[1:])
-        for name in dataset.variant_names
-    }
-    summary = {
-        "num_samples": len(dataset),
-        "num_classes": int(action_values.shape[0]),
-        "variants": dataset.variant_names,
-        "feature_shapes": feature_shapes,
-        "ensemble_flags": ensemble_flags,
-        "rides": sorted(set(rides)),
-    }
-    print(json.dumps(summary, indent=2))
-
-    model, accuracy = train_model(dataset, action_values, args)
-
-    if args.checkpoint_path:
-        save_checkpoint(args.checkpoint_path, model, action_values, args, dataset.variant_names, ensemble_flags)
-
-    print(f"Training complete. Final accuracy: {accuracy * 100:.2f}%")
+    train_streaming(args, rides, action_dim)
 
 
 if __name__ == "__main__":
