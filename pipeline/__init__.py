@@ -4,8 +4,9 @@ from .switch_causal_inference import SwitchCausalInferencePipeline
 from .streaming_training import StreamingTrainingPipeline
 from .streaming_switch_training import StreamingSwitchTrainingPipeline
 from .self_forcing_training import SelfForcingTrainingPipeline
-
+from .action_inference import ActionCausalInferencePipeline
 __all__ = [
+    "ActionCausalInferencePipeline",
     "CausalInferencePipeline",
     "SwitchCausalInferencePipeline",
     "InteractiveCausalInferencePipeline",
