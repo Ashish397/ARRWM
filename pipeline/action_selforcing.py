@@ -41,6 +41,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         self.action_module: Optional[Any] = action_module
         self.action_projection: Optional[ActionModulationProjection] = None
         self._action_conditioning_enabled: bool = enable_adaln_zero or action_module is not None
+        self._default_action_inputs: Optional[dict[str, Any]] = None
 
         super().__init__(
             denoising_step_list=denoising_step_list,
@@ -154,6 +155,9 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             conditional_dict["action_features"] = action_inputs["action_features"]
         return conditional_dict
 
+    def set_default_action_inputs(self, action_inputs: Optional[dict[str, Any]]) -> None:
+        self._default_action_inputs = action_inputs
+
     def generate_chunk_with_cache(
         self,
         noise: torch.Tensor,
@@ -164,6 +168,9 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         return_sim_step: bool = False,
         action_inputs: Optional[dict[str, Any]] = None,
     ):
+        if action_inputs is None:
+            action_inputs = self._default_action_inputs
+
         batch_size, chunk_frames, num_channels, height, width = noise.shape
 
         if chunk_frames % self.num_frame_per_block != 0:
@@ -317,6 +324,9 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         action_inputs: Optional[dict[str, Any]] = None,
         **conditional_dict,
     ):
+        if action_inputs is None:
+            action_inputs = self._default_action_inputs
+
         batch_size, num_frames, num_channels, height, width = noise.shape
 
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):

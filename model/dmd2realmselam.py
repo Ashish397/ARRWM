@@ -9,6 +9,7 @@ import math
 from contextlib import contextmanager
 
 from model.base import SelfForcingModel
+from pipeline.action_selforcing import ActionSelfForcingTrainingPipeline
 from utils.memory import log_gpu_memory
 import torch.distributed as dist
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY
@@ -38,7 +39,7 @@ class DMD2RealMSELAM(SelfForcingModel):
             self.fake_score.enable_gradient_checkpointing()
 
         # this will be init later with fsdp-wrapped modules
-        self.inference_pipeline: SelfForcingTrainingPipeline = None
+        self.inference_pipeline: Optional[ActionSelfForcingTrainingPipeline] = None
 
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep
@@ -72,6 +73,8 @@ class DMD2RealMSELAM(SelfForcingModel):
         self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.0)
         self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
         self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
+        self.enable_adaln_zero = bool(getattr(args, "enable_adaln_zero", True))
+        self.action_module = getattr(args, "action_module", None)
 
         if hasattr(self.fake_score, "adding_cls_branch"):
             try:
@@ -100,6 +103,64 @@ class DMD2RealMSELAM(SelfForcingModel):
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
         self.action_loss_weight = float(getattr(args, "action_loss_weight", 1.0))
+
+
+    def _initialize_inference_pipeline(self):
+        if self.inference_pipeline is not None:
+            return
+
+        local_attn_size = getattr(self.args, "model_kwargs", {}).get("local_attn_size", -1)
+        slice_last_frames = getattr(self.args, "slice_last_frames", 21)
+        num_training_frames = getattr(self.args, "num_training_frames")
+
+        self.inference_pipeline = ActionSelfForcingTrainingPipeline(
+            denoising_step_list=self.denoising_step_list,
+            scheduler=self.scheduler,
+            generator=self.generator,
+            num_frame_per_block=self.num_frame_per_block,
+            independent_first_frame=self.args.independent_first_frame,
+            same_step_across_blocks=self.args.same_step_across_blocks,
+            last_step_only=self.args.last_step_only,
+            num_max_frames=num_training_frames,
+            context_noise=self.args.context_noise,
+            local_attn_size=local_attn_size,
+            slice_last_frames=slice_last_frames,
+            num_training_frames=num_training_frames,
+            action_dim=self.action_dim,
+            enable_adaln_zero=self.enable_adaln_zero,
+            action_module=self.action_module,
+        )
+
+
+    def _run_generator(
+        self,
+        image_or_video_shape,
+        conditional_dict: dict,
+        initial_latent: torch.Tensor = None,
+        slice_last_frames: int = 21,
+        actions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
+        action_inputs = None
+        if actions is not None:
+            action_inputs = {
+                "action_features": actions.to(device=self.device, dtype=torch.float32),
+            }
+
+        self._initialize_inference_pipeline()
+
+        if isinstance(self.inference_pipeline, ActionSelfForcingTrainingPipeline):
+            self.inference_pipeline.set_default_action_inputs(action_inputs)
+
+        try:
+            return super()._run_generator(
+                image_or_video_shape=image_or_video_shape,
+                conditional_dict=conditional_dict,
+                initial_latent=initial_latent,
+                slice_last_frames=slice_last_frames,
+            )
+        finally:
+            if isinstance(self.inference_pipeline, ActionSelfForcingTrainingPipeline):
+                self.inference_pipeline.set_default_action_inputs(None)
 
 
     def _compute_kl_grad(
@@ -385,6 +446,7 @@ class DMD2RealMSELAM(SelfForcingModel):
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
             slice_last_frames=slice_last_frames,
+            actions=actions,
         )
         gen_time = time.time() - _t_gen_start
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -507,7 +569,8 @@ class DMD2RealMSELAM(SelfForcingModel):
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,
-                slice_last_frames=slice_last_frames
+                slice_last_frames=slice_last_frames,
+                actions=actions,
             )
         if dist.get_rank() == 0 and DEBUG:
             print(f"pred_image: {generated_image.shape}")
