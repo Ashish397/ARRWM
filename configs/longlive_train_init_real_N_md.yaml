@@ -1,4 +1,4 @@
-config_name: 'init-real-dmd2mseganlam-naive-md'
+config_name: 'init-real-dmd2mseganlam-naive-md-256'
 text_pre_encoded: true
 negative_prompt_encoded_path: /projects/u5as/frodobots_captions/negative/longlive_train_init_real_negative_1.json
 cls_on_clean_image: true
@@ -31,7 +31,7 @@ fake_name: Wan2.1-T2V-1.3B
 text_encoder_fsdp_wrap_strategy: size
 
 teacher_lora: 256
-teacher_lora_weights: /scratch/u5as/as1748.u5as/frodobots/retrain_no_gan_256/logs/diffusion_lora_step0009900.pt
+teacher_lora_weights: /scratch/u5as/as1748.u5as/frodobots/retrain_no_gan_256/logs/diffusion_lora_step0012000.pt
 lora_ckpt:
 denoising_step_list:
 - 1000

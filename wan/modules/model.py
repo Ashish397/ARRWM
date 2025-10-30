@@ -641,10 +641,16 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         classify_mode=False,
+        regress_mode=False,
         concat_time_embeddings=False,
         register_tokens=None,
         cls_pred_branch=None,
         gan_ca_blocks=None,
+        register_tokens_rgs=None,
+        rgs_pred_branch=None,
+        gan_ca_blocks_rgs=None,
+        num_frames_rgs=None,
+        num_class_rgs=None,
         clip_fea=None,
         y=None,
     ):
@@ -736,7 +742,18 @@ class WanModel(ModelMixin, ConfigMixin):
             registers = repeat(register_tokens(), "n d -> b n d", b=x.shape[0])
             # x = torch.cat([registers, x], dim=1)
 
+        final_x_rgs = None
+        if regress_mode:
+            assert register_tokens_rgs is not None
+            assert gan_ca_blocks_rgs is not None
+            assert rgs_pred_branch is not None
+
+            final_x_rgs = []
+            registers_rgs = repeat(register_tokens_rgs(), "n d -> b n d", b=x.shape[0])
+            # x = torch.cat([registers_rgs, x], dim=1)
+
         gan_idx = 0
+        gan_idx_rgs = 0
         for ii, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
@@ -752,12 +769,29 @@ class WanModel(ModelMixin, ConfigMixin):
                 final_x.append(gan_ca_blocks[gan_idx](x, gan_token))
                 gan_idx += 1
 
+            if regress_mode and ii in [13, 21, 29]:
+                gan_token_rgs = registers_rgs[:, gan_idx_rgs: gan_idx_rgs + 1]
+                final_x_rgs.append(gan_ca_blocks_rgs[gan_idx_rgs](x, gan_token_rgs))
+                gan_idx_rgs += 1
+
         if classify_mode:
             final_x = torch.cat(final_x, dim=1)
             if concat_time_embeddings:
                 final_x = cls_pred_branch(torch.cat([final_x, 10 * e[:, None, :]], dim=1).view(final_x.shape[0], -1))
             else:
                 final_x = cls_pred_branch(final_x.view(final_x.shape[0], -1))
+
+        if regress_mode:
+            final_x_rgs = torch.cat(final_x_rgs, dim=1)
+            if concat_time_embeddings:
+                final_x_rgs = rgs_pred_branch(torch.cat([final_x_rgs, 10 * e[:, None, :]], dim=1).view(final_x_rgs.shape[0], -1))
+            else:
+                final_x_rgs = rgs_pred_branch(final_x_rgs.view(final_x_rgs.shape[0], -1))
+
+            # Reshape from [B, 4, 21] to [B, 21, 4]
+            # Hard-coded: 42 = 21 frames * 2 actions
+            batch_size = final_x_rgs.shape[0]
+            final_x_rgs = final_x_rgs.view(batch_size, num_frames_rgs, num_class_rgs)
 
         # head
         x = self.head(x, e)
@@ -767,6 +801,9 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if classify_mode:
             return torch.stack(x), final_x
+
+        if regress_mode:
+            return torch.stack(x), final_x_rgs
 
         return torch.stack(x)
 

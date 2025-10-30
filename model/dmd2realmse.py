@@ -262,14 +262,14 @@ class DMD2RealMSE(SelfForcingModel):
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
 
-            # Step 2: Compute the KL grad
-            grad, dmd_log_dict = self._compute_kl_grad(
-                noisy_image_or_video=noisy_latent,
-                estimated_clean_image_or_video=original_latent,
-                timestep=timestep,
-                conditional_dict=conditional_dict,
-                unconditional_dict=unconditional_dict
-            )
+        # Step 2: Compute the KL grad
+        grad, dmd_log_dict = self._compute_kl_grad(
+            noisy_image_or_video=noisy_latent,
+            estimated_clean_image_or_video=original_latent,
+            timestep=timestep,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict
+        )
 
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
@@ -289,6 +289,9 @@ class DMD2RealMSE(SelfForcingModel):
         real_latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Train the generator with DMD2 loss plus optional MSE and GAN terms."""
+        # Keep teacher/fake_score frozen throughout the generator step so checkpointing
+        # sees identical metadata between forward and backward recomputations.
+        self._set_fake_score_trainable(False)
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: Before generator unroll", device=self.device, rank=dist.get_rank())
 
@@ -324,7 +327,6 @@ class DMD2RealMSE(SelfForcingModel):
         log_dict = dict(dmd_log_dict)
         log_dict.update({
             "gen_time": gen_time,
-            "loss_time": loss_time,
             "generator_dmd_loss": dmd_loss.detach(),
         })
 
@@ -395,6 +397,8 @@ class DMD2RealMSE(SelfForcingModel):
             - loss: a scalar tensor representing the generator loss.
             - critic_log_dict: a dictionary containing the intermediate tensors for logging.
         """
+        # Ensure critic updates can flow into fake_score parameters.
+        self._set_fake_score_trainable(True)
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"Critic loss: Before generator unroll", device=self.device, rank=dist.get_rank())
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)

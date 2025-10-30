@@ -11,7 +11,7 @@ trainer: lora_diffusion
 seed: 0
 mixed_precision: true
 autocast_dtype: bf16
-max_iters: 15000
+max_iters: 30000
 log_interval: 10
 ckpt_interval: 300
 max_grad_norm: 1.0
@@ -24,7 +24,7 @@ wandb_group: bidirectional-lora
 wandb_tags:
   - bidirectional
   - no-gan
-max_checkpoints: 50
+max_checkpoints: 100
 
 # LoRA adapter settings
 adapter:

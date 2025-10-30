@@ -87,7 +87,6 @@ class DMD2RealMSELAM(SelfForcingModel):
             try:
                 self.fake_score.adding_rgs_branch(
                     time_embed_dim=1536 if self.concat_time_embeddings else 0,
-                    num_frames=self.num_training_frames,
                 )
             except Exception:
                 if dist.get_rank() == 0:
@@ -101,15 +100,6 @@ class DMD2RealMSELAM(SelfForcingModel):
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
         self.action_loss_weight = float(getattr(args, "action_loss_weight", 1.0))
-        self.latent_action_model = nn.Sequential(
-            # Layer norming this means it can't cheat by learning to predict the action from the latent's position and scale.
-            # Predict action not intention
-            nn.LayerNorm(self.latent_feature_dim),
-            nn.Linear(self.latent_feature_dim, self.action_head_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.action_head_hidden_dim, self.action_dim),
-        )
-        self.latent_action_model.to(device=self.device, dtype=torch.float32)
 
 
     def _compute_kl_grad(
@@ -384,6 +374,7 @@ class DMD2RealMSELAM(SelfForcingModel):
         actions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Train the generator with DMD2 loss plus optional MSE and GAN terms."""
+        self._set_fake_score_trainable(False)
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: Before generator unroll", device=self.device, rank=dist.get_rank())
 
@@ -503,6 +494,7 @@ class DMD2RealMSELAM(SelfForcingModel):
             - loss: a scalar tensor representing the generator loss.
             - critic_log_dict: a dictionary containing the intermediate tensors for logging.
         """
+        self._set_fake_score_trainable(True)
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"Critic loss: Before generator unroll", device=self.device, rank=dist.get_rank())
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)

@@ -30,11 +30,6 @@ def main():
 
     # get the filename of config_path
     # config_name = os.path.basename(args.config_path).split(".")[0]
-    if args.experiment_name:
-        config_name = args.experiment_name
-    else:
-        config_name = os.path.dirname(args.config_path).split("/")[-1]
-    config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb

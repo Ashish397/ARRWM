@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J train_init_real_N_md_lam_2
-#SBATCH -N 1
-#SBATCH --ntasks=4
+#SBATCH --nodes=16
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=16
 #SBATCH -t 22:00:00
 #SBATCH --requeue
 #SBATCH -o %x_%j.out

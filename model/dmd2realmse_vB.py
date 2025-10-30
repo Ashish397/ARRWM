@@ -289,6 +289,7 @@ class DMD2RealMSE_vB(SelfForcingModel):
         real_latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Train the generator using only the GAN objective (no teacher)."""
+        self._set_fake_score_trainable(False)
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: Before generator unroll", device=self.device, rank=dist.get_rank())
 
@@ -377,6 +378,7 @@ class DMD2RealMSE_vB(SelfForcingModel):
             - loss: a scalar tensor representing the generator loss.
             - critic_log_dict: a dictionary containing the intermediate tensors for logging.
         """
+        self._set_fake_score_trainable(True)
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"Critic loss: Before generator unroll", device=self.device, rank=dist.get_rank())
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)

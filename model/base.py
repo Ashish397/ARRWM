@@ -44,6 +44,7 @@ class BaseModel(nn.Module):
 
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
         self.fake_score.model.requires_grad_(True)
+        self._fake_score_trainable = True
 
         if not self.text_pre_encoded:
             self.text_encoder = WanTextEncoder(model_name=self.real_model_name)
@@ -56,6 +57,13 @@ class BaseModel(nn.Module):
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
+
+    def _set_fake_score_trainable(self, value: bool) -> None:
+        if getattr(self, "_fake_score_trainable", None) == value:
+            return
+        for param in self.fake_score.parameters():
+            param.requires_grad_(value)
+        self._fake_score_trainable = value
 
     def _get_timestep(
             self,

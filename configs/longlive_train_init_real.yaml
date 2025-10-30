@@ -1,21 +1,21 @@
-config_name: 'init-real-dmd2mseganlam-md-lam-2-256'
+config_name: 'init-real-dmd2mseganlam-naive-d2'
 text_pre_encoded: true
 negative_prompt_encoded_path: /projects/u5as/frodobots_captions/negative/longlive_train_init_real_negative_1.json
 cls_on_clean_image: true
 gan_type: 'relative'
-dmd_loss_weight: 1.0
+dmd_loss_weight: 0.0
 dmd_loss_weight_decay: 0.0
-gan_loss_weight: 0.0
+gan_loss_weight: 0.05
 gan_loss_weight_decay: 0.0
 action_loss_weight: 0.0
-action_loss_weight_decay: -0.1
-guidance_cls_loss_weight: 0.0
-guidance_rgs_loss_weight: 2.0
+action_loss_weight_decay: 0.0
+guidance_cls_loss_weight: 2.0
+guidance_rgs_loss_weight: 0.0
 diffusion_gan: True
 diffusion_gan_max_timestep: 400
 min_score_timestep: 100
 concat_time_embeddings: true
-generator_mse_loss_weight: 0.1
+generator_mse_loss_weight: 0.05
 generator_mse_loss_weight_decay: 0.0
 motion_enabled_loss: false
 motion_weight_c: 2.0
@@ -70,6 +70,7 @@ total_batch_size: 64
 log_iters: 100
 max_checkpoints: 5
 max_iters: 700
+reset_base_checkpoint_step: true
 
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
 dfake_gen_update_ratio: 5
@@ -79,7 +80,7 @@ image_or_video_shape:
 - 16
 - 60
 - 104
-distribution_loss: mse_dmd_lam
+distribution_loss: dmd2realmse
 trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3

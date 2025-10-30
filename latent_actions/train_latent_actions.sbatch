@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=latent-actions-stream-3dcnn-eval
+#SBATCH --job-name=latent-actions-stream-3dcnn-eval-ckpt
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -54,7 +54,7 @@ WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_GROUP="${WANDB_GROUP:-}"
 
 # Directory for storing checkpoints and logs specific to this job.
-CHECKPOINT_BASE="${CHECKPOINT_BASE:-latent_actions/checkpoints}"
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-/projects/u5as/frodobots_lam/latent_actions/checkpoints}"
 CHECKPOINT_DIR="$CHECKPOINT_BASE/$SLURM_JOB_ID"
 mkdir -p logs
 mkdir -p "$CHECKPOINT_DIR"
@@ -71,11 +71,9 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 for ACTION_KIND in input output; do
-  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-  CHECKPOINT_PATH="$CHECKPOINT_DIR/${ACTION_KIND}_actions_${TIMESTAMP}.pt"
   echo "----"
   echo "Training latent action model for ${ACTION_KIND} actions"
-  echo "Checkpoint: $CHECKPOINT_PATH"
+  echo "Checkpoint directory: $CHECKPOINT_DIR"
   EVAL_ARGS=()
   if [ -n "$EVAL_SPLIT" ]; then
     EVAL_ARGS+=(--eval-split "$EVAL_SPLIT")
@@ -109,7 +107,7 @@ for ACTION_KIND in input output; do
     --wandb-run-name "${WANDB_RUN_NAME:-latent_${ACTION_KIND}_$SLURM_JOB_ID}" \
     --wandb-group "$WANDB_GROUP" \
     --wandb-mode "$WANDB_MODE" \
-    --checkpoint-path "$CHECKPOINT_PATH" \
+    --checkpoint-dir "$CHECKPOINT_DIR" \
     --device auto \
     "${EVAL_ARGS[@]}"
 done

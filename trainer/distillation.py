@@ -14,6 +14,7 @@ from utils.misc import (
     set_seed,
     merge_dict_list
 )
+# from utils.action_loss import compute_action_faithfulness_loss
 import torch.distributed as dist
 from omegaconf import OmegaConf, DictConfig
 from model import (
@@ -1263,6 +1264,19 @@ class Trainer:
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
             generator_loss, generator_log_dict = self.model.generator_loss(**generator_kwargs)
+
+            # # Compute action faithfulness loss if applicable
+            # if actions is not None and hasattr(self.model, 'last_generated_latents') and self.model.last_generated_latents is not None:
+            #     try:
+            #         action_mae, action_log_dict = compute_action_faithfulness_loss(
+            #             pred_latents=self.model.last_generated_latents,
+            #             gt_actions=actions,
+            #             device=self.device
+            #         )
+            #         generator_log_dict.update(action_log_dict)
+            #     except Exception as e:
+            #         if dist.get_rank() == 0:
+            #             print(f"Warning: Failed to compute action faithfulness loss: {e}")
 
             # Scale loss for gradient accumulation and backward
             scaled_generator_loss = generator_loss / self.gradient_accumulation_steps

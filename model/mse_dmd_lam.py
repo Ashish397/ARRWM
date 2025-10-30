@@ -29,7 +29,6 @@ class MSE_DMD_LAM(DMD):
             try:
                 self.fake_score.adding_rgs_branch(
                     time_embed_dim=1536 if self.concat_time_embeddings else 0,
-                    num_frames=self.num_training_frames,
                 )
             except Exception:
                 if not dist.is_initialized() or dist.get_rank() == 0:

@@ -15,6 +15,7 @@ import csv
 import json
 import math
 import random
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -391,6 +392,74 @@ def scale_for_gpu(args: argparse.Namespace) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint utilities
+
+
+def save_checkpoint(
+    checkpoint_dir: Path,
+    checkpoint_name: str,
+    model_state: Dict[str, torch.Tensor],
+    optimizer_state: Optional[Dict] = None,
+    action_dim: int = 0,
+    input_channels: int = 0,
+    args: Optional[argparse.Namespace] = None,
+    best_mse: float = float("inf"),
+    total_chunks: int = 0,
+    global_step: int = 0,
+    train_metrics: Optional[Dict[str, float]] = None,
+    eval_metrics: Optional[Dict[str, float]] = None,
+) -> Path:
+    """Save a checkpoint with model and training state."""
+    checkpoint_path = checkpoint_dir / checkpoint_name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    payload = {
+        "model_state": model_state,
+        "action_dim": action_dim,
+        "input_channels": input_channels,
+        "best_mse": best_mse,
+        "total_chunks": total_chunks,
+        "global_step": global_step,
+    }
+    
+    if optimizer_state is not None:
+        payload["optimizer_state"] = optimizer_state
+    
+    if args is not None:
+        payload.update({
+            "hidden_dims": list(args.hidden_dims),
+            "pool_size": args.pool_size,
+            "action_kind": args.action_kind,
+            "metadata": {
+                "split": args.split,
+                "chunk_size": args.chunk_size,
+                "chunk_epochs": args.chunk_epochs,
+                "patience": args.patience,
+                "target_mse": args.target_mse,
+                "best_mse": best_mse,
+                "total_chunks": total_chunks,
+                "eval_split": args.eval_split,
+            },
+        })
+    
+    if train_metrics or eval_metrics:
+        payload["evaluation"] = {
+            "train": train_metrics if train_metrics else {},
+            "eval": eval_metrics if eval_metrics else {},
+        }
+    
+    torch.save(payload, checkpoint_path)
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path: Path) -> Dict:
+    """Load a checkpoint from disk."""
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+    return torch.load(checkpoint_path, map_location="cpu")
+
+
 def train_streaming(
     args: argparse.Namespace,
     rides: Sequence[RideData],
@@ -400,6 +469,16 @@ def train_streaming(
     model = None
     optimizer: Optional[torch.optim.Optimizer] = None
     criterion = nn.MSELoss()
+    
+    # Setup checkpoint directories
+    checkpoint_base = Path(args.checkpoint_dir) if args.checkpoint_dir else None
+    best_checkpoint_dir = checkpoint_base / "best" if checkpoint_base else None
+    current_checkpoint_dir = checkpoint_base / "current" if checkpoint_base else None
+    
+    # Initialize timing for periodic saves (every 15 minutes = 900 seconds)
+    last_checkpoint_time = time.time()
+    checkpoint_interval = 900  # 15 minutes
+    best_state_updated = False  # Track if best state has changed since last save
 
     if args.eval_split:
         eval_ride_ids = set(args.eval_ride_ids) if args.eval_ride_ids else None
@@ -495,6 +574,7 @@ def train_streaming(
                 base_model = model.module if isinstance(model, nn.DataParallel) else model
                 best_state = base_model.state_dict()
                 best_mse = mse
+                best_state_updated = True  # Mark that best state has changed
             total_chunks += 1
             if args.target_mse > 0:
                 consecutive_hits = consecutive_hits + 1 if mse <= args.target_mse else 0
@@ -519,6 +599,51 @@ def train_streaming(
                     },
                     step=global_step,
                 )
+
+            # Periodic checkpoint saving (every 10 minutes)
+            current_time = time.time()
+            if checkpoint_base and (current_time - last_checkpoint_time) >= checkpoint_interval:
+                if model is not None and best_state is not None and input_channels is not None:
+                    base_model = model.module if isinstance(model, nn.DataParallel) else model
+                    current_state = base_model.state_dict()
+                    
+                    # Save current checkpoint
+                    checkpoint_name = f"{args.action_kind}_actions_current.pt"
+                    save_checkpoint(
+                        checkpoint_dir=current_checkpoint_dir,
+                        checkpoint_name=checkpoint_name,
+                        model_state=current_state,
+                        optimizer_state=optimizer.state_dict() if optimizer else None,
+                        action_dim=action_dim,
+                        input_channels=input_channels,
+                        args=args,
+                        best_mse=mse,  # Current MSE
+                        total_chunks=total_chunks,
+                        global_step=global_step,
+                    )
+                    print(f"✓ Saved current checkpoint to {current_checkpoint_dir / checkpoint_name}")
+                    
+                    # Save best checkpoint only if it has been updated since last save
+                    if best_state_updated:
+                        checkpoint_name = f"{args.action_kind}_actions_best.pt"
+                        save_checkpoint(
+                            checkpoint_dir=best_checkpoint_dir,
+                            checkpoint_name=checkpoint_name,
+                            model_state=best_state,
+                            optimizer_state=None,  # Don't need optimizer state for best
+                            action_dim=action_dim,
+                            input_channels=input_channels,
+                            args=args,
+                            best_mse=best_mse,
+                            total_chunks=total_chunks,
+                            global_step=global_step,
+                        )
+                        print(f"✓ Saved best checkpoint to {best_checkpoint_dir / checkpoint_name}")
+                        best_state_updated = False  # Reset flag after saving
+                    else:
+                        print(f"⊘ Skipped best checkpoint (no improvement since last save)")
+                    
+                    last_checkpoint_time = current_time
 
             if args.target_mse > 0 and consecutive_hits >= args.patience:
                 print(
@@ -561,37 +686,83 @@ def train_streaming(
     finally:
         if run:
             run.finish()
-
-    if args.checkpoint_path and best_state is not None:
-        path = args.checkpoint_path
-        if path.exists():
-            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-            path = path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
-            print(f"Checkpoint path exists; writing new checkpoint to {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "model_state": best_state,
-            "hidden_dims": list(args.hidden_dims),
-            "pool_size": args.pool_size,
-            "action_kind": args.action_kind,
-            "action_dim": action_dim,
-            "metadata": {
-                "split": args.split,
-                "chunk_size": args.chunk_size,
-                "chunk_epochs": args.chunk_epochs,
-                "patience": args.patience,
-                "target_mse": args.target_mse,
-                "best_mse": best_mse,
-                "total_chunks": total_chunks,
-                "eval_split": args.eval_split,
-            },
-            "evaluation": {
-                "train": train_metrics if train_metrics else {},
-                "eval": eval_metrics if eval_metrics else {},
-            },
-        }
-        torch.save(payload, path)
-        print(f"Checkpoint saved to {path}")
+        
+        # Save final checkpoints
+        if best_state is not None and input_channels is not None:
+            # Save to new checkpoint directory structure
+            if checkpoint_base:
+                print("\nSaving final checkpoints...")
+                
+                # Save best checkpoint
+                checkpoint_name = f"{args.action_kind}_actions_best.pt"
+                save_checkpoint(
+                    checkpoint_dir=best_checkpoint_dir,
+                    checkpoint_name=checkpoint_name,
+                    model_state=best_state,
+                    optimizer_state=None,
+                    action_dim=action_dim,
+                    input_channels=input_channels,
+                    args=args,
+                    best_mse=best_mse,
+                    total_chunks=total_chunks,
+                    global_step=global_step,
+                    train_metrics=train_metrics,
+                    eval_metrics=eval_metrics,
+                )
+                print(f"✓ Final best checkpoint saved to {best_checkpoint_dir / checkpoint_name}")
+                
+                # Save current checkpoint if model exists
+                if model is not None:
+                    base_model = model.module if isinstance(model, nn.DataParallel) else model
+                    current_state = base_model.state_dict()
+                    checkpoint_name = f"{args.action_kind}_actions_current.pt"
+                    save_checkpoint(
+                        checkpoint_dir=current_checkpoint_dir,
+                        checkpoint_name=checkpoint_name,
+                        model_state=current_state,
+                        optimizer_state=optimizer.state_dict() if optimizer else None,
+                        action_dim=action_dim,
+                        input_channels=input_channels,
+                        args=args,
+                        best_mse=best_mse,
+                        total_chunks=total_chunks,
+                        global_step=global_step,
+                        train_metrics=train_metrics,
+                        eval_metrics=eval_metrics,
+                    )
+                    print(f"✓ Final current checkpoint saved to {current_checkpoint_dir / checkpoint_name}")
+            
+            # Maintain backwards compatibility with old checkpoint_path argument
+            if args.checkpoint_path:
+                path = args.checkpoint_path
+                if path.exists():
+                    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                    path = path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
+                    print(f"Checkpoint path exists; writing new checkpoint to {path}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "model_state": best_state,
+                    "hidden_dims": list(args.hidden_dims),
+                    "pool_size": args.pool_size,
+                    "action_kind": args.action_kind,
+                    "action_dim": action_dim,
+                    "metadata": {
+                        "split": args.split,
+                        "chunk_size": args.chunk_size,
+                        "chunk_epochs": args.chunk_epochs,
+                        "patience": args.patience,
+                        "target_mse": args.target_mse,
+                        "best_mse": best_mse,
+                        "total_chunks": total_chunks,
+                        "eval_split": args.eval_split,
+                    },
+                    "evaluation": {
+                        "train": train_metrics if train_metrics else {},
+                        "eval": eval_metrics if eval_metrics else {},
+                    },
+                }
+                torch.save(payload, path)
+                print(f"Checkpoint saved to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +789,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-mse", type=float, default=0.0, help="Optional target MSE for early stopping (<=0 disables early stop).")
     parser.add_argument("--device", type=str, default="auto", help="Training device ('cpu', 'cuda', or 'auto').")
     parser.add_argument("--num-workers", type=int, default=16, help="Number of worker threads for parallel data loading per chunk.")
-    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional path to save the trained model state.")
+    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Optional path to save the trained model state (legacy format).")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory for periodic checkpoints (creates 'best' and 'current' subdirs).")
     parser.add_argument("--eval-split", type=str, default="", help="Optional split name for evaluation (e.g. 'test').")
     parser.add_argument("--eval-ride-ids", type=str, nargs="*", default=None, help="Optional specific rides for evaluation split.")
     parser.add_argument("--eval-chunk-size", type=int, default=0, help="Chunk size for evaluation (0 reuses chunk-size).")
