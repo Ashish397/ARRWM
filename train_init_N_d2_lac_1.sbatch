@@ -1,24 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=wan-bidir-lora-nogan-128-acc256
+#SBATCH -J train_init_real_N_d2_lac_1_with_action
 #SBATCH --nodes=16
-#SBATCH --cpus-per-task=32
 #SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
-#SBATCH --time=23:59:59
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-node=4
+#SBATCH -t 10:00:00
+#SBATCH --requeue
+#SBATCH -o %x_%j.out
+#SBATCH -e %x_%j.err
 
 set -e -o pipefail
 
-# Change to the ARRWM directory where the training scripts live
+# Change to the ARRWM directory where train.py is located
 cd /home/u5as/as1748.u5as/frodobots/ARRWM
 
 # Project path and config
-CONFIG=configs/bidirectional_lora_no_gan_128_acc256.yaml
-LOGDIR=/scratch/u5as/as1748.u5as/frodobots/retrain_no_gan_128/logs
+CONFIG=configs/longlive_train_init_real_N_d2_lac_1.yaml
+LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs_N_d2_lac_1_with_action
 WANDB_SAVE_DIR=wandb
-EXPERIMENT_NAME="retrain-no-gan-$(date +%Y%m%d-%H%M%S)"
-
+EXPERIMENT_NAME="dmd2-init-N-d2-lac-1-with-action-$(date +%Y%m%d-%H%M%S)"
 
 # Activate arrwm conda environment
 if [ -f "$HOME/miniforge/etc/profile.d/conda.sh" ]; then
@@ -37,8 +37,6 @@ export HUGGINGFACE_HUB_CACHE=$CACHE_DIR
 export TRANSFORMERS_CACHE=$CACHE_DIR
 mkdir -p "$CACHE_DIR"
 
-mkdir -p "$LOGDIR"
-
 echo "CONFIG=$CONFIG"
 echo "Starting training job on $(date)"
 echo "Job ID: $SLURM_JOB_ID"
@@ -49,4 +47,6 @@ torchrun \
   --config_path $CONFIG \
   --logdir $LOGDIR \
   --wandb-save-dir $WANDB_SAVE_DIR \
-  --experiment-name "$EXPERIMENT_NAME" \
+  --experiment-name "$EXPERIMENT_NAME"
+
+echo "Training completed on $(date)"

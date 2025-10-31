@@ -321,7 +321,8 @@ class DMD2Real(SelfForcingModel):
 
         loss_time = time.time() - _t_loss_start
         log_dict["loss_time"] = loss_time
-        log_dict["dmdtrain_gradient_norm"] = torch.tensor(0.0, device=pred_image.device)
+        # dmdtrain_gradient_norm is already set in dmd_log_dict from compute_distribution_matching_loss
+        # No need to overwrite it with 0.0
 
         return total_loss, log_dict
 

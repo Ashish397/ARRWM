@@ -28,18 +28,22 @@ from model import (
     MSE_DMD_LAM_ACTION,
     DMD2RealMSE,
     DMD2RealMSELAM,
-    DMD2RealMSE_vB,
+    DMD2RealMSELAM_Actions,
 )
 from model.streaming_training import StreamingTrainingModel
 from latent_actions.train_latent_action_model import Action3DCNN
 import torch
+import torch.nn as nn
 import wandb
 import time
 import os
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (
-    StateDictType, FullStateDictConfig, FullOptimStateDictConfig
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
 )
+from torch.distributed.fsdp._common_utils import TrainingState
+from torch.distributed.fsdp._flat_param import HandleTrainingState
 from torchvision.io import write_video
 
 # LoRA related imports
@@ -49,6 +53,7 @@ import safetensors.torch
 
 from utils.memory import gpu, get_cuda_free_memory_gb, log_gpu_memory
 from pipeline import (
+    ActionCausalInferencePipeline,
     CausalInferencePipeline,
     SwitchCausalInferencePipeline
 )
@@ -61,6 +66,7 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.step = 0
+        self._zero_grad_reported_steps: set[int] = set()
 
         # Step 1: Initialize the distributed training environment (rank, seed, dtype, logging etc.)
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -153,14 +159,12 @@ class Trainer:
             self.model = DMD2Real(config, device=self.device)
         elif config.distribution_loss == "dmd2mse":
             self.model = DMD2MSE(config, device=self.device)
-        elif config.distribution_loss == "dmd2realmse_vB":
-            self.model = DMD2RealMSE_vB(config, device=self.device)
         elif config.distribution_loss == "dmd2realmse":
             self.model = DMD2RealMSE(config, device=self.device)
         elif config.distribution_loss == "dmd2realmselam":
             self.model = DMD2RealMSELAM(config, device=self.device)
-        elif config.distribution_loss == "dmd2realmsedwt":
-            self.model = DMD2RealMSEDWT(config, device=self.device)
+        elif config.distribution_loss == "dmd2realmselam_actions":
+            self.model = DMD2RealMSELAM_Actions(config, device=self.device)
         elif config.distribution_loss == "mse_dmd":
             self.model = MSE_DMD(config, device=self.device)
         elif config.distribution_loss == "mse_dmd_lam":
@@ -168,6 +172,13 @@ class Trainer:
         elif config.distribution_loss == "mse_dmd_lam_action":
             latent_action_model = self._build_latent_action_model(config)
             self.model = MSE_DMD_LAM_ACTION(
+                config,
+                device=self.device,
+                latent_action_model=latent_action_model,
+            )
+        elif config.distribution_loss in ("dmd2realmselam_actions"):
+            latent_action_model = self._build_latent_action_model(config)
+            self.model = DMD2RealMSELAM_Actions(
                 config,
                 device=self.device,
                 latent_action_model=latent_action_model,
@@ -467,6 +478,16 @@ class Trainer:
         self.model.vae = self.model.vae.to(
             device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        # Lazily initialize the action-conditioned pipeline now that FSDP wrapping is complete.
+        if getattr(self.model, "inference_pipeline", None) is None or not hasattr(self.model, "action_projection"):
+            self.model._initialize_inference_pipeline()
+        if hasattr(self.model, "action_projection"):
+            self.model.action_projection.to(device=self.device)
+
+        self.extra_generator_modules: list[nn.Module] = []
+        if hasattr(self.model, "action_projection") and isinstance(self.model.action_projection, nn.Module):
+            self.extra_generator_modules.append(self.model.action_projection)
+
         # if not config.no_visualize or config.load_raw_video:
         #     print("Moving vae to device 2, self.device: ", self.device)
         #     self.model.vae = self.model.vae.to(
@@ -504,17 +525,34 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_optimizer_init_start()
 
+        generator_params = [
+            param for param in self.model.generator.parameters() if param.requires_grad
+        ]
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
+            generator_params,
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
 
+        extra_param_list = []
+        for module in self.extra_generator_modules:
+            extra_param_list.extend(
+                param for param in module.parameters() if param.requires_grad
+            )
+        self.generator_aux_optimizer = torch.optim.AdamW(
+            extra_param_list,
+            lr=config.lr,
+            betas=(config.beta1, config.beta2),
+            weight_decay=config.weight_decay,
+        ) if extra_param_list else None
+
         critic_params = [param for param in self.model.fake_score.parameters()
                          if param.requires_grad]
-        if getattr(config, "distribution_loss", None) == "dmd2realmselam" and hasattr(self.model, "latent_action_model"):
+        if (
+            getattr(config, "distribution_loss", None) in ("dmd2realmselam", "dmd2realmselam_actions")
+            and getattr(self.model, "latent_action_model", None) is not None
+        ):
             critic_params.extend(
                 param
                 for param in self.model.latent_action_model.parameters()
@@ -537,7 +575,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -569,7 +607,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmse_vB", "dmd2realmselam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -678,6 +716,17 @@ class Trainer:
                 else:
                     if self.is_main_process:
                         print("Warning: EMA checkpoint not found or EMA not initialized.")
+
+                if (
+                    self.extra_generator_modules
+                    and hasattr(self.model, "action_projection")
+                    and "action_projection" in checkpoint
+                ):
+                    if self.is_main_process:
+                        print("Loading action modulation projection weights from checkpoint")
+                    self.model.action_projection.load_state_dict(checkpoint["action_projection"])
+                elif self.extra_generator_modules and self.is_main_process:
+                    print("Warning: Action projection weights not found in checkpoint; reinitializing module.")
                 
                 # For auto resume, always resume full training state
                 # Load optimizers
@@ -693,6 +742,16 @@ class Trainer:
                 else:
                     if self.is_main_process:
                         print("Warning: Generator optimizer checkpoint not found.")
+
+                if (
+                    self.generator_aux_optimizer is not None
+                    and "action_optimizer" in checkpoint
+                ):
+                    if self.is_main_process:
+                        print("Resuming action modulation optimizer...")
+                    self.generator_aux_optimizer.load_state_dict(checkpoint["action_optimizer"])
+                elif self.generator_aux_optimizer is not None and self.is_main_process:
+                    print("Warning: Action modulation optimizer state not found in checkpoint.")
                 
                 if "critic_optimizer" in checkpoint:
                     if self.is_main_process:
@@ -778,6 +837,18 @@ class Trainer:
         if hasattr(self.model, "gan_loss_weight"):
             self.model.gan_loss_weight = self._gan_weight_start
 
+        # GAN loss weight schedule (linear). "decay" represents the total change applied across training.
+        self._latent_action_loss_weight_start = float(getattr(self.config, "latent_action_loss_weight", 0.0))
+        latent_action_decay = getattr(self.config, "latent_action_loss_weight_decay", None)
+        if latent_action_decay is None:
+            self._latent_action_loss_weight_end = self._latent_action_loss_weight_start
+        else:
+            self._latent_action_loss_weight_end = self._latent_action_loss_weight_start - float(latent_action_decay)
+        self._latent_action_loss_weight_end = max(0.0, self._latent_action_loss_weight_end)
+        self._latent_action_schedule_enabled = abs(self._latent_action_loss_weight_end - self._latent_action_loss_weight_start) > 1e-8
+        if hasattr(self.model, "latent_action_loss_weight"):
+            self.model.latent_action_loss_weight = self._latent_action_loss_weight_start
+
         # Action loss weight schedule (linear). "decay" represents the total change applied across training.
         self._action_loss_weight_start = float(getattr(self.config, "action_loss_weight", 0.0))
         action_decay = getattr(self.config, "action_loss_weight_decay", None)
@@ -835,6 +906,10 @@ class Trainer:
         if self._gan_schedule_enabled and hasattr(self.model, "gan_loss_weight"):
             weight = self._gan_weight_start + (self._gan_weight_end - self._gan_weight_start) * progress
             self.model.gan_loss_weight = weight
+
+        if self._latent_action_schedule_enabled and hasattr(self.model, "latent_action_loss_weight"):
+            weight = self._latent_action_loss_weight_start + (self._latent_action_loss_weight_end - self._latent_action_loss_weight_start) * progress
+            self.model.latent_action_loss_weight = weight
 
         if self._action_schedule_enabled and hasattr(self.model, "action_loss_weight"):
             weight = self._action_loss_weight_start + (self._action_loss_weight_end - self._action_loss_weight_start) * progress
@@ -1053,6 +1128,79 @@ class Trainer:
             raise ValueError(f"Invalid switch_mode: {getattr(self.config, 'switch_mode', 'fixed')}")
         return switch_idx
 
+    def _warn_if_no_generator_grads(self, core_has_grad: bool, aux_has_grad: bool) -> None:
+        if (core_has_grad or aux_has_grad) or not self.is_main_process:
+            return
+        if self.step not in self._zero_grad_reported_steps:
+            print(
+                f"[Warning] Generator backward at logical step {self.step} produced no gradients; "
+                f"action modulation may be the only component receiving updates."
+            )
+            self._zero_grad_reported_steps.add(self.step)
+
+    def _clip_auxiliary_grad_norm(self, max_norm: float, core_norm: torch.Tensor) -> torch.Tensor:
+        if not self.extra_generator_modules:
+            return torch.zeros((), device=self.device, dtype=core_norm.dtype)
+
+        params: list[torch.Tensor] = []
+        for module in self.extra_generator_modules:
+            for param in module.parameters():
+                if param.grad is not None:
+                    params.append(param)
+
+        if not params:
+            return torch.zeros((), device=self.device, dtype=core_norm.dtype)
+
+        grad_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
+        for param in params:
+            grad_sq += torch.sum(param.grad.detach().float() ** 2)
+        if dist.is_initialized():
+            dist.all_reduce(grad_sq, op=dist.ReduceOp.SUM)
+
+        grad_sq = grad_sq.clamp_min(0.0)
+        aux_norm = torch.sqrt(grad_sq).squeeze(0)
+        if not torch.isfinite(aux_norm):
+            aux_norm = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        if max_norm is not None and max_norm > 0 and torch.isfinite(aux_norm):
+            core_val = float(core_norm.detach().float().cpu())
+            max_norm_sq = max_norm * max_norm
+            residual_sq = max_norm_sq - min(core_val * core_val, max_norm_sq)
+            if residual_sq <= 0.0:
+                for param in params:
+                    param.grad.zero_()
+                return aux_norm.new_zeros(())
+            residual = math.sqrt(residual_sq)
+            aux_val = float(aux_norm.cpu())
+            if aux_val > residual:
+                scale = residual / (aux_val + 1e-6)
+                for param in params:
+                    param.grad.mul_(scale)
+                aux_norm = aux_norm.new_tensor(residual)
+
+        return aux_norm.to(device=self.device, dtype=core_norm.dtype)
+
+    def _ensure_fsdp_idle(self, module: torch.nn.Module, module_name: str = "module") -> None:
+        if not isinstance(module, FSDP):
+            return
+        reset_state = 0
+        reset_handle = 0
+        for fsdp_submodule in module.modules():
+            if not isinstance(fsdp_submodule, FSDP):
+                continue
+            if getattr(fsdp_submodule, "training_state", None) != TrainingState.IDLE:
+                fsdp_submodule.training_state = TrainingState.IDLE
+                fsdp_submodule._needs_pre_forward_unshard = False
+                fsdp_submodule._needs_pre_backward_unshard = False
+                reset_state += 1
+            handle = getattr(fsdp_submodule, "_handle", None)
+            if handle is not None and getattr(handle, "_training_state", None) != HandleTrainingState.IDLE:
+                handle._training_state = HandleTrainingState.IDLE
+                handle._prefetched = False
+                reset_handle += 1
+        if self.is_main_process and (reset_state or reset_handle):
+            print(f"[FSDP:{module_name}] Reset {reset_state} module states and {reset_handle} handles to IDLE prior to checkpointing.")
+
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -1087,25 +1235,47 @@ class Trainer:
             else:
                 state_dict["teacher_lora"] = {}
         else:
-            with FSDP.state_dict_type(
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            if dist.is_initialized():
+                dist.barrier()
+            self._ensure_fsdp_idle(self.model.generator, module_name="generator")
+            generator_state_dict: dict[str, object] = {}
+            generator_opim_state_dict: dict[str, object] = {}
+            with FSDP.summon_full_params(
+                self.model.generator, writeback=False, rank0_only=True
+            ):
+                if self.is_main_process:
+                    generator_state_dict = self.model.generator.module.state_dict()
+            full_gen_optim = FSDP.full_optim_state_dict(
                 self.model.generator,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-                FullOptimStateDictConfig(rank0_only=True),          # newly added
-            ):
-                generator_state_dict  = self.model.generator.state_dict()
-                generator_opim_state_dict = FSDP.optim_state_dict(self.model.generator,
-                                                self.generator_optimizer)
+                self.generator_optimizer,
+                rank0_only=True,
+            )
+            if self.is_main_process and full_gen_optim is not None:
+                generator_opim_state_dict = full_gen_optim
+            if not self.is_main_process:
+                generator_state_dict = {}
+                generator_opim_state_dict = {}
 
-            with FSDP.state_dict_type(
-                self.model.fake_score,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-                FullOptimStateDictConfig(rank0_only=True),          # newly added
+            self._ensure_fsdp_idle(self.model.fake_score, module_name="critic")
+            critic_state_dict: dict[str, object] = {}
+            critic_opim_state_dict: dict[str, object] = {}
+            with FSDP.summon_full_params(
+                self.model.fake_score, writeback=False, rank0_only=True
             ):
-                critic_state_dict  = self.model.fake_score.state_dict()
-                critic_opim_state_dict = FSDP.optim_state_dict(self.model.fake_score,
-                                                self.critic_optimizer)
+                if self.is_main_process:
+                    critic_state_dict = self.model.fake_score.module.state_dict()
+            full_critic_optim = FSDP.full_optim_state_dict(
+                self.model.fake_score,
+                self.critic_optimizer,
+                rank0_only=True,
+            )
+            if self.is_main_process and full_critic_optim is not None:
+                critic_opim_state_dict = full_critic_optim
+            if not self.is_main_process:
+                critic_state_dict = {}
+                critic_opim_state_dict = {}
 
             if self.config.ema_start_step < self.step and self.generator_ema is not None:
                 state_dict = {
@@ -1124,6 +1294,11 @@ class Trainer:
                     "critic_optimizer": critic_opim_state_dict,
                     "step": self.step,
                 }
+
+            if hasattr(self.model, "action_projection") and self.extra_generator_modules:
+                state_dict["action_projection"] = self.model.action_projection.state_dict()
+            if self.generator_aux_optimizer is not None:
+                state_dict["action_optimizer"] = self.generator_aux_optimizer.state_dict()
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
@@ -1224,7 +1399,7 @@ class Trainer:
                 actions = actions.to(self.device, dtype=torch.float32)
             else:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam', 'mse_dmd_lam_action') and actions is None:
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'mse_dmd_lam', 'mse_dmd_lam_action') and actions is None:
             raise ValueError('Batch is missing action annotations required for action-guided training.')
 
         image_or_video_shape = list(self.config.image_or_video_shape)
@@ -1257,9 +1432,9 @@ class Trainer:
                 clean_latent=None,
                 initial_latent=None,
             )
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmse_vB', 'dmd2realmselam'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
                 generator_kwargs['real_latents'] = real_latents
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['actions'] = actions
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
@@ -1287,6 +1462,17 @@ class Trainer:
                         p.grad = None
             if LOG_GPU_MEMORY:
                 log_gpu_memory("After train_generator backward pass", device=self.device, rank=dist.get_rank())
+            core_has_grad = any(param.grad is not None for param in self.model.generator.parameters())
+            aux_has_grad = False
+            if self.extra_generator_modules:
+                for module in self.extra_generator_modules:
+                    for param in module.parameters():
+                        if param.grad is not None:
+                            aux_has_grad = True
+                            break
+                    if aux_has_grad:
+                        break
+            self._warn_if_no_generator_grads(core_has_grad, aux_has_grad)
             # Return original loss for logging
             generator_log_dict.update({"generator_loss": generator_loss,
                                        "generator_grad_norm": torch.tensor(0.0, device=self.device)})  # Will be computed after accumulation
@@ -1302,9 +1488,9 @@ class Trainer:
             clean_latent=None,
             initial_latent=None,
         )
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmse_vB', 'dmd2realmselam'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
             critic_kwargs['real_latents'] = real_latents
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['actions'] = actions
         if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['clean_latent'] = real_latents
@@ -1361,6 +1547,7 @@ class Trainer:
                 text_prompts=prompts if not self.text_pre_encoded else None,
                 prompt_embeds=prompt_embeds if self.text_pre_encoded else None,
                 return_latents=True,
+                action_inputs=actions,
             )
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
         pipeline.vae.model.clear_cache()
@@ -1673,6 +1860,8 @@ class Trainer:
                     # Zero-out all optimizer gradients
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
+                        if self.generator_aux_optimizer is not None:
+                            self.generator_aux_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     
                     # Whole-cycle gradient accumulation loop
@@ -1704,14 +1893,27 @@ class Trainer:
                     
                     # Compute grad norm and update parameters
                     if TRAIN_GENERATOR:
-                        generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
+                        generator_core_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
+                        aux_norm = self._clip_auxiliary_grad_norm(self.max_grad_norm_generator, generator_core_norm)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
-                        generator_log_dict["generator_grad_norm"] = generator_grad_norm
-                        
+                        core_val = generator_core_norm.detach().float()
+                        aux_val = aux_norm.detach().float()
+                        total_norm = torch.sqrt(core_val ** 2 + aux_val ** 2).to(device=self.device, dtype=generator_core_norm.dtype)
+                        generator_log_dict["generator_grad_norm"] = total_norm
+                        generator_log_dict["generator_core_grad_norm"] = generator_core_norm.detach()
+                        if self.extra_generator_modules:
+                            generator_log_dict["action_mod_grad_norm"] = aux_norm.detach()
+
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                            print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
-                        
+                            print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={total_norm.item()}")
+
+                        core_has_grad = core_val.item() > 0.0
+                        aux_has_grad = aux_val.item() > 0.0 if self.extra_generator_modules else False
+                        self._warn_if_no_generator_grads(core_has_grad, aux_has_grad)
+
                         self.generator_optimizer.step()
+                        if self.generator_aux_optimizer is not None:
+                            self.generator_aux_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -1743,6 +1945,8 @@ class Trainer:
                 else:
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
+                        if self.generator_aux_optimizer is not None:
+                            self.generator_aux_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     
                     # Whole-cycle gradient accumulation loop
@@ -1763,11 +1967,24 @@ class Trainer:
                     
                     # Compute grad norm and update parameters
                     if TRAIN_GENERATOR:
-                        generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
+                        generator_core_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
+                        aux_norm = self._clip_auxiliary_grad_norm(self.max_grad_norm_generator, generator_core_norm)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
-                        generator_log_dict["generator_grad_norm"] = generator_grad_norm
-                        
+                        core_val = generator_core_norm.detach().float()
+                        aux_val = aux_norm.detach().float()
+                        total_norm = torch.sqrt(core_val ** 2 + aux_val ** 2).to(device=self.device, dtype=generator_core_norm.dtype)
+                        generator_log_dict["generator_grad_norm"] = total_norm
+                        generator_log_dict["generator_core_grad_norm"] = generator_core_norm.detach()
+                        if self.extra_generator_modules:
+                            generator_log_dict["action_mod_grad_norm"] = aux_norm.detach()
+
+                        core_has_grad = core_val.item() > 0.0
+                        aux_has_grad = aux_val.item() > 0.0 if self.extra_generator_modules else False
+                        self._warn_if_no_generator_grads(core_has_grad, aux_has_grad)
+
                         self.generator_optimizer.step()
+                        if self.generator_aux_optimizer is not None:
+                            self.generator_aux_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -2128,7 +2345,7 @@ class Trainer:
                 text_encoder=self.model.text_encoder,
                 vae=self.model.vae)
         else:
-            self.vis_pipeline = CausalInferencePipeline(
+            self.vis_pipeline = ActionCausalInferencePipeline(
                 args=self.config,
                 device=self.device,
                 generator=self.model.generator,
@@ -2158,6 +2375,7 @@ class Trainer:
         os.makedirs(step_vis_dir, exist_ok=True)
         batch = self.fixed_vis_batch
         prompt_embeds = batch.get('prompt_embeds') if isinstance(batch, dict) else None
+        action_inputs = batch.get('actions') if isinstance(batch, dict) else None
         if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
             prompts = batch["prompts"]
             switch_prompts = batch["switch_prompts"]
@@ -2181,7 +2399,7 @@ class Trainer:
             if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
                 videos = self.generate_video_with_switch(self.vis_pipeline, vid_len, prompts, switch_prompts, switch_frame_index, image=image)
             else:
-                videos = self.generate_video(self.vis_pipeline, vid_len, prompts, prompt_embeds=prompt_embeds, image=image)
+                videos = self.generate_video(self.vis_pipeline, vid_len, prompts, prompt_embeds=prompt_embeds, image=image, action_inputs=action_inputs)
 
             # Save each sample
             for idx, video_np in enumerate(videos):

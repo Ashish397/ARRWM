@@ -1,14 +1,15 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
-from typing import Tuple
+from typing import Tuple, Optional
 from einops import rearrange
 from torch import nn
 import torch.distributed as dist
 import torch
 
-from pipeline import SelfForcingTrainingPipeline
+from pipeline import SelfForcingTrainingPipeline, ActionSelfForcingTrainingPipeline
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from model.action_model_patch import apply_action_patches
 
 from utils.debug_option import DEBUG
 
@@ -37,6 +38,9 @@ class BaseModel(nn.Module):
         if "model_name" not in model_kwargs:
             model_kwargs["model_name"] = self.real_model_name
         self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
+        # Apply action patches before any distributed/FSDP wrapping so the inner
+        # module gains the extended signature and hooks.
+        apply_action_patches(self.generator)
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
@@ -138,6 +142,8 @@ class SelfForcingModel(BaseModel):
     def __init__(self, args, device):
         super().__init__(args, device)
         self.denoising_loss_func = get_denoising_loss(args.denoising_loss_type)()
+        # Lazy-initialized training-time pipeline for backward simulation
+        self.inference_pipeline = None
 
     def _run_generator(
         self,
@@ -145,6 +151,7 @@ class SelfForcingModel(BaseModel):
         conditional_dict: dict,
         initial_latent: torch.tensor = None,
         slice_last_frames: int = 21,
+        action_inputs: Optional[object] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Optionally simulate the generator's input from noise using backward simulation
@@ -191,8 +198,9 @@ class SelfForcingModel(BaseModel):
 
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=torch.randn(noise_shape,
-                              device=self.device, dtype=self.dtype),
+                              device=self.device, dtype=torch.float32),
             slice_last_frames=slice_last_frames,
+            action_inputs=action_inputs,
             **conditional_dict,
         )
         # Decide whether to slice based on `slice_last_frames`; when `slice_last_frames == -1`, keep all frames
@@ -234,6 +242,7 @@ class SelfForcingModel(BaseModel):
         self,
         noise: torch.Tensor,
         slice_last_frames: int = 21,
+        action_inputs: Optional[object] = None,
         **conditional_dict: dict
     ) -> torch.Tensor:
         """
@@ -252,7 +261,11 @@ class SelfForcingModel(BaseModel):
             self._initialize_inference_pipeline()
 
         return self.inference_pipeline.inference_with_trajectory(
-            noise=noise, **conditional_dict, slice_last_frames=slice_last_frames
+            noise=noise,
+            initial_latent=conditional_dict.get("initial_latent", None),
+            slice_last_frames=slice_last_frames,
+            action_inputs=action_inputs,
+            **{k: v for k, v in conditional_dict.items() if k != "initial_latent"}
         )
 
     def _initialize_inference_pipeline(self):
@@ -265,7 +278,22 @@ class SelfForcingModel(BaseModel):
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         # do not use self.num_training_frames, because it is changed by generator_loss and critic_loss
         num_training_frames = getattr(self.args, "num_training_frames")
-        self.inference_pipeline = SelfForcingTrainingPipeline(
+        # self.inference_pipeline = SelfForcingTrainingPipeline(
+        #     denoising_step_list=self.denoising_step_list,
+        #     scheduler=self.scheduler,
+        #     generator=self.generator,
+        #     num_frame_per_block=self.num_frame_per_block,
+        #     independent_first_frame=self.args.independent_first_frame,
+        #     same_step_across_blocks=self.args.same_step_across_blocks,
+        #     last_step_only=self.args.last_step_only,
+        #     num_max_frames=num_training_frames,
+        #     context_noise=self.args.context_noise,
+        #     local_attn_size=local_attn_size,
+        #     slice_last_frames=slice_last_frames,
+        #     num_training_frames=num_training_frames,
+        # )
+
+        self.inference_pipeline = ActionSelfForcingTrainingPipeline(
             denoising_step_list=self.denoising_step_list,
             scheduler=self.scheduler,
             generator=self.generator,
@@ -278,4 +306,9 @@ class SelfForcingModel(BaseModel):
             local_attn_size=local_attn_size,
             slice_last_frames=slice_last_frames,
             num_training_frames=num_training_frames,
+            action_dim=getattr(self.args, "action_dim", getattr(self.args, "raw_action_dim", 2)),
         )
+
+        # Surface the action projection module so its parameters can be optimized.
+        if hasattr(self.inference_pipeline, "action_projection") and isinstance(self.inference_pipeline.action_projection, nn.Module):
+            self.action_projection = self.inference_pipeline.action_projection

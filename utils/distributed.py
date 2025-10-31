@@ -3,7 +3,14 @@ from functools import partial
 import os
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    FullStateDictConfig,
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
 from torch.distributed.fsdp.api import CPUOffload
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
@@ -62,7 +69,9 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         limit_all_gathers=True,
         use_orig_params=True,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=False  # Load ckpt on rank 0 and sync to other ranks
+        sync_module_states=False,  # Load ckpt on rank 0 and sync to other ranks
+        forward_prefetch=False,
+        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
     )
     return module
 

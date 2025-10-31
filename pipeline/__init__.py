@@ -5,6 +5,7 @@ from .streaming_training import StreamingTrainingPipeline
 from .streaming_switch_training import StreamingSwitchTrainingPipeline
 from .self_forcing_training import SelfForcingTrainingPipeline
 from .action_inference import ActionCausalInferencePipeline
+from .action_selforcing import ActionSelfForcingTrainingPipeline
 __all__ = [
     "ActionCausalInferencePipeline",
     "CausalInferencePipeline",
@@ -13,4 +14,5 @@ __all__ = [
     "StreamingTrainingPipeline",
     "StreamingSwitchTrainingPipeline",
     "SelfForcingTrainingPipeline",
+    "ActionSelfForcingTrainingPipeline",
 ]

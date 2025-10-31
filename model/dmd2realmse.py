@@ -36,7 +36,7 @@ class DMD2RealMSE(SelfForcingModel):
             self.fake_score.enable_gradient_checkpointing()
 
         # this will be init later with fsdp-wrapped modules
-        self.inference_pipeline: SelfForcingTrainingPipeline = None
+        self.inference_pipeline: ActionSelfForcingTrainingPipeline = None
 
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep
@@ -370,7 +370,8 @@ class DMD2RealMSE(SelfForcingModel):
 
         loss_time = time.time() - _t_loss_start
         log_dict["loss_time"] = loss_time
-        log_dict["dmdtrain_gradient_norm"] = torch.tensor(0.0, device=pred_image.device)
+        # dmdtrain_gradient_norm is already set in dmd_log_dict from compute_distribution_matching_loss
+        # No need to overwrite it with 0.0
 
         return total_loss, log_dict
 

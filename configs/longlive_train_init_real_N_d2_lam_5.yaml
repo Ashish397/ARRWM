@@ -1,15 +1,10 @@
-config_name: 'init-real-dmd2mseganlam-md-lam-2-256'
+config_name: 'init-real-dmd2mseganlam-d2-lam-5'
 text_pre_encoded: true
 negative_prompt_encoded_path: /projects/u5as/frodobots_captions/negative/longlive_train_init_real_negative_1.json
-cls_on_clean_image: true
-gan_type: 'relative'
 dmd_loss_weight: 1.0
 dmd_loss_weight_decay: 0.0
-gan_loss_weight: 0.0
-gan_loss_weight_decay: 0.0
-action_loss_weight: 0.0
-action_loss_weight_decay: -0.1
-guidance_cls_loss_weight: 0.0
+action_loss_weight: 0.1
+action_loss_weight_decay: -4.9
 guidance_rgs_loss_weight: 2.0
 diffusion_gan: True
 diffusion_gan_max_timestep: 400
@@ -19,8 +14,6 @@ generator_mse_loss_weight: 0.1
 generator_mse_loss_weight_decay: 0.0
 motion_enabled_loss: false
 motion_weight_c: 2.0
-adaptive_d_weight: false
-adaptive_d_weight_max: 10.0
 generator_ckpt: /scratch/u5as/as1748.u5as/frodobots/checkpoints/ode_init.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
@@ -79,7 +72,7 @@ image_or_video_shape:
 - 16
 - 60
 - 104
-distribution_loss: mse_dmd_lam
+distribution_loss: dmd2realmselam
 trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3

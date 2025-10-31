@@ -1,25 +1,21 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import time
 import math
 from contextlib import contextmanager
 
-from model.base import SelfForcingModelActions
+from model.base import SelfForcingModel
 from utils.memory import log_gpu_memory
 import torch.distributed as dist
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY
 
-# Add imports for AdaLN injection
-from model.action_modulation import ActionModulationProjection
-from model.action_model_patch import patch_causal_wan_model_for_action
 
-
-class DMD2RealMSELAM_Actions(SelfForcingModelActions):
-    def __init__(self, args, device, latent_action_model: Optional[Any] = None):
+class DMD2RealMSELAM_Actions(SelfForcingModel):
+    def __init__(self, args, device, latent_action_model: Optional[nn.Module] = None):
         """
         Initialize the DMD (Distribution Matching Distillation) module.
         This class is self-contained and compute generator and fake score losses
@@ -41,31 +37,6 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
 
-        # AdaLN-Zero action projection and patching
-        self.motion_enabled_loss = False #bool(getattr(args, "motion_enabled_loss", False))
-        self.action_loss_weight = float(getattr(args, "action_loss_weight", 0.0))
-        self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
-        if self.action_loss_weight > 0.0:
-            # Apply action patches to both model and wrapper so wrapper forwards _action_modulation
-            try:
-                from model.action_model_patch import apply_action_patches
-                apply_action_patches(self.generator)
-            except Exception:
-                if hasattr(self.generator, "model"):
-                    patch_causal_wan_model_for_action(self.generator.model)
-            model_dim = self.generator.model.dim if hasattr(self.generator.model, "dim") else 2048
-            self.action_projection = ActionModulationProjection(
-                action_dim=self.action_dim,
-                hidden_dim=model_dim,
-                num_frames=1,  # set dynamically per batch
-                zero_init=True
-            ).to(device)
-        else:
-            self.action_projection = None
-
-        # this will be init later with fsdp-wrapped modules
-        self.inference_pipeline: SelfForcingTrainingPipeline = None
-
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep
         self.min_step = int(0.02 * self.num_train_timestep)
@@ -86,15 +57,44 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
         else:
             self.scheduler.alphas_cumprod = None
 
-
-        # Latent action model integration
-        self.latent_action_loss_weight = float(getattr(args, "latent_action_loss_weight", 0.0))
+        # DMD2-specific configuration
+        self.cls_on_clean_image = getattr(args, "cls_on_clean_image", False)
+        self.gan_loss_weight = getattr(args, "gan_loss_weight", 0.0)
+        self.action_loss_weight = getattr(args, "action_loss_weight", 0.0)
+        self.guidance_cls_loss_weight = getattr(args, "guidance_cls_loss_weight", self.gan_loss_weight)
+        self.guidance_rgs_loss_weight = getattr(args, "guidance_rgs_loss_weight", self.action_loss_weight)
+        self.diffusion_gan = getattr(args, "diffusion_gan", False)
+        self.diffusion_gan_max_timestep = getattr(args, "diffusion_gan_max_timestep", self.num_train_timestep)
+        self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
+        self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.1)
+        self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
+        self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
+        self.latent_action_loss_weight = float(getattr(args, "latent_action_loss_weight", 1.0))
         self.latent_action_model = latent_action_model
         if self.latent_action_model is not None:
             try:
-                self.latent_action_model.to(device=self.device)
+                self.latent_action_model.to(device=device)
             except AttributeError:
                 pass
+
+        if hasattr(self.fake_score, "adding_cls_branch"):
+            try:
+                self.fake_score.adding_cls_branch(
+                    time_embed_dim=1536 if self.concat_time_embeddings else 0
+                )
+            except Exception:
+                if dist.get_rank() == 0:
+                    print("[Warning] Failed to add classification branch to fake_score.")
+
+        # Only initialize regression branch if action loss weights are non-zero
+        if (self.action_loss_weight > 0.0 or self.guidance_rgs_loss_weight > 0.0) and hasattr(self.fake_score, "adding_rgs_branch"):
+            try:
+                self.fake_score.adding_rgs_branch(
+                    time_embed_dim=1536 if self.concat_time_embeddings else 0,
+                )
+            except Exception:
+                if dist.get_rank() == 0:
+                    print("[Warning] Failed to add regression branch to fake_score.")
 
         latent_shape = getattr(args, "image_or_video_shape", None)
         latent_channels = 16
@@ -103,6 +103,7 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
         self.latent_feature_dim = latent_channels
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
+        self.action_loss_weight = float(getattr(args, "action_loss_weight", 1.0))
 
 
     def _compute_kl_grad(
@@ -194,136 +195,67 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
             for p, rg in zip(self.fake_score.parameters(), requires_grad):
                 p.requires_grad_(rg)
 
-    @contextmanager
-    def _freeze_module_params(self, module: Optional[Any]):
-        if module is None or not hasattr(module, "parameters"):
-            yield
-            return
+    def _build_classifier_inputs(self, latents: torch.Tensor, conditional_dict: dict, reuse_noise: Optional[torch.Tensor] = None):
+        batch_size, num_frames = latents.shape[:2]
+        device = latents.device
+        latents = latents.float()
 
-        params = list(module.parameters())
-        if not params:
-            yield
-            return
+        if self.diffusion_gan:
+            timesteps = torch.randint(
+                0,
+                self.diffusion_gan_max_timestep,
+                (batch_size,),
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            timesteps = torch.zeros((batch_size,), device=device, dtype=torch.long)
 
-        requires_grad = [p.requires_grad for p in params]
-        try:
-            for p in params:
-                p.requires_grad_(False)
-            yield
-        finally:
-            for p, rg in zip(params, requires_grad):
-                p.requires_grad_(rg)
+        timestep_full = timesteps[:, None].repeat(1, num_frames)
 
-    def _compute_latent_action_loss(
-        self,
-        latents: torch.Tensor,
-        actions: Optional[torch.Tensor],
-        conditional_dict: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        zero = torch.zeros((), device=latents.device, dtype=latents.dtype)
-        if self.latent_action_model is None or self.latent_action_loss_weight <= 0.0:
-            return zero, {}
+        if self.diffusion_gan:
+            noise = reuse_noise if reuse_noise is not None else torch.randn_like(latents)
+            noisy_latents = self.scheduler.add_noise(
+                latents.flatten(0, 1),
+                noise.flatten(0, 1),
+                timestep_full.flatten(0, 1),
+            ).unflatten(0, (batch_size, num_frames))
+        else:
+            noisy_latents = latents
 
-        if actions is None:
-            return zero, {}
+        return noisy_latents, timestep_full
 
-        if actions.device != latents.device:
-            actions = actions.to(device=latents.device)
+    def _classifier_logits(self, latents: torch.Tensor, conditional_dict: dict) -> torch.Tensor:
+        if not hasattr(self.fake_score, "adding_cls_branch"):
+            raise RuntimeError("fake_score does not support classification branch required for DMD2 GAN loss.")
 
-        latents_for_model = latents
-        actions_for_loss = actions
-        if latents.dim() >= 2 and actions.dim() >= 2:
-            min_frames = min(latents.shape[1], actions.shape[1])
-            latents_for_model = latents[:, :min_frames]
-            actions_for_loss = actions[:, :min_frames]
+        noisy_latents, timestep_full = self._build_classifier_inputs(latents, conditional_dict)
+        outputs = self.fake_score(
+            noisy_image_or_video=noisy_latents,
+            conditional_dict=conditional_dict,
+            timestep=timestep_full,
+            classify_mode=True,
+            concat_time_embeddings=self.concat_time_embeddings,
+        )
+        logits = outputs[-1]
+        return logits.squeeze(-1)
 
-        model = self.latent_action_model
-        assert model is not None
+    def _regressor_preds(self, latents: torch.Tensor, conditional_dict: dict) -> torch.Tensor:
+        if not hasattr(self.fake_score, "adding_rgs_branch"):
+            raise RuntimeError("fake_score does not support regression branch required for Action loss.")
 
-        def _call_latent_action_model_sequence(inputs: torch.Tensor) -> torch.Tensor:
-            if inputs.dim() != 5:
-                raise ValueError(
-                    f"Latent action model expects 5D tensor [B, F, C, H, W], got shape {tuple(inputs.shape)}"
-                )
-            bsz, frames, ch, h, w = inputs.shape
-            if frames < 8:
-                raise ValueError("Latent action model requires at least 8 frames for a forward window.")
-            num_preds = frames - 7  # targets correspond to indices [6 : 6+num_preds)
+        noisy_latents, timestep_full = self._build_classifier_inputs(latents, conditional_dict)
 
-            window_batches: list[torch.Tensor] = []
-            for start in range(0, num_preds):
-                window = inputs[:, start:start + 8]  # [B, 8, C, H, W]
-                window_batches.append(window)
-            stacked = torch.stack(window_batches, dim=1)  # [B, num_preds, 8, C, H, W]
-            stacked = stacked.flatten(0, 1)  # [B*num_preds, 8, C, H, W]
-            model_inputs = stacked.permute(0, 2, 1, 3, 4).contiguous()  # [B*num_preds, C, 8, H, W]
+        outputs = self.fake_score(
+            noisy_image_or_video=noisy_latents,
+            conditional_dict=conditional_dict,
+            timestep=timestep_full,
+            regress_mode=True,
+            concat_time_embeddings=self.concat_time_embeddings,
+        )
 
-            # Ensure FP32 inference regardless of global autocast
-            with torch.amp.autocast('cuda', enabled=False):
-                outputs = model(model_inputs.to(dtype=torch.float32))
-
-            if isinstance(outputs, dict):
-                if "logits" in outputs and torch.is_tensor(outputs["logits"]):
-                    out = outputs["logits"]
-                elif "predictions" in outputs and torch.is_tensor(outputs["predictions"]):
-                    out = outputs["predictions"]
-                elif "loss" in outputs and torch.is_tensor(outputs["loss"]):
-                    out = outputs["loss"].unsqueeze(0)
-                else:
-                    raise TypeError("Unsupported dict outputs from latent_action_model for sequence mode.")
-            elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
-                first = outputs[0]
-                if torch.is_tensor(first):
-                    out = first
-                else:
-                    raise TypeError("Unsupported tuple outputs from latent_action_model for sequence mode.")
-            elif torch.is_tensor(outputs):
-                out = outputs
-            else:
-                raise TypeError("Unsupported output type from latent_action_model in sequence mode.")
-
-            out = out.to(device=inputs.device)
-            # reshape back to [B, num_preds, ...]
-            out = out.reshape(bsz, num_preds, *out.shape[1:])
-            return out
-
-        def _loss_from_predictions(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            if targets.dtype.is_floating_point:
-                if predictions.shape != targets.shape:
-                    raise ValueError(
-                        f"Latent action model predictions shape {predictions.shape} does not match targets shape {targets.shape}."
-                    )
-                return F.mse_loss(predictions.to(dtype=targets.dtype), targets, reduction="mean")
-
-            logits = predictions
-            num_classes = logits.shape[-1]
-            logits_flat = logits.reshape(-1, num_classes)
-            targets_flat = targets.reshape(-1).long()
-            if logits_flat.shape[0] != targets_flat.shape[0]:
-                raise ValueError(
-                    "Latent action model logits and target sizes do not align for cross-entropy computation."
-                )
-            return F.cross_entropy(logits_flat, targets_flat)
-
-        with self._freeze_module_params(self.latent_action_model):
-            predictions_seq = _call_latent_action_model_sequence(latents_for_model)
-
-        # Align targets: actions_for_loss[:, 6 : -1] -> length num_preds (frames-7)
-        num_preds = predictions_seq.shape[1]
-        target_start = 6
-        target_end = target_start + num_preds
-        targets_seq = actions_for_loss[:, target_start:target_end]
-
-        # Compute supervised loss over the sequence
-        base_loss = _loss_from_predictions(predictions_seq, targets_seq)
-        log_updates: Dict[str, torch.Tensor] = {}
-
-        weighted_loss = base_loss * self.latent_action_loss_weight
-        log_updates.update({
-            "latent_action_loss": weighted_loss.detach(),
-            "latent_action_loss_raw": base_loss.detach(),
-        })
-        return weighted_loss.to(dtype=latents.dtype), log_updates
+        preds = outputs[-1]
+        return preds
 
     def _compute_motion_weights(self, reference: torch.Tensor) -> torch.Tensor:
         if (not self.motion_enabled_loss) or reference.ndim < 5:
@@ -366,6 +298,31 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
             error = error[mask]
 
         return error.mean()
+
+    def _compute_latent_action_loss(
+        self,
+        pred_frames: torch.Tensor,  # [B, 21, C, H, W]
+        actions: Optional[torch.Tensor],  # [B, 21, ...]
+        conditional_dict: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        zero = torch.zeros((), device=pred_frames.device, dtype=pred_frames.dtype)
+        if (
+            self.latent_action_model is None
+            or self.latent_action_loss_weight <= 0.0
+            or actions is None
+        ):
+            return zero, {}
+        # Use first 21 frames
+        if pred_frames.shape[1] < 21 or actions.shape[1] < 21:
+            return zero, {}
+        # Model expects [B, 21, C, H, W]. Actions true: compare to actions[:, 6:-1] (i.e. 14 action steps)
+        model_input = pred_frames[:, :21]  # [B, 21, C, H, W]
+        action_targets = actions[:, 6:20]  # [B, 14, action_dim] -- -1 is exclusive
+        model_out = self.latent_action_model(model_input)  # [B, 14, action_dim] (assumed)
+        # Loss: assumed regression/l1
+        loss = F.l1_loss(model_out, action_targets, reduction="mean") * self.latent_action_loss_weight
+        logs = {"latent_action_loss": loss.detach()}
+        return loss, logs
 
     def compute_distribution_matching_loss(
         self,
@@ -435,8 +392,6 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
         )
         return dmd_loss, dmd_log_dict
 
-    # Use base SelfForcingModelActions._run_generator which handles action modulation and backward simulation
-
     def generator_loss(
         self,
         image_or_video_shape,
@@ -459,8 +414,9 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
             slice_last_frames=slice_last_frames,
-            actions=actions,
+            action_inputs=actions,
         )
+        assert pred_image.requires_grad, "generator rollout returned a detached tensor"
         gen_time = time.time() - _t_gen_start
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: After generator unroll", device=self.device, rank=dist.get_rank())
@@ -516,19 +472,39 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
                     "generator_mse_raw": mse_loss.detach(),
                 })
 
-        # Latent action loss
+        if self.gan_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch"):
+            with self._freeze_fake_score_params():
+                logits_fake = self._classifier_logits(pred_image, conditional_dict)
+            gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
+            total_loss = total_loss + gan_loss
+            log_dict.update({
+                "generator_gan_loss": gan_loss.detach(),
+                "generator_gan_logits": logits_fake.detach().mean(),
+                "generator_gan_real_prob": torch.sigmoid(logits_fake.detach()).mean(),
+                "generator_gan_logits_std": logits_fake.detach().std(unbiased=False),
+            })
+
+        if self.action_loss_weight > 0.0 and hasattr(self.fake_score, "adding_rgs_branch"):
+            if actions is None:
+                raise ValueError("Actions tensor required for generator action regression loss.")
+            with self._freeze_fake_score_params():
+                action_preds = self._regressor_preds(pred_image, conditional_dict)
+            act_loss = F.l1_loss(action_preds, actions.to(device=pred_image.device, dtype=pred_image.dtype)) * self.action_loss_weight
+            total_loss = total_loss + act_loss
+            log_dict.update({
+                "generator_act_loss": act_loss.detach(),
+            })
+        # INSERT HERE: latent action model loss
         latent_action_loss, latent_action_logs = self._compute_latent_action_loss(
-            pred_image,
-            actions,
-            conditional_dict,
+            pred_image, actions, conditional_dict
         )
         total_loss = total_loss + latent_action_loss
-        if latent_action_logs:
-            log_dict.update(latent_action_logs)
+        log_dict.update(latent_action_logs)
 
         loss_time = time.time() - _t_loss_start
         log_dict["loss_time"] = loss_time
-        log_dict["dmdtrain_gradient_norm"] = torch.tensor(0.0, device=pred_image.device)
+        # dmdtrain_gradient_norm is already set in dmd_log_dict from compute_distribution_matching_loss
+        # No need to overwrite it with 0.0
 
         return total_loss, log_dict
 
@@ -569,7 +545,8 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,
-                slice_last_frames=slice_last_frames
+                slice_last_frames=slice_last_frames,
+                action_inputs=actions,
             )
         if dist.get_rank() == 0 and DEBUG:
             print(f"pred_image: {generated_image.shape}")
@@ -638,8 +615,42 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
             flow_pred=flow_pred
         )
 
-        # No GAN or action regression losses in this variant
-        total_loss = denoising_loss
+        cls_loss = torch.tensor(0.0, device=self.device)
+        gan_log_dict = {}
+        if (self.cls_on_clean_image and self.guidance_cls_loss_weight > 0.0 and
+                real_latents is not None and hasattr(self.fake_score, "adding_cls_branch")):
+            real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), conditional_dict)
+            fake_logits = self._classifier_logits(generated_image.detach(), conditional_dict)
+            loss_real = F.softplus(-real_logits).mean()
+            loss_fake = F.softplus(fake_logits).mean()
+            cls_loss = (loss_real + loss_fake) * self.guidance_cls_loss_weight
+            gan_log_dict = {
+                "critic_gan_loss": cls_loss.detach(),
+                "critic_real_logits": real_logits.detach().mean(),
+                "critic_fake_logits": fake_logits.detach().mean(),
+                "critic_real_prob": torch.sigmoid(real_logits.detach()).mean(),
+                "critic_fake_prob": torch.sigmoid(fake_logits.detach()).mean(),
+                "critic_real_accuracy": (real_logits.detach() > 0).float().mean(),
+                "critic_fake_accuracy": (fake_logits.detach() < 0).float().mean(),
+                "critic_cls_loss": cls_loss.detach(),
+            }
+
+        rgs_loss = torch.tensor(0.0, device=self.device)
+        action_log_dict = {}
+        if self.guidance_rgs_loss_weight > 0.0 and hasattr(self.fake_score, "adding_rgs_branch"):
+            if real_latents is None:
+                raise ValueError("Real latents required for critic action regression loss.")
+            if actions is None:
+                raise ValueError("Actions tensor required for critic action regression loss.")
+            live_actions = self._regressor_preds(real_latents.to(self.device, dtype=torch.float32), conditional_dict)
+            rgs_loss = F.l1_loss(live_actions, actions.to(device=self.device, dtype=torch.float32)) * self.guidance_rgs_loss_weight
+            action_log_dict = {
+                "critic_rgs_loss": rgs_loss.detach(),
+                "critic_action_pred_mean": live_actions.detach().mean(),
+                "critic_action_target_mean": actions.detach().mean(),
+            }
+
+        total_loss = denoising_loss + cls_loss + rgs_loss
 
         try:
             loss_val = total_loss.item()
@@ -655,6 +666,7 @@ class DMD2RealMSELAM_Actions(SelfForcingModelActions):
             "loss_time": loss_time,
             "critic_denoising_loss": denoising_loss.detach(),
         }
-        
+        critic_log_dict.update(gan_log_dict)
+        critic_log_dict.update(action_log_dict)
 
         return total_loss, critic_log_dict

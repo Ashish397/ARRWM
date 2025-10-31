@@ -37,9 +37,6 @@ class DMD2RealMSELAM(SelfForcingModel):
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
 
-        # this will be init later with fsdp-wrapped modules
-        self.inference_pipeline: SelfForcingTrainingPipeline = None
-
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep
         self.min_step = int(0.02 * self.num_train_timestep)
@@ -61,15 +58,15 @@ class DMD2RealMSELAM(SelfForcingModel):
             self.scheduler.alphas_cumprod = None
 
         # DMD2-specific configuration
-        self.cls_on_clean_image = getattr(args, "cls_on_clean_image", True)
-        self.gan_loss_weight = getattr(args, "gan_loss_weight", 1.0)
-        self.action_loss_weight = getattr(args, "action_loss_weight", 1.0)
+        self.cls_on_clean_image = getattr(args, "cls_on_clean_image", False)
+        self.gan_loss_weight = getattr(args, "gan_loss_weight", 0.0)
+        self.action_loss_weight = getattr(args, "action_loss_weight", 0.0)
         self.guidance_cls_loss_weight = getattr(args, "guidance_cls_loss_weight", self.gan_loss_weight)
         self.guidance_rgs_loss_weight = getattr(args, "guidance_rgs_loss_weight", self.action_loss_weight)
         self.diffusion_gan = getattr(args, "diffusion_gan", False)
         self.diffusion_gan_max_timestep = getattr(args, "diffusion_gan_max_timestep", self.num_train_timestep)
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
-        self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.0)
+        self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.1)
         self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
         self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
 
@@ -385,6 +382,7 @@ class DMD2RealMSELAM(SelfForcingModel):
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
             slice_last_frames=slice_last_frames,
+            action_inputs=actions,
         )
         gen_time = time.time() - _t_gen_start
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -466,7 +464,8 @@ class DMD2RealMSELAM(SelfForcingModel):
 
         loss_time = time.time() - _t_loss_start
         log_dict["loss_time"] = loss_time
-        log_dict["dmdtrain_gradient_norm"] = torch.tensor(0.0, device=pred_image.device)
+        # dmdtrain_gradient_norm is already set in dmd_log_dict from compute_distribution_matching_loss
+        # No need to overwrite it with 0.0
 
         return total_loss, log_dict
 
@@ -507,7 +506,8 @@ class DMD2RealMSELAM(SelfForcingModel):
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,
-                slice_last_frames=slice_last_frames
+                slice_last_frames=slice_last_frames,
+                action_inputs=actions
             )
         if dist.get_rank() == 0 and DEBUG:
             print(f"pred_image: {generated_image.shape}")

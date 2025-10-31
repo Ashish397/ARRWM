@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -J train_init_real_d2_test
-#SBATCH -N 1
-#SBATCH --ntasks=4
+#SBATCH -J train_init_real_N_d2_lam_5_with_actions
+#SBATCH --nodes=16
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=16
 #SBATCH -t 22:00:00
 #SBATCH --requeue
 #SBATCH -o %x_%j.out
@@ -15,10 +15,10 @@ set -e -o pipefail
 cd /home/u5as/as1748.u5as/frodobots/ARRWM
 
 # Project path and config
-CONFIG=configs/longlive_train_init_real.yaml
-LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/test
+CONFIG=configs/longlive_train_init_real_N_d2_lam_5.yaml
+LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs_N_d2_lam_5_with_actions
 WANDB_SAVE_DIR=wandb
-EXPERIMENT_NAME="dmd2-init-real-d2-test-$(date +%Y%m%d-%H%M%S)"
+EXPERIMENT_NAME="dmd2-init-N-d2-lam-5-with-actions-$(date +%Y%m%d-%H%M%S)"
 
 # Activate arrwm conda environment
 if [ -f "$HOME/miniforge/etc/profile.d/conda.sh" ]; then
