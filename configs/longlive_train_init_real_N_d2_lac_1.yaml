@@ -53,7 +53,7 @@ gradient_accumulation_steps: 1
 ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 64
-log_iters: 10
+log_iters: 100
 max_checkpoints: 5
 max_iters: 700
 

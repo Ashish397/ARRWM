@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=4
-#SBATCH -t 2:00:00
+#SBATCH -t 05:00:00
 #SBATCH --requeue
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
