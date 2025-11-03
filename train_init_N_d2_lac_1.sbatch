@@ -21,12 +21,7 @@ WANDB_SAVE_DIR=wandb
 EXPERIMENT_NAME="dmd2-init-N-d2-lac-1-with-action-$(date +%Y%m%d-%H%M%S)"
 
 # Activate arrwm conda environment
-if [ -f "$HOME/miniforge/etc/profile.d/conda.sh" ]; then
-  source "$HOME/miniforge/etc/profile.d/conda.sh"
-else
-  echo 'conda.sh not found at $HOME/miniforge/etc/profile.d/conda.sh' >&2
-  exit 1
-fi
+source "$HOME/miniforge/etc/profile.d/conda.sh"
 conda activate arrwm
 
 # Ensure Hugging Face downloads use scratch space (larger quota than $HOME).
