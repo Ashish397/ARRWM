@@ -7,6 +7,9 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+from __future__ import annotations
+
+from typing import Any, Optional
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -40,36 +43,31 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         
         # 初始化动作相关的配置
         self.action_module = action_module
-        self.use_action_conditioning = action_module is not None or enable_adaln_zero
         self.enable_adaln_zero = enable_adaln_zero
         self.action_dim = action_dim
-        
-        # 如果启用 adaLN-Zero，创建 action modulation 投影层
+        self.action_projection: Optional[ActionModulationProjection] = None
+        self._action_conditioning_enabled = self.enable_adaln_zero or self.action_module is not None
+        # Backwards compatibility for external checks.
+        self.use_action_conditioning = self._action_conditioning_enabled
+
+        if self._action_conditioning_enabled:
+            _ = apply_action_patches(self.generator)
+
         if self.enable_adaln_zero:
-            # 获取模型隐藏维度
-            if hasattr(self.generator.model, 'dim'):
-                model_dim = self.generator.model.dim
-            else:
-                model_dim = 2048  # Wan-1.3B 默认
-            
-            # 创建 action modulation projection
+            device = self._resolve_module_device(self.generator)
+            model_dim = getattr(self.generator.model, "dim", 2048)
             self.action_projection = ActionModulationProjection(
-                action_dim=action_dim,
+                action_dim=self.action_dim,
                 hidden_dim=model_dim,
                 num_frames=1,
-                zero_init=True,  # adaLN-Zero: 初始化为0
+                zero_init=True,
             ).to(device)
-            
-            # 应用模型补丁以支持 action modulation 注入
-            apply_action_patches(self.generator)
-            
+
             if not dist.is_initialized() or dist.get_rank() == 0:
-                print(f"[ActionPipeline] adaLN-Zero enabled: action_dim={action_dim}, model_dim={model_dim}")
-        else:
-            self.action_projection = None
-        
+                print(f"[ActionPipeline] adaLN-Zero enabled: action_dim={self.action_dim}, model_dim={model_dim}")
+
         if not dist.is_initialized() or dist.get_rank() == 0:
-            print(f"[ActionPipeline] Action conditioning: {self.use_action_conditioning}")
+            print(f"[ActionPipeline] Action conditioning: {self._action_conditioning_enabled}")
 
     def _process_action(
         self,
@@ -104,41 +102,88 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         print(f"[Action Module] Processing action at frame {current_frame_idx}")
         return None
 
-    def _apply_action_conditioning(
+    @staticmethod
+    def _resolve_module_device(module: WanDiffusionWrapper) -> torch.device:
+        try:
+            param = next(module.parameters())
+            return param.device
+        except (StopIteration, AttributeError):
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _compute_action_modulation(
         self,
-        conditional_dict: dict,
-        action_features: torch.Tensor | None,
-        current_frame_idx: int,
-        num_frames: int = 1,
-    ) -> dict:
-        """
-        将动作特征转换为 adaLN modulation 参数并注入到条件字典中。
-        
-        Args:
-            conditional_dict: 原始条件字典（来自 text encoder）
-            action_features: 动作特征 [batch_size, action_dim]
-            current_frame_idx: 当前帧索引
-            num_frames: 当前处理的帧数
-            
-        Returns:
-            modified_conditional_dict: 包含 action modulation 的条件字典
-        """
-        if action_features is None or not self.enable_adaln_zero:
-            return conditional_dict
-        
-        # 使用 adaLN-Zero 投影层生成 modulation 参数
-        # action_features: [B, action_dim] -> modulation: [B, num_frames, 6, hidden_dim]
-        action_modulation = self.action_projection(action_features, num_frames=num_frames)
-        
-        # 将 modulation 参数存储到 conditional_dict
-        # 这将在 generator forward 时被提取并传递给模型
-        conditional_dict = conditional_dict.copy()  # 避免修改原字典
-        conditional_dict['_action_modulation'] = action_modulation
-        conditional_dict['action_features'] = action_features  # 也保存原始特征供参考
-        
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(f"[ActionConditioning] Applied at frame {current_frame_idx}, modulation shape: {action_modulation.shape}")
-        
+        action_inputs: Optional[dict[str, Any]],
+        frame_start: int,
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not self._action_conditioning_enabled or action_inputs is None:
+            return None
+
+        batch_mod: Optional[torch.Tensor] = None
+
+        provided_mod = action_inputs.get("action_modulation") if isinstance(action_inputs, dict) else None
+        if provided_mod is not None:
+            provided_mod = provided_mod.to(device=device, dtype=dtype)
+            if provided_mod.dim() == 3:
+                total_frames = provided_mod.shape[1]
+                hidden = provided_mod.shape[2] // 6
+                provided_mod = provided_mod.view(provided_mod.shape[0], total_frames, 6, hidden)
+            if provided_mod.dim() != 4:
+                raise ValueError("action_modulation 需要形状 [B, T, 6, hidden_dim] 或兼容形状")
+            if frame_start + num_frames > provided_mod.shape[1]:
+                raise ValueError("action_modulation 的帧长度不足以覆盖当前块")
+            batch_mod = provided_mod[:, frame_start:frame_start + num_frames]
+            return batch_mod
+
+        action_features = None
+        if isinstance(action_inputs, dict):
+            if "action_features" in action_inputs and action_inputs["action_features"] is not None:
+                action_features = action_inputs["action_features"]
+            elif "actions" in action_inputs and action_inputs["actions"] is not None:
+                action_features = action_inputs["actions"]
+
+        if action_features is None:
+            return None
+
+        action_features = action_features.to(device=device, dtype=dtype)
+
+        if action_features.dim() == 2:
+            action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
+        elif action_features.dim() == 3:
+            if frame_start + num_frames > action_features.shape[1]:
+                raise ValueError("action_features 的帧长度不足以覆盖当前块")
+            action_features = action_features[:, frame_start:frame_start + num_frames]
+        else:
+            raise ValueError("action_features 需为 [B, action_dim] 或 [B, T, action_dim]")
+
+        if not self.enable_adaln_zero or self.action_projection is None:
+            return None
+
+        modulation = self.action_projection(action_features, num_frames=num_frames)
+        return modulation.to(device=device, dtype=dtype)
+
+    def _prepare_action_conditional(
+        self,
+        base_conditional: dict[str, Any],
+        action_inputs: Optional[dict[str, Any]],
+        frame_start: int,
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        if action_inputs is None:
+            return base_conditional
+
+        modulation = self._compute_action_modulation(action_inputs, frame_start, num_frames, device, dtype)
+        if modulation is None:
+            return base_conditional
+
+        conditional_dict = dict(base_conditional)
+        conditional_dict["_action_modulation"] = modulation
+        if "action_features" in action_inputs:
+            conditional_dict["action_features"] = action_inputs["action_features"]
         return conditional_dict
 
     def inference(
@@ -230,39 +275,46 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         self.generator.model.local_attn_size = self.local_attn_size
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
+        base_conditional_dict = conditional_dict
+        base_action_inputs = ({k: v for k, v in action_inputs.items()} if isinstance(action_inputs, dict) else None)
+
         # 时序去噪循环（逐块生成）
         all_num_frames = [self.num_frame_per_block] * num_blocks
         
         for block_idx, current_num_frames in enumerate(all_num_frames):
             print(f"\n[Block {block_idx}] Generating frames {current_start_frame} to {current_start_frame + current_num_frames}")
-            
-            # ============ 动作模块插入点 1: 基于历史帧预测动作 ============
-            if current_start_frame > 0 and self.use_action_conditioning:
-                # 使用已生成的帧来预测/计算动作
+
+            block_action_inputs = (
+                {k: v for k, v in base_action_inputs.items()} if base_action_inputs is not None else None
+            )
+
+            inferred_action_features: Optional[torch.Tensor] = None
+            if (
+                current_start_frame > 0
+                and self._action_conditioning_enabled
+                and self.action_module is not None
+            ):
                 historical_frames = output[:, :current_start_frame].to(noise.device)
-                action_features = self._process_action(
+                inferred_action_features = self._process_action(
                     generated_frames=historical_frames,
                     current_frame_idx=current_start_frame,
-                    action_inputs=action_inputs
+                    action_inputs=action_inputs,
                 )
-                
-                # 将动作特征应用到条件中（通过 adaLN-Zero）
-                conditional_dict = self._apply_action_conditioning(
-                    conditional_dict=conditional_dict,
-                    action_features=action_features,
-                    current_frame_idx=current_start_frame,
-                    num_frames=current_num_frames  # 传递当前处理的帧数
-                )
-            elif action_inputs is not None and 'action_features' in action_inputs:
-                # 或者直接使用外部提供的 action features
-                action_features = action_inputs['action_features']
-                conditional_dict = self._apply_action_conditioning(
-                    conditional_dict=conditional_dict,
-                    action_features=action_features,
-                    current_frame_idx=current_start_frame,
-                    num_frames=current_num_frames
-                )
-            
+
+            if inferred_action_features is not None:
+                if block_action_inputs is None:
+                    block_action_inputs = {}
+                block_action_inputs["action_features"] = inferred_action_features
+
+            cond_with_action = self._prepare_action_conditional(
+                base_conditional=base_conditional_dict,
+                action_inputs=block_action_inputs,
+                frame_start=current_start_frame,
+                num_frames=current_num_frames,
+                device=noise.device,
+                dtype=noise.dtype,
+            )
+
             # 准备输入噪声
             noisy_input = noise[:, current_start_frame:current_start_frame + current_num_frames]
 
@@ -283,7 +335,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                     # 中间去噪步骤
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
+                        conditional_dict=cond_with_action,
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
@@ -305,7 +357,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                     # 最后一步，获取干净输出
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
+                        conditional_dict=cond_with_action,
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
@@ -323,7 +375,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=conditional_dict,
+                conditional_dict=cond_with_action,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
@@ -341,4 +393,3 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
             return video, output.to(noise.device)
         else:
             return video
-

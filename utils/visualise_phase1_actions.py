@@ -4,7 +4,6 @@
 import argparse
 import json
 import sys
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable, Optional
@@ -18,7 +17,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pipeline.action_inference import ActionCausalInferencePipeline
-from utils.dataset import VideoLatentCaptionDataset
 
 
 DEFAULT_LOG_ROOT = Path("/scratch/u5as/as1748.u5as/frodobots/dmd2/logs")
@@ -165,6 +163,7 @@ def _load_caption(caption_root: Path, rel_dir: Path, *, text_pre_encoded: bool =
     if not caption_dir.is_dir():
         raise RuntimeError(f"Caption directory missing: {caption_dir}")
 
+    prompt_embeds: Optional[torch.Tensor] = None
     if text_pre_encoded:
         encoded_candidates = sorted(caption_dir.glob(f"*{encoded_suffix}.json"))
         if not encoded_candidates:
@@ -225,17 +224,27 @@ def _load_generator_weights(
         print(f"[Warning] {len(unexpected)} unexpected generator parameters: {unexpected[:8]} ...", file=sys.stderr)
 
 
-def _resolve_roots(config: OmegaConf, split: str) -> tuple[Path, Path]:
+def _resolve_roots(config: OmegaConf, split: str) -> tuple[Optional[Path], Path]:
     split = split.lower()
     if split == "train":
-        latent_root = Path(config.real_latent_root)
+        latent_attr = getattr(config, "real_latent_root", None)
         caption_root = Path(config.caption_root)
     elif split == "test":
-        latent_root = Path(config.val_real_latent_root)
+        latent_attr = getattr(config, "val_real_latent_root", None)
         caption_root = Path(config.val_caption_root)
     else:
         raise ValueError(f"Unsupported split '{split}'. Expected 'train' or 'test'.")
+    latent_root = Path(latent_attr) if latent_attr else None
     return latent_root, caption_root
+
+
+def _extract_checkpoint_step(checkpoint_path: Path) -> str:
+    candidates = [checkpoint_path.stem, checkpoint_path.parent.name]
+    for name in candidates:
+        step = _parse_step_from_dirname(name)
+        if step is not None:
+            return f"{step:06d}"
+    return "unknown"
 
 
 def parse_args() -> argparse.Namespace:
@@ -290,7 +299,53 @@ def main() -> None:
         checkpoint_path = _choose_checkpoint(run_dir, args.checkpoint_step)
         print(f"[Info] Using run directory: {run_dir}")
         print(f"[Info] Loading checkpoint: {checkpoint_path}")
-    latent_root, caption_root = _resolve_roots(config, args.split)
+    else:
+        generator_ckpt = getattr(config, "generator_ckpt", None)
+        if generator_ckpt:
+            ckpt_candidate = Path(str(generator_ckpt)).expanduser()
+            if ckpt_candidate.is_dir():
+                if ckpt_candidate.name.startswith("checkpoint_model_"):
+                    maybe_file = ckpt_candidate / "model.pt"
+                    if maybe_file.is_file():
+                        checkpoint_path = maybe_file
+                        run_dir = ckpt_candidate.parent
+                else:
+                    run_dir = ckpt_candidate
+            elif ckpt_candidate.is_file():
+                checkpoint_path = ckpt_candidate
+                checkpoint_parent = ckpt_candidate.parent
+                if checkpoint_parent.name.startswith("checkpoint_model_"):
+                    run_dir = checkpoint_parent.parent
+                else:
+                    run_dir = checkpoint_parent
+        weights_cfg = getattr(config, "weights", None)
+        if checkpoint_path is None and weights_cfg is not None:
+            weights_root = Path(str(weights_cfg.root)).expanduser()
+            weights_run = str(getattr(weights_cfg, "run", run_name or ""))
+            if not run_name:
+                run_name = weights_run or run_name
+            run_dir_candidate = weights_root / weights_run
+            run_dir = run_dir_candidate
+            target_step = args.checkpoint_step
+            if target_step is None:
+                default_step = getattr(weights_cfg, "default_step", None)
+                if default_step is not None:
+                    try:
+                        target_step = int(str(default_step))
+                    except ValueError:
+                        target_step = None
+            checkpoint_path = _choose_checkpoint(run_dir_candidate, target_step)
+            print(f"[Info] Using weights directory: {run_dir_candidate}")
+            print(f"[Info] Loading checkpoint: {checkpoint_path}")
+        if checkpoint_path is None and run_name:
+            try:
+                run_dir = _choose_run_dir(log_root, run_name, args.timestamp)
+                checkpoint_path = _choose_checkpoint(run_dir, args.checkpoint_step)
+                print(f"[Info] Using run directory: {run_dir}")
+                print(f"[Info] Loading checkpoint: {checkpoint_path}")
+            except FileNotFoundError:
+                pass
+    _, caption_root = _resolve_roots(config, args.split)
     # Only captions are required for selecting rides and prompts
     if not caption_root.exists():
         raise FileNotFoundError(f"Caption root not found: {caption_root}")
@@ -306,9 +361,13 @@ def main() -> None:
     print(f"[Info] Prompt: {prompt_text}")
 
     output_root = args.output_dir.expanduser()
+    if output_root == DEFAULT_OUTPUT_ROOT:
+        output_override = getattr(config, "output_folder", None)
+        if output_override:
+            output_root = Path(str(output_override)).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    if not args.run:
+    if checkpoint_path is None:
         ride_label = rel_dir.name.replace("/", "_")
         base_root = Path('/projects/u5as/frodobots')
         bucket = rel_dir.parts[0]
@@ -382,7 +441,8 @@ def main() -> None:
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    assert checkpoint_path is not None and run_dir is not None
+    if checkpoint_path is None:
+        raise RuntimeError("Checkpoint path could not be resolved; provide --run or configure weights/generator_ckpt.")
     config = OmegaConf.merge(config, OmegaConf.create({"generator_ckpt": str(checkpoint_path)}))
 
     pipeline = ActionCausalInferencePipeline(config, device=device, action_dim=2)
@@ -396,7 +456,7 @@ def main() -> None:
     if getattr(pipeline, 'text_encoder', None) is not None:
         pipeline.text_encoder.to(device=device)
 
-    num_frames = args.num_frames or int(getattr(config, "num_training_frames", 21))
+    num_frames = args.num_frames or int(getattr(config, "num_output_frames", getattr(config, "num_training_frames", 21)))
     noise = torch.randn(1, num_frames, 16, 60, 104, device=device, dtype=dtype)
     print(f"[Info] Generating {num_frames} frames on {device} with dtype {dtype}.")
 
@@ -438,7 +498,9 @@ def main() -> None:
     video_uint8 = (video * 255.0).round().to(torch.uint8)
 
     ride_label = rel_dir.name.replace("/", "_")
-    out_name = f"{run_dir.name}_{ride_label}_step{checkpoint_path.parent.name.split('_')[-1]}_{args.action}_idx{args.output_index}.mp4"
+    step_label = _extract_checkpoint_step(checkpoint_path)
+    run_label = run_dir.name if run_dir is not None else (run_name or "inference")
+    out_name = f"{run_label}_{ride_label}_step{step_label}_{args.action}_idx{args.output_index}.mp4"
     out_path = output_root / out_name
     write_video(str(out_path), video_uint8, fps=args.fps)
     if hasattr(pipeline.vae, "model"):
