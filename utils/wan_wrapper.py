@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import types
 from pathlib import Path
+from omegaconf import OmegaConf
 from typing import List, Optional, Union
 import torch
 from torch import nn
-from omegaconf import OmegaConf
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
@@ -15,16 +15,12 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 
 # Load default config to get wan_model_path
-def _get_wan_model_path() -> str:
-    """Get wan_model_path from default_config.yaml"""
-    try:
-        default_config = OmegaConf.load("configs/default_config.yaml")
-        return default_config.get("wan_model_path", "/home/ashish/Wan2.1/")
-    except Exception:
-        return "/home/ashish/Wan2.1/"
-
-_DEFAULT_WAN_MODEL_PATH = _get_wan_model_path()
-
+default_config_path = Path(__file__).parent.parent / "configs" / "default_config.yaml"
+_default_config = OmegaConf.load(default_config_path)
+_default_wan_model_path = _default_config.get("wan_model_path", "/home/ashish/Wan2.1/")
+# Ensure path ends with a slash
+if not _default_wan_model_path.endswith("/"):
+    _default_wan_model_path = _default_wan_model_path + "/"
 
 class WanTextEncoder(torch.nn.Module):
     def __init__(
@@ -36,7 +32,7 @@ class WanTextEncoder(torch.nn.Module):
         super().__init__()
 
         self.model_name = model_name or "Wan2.1-T2V-1.3B"
-        self.model_root = Path(model_root) if model_root is not None else Path(_DEFAULT_WAN_MODEL_PATH) / self.model_name
+        self.model_root = Path(model_root) if model_root is not None else Path(_default_wan_model_path) / self.model_name
         weights_path = self.model_root / "models_t5_umt5-xxl-enc-bf16.pth"
         tokenizer_path = self.model_root / "google" / "umt5-xxl"
 
@@ -106,7 +102,7 @@ class WanVAEWrapper(torch.nn.Module):
         self.std = torch.tensor(std, dtype=torch.float32)
 
         self.model_name = model_name or "Wan2.1-T2V-1.3B"
-        self.model_root = Path(model_root) if model_root is not None else Path(_DEFAULT_WAN_MODEL_PATH) / self.model_name
+        self.model_root = Path(model_root) if model_root is not None else Path(_default_wan_model_path) / self.model_name
         vae_checkpoint = self.model_root / "Wan2.1_VAE.pth"
 
         # init model
@@ -170,9 +166,9 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"{_DEFAULT_WAN_MODEL_PATH}{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"{_default_wan_model_path}{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"{_DEFAULT_WAN_MODEL_PATH}{model_name}/")
+            self.model = WanModel.from_pretrained(f"{_default_wan_model_path}{model_name}/")
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep

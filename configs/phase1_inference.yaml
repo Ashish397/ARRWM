@@ -38,7 +38,7 @@ val_caption_root: /home/ashish/test
 # Checkpoint discovery.
 weights:
   root: /home/ashish/isambard_weights
-  run: m_01
+  run: c_1
   default_step: 000700
   filename: model.pt
 
