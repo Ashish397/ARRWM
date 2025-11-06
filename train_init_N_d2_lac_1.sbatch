@@ -25,7 +25,7 @@ source /scratch/u5dk/as1748.u5dk/miniforge3/bin/activate
 conda activate arrwm
 
 # Ensure Hugging Face downloads use scratch space (larger quota than $HOME).
-CACHE_DIR='/scratch/u5dk/as1748.u5dk/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR

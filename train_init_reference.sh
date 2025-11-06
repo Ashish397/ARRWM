@@ -7,7 +7,7 @@
 #SBATCH --output=logs/%x_%j.out
 
 # Change to the ARRWM directory where train.py is located
-cd /home/u5dk/as1748.u5as/frodobots/ARRWM
+cd /home/u5dk/as1748.u5dk/frodobots/ARRWM
 
 
 # Activate arrwm conda environment

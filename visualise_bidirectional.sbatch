@@ -22,7 +22,7 @@ CONFIG=ARRWM/configs/bidirectional_inference.yaml
 SCRIPT=ARRWM/utils/visualise_retrain.py
 INPUT_DIR=/projects/u5dk/frodobots_captions/output_rides_3/test
 
-CACHE_DIR='/scratch/u5dk/as1748.u5dk/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR

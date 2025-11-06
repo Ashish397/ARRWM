@@ -45,7 +45,7 @@ MASTER_PORT=${MASTER_PORT:-29500}
 export CONFIG LOGDIR WANDB_SAVE_DIR EXPERIMENT_NAME MASTER_ADDR MASTER_PORT NNODES NPROC_PER_NODE
 
 # Ensure Hugging Face downloads use scratch space (larger quota than $HOME).
-CACHE_DIR='/scratch/u5dk/as1748.u5dk/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR

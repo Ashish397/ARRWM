@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Route Hugging Face cache to scratch to avoid $HOME quota issues.
-CACHE_DIR='/scratch/u5as/as1748.u5as/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR

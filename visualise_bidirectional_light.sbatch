@@ -22,7 +22,7 @@ CHECKPOINT_STEPS=(6900 5700 5100 3900)
 # CHECKPOINT_STEPS=(2700 1500 900 300)
 OUTPUT_DIR=/scratch/u5dk/as1748.u5dk/frodobots/retrain_visualisations/128G
 
-CACHE_DIR='/scratch/u5dk/as1748.u5dk/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR
