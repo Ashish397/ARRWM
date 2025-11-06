@@ -32,13 +32,13 @@ save_with_index: true
 global_sink: true
 
 # Paths for latent/caption lookups (phase-1 uses encoded captions).
-caption_root: /projects/u5as/frodobots_captions/train
-val_caption_root: /projects/u5as/frodobots_captions/test
+caption_root: /home/ashish/train
+val_caption_root: /home/ashish/test
 
 # Checkpoint discovery.
 weights:
-  root: /scratch/u5as/as1748.u5as/frodobots/checkpoints
-  run: c_01
+  root: /home/ashish/isambard_weights
+  run: m_01
   default_step: 000700
   filename: model.pt
 
@@ -46,4 +46,4 @@ weights:
 generator_ckpt: ${weights.root}/${weights.run}/checkpoint_model_${weights.default_step}/${weights.filename}
 
 # Where to store rendered videos.
-output_folder: /scratch/u5as/as1748.u5as/frodobots/visualisations/${weights.run}_${weights.default_step}
+output_folder: /home/ashish/vis/${weights.run}_${weights.default_step}

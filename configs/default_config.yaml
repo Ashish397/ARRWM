@@ -13,6 +13,7 @@ causal: true
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
 prompt_path: prompts/MovieGenVideoBench.txt
+wan_model_path: /home/ashish/Wan2.1/
 eval_first_n: 64
 num_samples: 1
 height: 480
