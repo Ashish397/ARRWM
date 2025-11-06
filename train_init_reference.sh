@@ -7,16 +7,11 @@
 #SBATCH --output=logs/%x_%j.out
 
 # Change to the ARRWM directory where train.py is located
-cd /home/u5as/as1748.u5as/frodobots/ARRWM
+cd /home/u5dk/as1748.u5as/frodobots/ARRWM
 
 
 # Activate arrwm conda environment
-if [ -f "$HOME/miniforge/etc/profile.d/conda.sh" ]; then
-  source "$HOME/miniforge/etc/profile.d/conda.sh"
-else
-  echo 'conda.sh not found at $HOME/miniforge/etc/profile.d/conda.sh' >&2
-  exit 1
-fi
+source /scratch/u5dk/as1748.u5dk/miniforge3/bin/activate
 conda activate arrwm
 
 # Project path and config

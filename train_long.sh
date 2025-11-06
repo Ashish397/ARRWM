@@ -2,12 +2,12 @@
 
 # Project path and config
 CONFIG=configs/longlive_train_long.yaml
-LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs
+LOGDIR=/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs
 WANDB_SAVE_DIR=wandb
 EXPERIMENT_NAME="dmd2-long-$(date +%Y%m%d-%H%M%S)"
 
 # Ensure Hugging Face downloads use scratch space (larger quota than $HOME).
-CACHE_DIR='/scratch/u5as/as1748.u5as/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR

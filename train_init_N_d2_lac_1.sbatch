@@ -12,20 +12,20 @@
 set -e -o pipefail
 
 # Change to the ARRWM directory where train.py is located
-cd /home/u5as/as1748.u5as/frodobots/ARRWM
+cd /home/u5dk/as1748.u5dk/frodobots/ARRWM
 
 # Project path and config
 CONFIG=configs/longlive_train_init_real_N_d2_lac_1.yaml
-LOGDIR=/scratch/u5as/as1748.u5as/frodobots/dmd2/logs_N_d2_lac_1_with_action
+LOGDIR=/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lac_1_with_action
 WANDB_SAVE_DIR=wandb
 EXPERIMENT_NAME="dmd2-init-N-d2-lac-1-with-action-$(date +%Y%m%d-%H%M%S)"
 
 # Activate arrwm conda environment
-source "$HOME/miniforge/etc/profile.d/conda.sh"
+source /scratch/u5dk/as1748.u5dk/miniforge3/bin/activate
 conda activate arrwm
 
 # Ensure Hugging Face downloads use scratch space (larger quota than $HOME).
-CACHE_DIR='/scratch/u5as/as1748.u5as/frodobots/hf_cache'
+CACHE_DIR='/scratch/u5dk/as1748.u5dk/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR
