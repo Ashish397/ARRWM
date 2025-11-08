@@ -78,7 +78,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
 
     def _compute_action_modulation(
         self,
-        action_inputs: Optional[dict[str, Any]],
+        action_inputs: Any,
         frame_start: int,
         num_frames: int,
         device: torch.device,
@@ -89,40 +89,15 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
 
         batch_mod: Optional[torch.Tensor] = None
 
-        provided_mod = action_inputs.get("action_modulation") if isinstance(action_inputs, dict) else None
-        if provided_mod is not None:
-            provided_mod = provided_mod.to(device=device, dtype=dtype)
-            if provided_mod.dim() == 3:
-                # Assume shape [B, total_frames, hidden_dim * 6]
-                total_frames = provided_mod.shape[1]
-                hidden = provided_mod.shape[2] // 6
-                provided_mod = provided_mod.view(provided_mod.shape[0], total_frames, 6, hidden)
-            if provided_mod.dim() != 4:
-                raise ValueError("action_modulation 需要形状 [B, T, 6, hidden_dim] 或兼容形状")
-            if frame_start + num_frames > provided_mod.shape[1]:
-                raise ValueError("action_modulation 的帧长度不足以覆盖当前块")
-            batch_mod = provided_mod[:, frame_start:frame_start + num_frames]
-            return batch_mod
-
-        action_features = None
-        if isinstance(action_inputs, dict):
-            if "action_features" in action_inputs and action_inputs["action_features"] is not None:
-                action_features = action_inputs["action_features"]
-            elif "actions" in action_inputs and action_inputs["actions"] is not None:
-                action_features = action_inputs["actions"]
-
-        if action_features is None:
-            return None
-
-        action_features = action_features.to(device=device, dtype=dtype)
+        action_features = action_inputs.to(device=device, dtype=dtype)
 
         if action_features.dim() == 2:
             # [B, action_dim] -> expand到当前块帧数
             action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
         elif action_features.dim() == 3:
-            if frame_start + num_frames > action_features.shape[1]:
-                raise ValueError("action_features 的帧长度不足以覆盖当前块")
-            action_features = action_features[:, frame_start:frame_start + num_frames]
+            # if frame_start + num_frames > action_features.shape[1]:
+            #     raise ValueError("action_features 的帧长度不足以覆盖当前块")
+            action_features = action_features#[:, frame_start:frame_start + num_frames]
         else:
             raise ValueError("action_features 需为 [B, action_dim] 或 [B, T, action_dim]")
 
@@ -142,16 +117,14 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         dtype: torch.dtype,
     ) -> dict[str, Any]:
         if action_inputs is None:
-            return base_conditional
+            raise ValueError("action_inputs is required")
 
         modulation = self._compute_action_modulation(action_inputs, frame_start, num_frames, device, dtype)
         if modulation is None:
-            return base_conditional
+            raise ValueError("action_modulation is required")
 
         conditional_dict = dict(base_conditional)
         conditional_dict["_action_modulation"] = modulation
-        if "action_features" in action_inputs:
-            conditional_dict["action_features"] = action_inputs["action_features"]
         return conditional_dict
 
     def generate_chunk_with_cache(

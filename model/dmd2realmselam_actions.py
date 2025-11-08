@@ -68,8 +68,8 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
         self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.1)
         self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
-        self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
-        self.latent_action_loss_weight = float(getattr(args, "latent_action_loss_weight", 1.0))
+        self.motion_weight_c = float(getattr(args, "motion_weight_c", 0.0))
+        self.latent_action_loss_weight = float(getattr(args, "latent_action_loss_weight", 0.0))
         self.latent_action_model = latent_action_model
         if self.latent_action_model is not None:
             try:
@@ -103,7 +103,6 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         self.latent_feature_dim = latent_channels
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
-        self.action_loss_weight = float(getattr(args, "action_loss_weight", 1.0))
 
 
     def _compute_kl_grad(

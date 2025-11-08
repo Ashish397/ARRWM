@@ -138,11 +138,71 @@ def _as_video_list(x, target_device=None, target_dtype=None):
     return [_maybe_cast(x[i].permute(1, 0, 2, 3).contiguous()) for i in range(B)]
 
 
+def _coerce_int(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.item()
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp_start(index, total_frames, window):
+    if total_frames < window:
+        raise ValueError(
+            f"action_modulation only has {total_frames} frames, but generator needs {window}"
+        )
+    max_start = max(total_frames - window, 0)
+    if index is None:
+        return 0
+    return min(max(index, 0), max_start)
+
+
+def _slice_action_modulation(action_modulation, chunk_frames, frame_hint, current_start, frame_seq_len):
+    if action_modulation is None:
+        return None
+    if action_modulation.dim() != 4:
+        raise ValueError(f"action_modulation must be [B, F, 6, dim], got {action_modulation.shape}")
+
+    total_frames = action_modulation.shape[1]
+    if total_frames == chunk_frames:
+        return action_modulation
+
+    hint_idx = _coerce_int(frame_hint)
+    if hint_idx is not None:
+        start = _clamp_start(hint_idx, total_frames, chunk_frames)
+        return action_modulation[:, start:start + chunk_frames]
+
+    curr_start_val = _coerce_int(current_start)
+    if curr_start_val is None:
+        start = _clamp_start(0, total_frames, chunk_frames)
+        return action_modulation[:, start:start + chunk_frames]
+
+    if frame_seq_len is None or frame_seq_len <= 0:
+        frame_seq_len = 1
+
+    token_based = curr_start_val // frame_seq_len
+    # Fallback if caller already passed frame indices instead of tokens
+    if token_based + chunk_frames > total_frames and curr_start_val + chunk_frames <= total_frames:
+        token_based = curr_start_val
+
+    start = _clamp_start(token_based, total_frames, chunk_frames)
+    return action_modulation[:, start:start + chunk_frames]
+
+
 def patch_wan_wrapper_for_action(wrapper):
     if getattr(wrapper, "_action_forward_patched", False):
         return wrapper
 
     original_forward = wrapper.forward
+    frame_seq_len_hint = getattr(wrapper, "_action_frame_seq_length", None)
+    if frame_seq_len_hint is None:
+        frame_seq_len_hint = getattr(wrapper, "frame_seq_length", 1560)
+        wrapper._action_frame_seq_length = frame_seq_len_hint
 
     @wraps(original_forward)
     def forward_with_action_extraction(
@@ -159,6 +219,7 @@ def patch_wan_wrapper_for_action(wrapper):
         cache_start=None,
     ):
         action_modulation = conditional_dict.get("_action_modulation", None)
+        frame_start_hint = conditional_dict.get("_action_frame_start", None)
         prompt_embeds = conditional_dict["prompt_embeds"]
 
         # WAN timestep collapse
@@ -166,6 +227,16 @@ def patch_wan_wrapper_for_action(wrapper):
             input_timestep = timestep[:, 0]
         else:
             input_timestep = timestep
+
+        chunk_frames = noisy_image_or_video.shape[1] if isinstance(noisy_image_or_video, torch.Tensor) else None
+        if action_modulation is not None and chunk_frames is not None:
+            action_modulation = _slice_action_modulation(
+                action_modulation,
+                chunk_frames,
+                frame_start_hint,
+                current_start,
+                frame_seq_len_hint,
+            )
 
         # try to get target device/dtype from patch_embedding, but final guard is in model
         mp = wrapper.model.patch_embedding
