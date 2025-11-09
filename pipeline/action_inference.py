@@ -36,17 +36,19 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         text_encoder: WanTextEncoder | None = None,
         vae: WanVAEWrapper | None = None,
         action_module=None,  # 动作模块，可以是任何模型
-        action_dim: int = 512,  # 动作特征维度
+        action_dim: Optional[int] = None,  # 动作特征维度
         enable_adaln_zero: bool = True,  # 是否使用 adaLN-Zero 注入
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         
         # 初始化动作相关的配置
+        resolved_action_dim = action_dim if action_dim is not None else int(getattr(args, "action_dim", 512))
         self.action_module = action_module
         self.enable_adaln_zero = enable_adaln_zero
-        self.action_dim = action_dim
+        self.action_dim = resolved_action_dim
         self.action_projection: Optional[ActionModulationProjection] = None
         self._action_conditioning_enabled = self.enable_adaln_zero or self.action_module is not None
+        self.action_norm_epsilon = float(getattr(args, "action_norm_epsilon", 0.0) or 0.0)
         # Backwards compatibility for external checks.
         self.use_action_conditioning = self._action_conditioning_enabled
 
@@ -102,6 +104,56 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         print(f"[Action Module] Processing action at frame {current_frame_idx}")
         return None
 
+    def _canonicalize_action_inputs(self, action_inputs: Any) -> dict[str, Any]:
+        if action_inputs is None:
+            raise ValueError("action_inputs is required for action-conditioned inference")
+        if isinstance(action_inputs, dict):
+            if not action_inputs:
+                raise ValueError("action_inputs dictionary is empty; provide action data")
+            return dict(action_inputs)
+        if torch.is_tensor(action_inputs):
+            return {"action_features": action_inputs}
+        raise TypeError(
+            f"Unsupported action_inputs type '{type(action_inputs)}'; expected dict or torch.Tensor"
+        )
+
+    def _assert_non_zero_modulation(self, modulation: torch.Tensor, *, source: str = "action_modulation") -> None:
+        if modulation.numel() == 0:
+            raise ValueError(f"{source} tensor is empty")
+        flat = modulation.detach().float().reshape(modulation.shape[0], -1)
+        threshold = max(self.action_norm_epsilon, 0.0)
+        zero_mask = flat.norm(dim=1) <= threshold
+        if torch.any(zero_mask):
+            idx_list = torch.nonzero(zero_mask, as_tuple=False).flatten().tolist()
+            raise ValueError(
+                f"{source} contains zero-norm entries for sample indices {idx_list}; "
+                "action-conditioned inference requires non-zero modulation"
+            )
+
+    def _coerce_action_modulation_tensor(
+        self,
+        modulation: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        mod = modulation.to(device=device, dtype=dtype)
+        if mod.dim() == 3:
+            if mod.shape[2] % 6 != 0:
+                raise ValueError(
+                    "Flattened action_modulation last dimension must be divisible by 6 "
+                    f"(got {mod.shape[2]})"
+                )
+            hidden = mod.shape[2] // 6
+            mod = mod.view(mod.shape[0], mod.shape[1], 6, hidden)
+        if mod.dim() != 4:
+            raise ValueError(
+                "action_modulation must be shaped as [B, num_frames, 6, hidden_dim] after coercion"
+            )
+        if mod.shape[2] != 6:
+            raise ValueError(f"action_modulation expected 6 modulation slots, got {mod.shape[2]}")
+        self._assert_non_zero_modulation(mod)
+        return mod
+
     @staticmethod
     def _resolve_module_device(module: WanDiffusionWrapper) -> torch.device:
         try:
@@ -118,51 +170,49 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
-        if not self._action_conditioning_enabled or action_inputs is None:
-            return None
+        if not self._action_conditioning_enabled:
+            raise RuntimeError("Action conditioning is disabled; enable AdaLN-Zero or provide an action module")
+        if action_inputs is None:
+            raise ValueError("action_inputs is required")
 
-        batch_mod: Optional[torch.Tensor] = None
+        cached_mod = action_inputs.get("_cached_action_modulation")
+        if cached_mod is not None:
+            return self._coerce_action_modulation_tensor(cached_mod, device, dtype)
 
-        provided_mod = action_inputs.get("action_modulation") if isinstance(action_inputs, dict) else None
+        provided_mod = action_inputs.get("action_modulation")
         if provided_mod is not None:
-            provided_mod = provided_mod.to(device=device, dtype=dtype)
-            if provided_mod.dim() == 3:
-                total_frames = provided_mod.shape[1]
-                hidden = provided_mod.shape[2] // 6
-                provided_mod = provided_mod.view(provided_mod.shape[0], total_frames, 6, hidden)
-            if provided_mod.dim() != 4:
-                raise ValueError("action_modulation 需要形状 [B, T, 6, hidden_dim] 或兼容形状")
-            if frame_start + num_frames > provided_mod.shape[1]:
-                raise ValueError("action_modulation 的帧长度不足以覆盖当前块")
-            batch_mod = provided_mod[:, frame_start:frame_start + num_frames]
-            return batch_mod
+            mod = self._coerce_action_modulation_tensor(provided_mod, device, dtype)
+            action_inputs["_cached_action_modulation"] = mod
+            return mod
 
-        action_features = None
-        if isinstance(action_inputs, dict):
-            if "action_features" in action_inputs and action_inputs["action_features"] is not None:
-                action_features = action_inputs["action_features"]
-            elif "actions" in action_inputs and action_inputs["actions"] is not None:
-                action_features = action_inputs["actions"]
-
+        action_features = action_inputs.get("action_features")
         if action_features is None:
-            return None
+            action_features = action_inputs.get("actions")
+        if action_features is None:
+            raise ValueError("action_inputs must include 'action_features'/'actions' or 'action_modulation'")
 
         action_features = action_features.to(device=device, dtype=dtype)
 
         if action_features.dim() == 2:
             action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
-        elif action_features.dim() == 3:
-            if frame_start + num_frames > action_features.shape[1]:
-                raise ValueError("action_features 的帧长度不足以覆盖当前块")
-            action_features = action_features[:, frame_start:frame_start + num_frames]
-        else:
+        elif action_features.dim() != 3:
             raise ValueError("action_features 需为 [B, action_dim] 或 [B, T, action_dim]")
 
+        if action_features.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"action_features last dimension ({action_features.shape[-1]}) != configured action_dim ({self.action_dim})"
+            )
+
         if not self.enable_adaln_zero or self.action_projection is None:
-            return None
+            raise RuntimeError(
+                "action_projection is unavailable; supply precomputed 'action_modulation' instead of features"
+            )
 
         modulation = self.action_projection(action_features, num_frames=num_frames)
-        return modulation.to(device=device, dtype=dtype)
+        modulation = modulation.to(device=device, dtype=dtype)
+        self._assert_non_zero_modulation(modulation)
+        action_inputs["_cached_action_modulation"] = modulation
+        return modulation
 
     def _prepare_action_conditional(
         self,
@@ -174,14 +224,13 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         dtype: torch.dtype,
     ) -> dict[str, Any]:
         if action_inputs is None:
-            return base_conditional
+            raise ValueError("action_inputs is required for conditional preparation")
 
         modulation = self._compute_action_modulation(action_inputs, frame_start, num_frames, device, dtype)
-        if modulation is None:
-            return base_conditional
 
         conditional_dict = dict(base_conditional)
         conditional_dict["_action_modulation"] = modulation
+        conditional_dict["_action_frame_start"] = frame_start
         if "action_features" in action_inputs:
             conditional_dict["action_features"] = action_inputs["action_features"]
         return conditional_dict
@@ -192,7 +241,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         text_prompts: list[str] | None = None,
         *,
         prompt_embeds: torch.Tensor | None = None,
-        action_inputs: dict | None = None,  # 新增：动作相关的输入
+        action_inputs: Any = None,  # 新增：动作相关的输入
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
@@ -204,10 +253,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
             noise: 输入噪声 [batch_size, num_output_frames, num_channels, height, width]
             text_prompts: 文本提示列表（当 text_pre_encoded=False 时使用）
             prompt_embeds: 预编码的文本嵌入（当 text_pre_encoded=True 时使用）
-            action_inputs: 动作相关的输入字典，可以包含：
-                - 'target_actions': 目标动作序列
-                - 'action_embeddings': 预先计算的动作嵌入
-                - 'control_signals': 控制信号等
+            action_inputs: 必填的动作输入。可为 torch.Tensor（形状 [B, action_dim] 或 [B, T, action_dim]）
+                或包含 'action_features' / 'actions' / 'action_modulation' 的字典。
             return_latents: 是否返回潜在表示
             profile: 是否进行性能分析
             low_memory: 是否使用低内存模式
@@ -215,6 +262,10 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         Returns:
             video: 生成的视频张量 [batch_size, num_output_frames, 3, height, width]
         """
+        if not self._action_conditioning_enabled:
+            raise RuntimeError("Action conditioning is disabled; enable AdaLN-Zero before using this pipeline")
+        base_action_inputs = self._canonicalize_action_inputs(action_inputs)
+
         batch_size, num_output_frames, num_channels, height, width = noise.shape
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
@@ -276,7 +327,6 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
         base_conditional_dict = conditional_dict
-        base_action_inputs = ({k: v for k, v in action_inputs.items()} if isinstance(action_inputs, dict) else None)
 
         # 时序去噪循环（逐块生成）
         all_num_frames = [self.num_frame_per_block] * num_blocks
@@ -284,9 +334,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         for block_idx, current_num_frames in enumerate(all_num_frames):
             print(f"\n[Block {block_idx}] Generating frames {current_start_frame} to {current_start_frame + current_num_frames}")
 
-            block_action_inputs = (
-                {k: v for k, v in base_action_inputs.items()} if base_action_inputs is not None else None
-            )
+            block_action_inputs = base_action_inputs
 
             inferred_action_features: Optional[torch.Tensor] = None
             if (
@@ -298,13 +346,14 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                 inferred_action_features = self._process_action(
                     generated_frames=historical_frames,
                     current_frame_idx=current_start_frame,
-                    action_inputs=action_inputs,
+                    action_inputs=base_action_inputs,
                 )
 
             if inferred_action_features is not None:
-                if block_action_inputs is None:
-                    block_action_inputs = {}
+                block_action_inputs = dict(base_action_inputs)
                 block_action_inputs["action_features"] = inferred_action_features
+                block_action_inputs.pop("action_modulation", None)
+                block_action_inputs.pop("_cached_action_modulation", None)
 
             cond_with_action = self._prepare_action_conditional(
                 base_conditional=base_conditional_dict,

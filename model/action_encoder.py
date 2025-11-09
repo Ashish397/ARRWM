@@ -47,6 +47,8 @@ class ActionEncoder(nn.Module):
         self.action_dim = action_dim
         self.feature_dim = feature_dim
         self.use_sinusoidal = use_sinusoidal
+        if freq_dim <= 0 or freq_dim % 2 != 0:
+            raise ValueError(f"freq_dim must be a positive even integer, got {freq_dim}")
         self.freq_dim = freq_dim
         
         if use_sinusoidal:
@@ -72,8 +74,8 @@ class ActionEncoder(nn.Module):
                 nn.Linear(hidden_dim, feature_dim),
             )
         
-        print(f"[ActionEncoder] Created: action_dim={action_dim}, feature_dim={feature_dim}, "
-              f"use_sinusoidal={use_sinusoidal}")
+        # Avoid noisy constructor logs on multi-GPU jobs.
+        # print(f"[ActionEncoder] Created: action_dim={action_dim}, feature_dim={feature_dim}, use_sinusoidal={use_sinusoidal}")
     
     def sinusoidal_encoding(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -231,4 +233,3 @@ def create_action_encoder(
         )
     else:
         raise ValueError(f"Unknown action_type: {action_type}")
-

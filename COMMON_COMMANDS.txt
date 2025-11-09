@@ -1,0 +1,6 @@
+scp -r 
+as1748.u5dk@u5dk.aip2.isambard:/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_with_actions 
+/home/ashish/isambard_weights/d2_v256
+
+## Gets weights from isambard to inference
+scp -r as1748.u5dk@u5dk.aip2.isambard:/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_with_actions /home/ashish/isambard_weights/d2_v256

@@ -133,9 +133,18 @@ def _as_video_list(x, target_device=None, target_dtype=None):
     def _maybe_cast(t):
         return t.to(device=target_device, dtype=target_dtype)
 
+    if isinstance(x, (list, tuple)):
+        return [_maybe_cast(t) for t in x]
+
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"Unsupported noisy input type: {type(x)}")
+
     B = x.size(0)
-    dim1 = x.size(1)
-    return [_maybe_cast(x[i].permute(1, 0, 2, 3).contiguous()) for i in range(B)]
+    if x.dim() == 5 and x.size(1) in (3, 16):  # [B, C, T, H, W]
+        return [_maybe_cast(x[i].permute(1, 0, 2, 3).contiguous()) for i in range(B)]
+    if x.dim() == 5 and x.size(2) in (3, 16):  # [B, T, C, H, W]
+        return [_maybe_cast(x[i].permute(2, 1, 3, 4).contiguous()) for i in range(B)]
+    raise ValueError(f"Expected video tensor with channel/time dims, got shape {tuple(x.shape)}")
 
 
 def _coerce_int(value):
@@ -213,6 +222,7 @@ def patch_wan_wrapper_for_action(wrapper):
         crossattn_cache=None,
         current_start=None,
         classify_mode=False,
+        regress_mode=False,
         concat_time_embeddings=False,
         clean_x=None,
         aug_t=None,
@@ -281,12 +291,41 @@ def patch_wan_wrapper_for_action(wrapper):
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
+                    if not all(hasattr(wrapper, attr) for attr in ("_register_tokens", "_cls_pred_branch", "_gan_ca_blocks")):
+                        raise RuntimeError("Classify mode requested but classification heads are not initialized.")
                     result = wrapper.model(
                         x_list,
                         t=input_timestep,
                         context=prompt_embeds,
                         seq_len=wrapper.seq_len,
                         classify_mode=True,
+                        register_tokens=getattr(wrapper, "_register_tokens", None),
+                        cls_pred_branch=getattr(wrapper, "_cls_pred_branch", None),
+                        gan_ca_blocks=getattr(wrapper, "_gan_ca_blocks", None),
+                        concat_time_embeddings=concat_time_embeddings,
+                        action_modulation=action_modulation,
+                    )
+                    if isinstance(result, tuple):
+                        flow_pred, logits = result
+                    else:
+                        flow_pred = result
+                    flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+                elif regress_mode:
+                    required = ("_register_tokens_rgs", "_rgs_pred_branch", "_gan_ca_blocks_rgs", "num_frames", "num_class")
+                    if not all(hasattr(wrapper, attr) for attr in required):
+                        raise RuntimeError("Regress mode requested but regression heads are not initialized.")
+                    result = wrapper.model(
+                        x_list,
+                        t=input_timestep,
+                        context=prompt_embeds,
+                        seq_len=wrapper.seq_len,
+                        regress_mode=True,
+                        register_tokens_rgs=getattr(wrapper, "_register_tokens_rgs", None),
+                        rgs_pred_branch=getattr(wrapper, "_rgs_pred_branch", None),
+                        gan_ca_blocks_rgs=getattr(wrapper, "_gan_ca_blocks_rgs", None),
+                        num_frames_rgs=getattr(wrapper, "num_frames", None),
+                        num_class_rgs=getattr(wrapper, "num_class", None),
+                        concat_time_embeddings=concat_time_embeddings,
                         action_modulation=action_modulation,
                     )
                     if isinstance(result, tuple):
@@ -310,12 +349,10 @@ def patch_wan_wrapper_for_action(wrapper):
             timestep=timestep.flatten(0, 1),
         ).unflatten(0, flow_pred.shape[:2])
 
-        if classify_mode:
-            if logits is not None:
-                return logits, x0_pred
-            return x0_pred
+        if logits is not None:
+            return flow_pred, x0_pred, logits
 
-        return logits, x0_pred
+        return flow_pred, x0_pred
 
     wrapper.forward = forward_with_action_extraction
     print("[ActionPatch] Successfully patched WanDiffusionWrapper for action conditioning")

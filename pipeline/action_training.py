@@ -87,17 +87,21 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         if not self._action_conditioning_enabled or action_inputs is None:
             return None
 
-        batch_mod: Optional[torch.Tensor] = None
+        if isinstance(action_inputs, dict):
+            provided_mod = action_inputs.get("_cached_action_modulation") or action_inputs.get("action_modulation")
+            if provided_mod is not None:
+                return provided_mod.to(device=device, dtype=dtype)
+            action_features = action_inputs.get("action_features") or action_inputs.get("actions")
+            if action_features is None:
+                raise ValueError("action_inputs must provide 'action_features'/'actions'")
+        else:
+            action_features = action_inputs
 
-        action_features = action_inputs.to(device=device, dtype=dtype)
-
+        action_features = action_features.to(device=device, dtype=dtype)
         if action_features.dim() == 2:
-            # [B, action_dim] -> expand到当前块帧数
             action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
         elif action_features.dim() == 3:
-            # if frame_start + num_frames > action_features.shape[1]:
-            #     raise ValueError("action_features 的帧长度不足以覆盖当前块")
-            action_features = action_features#[:, frame_start:frame_start + num_frames]
+            action_features = action_features[:, frame_start:frame_start + num_frames]
         else:
             raise ValueError("action_features 需为 [B, action_dim] 或 [B, T, action_dim]")
 
@@ -125,6 +129,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
 
         conditional_dict = dict(base_conditional)
         conditional_dict["_action_modulation"] = modulation
+        conditional_dict["_action_frame_start"] = frame_start
         return conditional_dict
 
     def generate_chunk_with_cache(
@@ -471,4 +476,3 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
 
         return output, denoised_timestep_from, denoised_timestep_to
-

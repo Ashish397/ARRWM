@@ -556,7 +556,8 @@ def main() -> None:
         raise RuntimeError("Checkpoint path could not be resolved; provide --run or configure weights/generator_ckpt.")
     config = OmegaConf.merge(config, OmegaConf.create({"generator_ckpt": str(checkpoint_path)}))
 
-    pipeline = ActionCausalInferencePipeline(config, device=device, action_dim=2)
+    action_dim = int(getattr(config, "action_dim", 2))
+    pipeline = ActionCausalInferencePipeline(config, device=device, action_dim=action_dim)
     _load_generator_weights(pipeline, checkpoint_path, prefer_ema=not args.no_ema)
 
     use_bfloat16 = bool(getattr(config, "mixed_precision", False)) and device.type == "cuda"
@@ -598,14 +599,20 @@ def main() -> None:
 
         for action_name, pair in action_specs:
             print(f"[Info]  -> Action '{action_name}'")
-            action_tensor = torch.tensor(pair, device=device, dtype=dtype).view(1, 1, 2)
-            action_features = action_tensor.expand(1, num_frames, 2).contiguous()
+            pair_tensor = torch.tensor(pair, device=device, dtype=dtype).flatten()
+            if pair_tensor.numel() != action_dim:
+                raise ValueError(
+                    f"Preset '{action_name}' provides {pair_tensor.numel()} values but action_dim={action_dim}. "
+                    "Update the preset or config to match."
+                )
+            action_features = pair_tensor.view(1, 1, action_dim).expand(1, num_frames, action_dim).contiguous()
+            action_payload = {"action_features": action_features}
 
             video = pipeline.inference(
                 noise=base_noise.clone(),
                 text_prompts=[caption] if not text_pre_encoded else None,
                 prompt_embeds=prompt_embeds if text_pre_encoded else None,
-                action_inputs={"action_features": action_features},
+                action_inputs=action_payload,
             )
             if isinstance(video, tuple):
                 video = video[0]

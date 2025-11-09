@@ -1,0 +1,852 @@
+[Info] Checkpoint uses non-resizable storages; cloning for compatibility.
+/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torchvision/io/_video_deprecation_warning.py:5: UserWarning: The video decoding and encoding capabilities of torchvision are deprecated from version 0.22 and will be removed in version 0.24. We recommend that you migrate to TorchCodec, where we'll consolidate the future decoding/encoding capabilities of PyTorch: https://github.com/pytorch/torchcodec
+  warnings.warn(
+[Info] Using weights directory: /home/ashish/isambard_weights/d2_v2
+[Info] Loading checkpoint: /home/ashish/isambard_weights/d2_v2/checkpoint_model_000700/model.pt
+[Info] No --output-index provided; iterating first 5 prompt(s).
+[Info] Selected ride #1: output_rides_0/ride_17097_20240125073731 (index 0, caption length 1094 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds in an urban park setting, likely in Taipei, characterized by a paved plaza area surrounded by trees. The ground is composed of large, square tiles, and the area is bordered by a low, textured wall on the left. The trees, with their dense foliage, create a canopy overhead, providing shade and a sense of tranquility. In the background, high-rise buildings are visible, indicating the proximity to a residential or commercial district. The weather appears overcast, with raindrops visible on the camera lens, suggesting recent or ongoing light rain. The lighting is soft, typical of an overcast day, and the overall atmosphere is calm and serene.   In the mid-ground, a small structure with an open entrance is noticeable, possibly a pavilion or rest area. The plaza is largely empty, with no visible pedestrians or vehicles, enhancing the quiet ambiance. The natural elements, such as the trees and scattered leaves on the ground, add to the park's peaceful setting. The scene captures a moment of stillness, with the rain adding a gentle, rhythmic quality to the environment.
+[Info] Selected ride #2: output_rides_0/ride_17496_20240128025544 (index 1, caption length 1225 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds along a winding dirt path in a serene forested area. Tall, slender trees with dark trunks and lush green canopies line both sides of the path, creating a natural canopy overhead. The sky is a clear, bright blue with a few scattered white clouds, suggesting a sunny day. The ground is covered with a layer of dry pine needles and small rocks, typical of a forest floor. Shadows cast by the trees stretch across the path, indicating the sun is high in the sky, likely around midday.  The path itself is well-trodden, with a smooth, reddish-brown surface, and it curves gently to the right as it extends into the distance. The forest appears dense, with trees standing closely together, though there are occasional clearings that allow glimpses of the sky and additional trees further back. The atmosphere is tranquil, with no visible movement or people, emphasizing the stillness of the natural environment.  The scene lacks any built structures or street furniture, focusing entirely on the natural landscape. The path seems to be a quiet, possibly recreational trail, inviting exploration through the woods. The overall impression is one of peaceful solitude, with the natural elements dominating the scene.
+[Info] Selected ride #3: output_rides_0/ride_17784_20240202080114 (index 2, caption length 749 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds from a low-angle perspective, looking upwards through a dense canopy of trees. The branches and leaves form a textured, intricate pattern against a bright sky, partially obscured by mist or fog. Sunlight filters through the foliage, creating a soft, diffused glow. The trees appear to be coniferous, with needle-like leaves, and are closely packed, suggesting a forested or park-like setting. The sky is visible in patches, indicating a clear day with some haze. The overall atmosphere is serene and slightly ethereal, with the mist adding a layer of calmness. There are no visible paths, buildings, or people, emphasizing the natural environment. The scene remains static, with no discernible movement or changes in the landscape.
+[Info] Selected ride #4: output_rides_0/ride_17836_20240203103305 (index 3, caption length 1043 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The video captures a nighttime scene in an urban park setting. The area is well-lit by streetlights, casting a bright glow on the pathways and surrounding trees. The park is lined with tall trees on both sides, creating a canopy effect. The ground is paved, with a smooth, wide walkway running through the center.   In the background, there are buildings with illuminated windows, suggesting a cityscape beyond the park. The lighting creates a contrast between the brightly lit paths and the darker areas under the trees. The scene is relatively quiet, with minimal human activity visible. A few people can be seen walking or standing in the distance, but they are not the focus of the scene.  The park appears to be spacious, with open areas and some benches visible on the sides. The overall atmosphere is calm and serene, typical of a city park at night. The weather seems clear, with no visible signs of rain or fog, allowing for good visibility. The scene is devoid of any vehicles, emphasizing the pedestrian-friendly nature of the area.
+[Info] Selected ride #5: output_rides_0/ride_17843_20240204051347 (index 4, caption length 1250 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds along a dirt path in a serene, wooded area, likely a park or nature reserve. Tall, slender trees with dark trunks and green foliage line both sides of the path, creating a canopy overhead. The sky is clear and blue, suggesting a sunny day with good weather. The path itself is composed of compacted earth, appearing well-trodden and slightly curved as it winds through the trees.   On the left side of the path, a large, curved, white fossil or sculpture is partially visible, adding an element of interest to the natural setting. The ground is covered with dry leaves and small twigs, typical of a forest floor. Shadows cast by the trees stretch across the path, indicating the sun is high in the sky, possibly around midday.  The scene is devoid of people or animals, giving it a tranquil and undisturbed atmosphere. The path appears to be a quiet, pedestrian trail, with no visible signs of vehicular or bicycle traffic. The overall environment is calm and inviting, perfect for a leisurely walk or nature exploration. The natural elements dominate the scene, with the trees and ground textures providing a rich, earthy palette. The lighting is bright, casting clear shadows and highlighting the textures of the bark and foliage.
+KV inference with 3 frames per block
+[ActionPatch] Successfully patched WanDiffusionWrapper for action conditioning
+[ActionPipeline] adaLN-Zero enabled: action_dim=2, model_dim=1536
+[ActionPipeline] Action conditioning: True
+Moving WanDiffusionWrapper to cuda:0 with preserved memory: 0 GB
+Moving WanVAEWrapper to cuda:0 with preserved memory: 0 GB
+[Info] Generating 21 frames on cuda:0 with dtype torch.bfloat16.
+[Info] Actions to render: noop, straight, back, straight_right, straight_left, back_right, back_left, right, left
+[Info] Rendering prompt 1/5: output_rides_0/ride_17097_20240125073731 (idx 0)
+[Info]  -> Action 'noop'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_noop_idx0.mp4
+[Info]  -> Action 'straight'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_straight_idx0.mp4
+[Info]  -> Action 'back'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_back_idx0.mp4
+[Info]  -> Action 'straight_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_straight_right_idx0.mp4
+[Info]  -> Action 'straight_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_straight_left_idx0.mp4
+[Info]  -> Action 'back_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_back_right_idx0.mp4
+[Info]  -> Action 'back_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_back_left_idx0.mp4
+[Info]  -> Action 'right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_right_idx0.mp4
+[Info]  -> Action 'left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17097_20240125073731_step000700_left_idx0.mp4
+[Info] Rendering prompt 2/5: output_rides_0/ride_17496_20240128025544 (idx 1)
+[Info]  -> Action 'noop'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_noop_idx1.mp4
+[Info]  -> Action 'straight'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_straight_idx1.mp4
+[Info]  -> Action 'back'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_back_idx1.mp4
+[Info]  -> Action 'straight_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_straight_right_idx1.mp4
+[Info]  -> Action 'straight_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_straight_left_idx1.mp4
+[Info]  -> Action 'back_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_back_right_idx1.mp4
+[Info]  -> Action 'back_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_back_left_idx1.mp4
+[Info]  -> Action 'right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_right_idx1.mp4
+[Info]  -> Action 'left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17496_20240128025544_step000700_left_idx1.mp4
+[Info] Rendering prompt 3/5: output_rides_0/ride_17784_20240202080114 (idx 2)
+[Info]  -> Action 'noop'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_noop_idx2.mp4
+[Info]  -> Action 'straight'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_straight_idx2.mp4
+[Info]  -> Action 'back'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_back_idx2.mp4
+[Info]  -> Action 'straight_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_straight_right_idx2.mp4
+[Info]  -> Action 'straight_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_straight_left_idx2.mp4
+[Info]  -> Action 'back_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_back_right_idx2.mp4
+[Info]  -> Action 'back_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_back_left_idx2.mp4
+[Info]  -> Action 'right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_right_idx2.mp4
+[Info]  -> Action 'left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17784_20240202080114_step000700_left_idx2.mp4
+[Info] Rendering prompt 4/5: output_rides_0/ride_17836_20240203103305 (idx 3)
+[Info]  -> Action 'noop'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_noop_idx3.mp4
+[Info]  -> Action 'straight'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_straight_idx3.mp4
+[Info]  -> Action 'back'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_back_idx3.mp4
+[Info]  -> Action 'straight_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_straight_right_idx3.mp4
+[Info]  -> Action 'straight_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_straight_left_idx3.mp4
+[Info]  -> Action 'back_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_back_right_idx3.mp4
+[Info]  -> Action 'back_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_back_left_idx3.mp4
+[Info]  -> Action 'right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_right_idx3.mp4
+[Info]  -> Action 'left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17836_20240203103305_step000700_left_idx3.mp4
+[Info] Rendering prompt 5/5: output_rides_0/ride_17843_20240204051347 (idx 4)
+[Info]  -> Action 'noop'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_noop_idx4.mp4
+[Info]  -> Action 'straight'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_straight_idx4.mp4
+[Info]  -> Action 'back'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_back_idx4.mp4
+[Info]  -> Action 'straight_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_straight_right_idx4.mp4
+[Info]  -> Action 'straight_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_straight_left_idx4.mp4
+[Info]  -> Action 'back_right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_back_right_idx4.mp4
+[Info]  -> Action 'back_left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_back_left_idx4.mp4
+[Info]  -> Action 'right'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_right_idx4.mp4
+[Info]  -> Action 'left'
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+[Info] Saved video to: /home/ashish/vis/d2_v2_448/d2_v2_ride_17843_20240204051347_step000700_left_idx4.mp4
+[Info] Using weights directory: /home/ashish/isambard_weights/d2_v2
+[Info] Loading checkpoint: /home/ashish/isambard_weights/d2_v2/checkpoint_model_000700/model.pt
+[Info] No --output-index provided; iterating first 5 prompt(s).
+[Info] Selected ride #1: output_rides_0/ride_17097_20240125073731 (index 0, caption length 1094 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds in an urban park setting, likely in Taipei, characterized by a paved plaza area surrounded by trees. The ground is composed of large, square tiles, and the area is bordered by a low, textured wall on the left. The trees, with their dense foliage, create a canopy overhead, providing shade and a sense of tranquility. In the background, high-rise buildings are visible, indicating the proximity to a residential or commercial district. The weather appears overcast, with raindrops visible on the camera lens, suggesting recent or ongoing light rain. The lighting is soft, typical of an overcast day, and the overall atmosphere is calm and serene.   In the mid-ground, a small structure with an open entrance is noticeable, possibly a pavilion or rest area. The plaza is largely empty, with no visible pedestrians or vehicles, enhancing the quiet ambiance. The natural elements, such as the trees and scattered leaves on the ground, add to the park's peaceful setting. The scene captures a moment of stillness, with the rain adding a gentle, rhythmic quality to the environment.
+[Info] Selected ride #2: output_rides_0/ride_17496_20240128025544 (index 1, caption length 1225 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds along a winding dirt path in a serene forested area. Tall, slender trees with dark trunks and lush green canopies line both sides of the path, creating a natural canopy overhead. The sky is a clear, bright blue with a few scattered white clouds, suggesting a sunny day. The ground is covered with a layer of dry pine needles and small rocks, typical of a forest floor. Shadows cast by the trees stretch across the path, indicating the sun is high in the sky, likely around midday.  The path itself is well-trodden, with a smooth, reddish-brown surface, and it curves gently to the right as it extends into the distance. The forest appears dense, with trees standing closely together, though there are occasional clearings that allow glimpses of the sky and additional trees further back. The atmosphere is tranquil, with no visible movement or people, emphasizing the stillness of the natural environment.  The scene lacks any built structures or street furniture, focusing entirely on the natural landscape. The path seems to be a quiet, possibly recreational trail, inviting exploration through the woods. The overall impression is one of peaceful solitude, with the natural elements dominating the scene.
+[Info] Selected ride #3: output_rides_0/ride_17784_20240202080114 (index 2, caption length 749 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds from a low-angle perspective, looking upwards through a dense canopy of trees. The branches and leaves form a textured, intricate pattern against a bright sky, partially obscured by mist or fog. Sunlight filters through the foliage, creating a soft, diffused glow. The trees appear to be coniferous, with needle-like leaves, and are closely packed, suggesting a forested or park-like setting. The sky is visible in patches, indicating a clear day with some haze. The overall atmosphere is serene and slightly ethereal, with the mist adding a layer of calmness. There are no visible paths, buildings, or people, emphasizing the natural environment. The scene remains static, with no discernible movement or changes in the landscape.
+[Info] Selected ride #4: output_rides_0/ride_17836_20240203103305 (index 3, caption length 1043 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The video captures a nighttime scene in an urban park setting. The area is well-lit by streetlights, casting a bright glow on the pathways and surrounding trees. The park is lined with tall trees on both sides, creating a canopy effect. The ground is paved, with a smooth, wide walkway running through the center.   In the background, there are buildings with illuminated windows, suggesting a cityscape beyond the park. The lighting creates a contrast between the brightly lit paths and the darker areas under the trees. The scene is relatively quiet, with minimal human activity visible. A few people can be seen walking or standing in the distance, but they are not the focus of the scene.  The park appears to be spacious, with open areas and some benches visible on the sides. The overall atmosphere is calm and serene, typical of a city park at night. The weather seems clear, with no visible signs of rain or fog, allowing for good visibility. The scene is devoid of any vehicles, emphasizing the pedestrian-friendly nature of the area.
+[Info] Selected ride #5: output_rides_0/ride_17843_20240204051347 (index 4, caption length 1250 characters)
+[Info] Loaded encoded caption embedding with shape (512, 4096)
+[Info] Prompt: The scene unfolds along a dirt path in a serene, wooded area, likely a park or nature reserve. Tall, slender trees with dark trunks and green foliage line both sides of the path, creating a canopy overhead. The sky is clear and blue, suggesting a sunny day with good weather. The path itself is composed of compacted earth, appearing well-trodden and slightly curved as it winds through the trees.   On the left side of the path, a large, curved, white fossil or sculpture is partially visible, adding an element of interest to the natural setting. The ground is covered with dry leaves and small twigs, typical of a forest floor. Shadows cast by the trees stretch across the path, indicating the sun is high in the sky, possibly around midday.  The scene is devoid of people or animals, giving it a tranquil and undisturbed atmosphere. The path appears to be a quiet, pedestrian trail, with no visible signs of vehicular or bicycle traffic. The overall environment is calm and inviting, perfect for a leisurely walk or nature exploration. The natural elements dominate the scene, with the trees and ground textures providing a rich, earthy palette. The lighting is bright, casting clear shadows and highlighting the textures of the bark and foliage.
+KV inference with 3 frames per block
+[ActionPatch] Successfully patched WanDiffusionWrapper for action conditioning
+[ActionPipeline] adaLN-Zero enabled: action_dim=2, model_dim=1536
+[ActionPipeline] Action conditioning: True
+Traceback (most recent call last):
+  File "/home/ashish/ARRWM/utils/visualise_phase1_actions.py", line 625, in <module>
+    main()
+  File "/home/ashish/ARRWM/utils/visualise_phase1_actions.py", line 560, in main
+    _load_generator_weights(pipeline, checkpoint_path, prefer_ema=not args.no_ema)
+  File "/home/ashish/ARRWM/utils/visualise_phase1_actions.py", line 250, in _load_generator_weights
+    ckpt = _load_checkpoint_with_storage_fallback(checkpoint_path, map_location="cpu")
+  File "/home/ashish/ARRWM/utils/visualise_phase1_actions.py", line 60, in _load_checkpoint_with_storage_fallback
+    return torch.load(path, **torch_load_kwargs)
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/serialization.py", line 1521, in load
+    return _load(
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/serialization.py", line 2119, in _load
+    result = unpickler.load()
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/_weights_only_unpickler.py", line 532, in load
+    self.append(self.persistent_load(pid))
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/serialization.py", line 2083, in persistent_load
+    typed_storage = load_tensor(
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/serialization.py", line 2036, in load_tensor
+    zip_file.get_storage_from_record(name, numel, torch.UntypedStorage)
+KeyboardInterrupt
+Exception ignored in atexit callback: <function shutdown_compile_workers at 0x718a427b71c0>
+Traceback (most recent call last):
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/_inductor/async_compile.py", line 142, in shutdown_compile_workers
+    pool.shutdown()
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/site-packages/torch/_inductor/compile_worker/subproc_pool.py", line 243, in shutdown
+    self.process.wait(300)
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/subprocess.py", line 1209, in wait
+    return self._wait(timeout=timeout)
+  File "/home/ashish/miniconda3/envs/flash/lib/python3.10/subprocess.py", line 1953, in _wait
+    time.sleep(delay)
+KeyboardInterrupt: 
