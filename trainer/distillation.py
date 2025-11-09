@@ -1514,7 +1514,7 @@ class Trainer:
 
         return critic_log_dict
 
-    def generate_video(self, pipeline, num_frames, prompts, prompt_embeds=None, image=None):
+    def generate_video(self, pipeline, num_frames, prompts, prompt_embeds=None, image=None, action_inputs=None):
         if prompt_embeds is not None and not isinstance(prompt_embeds, torch.Tensor):
             if isinstance(prompt_embeds, list):
                 prompt_embeds = torch.stack(prompt_embeds)
@@ -1547,7 +1547,7 @@ class Trainer:
                 text_prompts=prompts if not self.text_pre_encoded else None,
                 prompt_embeds=prompt_embeds if self.text_pre_encoded else None,
                 return_latents=True,
-                action_inputs=actions,
+                action_inputs=action_inputs,
             )
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
         pipeline.vae.model.clear_cache()
