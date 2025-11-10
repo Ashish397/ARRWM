@@ -58,6 +58,7 @@ from pipeline import (
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
+from utils.action_patch import action_patch_enabled
 # # from one_logger_utils import OneLoggerUtils  # Commented out - module not available
 import time
 
@@ -482,11 +483,18 @@ class Trainer:
         if getattr(self.model, "inference_pipeline", None) is None or not hasattr(self.model, "action_projection"):
             self.model._initialize_inference_pipeline()
         if hasattr(self.model, "action_projection"):
-            self.model.action_projection.to(device=self.device)
+            if self.model.action_projection is not None:
+                self.model.action_projection.to(device=self.device)
+            else:
+                print("Warning: Action projection is None, skipping to device")
 
         self.extra_generator_modules: list[nn.Module] = []
         if hasattr(self.model, "action_projection") and isinstance(self.model.action_projection, nn.Module):
             self.extra_generator_modules.append(self.model.action_projection)
+
+        if hasattr(self.model, "action_encoder") and isinstance(self.model.action_encoder, nn.Module):
+            self.model.action_encoder.to(device=self.device)
+            self.extra_generator_modules.append(self.model.action_encoder)
 
         # if not config.no_visualize or config.load_raw_video:
         #     print("Moving vae to device 2, self.device: ", self.device)
