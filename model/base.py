@@ -10,13 +10,17 @@ from pipeline import SelfForcingTrainingPipeline, ActionSelfForcingTrainingPipel
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from model.action_model_patch import apply_action_patches
+from utils.action_patch import action_patch_disabled, action_patch_enabled
+from model.action_encoder import ActionEncoder
 
 from utils.debug_option import DEBUG
 
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
+        self._action_patch_enabled = action_patch_enabled()
         self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
+        self.action_encoder: Optional[ActionEncoder] = None
         self._initialize_models(args, device)
 
         self.device = device
@@ -40,7 +44,8 @@ class BaseModel(nn.Module):
         self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
         # Apply action patches before any distributed/FSDP wrapping so the inner
         # module gains the extended signature and hooks.
-        apply_action_patches(self.generator)
+        if self._action_patch_enabled:
+            apply_action_patches(self.generator)
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
@@ -61,6 +66,15 @@ class BaseModel(nn.Module):
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
+
+        if self._action_patch_enabled:
+            raw_action_dim = int(getattr(args, "raw_action_dim", None))
+            feature_dim = int(getattr(args, "action_dim", None))
+            self.action_encoder = ActionEncoder(
+                action_dim=raw_action_dim,
+                feature_dim=feature_dim,
+            ).to(device)
+            self.action_encoder.train()
 
     def _set_fake_score_trainable(self, value: bool) -> None:
         if getattr(self, "_fake_score_trainable", None) == value:
@@ -260,13 +274,24 @@ class SelfForcingModel(BaseModel):
         if self.inference_pipeline is None:
             self._initialize_inference_pipeline()
 
-        return self.inference_pipeline.inference_with_trajectory(
-            noise=noise,
-            initial_latent=conditional_dict.get("initial_latent", None),
-            slice_last_frames=slice_last_frames,
-            action_inputs=action_inputs,
-            **{k: v for k, v in conditional_dict.items() if k != "initial_latent"}
-        )
+        kwargs = {
+            k: v for k, v in conditional_dict.items() if k != "initial_latent"
+        }
+        if self._action_patch_enabled:
+            return self.inference_pipeline.inference_with_trajectory(
+                noise=noise,
+                initial_latent=conditional_dict.get("initial_latent", None),
+                slice_last_frames=slice_last_frames,
+                action_inputs=action_inputs,
+                **kwargs,
+            )
+        else:
+            return self.inference_pipeline.inference_with_trajectory(
+                noise=noise,
+                initial_latent=conditional_dict.get("initial_latent", None),
+                slice_last_frames=slice_last_frames,
+                **kwargs,
+            )
 
     def _initialize_inference_pipeline(self):
         """
@@ -278,22 +303,7 @@ class SelfForcingModel(BaseModel):
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         # do not use self.num_training_frames, because it is changed by generator_loss and critic_loss
         num_training_frames = getattr(self.args, "num_training_frames")
-        # self.inference_pipeline = SelfForcingTrainingPipeline(
-        #     denoising_step_list=self.denoising_step_list,
-        #     scheduler=self.scheduler,
-        #     generator=self.generator,
-        #     num_frame_per_block=self.num_frame_per_block,
-        #     independent_first_frame=self.args.independent_first_frame,
-        #     same_step_across_blocks=self.args.same_step_across_blocks,
-        #     last_step_only=self.args.last_step_only,
-        #     num_max_frames=num_training_frames,
-        #     context_noise=self.args.context_noise,
-        #     local_attn_size=local_attn_size,
-        #     slice_last_frames=slice_last_frames,
-        #     num_training_frames=num_training_frames,
-        # )
-
-        self.inference_pipeline = ActionSelfForcingTrainingPipeline(
+        shared_kwargs = dict(
             denoising_step_list=self.denoising_step_list,
             scheduler=self.scheduler,
             generator=self.generator,
@@ -306,9 +316,18 @@ class SelfForcingModel(BaseModel):
             local_attn_size=local_attn_size,
             slice_last_frames=slice_last_frames,
             num_training_frames=num_training_frames,
-            action_dim=getattr(self.args, "action_dim", getattr(self.args, "raw_action_dim", 2)),
         )
 
-        # Surface the action projection module so its parameters can be optimized.
-        if hasattr(self.inference_pipeline, "action_projection") and isinstance(self.inference_pipeline.action_projection, nn.Module):
-            self.action_projection = self.inference_pipeline.action_projection
+        self.action_projection = None
+        if self._action_patch_enabled:
+            self.inference_pipeline = ActionSelfForcingTrainingPipeline(
+                **shared_kwargs,
+                action_dim=getattr(self.args, "action_dim", getattr(self.args, "raw_action_dim", 2)),
+                action_module=self.action_encoder,
+            )
+            if hasattr(self.inference_pipeline, "action_projection") and isinstance(
+                self.inference_pipeline.action_projection, nn.Module
+            ):
+                self.action_projection = self.inference_pipeline.action_projection
+        else:
+            self.inference_pipeline = SelfForcingTrainingPipeline(**shared_kwargs)

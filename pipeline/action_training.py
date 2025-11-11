@@ -3,45 +3,37 @@ from __future__ import annotations
 
 from typing import Any, Optional, cast
 
-import torch
 
 from pipeline.self_forcing_training import SelfForcingTrainingPipeline
 from model.action_modulation import ActionModulationProjection
 from model.action_model_patch import apply_action_patches
+from utils.action_patch import action_patch_disabled
 from utils.scheduler import SchedulerInterface
 from utils.wan_wrapper import WanDiffusionWrapper
+from utils.scheduler import SchedulerInterface
+from typing import List, Optional, Tuple, cast, Any
+import torch
+import torch.distributed as dist
+from utils.debug_option import DEBUG, LOG_GPU_MEMORY
+from utils.memory import log_gpu_memory
 
 
 class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
-    """Self-Forcing 训练版本的动作条件化流水线。
-
-    继承 `SelfForcingTrainingPipeline`，在每次调用 Wan 生成器时将动作调制（AdaLN-Zero）
-    与当前 timestep 一起注入，从而在训练/蒸馏阶段保持与推理时一致的动作条件化行为。
-    """
-
-    def __init__(
-        self,
-        denoising_step_list: list[int],
-        scheduler: SchedulerInterface,
-        generator: WanDiffusionWrapper,
-        num_frame_per_block: int = 3,
-        independent_first_frame: bool = False,
-        same_step_across_blocks: bool = False,
-        last_step_only: bool = False,
-        num_max_frames: int = 21,
-        context_noise: int = 0,
-        *,
-        action_dim: int = 512,
-        enable_adaln_zero: bool = True,
-        action_module: Optional[Any] = None,
-        **kwargs: Any,
-    ) -> None:
-        self.action_dim: int = action_dim
-        self.enable_adaln_zero: bool = enable_adaln_zero
-        self.action_module: Optional[Any] = action_module
-        self.action_projection: Optional[ActionModulationProjection] = None
-        self._action_conditioning_enabled: bool = enable_adaln_zero or action_module is not None
-
+    def __init__(self,
+                 denoising_step_list: List[int],
+                 scheduler: SchedulerInterface,
+                 generator: WanDiffusionWrapper,
+                 num_frame_per_block=3,
+                 independent_first_frame: bool = False,
+                 same_step_across_blocks: bool = False,
+                 last_step_only: bool = False,
+                 num_max_frames: int = 21,
+                 context_noise: int = 0,
+                 *,
+                 action_dim: int = 512,
+                 enable_adaln_zero: bool = True,
+                 action_module: Optional[Any] = None,
+                 **kwargs):
         super().__init__(
             denoising_step_list=denoising_step_list,
             scheduler=scheduler,
@@ -55,26 +47,27 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             **kwargs,
         )
 
+        self.action_dim: int = action_dim
+        self.enable_adaln_zero: bool = enable_adaln_zero
+        self.action_module: Optional[Any] = action_module
+        self.action_encoder: Optional[Any] = action_module
+        self.action_projection: Optional[ActionModulationProjection] = None
+        self._action_conditioning_enabled: bool = enable_adaln_zero #Is this needed? - 1
+        self._action_patch_globally_disabled = action_patch_disabled() #Is this needed? -2
+        if self._action_patch_globally_disabled:
+            self._action_conditioning_enabled = False #Is this needed? - 3
+
         if self._action_conditioning_enabled:
             _ = apply_action_patches(self.generator)
 
-        if self.enable_adaln_zero:
-            device = self._resolve_module_device(self.generator)
-            model_dim = getattr(self.generator.model, "dim", 2048)
+        if self.enable_adaln_zero and self._action_conditioning_enabled:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.action_projection = ActionModulationProjection(
                 action_dim=self.action_dim,
-                hidden_dim=model_dim,
+                hidden_dim=self.generator.model.dim,
                 num_frames=1,
                 zero_init=True,
-            ).to(device)
-
-    @staticmethod
-    def _resolve_module_device(module: WanDiffusionWrapper) -> torch.device:
-        try:
-            param = next(module.parameters())
-            return param.device
-        except (StopIteration, AttributeError):
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            ).to(device=device)
 
     def _compute_action_modulation(
         self,
@@ -88,9 +81,25 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             return None
 
         if isinstance(action_inputs, dict):
-            provided_mod = action_inputs.get("_cached_action_modulation") or action_inputs.get("action_modulation")
+            full_cached = action_inputs.get("_cached_action_modulation_full") or action_inputs.get("_cached_action_modulation")
+            provided_mod = action_inputs.get("action_modulation")
+            if full_cached is not None:
+                mod = full_cached.to(device=device, dtype=dtype)
+                if mod.dim() != 4 or mod.shape[2] != 6:
+                    raise ValueError("action_modulation must be [B, T, 6, hidden_dim]")
+                stop = frame_start + num_frames
+                if stop > mod.shape[1]:
+                    raise ValueError("Cached action_modulation is shorter than required block")
+                return mod[:, frame_start:stop]
             if provided_mod is not None:
-                return provided_mod.to(device=device, dtype=dtype)
+                mod = provided_mod.to(device=device, dtype=dtype)
+                if mod.dim() != 4 or mod.shape[2] != 6:
+                    raise ValueError("action_modulation must be [B, T, 6, hidden_dim]")
+                stop = frame_start + num_frames
+                if stop > mod.shape[1]:
+                    raise ValueError("action_modulation 的帧长度不足以覆盖当前块")
+                action_inputs["_cached_action_modulation_full"] = mod
+                return mod[:, frame_start:stop]
             action_features = action_inputs.get("action_features") or action_inputs.get("actions")
             if action_features is None:
                 raise ValueError("action_inputs must provide 'action_features'/'actions'")
@@ -98,6 +107,16 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             action_features = action_inputs
 
         action_features = action_features.to(device=device, dtype=dtype)
+        encoder = self.action_encoder
+        if encoder is not None:
+            if action_features.dim() == 2:
+                action_features = encoder(action_features)
+            elif action_features.dim() == 3:
+                B, T, D = action_features.shape
+                encoded = encoder(action_features.reshape(B * T, D))
+                action_features = encoded.reshape(B, T, -1)
+            else:
+                raise ValueError("action_features must be 2D or 3D when using an action encoder")
         if action_features.dim() == 2:
             action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
         elif action_features.dim() == 3:
@@ -129,48 +148,95 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
 
         conditional_dict = dict(base_conditional)
         conditional_dict["_action_modulation"] = modulation
-        conditional_dict["_action_frame_start"] = frame_start
         return conditional_dict
 
     def generate_chunk_with_cache(
         self,
         noise: torch.Tensor,
-        conditional_dict: dict[str, Any],
+        conditional_dict: dict,
         *,
         current_start_frame: int = 0,
         requires_grad: bool = True,
         return_sim_step: bool = False,
         action_inputs: Optional[dict[str, Any]] = None,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
+        """
+        Chunk generation method tailored for sequential training
+        
+        Args:
+            noise: noise tensor for a single chunk [batch_size, chunk_frames, C, H, W]
+            conditional_dict: dictionary of conditional information
+            kv_cache: externally provided KV cache (defaults to self.kv_cache1 if None)
+            crossattn_cache: externally provided cross-attention cache (defaults to self.crossattn_cache if None)
+            current_start_frame: start frame index of the chunk in the full sequence
+            requires_grad: whether gradients are required
+            return_sim_step: whether to return simulation step info
+            action_inputs: Dictionary of action inputs
+            
+        Returns:
+            output: generated chunk [batch_size, chunk_frames, C, H, W]
+            denoised_timestep_from: starting denoise timestep
+            denoised_timestep_to: ending denoise timestep
+        """
         batch_size, chunk_frames, num_channels, height, width = noise.shape
-
-        if chunk_frames % self.num_frame_per_block != 0:
-            if not self.independent_first_frame or chunk_frames <= 1:
-                raise AssertionError("chunk_frames 必须是 num_frame_per_block 的整数倍")
-
+        
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SeqTrain-Pipeline] generate_chunk_with_cache: batch_size={batch_size}, chunk_frames={chunk_frames}")
+            print(f"[SeqTrain-Pipeline] current_start_frame={current_start_frame}, requires_grad={requires_grad}")
+        
+        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+            log_gpu_memory(f"SeqTrain-Pipeline: Before chunk generation", device=noise.device, rank=dist.get_rank() if dist.is_initialized() else 0)
+        
+        # Compute block configuration
         if not self.independent_first_frame or chunk_frames % self.num_frame_per_block == 0:
+            assert chunk_frames % self.num_frame_per_block == 0
             num_blocks = chunk_frames // self.num_frame_per_block
             all_num_frames = [self.num_frame_per_block] * num_blocks
         else:
+            # Handle the case of an independent first frame
+            assert (chunk_frames - 1) % self.num_frame_per_block == 0
             num_blocks = (chunk_frames - 1) // self.num_frame_per_block
             all_num_frames = [1] + [self.num_frame_per_block] * num_blocks
-
+            
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SeqTrain-Pipeline] Block config: num_blocks={num_blocks}, all_num_frames={all_num_frames}")
+            print(f"[SeqTrain-Pipeline] independent_first_frame={self.independent_first_frame}")
+            
+        # Prepare output tensor
         output = torch.zeros_like(noise)
 
+        # Randomly select denoising steps (synced across ranks)
         num_denoising_steps = len(self.denoising_step_list)
         exit_flags = self.generate_and_sync_list(len(all_num_frames), num_denoising_steps, device=noise.device)
 
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SeqTrain-Pipeline] Denoising steps: {num_denoising_steps}, exit_flags: {exit_flags}")
+        
+        # Determine gradient-enabled range — disable everywhere when requires_grad=False
         if not requires_grad:
-            start_gradient_frame_index = chunk_frames
+            start_gradient_frame_index = chunk_frames  # Out of range: no gradients anywhere
         else:
             start_gradient_frame_index = 0
 
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SeqTrain-Pipeline] start_gradient_frame_index={start_gradient_frame_index}")
+        
+        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+            log_gpu_memory(f"SeqTrain-Pipeline: Before block generation loop", device=noise.device, rank=dist.get_rank() if dist.is_initialized() else 0)
+        
+        # Generate block by block
         local_start_frame = 0
-        if not isinstance(self.local_attn_size, (list, tuple)):
+        # If static local_attn_size, set it on the model before the step loop
+        if not (isinstance(self.local_attn_size, (list, tuple)) or (hasattr(self.local_attn_size, "__iter__") and not isinstance(self.local_attn_size, (str, bytes)))):
             self.generator.model.local_attn_size = int(self.local_attn_size)
             self._set_all_modules_max_attention_size(int(self.local_attn_size))
-
         for block_index, current_num_frames in enumerate(all_num_frames):
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SeqTrain-Pipeline] Processing block {block_index}: frames {local_start_frame}-{local_start_frame + current_num_frames}")
+            
+            if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY and block_index == 0:
+                log_gpu_memory(f"SeqTrain-Pipeline: Before first block generation", device=noise.device, rank=dist.get_rank() if dist.is_initialized() else 0)
+                
             noisy_input = noise[:, local_start_frame:local_start_frame + current_num_frames]
 
             global_start = current_start_frame + local_start_frame
@@ -182,19 +248,15 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                 device=noise.device,
                 dtype=noise.dtype,
             )
-
-            denoised_pred = torch.zeros_like(noisy_input)
-            timestep = torch.zeros(
-                [batch_size, current_num_frames],
-                device=noise.device,
-                dtype=torch.int64,
-            )
-
+            
+            # Spatial denoising loop
             for step_idx, current_timestep in enumerate(self.denoising_step_list):
-                if isinstance(self.local_attn_size, (list, tuple)):
+                # If scheduled, set local_attn_size dynamically per timestep
+                if isinstance(self.local_attn_size, (list, tuple)) or (hasattr(self.local_attn_size, "__iter__") and not isinstance(self.local_attn_size, (str, bytes))):
                     self.generator.model.local_attn_size = int(self.local_attn_size[step_idx])
+                    if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                        print(f"[denoise step {step_idx}] timestep={float(current_timestep)} local_attn_size={self.generator.model.local_attn_size}")
                     self._set_all_modules_max_attention_size(int(self.local_attn_size[step_idx]))
-
                 exit_flag = (
                     step_idx == exit_flags[0]
                     if self.same_step_across_blocks
@@ -204,10 +266,14 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
                     device=noise.device,
-                    dtype=torch.int64,
+                    dtype=torch.int64
                 ) * current_timestep
 
                 if not exit_flag:
+                    # Intermediate steps: no gradients
+                    if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                        print(f"[SeqTrain-Pipeline] Block {block_index} intermediate steps (no grad)")
+                        
                     with torch.no_grad():
                         _, denoised_pred = self.generator(
                             noisy_image_or_video=noisy_input,
@@ -217,20 +283,24 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
-
+                        
+                        # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
                             next_timestep = self.denoising_step_list[step_idx + 1]
                             noisy_input = self.scheduler.add_noise(
                                 denoised_pred.flatten(0, 1),
                                 torch.randn_like(denoised_pred.flatten(0, 1)),
                                 next_timestep * torch.ones(
-                                    [batch_size * current_num_frames],
-                                    device=noise.device,
-                                    dtype=torch.long,
+                                    [batch_size * current_num_frames], device=noise.device, dtype=torch.long
                                 ),
                             ).unflatten(0, denoised_pred.shape[:2])
                 else:
+                    # Final step may require gradients
                     enable_grad = local_start_frame >= start_gradient_frame_index
+                    
+                    if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                        print(f"[SeqTrain-Pipeline] Block {block_index} final step: enable_grad={enable_grad}")
+                    
                     context_manager = torch.enable_grad() if enable_grad else torch.no_grad()
                     with context_manager:
                         _, denoised_pred = self.generator(
@@ -242,16 +312,21 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
                     break
-
+            
+            # Record output
             output[:, local_start_frame:local_start_frame + current_num_frames] = denoised_pred
-
+            
+            # Update cache with context noise
             context_timestep = torch.ones_like(timestep) * self.context_noise
             context_noisy = self.scheduler.add_noise(
                 denoised_pred.flatten(0, 1),
                 torch.randn_like(denoised_pred.flatten(0, 1)),
                 context_timestep.flatten(0, 1),
             ).unflatten(0, denoised_pred.shape[:2])
-
+            
+            if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
+            
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=context_noisy,
@@ -261,63 +336,71 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                     crossattn_cache=self.crossattn_cache,
                     current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                 )
-
+            
             local_start_frame += current_num_frames
-
-        scheduler_timesteps = cast(torch.Tensor, getattr(self.scheduler, "timesteps"))
-
+        
+        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+            log_gpu_memory(f"SeqTrain-Pipeline: After all blocks generated", device=noise.device, rank=dist.get_rank() if dist.is_initialized() else 0)
+        
+        # Compute returned timestep information
         if not self.same_step_across_blocks:
             denoised_timestep_from, denoised_timestep_to = None, None
         elif exit_flags[0] == len(self.denoising_step_list) - 1:
             denoised_timestep_to = 0
             denoised_timestep_from = 1000 - torch.argmin(
-                (scheduler_timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0,
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0
             ).item()
         else:
             denoised_timestep_to = 1000 - torch.argmin(
-                (scheduler_timesteps.cuda() - self.denoising_step_list[exit_flags[0] + 1].cuda()).abs(), dim=0,
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0] + 1].cuda()).abs(), dim=0
             ).item()
             denoised_timestep_from = 1000 - torch.argmin(
-                (scheduler_timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0,
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0
             ).item()
-
+        
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
-
+        
         return output, denoised_timestep_from, denoised_timestep_to
 
     def inference_with_trajectory(
-        self,
-        noise: torch.Tensor,
-        initial_latent: Optional[torch.Tensor] = None,
-        return_sim_step: bool = False,
-        slice_last_frames: int = 21,
-        action_inputs: Optional[dict[str, Any]] = None,
-        **conditional_dict,
-    ):
+            self,
+            noise: torch.Tensor,
+            initial_latent: Optional[torch.Tensor] = None,
+            return_sim_step: bool = False,
+            slice_last_frames: int = 21,
+            action_inputs: Optional[dict[str, Any]] = None,
+            **conditional_dict
+    ) -> torch.Tensor:
         batch_size, num_frames, num_channels, height, width = noise.shape
-
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
+            # If the first frame is independent and the first frame is provided, then the number of frames in the
+            # noise should still be a multiple of num_frame_per_block
             assert num_frames % self.num_frame_per_block == 0
             num_blocks = num_frames // self.num_frame_per_block
         else:
+            # Using a [1, 4, 4, 4, 4, 4, ...] model to generate a video without image conditioning
             assert (num_frames - 1) % self.num_frame_per_block == 0
             num_blocks = (num_frames - 1) // self.num_frame_per_block
-
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
-        num_output_frames = num_frames + num_input_frames
+        num_output_frames = num_frames + num_input_frames  # add the initial latent frames
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
             device=noise.device,
-            dtype=noise.dtype,
+            dtype=noise.dtype
         )
 
-        self._initialize_kv_cache(batch_size=batch_size, dtype=noise.dtype, device=noise.device)
-        self._initialize_crossattn_cache(batch_size=batch_size, dtype=noise.dtype, device=noise.device)
-
+        # Step 1: Initialize KV cache to all zeros
+        self._initialize_kv_cache(
+            batch_size=batch_size, dtype=noise.dtype, device=noise.device
+        )
+        self._initialize_crossattn_cache(
+            batch_size=batch_size, dtype=noise.dtype, device=noise.device
+        )
+        # Step 2: Cache context feature
         current_start_frame = 0
         if initial_latent is not None:
-            timestep = torch.zeros([batch_size, 1], device=noise.device, dtype=torch.int64)
+            timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
             cond_with_action = self._prepare_action_conditional(
                 conditional_dict,
                 action_inputs,
@@ -326,35 +409,36 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                 device=noise.device,
                 dtype=initial_latent.dtype,
             )
-            output[:, : initial_latent.shape[1]] = initial_latent
+            # Assume num_input_frames is 1 + self.num_frame_per_block * num_input_blocks
+            output[:, :1] = initial_latent
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=initial_latent,
                     conditional_dict=cond_with_action,
-                    timestep=timestep,
+                    timestep=timestep * 0,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
+                    current_start=current_start_frame * self.frame_seq_length
                 )
-            current_start_frame += initial_latent.shape[1]
+            current_start_frame += 1
 
+        # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-
         num_denoising_steps = len(self.denoising_step_list)
         exit_flags = self.generate_and_sync_list(len(all_num_frames), num_denoising_steps, device=noise.device)
         start_gradient_frame_index = num_output_frames - slice_last_frames
 
         grad_enable_mask = torch.zeros((batch_size, sum(all_num_frames)), dtype=torch.bool)
-
+        # If static local_attn_size, set it first
         if not isinstance(self.local_attn_size, (list, tuple)):
             self.generator.model.local_attn_size = int(self.local_attn_size)
             self._set_all_modules_max_attention_size(int(self.local_attn_size))
-
+        # for block_index in range(num_blocks):
         for block_index, current_num_frames in enumerate(all_num_frames):
-            offset = current_start_frame - num_input_frames
-            noisy_input = noise[:, offset:offset + current_num_frames]
+            noisy_input = noise[
+                :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
             global_start = current_start_frame
             cond_with_action = self._prepare_action_conditional(
@@ -366,26 +450,24 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                 dtype=noise.dtype,
             )
 
-            denoised_pred = torch.zeros_like(noisy_input)
-            timestep = torch.zeros(
-                [batch_size, current_num_frames],
-                device=noise.device,
-                dtype=torch.int64,
-            )
-
+            # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
+                # If scheduled, set local_attn_size dynamically per timestep
                 if isinstance(self.local_attn_size, (list, tuple)):
                     self.generator.model.local_attn_size = int(self.local_attn_size[index])
+                    if not dist.is_initialized() or dist.get_rank() == 0 and DEBUG:
+                        print(f"[denoise step {index}] timestep={float(current_timestep)} local_attn_size={self.generator.model.local_attn_size}")
                     self._set_all_modules_max_attention_size(int(self.local_attn_size[index]))
-
-                exit_flag = index == exit_flags[0] if self.same_step_across_blocks else index == exit_flags[block_index]
-
+                if self.same_step_across_blocks:
+                    exit_flag = (index == exit_flags[0])
+                else:
+                    exit_flag = (index == exit_flags[block_index])  # Only backprop at the randomly selected timestep (consistent across all ranks)
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
                     device=noise.device,
-                    dtype=torch.int64,
-                ) * current_timestep
-
+                    dtype=torch.int64) * current_timestep
+                if DEBUG and dist.get_rank() == 0:
+                    print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
                 if not exit_flag:
                     with torch.no_grad():
                         _, denoised_pred = self.generator(
@@ -394,19 +476,18 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length,
+                            current_start=current_start_frame * self.frame_seq_length
                         )
                         next_timestep = self.denoising_step_list[index + 1]
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
                             torch.randn_like(denoised_pred.flatten(0, 1)),
                             next_timestep * torch.ones(
-                                [batch_size * current_num_frames],
-                                device=noise.device,
-                                dtype=torch.long,
-                            ),
+                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
+                    # for getting real output
+                    # with torch.set_grad_enabled(current_start_frame >= start_gradient_frame_index):
                     if current_start_frame < start_gradient_frame_index:
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = False
                         with torch.no_grad():
@@ -416,9 +497,10 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                                 timestep=timestep,
                                 kv_cache=self.kv_cache1,
                                 crossattn_cache=self.crossattn_cache,
-                                current_start=current_start_frame * self.frame_seq_length,
+                                current_start=current_start_frame * self.frame_seq_length
                             )
                     else:
+                        # print(f"enable grad: {current_start_frame}")
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = True
                         _, denoised_pred = self.generator(
                             noisy_image_or_video=noisy_input,
@@ -426,51 +508,53 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length,
+                            current_start=current_start_frame * self.frame_seq_length
                         )
                     break
 
+            # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
+            # Step 3.3: rerun with timestep zero to update the cache
             context_timestep = torch.ones_like(timestep) * self.context_noise
-            denoised_pred_for_cache = self.scheduler.add_noise(
+            # add context noise
+            denoised_pred = self.scheduler.add_noise(
                 denoised_pred.flatten(0, 1),
                 torch.randn_like(denoised_pred.flatten(0, 1)),
                 context_timestep * torch.ones(
-                    [batch_size * current_num_frames],
-                    device=noise.device,
-                    dtype=torch.long,
-                ),
+                    [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
             ).unflatten(0, denoised_pred.shape[:2])
-
+            if DEBUG and dist.get_rank() == 0:
+                print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
+                print(f"rank {dist.get_rank()}, rerun_for_cache")
             with torch.no_grad():
                 self.generator(
-                    noisy_image_or_video=denoised_pred_for_cache,
+                    noisy_image_or_video=denoised_pred,
                     conditional_dict=cond_with_action,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
+                    current_start=current_start_frame * self.frame_seq_length
                 )
 
+            # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
 
-        scheduler_timesteps = cast(torch.Tensor, getattr(self.scheduler, "timesteps"))
-
+        if dist.get_rank() == 0 and DEBUG:
+            print(f"grad_enable_mask: {grad_enable_mask[0, :]}")
+            
+        # Step 3.5: Return the denoised timestep
         if not self.same_step_across_blocks:
             denoised_timestep_from, denoised_timestep_to = None, None
         elif exit_flags[0] == len(self.denoising_step_list) - 1:
             denoised_timestep_to = 0
             denoised_timestep_from = 1000 - torch.argmin(
-                (scheduler_timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0,
-            ).item()
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0).item()
         else:
             denoised_timestep_to = 1000 - torch.argmin(
-                (scheduler_timesteps.cuda() - self.denoising_step_list[exit_flags[0] + 1].cuda()).abs(), dim=0,
-            ).item()
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0] + 1].cuda()).abs(), dim=0).item()
             denoised_timestep_from = 1000 - torch.argmin(
-                (scheduler_timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0,
-            ).item()
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0).item()
 
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1

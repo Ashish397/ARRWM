@@ -118,6 +118,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         )
 
     def _assert_non_zero_modulation(self, modulation: torch.Tensor, *, source: str = "action_modulation") -> None:
+        if getattr(self, "debug_allow_zero_modulation", False):
+            return
         if modulation.numel() == 0:
             raise ValueError(f"{source} tensor is empty")
         flat = modulation.detach().float().reshape(modulation.shape[0], -1)
@@ -135,6 +137,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         modulation: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        debug_allow_zero_modulation: bool = False,
     ) -> torch.Tensor:
         mod = modulation.to(device=device, dtype=dtype)
         if mod.dim() == 3:
@@ -151,7 +154,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
             )
         if mod.shape[2] != 6:
             raise ValueError(f"action_modulation expected 6 modulation slots, got {mod.shape[2]}")
-        self._assert_non_zero_modulation(mod)
+        # if not debug_allow_zero_modulation:
+            # self._assert_non_zero_modulation(mod)
         return mod
 
     @staticmethod
@@ -169,21 +173,38 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         num_frames: int,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        debug_allow_zero_modulation: bool = False,
     ) -> Optional[torch.Tensor]:
         if not self._action_conditioning_enabled:
             raise RuntimeError("Action conditioning is disabled; enable AdaLN-Zero or provide an action module")
         if action_inputs is None:
             raise ValueError("action_inputs is required")
 
-        cached_mod = action_inputs.get("_cached_action_modulation")
-        if cached_mod is not None:
-            return self._coerce_action_modulation_tensor(cached_mod, device, dtype)
+        full_cached = action_inputs.get("_cached_action_modulation_full") or action_inputs.get("_cached_action_modulation")
+        if full_cached is not None:
+            mod = self._coerce_action_modulation_tensor(
+                full_cached,
+                device,
+                dtype,
+                debug_allow_zero_modulation=debug_allow_zero_modulation,
+            )
+            if frame_start + num_frames > mod.shape[1]:
+                raise ValueError("cached action_modulation is shorter than required block")
+            return mod[:, frame_start:frame_start + num_frames]
 
         provided_mod = action_inputs.get("action_modulation")
         if provided_mod is not None:
-            mod = self._coerce_action_modulation_tensor(provided_mod, device, dtype)
-            action_inputs["_cached_action_modulation"] = mod
-            return mod
+            mod = self._coerce_action_modulation_tensor(
+                provided_mod,
+                device,
+                dtype,
+                debug_allow_zero_modulation=debug_allow_zero_modulation,
+            )
+            if frame_start + num_frames > mod.shape[1]:
+                raise ValueError("action_modulation 的帧长度不足以覆盖当前块")
+            action_inputs["_cached_action_modulation_full"] = mod
+            return mod[:, frame_start:frame_start + num_frames]
 
         action_features = action_inputs.get("action_features")
         if action_features is None:
@@ -195,7 +216,12 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
 
         if action_features.dim() == 2:
             action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
-        elif action_features.dim() != 3:
+        elif action_features.dim() == 3:
+            stop = frame_start + num_frames
+            if stop > action_features.shape[1]:
+                raise ValueError("action_features 的帧长度不足以覆盖当前块")
+            action_features = action_features[:, frame_start:stop]
+        else:
             raise ValueError("action_features 需为 [B, action_dim] 或 [B, T, action_dim]")
 
         if action_features.shape[-1] != self.action_dim:
@@ -210,8 +236,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
 
         modulation = self.action_projection(action_features, num_frames=num_frames)
         modulation = modulation.to(device=device, dtype=dtype)
-        self._assert_non_zero_modulation(modulation)
-        action_inputs["_cached_action_modulation"] = modulation
+        # if not debug_allow_zero_modulation:
+        #     self._assert_non_zero_modulation(modulation)
         return modulation
 
     def _prepare_action_conditional(
@@ -230,7 +256,6 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
 
         conditional_dict = dict(base_conditional)
         conditional_dict["_action_modulation"] = modulation
-        conditional_dict["_action_frame_start"] = frame_start
         if "action_features" in action_inputs:
             conditional_dict["action_features"] = action_inputs["action_features"]
         return conditional_dict
@@ -334,7 +359,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         for block_idx, current_num_frames in enumerate(all_num_frames):
             print(f"\n[Block {block_idx}] Generating frames {current_start_frame} to {current_start_frame + current_num_frames}")
 
-            block_action_inputs = base_action_inputs
+            block_action_inputs = dict(base_action_inputs)
 
             inferred_action_features: Optional[torch.Tensor] = None
             if (
