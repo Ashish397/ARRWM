@@ -84,6 +84,7 @@ class DMD2RealMSELAM(SelfForcingModel):
             try:
                 self.fake_score.adding_rgs_branch(
                     time_embed_dim=1536 if self.concat_time_embeddings else 0,
+                    num_frames=self.num_training_frames,
                 )
             except Exception:
                 if dist.get_rank() == 0:

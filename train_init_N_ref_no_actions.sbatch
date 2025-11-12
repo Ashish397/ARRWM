@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J train_init_real_N_d2_with_action_definitive_edition
+#SBATCH -J train_init_ref_no_actions
 #SBATCH --nodes=16
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=32
@@ -15,10 +15,10 @@ set -e -o pipefail
 cd /home/u5dk/as1748.u5dk/ARRWM
 
 # Project path and config
-CONFIG=configs/longlive_train_init_real_N_d2.yaml
-LOGDIR=/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_with_action_definitive_edition
+CONFIG=configs/longlive_train_init_real_N_ref_no_actions.yaml
+LOGDIR=/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_ref_no_actions
 WANDB_SAVE_DIR=wandb
-EXPERIMENT_NAME="dmd2-init-N-d2-with-action-definitive-edition-$(date +%Y%m%d-%H%M%S)"
+EXPERIMENT_NAME="dmd2-init-N-ref-no-actions-$(date +%Y%m%d-%H%M%S)"
 
 # Activate arrwm conda environment
 source /scratch/u5dk/as1748.u5dk/miniforge3/bin/activate

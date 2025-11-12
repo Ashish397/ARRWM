@@ -1,0 +1,25 @@
+part,url,compressed size,uncompressed size
+0,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_0.zip,18.76GB,21.04GB
+1,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_1.zip,29.30GB,33.07GB
+2,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_2.zip,45.51GB,51.00GB
+3,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_3.zip,85.55GB,95.93GB
+4,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_4.zip,95.16GB,106.59GB
+5,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_5.zip,85.99GB,96.20GB
+6,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_6.zip,64.04GB,71.67GB
+7,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_7.zip,20.66GB,23.15GB
+8,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_8.zip,71.61GB,82.21GB
+9,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_9.zip,13.22GB,14.92GB
+10,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_10.zip,12.19GB,13.15GB
+11,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_11.zip,70.45GB,79.60GB
+12,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_12.zip,45.86GB,51.38GB
+13,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_13.zip,41.29GB,46.36GB
+14,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_14.zip,46.89GB,52.61GB
+15,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_15.zip,22.76GB,25.53GB
+16,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_16.zip,15.84GB,17.47GB
+17,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_17.zip,33.95GB,38.60GB
+18,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_18.zip,25.86GB,29.00GB
+19,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_19.zip,14.68GB,16.41GB
+20,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_20.zip,17.71GB,20.76GB
+21,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_21.zip,12.56GB,14.47GB
+22,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_22.zip,6.36GB,7.15GB
+23,https://frodobots-2k-dataset.s3.ap-southeast-1.amazonaws.com/output_rides_23.zip,2.00GB,2.25GB

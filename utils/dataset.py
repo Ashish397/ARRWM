@@ -154,24 +154,28 @@ class VideoLatentCaptionDataset(Dataset):
         action_root: Optional[str] = None,
         action_variant: str = "input",
         include_dir_substrings: Optional[list[str]] = None,
+        include_actions: bool = True,
     ):
         self.latent_root = Path(latent_root)
         self.caption_root = Path(caption_root)
         self.num_frames = num_frames
         self.text_pre_encoded = text_pre_encoded
         self.encoded_suffix = encoded_suffix
+        self.include_actions = include_actions
 
         if not self.latent_root.exists():
             raise FileNotFoundError(f"Latent root does not exist: {latent_root}")
         if not self.caption_root.exists():
             raise FileNotFoundError(f"Caption root does not exist: {caption_root}")
 
-        if action_variant not in {"input", "output"}:
+        if include_actions and action_variant not in {"input", "output"}:
             raise ValueError(
                 f"Unsupported action_variant '{action_variant}' (expected 'input' or 'output')."
             )
         self.action_variant = action_variant
-        self.actions_root = self._resolve_action_root(action_root)
+        self.actions_root = (
+            self._resolve_action_root(action_root) if include_actions else None
+        )
 
         self._action_cache: dict[Path, tuple[torch.Tensor, torch.Tensor]] = {}
         self._action_value_keys: Optional[tuple[str, ...]] = None
@@ -189,11 +193,14 @@ class VideoLatentCaptionDataset(Dataset):
             "captions",
             skip=lambda p: p.name.endswith(f"{self.encoded_suffix}.json"),
         )
-        actions_map = self._index_unique(
-            self.actions_root,
-            f"{self.action_variant}_actions_*.csv",
-            f"{self.action_variant} actions",
-        )
+        if self.include_actions:
+            actions_map = self._index_unique(
+                self.actions_root,
+                f"{self.action_variant}_actions_*.csv",
+                f"{self.action_variant} actions",
+            )
+        else:
+            actions_map = {}
 
         include_filters: Optional[tuple[str, ...]] = None
         if include_dir_substrings:
@@ -314,8 +321,8 @@ class VideoLatentCaptionDataset(Dataset):
         raw_map: dict[Path, Path],
         actions_map: dict[Path, Path],
     ) -> Optional["VideoLatentCaptionDataset.Sample"]:
-        actions_path = actions_map.get(rel_dir)
-        if actions_path is None:
+        actions_path = actions_map.get(rel_dir) if self.include_actions else None
+        if self.include_actions and actions_path is None:
             print(f"{rel_dir}: actions don't exist, skipping")
             return None
 
@@ -350,8 +357,8 @@ class VideoLatentCaptionDataset(Dataset):
         raw_map: dict[Path, Path],
         actions_map: dict[Path, Path],
     ) -> Optional["VideoLatentCaptionDataset.Sample"]:
-        actions_path = actions_map.get(rel_dir)
-        if actions_path is None:
+        actions_path = actions_map.get(rel_dir) if self.include_actions else None
+        if self.include_actions and actions_path is None:
             print(f"{rel_dir}: actions don't exist, skipping")
             return None
 
@@ -459,49 +466,50 @@ class VideoLatentCaptionDataset(Dataset):
             "real_latents": latents,
         }
 
-        actions_path = sample.actions_path
-        if actions_path is None:
-            raise RuntimeError("Actions path missing for sample.")
+        if self.include_actions:
+            actions_path = sample.actions_path
+            if actions_path is None:
+                raise RuntimeError("Actions path missing for sample.")
 
-        action_frames, action_values = self._load_actions_tensor(actions_path)
-        available = action_values.shape[0]
-        desired = end - start
-        shortfall = 0
-        if start >= available:
-            shortfall = desired
-            base_frame = action_frames[-1:]
-            base_value = action_values[-1:]
-            action_frames = base_frame.repeat(desired)
-            action_values = base_value.repeat(desired, 1)
-        else:
-            slice_end = min(end, available)
-            action_frames = action_frames[start:slice_end]
-            action_values = action_values[start:slice_end]
-            shortfall = desired - action_values.shape[0]
-            if shortfall > 0:
-                pad_frames = action_frames[-1:].repeat(shortfall)
-                pad_values = action_values[-1:].repeat(shortfall, 1)
-                action_frames = torch.cat([action_frames, pad_frames], dim=0)
-                action_values = torch.cat([action_values, pad_values], dim=0)
+            action_frames, action_values = self._load_actions_tensor(actions_path)
+            available = action_values.shape[0]
+            desired = end - start
+            shortfall = 0
+            if start >= available:
+                shortfall = desired
+                base_frame = action_frames[-1:]
+                base_value = action_values[-1:]
+                action_frames = base_frame.repeat(desired)
+                action_values = base_value.repeat(desired, 1)
+            else:
+                slice_end = min(end, available)
+                action_frames = action_frames[start:slice_end]
+                action_values = action_values[start:slice_end]
+                shortfall = desired - action_values.shape[0]
+                if shortfall > 0:
+                    pad_frames = action_frames[-1:].repeat(shortfall)
+                    pad_values = action_values[-1:].repeat(shortfall, 1)
+                    action_frames = torch.cat([action_frames, pad_frames], dim=0)
+                    action_values = torch.cat([action_values, pad_values], dim=0)
 
-        if shortfall > 0 and actions_path not in self._short_action_warned:
-            print(
-                f"{actions_path}: actions shorter than video, repeating last action for {shortfall} frames"
-            )
-            self._short_action_warned.add(actions_path)
+            if shortfall > 0 and actions_path not in self._short_action_warned:
+                print(
+                    f"{actions_path}: actions shorter than video, repeating last action for {shortfall} frames"
+                )
+                self._short_action_warned.add(actions_path)
 
-        if repeat:
-            action_frames = torch.cat(
-                [action_frames, action_frames[-1:].repeat(repeat)],
-                dim=0,
-            )
-            action_values = torch.cat(
-                [action_values, action_values[-1:].repeat(repeat, 1)],
-                dim=0,
-            )
+            if repeat:
+                action_frames = torch.cat(
+                    [action_frames, action_frames[-1:].repeat(repeat)],
+                    dim=0,
+                )
+                action_values = torch.cat(
+                    [action_values, action_values[-1:].repeat(repeat, 1)],
+                    dim=0,
+                )
 
-        sample_dict["action_frames"] = action_frames.clone()
-        sample_dict["actions"] = action_values.clone()
+            sample_dict["action_frames"] = action_frames.clone()
+            sample_dict["actions"] = action_values.clone()
 
         if sample.encoded_path is not None:
             try:

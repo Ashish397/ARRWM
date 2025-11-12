@@ -1,5 +1,6 @@
 independent_first_frame: false
 warp_denoising_step: false
+action_patch_enabled: true
 weight_decay: 0.01
 same_step_across_blocks: true
 discriminator_lr_multiplier: 1.0
@@ -13,7 +14,7 @@ causal: true
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
 prompt_path: prompts/MovieGenVideoBench.txt
-wan_model_path: /home/ashish/Wan2.1/
+wan_model_path: /home/u5dk/as1748.u5dk/ARRWM/wan_models/
 eval_first_n: 64
 num_samples: 1
 height: 480

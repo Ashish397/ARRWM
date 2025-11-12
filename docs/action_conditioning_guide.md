@@ -311,16 +311,16 @@ class ActionSequenceEncoder(nn.Module):
         return self.fc(h.squeeze(0))         # [B, action_dim]
 
 # Usage
-action_encoder = ActionSequenceEncoder().cuda()
+sequence_module = ActionSequenceEncoder().cuda()
 pipeline = ActionCausalInferencePipeline(
     ...,
-    action_module=action_encoder,
+    action_module=sequence_module,
     action_dim=512,
 )
 
 # Provide action sequence during inference
 action_seq = torch.tensor([[1, 3, 5, 2, 0]]).cuda()  # [B, seq_len]
-action_features = action_encoder(action_seq)
+action_features = sequence_module(action_seq)
 
 video = pipeline.inference(
     noise=noise,

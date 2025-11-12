@@ -9,18 +9,19 @@ import torch
 from pipeline import SelfForcingTrainingPipeline, ActionSelfForcingTrainingPipeline
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
-from model.action_model_patch import apply_action_patches
-from utils.action_patch import action_patch_disabled, action_patch_enabled
-from model.action_encoder import ActionEncoder
+from model.action_model_patch import apply_action_patches, apply_action_patches_critic
+from model.action_modulation import ActionModulationProjection
 
 from utils.debug_option import DEBUG
 
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
-        self._action_patch_enabled = action_patch_enabled()
+        cfg_flag = getattr(args, "action_patch_enabled", None)
+        self._action_patch_enabled = bool(cfg_flag)
+        self.action_projection: Optional[nn.Module] = None
+        self._action_dim: Optional[int] = None
         self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
-        self.action_encoder: Optional[ActionEncoder] = None
         self._initialize_models(args, device)
 
         self.device = device
@@ -47,11 +48,14 @@ class BaseModel(nn.Module):
         if self._action_patch_enabled:
             apply_action_patches(self.generator)
         self.generator.model.requires_grad_(True)
+        self._init_action_projection(args, device)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
         self.real_score.model.requires_grad_(False)
 
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        if self._action_patch_enabled:
+            apply_action_patches_critic(self.fake_score)
         self.fake_score.model.requires_grad_(True)
         self._fake_score_trainable = True
 
@@ -67,14 +71,21 @@ class BaseModel(nn.Module):
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
-        if self._action_patch_enabled:
-            raw_action_dim = int(getattr(args, "raw_action_dim", None))
-            feature_dim = int(getattr(args, "action_dim", None))
-            self.action_encoder = ActionEncoder(
-                action_dim=raw_action_dim,
-                feature_dim=feature_dim,
-            ).to(device)
-            self.action_encoder.train()
+    def _init_action_projection(self, args, device) -> None:
+        if not self._action_patch_enabled:
+            self.action_projection = None
+            return
+        action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
+        self._action_dim = action_dim
+        model_dim = getattr(self.generator.model, "dim", 2048)
+        dtype = torch.bfloat16 if args.mixed_precision else torch.float32
+        module = ActionModulationProjection(
+            action_dim=action_dim,
+            hidden_dim=model_dim,
+            num_frames=1,
+            zero_init=True,
+        ).to(device=device, dtype=dtype)
+        self.action_projection = module
 
     def _set_fake_score_trainable(self, value: bool) -> None:
         if getattr(self, "_fake_score_trainable", None) == value:
@@ -159,6 +170,41 @@ class SelfForcingModel(BaseModel):
         # Lazy-initialized training-time pipeline for backward simulation
         self.inference_pipeline = None
 
+    def _compute_action_modulation_tensor(
+        self,
+        actions: Optional[torch.Tensor],
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not self._action_patch_enabled or actions is None:
+            return None
+        if self.inference_pipeline is None:
+            self._initialize_inference_pipeline()
+        action_inputs = {"actions": actions}
+        return self.inference_pipeline._compute_action_modulation(
+            action_inputs,
+            frame_start=0,
+            num_frames=num_frames,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _with_action_conditioning(
+        self,
+        base_conditional: dict,
+        actions: Optional[torch.Tensor],
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict:
+        modulation = self._compute_action_modulation_tensor(actions, num_frames, device, dtype)
+        if modulation is None:
+            return base_conditional
+        conditioned = dict(base_conditional)
+        conditioned["_action_modulation"] = modulation
+        return conditioned
+
     def _run_generator(
         self,
         image_or_video_shape,
@@ -212,7 +258,7 @@ class SelfForcingModel(BaseModel):
 
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=torch.randn(noise_shape,
-                              device=self.device, dtype=torch.float32),
+                              device=self.device, dtype=self.dtype),
             slice_last_frames=slice_last_frames,
             action_inputs=action_inputs,
             **conditional_dict,
@@ -280,17 +326,15 @@ class SelfForcingModel(BaseModel):
         if self._action_patch_enabled:
             return self.inference_pipeline.inference_with_trajectory(
                 noise=noise,
-                initial_latent=conditional_dict.get("initial_latent", None),
+                **conditional_dict,
                 slice_last_frames=slice_last_frames,
                 action_inputs=action_inputs,
-                **kwargs,
             )
         else:
             return self.inference_pipeline.inference_with_trajectory(
                 noise=noise,
-                initial_latent=conditional_dict.get("initial_latent", None),
+                **conditional_dict,
                 slice_last_frames=slice_last_frames,
-                **kwargs,
             )
 
     def _initialize_inference_pipeline(self):
@@ -318,16 +362,11 @@ class SelfForcingModel(BaseModel):
             num_training_frames=num_training_frames,
         )
 
-        self.action_projection = None
         if self._action_patch_enabled:
             self.inference_pipeline = ActionSelfForcingTrainingPipeline(
                 **shared_kwargs,
-                action_dim=getattr(self.args, "action_dim", getattr(self.args, "raw_action_dim", 2)),
-                action_module=self.action_encoder,
+                action_dim=getattr(self.args, "raw_action_dim", getattr(self.args, "action_dim", 2)),
+                action_projection=self.action_projection,
             )
-            if hasattr(self.inference_pipeline, "action_projection") and isinstance(
-                self.inference_pipeline.action_projection, nn.Module
-            ):
-                self.action_projection = self.inference_pipeline.action_projection
         else:
             self.inference_pipeline = SelfForcingTrainingPipeline(**shared_kwargs)

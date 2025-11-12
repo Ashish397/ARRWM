@@ -4,11 +4,13 @@
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 """
-Minimal monkey patches so Wan's causal model can accept externally computed
-adaLN-Zero modulation. The only behaviour change should be:
+Minimal monkey patches so Wan's causal (actor) and bidirectional (critic)
+models can accept externally computed adaLN-Zero modulation. The only behaviour
+change should be:
 
   • add `_action_modulation` (if provided) to the output of `time_projection`
-  • thread `_action_modulation` through `_forward_inference`
+  • thread `_action_modulation` through `_forward_inference` (actor) or
+    `_forward` (critic)
 
 Everything else stays untouched so the no-action path is bit-identical to the
 upstream implementation.
@@ -24,12 +26,11 @@ try:
 except Exception:  # pragma: no cover
     FSDP = None
 
-def patch_causal_wan_model_for_action(model):
-    """Patch Wan's causal model in-place to support external action modulation."""
+def _patch_time_projection(model):
     if getattr(model, "_action_tp_patched", False):
-        return model
+        return
 
-    # 1) Inject action modulation right after time_projection.
+    # Inject action modulation right after time_projection.
     tp = model.time_projection
     orig_tp_forward = tp.forward
 
@@ -49,6 +50,17 @@ def patch_causal_wan_model_for_action(model):
         return e0 + am_flat
 
     tp.forward = types.MethodType(tp_forward_with_action, tp)
+    model._action_tp_patched = True
+
+
+def patch_causal_wan_model_for_action(model):
+    """Patch Wan's causal model in-place to support external action modulation."""
+    if getattr(model, "_action_causal_patched", False):
+        return model
+
+    _patch_time_projection(model)
+    if not hasattr(model, "_forward_inference"):
+        raise AttributeError("Causal Wan model is expected to define `_forward_inference`.")
 
     # 2) Thread modulation through _forward_inference.
     orig_inf = model._forward_inference
@@ -71,8 +83,40 @@ def patch_causal_wan_model_for_action(model):
             self._action_modulation = None
 
     model._forward_inference = _forward_inference_with_action.__get__(model, type(model))
+    model._action_causal_patched = True
+    return model
 
-    model._action_tp_patched = True
+
+def patch_bidirectional_wan_model_for_action(model):
+    """Patch Wan's bidirectional model to support external action modulation."""
+    if getattr(model, "_action_bidir_patched", False):
+        return model
+
+    _patch_time_projection(model)
+    if not hasattr(model, "_forward"):
+        raise AttributeError("Bidirectional Wan model is expected to define `_forward`.")
+
+    orig_fwd = model._forward
+
+    @wraps(orig_fwd)
+    def _forward_with_action(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        *args,
+        action_modulation=None,
+        **kwargs,
+    ):
+        self._action_modulation = action_modulation
+        try:
+            return orig_fwd(x, t, context, seq_len, *args, **kwargs)
+        finally:
+            self._action_modulation = None
+
+    model._forward = _forward_with_action.__get__(model, type(model))
+    model._action_bidir_patched = True
     return model
 
 
@@ -85,5 +129,18 @@ def apply_action_patches(generator_wrapper):
         return generator_wrapper
     if hasattr(target, "model"):
         patch_causal_wan_model_for_action(target.model)
+    target._action_patch_applied = True  # type: ignore[attr-defined]
+    return generator_wrapper
+
+
+def apply_action_patches_critic(generator_wrapper):
+    """Apply action patches to a critic (bidirectional) WanDiffusionWrapper."""
+    target = generator_wrapper
+    if FSDP is not None and isinstance(target, FSDP):
+        target = target.module  # type: ignore[attr-defined]
+    if getattr(target, "_action_patch_applied", False):
+        return generator_wrapper
+    if hasattr(target, "model"):
+        patch_bidirectional_wan_model_for_action(target.model)
     target._action_patch_applied = True  # type: ignore[attr-defined]
     return generator_wrapper

@@ -29,7 +29,6 @@ from utils.loss import get_denoising_loss
 
 from model.action_modulation import ActionModulationProjection
 from model.action_model_patch import apply_action_patches
-from model.action_encoder import ActionEncoder
 
 class PatchDiscriminator3D(nn.Module):
     def __init__(self, in_channels: int = 16, base_channels: int = 64, num_layers: int = 4, channel_multiplier: int = 2):
@@ -193,7 +192,6 @@ class LoRADiffusionTrainer:
         self.gan_expected_channels = None
         self.start_step = 0
 
-        self.action_encoder = None
         self.action_projection = None
         self.use_action_conditioning = None
 
@@ -319,21 +317,13 @@ class LoRADiffusionTrainer:
             else:
                 model_dim = 2048
 
-            action_dim = getattr(self.config, "action_dim", 512)
-            raw_action_dim = getattr(self.config, "raw_action_dim", 2)
+            resolved_action_dim = getattr(self.config, "raw_action_dim", None)
+            if resolved_action_dim is None:
+                resolved_action_dim = getattr(self.config, "action_dim", 2)
             enable_adaln_zero = getattr(self.config, "enable_adaln_zero", True)
 
-            self.action_encoder = ActionEncoder(
-                action_dim=raw_action_dim,      # Input: 2D raw actions
-                feature_dim=action_dim,          # Output: 512D features
-                hidden_dim=256,
-                use_sinusoidal=True,
-            )
-            self.action_encoder.to(self.device)
-            self.action_encoder.train()
-
             self.action_projection = ActionModulationProjection(
-                action_dim=action_dim,
+                action_dim=resolved_action_dim,
                 hidden_dim=model_dim,
                 num_frames=1,
                 zero_init=enable_adaln_zero,
@@ -346,8 +336,11 @@ class LoRADiffusionTrainer:
             self.use_action_conditioning = True
 
             if self.is_main_process:
-                logging.info(f"Action-injection enabled: raw_action_dim={raw_action_dim}, "
-                    f"feature_dim={action_dim}, enable_adaln_zero={enable_adaln_zero}")
+                logging.info(
+                    "Action-injection enabled: action_dim=%s, enable_adaln_zero=%s",
+                    resolved_action_dim,
+                    enable_adaln_zero,
+                )
 
         wrapper.to(self.device)
         wrapper.train()
@@ -369,14 +362,6 @@ class LoRADiffusionTrainer:
             )
 
             if self.use_action_conditioning:
-                if self.action_encoder is not None:
-                    self.action_encoder = DDP(
-                        self.action_encoder,
-                        device_ids=[torch.cuda.current_device()],
-                        output_device=torch.cuda.current_device(),
-                        broadcast_buffers=False,
-                        find_unused_parameters=False,
-                    )
                 if self.action_projection is not None:
                     self.action_projection = DDP(
                         self.action_projection,
@@ -778,12 +763,6 @@ class LoRADiffusionTrainer:
         params = [p for p in self.model.parameters() if p.requires_grad]
 
         if self.use_action_conditioning:
-            if self.action_encoder is not None:
-                encoder_params = [p for p in self.action_encoder.parameters() if p.requires_grad]
-                params.extend(encoder_params)
-                if self.is_main_process:
-                    logging.info(f"Added {len(encoder_params)} action encoder parameters to optimizer")
-
             if self.action_projection is not None:
                 proj_params = [p for p in self.action_projection.parameters() if p.requires_grad]
                 params.extend(proj_params)
@@ -1193,20 +1172,32 @@ class LoRADiffusionTrainer:
                 if self.use_action_conditioning and self.action_projection is not None:
                     raw_actions = batch.get("raw_actions", None)
                     if raw_actions is not None:
-                        action_features = self.action_encoder(raw_actions.to(self.device))
-                        action_weight = self._get_action_weight(step)
+                        if not torch.is_tensor(raw_actions):
+                            raise TypeError("raw_actions must be a torch.Tensor when action conditioning is enabled")
+                        action_features = raw_actions.to(self.device)
+                        proj_module = self.action_projection.module if isinstance(self.action_projection, DDP) else self.action_projection
+                        proj_dtype = next(proj_module.parameters()).dtype
+                        action_features = action_features.to(dtype=proj_dtype)
                         num_frames = latents.shape[1]
 
+                        if action_features.dim() == 2:
+                            prepared_features = action_features
+                        elif action_features.dim() == 3:
+                            if action_features.shape[1] < num_frames:
+                                raise ValueError(
+                                    f"raw_actions has {action_features.shape[1]} frames, but {num_frames} are required"
+                                )
+                            prepared_features = action_features[:, :num_frames]
+                        else:
+                            raise ValueError("raw_actions must have shape [B, action_dim] or [B, T, action_dim]")
+
+                        action_weight = self._get_action_weight(step)
                         action_modulation = self.action_projection(
-                            action_features,
+                            prepared_features,
                             num_frames=num_frames
                         ) * action_weight
                         if self.is_main_process and step % self.log_interval == 0:
                             logging.info(f"Action weight at step {step}: {action_weight:.4f}")
-                    else:
-                        action_modulation = None
-                else:
-                    action_modulation = None
 
                 bsz, num_frames = latents.shape[:2]
                 timesteps = self._sample_timesteps(bsz, num_frames)

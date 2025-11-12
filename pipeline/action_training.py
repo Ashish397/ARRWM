@@ -7,7 +7,6 @@ from typing import Any, Optional, cast
 from pipeline.self_forcing_training import SelfForcingTrainingPipeline
 from model.action_modulation import ActionModulationProjection
 from model.action_model_patch import apply_action_patches
-from utils.action_patch import action_patch_disabled
 from utils.scheduler import SchedulerInterface
 from utils.wan_wrapper import WanDiffusionWrapper
 from utils.scheduler import SchedulerInterface
@@ -33,6 +32,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                  action_dim: int = 512,
                  enable_adaln_zero: bool = True,
                  action_module: Optional[Any] = None,
+                 action_projection: Optional[ActionModulationProjection] = None,
                  **kwargs):
         super().__init__(
             denoising_step_list=denoising_step_list,
@@ -50,24 +50,26 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         self.action_dim: int = action_dim
         self.enable_adaln_zero: bool = enable_adaln_zero
         self.action_module: Optional[Any] = action_module
-        self.action_encoder: Optional[Any] = action_module
-        self.action_projection: Optional[ActionModulationProjection] = None
-        self._action_conditioning_enabled: bool = enable_adaln_zero #Is this needed? - 1
-        self._action_patch_globally_disabled = action_patch_disabled() #Is this needed? -2
-        if self._action_patch_globally_disabled:
-            self._action_conditioning_enabled = False #Is this needed? - 3
+        self.action_projection: Optional[ActionModulationProjection] = action_projection
+        self._shared_action_projection: bool = action_projection is not None
+        self._action_conditioning_enabled: bool = enable_adaln_zero
 
         if self._action_conditioning_enabled:
             _ = apply_action_patches(self.generator)
 
-        if self.enable_adaln_zero and self._action_conditioning_enabled:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.enable_adaln_zero and self._action_conditioning_enabled and self.action_projection is None:
+            # Match the generator's primary dtype/device so we avoid dtype mismatches
+            first_param = next(self.generator.parameters(), None)
+            if first_param is None:
+                raise RuntimeError("Generator must have parameters to derive dtype/device for action projection.")
+            device = first_param.device
+            dtype = first_param.dtype
             self.action_projection = ActionModulationProjection(
                 action_dim=self.action_dim,
                 hidden_dim=self.generator.model.dim,
                 num_frames=1,
                 zero_init=True,
-            ).to(device=device)
+            ).to(device=device, dtype=dtype)
 
     def _compute_action_modulation(
         self,
@@ -107,16 +109,6 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             action_features = action_inputs
 
         action_features = action_features.to(device=device, dtype=dtype)
-        encoder = self.action_encoder
-        if encoder is not None:
-            if action_features.dim() == 2:
-                action_features = encoder(action_features)
-            elif action_features.dim() == 3:
-                B, T, D = action_features.shape
-                encoded = encoder(action_features.reshape(B * T, D))
-                action_features = encoded.reshape(B, T, -1)
-            else:
-                raise ValueError("action_features must be 2D or 3D when using an action encoder")
         if action_features.dim() == 2:
             action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
         elif action_features.dim() == 3:
@@ -127,8 +119,19 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         if not self.enable_adaln_zero or self.action_projection is None:
             return None
 
+        self._ensure_action_projection_dtype(device=device, dtype=dtype)
         modulation = self.action_projection(action_features, num_frames=num_frames)
         return modulation.to(device=device, dtype=dtype)
+
+    def _ensure_action_projection_dtype(self, device: torch.device, dtype: torch.dtype) -> None:
+        if self.action_projection is None or self._shared_action_projection:
+            return
+        param = next(self.action_projection.parameters(), None)
+        if param is None:
+            return
+        if param.device == device and param.dtype == dtype:
+            return
+        self.action_projection = self.action_projection.to(device=device, dtype=dtype)
 
     def _prepare_action_conditional(
         self,

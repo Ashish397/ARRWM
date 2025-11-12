@@ -38,16 +38,23 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         action_module=None,  # 动作模块，可以是任何模型
         action_dim: Optional[int] = None,  # 动作特征维度
         enable_adaln_zero: bool = True,  # 是否使用 adaLN-Zero 注入
+        action_projection: Optional[ActionModulationProjection] = None,
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         
         # 初始化动作相关的配置
-        resolved_action_dim = action_dim if action_dim is not None else int(getattr(args, "action_dim", 512))
+        if action_dim is not None:
+            resolved_action_dim = action_dim
+        else:
+            resolved_action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
         self.action_module = action_module
         self.enable_adaln_zero = enable_adaln_zero
         self.action_dim = resolved_action_dim
-        self.action_projection: Optional[ActionModulationProjection] = None
-        self._action_conditioning_enabled = self.enable_adaln_zero or self.action_module is not None
+        self.action_projection: Optional[ActionModulationProjection] = action_projection
+        self._shared_action_projection = action_projection is not None
+        self._action_conditioning_enabled = (
+            self.enable_adaln_zero or self.action_module is not None or action_projection is not None
+        )
         self.action_norm_epsilon = float(getattr(args, "action_norm_epsilon", 0.0) or 0.0)
         # Backwards compatibility for external checks.
         self.use_action_conditioning = self._action_conditioning_enabled
@@ -55,7 +62,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         if self._action_conditioning_enabled:
             _ = apply_action_patches(self.generator)
 
-        if self.enable_adaln_zero:
+        if self.enable_adaln_zero and self.action_projection is None:
             device = self._resolve_module_device(self.generator)
             model_dim = getattr(self.generator.model, "dim", 2048)
             self.action_projection = ActionModulationProjection(
@@ -64,9 +71,11 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                 num_frames=1,
                 zero_init=True,
             ).to(device)
-
             if not dist.is_initialized() or dist.get_rank() == 0:
                 print(f"[ActionPipeline] adaLN-Zero enabled: action_dim={self.action_dim}, model_dim={model_dim}")
+        elif self.enable_adaln_zero and self.action_projection is not None:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"[ActionPipeline] Reusing shared action_projection (dim={self.action_dim}).")
 
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"[ActionPipeline] Action conditioning: {self._action_conditioning_enabled}")
@@ -236,8 +245,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
 
         modulation = self.action_projection(action_features, num_frames=num_frames)
         modulation = modulation.to(device=device, dtype=dtype)
-        # if not debug_allow_zero_modulation:
-        #     self._assert_non_zero_modulation(modulation)
+        if not debug_allow_zero_modulation:
+            self._assert_non_zero_modulation(modulation)
         return modulation
 
     def _prepare_action_conditional(

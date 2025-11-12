@@ -297,7 +297,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
-        action_modulation = conditional_dict.get("_action_modulation", None)
+        if getattr(self, "_action_patch_applied", False):
+            action_modulation = conditional_dict.get("_action_modulation", None)
+            action_mod_kwargs = {"action_modulation": action_modulation}
+        else:
+            action_mod_kwargs = {}
 
         # [B, F] -> [B]
         if self.uniform_timestep:
@@ -316,7 +320,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
                 cache_start=cache_start,
-                action_modulation=action_modulation,
+                **action_mod_kwargs,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -327,7 +331,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
-                    action_modulation=action_modulation,
+                    **action_mod_kwargs,
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
@@ -340,7 +344,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
                         concat_time_embeddings=concat_time_embeddings,
-                        action_modulation=action_modulation,
+                        **action_mod_kwargs,
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 elif regress_mode:
@@ -355,7 +359,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         num_frames_rgs=self.num_frames,
                         num_class_rgs=self.num_class,
                         concat_time_embeddings=concat_time_embeddings,
-                        action_modulation=action_modulation,
+                        **action_mod_kwargs,
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
@@ -363,7 +367,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
                         seq_len=self.seq_len,
-                        action_modulation=action_modulation,
+                        **action_mod_kwargs,
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

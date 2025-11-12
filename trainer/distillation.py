@@ -58,7 +58,6 @@ from pipeline import (
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
-from utils.action_patch import action_patch_enabled
 # # from one_logger_utils import OneLoggerUtils  # Commented out - module not available
 import time
 
@@ -145,6 +144,9 @@ class Trainer:
             # self.one_logger.on_app_start(app_start_time = app_start_time)  # Commented out - one_logger disabled  
         else:
             self.one_logger = None
+
+        cfg_flag = getattr(config, "action_patch_enabled", None)
+        self._action_patch_enabled = bool(cfg_flag)
 
         # Step 2: Initialize the model
         if self.one_logger is not None:
@@ -479,22 +481,21 @@ class Trainer:
         self.model.vae = self.model.vae.to(
             device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        if getattr(self.model, "action_projection", None) is not None:
+            self.model.action_projection = fsdp_wrap(
+                self.model.action_projection,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy="size",
+                min_num_params=1,
+            )
+
         # Lazily initialize the action-conditioned pipeline now that FSDP wrapping is complete.
-        if getattr(self.model, "inference_pipeline", None) is None or not hasattr(self.model, "action_projection"):
-            self.model._initialize_inference_pipeline()
-        if hasattr(self.model, "action_projection"):
-            if self.model.action_projection is not None:
-                self.model.action_projection.to(device=self.device)
-            else:
-                print("Warning: Action projection is None, skipping to device")
+        self.model._initialize_inference_pipeline()
 
         self.extra_generator_modules: list[nn.Module] = []
-        if hasattr(self.model, "action_projection") and isinstance(self.model.action_projection, nn.Module):
+        if getattr(self.model, "action_projection", None) is not None:
             self.extra_generator_modules.append(self.model.action_projection)
-
-        if hasattr(self.model, "action_encoder") and isinstance(self.model.action_encoder, nn.Module):
-            self.model.action_encoder.to(device=self.device)
-            self.extra_generator_modules.append(self.model.action_encoder)
 
         # if not config.no_visualize or config.load_raw_video:
         #     print("Moving vae to device 2, self.device: ", self.device)
@@ -533,11 +534,8 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_optimizer_init_start()
 
-        generator_params = [
-            param for param in self.model.generator.parameters() if param.requires_grad
-        ]
         self.generator_optimizer = torch.optim.AdamW(
-            generator_params,
+            [param for param in self.model.generator.parameters() if param.requires_grad],
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
@@ -589,6 +587,7 @@ class Trainer:
                 config.caption_root,
                 num_frames=getattr(config, "num_training_frames", 21),
                 text_pre_encoded=self.text_pre_encoded,
+                include_actions=self._action_patch_enabled,
             )
         else:
             dataset = TextDataset(config.data_path)
@@ -624,6 +623,7 @@ class Trainer:
                     val_caption_root,
                     num_frames=getattr(config, "num_training_frames", 21),
                     text_pre_encoded=self.text_pre_encoded,
+                    include_actions=self._action_patch_enabled,
                 )
             else:
                 val_dataset = TextDataset(val_data_path)
@@ -725,16 +725,29 @@ class Trainer:
                     if self.is_main_process:
                         print("Warning: EMA checkpoint not found or EMA not initialized.")
 
-                if (
-                    self.extra_generator_modules
-                    and hasattr(self.model, "action_projection")
-                    and "action_projection" in checkpoint
-                ):
-                    if self.is_main_process:
-                        print("Loading action modulation projection weights from checkpoint")
-                    self.model.action_projection.load_state_dict(checkpoint["action_projection"])
-                elif self.extra_generator_modules and self.is_main_process:
-                    print("Warning: Action projection weights not found in checkpoint; reinitializing module.")
+                if getattr(self.model, "action_projection", None) is not None:
+                    expects_projection = (
+                        "step" in checkpoint
+                        or "generator_optimizer" in checkpoint
+                        or "critic_optimizer" in checkpoint
+                    )
+                    if "action_projection" not in checkpoint:
+                        if expects_projection:
+                            raise RuntimeError(
+                                "Checkpoint is missing 'action_projection' weights required for action-conditioned training."
+                            )
+                        elif self.is_main_process:
+                            print("No action projection weights in checkpoint; starting from freshly initialized module.")
+                    else:
+                        if self.is_main_process:
+                            print("Loading action modulation projection weights from checkpoint")
+                        cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+                        with FSDP.state_dict_type(
+                            self.model.action_projection,
+                            StateDictType.FULL_STATE_DICT,
+                            cfg,
+                        ):
+                            self.model.action_projection.load_state_dict(checkpoint["action_projection"], strict=True)
                 
                 # For auto resume, always resume full training state
                 # Load optimizers
@@ -754,10 +767,16 @@ class Trainer:
                 if (
                     self.generator_aux_optimizer is not None
                     and "action_optimizer" in checkpoint
+                    and getattr(self.model, "action_projection", None) is not None
                 ):
                     if self.is_main_process:
                         print("Resuming action modulation optimizer...")
-                    self.generator_aux_optimizer.load_state_dict(checkpoint["action_optimizer"])
+                    action_osd = FSDP.optim_state_dict_to_load(
+                        self.model.action_projection,
+                        self.generator_aux_optimizer,
+                        checkpoint["action_optimizer"],
+                    )
+                    self.generator_aux_optimizer.load_state_dict(action_osd)
                 elif self.generator_aux_optimizer is not None and self.is_main_process:
                     print("Warning: Action modulation optimizer state not found in checkpoint.")
                 
@@ -931,7 +950,7 @@ class Trainer:
         action_dim_cfg = getattr(
             config,
             "latent_action_action_dim",
-            getattr(config, "action_dim", getattr(config, "raw_action_dim", 2)),
+            getattr(config, "raw_action_dim", getattr(config, "action_dim", 2)),
         )
         in_channels_cfg = getattr(config, "latent_action_in_channels", None)
 
@@ -1303,10 +1322,25 @@ class Trainer:
                     "step": self.step,
                 }
 
-            if hasattr(self.model, "action_projection") and self.extra_generator_modules:
-                state_dict["action_projection"] = self.model.action_projection.state_dict()
-            if self.generator_aux_optimizer is not None:
-                state_dict["action_optimizer"] = self.generator_aux_optimizer.state_dict()
+            action_opim_state_dict: dict[str, object] = {}
+            if (
+                getattr(self.model, "action_projection", None) is not None
+                and self.generator_aux_optimizer is not None
+            ):
+                self._ensure_fsdp_idle(self.model.action_projection, module_name="action_projection")
+                full_action_optim = FSDP.full_optim_state_dict(
+                    self.model.action_projection,
+                    self.generator_aux_optimizer,
+                    rank0_only=True,
+                )
+                if self.is_main_process and full_action_optim is not None:
+                    action_opim_state_dict = full_action_optim
+                if not self.is_main_process:
+                    action_opim_state_dict = {}
+                state_dict["action_projection"] = fsdp_state_dict(self.model.action_projection)
+                state_dict["action_optimizer"] = action_opim_state_dict
+            elif getattr(self.model, "action_projection", None) is not None:
+                state_dict["action_projection"] = fsdp_state_dict(self.model.action_projection)
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
@@ -1407,7 +1441,11 @@ class Trainer:
                 actions = actions.to(self.device, dtype=torch.float32)
             else:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'mse_dmd_lam', 'mse_dmd_lam_action') and actions is None:
+        if (
+            self._action_patch_enabled
+            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'mse_dmd_lam', 'mse_dmd_lam_action')
+            and actions is None
+        ):
             raise ValueError('Batch is missing action annotations required for action-guided training.')
 
         image_or_video_shape = list(self.config.image_or_video_shape)
@@ -1442,7 +1480,7 @@ class Trainer:
             )
             if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
                 generator_kwargs['real_latents'] = real_latents
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['actions'] = actions
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
@@ -1498,7 +1536,7 @@ class Trainer:
         )
         if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
             critic_kwargs['real_latents'] = real_latents
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['actions'] = actions
         if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['clean_latent'] = real_latents
@@ -2353,12 +2391,18 @@ class Trainer:
                 text_encoder=self.model.text_encoder,
                 vae=self.model.vae)
         else:
+            if self._action_patch_enabled and getattr(self.model, "action_projection", None) is None:
+                raise RuntimeError(
+                    "Action projection weights are missing; load a checkpoint that includes 'action_projection' before visualization."
+                )
             self.vis_pipeline = ActionCausalInferencePipeline(
                 args=self.config,
                 device=self.device,
                 generator=self.model.generator,
                 text_encoder=self.model.text_encoder,
-                vae=self.model.vae)
+                vae=self.model.vae,
+                action_projection=getattr(self.model, "action_projection", None),
+            )
 
         # Visualization output directory (default: <logdir>/vis)
         self.vis_output_dir = os.path.join(os.path.dirname(self.output_path), "vis")

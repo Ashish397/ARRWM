@@ -101,7 +101,7 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         if latent_shape is not None and len(latent_shape) >= 3:
             latent_channels = int(latent_shape[2])
         self.latent_feature_dim = latent_channels
-        self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
+        self.action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
 
 
@@ -330,7 +330,8 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         unconditional_dict: dict,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
+        denoised_timestep_to: int = 0,
+        actions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -346,6 +347,20 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         original_latent = image_or_video
 
         batch_size, num_frame = image_or_video.shape[:2]
+        cond_with_action = self._with_action_conditioning(
+            conditional_dict,
+            actions,
+            num_frame,
+            image_or_video.device,
+            image_or_video.dtype,
+        )
+        uncond_with_action = self._with_action_conditioning(
+            unconditional_dict,
+            actions,
+            num_frame,
+            image_or_video.device,
+            image_or_video.dtype,
+        )
 
         with torch.no_grad():
             # Step 1: Randomly sample timestep based on the given schedule and corresponding noise
@@ -379,16 +394,16 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
                 noisy_image_or_video=noisy_latent,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
-                conditional_dict=conditional_dict,
-                unconditional_dict=unconditional_dict
+                conditional_dict=cond_with_action,
+                unconditional_dict=uncond_with_action
             )
 
-        target_latent = (original_latent.double() - grad.double()).detach()
-        dmd_loss = 0.5 * self._motion_weighted_mse(
-            pred=original_latent.double(),
-            target=target_latent,
-            gradient_mask=gradient_mask,
-        )
+        if gradient_mask is not None:
+            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
+            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
+        else:
+            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
+            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
         return dmd_loss, dmd_log_dict
 
     def generator_loss(
@@ -427,7 +442,8 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
             unconditional_dict=unconditional_dict,
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
-            denoised_timestep_to=denoised_timestep_to
+            denoised_timestep_to=denoised_timestep_to,
+            actions=actions,
         )
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: After compute_distribution_matching_loss", device=self.device, rank=dist.get_rank())
@@ -460,9 +476,9 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
                 pred_for_mse = pred_image[:, :min_frames]
                 target_for_mse = mse_target[:, :min_frames]
 
-                mse_loss = self._motion_weighted_mse(
-                    pred=pred_for_mse.float(),
-                    target=target_for_mse.float(),
+                mse_loss = F.mse_loss(
+                    pred_for_mse.float(),
+                    target_for_mse.float()
                 )
                 weighted_mse_loss = mse_loss * self.generator_mse_loss_weight
                 total_loss = weighted_mse_loss if total_loss is None else total_loss + weighted_mse_loss
@@ -473,7 +489,14 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
 
         if self.gan_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch"):
             with self._freeze_fake_score_params():
-                logits_fake = self._classifier_logits(pred_image, conditional_dict)
+                cls_conditional = self._with_action_conditioning(
+                    conditional_dict,
+                    actions,
+                    pred_image.shape[1],
+                    pred_image.device,
+                    pred_image.dtype,
+                )
+                logits_fake = self._classifier_logits(pred_image, cls_conditional)
             gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
             total_loss = total_loss + gan_loss
             log_dict.update({
@@ -487,7 +510,14 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
             if actions is None:
                 raise ValueError("Actions tensor required for generator action regression loss.")
             with self._freeze_fake_score_params():
-                action_preds = self._regressor_preds(pred_image, conditional_dict)
+                rgs_conditional = self._with_action_conditioning(
+                    conditional_dict,
+                    actions,
+                    pred_image.shape[1],
+                    pred_image.device,
+                    pred_image.dtype,
+                )
+                action_preds = self._regressor_preds(pred_image, rgs_conditional)
             act_loss = F.l1_loss(action_preds, actions.to(device=pred_image.device, dtype=pred_image.dtype)) * self.action_loss_weight
             total_loss = total_loss + act_loss
             log_dict.update({
@@ -551,6 +581,13 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
             print(f"pred_image: {generated_image.shape}")
         gen_time = time.time() - _t_gen_start
         batch_size, num_frame = generated_image.shape[:2]
+        critic_conditional = self._with_action_conditioning(
+            conditional_dict,
+            actions,
+            num_frame,
+            generated_image.device,
+            generated_image.dtype,
+        )
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"Critic loss: After generator unroll", device=self.device, rank=dist.get_rank())
         _t_loss_start = time.time()
@@ -582,7 +619,7 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
 
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_generated_image,
-            conditional_dict=conditional_dict,
+            conditional_dict=critic_conditional,
             timestep=critic_timestep
         )
 
@@ -618,8 +655,15 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         gan_log_dict = {}
         if (self.cls_on_clean_image and self.guidance_cls_loss_weight > 0.0 and
                 real_latents is not None and hasattr(self.fake_score, "adding_cls_branch")):
-            real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), conditional_dict)
-            fake_logits = self._classifier_logits(generated_image.detach(), conditional_dict)
+            real_conditional = self._with_action_conditioning(
+                conditional_dict,
+                actions,
+                real_latents.shape[1],
+                real_latents.device,
+                real_latents.dtype,
+            )
+            real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), real_conditional)
+            fake_logits = self._classifier_logits(generated_image.detach(), critic_conditional)
             loss_real = F.softplus(-real_logits).mean()
             loss_fake = F.softplus(fake_logits).mean()
             cls_loss = (loss_real + loss_fake) * self.guidance_cls_loss_weight
@@ -641,7 +685,14 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
                 raise ValueError("Real latents required for critic action regression loss.")
             if actions is None:
                 raise ValueError("Actions tensor required for critic action regression loss.")
-            live_actions = self._regressor_preds(real_latents.to(self.device, dtype=torch.float32), conditional_dict)
+            real_conditional = self._with_action_conditioning(
+                conditional_dict,
+                actions,
+                real_latents.shape[1],
+                real_latents.device,
+                real_latents.dtype,
+            )
+            live_actions = self._regressor_preds(real_latents.to(self.device, dtype=torch.float32), real_conditional)
             rgs_loss = F.l1_loss(live_actions, actions.to(device=self.device, dtype=torch.float32)) * self.guidance_rgs_loss_weight
             action_log_dict = {
                 "critic_rgs_loss": rgs_loss.detach(),

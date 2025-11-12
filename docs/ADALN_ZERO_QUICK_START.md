@@ -138,7 +138,7 @@ def custom_action_processing(self, generated_frames, current_frame_idx, action_i
     
     # Example: Use external data
     frame_actions = action_inputs['action_sequence'][current_frame_idx]
-    return self.action_encoder(frame_actions)
+    return self.action_module(frame_actions)
 
 pipeline._process_action = custom_action_processing.__get__(
     pipeline, ActionCausalInferencePipeline
