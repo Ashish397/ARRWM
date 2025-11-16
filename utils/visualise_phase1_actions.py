@@ -248,6 +248,10 @@ def _load_generator_weights(
     prefer_ema: bool,
 ) -> None:
     ckpt = _load_checkpoint_with_storage_fallback(checkpoint_path, map_location="cpu")
+    print("--------------------------------")
+    for key in ckpt.keys():
+        print(key)
+    print("--------------------------------")
     gen_key = None
     if prefer_ema and "generator_ema" in ckpt:
         gen_key = "generator_ema"
@@ -272,8 +276,16 @@ def _load_generator_weights(
 
     if hasattr(pipeline, "action_projection") and pipeline.action_projection is not None:
         action_sd = ckpt.get("action_projection")
-        if isinstance(action_sd, dict):
-            pipeline.action_projection.load_state_dict(action_sd)
+        if action_sd is None:
+            raise KeyError(
+                "Checkpoint does not contain 'action_projection'; inference requires a checkpoint saved "
+                "after action-conditioned training was enabled."
+            )
+        if not isinstance(action_sd, dict):
+            raise TypeError(
+                f"Unexpected state dict type for key 'action_projection' in {checkpoint_path}"
+            )
+        pipeline.action_projection.load_state_dict(action_sd)
 
 
 def _resolve_roots(config: OmegaConf, split: str) -> tuple[Optional[Path], Path]:

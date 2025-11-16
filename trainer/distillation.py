@@ -1254,6 +1254,10 @@ class Trainer:
                 }
 
         action_proj_module = getattr(self.model, "action_projection", None)
+        if getattr(self.model, "_action_patch_enabled", False) and action_proj_module is None:
+            raise RuntimeError(
+                "Action-conditioned training is enabled but action_projection is missing at checkpoint save time."
+            )
         if action_proj_module is not None:
             state_dict["action_projection"] = action_proj_module.state_dict()
 
