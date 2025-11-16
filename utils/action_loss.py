@@ -1,19 +1,10 @@
-"""
-Action faithfulness loss using pre-trained latent action model.
-
-This module loads a pre-trained Action3DCNN model that predicts actions from 8-frame
-windows of latent frames. It provides a function to compute the MAE between predicted
-actions and ground truth actions across sliding windows of generated frames.
-"""
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
 
-
-# Hardcoded path to the pre-trained latent action model
-LATENT_ACTION_MODEL_PATH = "/projects/u5as/frodobots_lam/latent_actions/checkpoints/1442126/best/input_actions_best.pt"
 
 # Constants from the latent action training
 WINDOW_SIZE = 8
@@ -66,44 +57,33 @@ class LatentActionLoss:
     then compute MAE against the ground truth actions.
     """
     
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, model_path: Optional[str] = None):
         self.device = device
+        if not model_path:
+            raise ValueError("Latent action model path is not set.")
         self.model = None
+        self.model_path = str(Path(model_path).expanduser())
         self._load_model()
     
     def _load_model(self):
         """Load the pre-trained latent action model."""
-        try:
-            print(f"[ActionLoss] Loading latent action model from {LATENT_ACTION_MODEL_PATH}")
-            
-            checkpoint = torch.load(LATENT_ACTION_MODEL_PATH, map_location="cpu")
-            
-            # Extract model parameters from checkpoint
-            in_channels = checkpoint.get("input_channels", 16)
-            action_dim = checkpoint.get("action_dim", 2)
-            hidden_dims = tuple(checkpoint.get("hidden_dims", [256, 128]))
-            
-            # Create and load the model
-            self.model = Action3DCNN(
-                in_channels=in_channels,
-                action_dim=action_dim,
-                hidden_dims=hidden_dims,
-                dropout=0.0
-            )
-            self.model.load_state_dict(checkpoint["model_state"])
-            self.model.to(self.device)
-            self.model.eval()
-            
-            # Freeze all parameters
-            for param in self.model.parameters():
-                param.requires_grad = False
-            
-            print(f"[ActionLoss] Successfully loaded latent action model (in_channels={in_channels}, action_dim={action_dim})")
-        
-        except Exception as e:
-            print(f"[ActionLoss] Warning: Failed to load latent action model: {e}")
-            print("[ActionLoss] Action faithfulness metric will be disabled.")
-            self.model = None
+        print(f"[ActionLoss] Loading latent action model from {self.model_path}")
+        checkpoint = torch.load(self.model_path, map_location="cpu")
+        in_channels = checkpoint.get("input_channels", 16)
+        action_dim = checkpoint.get("action_dim", 2)
+        hidden_dims = tuple(checkpoint.get("hidden_dims", [256, 128]))
+        self.model = Action3DCNN(
+            in_channels=in_channels,
+            action_dim=action_dim,
+            hidden_dims=hidden_dims,
+            dropout=0.0
+        )
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.to(self.device)
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+        print(f"[ActionLoss] Successfully loaded latent action model (in_channels={in_channels}, action_dim={action_dim})")
     
     def compute_loss(
         self,
@@ -156,7 +136,6 @@ class LatentActionLoss:
         if not predicted_actions_list:
             return torch.tensor(0.0, device=self.device), {}
         
-        # Stack all predictions and ground truth
         predicted_actions = torch.stack(predicted_actions_list, dim=1)  # [B, num_windows, action_dim]
         gt_actions_stacked = torch.stack(gt_actions_list, dim=1)  # [B, num_windows, action_dim]
         
@@ -172,21 +151,27 @@ class LatentActionLoss:
 
 
 # Global instance (lazy initialized)
-_global_action_loss_instance = None
+_global_action_loss_instances: Dict[Tuple[str, str], LatentActionLoss] = {}
 
 
-def get_action_loss_instance(device: torch.device) -> LatentActionLoss:
+def get_action_loss_instance(device: torch.device, model_path: Optional[str] = None) -> LatentActionLoss:
     """Get or create the global action loss instance."""
-    global _global_action_loss_instance
-    if _global_action_loss_instance is None:
-        _global_action_loss_instance = LatentActionLoss(device)
-    return _global_action_loss_instance
+    if not model_path:
+        raise ValueError("Latent action model path is not set.")
+    resolved_path = str(Path(model_path).expanduser())
+    key = (str(device), resolved_path)
+    instance = _global_action_loss_instances.get(key)
+    if instance is None:
+        instance = LatentActionLoss(device, model_path=resolved_path)
+        _global_action_loss_instances[key] = instance
+    return instance
 
 
 def compute_action_faithfulness_loss(
     pred_latents: torch.Tensor,
     gt_actions: Optional[torch.Tensor] = None,
     device: Optional[torch.device] = None,
+    model_path: Optional[str] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Convenience function to compute action faithfulness loss.
@@ -203,6 +188,5 @@ def compute_action_faithfulness_loss(
     if device is None:
         device = pred_latents.device
     
-    action_loss_fn = get_action_loss_instance(device)
+    action_loss_fn = get_action_loss_instance(device, model_path=model_path)
     return action_loss_fn.compute_loss(pred_latents, gt_actions)
-

@@ -169,7 +169,7 @@ class MSE_DMD(DMD):
         _t_gen_start = time.time()
         if DEBUG and dist.get_rank() == 0:
             print(f"generator_rollout")
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
@@ -226,5 +226,4 @@ class MSE_DMD(DMD):
             "latent_mse": latents_mse.detach(),
         })
         return total_loss, dmd_log_dict
-
 

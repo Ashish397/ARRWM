@@ -155,6 +155,7 @@ class VideoLatentCaptionDataset(Dataset):
         action_variant: str = "input",
         include_dir_substrings: Optional[list[str]] = None,
         include_actions: bool = True,
+        blacklist_path: Optional[str] = None,
     ):
         self.latent_root = Path(latent_root)
         self.caption_root = Path(caption_root)
@@ -162,6 +163,7 @@ class VideoLatentCaptionDataset(Dataset):
         self.text_pre_encoded = text_pre_encoded
         self.encoded_suffix = encoded_suffix
         self.include_actions = include_actions
+        self.blacklist_path = Path(blacklist_path) if blacklist_path else None
 
         if not self.latent_root.exists():
             raise FileNotFoundError(f"Latent root does not exist: {latent_root}")
@@ -180,6 +182,9 @@ class VideoLatentCaptionDataset(Dataset):
         self._action_cache: dict[Path, tuple[torch.Tensor, torch.Tensor]] = {}
         self._action_value_keys: Optional[tuple[str, ...]] = None
         self._short_action_warned: set[Path] = set()
+        self._blacklisted_dirs: set[Path] = set()
+        if self.blacklist_path is not None:
+            self._load_blacklist(self.blacklist_path)
 
         latent_map = self._index_latents(self.latent_root)
         encoded_map = self._index_unique(
@@ -224,6 +229,9 @@ class VideoLatentCaptionDataset(Dataset):
             set(latent_map) | set(encoded_map) | set(raw_map) | set(actions_map)
         )
         for rel_dir in all_dirs:
+            if self._is_dir_blacklisted(rel_dir):
+                print(f"{rel_dir}: blacklisted, skipping directory")
+                continue
             latent_paths = latent_map.get(rel_dir, [])
             if not latent_paths:
                 print(f"{rel_dir}: video doesn't exist, skipping")
@@ -312,6 +320,37 @@ class VideoLatentCaptionDataset(Dataset):
                 raise RuntimeError(f"Multiple {description} found for {rel_dir}")
             matches[rel_dir] = path
         return matches
+
+    def _load_blacklist(self, blacklist_file: Path) -> None:
+        if not blacklist_file.is_file():
+            raise FileNotFoundError(f"Blacklist file not found: {blacklist_file}")
+
+        dirs: set[Path] = set()
+
+        with blacklist_file.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # allow inline comments after '#'
+                if "#" in line:
+                    line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+
+                entry = line.split(":", 1)[0].strip()
+                if not entry:
+                    continue
+
+                path = Path(entry)
+                rel_path = self._relativize_latent_path(path)
+
+                if rel_path.suffix == ".pt":
+                    rel_path = rel_path.parent
+
+                dirs.add(rel_path)
+
+        self._blacklisted_dirs = dirs
 
     def _build_encoded_sample(
         self,
@@ -429,87 +468,69 @@ class VideoLatentCaptionDataset(Dataset):
         self._action_cache[actions_path] = (frame_tensor, value_tensor)
         return frame_tensor, value_tensor
 
+    def _relativize_latent_path(self, path: Path) -> Path:
+        try:
+            return path.relative_to(self.latent_root)
+        except ValueError:
+            return path
+
+    def _is_dir_blacklisted(self, rel_dir: Path) -> bool:
+        return rel_dir in self._blacklisted_dirs
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
+
+        #load latent
         latents = torch.load(sample.latent_path, map_location="cpu")[0]
+
         if not isinstance(latents, torch.Tensor) or latents.ndim != 4:
             raise ValueError(f"Unexpected latent format at {sample.latent_path}")
         if latents.shape[0] == 0:
             raise ValueError(f"Latent sequence empty: {sample.latent_path}")
 
-        total = latents.shape[0]
-        repeat = 0
-        if total >= self.num_frames:
-            start_max = total - self.num_frames
-            start = random.randint(0, start_max) if start_max > 0 else 0
-            end = start + self.num_frames
-        else:
-            start = 0
-            end = total
-            repeat = self.num_frames - total
-
-        latents = latents[start:end]
-        if repeat:
-            latents = torch.cat(
-                [latents, latents[-1:].repeat(repeat, 1, 1, 1)],
-                dim=0,
-            )
-
-        latents = latents.contiguous().float()
-        prompt_text = sample.prompt_text or ""
-        sample_dict = {
-            "idx": idx,
-            "prompts": prompt_text,
-            "real_latents": latents,
-        }
-
         if self.include_actions:
+            #load actions
             actions_path = sample.actions_path
             if actions_path is None:
                 raise RuntimeError("Actions path missing for sample.")
 
             action_frames, action_values = self._load_actions_tensor(actions_path)
-            available = action_values.shape[0]
-            desired = end - start
-            shortfall = 0
-            if start >= available:
-                shortfall = desired
-                base_frame = action_frames[-1:]
-                base_value = action_values[-1:]
-                action_frames = base_frame.repeat(desired)
-                action_values = base_value.repeat(desired, 1)
-            else:
-                slice_end = min(end, available)
-                action_frames = action_frames[start:slice_end]
-                action_values = action_values[start:slice_end]
-                shortfall = desired - action_values.shape[0]
-                if shortfall > 0:
-                    pad_frames = action_frames[-1:].repeat(shortfall)
-                    pad_values = action_values[-1:].repeat(shortfall, 1)
-                    action_frames = torch.cat([action_frames, pad_frames], dim=0)
-                    action_values = torch.cat([action_values, pad_values], dim=0)
 
-            if shortfall > 0 and actions_path not in self._short_action_warned:
-                print(
-                    f"{actions_path}: actions shorter than video, repeating last action for {shortfall} frames"
-                )
-                self._short_action_warned.add(actions_path)
+            total = min(latents.shape[0], action_frames.shape[0])
+        else:
+            total = latents.shape[0]
 
-            if repeat:
-                action_frames = torch.cat(
-                    [action_frames, action_frames[-1:].repeat(repeat)],
-                    dim=0,
-                )
-                action_values = torch.cat(
-                    [action_values, action_values[-1:].repeat(repeat, 1)],
-                    dim=0,
-                )
+        if total >= self.num_frames:
+            start_max = total - self.num_frames
+            start = random.randint(0, start_max) if start_max > 0 else 0
+            end = start + self.num_frames
+        else:
+            raise RuntimeError("Not enough frames in the sample.")
 
-            sample_dict["action_frames"] = action_frames.clone()
-            sample_dict["actions"] = action_values.clone()
+        latents = latents[start:end]
+        latents = latents.contiguous().float()
+        prompt_text = sample.prompt_text or ""
+
+        if self.include_actions:
+            action_frames = action_frames[start:end]
+            action_values = action_values[start:end]
+
+            sample_dict = {
+                "idx": idx,
+                "prompts": prompt_text,
+                "real_latents": latents,
+                "action_frames": action_frames.clone(),
+                "actions": action_values.clone(),
+            }
+        else:
+            sample_dict = {
+                "idx": idx,
+                "prompts": prompt_text,
+                "real_latents": latents,
+            }
 
         if sample.encoded_path is not None:
             try:

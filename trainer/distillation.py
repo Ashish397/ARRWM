@@ -7,9 +7,12 @@ import math
 import re
 from pathlib import Path
 import json
+from typing import Optional
+
+from contextlib import nullcontext
 
 from utils.dataset import TextDataset, TwoTextDataset, VideoLatentCaptionDataset, cycle
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from utils.distributed import EMA_FSDP, fsdp_wrap, launch_distributed_job
 from utils.misc import (
     set_seed,
     merge_dict_list
@@ -75,6 +78,16 @@ class Trainer:
         launch_distributed_job()
         global_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        configured_total_batch = getattr(config, "total_batch_size", None)
+        micro_batch = config.batch_size * getattr(config, "gradient_accumulation_steps", 1)
+        if configured_total_batch is not None:
+            actual_total_batch = micro_batch * self.world_size
+            if actual_total_batch != configured_total_batch:
+                raise RuntimeError(
+                    f"Global batch size mismatch: config.total_batch_size={configured_total_batch} "
+                    f"but effective batch={actual_total_batch} (batch_size={config.batch_size}, "
+                    f"grad_accum={getattr(config, 'gradient_accumulation_steps', 1)}, world_size={self.world_size})."
+                )
 
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
@@ -166,8 +179,6 @@ class Trainer:
             self.model = DMD2RealMSE(config, device=self.device)
         elif config.distribution_loss == "dmd2realmselam":
             self.model = DMD2RealMSELAM(config, device=self.device)
-        elif config.distribution_loss == "dmd2realmselam_actions":
-            self.model = DMD2RealMSELAM_Actions(config, device=self.device)
         elif config.distribution_loss == "mse_dmd":
             self.model = MSE_DMD(config, device=self.device)
         elif config.distribution_loss == "mse_dmd_lam":
@@ -260,19 +271,9 @@ class Trainer:
                     print(f"Loading base model from {base_checkpoint_path} (before applying LoRA)")
                 base_checkpoint = torch.load(base_checkpoint_path, map_location="cpu")
                 
-                # Load generator (directly; no key alignment needed since LoRA not applied yet)
-                if "generator" in base_checkpoint:
-                    if self.is_main_process:
-                        print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    result = self.model.generator.load_state_dict(base_checkpoint["generator"], strict=True)
-                    if self.is_main_process:
-                        print("Generator weights loaded successfully")
-                elif "model" in base_checkpoint:
-                    if self.is_main_process:
-                        print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    result = self.model.generator.load_state_dict(base_checkpoint["model"], strict=True)
-                    if self.is_main_process:
-                        print("Generator weights loaded successfully")
+                generator_state = base_checkpoint.get("generator") or base_checkpoint.get("model")
+                if generator_state is not None:
+                    self._load_generator_checkpoint(generator_state, source=base_checkpoint_path)
                 else:
                     if self.is_main_process:
                         print("Warning: Generator checkpoint not found in base model.")
@@ -481,21 +482,8 @@ class Trainer:
         self.model.vae = self.model.vae.to(
             device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
-        if getattr(self.model, "action_projection", None) is not None:
-            self.model.action_projection = fsdp_wrap(
-                self.model.action_projection,
-                sharding_strategy=config.sharding_strategy,
-                mixed_precision=config.mixed_precision,
-                wrap_strategy="size",
-                min_num_params=1,
-            )
-
         # Lazily initialize the action-conditioned pipeline now that FSDP wrapping is complete.
         self.model._initialize_inference_pipeline()
-
-        self.extra_generator_modules: list[nn.Module] = []
-        if getattr(self.model, "action_projection", None) is not None:
-            self.extra_generator_modules.append(self.model.action_projection)
 
         # if not config.no_visualize or config.load_raw_video:
         #     print("Moving vae to device 2, self.device: ", self.device)
@@ -534,24 +522,16 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_optimizer_init_start()
 
+        generator_params: list[torch.nn.Parameter] = [
+            param for param in self.model.generator.parameters() if param.requires_grad
+        ]
+
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters() if param.requires_grad],
+            generator_params,
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
-
-        extra_param_list = []
-        for module in self.extra_generator_modules:
-            extra_param_list.extend(
-                param for param in module.parameters() if param.requires_grad
-            )
-        self.generator_aux_optimizer = torch.optim.AdamW(
-            extra_param_list,
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            weight_decay=config.weight_decay,
-        ) if extra_param_list else None
 
         critic_params = [param for param in self.model.fake_score.parameters()
                          if param.requires_grad]
@@ -577,6 +557,8 @@ class Trainer:
         # Step 5: Initialize the dataloader
         if self.one_logger is not None:
             self.one_logger.on_dataloader_init_start()
+        blacklist_path = getattr(config, "data_blacklist_path", None)
+
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
@@ -588,6 +570,7 @@ class Trainer:
                 num_frames=getattr(config, "num_training_frames", 21),
                 text_pre_encoded=self.text_pre_encoded,
                 include_actions=self._action_patch_enabled,
+                blacklist_path=blacklist_path,
             )
         else:
             dataset = TextDataset(config.data_path)
@@ -624,6 +607,7 @@ class Trainer:
                     num_frames=getattr(config, "num_training_frames", 21),
                     text_pre_encoded=self.text_pre_encoded,
                     include_actions=self._action_patch_enabled,
+                    blacklist_path=blacklist_path,
                 )
             else:
                 val_dataset = TextDataset(val_data_path)
@@ -695,14 +679,9 @@ class Trainer:
                 checkpoint = torch.load(checkpoint_path, map_location="cpu")
                 
                 # Load generator
-                if "generator" in checkpoint:
-                    if self.is_main_process:
-                        print(f"Loading pretrained generator from {checkpoint_path}")
-                    self.model.generator.load_state_dict(checkpoint["generator"], strict=True)
-                elif "model" in checkpoint:
-                    if self.is_main_process:
-                        print(f"Loading pretrained generator from {checkpoint_path}")
-                    self.model.generator.load_state_dict(checkpoint["model"], strict=True)
+                generator_state = checkpoint.get("generator") or checkpoint.get("model")
+                if generator_state is not None:
+                    self._load_generator_checkpoint(generator_state, source=checkpoint_path)
                 else:
                     if self.is_main_process:
                         print("Warning: Generator checkpoint not found.")
@@ -731,23 +710,36 @@ class Trainer:
                         or "generator_optimizer" in checkpoint
                         or "critic_optimizer" in checkpoint
                     )
-                    if "action_projection" not in checkpoint:
-                        if expects_projection:
+                    action_projection_state = checkpoint.get("action_projection")
+                    generator_state = checkpoint.get("generator") or checkpoint.get("model")
+                    has_proj_in_generator = False
+                    if isinstance(generator_state, dict):
+                        has_proj_in_generator = any(
+                            "action_projection" in key for key in generator_state.keys()
+                        )
+
+                    if action_projection_state is None:
+                        if not has_proj_in_generator and expects_projection:
                             raise RuntimeError(
                                 "Checkpoint is missing 'action_projection' weights required for action-conditioned training."
                             )
-                        elif self.is_main_process:
+                        elif not has_proj_in_generator and self.is_main_process:
                             print("No action projection weights in checkpoint; starting from freshly initialized module.")
                     else:
                         if self.is_main_process:
-                            print("Loading action modulation projection weights from checkpoint")
-                        cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-                        with FSDP.state_dict_type(
-                            self.model.action_projection,
-                            StateDictType.FULL_STATE_DICT,
-                            cfg,
-                        ):
-                            self.model.action_projection.load_state_dict(checkpoint["action_projection"], strict=True)
+                            print("Loading action modulation projection weights from legacy checkpoint format")
+                        target_module = self.model.generator
+                        context = nullcontext()
+                        if isinstance(target_module, FSDP):
+                            context = FSDP.summon_full_params(target_module, writeback=True)
+                            target = target_module.module
+                        else:
+                            target = target_module
+                        target = getattr(target, "action_projection", None)
+                        if target is None:
+                            raise RuntimeError("Action projection module not initialized.")
+                        with context:
+                            target.load_state_dict(action_projection_state, strict=True)
                 
                 # For auto resume, always resume full training state
                 # Load optimizers
@@ -764,22 +756,6 @@ class Trainer:
                     if self.is_main_process:
                         print("Warning: Generator optimizer checkpoint not found.")
 
-                if (
-                    self.generator_aux_optimizer is not None
-                    and "action_optimizer" in checkpoint
-                    and getattr(self.model, "action_projection", None) is not None
-                ):
-                    if self.is_main_process:
-                        print("Resuming action modulation optimizer...")
-                    action_osd = FSDP.optim_state_dict_to_load(
-                        self.model.action_projection,
-                        self.generator_aux_optimizer,
-                        checkpoint["action_optimizer"],
-                    )
-                    self.generator_aux_optimizer.load_state_dict(action_osd)
-                elif self.generator_aux_optimizer is not None and self.is_main_process:
-                    print("Warning: Action modulation optimizer state not found in checkpoint.")
-                
                 if "critic_optimizer" in checkpoint:
                     if self.is_main_process:
                         print("Resuming critic optimizer...")
@@ -864,18 +840,6 @@ class Trainer:
         if hasattr(self.model, "gan_loss_weight"):
             self.model.gan_loss_weight = self._gan_weight_start
 
-        # GAN loss weight schedule (linear). "decay" represents the total change applied across training.
-        self._latent_action_loss_weight_start = float(getattr(self.config, "latent_action_loss_weight", 0.0))
-        latent_action_decay = getattr(self.config, "latent_action_loss_weight_decay", None)
-        if latent_action_decay is None:
-            self._latent_action_loss_weight_end = self._latent_action_loss_weight_start
-        else:
-            self._latent_action_loss_weight_end = self._latent_action_loss_weight_start - float(latent_action_decay)
-        self._latent_action_loss_weight_end = max(0.0, self._latent_action_loss_weight_end)
-        self._latent_action_schedule_enabled = abs(self._latent_action_loss_weight_end - self._latent_action_loss_weight_start) > 1e-8
-        if hasattr(self.model, "latent_action_loss_weight"):
-            self.model.latent_action_loss_weight = self._latent_action_loss_weight_start
-
         # Action loss weight schedule (linear). "decay" represents the total change applied across training.
         self._action_loss_weight_start = float(getattr(self.config, "action_loss_weight", 0.0))
         action_decay = getattr(self.config, "action_loss_weight_decay", None)
@@ -934,16 +898,12 @@ class Trainer:
             weight = self._gan_weight_start + (self._gan_weight_end - self._gan_weight_start) * progress
             self.model.gan_loss_weight = weight
 
-        if self._latent_action_schedule_enabled and hasattr(self.model, "latent_action_loss_weight"):
-            weight = self._latent_action_loss_weight_start + (self._latent_action_loss_weight_end - self._latent_action_loss_weight_start) * progress
-            self.model.latent_action_loss_weight = weight
-
         if self._action_schedule_enabled and hasattr(self.model, "action_loss_weight"):
             weight = self._action_loss_weight_start + (self._action_loss_weight_end - self._action_loss_weight_start) * progress
             self.model.action_loss_weight = weight
 
     def _build_latent_action_model(self, config):
-        checkpoint_path = getattr(config, "latent_action_checkpoint", None)
+        checkpoint_path_cfg = getattr(config, "latent_action_checkpoint", None)
         dropout = float(getattr(config, "latent_action_dropout", 0.0))
         hidden_dims_cfg = getattr(config, "latent_action_hidden_dims", (256, 128))
         hidden_dims = list(hidden_dims_cfg) if hidden_dims_cfg else []
@@ -954,14 +914,11 @@ class Trainer:
         )
         in_channels_cfg = getattr(config, "latent_action_in_channels", None)
 
-        default_checkpoint = Path("/projects/u5as/frodobots_lam/latent_actions/checkpoints/1442126/best/input_actions_best.pt")
-        if not checkpoint_path:
-            if default_checkpoint.exists():
-                checkpoint_path = str(default_checkpoint)
-                if self.is_main_process:
-                    print(f"[latent_action] Using default checkpoint: {checkpoint_path}")
-            else:
-                checkpoint_path = None
+        if not checkpoint_path_cfg:
+            raise ValueError("latent_action_checkpoint must be set in the config.")
+        checkpoint_path = Path(checkpoint_path_cfg).expanduser()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"latent_action_checkpoint not found: {checkpoint_path}")
 
         state_dict = None
         if checkpoint_path:
@@ -1155,57 +1112,15 @@ class Trainer:
             raise ValueError(f"Invalid switch_mode: {getattr(self.config, 'switch_mode', 'fixed')}")
         return switch_idx
 
-    def _warn_if_no_generator_grads(self, core_has_grad: bool, aux_has_grad: bool) -> None:
-        if (core_has_grad or aux_has_grad) or not self.is_main_process:
+    def _warn_if_no_generator_grads(self, has_grad: bool) -> None:
+        if has_grad or not self.is_main_process:
             return
         if self.step not in self._zero_grad_reported_steps:
             print(
                 f"[Warning] Generator backward at logical step {self.step} produced no gradients; "
-                f"action modulation may be the only component receiving updates."
+                f"generator parameters received no updates."
             )
             self._zero_grad_reported_steps.add(self.step)
-
-    def _clip_auxiliary_grad_norm(self, max_norm: float, core_norm: torch.Tensor) -> torch.Tensor:
-        if not self.extra_generator_modules:
-            return torch.zeros((), device=self.device, dtype=core_norm.dtype)
-
-        params: list[torch.Tensor] = []
-        for module in self.extra_generator_modules:
-            for param in module.parameters():
-                if param.grad is not None:
-                    params.append(param)
-
-        if not params:
-            return torch.zeros((), device=self.device, dtype=core_norm.dtype)
-
-        grad_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
-        for param in params:
-            grad_sq += torch.sum(param.grad.detach().float() ** 2)
-        if dist.is_initialized():
-            dist.all_reduce(grad_sq, op=dist.ReduceOp.SUM)
-
-        grad_sq = grad_sq.clamp_min(0.0)
-        aux_norm = torch.sqrt(grad_sq).squeeze(0)
-        if not torch.isfinite(aux_norm):
-            aux_norm = torch.zeros((), device=self.device, dtype=torch.float32)
-
-        if max_norm is not None and max_norm > 0 and torch.isfinite(aux_norm):
-            core_val = float(core_norm.detach().float().cpu())
-            max_norm_sq = max_norm * max_norm
-            residual_sq = max_norm_sq - min(core_val * core_val, max_norm_sq)
-            if residual_sq <= 0.0:
-                for param in params:
-                    param.grad.zero_()
-                return aux_norm.new_zeros(())
-            residual = math.sqrt(residual_sq)
-            aux_val = float(aux_norm.cpu())
-            if aux_val > residual:
-                scale = residual / (aux_val + 1e-6)
-                for param in params:
-                    param.grad.mul_(scale)
-                aux_norm = aux_norm.new_tensor(residual)
-
-        return aux_norm.to(device=self.device, dtype=core_norm.dtype)
 
     def _ensure_fsdp_idle(self, module: torch.nn.Module, module_name: str = "module") -> None:
         if not isinstance(module, FSDP):
@@ -1227,6 +1142,28 @@ class Trainer:
                 reset_handle += 1
         if self.is_main_process and (reset_state or reset_handle):
             print(f"[FSDP:{module_name}] Reset {reset_state} module states and {reset_handle} handles to IDLE prior to checkpointing.")
+
+    def _load_generator_checkpoint(
+        self,
+        state_dict: Optional[dict[str, torch.Tensor]],
+        *,
+        source: str = "checkpoint",
+    ) -> None:
+        if state_dict is None:
+            return
+        if self.is_main_process:
+            print(f"Loading pretrained generator from {source}")
+        has_action_proj = any("action_projection" in key for key in state_dict.keys())
+        requires_action_proj = getattr(self.model, "action_projection", None) is not None
+        strict_load = not (requires_action_proj and not has_action_proj)
+        if not strict_load and self.is_main_process:
+            print("Generator checkpoint missing action_projection weights; keeping freshly initialized projection.")
+        incompatible = self.model.generator.load_state_dict(state_dict, strict=strict_load)
+        if self.is_main_process:
+            if incompatible.missing_keys:
+                print(f"Generator load missing keys: {incompatible.missing_keys}")
+            if incompatible.unexpected_keys:
+                print(f"Generator load unexpected keys: {incompatible.unexpected_keys}")
 
 
     def save(self):
@@ -1321,26 +1258,6 @@ class Trainer:
                     "critic_optimizer": critic_opim_state_dict,
                     "step": self.step,
                 }
-
-            action_opim_state_dict: dict[str, object] = {}
-            if (
-                getattr(self.model, "action_projection", None) is not None
-                and self.generator_aux_optimizer is not None
-            ):
-                self._ensure_fsdp_idle(self.model.action_projection, module_name="action_projection")
-                full_action_optim = FSDP.full_optim_state_dict(
-                    self.model.action_projection,
-                    self.generator_aux_optimizer,
-                    rank0_only=True,
-                )
-                if self.is_main_process and full_action_optim is not None:
-                    action_opim_state_dict = full_action_optim
-                if not self.is_main_process:
-                    action_opim_state_dict = {}
-                state_dict["action_projection"] = fsdp_state_dict(self.model.action_projection)
-                state_dict["action_optimizer"] = action_opim_state_dict
-            elif getattr(self.model, "action_projection", None) is not None:
-                state_dict["action_projection"] = fsdp_state_dict(self.model.action_projection)
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
@@ -1509,16 +1426,7 @@ class Trainer:
             if LOG_GPU_MEMORY:
                 log_gpu_memory("After train_generator backward pass", device=self.device, rank=dist.get_rank())
             core_has_grad = any(param.grad is not None for param in self.model.generator.parameters())
-            aux_has_grad = False
-            if self.extra_generator_modules:
-                for module in self.extra_generator_modules:
-                    for param in module.parameters():
-                        if param.grad is not None:
-                            aux_has_grad = True
-                            break
-                    if aux_has_grad:
-                        break
-            self._warn_if_no_generator_grads(core_has_grad, aux_has_grad)
+            self._warn_if_no_generator_grads(core_has_grad)
             # Return original loss for logging
             generator_log_dict.update({"generator_loss": generator_loss,
                                        "generator_grad_norm": torch.tensor(0.0, device=self.device)})  # Will be computed after accumulation
@@ -1906,8 +1814,6 @@ class Trainer:
                     # Zero-out all optimizer gradients
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
-                        if self.generator_aux_optimizer is not None:
-                            self.generator_aux_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     
                     # Whole-cycle gradient accumulation loop
@@ -1940,26 +1846,17 @@ class Trainer:
                     # Compute grad norm and update parameters
                     if TRAIN_GENERATOR:
                         generator_core_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
-                        aux_norm = self._clip_auxiliary_grad_norm(self.max_grad_norm_generator, generator_core_norm)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
-                        core_val = generator_core_norm.detach().float()
-                        aux_val = aux_norm.detach().float()
-                        total_norm = torch.sqrt(core_val ** 2 + aux_val ** 2).to(device=self.device, dtype=generator_core_norm.dtype)
-                        generator_log_dict["generator_grad_norm"] = total_norm
-                        generator_log_dict["generator_core_grad_norm"] = generator_core_norm.detach()
-                        if self.extra_generator_modules:
-                            generator_log_dict["action_mod_grad_norm"] = aux_norm.detach()
+                        generator_grad_norm = generator_core_norm.detach()
+                        generator_log_dict["generator_grad_norm"] = generator_grad_norm
+                        generator_log_dict["generator_core_grad_norm"] = generator_grad_norm
 
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                            print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={total_norm.item()}")
+                            print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
 
-                        core_has_grad = core_val.item() > 0.0
-                        aux_has_grad = aux_val.item() > 0.0 if self.extra_generator_modules else False
-                        self._warn_if_no_generator_grads(core_has_grad, aux_has_grad)
+                        self._warn_if_no_generator_grads(generator_grad_norm.item() > 0.0)
 
                         self.generator_optimizer.step()
-                        if self.generator_aux_optimizer is not None:
-                            self.generator_aux_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -1991,8 +1888,6 @@ class Trainer:
                 else:
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
-                        if self.generator_aux_optimizer is not None:
-                            self.generator_aux_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     
                     # Whole-cycle gradient accumulation loop
@@ -2014,23 +1909,14 @@ class Trainer:
                     # Compute grad norm and update parameters
                     if TRAIN_GENERATOR:
                         generator_core_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
-                        aux_norm = self._clip_auxiliary_grad_norm(self.max_grad_norm_generator, generator_core_norm)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
-                        core_val = generator_core_norm.detach().float()
-                        aux_val = aux_norm.detach().float()
-                        total_norm = torch.sqrt(core_val ** 2 + aux_val ** 2).to(device=self.device, dtype=generator_core_norm.dtype)
-                        generator_log_dict["generator_grad_norm"] = total_norm
-                        generator_log_dict["generator_core_grad_norm"] = generator_core_norm.detach()
-                        if self.extra_generator_modules:
-                            generator_log_dict["action_mod_grad_norm"] = aux_norm.detach()
+                        generator_grad_norm = generator_core_norm.detach()
+                        generator_log_dict["generator_grad_norm"] = generator_grad_norm
+                        generator_log_dict["generator_core_grad_norm"] = generator_grad_norm
 
-                        core_has_grad = core_val.item() > 0.0
-                        aux_has_grad = aux_val.item() > 0.0 if self.extra_generator_modules else False
-                        self._warn_if_no_generator_grads(core_has_grad, aux_has_grad)
+                        self._warn_if_no_generator_grads(generator_grad_norm.item() > 0.0)
 
                         self.generator_optimizer.step()
-                        if self.generator_aux_optimizer is not None:
-                            self.generator_aux_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -2058,7 +1944,6 @@ class Trainer:
                     else:
                         if self.is_main_process:
                             print(f"EMA creation skipped at step {self.step} (disabled in LoRA mode)")
-
                 # Save the model
                 if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
                     torch.cuda.empty_cache()
@@ -2392,9 +2277,12 @@ class Trainer:
                 vae=self.model.vae)
         else:
             if self._action_patch_enabled and getattr(self.model, "action_projection", None) is None:
-                raise RuntimeError(
-                    "Action projection weights are missing; load a checkpoint that includes 'action_projection' before visualization."
-                )
+                if self.is_main_process:
+                    print(
+                        "[Visualizer] Action projection weights missing in checkpoint; "
+                        "reinitializing default projection for visualization."
+                    )
+                self.model._init_action_projection(self.model.args, self.device)
             self.vis_pipeline = ActionCausalInferencePipeline(
                 args=self.config,
                 device=self.device,

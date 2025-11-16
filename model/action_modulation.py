@@ -85,14 +85,12 @@ class ActionModulationProjection(nn.Module):
         num_frames = action_features.shape[1]
         
         # Flatten for processing
-        action_flat = action_features.flatten(0, 1)  # [B*F, action_dim]
-        
+        action_flat = action_features.flatten(0, 1)  # [B*F, action_dim]        
         # Embed action
-        action_emb = self.action_embedding(action_flat)  # [B*F, hidden_dim]
-        
+        action_emb = self.action_embedding(torch.tensor(action_flat, device='cuda'))  # [B*F, hidden_dim]
+
         # Project to modulation parameters
         modulation = self.action_projection(action_emb)  # [B*F, hidden_dim * 6]
-        
         # Reshape to [B, F, 6, hidden_dim]
         modulation = modulation.view(batch_size, num_frames, 6, self.hidden_dim)
         
@@ -188,4 +186,3 @@ def create_action_modulation_module(
         zero_init=zero_init,
     )
     return module.to(device)
-

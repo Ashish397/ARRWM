@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import time
 import math
 import torch.distributed as dist
@@ -9,6 +9,9 @@ from contextlib import contextmanager
 from model.dmd import DMD
 from utils.memory import log_gpu_memory
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY
+
+LATENT_ACTION_WINDOW = 8
+LATENT_ACTION_PRED_INDEX = 6
 
 
 class MSE_DMD_LAM_ACTION(DMD):
@@ -24,7 +27,6 @@ class MSE_DMD_LAM_ACTION(DMD):
         self.guidance_rgs_loss_weight = float(getattr(args, "guidance_rgs_loss_weight", self.action_loss_weight))
         self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
         self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
-        self.latent_action_loss_weight = float(getattr(args, "latent_action_loss_weight", 0.0))
         self.latent_action_model = latent_action_model
         if self.latent_action_model is not None:
             try:
@@ -292,7 +294,7 @@ class MSE_DMD_LAM_ACTION(DMD):
         conditional_dict: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         zero = torch.zeros((), device=latents.device, dtype=latents.dtype)
-        if self.latent_action_model is None or self.latent_action_loss_weight <= 0.0:
+        if self.latent_action_model is None or self.action_loss_weight <= 0.0:
             return zero, {}
 
         if actions is None:
@@ -311,95 +313,35 @@ class MSE_DMD_LAM_ACTION(DMD):
         model = self.latent_action_model
         assert model is not None, "latent_action_model should be non-null after guard."
 
-        def _call_latent_action_model(inputs: torch.Tensor) -> Any:
-            if inputs.dim() != 5:
-                raise ValueError(
-                    f"Latent action model expects 5D tensor [B, F, C, H, W], got shape {tuple(inputs.shape)}"
-                )
-            model_inputs = inputs.permute(0, 2, 1, 3, 4).contiguous()
-            attempt_kwargs = []
-            if actions_for_loss is not None and conditional_dict is not None:
-                attempt_kwargs.append({"actions": actions_for_loss, "conditional_dict": conditional_dict})
-            if conditional_dict is not None:
-                attempt_kwargs.append({"conditional_dict": conditional_dict})
-            if actions_for_loss is not None:
-                attempt_kwargs.append({"actions": actions_for_loss})
-            attempt_kwargs.append({})
+        num_frames = latents_for_model.shape[1]
+        if num_frames < LATENT_ACTION_WINDOW:
+            return zero, {}
 
-            last_error: Optional[Exception] = None
-            for kwargs in attempt_kwargs:
-                try:
-                    return model(model_inputs, **kwargs)
-                except TypeError as exc:
-                    last_error = exc
-                    continue
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError("Failed to invoke latent_action_model with supported signatures.")
+        num_windows = num_frames - LATENT_ACTION_WINDOW + 1
+        target_stop = LATENT_ACTION_PRED_INDEX + num_windows
+        if actions_for_loss.shape[1] < target_stop:
+            return zero, {}
 
-        def _loss_from_predictions(predictions: torch.Tensor) -> torch.Tensor:
-            nonlocal actions_for_loss
-            if actions_for_loss.dtype.is_floating_point:
-                if predictions.shape != actions_for_loss.shape:
-                    raise ValueError(
-                        f"Latent action model predictions shape {predictions.shape} does not match actions shape {actions_for_loss.shape}."
-                    )
-                return F.mse_loss(predictions.to(dtype=actions_for_loss.dtype), actions_for_loss, reduction="mean")
-
-            logits = predictions
-            num_classes = logits.shape[-1]
-            logits_flat = logits.reshape(-1, num_classes)
-            targets_flat = actions_for_loss.reshape(-1).long()
-            if logits_flat.shape[0] != targets_flat.shape[0]:
-                raise ValueError(
-                    "Latent action model logits and target sizes do not align for cross-entropy computation."
-                )
-            return F.cross_entropy(logits_flat, targets_flat)
-
+        windows = latents_for_model.unfold(dimension=1, size=LATENT_ACTION_WINDOW, step=1)
+        windows = windows.permute(0, 1, 3, 2, 4, 5).contiguous()
+        windows = windows.reshape(-1, windows.shape[2], windows.shape[3], windows.shape[4], windows.shape[5])
+        windows = windows.to(dtype=torch.float32)
         with self._freeze_module_params(self.latent_action_model):
-            outputs = _call_latent_action_model(latents_for_model)
+            model_outputs = model(windows)
+        model_outputs = model_outputs.view(latents.shape[0], num_windows, -1)
+        actions_for_loss = actions_for_loss[:, LATENT_ACTION_PRED_INDEX:target_stop].to(dtype=torch.float32)
 
-        base_loss: Optional[torch.Tensor] = None
-        log_updates: Dict[str, torch.Tensor] = {}
+        base_loss = F.l1_loss(
+            model_outputs.to(dtype=actions_for_loss.dtype),
+            actions_for_loss,
+            reduction="mean",
+        )
 
-        if isinstance(outputs, dict):
-            if "loss" in outputs:
-                base_loss = outputs["loss"].to(device=latents.device, dtype=latents.dtype)
-            elif "logits" in outputs:
-                base_loss = _loss_from_predictions(outputs["logits"].to(device=latents.device))
-            elif "predictions" in outputs:
-                base_loss = _loss_from_predictions(outputs["predictions"].to(device=latents.device))
-            for key, value in outputs.items():
-                if key == "loss":
-                    continue
-                if torch.is_tensor(value) and value.ndim == 0:
-                    log_updates[f"latent_action_{key}"] = value.detach()
-        elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
-            first = outputs[0]
-            if torch.is_tensor(first) and first.ndim == 0:
-                base_loss = first.to(device=latents.device, dtype=latents.dtype)
-            elif torch.is_tensor(first):
-                base_loss = _loss_from_predictions(first.to(device=latents.device))
-            if len(outputs) > 1 and isinstance(outputs[1], dict):
-                for key, value in outputs[1].items():
-                    if torch.is_tensor(value) and value.ndim == 0:
-                        log_updates[f"latent_action_{key}"] = value.detach()
-        elif torch.is_tensor(outputs):
-            if outputs.ndim == 0:
-                base_loss = outputs.to(device=latents.device, dtype=latents.dtype)
-            else:
-                base_loss = _loss_from_predictions(outputs.to(device=latents.device))
-        else:
-            raise TypeError("Unsupported latent_action_model output type for loss computation.")
-
-        if base_loss is None:
-            raise RuntimeError("Failed to derive latent action loss from latent_action_model output.")
-
-        weighted_loss = base_loss * self.latent_action_loss_weight
-        log_updates.update({
+        weighted_loss = base_loss * self.action_loss_weight
+        log_updates = {
             "latent_action_loss": weighted_loss.detach(),
             "latent_action_loss_raw": base_loss.detach(),
-        })
+        }
         return weighted_loss.to(dtype=latents.dtype), log_updates
 
     def generator_loss(
@@ -422,7 +364,7 @@ class MSE_DMD_LAM_ACTION(DMD):
         _t_gen_start = time.time()
         if DEBUG and dist.get_rank() == 0:
             print(f"generator_rollout")
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
@@ -520,7 +462,7 @@ class MSE_DMD_LAM_ACTION(DMD):
         with torch.no_grad():
             if DEBUG and dist.get_rank() == 0:
                 print(f"critic_rollout")
-            generated_image, _, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+            generated_image, _, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,

@@ -109,8 +109,16 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             action_features = action_inputs
 
         action_features = action_features.to(device=device, dtype=dtype)
+        if action_features.dim() == 1:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"[ActionPipeline] Detected 1-D action vector (len={action_features.shape[0]}). Expanding to batch=1.")
+            action_features = action_features.unsqueeze(0)
+
         if action_features.dim() == 2:
-            action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
+            # Treat a 2D tensor as an already-selected action for the current chunk.
+            # Do not broadcast it across frames; the downstream Wan patch will match
+            # the single-frame modulation to whichever timesteps are active.
+            action_features = action_features.unsqueeze(1)
         elif action_features.dim() == 3:
             action_features = action_features[:, frame_start:frame_start + num_frames]
         else:
@@ -120,6 +128,8 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             return None
 
         self._ensure_action_projection_dtype(device=device, dtype=dtype)
+        if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+            print(f"[ActionPipeline] Feeding action_features with shape {action_features.shape} into action_projection (num_frames={num_frames}).")
         modulation = self.action_projection(action_features, num_frames=num_frames)
         return modulation.to(device=device, dtype=dtype)
 

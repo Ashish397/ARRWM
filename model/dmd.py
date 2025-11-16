@@ -228,7 +228,7 @@ class DMD(SelfForcingModel):
         _t_gen_start = time.time()
         if DEBUG and dist.get_rank() == 0:
             print(f"generator_rollout")
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
@@ -299,7 +299,7 @@ class DMD(SelfForcingModel):
         with torch.no_grad():
             if DEBUG and dist.get_rank() == 0:
                 print(f"critic_rollout")
-            generated_image, _, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+            generated_image, _, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,

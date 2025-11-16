@@ -10,6 +10,7 @@ gan_loss_weight: 0.05
 gan_loss_weight_decay: 0.0
 action_loss_weight: 0.0
 action_loss_weight_decay: 0.0
+indep_lat_act_weight: 0.0
 guidance_cls_loss_weight: 2.0
 guidance_rgs_loss_weight: 0.0
 diffusion_gan: True
@@ -62,6 +63,7 @@ real_latent_root: /projects/u5dk/frodobots_encoded/train
 caption_root: /projects/u5dk/frodobots_captions/train
 val_real_latent_root: /projects/u5dk/frodobots_encoded/test
 val_caption_root: /projects/u5dk/frodobots_captions/test
+data_blacklist_path: /home/u5dk/as1748.u5dk/ARRWM/data_blacklist.txt
 batch_size: 1
 gradient_accumulation_steps: 1
 ema_weight: 0.99

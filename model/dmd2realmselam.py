@@ -68,7 +68,7 @@ class DMD2RealMSELAM(SelfForcingModel):
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
         self.generator_mse_loss_weight = getattr(args, "generator_mse_loss_weight", 0.1)
         self.motion_enabled_loss = bool(getattr(args, "motion_enabled_loss", False))
-        self.motion_weight_c = float(getattr(args, "motion_weight_c", 2.0))
+        self.motion_weight_c = float(getattr(args, "motion_weight_c", 0.0))
 
         if hasattr(self.fake_score, "adding_cls_branch"):
             try:
@@ -97,7 +97,7 @@ class DMD2RealMSELAM(SelfForcingModel):
         self.latent_feature_dim = latent_channels
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
-        self.action_loss_weight = float(getattr(args, "action_loss_weight", 1.0))
+        self.action_loss_weight = float(getattr(args, "action_loss_weight", None))
 
 
     def _compute_kl_grad(
@@ -378,7 +378,7 @@ class DMD2RealMSELAM(SelfForcingModel):
 
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         _t_gen_start = time.time()
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
@@ -503,7 +503,7 @@ class DMD2RealMSELAM(SelfForcingModel):
         with torch.no_grad():
             if DEBUG and dist.get_rank() == 0:
                 print(f"critic_rollout")
-            generated_image, _, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+        generated_image, _, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,

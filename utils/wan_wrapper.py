@@ -208,9 +208,14 @@ class WanDiffusionWrapper(torch.nn.Module):
         self._gan_ca_blocks.requires_grad_(True)
         # self.has_cls_branch = True
 
-    def adding_rgs_branch(self, atten_dim=1536, num_class=2, time_embed_dim=0) -> None:
+    def adding_rgs_branch(
+        self,
+        atten_dim: int = 1536,
+        num_class: int = 2,
+        time_embed_dim: int = 0,
+        num_frames: int = 21,
+    ) -> None:
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
-        num_frames=21
         self._rgs_pred_branch = nn.Sequential(
             # Input: [B, 384, 21, 60, 104]
             nn.LayerNorm(atten_dim * 3 + time_embed_dim),

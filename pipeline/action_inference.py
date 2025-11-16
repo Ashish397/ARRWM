@@ -224,7 +224,9 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         action_features = action_features.to(device=device, dtype=dtype)
 
         if action_features.dim() == 2:
-            action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
+            # Already-selected actions target the current chunk; keep them as single-frame
+            # inputs instead of tiling across num_frames.
+            action_features = action_features.unsqueeze(1)
         elif action_features.dim() == 3:
             stop = frame_start + num_frames
             if stop > action_features.shape[1]:

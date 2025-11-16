@@ -19,7 +19,7 @@ class BaseModel(nn.Module):
         super().__init__()
         cfg_flag = getattr(args, "action_patch_enabled", None)
         self._action_patch_enabled = bool(cfg_flag)
-        self.action_projection: Optional[nn.Module] = None
+        object.__setattr__(self, "_action_projection_ref", None)
         self._action_dim: Optional[int] = None
         self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
         self._initialize_models(args, device)
@@ -86,6 +86,23 @@ class BaseModel(nn.Module):
             zero_init=True,
         ).to(device=device, dtype=dtype)
         self.action_projection = module
+
+    @property
+    def action_projection(self) -> Optional[nn.Module]:
+        return getattr(self, "_action_projection_ref", None)
+
+    @action_projection.setter
+    def action_projection(self, module: Optional[nn.Module]) -> None:
+        object.__setattr__(self, "_action_projection_ref", module)
+        generator = getattr(self, "generator", None)
+        if generator is None:
+            return
+        target = getattr(generator, "module", generator)
+        if module is None:
+            if hasattr(target, "action_projection"):
+                delattr(target, "action_projection")
+            return
+        target.action_projection = module
 
     def _set_fake_score_trainable(self, value: bool) -> None:
         if getattr(self, "_fake_score_trainable", None) == value:
@@ -176,19 +193,25 @@ class SelfForcingModel(BaseModel):
         num_frames: int,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        detach: bool = False,
+        frame_start: int = 0,
     ) -> Optional[torch.Tensor]:
         if not self._action_patch_enabled or actions is None:
             return None
         if self.inference_pipeline is None:
             self._initialize_inference_pipeline()
         action_inputs = {"actions": actions}
-        return self.inference_pipeline._compute_action_modulation(
+        modulation = self.inference_pipeline._compute_action_modulation(
             action_inputs,
-            frame_start=0,
+            frame_start=frame_start,
             num_frames=num_frames,
             device=device,
             dtype=dtype,
         )
+        if detach and modulation is not None:
+            return modulation.detach()
+        return modulation
 
     def _with_action_conditioning(
         self,
@@ -197,8 +220,32 @@ class SelfForcingModel(BaseModel):
         num_frames: int,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        detach_modulation: bool = False,
+        frame_start: int = 0,
+        target_num_frames: Optional[int] = None,
     ) -> dict:
-        modulation = self._compute_action_modulation_tensor(actions, num_frames, device, dtype)
+        effective_num_frames = target_num_frames if target_num_frames is not None else num_frames
+        modulation = self._compute_action_modulation_tensor(
+            actions,
+            effective_num_frames,
+            device,
+            dtype,
+            detach=detach_modulation,
+            frame_start=frame_start,
+        )
+        if (
+            modulation is not None
+            and target_num_frames is not None
+            and modulation.shape[1] != target_num_frames
+        ):
+            if modulation.shape[1] < target_num_frames:
+                raise ValueError(
+                    f"action_modulation has only {modulation.shape[1]} frames; "
+                    f"{target_num_frames} required to match critic timestep."
+                )
+            modulation = modulation[:, :target_num_frames]
+
         if modulation is None:
             return base_conditional
         conditioned = dict(base_conditional)
@@ -212,7 +259,7 @@ class SelfForcingModel(BaseModel):
         initial_latent: torch.tensor = None,
         slice_last_frames: int = 21,
         action_inputs: Optional[object] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[int], Optional[int], int]:
         """
         Optionally simulate the generator's input from noise using backward simulation
         and then run the generator for one-step.
@@ -285,6 +332,8 @@ class SelfForcingModel(BaseModel):
         else:
             pred_image_or_video_sliced = pred_image_or_video
 
+        frame_start_index = max(0, pred_image_or_video.shape[1] - pred_image_or_video_sliced.shape[1])
+
         if num_generated_frames != min_num_frames:
             # Currently, we do not use gradient for the first chunk, since it contains image latents
             gradient_mask = torch.ones_like(pred_image_or_video_sliced, dtype=torch.bool)
@@ -296,7 +345,13 @@ class SelfForcingModel(BaseModel):
             gradient_mask = None
 
         pred_image_or_video_sliced = pred_image_or_video_sliced.to(self.dtype)
-        return pred_image_or_video_sliced, gradient_mask, denoised_timestep_from, denoised_timestep_to
+        return (
+            pred_image_or_video_sliced,
+            gradient_mask,
+            denoised_timestep_from,
+            denoised_timestep_to,
+            frame_start_index,
+        )
 
     def _consistency_backward_simulation(
         self,

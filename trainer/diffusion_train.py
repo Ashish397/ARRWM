@@ -247,12 +247,15 @@ class LoRADiffusionTrainer:
     # ------------------------------------------------------------------
 
     def _build_dataloader(self) -> None:
+        blacklist_path = getattr(self.config, "data_blacklist_path", None)
+
         dataset = VideoLatentCaptionDataset(
             latent_root=self.config.real_latent_root,
             caption_root=self.config.caption_root,
             num_frames=getattr(self.config, "num_training_frames", 21),
             text_pre_encoded=bool(getattr(self.config, "text_pre_encoded", False)),
             include_dir_substrings=getattr(self.config, "include_dir_substrings", None),
+            blacklist_path=blacklist_path,
         )
         self.train_dataset_size = len(dataset)
         if self.is_main_process:
@@ -511,11 +514,12 @@ class LoRADiffusionTrainer:
             return None
 
         dataset = VideoLatentCaptionDataset(
-        latent_root=val_latent_root,
-        caption_root=val_caption_root,
-        num_frames=getattr(self.config, "num_training_frames", 21),
-        text_pre_encoded=bool(getattr(self.config, "text_pre_encoded", False)),
-        include_dir_substrings=getattr(self.config, "val_include_dir_substrings", None),
+            latent_root=val_latent_root,
+            caption_root=val_caption_root,
+            num_frames=getattr(self.config, "num_training_frames", 21),
+            text_pre_encoded=bool(getattr(self.config, "text_pre_encoded", False)),
+            include_dir_substrings=getattr(self.config, "val_include_dir_substrings", None),
+            blacklist_path=getattr(self.config, "data_blacklist_path", None),
         )
         self.eval_dataset_size = len(dataset)
         if self.is_main_process:
