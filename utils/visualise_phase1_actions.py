@@ -569,6 +569,8 @@ def main() -> None:
         pipeline.text_encoder.to(device=device)
     if getattr(pipeline, "action_projection", None) is not None:
         pipeline.action_projection.to(device=device, dtype=dtype)
+    else:
+        raise RuntimeError("action_projection is not available")
     if device.type == "cuda":
         move_model_to_device_with_memory_preservation(pipeline.generator, target_device=device)
         move_model_to_device_with_memory_preservation(pipeline.vae, target_device=device)
@@ -607,6 +609,21 @@ def main() -> None:
                 )
             action_features = pair_tensor.view(1, 1, action_dim).expand(1, num_frames, action_dim).contiguous()
             action_payload = {"action_features": action_features}
+
+            if pipeline.action_projection is not None:
+                modulation = pipeline.action_projection(
+                    action_features, num_frames=num_frames
+                ).to(device=device, dtype=dtype)
+                flat = modulation.detach().float().flatten(1)
+                batch_norm = flat.norm(dim=1)
+                batch_mean = flat.mean(dim=1)
+                batch_std = flat.std(dim=1)
+                stats = (
+                    f"norm={batch_norm.item():.6f}, "
+                    f"mean={batch_mean.item():.6f}, "
+                    f"std={batch_std.item():.6f}"
+                )
+                print(f"[Info]     action_modulation norm stats: {stats}")
 
             video = pipeline.inference(
                 noise=base_noise.clone(),

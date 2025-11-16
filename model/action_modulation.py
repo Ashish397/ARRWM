@@ -85,9 +85,13 @@ class ActionModulationProjection(nn.Module):
         num_frames = action_features.shape[1]
         
         # Flatten for processing
-        action_flat = action_features.flatten(0, 1)  # [B*F, action_dim]        
-        # Embed action
-        action_emb = self.action_embedding(torch.tensor(action_flat, device='cuda'))  # [B*F, hidden_dim]
+        action_flat = action_features.flatten(0, 1)  # [B*F, action_dim]
+        ref_weight = next(self.action_embedding.parameters(), None)
+        if ref_weight is None:
+            raise RuntimeError("action_embedding must have parameters to determine device/dtype.")
+        action_flat = action_flat.to(device=ref_weight.device, dtype=ref_weight.dtype)
+        # Embed action without breaking autograd or dtype
+        action_emb = self.action_embedding(action_flat)  # [B*F, hidden_dim]
 
         # Project to modulation parameters
         modulation = self.action_projection(action_emb)  # [B*F, hidden_dim * 6]

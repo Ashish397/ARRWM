@@ -718,28 +718,22 @@ class Trainer:
                             "action_projection" in key for key in generator_state.keys()
                         )
 
-                    if action_projection_state is None:
+                    if action_projection_state is not None:
+                        target = getattr(self.model, "action_projection", None)
+                        if target is None:
+                            raise RuntimeError("Action projection module not initialized.")
+                        if self.is_main_process:
+                            print("Loading action modulation projection weights from checkpoint")
+                        target.load_state_dict(action_projection_state, strict=True)
+                    else:
                         if not has_proj_in_generator and expects_projection:
                             raise RuntimeError(
                                 "Checkpoint is missing 'action_projection' weights required for action-conditioned training."
                             )
-                        elif not has_proj_in_generator and self.is_main_process:
-                            print("No action projection weights in checkpoint; starting from freshly initialized module.")
-                    else:
-                        if self.is_main_process:
-                            print("Loading action modulation projection weights from legacy checkpoint format")
-                        target_module = self.model.generator
-                        context = nullcontext()
-                        if isinstance(target_module, FSDP):
-                            context = FSDP.summon_full_params(target_module, writeback=True)
-                            target = target_module.module
-                        else:
-                            target = target_module
-                        target = getattr(target, "action_projection", None)
-                        if target is None:
-                            raise RuntimeError("Action projection module not initialized.")
-                        with context:
-                            target.load_state_dict(action_projection_state, strict=True)
+                        if not has_proj_in_generator and self.is_main_process:
+                            print(
+                                "No action projection weights in checkpoint; starting from freshly initialized module."
+                            )
                 
                 # For auto resume, always resume full training state
                 # Load optimizers
@@ -1258,6 +1252,10 @@ class Trainer:
                     "critic_optimizer": critic_opim_state_dict,
                     "step": self.step,
                 }
+
+        action_proj_module = getattr(self.model, "action_projection", None)
+        if action_proj_module is not None:
+            state_dict["action_projection"] = action_proj_module.state_dict()
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
