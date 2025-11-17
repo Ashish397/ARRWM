@@ -47,8 +47,14 @@ class BaseModel(nn.Module):
         # module gains the extended signature and hooks.
         if self._action_patch_enabled:
             apply_action_patches(self.generator)
+            self._init_action_projection(args, device)
+            if self.action_projection is None:
+                raise RuntimeError(
+                    "Action patches are enabled but action_projection failed to initialize."
+                )
+            self.action_projection.requires_grad_(True)
+            
         self.generator.model.requires_grad_(True)
-        self._init_action_projection(args, device)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
         self.real_score.model.requires_grad_(False)
@@ -73,7 +79,7 @@ class BaseModel(nn.Module):
 
     def _init_action_projection(self, args, device) -> None:
         if not self._action_patch_enabled:
-            self.action_projection = None
+            self._set_action_projection(None)
             return
         action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
         self._action_dim = action_dim
@@ -85,24 +91,23 @@ class BaseModel(nn.Module):
             num_frames=1,
             zero_init=True,
         ).to(device=device, dtype=dtype)
-        self.action_projection = module
+        self._set_action_projection(module)
+        self._sync_action_projection_params()
 
     @property
     def action_projection(self) -> Optional[nn.Module]:
         return getattr(self, "_action_projection_ref", None)
 
-    @action_projection.setter
-    def action_projection(self, module: Optional[nn.Module]) -> None:
+    def _set_action_projection(self, module: Optional[nn.Module]) -> None:
         object.__setattr__(self, "_action_projection_ref", module)
-        generator = getattr(self, "generator", None)
-        if generator is None:
+
+    def _sync_action_projection_params(self) -> None:
+        module = getattr(self, "_action_projection_ref", None)
+        if module is None or not dist.is_initialized():
             return
-        target = getattr(generator, "module", generator)
-        if module is None:
-            if hasattr(target, "action_projection"):
-                delattr(target, "action_projection")
-            return
-        target.action_projection = module
+        with torch.no_grad():
+            for param in module.parameters():
+                dist.broadcast(param.data, src=0)
 
     def _set_fake_score_trainable(self, value: bool) -> None:
         if getattr(self, "_fake_score_trainable", None) == value:

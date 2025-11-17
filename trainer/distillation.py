@@ -57,12 +57,49 @@ import safetensors.torch
 from utils.memory import gpu, get_cuda_free_memory_gb, log_gpu_memory
 from pipeline import (
     ActionCausalInferencePipeline,
-    CausalInferencePipeline,
+    # CausalInferencePipeline,
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
 # # from one_logger_utils import OneLoggerUtils  # Commented out - module not available
 import time
+
+
+def _load_checkpoint_with_storage_fallback(path, **torch_load_kwargs):
+    """
+    Load a checkpoint while handling storages that were saved as non-resizable.
+
+    PyTorch tightened storage semantics in newer releases, so older checkpoints
+    (or ones produced by other environments) may fail to load with
+    ``RuntimeError: Trying to resize storage that is not resizable``. When that
+    happens, fall back to cloning the untyped storage before rebuilding the
+    tensor view so the weights can still be materialised.
+    """
+    try:
+        return torch.load(path, **torch_load_kwargs)
+    except RuntimeError as exc:
+        if "not resizable" not in str(exc):
+            raise
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(
+                f"[Checkpoint] {path} uses legacy non-resizable storages; cloning for compatibility."
+            )
+    import torch._utils as torch_utils
+
+    original_rebuild_tensor = torch_utils._rebuild_tensor
+
+    def _rebuild_tensor_with_clone(storage, storage_offset, size, stride):
+        untyped = storage._untyped_storage
+        if not untyped.resizable():
+            untyped = untyped.clone()
+        tensor = torch.empty((0,), dtype=storage.dtype, device=untyped.device)
+        return tensor.set_(untyped, storage_offset, size, stride)
+
+    torch_utils._rebuild_tensor = _rebuild_tensor_with_clone
+    try:
+        return torch.load(path, **torch_load_kwargs)
+    finally:
+        torch_utils._rebuild_tensor = original_rebuild_tensor
 
 class Trainer:
     
@@ -160,6 +197,7 @@ class Trainer:
 
         cfg_flag = getattr(config, "action_patch_enabled", None)
         self._action_patch_enabled = bool(cfg_flag)
+        print(f"Action patch enabled: {self._action_patch_enabled}")
 
         # Step 2: Initialize the model
         if self.one_logger is not None:
@@ -269,7 +307,9 @@ class Trainer:
             if base_checkpoint_path:
                 if self.is_main_process:
                     print(f"Loading base model from {base_checkpoint_path} (before applying LoRA)")
-                base_checkpoint = torch.load(base_checkpoint_path, map_location="cpu")
+                base_checkpoint = _load_checkpoint_with_storage_fallback(
+                    base_checkpoint_path, map_location="cpu"
+                )
                 
                 generator_state = base_checkpoint.get("generator") or base_checkpoint.get("model")
                 if generator_state is not None:
@@ -333,7 +373,9 @@ class Trainer:
                 latest_checkpoint = self.find_latest_checkpoint(self.output_path)
                 if latest_checkpoint:
                     try:
-                        checkpoint = torch.load(latest_checkpoint, map_location="cpu")
+                        checkpoint = _load_checkpoint_with_storage_fallback(
+                            latest_checkpoint, map_location="cpu"
+                        )
                         expected_lora_keys = {"generator_lora"}
                         if self.apply_lora_to_critic:
                             expected_lora_keys.add("critic_lora")
@@ -369,7 +411,9 @@ class Trainer:
                 lora_ckpt_path = getattr(config, "lora_ckpt", None)
                 if lora_ckpt_path:
                     try:
-                        checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
+                        checkpoint = _load_checkpoint_with_storage_fallback(
+                            lora_ckpt_path, map_location="cpu"
+                        )
                         expected_lora_keys = {"generator_lora"}
                         if self.apply_lora_to_critic:
                             expected_lora_keys.add("critic_lora")
@@ -398,7 +442,9 @@ class Trainer:
             if lora_checkpoint_path:
                 if self.is_main_process:
                     print(f"Loading LoRA checkpoint from {lora_checkpoint_path} (before FSDP wrapping)")
-                lora_checkpoint = torch.load(lora_checkpoint_path, map_location="cpu")
+                lora_checkpoint = _load_checkpoint_with_storage_fallback(
+                    lora_checkpoint_path, map_location="cpu"
+                )
                 
                 # Load LoRA weights using PEFT's standard method
                 if "generator_lora" in lora_checkpoint:
@@ -532,6 +578,17 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
+        self.action_projection_optimizer: Optional[torch.optim.Optimizer] = None
+        action_proj = getattr(self.model, "action_projection", None)
+        if action_proj is not None:
+            action_params = [param for param in action_proj.parameters() if param.requires_grad]
+            if action_params:
+                self.action_projection_optimizer = torch.optim.AdamW(
+                    action_params,
+                    lr=config.lr,
+                    betas=(config.beta1, config.beta2),
+                    weight_decay=config.weight_decay,
+                )
 
         critic_params = [param for param in self.model.fake_score.parameters()
                          if param.requires_grad]
@@ -676,10 +733,26 @@ class Trainer:
             if checkpoint_path:
                 if self.is_main_process:
                     print(f"Loading checkpoint from {checkpoint_path}")
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                checkpoint = _load_checkpoint_with_storage_fallback(
+                    checkpoint_path, map_location="cpu", weights_only=False
+                )
                 
                 # Load generator
                 generator_state = checkpoint.get("generator") or checkpoint.get("model")
+                action_projection_state = checkpoint.get("action_projection")
+                if generator_state is not None and action_projection_state is None:
+                    extracted: dict[str, torch.Tensor] = {}
+                    filtered_state = generator_state.__class__()
+                    for key, value in generator_state.items():
+                        marker = ".action_projection."
+                        if key.startswith("action_projection.") or marker in key:
+                            _, suffix = key.split("action_projection.", 1)
+                            extracted[suffix] = value
+                        else:
+                            filtered_state[key] = value
+                    if extracted:
+                        action_projection_state = extracted
+                        generator_state = filtered_state
                 if generator_state is not None:
                     self._load_generator_checkpoint(generator_state, source=checkpoint_path)
                 else:
@@ -710,14 +783,6 @@ class Trainer:
                         or "generator_optimizer" in checkpoint
                         or "critic_optimizer" in checkpoint
                     )
-                    action_projection_state = checkpoint.get("action_projection")
-                    generator_state = checkpoint.get("generator") or checkpoint.get("model")
-                    has_proj_in_generator = False
-                    if isinstance(generator_state, dict):
-                        has_proj_in_generator = any(
-                            "action_projection" in key for key in generator_state.keys()
-                        )
-
                     if action_projection_state is not None:
                         target = getattr(self.model, "action_projection", None)
                         if target is None:
@@ -726,11 +791,11 @@ class Trainer:
                             print("Loading action modulation projection weights from checkpoint")
                         target.load_state_dict(action_projection_state, strict=True)
                     else:
-                        if not has_proj_in_generator and expects_projection:
+                        if expects_projection:
                             raise RuntimeError(
                                 "Checkpoint is missing 'action_projection' weights required for action-conditioned training."
                             )
-                        if not has_proj_in_generator and self.is_main_process:
+                        if self.is_main_process:
                             print(
                                 "No action projection weights in checkpoint; starting from freshly initialized module."
                             )
@@ -749,6 +814,21 @@ class Trainer:
                 else:
                     if self.is_main_process:
                         print("Warning: Generator optimizer checkpoint not found.")
+
+                if (
+                    "action_projection_optimizer" in checkpoint
+                    and self.action_projection_optimizer is not None
+                ):
+                    if self.is_main_process:
+                        print("Resuming action projection optimizer...")
+                    self.action_projection_optimizer.load_state_dict(
+                        checkpoint["action_projection_optimizer"]
+                    )
+                elif "action_projection_optimizer" in checkpoint:
+                    if self.is_main_process:
+                        print(
+                            "Warning: action_projection_optimizer checkpoint found but module optimizer is unavailable."
+                        )
 
                 if "critic_optimizer" in checkpoint:
                     if self.is_main_process:
@@ -916,7 +996,7 @@ class Trainer:
 
         state_dict = None
         if checkpoint_path:
-            payload = torch.load(checkpoint_path, map_location="cpu")
+            payload = _load_checkpoint_with_storage_fallback(checkpoint_path, map_location="cpu")
             state_dict = payload.get("model_state", payload)
             if isinstance(payload, dict):
                 hidden_dims_payload = payload.get("hidden_dims")
@@ -1192,6 +1272,10 @@ class Trainer:
                 state_dict["teacher_lora"] = teacher_lora_sd
             else:
                 state_dict["teacher_lora"] = {}
+            if self.action_projection_optimizer is not None:
+                state_dict["action_projection_optimizer"] = (
+                    self.action_projection_optimizer.state_dict()
+                )
         else:
             if torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
@@ -1215,6 +1299,12 @@ class Trainer:
             if not self.is_main_process:
                 generator_state_dict = {}
                 generator_opim_state_dict = {}
+            action_proj_opim_state_dict: dict[str, object] = {}
+            if self.action_projection_optimizer is not None:
+                if self.is_main_process:
+                    action_proj_opim_state_dict = self.action_projection_optimizer.state_dict()
+                else:
+                    action_proj_opim_state_dict = {}
 
             self._ensure_fsdp_idle(self.model.fake_score, module_name="critic")
             critic_state_dict: dict[str, object] = {}
@@ -1252,6 +1342,8 @@ class Trainer:
                     "critic_optimizer": critic_opim_state_dict,
                     "step": self.step,
                 }
+            if self.action_projection_optimizer is not None:
+                state_dict["action_projection_optimizer"] = action_proj_opim_state_dict
 
         action_proj_module = getattr(self.model, "action_projection", None)
         if getattr(self.model, "_action_patch_enabled", False) and action_proj_module is None:
@@ -1816,6 +1908,8 @@ class Trainer:
                     # Zero-out all optimizer gradients
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
+                        if self.action_projection_optimizer is not None:
+                            self.action_projection_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     
                     # Whole-cycle gradient accumulation loop
@@ -1859,6 +1953,8 @@ class Trainer:
                         self._warn_if_no_generator_grads(generator_grad_norm.item() > 0.0)
 
                         self.generator_optimizer.step()
+                        if self.action_projection_optimizer is not None:
+                            self.action_projection_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -1890,6 +1986,8 @@ class Trainer:
                 else:
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
+                        if self.action_projection_optimizer is not None:
+                            self.action_projection_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     
                     # Whole-cycle gradient accumulation loop
@@ -1919,6 +2017,8 @@ class Trainer:
                         self._warn_if_no_generator_grads(generator_grad_norm.item() > 0.0)
 
                         self.generator_optimizer.step()
+                        if self.action_projection_optimizer is not None:
+                            self.action_projection_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -2227,7 +2327,7 @@ class Trainer:
         if self.is_main_process:
             print(f"Loading pretrained teacher LoRA weights from {weights_path}")
 
-        checkpoint = torch.load(weights_path, map_location="cpu")
+        checkpoint = _load_checkpoint_with_storage_fallback(weights_path, map_location="cpu")
         if isinstance(checkpoint, dict):
             if "lora" in checkpoint:
                 lora_state = checkpoint["lora"]

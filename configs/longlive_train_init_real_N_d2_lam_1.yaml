@@ -1,4 +1,4 @@
-config_name: 'init-real-dmd2mseganlam-d2-lam_de'
+config_name: 'init-real-dmd2mseganlam-d2-lam_de_v2'
 text_pre_encoded: true
 negative_prompt_encoded_path: /projects/u5dk/frodobots_captions/negative/longlive_train_init_real_negative_1.json
 action_patch_enabled: true
