@@ -269,6 +269,123 @@ def _load_actions(
     return np.asarray(coords, dtype=np.float32)
 
 
+def _compute_unique_actions(
+    actions: np.ndarray,
+    decimals: int = 6,
+) -> list[tuple[float, float, int]]:
+    """
+    Compute unique action pairs and their occurrence counts.
+    
+    Returns a list of (x, y, count) tuples sorted by count (descending).
+    Actions are rounded to `decimals` decimal places for uniqueness comparison.
+    """
+    if actions.size == 0:
+        return []
+    
+    # Round actions to specified decimal places for comparison
+    rounded = np.round(actions, decimals=decimals)
+    
+    # Use a dictionary to count occurrences
+    counts: dict[tuple[float, float], int] = {}
+    for x, y in rounded:
+        key = (float(x), float(y))
+        counts[key] = counts.get(key, 0) + 1
+    
+    # Sort by count descending, then by x, then by y
+    result = [(x, y, count) for (x, y), count in counts.items()]
+    result.sort(key=lambda item: (-item[2], item[0], item[1]))
+    
+    return result
+
+
+def _output_unique_actions(
+    unique_actions: list[tuple[float, float, int]],
+    output_path: Path | None,
+    top_n: int | None,
+    total_count: int,
+) -> None:
+    """
+    Output unique action pairs with their counts and percentages.
+    """
+    if top_n is not None and top_n > 0:
+        display_actions = unique_actions[:top_n]
+        truncated = len(unique_actions) > top_n
+    else:
+        display_actions = unique_actions
+        truncated = False
+    
+    lines: list[str] = []
+    lines.append(f"# Unique action pairs: {len(unique_actions):,}")
+    lines.append(f"# Total action samples: {total_count:,}")
+    lines.append("# Sorted by frequency (descending)")
+    lines.append("")
+    lines.append("action_x,action_y,count,percentage")
+    
+    for x, y, count in display_actions:
+        pct = (count / total_count) * 100 if total_count > 0 else 0.0
+        lines.append(f"{x},{y},{count},{pct:.4f}")
+    
+    if truncated:
+        lines.append(f"# ... and {len(unique_actions) - top_n:,} more unique actions")
+    
+    content = "\n".join(lines) + "\n"
+    
+    if output_path is not None:
+        output_path = output_path.expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content, encoding="utf-8")
+        print(f"[Info] Saved unique actions to {output_path}", file=sys.stderr)
+    else:
+        # Print to stdout
+        print(content)
+
+
+def _print_unique_actions_summary(
+    unique_actions: list[tuple[float, float, int]],
+    total_count: int,
+    top_n: int = 20,
+) -> None:
+    """
+    Print a summary of unique actions to stderr.
+    """
+    print(f"\n[Unique Actions Summary]", file=sys.stderr)
+    print(f"  Total unique action pairs: {len(unique_actions):,}", file=sys.stderr)
+    print(f"  Total action samples: {total_count:,}", file=sys.stderr)
+    
+    if not unique_actions:
+        return
+    
+    # Coverage statistics
+    cumulative = 0
+    coverage_50 = coverage_90 = coverage_99 = None
+    for i, (_, _, count) in enumerate(unique_actions):
+        cumulative += count
+        pct = (cumulative / total_count) * 100
+        if coverage_50 is None and pct >= 50:
+            coverage_50 = i + 1
+        if coverage_90 is None and pct >= 90:
+            coverage_90 = i + 1
+        if coverage_99 is None and pct >= 99:
+            coverage_99 = i + 1
+            break
+    
+    print(f"  Actions covering 50% of samples: {coverage_50 or 'N/A'}", file=sys.stderr)
+    print(f"  Actions covering 90% of samples: {coverage_90 or 'N/A'}", file=sys.stderr)
+    print(f"  Actions covering 99% of samples: {coverage_99 or 'N/A'}", file=sys.stderr)
+    
+    print(f"\n  Top {min(top_n, len(unique_actions))} most frequent actions:", file=sys.stderr)
+    print(f"  {'Rank':<6} {'Action X':<12} {'Action Y':<12} {'Count':<10} {'%':>8}", file=sys.stderr)
+    print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*8}", file=sys.stderr)
+    
+    for i, (x, y, count) in enumerate(unique_actions[:top_n], start=1):
+        pct = (count / total_count) * 100 if total_count > 0 else 0.0
+        print(f"  {i:<6} {x:<12.6f} {y:<12.6f} {count:<10,} {pct:>7.3f}%", file=sys.stderr)
+    
+    if len(unique_actions) > top_n:
+        print(f"  ... and {len(unique_actions) - top_n:,} more unique actions", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def _build_histogram(
     actions: np.ndarray,
     bins_x: int,
@@ -440,6 +557,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Exchange X and Y before plotting (useful when actions are stored as Y,X).",
     )
+    parser.add_argument(
+        "--unique-actions",
+        action="store_true",
+        help="Output a list of unique action pairs with their occurrence counts.",
+    )
+    parser.add_argument(
+        "--unique-output",
+        type=Path,
+        help="Path to save unique action counts as CSV (default: print to stdout).",
+    )
+    parser.add_argument(
+        "--unique-top-n",
+        type=int,
+        default=None,
+        help="Only show top N most frequent unique actions (default: show all).",
+    )
+    parser.add_argument(
+        "--unique-decimals",
+        type=int,
+        default=6,
+        help="Number of decimal places to round actions for uniqueness comparison (default: 6).",
+    )
     args = parser.parse_args(argv)
     if args.clip_percentile is not None and not (0 < args.clip_percentile <= 100):
         parser.error("--clip-percentile must be within (0, 100].")
@@ -521,6 +660,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         actions = actions[:, [1, 0]]
         print("[Info] Swapped X and Y action columns per --swap-axes.", file=sys.stderr)
         _describe_actions("Post-swap actions", actions, force=True)
+
+    # Compute and output unique actions if requested
+    if args.unique_actions or args.unique_output:
+        unique_actions = _compute_unique_actions(actions, decimals=args.unique_decimals)
+        total_count = int(actions.shape[0])
+        
+        # Always print summary to stderr
+        _print_unique_actions_summary(unique_actions, total_count)
+        
+        # Output full list to file or stdout
+        _output_unique_actions(
+            unique_actions,
+            output_path=args.unique_output,
+            top_n=args.unique_top_n,
+            total_count=total_count,
+        )
 
     if args.auto_range:
         x_range = None

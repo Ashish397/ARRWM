@@ -203,7 +203,7 @@ class SelfForcingModel(BaseModel):
         frame_start: int = 0,
     ) -> Optional[torch.Tensor]:
         if not self._action_patch_enabled or actions is None:
-            return None
+            raise ValueError("there is an issue with actions")
         if self.inference_pipeline is None:
             self._initialize_inference_pipeline()
         action_inputs = {"actions": actions}
@@ -252,7 +252,7 @@ class SelfForcingModel(BaseModel):
             modulation = modulation[:, :target_num_frames]
 
         if modulation is None:
-            return base_conditional
+            raise ValueError("action_modulation is required")
         conditioned = dict(base_conditional)
         conditioned["_action_modulation"] = modulation
         return conditioned

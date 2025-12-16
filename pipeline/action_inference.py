@@ -80,39 +80,6 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"[ActionPipeline] Action conditioning: {self._action_conditioning_enabled}")
 
-    def _process_action(
-        self,
-        generated_frames: torch.Tensor,
-        current_frame_idx: int,
-        action_inputs: dict | None = None,
-    ) -> torch.Tensor | None:
-        """
-        处理动作模块，基于已生成的帧预测/提取动作特征。
-        
-        Args:
-            generated_frames: 已生成的帧 [batch_size, num_frames, channels, height, width]
-            current_frame_idx: 当前帧索引
-            action_inputs: 额外的动作输入（例如：目标位置、动作序列等）
-            
-        Returns:
-            action_features: 动作特征，用于条件化后续生成
-        """
-        if not self.use_action_conditioning or self.action_module is None:
-            return None
-        
-        # TODO: 在这里实现你的动作处理逻辑
-        # 示例：
-        # with torch.no_grad():
-        #     action_features = self.action_module(
-        #         frames=generated_frames,
-        #         frame_idx=current_frame_idx,
-        #         **action_inputs
-        #     )
-        # return action_features
-        
-        print(f"[Action Module] Processing action at frame {current_frame_idx}")
-        return None
-
     def _canonicalize_action_inputs(self, action_inputs: Any) -> dict[str, Any]:
         if action_inputs is None:
             raise ValueError("action_inputs is required for action-conditioned inference")
@@ -163,8 +130,8 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
             )
         if mod.shape[2] != 6:
             raise ValueError(f"action_modulation expected 6 modulation slots, got {mod.shape[2]}")
-        # if not debug_allow_zero_modulation:
-            # self._assert_non_zero_modulation(mod)
+        if not debug_allow_zero_modulation:
+            self._assert_non_zero_modulation(mod)
         return mod
 
     @staticmethod
@@ -371,25 +338,6 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
             print(f"\n[Block {block_idx}] Generating frames {current_start_frame} to {current_start_frame + current_num_frames}")
 
             block_action_inputs = dict(base_action_inputs)
-
-            inferred_action_features: Optional[torch.Tensor] = None
-            if (
-                current_start_frame > 0
-                and self._action_conditioning_enabled
-                and self.action_module is not None
-            ):
-                historical_frames = output[:, :current_start_frame].to(noise.device)
-                inferred_action_features = self._process_action(
-                    generated_frames=historical_frames,
-                    current_frame_idx=current_start_frame,
-                    action_inputs=base_action_inputs,
-                )
-
-            if inferred_action_features is not None:
-                block_action_inputs = dict(base_action_inputs)
-                block_action_inputs["action_features"] = inferred_action_features
-                block_action_inputs.pop("action_modulation", None)
-                block_action_inputs.pop("_cached_action_modulation", None)
 
             cond_with_action = self._prepare_action_conditional(
                 base_conditional=base_conditional_dict,

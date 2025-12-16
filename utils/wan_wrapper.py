@@ -304,6 +304,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         prompt_embeds = conditional_dict["prompt_embeds"]
         if getattr(self, "_action_patch_applied", False):
             action_modulation = conditional_dict.get("_action_modulation", None)
+            if action_modulation is None and not (classify_mode or regress_mode):
+                raise ValueError(
+                    "action_modulation is required for generation forward pass. "
+                    "Got None in conditional_dict."
+                )
             action_mod_kwargs = {"action_modulation": action_modulation}
         else:
             action_mod_kwargs = {}

@@ -80,7 +80,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
         if not self._action_conditioning_enabled or action_inputs is None:
-            return None
+            raise ValueError("action_inputs is required / action_conditioning_enabled is disabled")
 
         if isinstance(action_inputs, dict):
             full_cached = action_inputs.get("_cached_action_modulation_full") or action_inputs.get("_cached_action_modulation")
@@ -125,7 +125,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             raise ValueError("action_features 需为 [B, action_dim] 或 [B, T, action_dim]")
 
         if not self.enable_adaln_zero or self.action_projection is None:
-            return None
+            raise ValueError("action_projection is unavailable; supply precomputed 'action_modulation' instead of features")
 
         self._ensure_action_projection_dtype(device=device, dtype=dtype)
         if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:

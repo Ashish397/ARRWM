@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J train_init_real_N_d2_lam_v2
+#SBATCH -J train_init_real_N_d2_lam_v2_v2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
@@ -15,10 +15,10 @@ set -e -o pipefail
 cd /home/u5dk/as1748.u5dk/ARRWM
 
 # Project path and config
-CONFIG=configs/longlive_train_init_real_N_d2_lam_1.yaml
-LOGDIR_ROOT=/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2
+CONFIG=configs/longlive_train_init_real_N_d2_lam_1_v2.yaml
+LOGDIR_ROOT=/scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_1_v2
 WANDB_SAVE_DIR=wandb
-EXPERIMENT_NAME="dmd2-init-N-d2-lam-v2"
+EXPERIMENT_NAME="dmd2-init-N-d2-lam-v2-v2"
 LOGDIR="$LOGDIR_ROOT/$EXPERIMENT_NAME"
 mkdir -p "$LOGDIR"
 

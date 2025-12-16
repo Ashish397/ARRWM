@@ -1,0 +1,1596 @@
+CONFIG=configs/longlive_train_init_real_N_d2_lam_1.yaml
+Starting training job on Sun Nov 16 11:31:08 PM UTC 2025
+Job ID: 1549422
+Action patch enabled: True
+Action patch enabled: True
+Action patch enabled: True
+Action patch enabled: True
+Setting up EMA with weight 0.99
+Setting up EMA with weight 0.99
+Setting up EMA with weight 0.99
+Setting up EMA with weight 0.99
+output_rides_0/ride_16506_20240116020608: blacklisted, skipping directoryoutput_rides_0/ride_16506_20240116020608: blacklisted, skipping directory
+output_rides_0/ride_16506_20240116020608: blacklisted, skipping directory
+output_rides_0/ride_16870_20240124044029: blacklisted, skipping directory
+output_rides_0/ride_16870_20240124044029: blacklisted, skipping directory
+output_rides_0/ride_17133_20240125090143: blacklisted, skipping directory
+output_rides_0/ride_17146_20240125095514: blacklisted, skipping directory
+output_rides_0/ride_17174_20240125112909: blacklisted, skipping directory
+output_rides_0/ride_17259_20240126052519: blacklisted, skipping directory
+output_rides_0/ride_17133_20240125090143: blacklisted, skipping directory
+
+output_rides_0/ride_17146_20240125095514: blacklisted, skipping directory
+output_rides_0/ride_17174_20240125112909: blacklisted, skipping directory
+output_rides_0/ride_17259_20240126052519: blacklisted, skipping directory
+output_rides_0/ride_17513_20240128043544: blacklisted, skipping directory
+output_rides_0/ride_17622_20240130045931: blacklisted, skipping directory
+output_rides_0/ride_17513_20240128043544: blacklisted, skipping directory
+output_rides_0/ride_17622_20240130045931: blacklisted, skipping directory
+output_rides_0/ride_17747_20240201064120: blacklisted, skipping directory
+output_rides_0/ride_17747_20240201064120: blacklisted, skipping directory
+output_rides_0/ride_16870_20240124044029: blacklisted, skipping directoryoutput_rides_1/ride_17950_20240207020016: blacklisted, skipping directory
+output_rides_1/ride_17963_20240207045230: blacklisted, skipping directory
+output_rides_1/ride_17988_20240207062907: blacklisted, skipping directory
+output_rides_1/ride_17950_20240207020016: blacklisted, skipping directory
+
+output_rides_1/ride_17963_20240207045230: blacklisted, skipping directoryoutput_rides_1/ride_18013_20240207123018: blacklisted, skipping directory
+
+output_rides_1/ride_17988_20240207062907: blacklisted, skipping directory
+output_rides_1/ride_18013_20240207123018: blacklisted, skipping directory
+output_rides_0/ride_16506_20240116020608: blacklisted, skipping directory
+output_rides_0/ride_17133_20240125090143: blacklisted, skipping directoryoutput_rides_0/ride_16870_20240124044029: blacklisted, skipping directory
+
+output_rides_0/ride_17146_20240125095514: blacklisted, skipping directoryoutput_rides_0/ride_17133_20240125090143: blacklisted, skipping directory
+output_rides_0/ride_17146_20240125095514: blacklisted, skipping directory
+output_rides_0/ride_17174_20240125112909: blacklisted, skipping directory
+output_rides_0/ride_17259_20240126052519: blacklisted, skipping directory
+
+output_rides_0/ride_17174_20240125112909: blacklisted, skipping directoryoutput_rides_0/ride_17513_20240128043544: blacklisted, skipping directory
+output_rides_1/ride_18713_20240220110429: blacklisted, skipping directory
+output_rides_1/ride_18713_20240220110429: blacklisted, skipping directory
+
+output_rides_0/ride_17622_20240130045931: blacklisted, skipping directory
+output_rides_1/ride_18835_20240221170246: blacklisted, skipping directory
+output_rides_1/ride_18835_20240221170246: blacklisted, skipping directory
+output_rides_0/ride_17747_20240201064120: blacklisted, skipping directory
+output_rides_0/ride_17259_20240126052519: blacklisted, skipping directory
+output_rides_1/ride_17950_20240207020016: blacklisted, skipping directory
+output_rides_1/ride_17963_20240207045230: blacklisted, skipping directory
+output_rides_1/ride_17988_20240207062907: blacklisted, skipping directory
+output_rides_1/ride_18013_20240207123018: blacklisted, skipping directory
+output_rides_0/ride_17513_20240128043544: blacklisted, skipping directory
+output_rides_0/ride_17622_20240130045931: blacklisted, skipping directoryoutput_rides_1/ride_19401_20240227103815: blacklisted, skipping directory
+
+output_rides_1/ride_19401_20240227103815: blacklisted, skipping directory
+output_rides_1/ride_18713_20240220110429: blacklisted, skipping directory
+output_rides_0/ride_17747_20240201064120: blacklisted, skipping directoryoutput_rides_1/ride_18835_20240221170246: blacklisted, skipping directory
+
+output_rides_11/ride_28154_20240406073823: blacklisted, skipping directory
+output_rides_11/ride_28154_20240406073823: blacklisted, skipping directory
+output_rides_1/ride_17950_20240207020016: blacklisted, skipping directory
+output_rides_11/ride_28217_20240406134020: blacklisted, skipping directory
+output_rides_11/ride_28218_20240406134053: blacklisted, skipping directory
+output_rides_11/ride_28217_20240406134020: blacklisted, skipping directory
+output_rides_11/ride_28218_20240406134053: blacklisted, skipping directory
+output_rides_1/ride_17963_20240207045230: blacklisted, skipping directoryoutput_rides_11/ride_28235_20240406143508: blacklisted, skipping directory
+output_rides_11/ride_28235_20240406143508: blacklisted, skipping directory
+
+output_rides_11/ride_28273_20240406161611: blacklisted, skipping directory
+output_rides_11/ride_28276_20240406162325: blacklisted, skipping directory
+output_rides_1/ride_17988_20240207062907: blacklisted, skipping directoryoutput_rides_11/ride_28281_20240406164152: blacklisted, skipping directory
+output_rides_11/ride_28283_20240406164443: blacklisted, skipping directory
+output_rides_11/ride_28273_20240406161611: blacklisted, skipping directory
+output_rides_11/ride_28276_20240406162325: blacklisted, skipping directory
+
+output_rides_11/ride_28281_20240406164152: blacklisted, skipping directory
+output_rides_11/ride_28289_20240406170711: blacklisted, skipping directoryoutput_rides_11/ride_28283_20240406164443: blacklisted, skipping directory
+
+output_rides_1/ride_19401_20240227103815: blacklisted, skipping directory
+output_rides_11/ride_28289_20240406170711: blacklisted, skipping directory
+output_rides_1/ride_18013_20240207123018: blacklisted, skipping directory
+output_rides_11/ride_28428_20240407093927: blacklisted, skipping directory
+output_rides_11/ride_28428_20240407093927: blacklisted, skipping directory
+output_rides_11/ride_28456_20240407113320: blacklisted, skipping directory
+output_rides_11/ride_28456_20240407113320: blacklisted, skipping directory
+output_rides_11/ride_28154_20240406073823: blacklisted, skipping directory
+output_rides_11/ride_28520_20240407171529: blacklisted, skipping directory
+output_rides_11/ride_28530_20240407174627: blacklisted, skipping directory
+output_rides_11/ride_28534_20240407180130: blacklisted, skipping directory
+output_rides_11/ride_28520_20240407171529: blacklisted, skipping directory
+output_rides_11/ride_28530_20240407174627: blacklisted, skipping directory
+output_rides_11/ride_28534_20240407180130: blacklisted, skipping directory
+output_rides_11/ride_28217_20240406134020: blacklisted, skipping directory
+output_rides_11/ride_28218_20240406134053: blacklisted, skipping directory
+output_rides_11/ride_28620_20240408015738: blacklisted, skipping directory
+output_rides_11/ride_28621_20240408015858: blacklisted, skipping directory
+output_rides_11/ride_28235_20240406143508: blacklisted, skipping directory
+output_rides_11/ride_28620_20240408015738: blacklisted, skipping directory
+output_rides_1/ride_18713_20240220110429: blacklisted, skipping directoryoutput_rides_11/ride_28621_20240408015858: blacklisted, skipping directory
+output_rides_11/ride_28659_20240408054306: blacklisted, skipping directory
+output_rides_11/ride_28660_20240408054411: blacklisted, skipping directory
+output_rides_11/ride_28664_20240408060527: blacklisted, skipping directory
+output_rides_11/ride_28273_20240406161611: blacklisted, skipping directory
+output_rides_11/ride_28276_20240406162325: blacklisted, skipping directory
+
+output_rides_11/ride_28281_20240406164152: blacklisted, skipping directory
+output_rides_11/ride_28659_20240408054306: blacklisted, skipping directory
+output_rides_11/ride_28283_20240406164443: blacklisted, skipping directoryoutput_rides_11/ride_28660_20240408054411: blacklisted, skipping directory
+
+output_rides_11/ride_28664_20240408060527: blacklisted, skipping directory
+output_rides_11/ride_28289_20240406170711: blacklisted, skipping directory
+output_rides_11/ride_28745_20240408105323: blacklisted, skipping directory
+output_rides_1/ride_18835_20240221170246: blacklisted, skipping directoryoutput_rides_11/ride_28772_20240408141736: blacklisted, skipping directory
+output_rides_11/ride_28745_20240408105323: blacklisted, skipping directory
+
+output_rides_11/ride_28772_20240408141736: blacklisted, skipping directory
+output_rides_11/ride_28871_20240409011722: blacklisted, skipping directory
+output_rides_11/ride_28885_20240409014548: blacklisted, skipping directory
+output_rides_11/ride_28871_20240409011722: blacklisted, skipping directory
+output_rides_11/ride_28428_20240407093927: blacklisted, skipping directory
+output_rides_11/ride_28894_20240409020145: blacklisted, skipping directory
+output_rides_11/ride_28895_20240409020207: blacklisted, skipping directory
+output_rides_11/ride_28885_20240409014548: blacklisted, skipping directory
+output_rides_11/ride_28894_20240409020145: blacklisted, skipping directoryoutput_rides_11/ride_28456_20240407113320: blacklisted, skipping directory
+output_rides_11/ride_28911_20240409024858: blacklisted, skipping directory
+
+output_rides_11/ride_28895_20240409020207: blacklisted, skipping directory
+output_rides_11/ride_28912_20240409024947: blacklisted, skipping directory
+output_rides_11/ride_28915_20240409025311: blacklisted, skipping directory
+output_rides_11/ride_28919_20240409025623: blacklisted, skipping directory
+output_rides_11/ride_28920_20240409025733: blacklisted, skipping directory
+output_rides_11/ride_28931_20240409032050: blacklisted, skipping directory
+output_rides_11/ride_28911_20240409024858: blacklisted, skipping directoryoutput_rides_11/ride_28932_20240409032131: blacklisted, skipping directory
+
+output_rides_11/ride_28912_20240409024947: blacklisted, skipping directory
+output_rides_11/ride_28915_20240409025311: blacklisted, skipping directory
+output_rides_11/ride_28919_20240409025623: blacklisted, skipping directory
+output_rides_11/ride_28920_20240409025733: blacklisted, skipping directory
+output_rides_11/ride_28931_20240409032050: blacklisted, skipping directory
+output_rides_11/ride_28932_20240409032131: blacklisted, skipping directory
+output_rides_11/ride_28520_20240407171529: blacklisted, skipping directory
+output_rides_11/ride_28530_20240407174627: blacklisted, skipping directory
+output_rides_11/ride_28534_20240407180130: blacklisted, skipping directory
+output_rides_11/ride_28993_20240409043950: blacklisted, skipping directory
+output_rides_11/ride_28993_20240409043950: blacklisted, skipping directory
+output_rides_11/ride_29030_20240409053744: blacklisted, skipping directory
+output_rides_11/ride_28620_20240408015738: blacklisted, skipping directory
+output_rides_11/ride_28621_20240408015858: blacklisted, skipping directory
+output_rides_11/ride_29030_20240409053744: blacklisted, skipping directory
+output_rides_11/ride_29052_20240409063551: blacklisted, skipping directory
+output_rides_11/ride_29054_20240409063615: blacklisted, skipping directory
+output_rides_11/ride_29067_20240409065744: blacklisted, skipping directory
+output_rides_11/ride_28659_20240408054306: blacklisted, skipping directory
+output_rides_11/ride_28660_20240408054411: blacklisted, skipping directory
+output_rides_11/ride_29052_20240409063551: blacklisted, skipping directory
+output_rides_11/ride_28664_20240408060527: blacklisted, skipping directoryoutput_rides_11/ride_29054_20240409063615: blacklisted, skipping directory
+
+output_rides_11/ride_29067_20240409065744: blacklisted, skipping directory
+output_rides_11/ride_29100_20240409094314: blacklisted, skipping directory
+output_rides_1/ride_19401_20240227103815: blacklisted, skipping directoryoutput_rides_11/ride_29100_20240409094314: blacklisted, skipping directory
+
+output_rides_11/ride_28745_20240408105323: blacklisted, skipping directory
+output_rides_11/ride_28772_20240408141736: blacklisted, skipping directory
+output_rides_11/ride_28871_20240409011722: blacklisted, skipping directory
+output_rides_11/ride_28885_20240409014548: blacklisted, skipping directory
+output_rides_11/ride_28894_20240409020145: blacklisted, skipping directory
+output_rides_11/ride_28895_20240409020207: blacklisted, skipping directory
+output_rides_11/ride_28911_20240409024858: blacklisted, skipping directory
+output_rides_11/ride_28912_20240409024947: blacklisted, skipping directory
+output_rides_11/ride_28915_20240409025311: blacklisted, skipping directoryoutput_rides_11/ride_29135_20240409113941: blacklisted, skipping directory
+
+output_rides_11/ride_28919_20240409025623: blacklisted, skipping directory
+output_rides_11/ride_28920_20240409025733: blacklisted, skipping directoryoutput_rides_11/ride_29137_20240409114601: blacklisted, skipping directory
+
+output_rides_11/ride_29140_20240409115246: blacklisted, skipping directory
+output_rides_11/ride_29135_20240409113941: blacklisted, skipping directoryoutput_rides_11/ride_28931_20240409032050: blacklisted, skipping directory
+
+output_rides_11/ride_28932_20240409032131: blacklisted, skipping directoryoutput_rides_11/ride_29148_20240409120914: blacklisted, skipping directory
+
+output_rides_11/ride_29137_20240409114601: blacklisted, skipping directory
+output_rides_11/ride_29140_20240409115246: blacklisted, skipping directory
+output_rides_11/ride_29148_20240409120914: blacklisted, skipping directory
+output_rides_11/ride_28154_20240406073823: blacklisted, skipping directoryoutput_rides_11/ride_28993_20240409043950: blacklisted, skipping directory
+
+output_rides_11/ride_29030_20240409053744: blacklisted, skipping directory
+output_rides_11/ride_29052_20240409063551: blacklisted, skipping directory
+output_rides_11/ride_29054_20240409063615: blacklisted, skipping directory
+output_rides_11/ride_29067_20240409065744: blacklisted, skipping directory
+output_rides_11/ride_29100_20240409094314: blacklisted, skipping directory
+output_rides_11/ride_28217_20240406134020: blacklisted, skipping directory
+output_rides_11/ride_28218_20240406134053: blacklisted, skipping directory
+output_rides_12/ride_29909_20240411195123: blacklisted, skipping directory
+output_rides_12/ride_29912_20240411200538: blacklisted, skipping directoryoutput_rides_11/ride_28235_20240406143508: blacklisted, skipping directory
+output_rides_12/ride_29909_20240411195123: blacklisted, skipping directory
+output_rides_12/ride_29912_20240411200538: blacklisted, skipping directory
+output_rides_11/ride_29135_20240409113941: blacklisted, skipping directory
+
+output_rides_11/ride_29137_20240409114601: blacklisted, skipping directory
+output_rides_11/ride_29140_20240409115246: blacklisted, skipping directory
+output_rides_11/ride_29148_20240409120914: blacklisted, skipping directory
+output_rides_11/ride_28273_20240406161611: blacklisted, skipping directoryoutput_rides_13/ride_30279_20240412165814: blacklisted, skipping directory
+
+output_rides_13/ride_30279_20240412165814: blacklisted, skipping directory
+output_rides_11/ride_28276_20240406162325: blacklisted, skipping directoryoutput_rides_13/ride_30376_20240413032838: blacklisted, skipping directory
+output_rides_13/ride_30376_20240413032838: blacklisted, skipping directory
+
+output_rides_13/ride_30508_20240413135357: blacklisted, skipping directory
+output_rides_13/ride_30508_20240413135357: blacklisted, skipping directoryoutput_rides_13/ride_30530_20240413150946: blacklisted, skipping directoryoutput_rides_11/ride_28281_20240406164152: blacklisted, skipping directory
+
+output_rides_13/ride_30530_20240413150946: blacklisted, skipping directory
+
+output_rides_11/ride_28283_20240406164443: blacklisted, skipping directoryoutput_rides_13/ride_30807_20240414190156: blacklisted, skipping directory
+output_rides_13/ride_30807_20240414190156: blacklisted, skipping directory
+
+output_rides_13/ride_30916_20240415024045: blacklisted, skipping directory
+output_rides_11/ride_28289_20240406170711: blacklisted, skipping directoryoutput_rides_13/ride_30916_20240415024045: blacklisted, skipping directory
+output_rides_12/ride_29909_20240411195123: blacklisted, skipping directory
+output_rides_12/ride_29912_20240411200538: blacklisted, skipping directory
+
+output_rides_13/ride_31037_20240415105943: blacklisted, skipping directory
+output_rides_13/ride_31037_20240415105943: blacklisted, skipping directory
+output_rides_14/ride_31233_20240416000404: blacklisted, skipping directory
+output_rides_14/ride_31233_20240416000404: blacklisted, skipping directory
+output_rides_13/ride_30279_20240412165814: blacklisted, skipping directory
+output_rides_11/ride_28428_20240407093927: blacklisted, skipping directoryoutput_rides_13/ride_30376_20240413032838: blacklisted, skipping directory
+
+output_rides_13/ride_30508_20240413135357: blacklisted, skipping directory
+output_rides_13/ride_30530_20240413150946: blacklisted, skipping directory
+output_rides_14/ride_31715_20240417041352: blacklisted, skipping directoryoutput_rides_14/ride_31715_20240417041352: blacklisted, skipping directory
+
+output_rides_11/ride_28456_20240407113320: blacklisted, skipping directory
+output_rides_13/ride_30807_20240414190156: blacklisted, skipping directory
+output_rides_14/ride_31936_20240417155437: blacklisted, skipping directory
+output_rides_14/ride_31936_20240417155437: blacklisted, skipping directory
+output_rides_13/ride_30916_20240415024045: blacklisted, skipping directory
+output_rides_11/ride_28520_20240407171529: blacklisted, skipping directoryoutput_rides_13/ride_31037_20240415105943: blacklisted, skipping directory
+output_rides_15/ride_32404_20240418144709: blacklisted, skipping directory
+output_rides_15/ride_32404_20240418144709: blacklisted, skipping directory
+
+output_rides_11/ride_28530_20240407174627: blacklisted, skipping directoryoutput_rides_14/ride_31233_20240416000404: blacklisted, skipping directory
+
+output_rides_11/ride_28534_20240407180130: blacklisted, skipping directory
+output_rides_11/ride_28620_20240408015738: blacklisted, skipping directoryoutput_rides_14/ride_31715_20240417041352: blacklisted, skipping directory
+
+output_rides_11/ride_28621_20240408015858: blacklisted, skipping directoryoutput_rides_17/ride_34467_20240422213841: blacklisted, skipping directory
+output_rides_14/ride_31936_20240417155437: blacklisted, skipping directory
+
+output_rides_17/ride_34467_20240422213841: blacklisted, skipping directory
+output_rides_17/ride_34494_20240422232357: blacklisted, skipping directory
+output_rides_17/ride_34494_20240422232357: blacklisted, skipping directory
+output_rides_11/ride_28659_20240408054306: blacklisted, skipping directoryoutput_rides_15/ride_32404_20240418144709: blacklisted, skipping directory
+
+output_rides_11/ride_28660_20240408054411: blacklisted, skipping directory
+output_rides_17/ride_35125_20240424030435: blacklisted, skipping directory
+output_rides_11/ride_28664_20240408060527: blacklisted, skipping directoryoutput_rides_17/ride_35125_20240424030435: blacklisted, skipping directory
+
+output_rides_18/ride_35371_20240424110226: blacklisted, skipping directory
+output_rides_18/ride_35387_20240424112625: blacklisted, skipping directory
+output_rides_18/ride_35389_20240424113123: blacklisted, skipping directory
+output_rides_18/ride_35390_20240424113148: blacklisted, skipping directory
+output_rides_18/ride_35371_20240424110226: blacklisted, skipping directoryoutput_rides_18/ride_35392_20240424113333: blacklisted, skipping directory
+
+output_rides_18/ride_35393_20240424113442: blacklisted, skipping directory
+output_rides_18/ride_35387_20240424112625: blacklisted, skipping directory
+output_rides_18/ride_35389_20240424113123: blacklisted, skipping directory
+output_rides_18/ride_35390_20240424113148: blacklisted, skipping directory
+output_rides_18/ride_35392_20240424113333: blacklisted, skipping directory
+output_rides_18/ride_35393_20240424113442: blacklisted, skipping directory
+output_rides_18/ride_35631_20240424215139: blacklisted, skipping directory
+output_rides_18/ride_35631_20240424215139: blacklisted, skipping directory
+output_rides_11/ride_28745_20240408105323: blacklisted, skipping directory
+output_rides_18/ride_35776_20240425063817: blacklisted, skipping directory
+output_rides_18/ride_35818_20240425084400: blacklisted, skipping directoryoutput_rides_18/ride_35776_20240425063817: blacklisted, skipping directory
+
+output_rides_18/ride_35818_20240425084400: blacklisted, skipping directory
+output_rides_18/ride_35889_20240425110047: blacklisted, skipping directoryoutput_rides_11/ride_28772_20240408141736: blacklisted, skipping directoryoutput_rides_17/ride_34467_20240422213841: blacklisted, skipping directory
+
+output_rides_18/ride_35889_20240425110047: blacklisted, skipping directory
+output_rides_17/ride_34494_20240422232357: blacklisted, skipping directory
+
+output_rides_11/ride_28871_20240409011722: blacklisted, skipping directoryoutput_rides_19/ride_36418_20240426182005: blacklisted, skipping directory
+
+output_rides_19/ride_36418_20240426182005: blacklisted, skipping directory
+output_rides_19/ride_36830_20240427210703: blacklisted, skipping directory
+output_rides_11/ride_28885_20240409014548: blacklisted, skipping directoryoutput_rides_17/ride_35125_20240424030435: blacklisted, skipping directory
+output_rides_19/ride_36898_20240428041011: blacklisted, skipping directory
+output_rides_19/ride_36830_20240427210703: blacklisted, skipping directory
+output_rides_19/ride_36898_20240428041011: blacklisted, skipping directory
+
+output_rides_18/ride_35371_20240424110226: blacklisted, skipping directory
+output_rides_2/ride_19623_20240301091914: blacklisted, skipping directory
+output_rides_18/ride_35387_20240424112625: blacklisted, skipping directoryoutput_rides_11/ride_28894_20240409020145: blacklisted, skipping directory
+output_rides_18/ride_35389_20240424113123: blacklisted, skipping directory
+output_rides_18/ride_35390_20240424113148: blacklisted, skipping directory
+output_rides_18/ride_35392_20240424113333: blacklisted, skipping directory
+output_rides_18/ride_35393_20240424113442: blacklisted, skipping directory
+output_rides_2/ride_19623_20240301091914: blacklisted, skipping directory
+
+output_rides_18/ride_35631_20240424215139: blacklisted, skipping directory
+output_rides_2/ride_19756_20240302174944: blacklisted, skipping directory
+output_rides_11/ride_28895_20240409020207: blacklisted, skipping directoryoutput_rides_2/ride_19763_20240302202415: blacklisted, skipping directory
+output_rides_2/ride_19756_20240302174944: blacklisted, skipping directory
+output_rides_2/ride_19763_20240302202415: blacklisted, skipping directory
+
+output_rides_18/ride_35776_20240425063817: blacklisted, skipping directory
+output_rides_18/ride_35818_20240425084400: blacklisted, skipping directory
+output_rides_11/ride_28911_20240409024858: blacklisted, skipping directoryoutput_rides_2/ride_19925_20240304114705: blacklisted, skipping directory
+output_rides_18/ride_35889_20240425110047: blacklisted, skipping directoryoutput_rides_2/ride_19953_20240304164001: blacklisted, skipping directory
+
+
+output_rides_2/ride_19925_20240304114705: blacklisted, skipping directory
+output_rides_2/ride_19953_20240304164001: blacklisted, skipping directory
+output_rides_11/ride_28912_20240409024947: blacklisted, skipping directoryoutput_rides_2/ride_20029_20240305072836: blacklisted, skipping directory
+output_rides_2/ride_20030_20240305072851: blacklisted, skipping directory
+output_rides_2/ride_20067_20240305134032: blacklisted, skipping directory
+
+output_rides_2/ride_20029_20240305072836: blacklisted, skipping directory
+output_rides_2/ride_20030_20240305072851: blacklisted, skipping directory
+output_rides_2/ride_20067_20240305134032: blacklisted, skipping directory
+output_rides_2/ride_20093_20240305210034: blacklisted, skipping directory
+output_rides_11/ride_28915_20240409025311: blacklisted, skipping directoryoutput_rides_2/ride_20110_20240306024847: blacklisted, skipping directory
+output_rides_2/ride_20093_20240305210034: blacklisted, skipping directory
+
+output_rides_2/ride_20110_20240306024847: blacklisted, skipping directory
+output_rides_19/ride_36418_20240426182005: blacklisted, skipping directory
+output_rides_11/ride_28919_20240409025623: blacklisted, skipping directory
+output_rides_19/ride_36830_20240427210703: blacklisted, skipping directory
+output_rides_19/ride_36898_20240428041011: blacklisted, skipping directory
+output_rides_11/ride_28920_20240409025733: blacklisted, skipping directory
+output_rides_2/ride_20357_20240307113752: blacklisted, skipping directory
+output_rides_2/ride_19623_20240301091914: blacklisted, skipping directory
+output_rides_11/ride_28931_20240409032050: blacklisted, skipping directoryoutput_rides_2/ride_20357_20240307113752: blacklisted, skipping directory
+
+output_rides_2/ride_19756_20240302174944: blacklisted, skipping directory
+output_rides_11/ride_28932_20240409032131: blacklisted, skipping directoryoutput_rides_2/ride_19763_20240302202415: blacklisted, skipping directory
+
+output_rides_2/ride_20598_20240309054951: blacklisted, skipping directory
+output_rides_2/ride_20598_20240309054951: blacklisted, skipping directory
+output_rides_2/ride_19925_20240304114705: blacklisted, skipping directory
+output_rides_2/ride_19953_20240304164001: blacklisted, skipping directory
+output_rides_11/ride_28993_20240409043950: blacklisted, skipping directoryoutput_rides_2/ride_20029_20240305072836: blacklisted, skipping directory
+output_rides_2/ride_20030_20240305072851: blacklisted, skipping directory
+
+output_rides_20/ride_37340_20240429083037: blacklisted, skipping directory
+output_rides_2/ride_20067_20240305134032: blacklisted, skipping directoryoutput_rides_20/ride_37388_20240429112349: blacklisted, skipping directory
+
+output_rides_20/ride_37340_20240429083037: blacklisted, skipping directory
+output_rides_20/ride_37388_20240429112349: blacklisted, skipping directory
+output_rides_2/ride_20093_20240305210034: blacklisted, skipping directory
+output_rides_20/ride_37591_20240429233942: blacklisted, skipping directory
+output_rides_2/ride_20110_20240306024847: blacklisted, skipping directory
+output_rides_11/ride_29030_20240409053744: blacklisted, skipping directoryoutput_rides_20/ride_37591_20240429233942: blacklisted, skipping directory
+
+output_rides_20/ride_37874_20240430130547: blacklisted, skipping directory
+output_rides_20/ride_37874_20240430130547: blacklisted, skipping directory
+output_rides_11/ride_29052_20240409063551: blacklisted, skipping directoryoutput_rides_21/ride_38381_20240501050001: blacklisted, skipping directory
+
+output_rides_21/ride_38381_20240501050001: blacklisted, skipping directory
+output_rides_2/ride_20357_20240307113752: blacklisted, skipping directory
+output_rides_21/ride_38691_20240501171623: blacklisted, skipping directoryoutput_rides_11/ride_29054_20240409063615: blacklisted, skipping directory
+output_rides_21/ride_38692_20240501171730: blacklisted, skipping directory
+output_rides_21/ride_38691_20240501171623: blacklisted, skipping directory
+output_rides_21/ride_38692_20240501171730: blacklisted, skipping directory
+
+output_rides_11/ride_29067_20240409065744: blacklisted, skipping directoryoutput_rides_21/ride_39236_20240502110626: blacklisted, skipping directory
+
+output_rides_2/ride_20598_20240309054951: blacklisted, skipping directoryoutput_rides_21/ride_39236_20240502110626: blacklisted, skipping directory
+
+output_rides_11/ride_29100_20240409094314: blacklisted, skipping directoryoutput_rides_23/ride_40284_20240504084739: blacklisted, skipping directory
+
+output_rides_20/ride_37340_20240429083037: blacklisted, skipping directory
+output_rides_23/ride_40284_20240504084739: blacklisted, skipping directory
+output_rides_20/ride_37388_20240429112349: blacklisted, skipping directory
+output_rides_11/ride_29135_20240409113941: blacklisted, skipping directoryoutput_rides_20/ride_37591_20240429233942: blacklisted, skipping directory
+
+output_rides_3/ride_20772_20240311102041: blacklisted, skipping directory
+output_rides_3/ride_20781_20240311111506: blacklisted, skipping directory
+output_rides_11/ride_29137_20240409114601: blacklisted, skipping directoryoutput_rides_3/ride_20794_20240311135108: blacklisted, skipping directory
+output_rides_3/ride_20772_20240311102041: blacklisted, skipping directory
+output_rides_3/ride_20805_20240311144114: blacklisted, skipping directory
+output_rides_20/ride_37874_20240430130547: blacklisted, skipping directoryoutput_rides_3/ride_20781_20240311111506: blacklisted, skipping directory
+
+
+output_rides_3/ride_20794_20240311135108: blacklisted, skipping directory
+output_rides_3/ride_20805_20240311144114: blacklisted, skipping directory
+output_rides_3/ride_20860_20240311184244: blacklisted, skipping directory
+output_rides_3/ride_20863_20240311185132: blacklisted, skipping directory
+output_rides_21/ride_38381_20240501050001: blacklisted, skipping directory
+output_rides_11/ride_29140_20240409115246: blacklisted, skipping directoryoutput_rides_3/ride_20860_20240311184244: blacklisted, skipping directory
+output_rides_3/ride_20863_20240311185132: blacklisted, skipping directory
+output_rides_21/ride_38691_20240501171623: blacklisted, skipping directory
+output_rides_21/ride_38692_20240501171730: blacklisted, skipping directory
+
+output_rides_11/ride_29148_20240409120914: blacklisted, skipping directoryoutput_rides_3/ride_21003_20240312073101: blacklisted, skipping directory
+output_rides_21/ride_39236_20240502110626: blacklisted, skipping directory
+
+output_rides_3/ride_21003_20240312073101: blacklisted, skipping directory
+output_rides_3/ride_21092_20240312204122: blacklisted, skipping directory
+output_rides_3/ride_21124_20240313011852: blacklisted, skipping directoryoutput_rides_3/ride_21092_20240312204122: blacklisted, skipping directory
+
+output_rides_23/ride_40284_20240504084739: blacklisted, skipping directory
+output_rides_3/ride_21165_20240313034947: blacklisted, skipping directory
+output_rides_3/ride_21124_20240313011852: blacklisted, skipping directory
+output_rides_3/ride_21214_20240313064341: blacklisted, skipping directory
+output_rides_3/ride_21165_20240313034947: blacklisted, skipping directory
+output_rides_3/ride_21214_20240313064341: blacklisted, skipping directory
+output_rides_3/ride_21259_20240313131118: blacklisted, skipping directory
+output_rides_3/ride_21259_20240313131118: blacklisted, skipping directory
+output_rides_3/ride_20772_20240311102041: blacklisted, skipping directory
+output_rides_3/ride_20781_20240311111506: blacklisted, skipping directory
+output_rides_3/ride_20794_20240311135108: blacklisted, skipping directory
+output_rides_3/ride_21328_20240313221235: blacklisted, skipping directory
+output_rides_3/ride_20805_20240311144114: blacklisted, skipping directoryoutput_rides_3/ride_21336_20240313230315: blacklisted, skipping directory
+
+output_rides_3/ride_21328_20240313221235: blacklisted, skipping directory
+output_rides_3/ride_21336_20240313230315: blacklisted, skipping directory
+output_rides_3/ride_20860_20240311184244: blacklisted, skipping directory
+output_rides_3/ride_20863_20240311185132: blacklisted, skipping directory
+output_rides_3/ride_21516_20240314121551: blacklisted, skipping directory
+output_rides_12/ride_29909_20240411195123: blacklisted, skipping directoryoutput_rides_3/ride_21516_20240314121551: blacklisted, skipping directory
+output_rides_3/ride_21003_20240312073101: blacklisted, skipping directory
+
+output_rides_3/ride_21092_20240312204122: blacklisted, skipping directory
+output_rides_12/ride_29912_20240411200538: blacklisted, skipping directoryoutput_rides_3/ride_21638_20240315025124: blacklisted, skipping directory
+output_rides_3/ride_21643_20240315030501: blacklisted, skipping directory
+output_rides_3/ride_21649_20240315031714: blacklisted, skipping directory
+output_rides_3/ride_21651_20240315032133: blacklisted, skipping directory
+output_rides_3/ride_21653_20240315032433: blacklisted, skipping directory
+output_rides_3/ride_21659_20240315035314: blacklisted, skipping directory
+output_rides_3/ride_21660_20240315035437: blacklisted, skipping directory
+output_rides_3/ride_21124_20240313011852: blacklisted, skipping directory
+
+output_rides_3/ride_21638_20240315025124: blacklisted, skipping directory
+output_rides_3/ride_21643_20240315030501: blacklisted, skipping directory
+output_rides_3/ride_21649_20240315031714: blacklisted, skipping directory
+output_rides_3/ride_21651_20240315032133: blacklisted, skipping directory
+output_rides_3/ride_21653_20240315032433: blacklisted, skipping directory
+output_rides_3/ride_21165_20240313034947: blacklisted, skipping directoryoutput_rides_3/ride_21659_20240315035314: blacklisted, skipping directory
+
+output_rides_3/ride_21660_20240315035437: blacklisted, skipping directory
+output_rides_3/ride_21214_20240313064341: blacklisted, skipping directory
+output_rides_4/ride_21783_20240315132457: blacklisted, skipping directory
+output_rides_3/ride_21259_20240313131118: blacklisted, skipping directory
+output_rides_4/ride_21783_20240315132457: blacklisted, skipping directory
+output_rides_3/ride_21328_20240313221235: blacklisted, skipping directory
+output_rides_3/ride_21336_20240313230315: blacklisted, skipping directory
+output_rides_13/ride_30279_20240412165814: blacklisted, skipping directory
+output_rides_3/ride_21516_20240314121551: blacklisted, skipping directoryoutput_rides_13/ride_30376_20240413032838: blacklisted, skipping directory
+
+output_rides_3/ride_21638_20240315025124: blacklisted, skipping directory
+output_rides_3/ride_21643_20240315030501: blacklisted, skipping directory
+output_rides_13/ride_30508_20240413135357: blacklisted, skipping directoryoutput_rides_3/ride_21649_20240315031714: blacklisted, skipping directory
+output_rides_3/ride_21651_20240315032133: blacklisted, skipping directory
+output_rides_3/ride_21653_20240315032433: blacklisted, skipping directory
+output_rides_3/ride_21659_20240315035314: blacklisted, skipping directory
+output_rides_3/ride_21660_20240315035437: blacklisted, skipping directory
+
+output_rides_13/ride_30530_20240413150946: blacklisted, skipping directoryoutput_rides_4/ride_22050_20240318033203: blacklisted, skipping directory
+
+output_rides_4/ride_22061_20240318040722: blacklisted, skipping directory
+output_rides_4/ride_21783_20240315132457: blacklisted, skipping directory
+output_rides_4/ride_22050_20240318033203: blacklisted, skipping directory
+output_rides_4/ride_22061_20240318040722: blacklisted, skipping directory
+output_rides_4/ride_22210_20240318165739: blacklisted, skipping directory
+output_rides_13/ride_30807_20240414190156: blacklisted, skipping directoryoutput_rides_4/ride_22236_20240318200422: blacklisted, skipping directory
+output_rides_4/ride_22210_20240318165739: blacklisted, skipping directory
+
+output_rides_4/ride_22236_20240318200422: blacklisted, skipping directory
+output_rides_13/ride_30916_20240415024045: blacklisted, skipping directory
+output_rides_4/ride_22428_20240319104752: blacklisted, skipping directory
+output_rides_4/ride_22428_20240319104752: blacklisted, skipping directory
+output_rides_13/ride_31037_20240415105943: blacklisted, skipping directoryoutput_rides_4/ride_22498_20240319191543: blacklisted, skipping directory
+output_rides_4/ride_22499_20240319191625: blacklisted, skipping directory
+output_rides_4/ride_22518_20240319214112: blacklisted, skipping directory
+output_rides_4/ride_22519_20240319214346: blacklisted, skipping directory
+output_rides_4/ride_22520_20240319214515: blacklisted, skipping directory
+
+output_rides_4/ride_22498_20240319191543: blacklisted, skipping directory
+output_rides_4/ride_22499_20240319191625: blacklisted, skipping directory
+output_rides_4/ride_22050_20240318033203: blacklisted, skipping directory
+output_rides_4/ride_22518_20240319214112: blacklisted, skipping directory
+output_rides_4/ride_22519_20240319214346: blacklisted, skipping directory
+output_rides_4/ride_22520_20240319214515: blacklisted, skipping directoryoutput_rides_4/ride_22061_20240318040722: blacklisted, skipping directory
+
+output_rides_4/ride_22602_20240320041447: blacklisted, skipping directory
+output_rides_14/ride_31233_20240416000404: blacklisted, skipping directoryoutput_rides_4/ride_22602_20240320041447: blacklisted, skipping directory
+
+output_rides_4/ride_22210_20240318165739: blacklisted, skipping directory
+output_rides_4/ride_22747_20240320153444: blacklisted, skipping directory
+output_rides_4/ride_22236_20240318200422: blacklisted, skipping directory
+output_rides_5/ride_22763_20240320171607: blacklisted, skipping directory
+output_rides_5/ride_22764_20240320171810: blacklisted, skipping directory
+output_rides_4/ride_22747_20240320153444: blacklisted, skipping directory
+output_rides_5/ride_22785_20240320192741: blacklisted, skipping directory
+output_rides_5/ride_22786_20240320192913: blacklisted, skipping directory
+output_rides_5/ride_22763_20240320171607: blacklisted, skipping directory
+output_rides_5/ride_22764_20240320171810: blacklisted, skipping directory
+output_rides_5/ride_22785_20240320192741: blacklisted, skipping directory
+output_rides_5/ride_22786_20240320192913: blacklisted, skipping directory
+output_rides_4/ride_22428_20240319104752: blacklisted, skipping directory
+output_rides_14/ride_31715_20240417041352: blacklisted, skipping directory
+output_rides_4/ride_22498_20240319191543: blacklisted, skipping directory
+output_rides_4/ride_22499_20240319191625: blacklisted, skipping directory
+output_rides_4/ride_22518_20240319214112: blacklisted, skipping directory
+output_rides_4/ride_22519_20240319214346: blacklisted, skipping directory
+output_rides_4/ride_22520_20240319214515: blacklisted, skipping directory
+output_rides_5/ride_23040_20240321113852: blacklisted, skipping directory
+output_rides_5/ride_23040_20240321113852: blacklisted, skipping directory
+output_rides_5/ride_23084_20240321162205: blacklisted, skipping directory
+output_rides_5/ride_23089_20240321165324: blacklisted, skipping directoryoutput_rides_14/ride_31936_20240417155437: blacklisted, skipping directory
+output_rides_4/ride_22602_20240320041447: blacklisted, skipping directory
+output_rides_5/ride_23084_20240321162205: blacklisted, skipping directory
+
+output_rides_5/ride_23089_20240321165324: blacklisted, skipping directory
+output_rides_5/ride_23172_20240322012348: blacklisted, skipping directory
+output_rides_5/ride_23212_20240322024032: blacklisted, skipping directory
+output_rides_5/ride_23172_20240322012348: blacklisted, skipping directory
+output_rides_4/ride_22747_20240320153444: blacklisted, skipping directory
+output_rides_5/ride_23212_20240322024032: blacklisted, skipping directory
+output_rides_5/ride_22763_20240320171607: blacklisted, skipping directory
+output_rides_5/ride_22764_20240320171810: blacklisted, skipping directory
+output_rides_5/ride_22785_20240320192741: blacklisted, skipping directory
+output_rides_5/ride_22786_20240320192913: blacklisted, skipping directory
+output_rides_15/ride_32404_20240418144709: blacklisted, skipping directory
+output_rides_5/ride_23376_20240322112652: blacklisted, skipping directory
+output_rides_5/ride_23376_20240322112652: blacklisted, skipping directory
+output_rides_5/ride_23040_20240321113852: blacklisted, skipping directory
+output_rides_5/ride_23577_20240323024147: blacklisted, skipping directory
+output_rides_5/ride_23590_20240323032429: blacklisted, skipping directory
+output_rides_5/ride_23577_20240323024147: blacklisted, skipping directory
+output_rides_5/ride_23084_20240321162205: blacklisted, skipping directory
+output_rides_5/ride_23590_20240323032429: blacklisted, skipping directory
+output_rides_5/ride_23089_20240321165324: blacklisted, skipping directory
+output_rides_5/ride_23644_20240323074034: blacklisted, skipping directory
+output_rides_5/ride_23644_20240323074034: blacklisted, skipping directoryoutput_rides_5/ride_23680_20240323115232: blacklisted, skipping directory
+
+output_rides_5/ride_23727_20240323162523: blacklisted, skipping directory
+output_rides_5/ride_23680_20240323115232: blacklisted, skipping directoryoutput_rides_5/ride_23172_20240322012348: blacklisted, skipping directory
+
+output_rides_5/ride_23727_20240323162523: blacklisted, skipping directory
+output_rides_5/ride_23212_20240322024032: blacklisted, skipping directory
+output_rides_6/ride_23844_20240324053045: blacklisted, skipping directory
+output_rides_6/ride_23844_20240324053045: blacklisted, skipping directory
+output_rides_17/ride_34467_20240422213841: blacklisted, skipping directory
+output_rides_6/ride_24006_20240325013325: blacklisted, skipping directory
+output_rides_6/ride_24006_20240325013325: blacklisted, skipping directory
+output_rides_5/ride_23376_20240322112652: blacklisted, skipping directory
+output_rides_17/ride_34494_20240422232357: blacklisted, skipping directory
+output_rides_5/ride_23577_20240323024147: blacklisted, skipping directory
+output_rides_5/ride_23590_20240323032429: blacklisted, skipping directory
+output_rides_5/ride_23644_20240323074034: blacklisted, skipping directory
+output_rides_5/ride_23680_20240323115232: blacklisted, skipping directory
+output_rides_5/ride_23727_20240323162523: blacklisted, skipping directory
+output_rides_6/ride_24453_20240326101751: blacklisted, skipping directory
+output_rides_17/ride_35125_20240424030435: blacklisted, skipping directoryoutput_rides_6/ride_24453_20240326101751: blacklisted, skipping directory
+output_rides_6/ride_24547_20240326184017: blacklisted, skipping directory
+output_rides_6/ride_23844_20240324053045: blacklisted, skipping directory
+output_rides_6/ride_24547_20240326184017: blacklisted, skipping directory
+output_rides_6/ride_24712_20240327092315: blacklisted, skipping directory
+output_rides_6/ride_24716_20240327092809: blacklisted, skipping directory
+output_rides_6/ride_24006_20240325013325: blacklisted, skipping directory
+output_rides_6/ride_24721_20240327093924: blacklisted, skipping directory
+output_rides_6/ride_24749_20240327111851: blacklisted, skipping directory
+output_rides_6/ride_24712_20240327092315: blacklisted, skipping directory
+output_rides_6/ride_24716_20240327092809: blacklisted, skipping directory
+output_rides_6/ride_24721_20240327093924: blacklisted, skipping directory
+output_rides_7/ride_24808_20240327151530: blacklisted, skipping directory
+output_rides_6/ride_24749_20240327111851: blacklisted, skipping directory
+output_rides_7/ride_24808_20240327151530: blacklisted, skipping directory
+
+output_rides_7/ride_25028_20240328071732: blacklisted, skipping directory
+output_rides_18/ride_35371_20240424110226: blacklisted, skipping directoryoutput_rides_7/ride_25028_20240328071732: blacklisted, skipping directory
+
+output_rides_6/ride_24453_20240326101751: blacklisted, skipping directory
+output_rides_18/ride_35387_20240424112625: blacklisted, skipping directory
+output_rides_6/ride_24547_20240326184017: blacklisted, skipping directory
+output_rides_18/ride_35389_20240424113123: blacklisted, skipping directory
+output_rides_18/ride_35390_20240424113148: blacklisted, skipping directoryoutput_rides_6/ride_24712_20240327092315: blacklisted, skipping directory
+
+output_rides_6/ride_24716_20240327092809: blacklisted, skipping directory
+output_rides_6/ride_24721_20240327093924: blacklisted, skipping directory
+output_rides_6/ride_24749_20240327111851: blacklisted, skipping directoryoutput_rides_18/ride_35392_20240424113333: blacklisted, skipping directory
+
+output_rides_8/ride_26121_20240401214342: blacklisted, skipping directoryoutput_rides_7/ride_24808_20240327151530: blacklisted, skipping directory
+
+output_rides_18/ride_35393_20240424113442: blacklisted, skipping directoryoutput_rides_8/ride_26144_20240402001442: blacklisted, skipping directory
+
+output_rides_8/ride_26121_20240401214342: blacklisted, skipping directory
+output_rides_8/ride_26144_20240402001442: blacklisted, skipping directory
+output_rides_18/ride_35631_20240424215139: blacklisted, skipping directoryoutput_rides_7/ride_25028_20240328071732: blacklisted, skipping directory
+
+output_rides_8/ride_26352_20240402235618: blacklisted, skipping directory
+output_rides_8/ride_26356_20240403000507: blacklisted, skipping directory
+output_rides_8/ride_26359_20240403000743: blacklisted, skipping directory
+output_rides_8/ride_26361_20240403000848: blacklisted, skipping directory
+output_rides_18/ride_35776_20240425063817: blacklisted, skipping directoryoutput_rides_8/ride_26352_20240402235618: blacklisted, skipping directory
+output_rides_8/ride_26356_20240403000507: blacklisted, skipping directory
+output_rides_8/ride_26359_20240403000743: blacklisted, skipping directory
+output_rides_8/ride_26361_20240403000848: blacklisted, skipping directory
+
+output_rides_18/ride_35818_20240425084400: blacklisted, skipping directoryoutput_rides_8/ride_26489_20240403110754: blacklisted, skipping directory
+output_rides_8/ride_26490_20240403110807: blacklisted, skipping directory
+
+output_rides_8/ride_26489_20240403110754: blacklisted, skipping directory
+output_rides_8/ride_26490_20240403110807: blacklisted, skipping directory
+output_rides_18/ride_35889_20240425110047: blacklisted, skipping directory
+output_rides_8/ride_26651_20240404053158: blacklisted, skipping directory
+output_rides_8/ride_26121_20240401214342: blacklisted, skipping directory
+output_rides_8/ride_26144_20240402001442: blacklisted, skipping directory
+output_rides_8/ride_26731_20240404121348: blacklisted, skipping directory
+output_rides_8/ride_26651_20240404053158: blacklisted, skipping directory
+output_rides_9/ride_27517_20240404140255: blacklisted, skipping directory
+output_rides_8/ride_26731_20240404121348: blacklisted, skipping directory
+output_rides_9/ride_27667_20240405005148: blacklisted, skipping directory
+output_rides_9/ride_27669_20240405005217: blacklisted, skipping directoryoutput_rides_9/ride_27517_20240404140255: blacklisted, skipping directory
+
+output_rides_19/ride_36418_20240426182005: blacklisted, skipping directoryoutput_rides_8/ride_26352_20240402235618: blacklisted, skipping directoryoutput_rides_9/ride_27667_20240405005148: blacklisted, skipping directory
+
+output_rides_9/ride_27669_20240405005217: blacklisted, skipping directory
+output_rides_8/ride_26356_20240403000507: blacklisted, skipping directory
+output_rides_8/ride_26359_20240403000743: blacklisted, skipping directory
+output_rides_8/ride_26361_20240403000848: blacklisted, skipping directory
+
+output_rides_19/ride_36830_20240427210703: blacklisted, skipping directoryoutput_rides_8/ride_26489_20240403110754: blacklisted, skipping directory
+output_rides_8/ride_26490_20240403110807: blacklisted, skipping directory
+
+output_rides_19/ride_36898_20240428041011: blacklisted, skipping directory
+output_rides_8/ride_26651_20240404053158: blacklisted, skipping directory
+output_rides_2/ride_19623_20240301091914: blacklisted, skipping directoryoutput_rides_8/ride_26731_20240404121348: blacklisted, skipping directory
+output_rides_9/ride_27517_20240404140255: blacklisted, skipping directory
+
+output_rides_9/ride_27667_20240405005148: blacklisted, skipping directory
+output_rides_9/ride_27669_20240405005217: blacklisted, skipping directory
+output_rides_2/ride_19756_20240302174944: blacklisted, skipping directory
+output_rides_2/ride_19763_20240302202415: blacklisted, skipping directory
+output_rides_2/ride_19925_20240304114705: blacklisted, skipping directory
+output_rides_2/ride_19953_20240304164001: blacklisted, skipping directory
+output_rides_2/ride_20029_20240305072836: blacklisted, skipping directory
+output_rides_2/ride_20030_20240305072851: blacklisted, skipping directory
+output_rides_2/ride_20067_20240305134032: blacklisted, skipping directory
+output_rides_2/ride_20093_20240305210034: blacklisted, skipping directory
+output_rides_2/ride_20110_20240306024847: blacklisted, skipping directory
+output_rides_2/ride_20357_20240307113752: blacklisted, skipping directory
+output_rides_2/ride_20598_20240309054951: blacklisted, skipping directory
+output_rides_20/ride_37340_20240429083037: blacklisted, skipping directory
+output_rides_20/ride_37388_20240429112349: blacklisted, skipping directory
+output_rides_20/ride_37591_20240429233942: blacklisted, skipping directory
+output_rides_20/ride_37874_20240430130547: blacklisted, skipping directory
+output_rides_21/ride_38381_20240501050001: blacklisted, skipping directory
+output_rides_21/ride_38691_20240501171623: blacklisted, skipping directory
+output_rides_21/ride_38692_20240501171730: blacklisted, skipping directory
+output_rides_21/ride_39236_20240502110626: blacklisted, skipping directory
+output_rides_23/ride_40284_20240504084739: blacklisted, skipping directory
+output_rides_3/ride_20772_20240311102041: blacklisted, skipping directory
+output_rides_3/ride_20781_20240311111506: blacklisted, skipping directory
+output_rides_3/ride_20794_20240311135108: blacklisted, skipping directory
+output_rides_3/ride_20805_20240311144114: blacklisted, skipping directory
+output_rides_3/ride_20860_20240311184244: blacklisted, skipping directory
+output_rides_3/ride_20863_20240311185132: blacklisted, skipping directory
+output_rides_3/ride_21003_20240312073101: blacklisted, skipping directory
+output_rides_3/ride_21092_20240312204122: blacklisted, skipping directory
+output_rides_3/ride_21124_20240313011852: blacklisted, skipping directory
+output_rides_3/ride_21165_20240313034947: blacklisted, skipping directory
+output_rides_3/ride_21214_20240313064341: blacklisted, skipping directory
+output_rides_3/ride_21259_20240313131118: blacklisted, skipping directory
+output_rides_3/ride_21328_20240313221235: blacklisted, skipping directory
+output_rides_3/ride_21336_20240313230315: blacklisted, skipping directory
+output_rides_3/ride_21516_20240314121551: blacklisted, skipping directory
+output_rides_3/ride_21638_20240315025124: blacklisted, skipping directory
+output_rides_3/ride_21643_20240315030501: blacklisted, skipping directory
+output_rides_3/ride_21649_20240315031714: blacklisted, skipping directory
+output_rides_3/ride_21651_20240315032133: blacklisted, skipping directory
+output_rides_3/ride_21653_20240315032433: blacklisted, skipping directory
+output_rides_3/ride_21659_20240315035314: blacklisted, skipping directory
+output_rides_3/ride_21660_20240315035437: blacklisted, skipping directory
+output_rides_4/ride_21783_20240315132457: blacklisted, skipping directory
+output_rides_4/ride_22050_20240318033203: blacklisted, skipping directory
+output_rides_4/ride_22061_20240318040722: blacklisted, skipping directory
+output_rides_4/ride_22210_20240318165739: blacklisted, skipping directory
+output_rides_4/ride_22236_20240318200422: blacklisted, skipping directory
+output_rides_4/ride_22428_20240319104752: blacklisted, skipping directory
+output_rides_4/ride_22498_20240319191543: blacklisted, skipping directory
+output_rides_4/ride_22499_20240319191625: blacklisted, skipping directory
+output_rides_4/ride_22518_20240319214112: blacklisted, skipping directory
+output_rides_4/ride_22519_20240319214346: blacklisted, skipping directory
+output_rides_4/ride_22520_20240319214515: blacklisted, skipping directory
+output_rides_4/ride_22602_20240320041447: blacklisted, skipping directory
+output_rides_4/ride_22747_20240320153444: blacklisted, skipping directory
+output_rides_5/ride_22763_20240320171607: blacklisted, skipping directory
+output_rides_5/ride_22764_20240320171810: blacklisted, skipping directory
+output_rides_5/ride_22785_20240320192741: blacklisted, skipping directory
+output_rides_5/ride_22786_20240320192913: blacklisted, skipping directory
+output_rides_5/ride_23040_20240321113852: blacklisted, skipping directory
+output_rides_5/ride_23084_20240321162205: blacklisted, skipping directory
+output_rides_5/ride_23089_20240321165324: blacklisted, skipping directory
+output_rides_5/ride_23172_20240322012348: blacklisted, skipping directory
+output_rides_5/ride_23212_20240322024032: blacklisted, skipping directory
+output_rides_5/ride_23376_20240322112652: blacklisted, skipping directory
+output_rides_5/ride_23577_20240323024147: blacklisted, skipping directory
+output_rides_5/ride_23590_20240323032429: blacklisted, skipping directory
+output_rides_5/ride_23644_20240323074034: blacklisted, skipping directory
+output_rides_5/ride_23680_20240323115232: blacklisted, skipping directory
+output_rides_5/ride_23727_20240323162523: blacklisted, skipping directory
+output_rides_6/ride_23844_20240324053045: blacklisted, skipping directory
+output_rides_6/ride_24006_20240325013325: blacklisted, skipping directory
+output_rides_6/ride_24453_20240326101751: blacklisted, skipping directory
+output_rides_6/ride_24547_20240326184017: blacklisted, skipping directory
+output_rides_6/ride_24712_20240327092315: blacklisted, skipping directory
+output_rides_6/ride_24716_20240327092809: blacklisted, skipping directory
+output_rides_6/ride_24721_20240327093924: blacklisted, skipping directory
+output_rides_6/ride_24749_20240327111851: blacklisted, skipping directory
+output_rides_7/ride_24808_20240327151530: blacklisted, skipping directory
+output_rides_7/ride_25028_20240328071732: blacklisted, skipping directory
+output_rides_8/ride_26121_20240401214342: blacklisted, skipping directory
+output_rides_8/ride_26144_20240402001442: blacklisted, skipping directory
+output_rides_8/ride_26352_20240402235618: blacklisted, skipping directory
+output_rides_8/ride_26356_20240403000507: blacklisted, skipping directory
+output_rides_8/ride_26359_20240403000743: blacklisted, skipping directory
+output_rides_8/ride_26361_20240403000848: blacklisted, skipping directory
+output_rides_8/ride_26489_20240403110754: blacklisted, skipping directory
+output_rides_8/ride_26490_20240403110807: blacklisted, skipping directory
+output_rides_8/ride_26651_20240404053158: blacklisted, skipping directory
+output_rides_8/ride_26731_20240404121348: blacklisted, skipping directory
+output_rides_9/ride_27517_20240404140255: blacklisted, skipping directory
+output_rides_9/ride_27667_20240405005148: blacklisted, skipping directory
+output_rides_9/ride_27669_20240405005217: blacklisted, skipping directory
+DATASET SIZE 9954
+VAL DATASET SIZE 135
+KV inference with 3 frames per block
+[ActionPipeline] Reusing shared action_projection (dim=2).
+[ActionPipeline] Action conditioning: True
+Auto resume: Found latest checkpoint at /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000100/model.pt
+Loading checkpoint from /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000100/model.pt
+[Checkpoint] /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000100/model.pt uses legacy non-resizable storages; cloning for compatibility.
+Loading pretrained generator from /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000100/model.pt
+Generator checkpoint missing action_projection weights; keeping freshly initialized projection.
+Loading pretrained critic from /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000100/model.pt
+Warning: EMA checkpoint not found or EMA not initialized.
+Loading action modulation projection weights from checkpoint
+Resuming generator optimizer...
+Resuming action projection optimizer...
+Resuming critic optimizer...
+Resuming from step 100
+Gradient accumulation steps: 1
+step 101, per iteration time 0, generator_loss 0.6230115508146319, generator_grad_norm 2.083911657333374, dmdtrain_gradient_norm 0.671875, critic_loss 1.133683681488037, critic_grad_norm 0.19744503498077393
+step 102, per iteration time 11.327704429626465, critic_loss 0.1946180760860443, critic_grad_norm 0.10366205126047134
+step 103, per iteration time 11.365955591201782, critic_loss 1.182158350944519, critic_grad_norm 1.001038908958435
+step 104, per iteration time 11.403094053268433, critic_loss 0.038818359375, critic_grad_norm 0.7559443116188049
+step 105, per iteration time 12.224483966827393, critic_loss 1.1273691654205322, critic_grad_norm 0.08153849840164185
+step 106, per iteration time 25.42011260986328, generator_loss 0.5302368567241349, generator_grad_norm 0.602401614189148, dmdtrain_gradient_norm 0.6328125, critic_loss 0.24962566792964935, critic_grad_norm 0.20323751866817474
+step 107, per iteration time 14.126198053359985, critic_loss 0.2447916716337204, critic_grad_norm 0.4123412072658539
+step 108, per iteration time 10.489453315734863, critic_loss 0.7713128328323364, critic_grad_norm 0.18981774151325226
+step 109, per iteration time 13.3261559009552, critic_loss 0.5585839748382568, critic_grad_norm 0.1197211742401123
+step 110, per iteration time 12.382042646408081, critic_loss 0.7294706702232361, critic_grad_norm 0.1321924477815628
+step 111, per iteration time 29.283281087875366, generator_loss 1.1040476371908008, generator_grad_norm 1.0331430435180664, dmdtrain_gradient_norm 0.83984375, critic_loss 0.7937500476837158, critic_grad_norm 0.4918792247772217
+step 112, per iteration time 12.403924465179443, critic_loss 0.826809287071228, critic_grad_norm 0.20353569090366364
+step 113, per iteration time 12.406593322753906, critic_loss 0.032958984375, critic_grad_norm 0.42106595635414124
+step 114, per iteration time 10.66026496887207, critic_loss 0.9917285442352295, critic_grad_norm 0.5547647476196289
+step 115, per iteration time 12.795347929000854, critic_loss 0.6241984367370605, critic_grad_norm 0.5042164325714111
+step 116, per iteration time 27.496941566467285, generator_loss 0.4408534251037203, generator_grad_norm 1.4147651195526123, dmdtrain_gradient_norm 0.5703125, critic_loss 0.04052734375, critic_grad_norm 0.2493700534105301
+step 117, per iteration time 12.649025678634644, critic_loss 0.3936360776424408, critic_grad_norm 0.8212922215461731
+step 118, per iteration time 11.453535079956055, critic_loss 1.0453439950942993, critic_grad_norm 0.08323143422603607
+step 119, per iteration time 10.509976387023926, critic_loss 1.1139748096466064, critic_grad_norm 0.2599402666091919
+step 120, per iteration time 11.470213174819946, critic_loss 0.8284627795219421, critic_grad_norm 0.4415929317474365
+step 121, per iteration time 25.63415026664734, generator_loss 0.37806239977104705, generator_grad_norm 1.4479854106903076, dmdtrain_gradient_norm 0.44921875, critic_loss 0.7837398052215576, critic_grad_norm 0.4997442066669464
+step 122, per iteration time 10.547797203063965, critic_loss 0.057861328125, critic_grad_norm 0.2548390030860901
+step 123, per iteration time 10.538434982299805, critic_loss 0.884501039981842, critic_grad_norm 0.08732198178768158
+step 124, per iteration time 10.543187856674194, critic_loss 0.0225830078125, critic_grad_norm 0.07800264656543732
+step 125, per iteration time 12.822965860366821, critic_loss 0.06142903491854668, critic_grad_norm 0.7015261650085449
+step 126, per iteration time 25.47654390335083, generator_loss 0.9155479262223186, generator_grad_norm 2.7343688011169434, dmdtrain_gradient_norm 0.88671875, critic_loss 0.8980957269668579, critic_grad_norm 0.09780155122280121
+step 127, per iteration time 12.438666820526123, critic_loss 0.8010631203651428, critic_grad_norm 0.6946977972984314
+step 128, per iteration time 13.74347186088562, critic_loss 1.2560955286026, critic_grad_norm 0.5800427794456482
+step 129, per iteration time 11.281011581420898, critic_loss 0.022216796875, critic_grad_norm 0.09712029993534088
+step 130, per iteration time 13.347118854522705, critic_loss 1.1938667297363281, critic_grad_norm 0.08184139430522919
+step 131, per iteration time 24.705535650253296, generator_loss 0.4145019958964584, generator_grad_norm 2.631133794784546, dmdtrain_gradient_norm 0.5546875, critic_loss 0.4082542657852173, critic_grad_norm 0.5203189849853516
+step 132, per iteration time 10.857977151870728, critic_loss 0.7285405993461609, critic_grad_norm 0.43842992186546326
+step 133, per iteration time 10.568077087402344, critic_loss 0.6496907472610474, critic_grad_norm 0.20086045563220978
+step 134, per iteration time 10.512622356414795, critic_loss 0.02001953125, critic_grad_norm 0.44296303391456604
+step 135, per iteration time 11.536518335342407, critic_loss 0.06494140625, critic_grad_norm 0.6818202137947083
+step 136, per iteration time 24.438039302825928, generator_loss 0.3807141912593845, generator_grad_norm 1.9654735326766968, dmdtrain_gradient_norm 0.494140625, critic_loss 0.0185546875, critic_grad_norm 0.32128381729125977
+step 137, per iteration time 13.34000849723816, critic_loss 0.9756126403808594, critic_grad_norm 0.4192340672016144
+step 138, per iteration time 12.455424785614014, critic_loss 0.62919020652771, critic_grad_norm 0.12829884886741638
+step 139, per iteration time 12.954876184463501, critic_loss 1.0894699096679688, critic_grad_norm 0.6905413269996643
+step 140, per iteration time 10.539021015167236, critic_loss 0.050537109375, critic_grad_norm 0.52326899766922
+step 141, per iteration time 25.417441368103027, generator_loss 0.34674705250922466, generator_grad_norm 1.5888205766677856, dmdtrain_gradient_norm 0.43359375, critic_loss 1.0971726179122925, critic_grad_norm 0.6070289015769958
+step 142, per iteration time 11.496351718902588, critic_loss 1.1705100536346436, critic_grad_norm 0.15777312219142914
+step 143, per iteration time 10.595637083053589, critic_loss 1.0161426067352295, critic_grad_norm 0.4875788390636444
+step 144, per iteration time 12.463061571121216, critic_loss 0.760640025138855, critic_grad_norm 0.3167933523654938
+step 145, per iteration time 10.55857539176941, critic_loss 1.1149461269378662, critic_grad_norm 0.4159386456012726
+step 146, per iteration time 25.05856490135193, generator_loss 0.4117841675303241, generator_grad_norm 1.2552611827850342, dmdtrain_gradient_norm 0.447265625, critic_loss 0.1458333432674408, critic_grad_norm 0.5477989912033081
+step 147, per iteration time 11.851662874221802, critic_loss 1.04052734375, critic_grad_norm 0.3028685450553894
+step 148, per iteration time 11.488932609558105, critic_loss 1.09998619556427, critic_grad_norm 0.22908015549182892
+step 149, per iteration time 13.181749820709229, critic_loss 0.9034765362739563, critic_grad_norm 0.18913893401622772
+step 150, per iteration time 12.43887996673584, critic_loss 0.7752106189727783, critic_grad_norm 0.10367590934038162
+step 151, per iteration time 24.517946004867554, generator_loss 0.6362079142885286, generator_grad_norm 2.2005021572113037, dmdtrain_gradient_norm 0.640625, critic_loss 1.2302204370498657, critic_grad_norm 0.11317867785692215
+step 152, per iteration time 11.553814172744751, critic_loss 1.1527975797653198, critic_grad_norm 0.4508855938911438
+step 153, per iteration time 13.385794401168823, critic_loss 0.8218870759010315, critic_grad_norm 0.510747492313385
+step 154, per iteration time 10.559586763381958, critic_loss 0.0247802734375, critic_grad_norm 0.5013120770454407
+step 155, per iteration time 10.569284915924072, critic_loss 0.0240478515625, critic_grad_norm 0.3732345998287201
+step 156, per iteration time 27.765432834625244, generator_loss 0.3597113104999936, generator_grad_norm 1.1073042154312134, dmdtrain_gradient_norm 0.423828125, critic_loss 0.8996075391769409, critic_grad_norm 0.08694812655448914
+step 157, per iteration time 11.52667760848999, critic_loss 0.9450063705444336, critic_grad_norm 0.21644176542758942
+step 158, per iteration time 11.846496343612671, critic_loss 0.059814453125, critic_grad_norm 0.349224328994751
+step 159, per iteration time 10.85759162902832, critic_loss 0.7728031873703003, critic_grad_norm 0.5292539000511169
+step 160, per iteration time 11.486950159072876, critic_loss 1.1530134677886963, critic_grad_norm 0.3522363007068634
+step 161, per iteration time 26.439926385879517, generator_loss 0.5255847412884991, generator_grad_norm 1.640550136566162, dmdtrain_gradient_norm 0.640625, critic_loss 0.0277099609375, critic_grad_norm 0.08809178322553635
+step 162, per iteration time 13.379884719848633, critic_loss 0.2520066201686859, critic_grad_norm 0.08503370732069016
+step 163, per iteration time 11.49700665473938, critic_loss 0.8397092223167419, critic_grad_norm 0.4815317690372467
+step 164, per iteration time 13.759363651275635, critic_loss 0.08203125, critic_grad_norm 0.5026060938835144
+step 165, per iteration time 11.493457078933716, critic_loss 0.41597843170166016, critic_grad_norm 0.5332099199295044
+step 166, per iteration time 24.035775899887085, generator_loss 0.3164078865769159, generator_grad_norm 1.8206926584243774, dmdtrain_gradient_norm 0.421875, critic_loss 1.088982343673706, critic_grad_norm 0.37502560019493103
+step 167, per iteration time 13.384340286254883, critic_loss 0.6201158761978149, critic_grad_norm 0.7276735901832581
+step 168, per iteration time 13.369459390640259, critic_loss 0.10498046875, critic_grad_norm 0.6290441751480103
+step 169, per iteration time 11.857795715332031, critic_loss 0.695881724357605, critic_grad_norm 0.46872955560684204
+step 170, per iteration time 12.442919731140137, critic_loss 0.9628444910049438, critic_grad_norm 0.3878600597381592
+step 171, per iteration time 28.110331296920776, generator_loss 0.3649316395740501, generator_grad_norm 0.8946830034255981, dmdtrain_gradient_norm 0.470703125, critic_loss 0.02670968323945999, critic_grad_norm 0.3747170865535736
+step 172, per iteration time 11.919567823410034, critic_loss 0.7683594226837158, critic_grad_norm 0.5756961703300476
+step 173, per iteration time 13.479421854019165, critic_loss 0.9229446053504944, critic_grad_norm 0.3912379741668701
+step 174, per iteration time 12.590841293334961, critic_loss 0.3934677243232727, critic_grad_norm 0.1547100692987442
+step 175, per iteration time 13.367211818695068, critic_loss 0.6357350945472717, critic_grad_norm 0.14930135011672974
+step 176, per iteration time 26.91919779777527, generator_loss 0.8563207145611255, generator_grad_norm 1.163657784461975, dmdtrain_gradient_norm 0.83203125, critic_loss 0.5501574873924255, critic_grad_norm 0.10143604129552841
+step 177, per iteration time 10.596612453460693, critic_loss 0.03759765625, critic_grad_norm 0.30730944871902466
+step 178, per iteration time 13.831094741821289, critic_loss 0.03173828125, critic_grad_norm 0.6365379691123962
+step 179, per iteration time 12.461333513259888, critic_loss 0.26396578550338745, critic_grad_norm 0.17205266654491425
+step 180, per iteration time 11.013138055801392, critic_loss 0.0174560546875, critic_grad_norm 0.47045180201530457
+step 181, per iteration time 26.92415499687195, generator_loss 0.4494137453580583, generator_grad_norm 0.6669935584068298, dmdtrain_gradient_norm 0.453125, critic_loss 0.5762599110603333, critic_grad_norm 0.13844476640224457
+step 182, per iteration time 10.618640422821045, critic_loss 0.024658203125, critic_grad_norm 0.06912311166524887
+step 183, per iteration time 10.707633256912231, critic_loss 0.9841601848602295, critic_grad_norm 0.12941457331180573
+step 184, per iteration time 10.610631227493286, critic_loss 1.4063574075698853, critic_grad_norm 0.19155310094356537
+step 185, per iteration time 14.453902959823608, critic_loss 0.5113504528999329, critic_grad_norm 0.4195539355278015
+step 186, per iteration time 27.43983745574951, generator_loss 0.2951946581513304, generator_grad_norm 0.6433199644088745, dmdtrain_gradient_norm 0.4921875, critic_loss 0.028564453125, critic_grad_norm 0.11592566967010498
+step 187, per iteration time 11.511751890182495, critic_loss 1.1017836332321167, critic_grad_norm 0.19801345467567444
+step 188, per iteration time 10.881626844406128, critic_loss 1.0812814235687256, critic_grad_norm 0.07077666372060776
+step 189, per iteration time 11.534496784210205, critic_loss 0.06177804246544838, critic_grad_norm 0.38195931911468506
+step 190, per iteration time 12.624878644943237, critic_loss 0.7746701240539551, critic_grad_norm 0.2456318736076355
+step 191, per iteration time 26.586894989013672, generator_loss 0.6035219194106878, generator_grad_norm 1.4754555225372314, dmdtrain_gradient_norm 0.57421875, critic_loss 0.9741524457931519, critic_grad_norm 0.5450006723403931
+step 192, per iteration time 11.685710191726685, critic_loss 0.9376081228256226, critic_grad_norm 0.1076088696718216
+step 193, per iteration time 10.774659395217896, critic_loss 1.4678711891174316, critic_grad_norm 0.49089643359184265
+step 194, per iteration time 14.194204568862915, critic_loss 0.041748046875, critic_grad_norm 0.33425959944725037
+step 195, per iteration time 12.587749242782593, critic_loss 0.0673828125, critic_grad_norm 0.33112168312072754
+step 196, per iteration time 27.329949140548706, generator_loss 0.8507638152603803, generator_grad_norm 1.274296760559082, dmdtrain_gradient_norm 0.7109375, critic_loss 1.0908079147338867, critic_grad_norm 0.20839610695838928
+step 197, per iteration time 13.481301307678223, critic_loss 1.0477341413497925, critic_grad_norm 0.0872969776391983
+step 198, per iteration time 13.620799779891968, critic_loss 0.804365336894989, critic_grad_norm 0.3071376085281372
+step 199, per iteration time 11.494998693466187, critic_loss 0.48344725370407104, critic_grad_norm 0.2440110296010971
+EMA created at step 200 with weight 0.99
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Generating video of length 21
+Generating video of length 21Generating video of length 21
+
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+
+[Block 0] Generating frames 0 to 3
+[Block 0] Generating frames 0 to 3
+[Block 0] Generating frames 0 to 3
+
+
+Model saved to /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000200/model.pt
+Checkpoint cleanup: Found 6 checkpoints, removing 1 oldest ones (keeping 5)
+  Removing: checkpoint_model_000092 (step 92)
+Checkpoint cleanup completed: removed 1/1 old checkpoints
+step 200, per iteration time 48.868873834609985, critic_loss 0.091796875, critic_grad_norm 0.33194032311439514
+Generating video of length 21
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+step 201, per iteration time 34.607123613357544, generator_loss 0.8537875466434945, generator_grad_norm 2.4317378997802734, dmdtrain_gradient_norm 0.67578125, critic_loss 1.1491072177886963, critic_grad_norm 0.5631818175315857
+step 202, per iteration time 13.386435747146606, critic_loss 1.0090625286102295, critic_grad_norm 0.15305224061012268
+step 203, per iteration time 13.897322177886963, critic_loss 0.44338881969451904, critic_grad_norm 0.2218872457742691
+step 204, per iteration time 10.576538801193237, critic_loss 0.5979960560798645, critic_grad_norm 0.4426177740097046
+step 205, per iteration time 10.73581576347351, critic_loss 0.9301311373710632, critic_grad_norm 0.07695542275905609
+step 206, per iteration time 28.087228059768677, generator_loss 0.4255830418633133, generator_grad_norm 1.4597760438919067, dmdtrain_gradient_norm 0.4765625, critic_loss 0.9684424996376038, critic_grad_norm 0.424852192401886
+step 207, per iteration time 11.205336093902588, critic_loss 0.6423225402832031, critic_grad_norm 0.3198067843914032
+step 208, per iteration time 11.855422973632812, critic_loss 0.55859375, critic_grad_norm 0.11191495507955551
+step 209, per iteration time 10.881314277648926, critic_loss 0.21913249790668488, critic_grad_norm 0.44960013031959534
+step 210, per iteration time 11.891380548477173, critic_loss 1.144309639930725, critic_grad_norm 0.1355665624141693
+step 211, per iteration time 30.866037845611572, generator_loss 0.8762228623190021, generator_grad_norm 0.6677499413490295, dmdtrain_gradient_norm 0.87890625, critic_loss 1.0901637077331543, critic_grad_norm 0.1369071900844574
+step 212, per iteration time 11.424466848373413, critic_loss 0.30184558033943176, critic_grad_norm 0.7363972663879395
+step 213, per iteration time 13.67954421043396, critic_loss 0.076171875, critic_grad_norm 0.35185930132865906
+step 214, per iteration time 12.052939653396606, critic_loss 0.0546875, critic_grad_norm 0.4274270534515381
+step 215, per iteration time 10.923404455184937, critic_loss 0.7869113087654114, critic_grad_norm 0.082182876765728
+step 216, per iteration time 29.415574550628662, generator_loss 0.41489937134979643, generator_grad_norm 0.6961107850074768, dmdtrain_gradient_norm 0.404296875, critic_loss 0.3004177212715149, critic_grad_norm 0.18314118683338165
+step 217, per iteration time 11.78029489517212, critic_loss 0.9943992495536804, critic_grad_norm 0.4862811267375946
+step 218, per iteration time 11.611841201782227, critic_loss 0.3008119463920593, critic_grad_norm 0.32869306206703186
+step 219, per iteration time 11.836030960083008, critic_loss 0.03662109375, critic_grad_norm 0.31775736808776855
+step 220, per iteration time 13.51030683517456, critic_loss 0.36493396759033203, critic_grad_norm 0.6571689248085022
+step 221, per iteration time 25.593231201171875, generator_loss 0.3539176813206768, generator_grad_norm 1.3764511346817017, dmdtrain_gradient_norm 0.3984375, critic_loss 0.14398470520973206, critic_grad_norm 0.1122773289680481
+step 222, per iteration time 13.533232688903809, critic_loss 1.1382006406784058, critic_grad_norm 0.39429956674575806
+step 223, per iteration time 11.729487895965576, critic_loss 0.8747830986976624, critic_grad_norm 0.38338664174079895
+step 224, per iteration time 10.531155347824097, critic_loss 0.9329696297645569, critic_grad_norm 0.10302367061376572
+step 225, per iteration time 10.865578651428223, critic_loss 0.6627439856529236, critic_grad_norm 0.4155783951282501
+step 226, per iteration time 27.444992780685425, generator_loss 0.9044102481046647, generator_grad_norm 2.2775471210479736, dmdtrain_gradient_norm 0.84375, critic_loss 0.09228515625, critic_grad_norm 0.24025262892246246
+step 227, per iteration time 11.495680570602417, critic_loss 0.7201243042945862, critic_grad_norm 0.08531767874956131
+step 228, per iteration time 13.817044734954834, critic_loss 1.1866496801376343, critic_grad_norm 0.1805928349494934
+step 229, per iteration time 10.964887619018555, critic_loss 0.7061913013458252, critic_grad_norm 0.34163200855255127
+step 230, per iteration time 13.721720218658447, critic_loss 0.9792081713676453, critic_grad_norm 0.10666397958993912
+step 231, per iteration time 27.680893182754517, generator_loss 0.3423238986546845, generator_grad_norm 4.11884880065918, dmdtrain_gradient_norm 0.357421875, critic_loss 0.07666015625, critic_grad_norm 0.9352656006813049
+step 232, per iteration time 11.0355384349823, critic_loss 0.7874755263328552, critic_grad_norm 1.3184089660644531
+step 233, per iteration time 12.820796012878418, critic_loss 0.6366796493530273, critic_grad_norm 1.5502328872680664
+step 234, per iteration time 12.294021129608154, critic_loss 0.7703125476837158, critic_grad_norm 1.3114588260650635
+step 235, per iteration time 10.694242000579834, critic_loss 1.2934324741363525, critic_grad_norm 0.9501863718032837
+step 236, per iteration time 28.81689190864563, generator_loss 0.5878839077941698, generator_grad_norm 1.4884775876998901, dmdtrain_gradient_norm 0.455078125, critic_loss 1.0315821170806885, critic_grad_norm 0.2609652578830719
+step 237, per iteration time 12.762656688690186, critic_loss 0.09619140625, critic_grad_norm 0.15895593166351318
+step 238, per iteration time 16.141419410705566, critic_loss 0.6900651454925537, critic_grad_norm 0.165699303150177
+step 239, per iteration time 10.885870933532715, critic_loss 0.7830078601837158, critic_grad_norm 0.10255316644906998
+step 240, per iteration time 12.29470705986023, critic_loss 0.7148942947387695, critic_grad_norm 0.24742694199085236
+step 241, per iteration time 25.35359025001526, generator_loss 0.35943135916592095, generator_grad_norm 2.0119376182556152, dmdtrain_gradient_norm 0.2734375, critic_loss 0.8191883563995361, critic_grad_norm 0.5006682872772217
+step 242, per iteration time 12.076642513275146, critic_loss 1.1163374185562134, critic_grad_norm 0.17697151005268097
+step 243, per iteration time 11.361555576324463, critic_loss 0.579016923904419, critic_grad_norm 0.08802139759063721
+step 244, per iteration time 13.84295916557312, critic_loss 1.0478506088256836, critic_grad_norm 0.3528883755207062
+step 245, per iteration time 12.637388229370117, critic_loss 1.2036396265029907, critic_grad_norm 0.24165713787078857
+step 246, per iteration time 28.54232621192932, generator_loss 0.5146096703248211, generator_grad_norm 1.5072171688079834, dmdtrain_gradient_norm 0.34375, critic_loss 1.1838618516921997, critic_grad_norm 0.20144827663898468
+step 247, per iteration time 14.445706367492676, critic_loss 0.7864258289337158, critic_grad_norm 0.31347790360450745
+step 248, per iteration time 12.509916543960571, critic_loss 0.534472644329071, critic_grad_norm 0.5840641260147095
+step 249, per iteration time 13.362622022628784, critic_loss 1.0735998153686523, critic_grad_norm 0.521872341632843
+step 250, per iteration time 10.666170120239258, critic_loss 0.7267740964889526, critic_grad_norm 0.26411446928977966
+step 251, per iteration time 29.778806447982788, generator_loss 0.2766634940085497, generator_grad_norm 0.7152977585792542, dmdtrain_gradient_norm 0.384765625, critic_loss 0.043701171875, critic_grad_norm 0.13727019727230072
+step 252, per iteration time 11.466999769210815, critic_loss 1.2104315757751465, critic_grad_norm 0.2519066333770752
+step 253, per iteration time 13.041455745697021, critic_loss 0.1435546875, critic_grad_norm 0.17817965149879456
+step 254, per iteration time 12.339912414550781, critic_loss 1.3178057670593262, critic_grad_norm 0.33320462703704834
+step 255, per iteration time 11.507148265838623, critic_loss 1.10660719871521, critic_grad_norm 0.33947616815567017
+step 256, per iteration time 28.97011113166809, generator_loss 0.2745562605118173, generator_grad_norm 1.610848069190979, dmdtrain_gradient_norm 0.32421875, critic_loss 0.06787109375, critic_grad_norm 0.41705650091171265
+step 257, per iteration time 11.464154243469238, critic_loss 0.8046239614486694, critic_grad_norm 0.5997056365013123
+step 258, per iteration time 10.707481145858765, critic_loss 1.220452070236206, critic_grad_norm 1.0775933265686035
+step 259, per iteration time 10.580536365509033, critic_loss 0.05859375, critic_grad_norm 0.18110291659832
+step 260, per iteration time 12.381393194198608, critic_loss 0.11597377061843872, critic_grad_norm 0.18125270307064056
+step 261, per iteration time 29.056284189224243, generator_loss 0.44153630720180337, generator_grad_norm 1.054019808769226, dmdtrain_gradient_norm 0.30859375, critic_loss 1.09765625, critic_grad_norm 0.15745659172534943
+step 262, per iteration time 12.36167311668396, critic_loss 0.9495256543159485, critic_grad_norm 0.16625253856182098
+step 263, per iteration time 12.755402088165283, critic_loss 0.8080161809921265, critic_grad_norm 0.14516125619411469
+step 264, per iteration time 12.403836488723755, critic_loss 0.7829905152320862, critic_grad_norm 0.3764631450176239
+step 265, per iteration time 11.90608263015747, critic_loss 0.07275390625, critic_grad_norm 0.182347372174263
+step 266, per iteration time 27.38834309577942, generator_loss 0.40828129190343637, generator_grad_norm 1.5202971696853638, dmdtrain_gradient_norm 0.337890625, critic_loss 1.1422209739685059, critic_grad_norm 0.13575439155101776
+step 267, per iteration time 10.843397378921509, critic_loss 0.1358119398355484, critic_grad_norm 0.6091750264167786
+step 268, per iteration time 11.483989238739014, critic_loss 0.4890206754207611, critic_grad_norm 0.2176630198955536
+step 269, per iteration time 13.334112167358398, critic_loss 1.1318359375, critic_grad_norm 0.3052322268486023
+step 270, per iteration time 11.47962212562561, critic_loss 0.7668945789337158, critic_grad_norm 0.4776250720024109
+step 271, per iteration time 25.226383686065674, generator_loss 0.2953547946234166, generator_grad_norm 2.5705904960632324, dmdtrain_gradient_norm 0.46875, critic_loss 0.034912109375, critic_grad_norm 0.08643048256635666
+step 272, per iteration time 13.25732946395874, critic_loss 0.6482617259025574, critic_grad_norm 0.15483878552913666
+step 273, per iteration time 11.579156875610352, critic_loss 0.138671875, critic_grad_norm 0.10363377630710602
+step 274, per iteration time 10.734461069107056, critic_loss 0.8081929683685303, critic_grad_norm 0.4681323766708374
+step 275, per iteration time 14.075206995010376, critic_loss 0.7955384850502014, critic_grad_norm 0.34566155076026917
+step 276, per iteration time 26.345789909362793, generator_loss 0.38294479662893227, generator_grad_norm 1.7949556112289429, dmdtrain_gradient_norm 0.345703125, critic_loss 0.78843754529953, critic_grad_norm 0.7250224351882935
+step 277, per iteration time 10.882057666778564, critic_loss 0.14663085341453552, critic_grad_norm 0.07279608398675919
+step 278, per iteration time 13.939541339874268, critic_loss 0.12189002335071564, critic_grad_norm 0.17046238481998444
+step 279, per iteration time 13.458147525787354, critic_loss 0.7109542489051819, critic_grad_norm 0.23898707330226898
+step 280, per iteration time 13.489760398864746, critic_loss 0.4143272340297699, critic_grad_norm 0.6196879148483276
+step 281, per iteration time 29.45325016975403, generator_loss 0.4539670054320242, generator_grad_norm 1.0222011804580688, dmdtrain_gradient_norm 0.5390625, critic_loss 0.5794744491577148, critic_grad_norm 0.46984755992889404
+step 282, per iteration time 11.689781665802002, critic_loss 0.054931640625, critic_grad_norm 0.6819429993629456
+step 283, per iteration time 10.586882591247559, critic_loss 1.0372846126556396, critic_grad_norm 0.25707578659057617
+step 284, per iteration time 13.5511794090271, critic_loss 1.0647811889648438, critic_grad_norm 0.1545894294977188
+step 285, per iteration time 14.730069160461426, critic_loss 1.2148669958114624, critic_grad_norm 0.3539212644100189
+step 286, per iteration time 29.661685943603516, generator_loss 0.23125922822978992, generator_grad_norm 1.0441913604736328, dmdtrain_gradient_norm 0.43359375, critic_loss 0.0654296875, critic_grad_norm 0.19170214235782623
+step 287, per iteration time 13.766029596328735, critic_loss 0.9977455139160156, critic_grad_norm 0.3617478311061859
+step 288, per iteration time 10.555052042007446, critic_loss 1.0603320598602295, critic_grad_norm 0.1489976942539215
+step 289, per iteration time 13.768454790115356, critic_loss 0.7690978646278381, critic_grad_norm 0.5084906220436096
+step 290, per iteration time 13.388996124267578, critic_loss 0.3324888348579407, critic_grad_norm 0.3566630780696869
+step 291, per iteration time 27.007369995117188, generator_loss 0.2804574044124884, generator_grad_norm 0.6564109921455383, dmdtrain_gradient_norm 0.51953125, critic_loss 0.13203124701976776, critic_grad_norm 0.09623593091964722
+step 292, per iteration time 13.725604772567749, critic_loss 0.291069895029068, critic_grad_norm 0.15586122870445251
+step 293, per iteration time 10.656797885894775, critic_loss 0.7664062976837158, critic_grad_norm 0.4020383656024933
+step 294, per iteration time 12.412592649459839, critic_loss 1.2462403774261475, critic_grad_norm 0.48987412452697754
+step 295, per iteration time 13.357168197631836, critic_loss 0.7826572060585022, critic_grad_norm 0.22803309559822083
+step 296, per iteration time 28.404215574264526, generator_loss 0.7440726061180966, generator_grad_norm 1.748148798942566, dmdtrain_gradient_norm 0.50390625, critic_loss 1.3357501029968262, critic_grad_norm 0.49167558550834656
+step 297, per iteration time 12.699638843536377, critic_loss 0.19448800384998322, critic_grad_norm 0.626301646232605
+step 298, per iteration time 13.425463914871216, critic_loss 1.019521951675415, critic_grad_norm 0.3608621656894684
+step 299, per iteration time 13.462382793426514, critic_loss 1.254120111465454, critic_grad_norm 0.43954282999038696
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Model saved to /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000300/model.pt
+Checkpoint cleanup: Found 6 checkpoints, removing 1 oldest ones (keeping 5)
+  Removing: checkpoint_model_000094 (step 94)
+Checkpoint cleanup completed: removed 1/1 old checkpoints
+step 300, per iteration time 36.16841506958008, critic_loss 1.2967872619628906, critic_grad_norm 0.08987396955490112
+step 301, per iteration time 27.738624811172485, generator_loss 0.5962399934754365, generator_grad_norm 2.9334611892700195, dmdtrain_gradient_norm 0.640625, critic_loss 0.7470345497131348, critic_grad_norm 0.3417682349681854
+step 302, per iteration time 10.90395998954773, critic_loss 0.8232747912406921, critic_grad_norm 0.08789795637130737
+step 303, per iteration time 14.183496713638306, critic_loss 0.3498407006263733, critic_grad_norm 0.5494255423545837
+step 304, per iteration time 13.719354391098022, critic_loss 1.1227933168411255, critic_grad_norm 0.32684633135795593
+step 305, per iteration time 13.667209148406982, critic_loss 0.3926595151424408, critic_grad_norm 0.22038733959197998
+step 306, per iteration time 30.573139429092407, generator_loss 0.5979331522034176, generator_grad_norm 0.8290430903434753, dmdtrain_gradient_norm 0.546875, critic_loss 0.8287428021430969, critic_grad_norm 0.18740107119083405
+step 307, per iteration time 11.457859516143799, critic_loss 0.21467846632003784, critic_grad_norm 0.19270992279052734
+step 308, per iteration time 11.525725364685059, critic_loss 1.0491479635238647, critic_grad_norm 0.622495174407959
+step 309, per iteration time 13.362949848175049, critic_loss 0.037841796875, critic_grad_norm 0.1684778779745102
+step 310, per iteration time 10.60503602027893, critic_loss 0.057373046875, critic_grad_norm 0.34575554728507996
+step 311, per iteration time 27.898534536361694, generator_loss 0.39151068713414583, generator_grad_norm 1.9056894779205322, dmdtrain_gradient_norm 0.32421875, critic_loss 1.1579011678695679, critic_grad_norm 1.3650933504104614
+step 312, per iteration time 12.505293607711792, critic_loss 0.4665358364582062, critic_grad_norm 0.15505661070346832
+step 313, per iteration time 13.894695043563843, critic_loss 1.0613346099853516, critic_grad_norm 0.1303865760564804
+step 314, per iteration time 13.955609560012817, critic_loss 0.062255859375, critic_grad_norm 0.48771151900291443
+step 315, per iteration time 13.949537754058838, critic_loss 1.1609785556793213, critic_grad_norm 0.10109816491603851
+step 316, per iteration time 27.737631797790527, generator_loss 0.3281188728584126, generator_grad_norm 0.7145692706108093, dmdtrain_gradient_norm 0.37109375, critic_loss 0.04150390625, critic_grad_norm 0.42538711428642273
+step 317, per iteration time 13.354588985443115, critic_loss 1.0637857913970947, critic_grad_norm 0.18336255848407745
+step 318, per iteration time 11.515450716018677, critic_loss 0.19578960537910461, critic_grad_norm 0.07712577283382416
+step 319, per iteration time 13.975173950195312, critic_loss 0.9700629115104675, critic_grad_norm 0.27956557273864746
+step 320, per iteration time 12.239578485488892, critic_loss 0.9098144769668579, critic_grad_norm 0.7626023888587952
+step 321, per iteration time 27.678942918777466, generator_loss 0.38168346069396897, generator_grad_norm 1.5011467933654785, dmdtrain_gradient_norm 0.427734375, critic_loss 0.5749097466468811, critic_grad_norm 0.07955469936132431
+step 322, per iteration time 10.540156126022339, critic_loss 0.0791015625, critic_grad_norm 0.7897719144821167
+step 323, per iteration time 12.83480191230774, critic_loss 0.35164281725883484, critic_grad_norm 0.1886330097913742
+step 324, per iteration time 13.647218942642212, critic_loss 0.04931640625, critic_grad_norm 0.11988451331853867
+step 325, per iteration time 13.625067472457886, critic_loss 1.1509578227996826, critic_grad_norm 0.40140485763549805
+step 326, per iteration time 25.704657077789307, generator_loss 0.471720350119887, generator_grad_norm 2.4844589233398438, dmdtrain_gradient_norm 0.384765625, critic_loss 0.9582250118255615, critic_grad_norm 0.48526841402053833
+step 327, per iteration time 13.362683296203613, critic_loss 0.9128484725952148, critic_grad_norm 0.22890131175518036
+step 328, per iteration time 12.638991117477417, critic_loss 1.1224733591079712, critic_grad_norm 0.6248863339424133
+step 329, per iteration time 12.414249897003174, critic_loss 1.1023653745651245, critic_grad_norm 0.11706331372261047
+step 330, per iteration time 11.489471435546875, critic_loss 1.0646874904632568, critic_grad_norm 0.310073584318161
+step 331, per iteration time 27.364683151245117, generator_loss 0.38654850497082416, generator_grad_norm 2.5017549991607666, dmdtrain_gradient_norm 0.4765625, critic_loss 0.7702288031578064, critic_grad_norm 0.11600770056247711
+step 332, per iteration time 12.402771949768066, critic_loss 0.35804736614227295, critic_grad_norm 0.10808773338794708
+step 333, per iteration time 12.201454401016235, critic_loss 0.6042885184288025, critic_grad_norm 0.06544655561447144
+step 334, per iteration time 11.537111520767212, critic_loss 0.9550518989562988, critic_grad_norm 0.10074152797460556
+step 335, per iteration time 10.505325078964233, critic_loss 0.7290527820587158, critic_grad_norm 0.3194156885147095
+step 336, per iteration time 27.1865713596344, generator_loss 0.9110022223696219, generator_grad_norm 3.3393797874450684, dmdtrain_gradient_norm 0.859375, critic_loss 1.0576529502868652, critic_grad_norm 0.5063993334770203
+step 337, per iteration time 12.39818787574768, critic_loss 1.2146738767623901, critic_grad_norm 0.20704197883605957
+step 338, per iteration time 13.489264965057373, critic_loss 0.26393407583236694, critic_grad_norm 0.15350916981697083
+step 339, per iteration time 13.811043977737427, critic_loss 1.3048591613769531, critic_grad_norm 0.2749425768852234
+step 340, per iteration time 10.566452026367188, critic_loss 0.48027342557907104, critic_grad_norm 0.21409662067890167
+step 341, per iteration time 28.424569368362427, generator_loss 0.7196286112156756, generator_grad_norm 2.341984510421753, dmdtrain_gradient_norm 0.671875, critic_loss 1.1253820657730103, critic_grad_norm 0.44799432158470154
+step 342, per iteration time 12.9120512008667, critic_loss 0.47869256138801575, critic_grad_norm 0.6550117135047913
+step 343, per iteration time 12.078836679458618, critic_loss 0.14610770344734192, critic_grad_norm 0.2525872588157654
+step 344, per iteration time 11.510478734970093, critic_loss 1.1058870553970337, critic_grad_norm 0.10040189325809479
+step 345, per iteration time 10.554884672164917, critic_loss 0.0986328125, critic_grad_norm 0.5226976275444031
+step 346, per iteration time 28.68303108215332, generator_loss 0.4825685384324132, generator_grad_norm 0.7543465495109558, dmdtrain_gradient_norm 0.458984375, critic_loss 0.2529359459877014, critic_grad_norm 0.23775802552700043
+step 347, per iteration time 13.301180124282837, critic_loss 0.8803955316543579, critic_grad_norm 0.0860166847705841
+step 348, per iteration time 13.377095699310303, critic_loss 0.028564453125, critic_grad_norm 0.09608136862516403
+step 349, per iteration time 10.619698762893677, critic_loss 1.0492937564849854, critic_grad_norm 0.5149540305137634
+step 350, per iteration time 12.441678762435913, critic_loss 1.0400390625, critic_grad_norm 0.0901000127196312
+step 351, per iteration time 28.484550952911377, generator_loss 0.4227374432692703, generator_grad_norm 1.2319949865341187, dmdtrain_gradient_norm 0.5078125, critic_loss 0.3573102653026581, critic_grad_norm 0.3754759728908539
+step 352, per iteration time 12.519484043121338, critic_loss 1.1373685598373413, critic_grad_norm 0.22486808896064758
+step 353, per iteration time 13.119879484176636, critic_loss 0.040771484375, critic_grad_norm 0.09162493795156479
+step 354, per iteration time 13.49073338508606, critic_loss 0.052001953125, critic_grad_norm 0.09892959892749786
+step 355, per iteration time 13.579638957977295, critic_loss 0.49363836646080017, critic_grad_norm 0.11812111735343933
+step 356, per iteration time 27.671528339385986, generator_loss 0.308761952316296, generator_grad_norm 0.7064560055732727, dmdtrain_gradient_norm 0.41015625, critic_loss 0.36912116408348083, critic_grad_norm 0.07841148972511292
+step 357, per iteration time 13.7647705078125, critic_loss 0.02783203125, critic_grad_norm 0.06982295215129852
+step 358, per iteration time 12.468129396438599, critic_loss 1.0439453125, critic_grad_norm 0.23527471721172333
+step 359, per iteration time 10.833845138549805, critic_loss 1.1230201721191406, critic_grad_norm 0.3034690022468567
+step 360, per iteration time 10.793536186218262, critic_loss 1.0930078029632568, critic_grad_norm 0.5305435657501221
+step 361, per iteration time 28.05689525604248, generator_loss 0.6427534108902668, generator_grad_norm 0.9462614059448242, dmdtrain_gradient_norm 0.68359375, critic_loss 0.6098455786705017, critic_grad_norm 0.14203183352947235
+step 362, per iteration time 11.470638990402222, critic_loss 1.0702383518218994, critic_grad_norm 0.28976187109947205
+step 363, per iteration time 10.786410093307495, critic_loss 0.0269775390625, critic_grad_norm 0.15719173848628998
+step 364, per iteration time 13.600115537643433, critic_loss 0.8995792269706726, critic_grad_norm 0.05765944719314575
+step 365, per iteration time 14.28119969367981, critic_loss 0.18271483480930328, critic_grad_norm 0.4174673855304718
+step 366, per iteration time 28.955523014068604, generator_loss 0.4865748626652472, generator_grad_norm 0.7634742259979248, dmdtrain_gradient_norm 0.423828125, critic_loss 0.6931067705154419, critic_grad_norm 0.08898283541202545
+step 367, per iteration time 11.666996002197266, critic_loss 0.3894585371017456, critic_grad_norm 0.1684432476758957
+step 368, per iteration time 10.58354640007019, critic_loss 0.7277100086212158, critic_grad_norm 0.25624188780784607
+step 369, per iteration time 13.769846677780151, critic_loss 0.042236328125, critic_grad_norm 0.28020551800727844
+step 370, per iteration time 12.616719722747803, critic_loss 0.7385742664337158, critic_grad_norm 0.08681440353393555
+step 371, per iteration time 27.83443307876587, generator_loss 0.5911269167973574, generator_grad_norm 1.7668384313583374, dmdtrain_gradient_norm 0.5390625, critic_loss 1.0463874340057373, critic_grad_norm 0.6313535571098328
+step 372, per iteration time 11.457590579986572, critic_loss 0.033203125, critic_grad_norm 0.1849515736103058
+step 373, per iteration time 13.404157400131226, critic_loss 0.7922050356864929, critic_grad_norm 0.29493603110313416
+step 374, per iteration time 11.661723852157593, critic_loss 0.719289243221283, critic_grad_norm 0.07397621124982834
+step 375, per iteration time 12.92690396308899, critic_loss 1.1126292943954468, critic_grad_norm 0.14759351313114166
+step 376, per iteration time 32.07866859436035, generator_loss 0.8046031095156465, generator_grad_norm 3.462057590484619, dmdtrain_gradient_norm 0.76953125, critic_loss 0.9244531989097595, critic_grad_norm 0.18237987160682678
+step 377, per iteration time 11.513668298721313, critic_loss 0.81097412109375, critic_grad_norm 0.679553747177124
+step 378, per iteration time 12.422647476196289, critic_loss 0.7632853984832764, critic_grad_norm 0.27361249923706055
+step 379, per iteration time 14.468973398208618, critic_loss 0.550386905670166, critic_grad_norm 0.07445807754993439
+step 380, per iteration time 11.539161920547485, critic_loss 0.03076171875, critic_grad_norm 0.10109245777130127
+step 381, per iteration time 27.621577262878418, generator_loss 0.3925847042888677, generator_grad_norm 0.9831637740135193, dmdtrain_gradient_norm 0.49609375, critic_loss 0.0272216796875, critic_grad_norm 0.05534099042415619
+step 382, per iteration time 11.85931944847107, critic_loss 1.0278749465942383, critic_grad_norm 0.17605574429035187
+step 383, per iteration time 13.631856679916382, critic_loss 1.0915666818618774, critic_grad_norm 0.46194565296173096
+step 384, per iteration time 11.888067245483398, critic_loss 0.0238037109375, critic_grad_norm 0.061873432248830795
+step 385, per iteration time 11.533042192459106, critic_loss 0.045654296875, critic_grad_norm 0.10972441732883453
+step 386, per iteration time 29.43226981163025, generator_loss 0.4217706831376981, generator_grad_norm 0.5402544736862183, dmdtrain_gradient_norm 0.51953125, critic_loss 0.0279541015625, critic_grad_norm 0.1365363448858261
+step 387, per iteration time 12.353646516799927, critic_loss 0.37164199352264404, critic_grad_norm 0.16424794495105743
+step 388, per iteration time 11.871074914932251, critic_loss 1.0531378984451294, critic_grad_norm 0.08093369007110596
+step 389, per iteration time 13.824686050415039, critic_loss 1.0738894939422607, critic_grad_norm 0.5313870310783386
+step 390, per iteration time 16.451539039611816, critic_loss 0.7605045437812805, critic_grad_norm 0.4299890995025635
+step 391, per iteration time 29.496769428253174, generator_loss 0.9700413242370627, generator_grad_norm 0.7059957385063171, dmdtrain_gradient_norm 0.75390625, critic_loss 1.1860216856002808, critic_grad_norm 0.13158144056797028
+step 392, per iteration time 12.755049467086792, critic_loss 1.1216661930084229, critic_grad_norm 0.11586915701627731
+step 393, per iteration time 13.070364952087402, critic_loss 0.8453848958015442, critic_grad_norm 0.0583484023809433
+step 394, per iteration time 13.69865894317627, critic_loss 1.0490103960037231, critic_grad_norm 0.06282337009906769
+step 395, per iteration time 14.1633620262146, critic_loss 0.031005859375, critic_grad_norm 0.2075146734714508
+step 396, per iteration time 28.519559383392334, generator_loss 0.5368001007121223, generator_grad_norm 1.199530839920044, dmdtrain_gradient_norm 0.60546875, critic_loss 0.7887653112411499, critic_grad_norm 0.16638095676898956
+step 397, per iteration time 10.538790941238403, critic_loss 0.8317878246307373, critic_grad_norm 0.10872512310743332
+step 398, per iteration time 12.718822002410889, critic_loss 0.0322265625, critic_grad_norm 0.18728339672088623
+step 399, per iteration time 13.85556936264038, critic_loss 1.1019283533096313, critic_grad_norm 0.12148381769657135
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Generating video of length 21
+Generating video of length 21
+Generating video of length 21
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)[ActionInference] kv_cache_size: 18720 (policy: local, size=12)[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+
+
+[Block 0] Generating frames 0 to 3
+
+[Block 0] Generating frames 0 to 3
+
+[Block 0] Generating frames 0 to 3
+Model saved to /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000400/model.pt
+Checkpoint cleanup: Found 6 checkpoints, removing 1 oldest ones (keeping 5)
+  Removing: checkpoint_model_000096 (step 96)
+Checkpoint cleanup completed: removed 1/1 old checkpoints
+step 400, per iteration time 44.11177039146423, critic_loss 0.7282175421714783, critic_grad_norm 0.12738099694252014
+Generating video of length 21
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+step 401, per iteration time 40.114763259887695, generator_loss 0.6060962494104802, generator_grad_norm 0.9019953608512878, dmdtrain_gradient_norm 0.73046875, critic_loss 0.0289306640625, critic_grad_norm 0.23477405309677124
+step 402, per iteration time 13.364326477050781, critic_loss 0.6111649870872498, critic_grad_norm 0.31679725646972656
+step 403, per iteration time 13.023399353027344, critic_loss 0.7745349407196045, critic_grad_norm 0.6005626916885376
+step 404, per iteration time 12.794835329055786, critic_loss 0.6388343572616577, critic_grad_norm 0.42260605096817017
+step 405, per iteration time 13.701748371124268, critic_loss 0.03125, critic_grad_norm 0.4526946246623993
+step 406, per iteration time 28.019086360931396, generator_loss 0.4319411338732554, generator_grad_norm 1.0111947059631348, dmdtrain_gradient_norm 0.51171875, critic_loss 0.810428261756897, critic_grad_norm 0.1316048949956894
+step 407, per iteration time 12.586194515228271, critic_loss 1.0224609375, critic_grad_norm 0.3954692780971527
+step 408, per iteration time 13.777443647384644, critic_loss 0.5455247163772583, critic_grad_norm 0.11661867052316666
+step 409, per iteration time 12.44315242767334, critic_loss 0.8822234869003296, critic_grad_norm 0.09631180763244629
+step 410, per iteration time 13.888134241104126, critic_loss 1.0166006088256836, critic_grad_norm 0.16632211208343506
+step 411, per iteration time 30.300984382629395, generator_loss 0.5805057012361018, generator_grad_norm 0.5723015069961548, dmdtrain_gradient_norm 0.61328125, critic_loss 0.777496337890625, critic_grad_norm 0.28743353486061096
+step 412, per iteration time 11.764392137527466, critic_loss 0.9063057899475098, critic_grad_norm 0.06468214094638824
+step 413, per iteration time 13.382014513015747, critic_loss 1.0289306640625, critic_grad_norm 0.141189306974411
+step 414, per iteration time 11.007677793502808, critic_loss 1.2405017614364624, critic_grad_norm 0.30447500944137573
+step 415, per iteration time 15.30309510231018, critic_loss 0.0654296875, critic_grad_norm 0.14075621962547302
+step 416, per iteration time 27.811439752578735, generator_loss 0.5176926907235231, generator_grad_norm 0.5391894578933716, dmdtrain_gradient_norm 0.56640625, critic_loss 0.7482054829597473, critic_grad_norm 0.1891227513551712
+step 417, per iteration time 13.674948930740356, critic_loss 0.07421875, critic_grad_norm 0.21252261102199554
+step 418, per iteration time 11.84697961807251, critic_loss 1.0657442808151245, critic_grad_norm 0.21957966685295105
+step 419, per iteration time 12.805188417434692, critic_loss 0.6709313988685608, critic_grad_norm 0.11842754483222961
+step 420, per iteration time 13.03905701637268, critic_loss 0.48247069120407104, critic_grad_norm 0.4420991539955139
+step 421, per iteration time 29.292914628982544, generator_loss 0.6388773978387535, generator_grad_norm 0.7241336703300476, dmdtrain_gradient_norm 0.54296875, critic_loss 0.48588865995407104, critic_grad_norm 0.2860283851623535
+step 422, per iteration time 10.95054030418396, critic_loss 0.8871093988418579, critic_grad_norm 0.5615154504776001
+step 423, per iteration time 11.338720321655273, critic_loss 0.8033154010772705, critic_grad_norm 0.8170313835144043
+step 424, per iteration time 12.168159246444702, critic_loss 0.4663020670413971, critic_grad_norm 0.09000776708126068
+step 425, per iteration time 13.599784851074219, critic_loss 0.0279541015625, critic_grad_norm 0.10390611737966537
+step 426, per iteration time 27.89902973175049, generator_loss 0.750900232666762, generator_grad_norm 1.0489716529846191, dmdtrain_gradient_norm 0.73046875, critic_loss 0.867966890335083, critic_grad_norm 0.5943512320518494
+step 427, per iteration time 13.968562602996826, critic_loss 0.04638671875, critic_grad_norm 0.25647246837615967
+step 428, per iteration time 11.268924474716187, critic_loss 0.7644389867782593, critic_grad_norm 0.4497271180152893
+step 429, per iteration time 13.488593816757202, critic_loss 0.068359375, critic_grad_norm 0.4765428304672241
+step 430, per iteration time 11.489989042282104, critic_loss 0.08642578125, critic_grad_norm 0.5301976203918457
+step 431, per iteration time 27.231266498565674, generator_loss 0.6309776370381268, generator_grad_norm 1.4150928258895874, dmdtrain_gradient_norm 0.6484375, critic_loss 0.049072265625, critic_grad_norm 0.19306707382202148
+step 432, per iteration time 10.524381160736084, critic_loss 0.2175292819738388, critic_grad_norm 0.09745830297470093
+step 433, per iteration time 10.556154489517212, critic_loss 1.021728515625, critic_grad_norm 0.5729502439498901
+step 434, per iteration time 11.90269136428833, critic_loss 0.5504205226898193, critic_grad_norm 0.05711512267589569
+step 435, per iteration time 10.6591055393219, critic_loss 1.1571853160858154, critic_grad_norm 0.7255238890647888
+step 436, per iteration time 28.06831669807434, generator_loss 0.7081189464587353, generator_grad_norm 0.9996868371963501, dmdtrain_gradient_norm 0.5859375, critic_loss 1.0680195093154907, critic_grad_norm 0.1687503159046173
+step 437, per iteration time 11.015880107879639, critic_loss 0.33135342597961426, critic_grad_norm 0.5201614499092102
+step 438, per iteration time 12.410718202590942, critic_loss 0.043212890625, critic_grad_norm 0.4260339140892029
+step 439, per iteration time 13.07319712638855, critic_loss 1.0466965436935425, critic_grad_norm 0.857234537601471
+step 440, per iteration time 11.485935688018799, critic_loss 0.044677734375, critic_grad_norm 0.2427252233028412
+step 441, per iteration time 28.11990737915039, generator_loss 0.7095159938615555, generator_grad_norm 2.10650634765625, dmdtrain_gradient_norm 0.60546875, critic_loss 1.1594990491867065, critic_grad_norm 0.44491228461265564
+step 442, per iteration time 12.315227270126343, critic_loss 0.2435786873102188, critic_grad_norm 0.11913838237524033
+step 443, per iteration time 11.48242735862732, critic_loss 0.09364303946495056, critic_grad_norm 0.5818313956260681
+step 444, per iteration time 17.91233730316162, critic_loss 0.8441312909126282, critic_grad_norm 0.07322201132774353
+step 445, per iteration time 11.60179853439331, critic_loss 0.41891252994537354, critic_grad_norm 0.6519421935081482
+step 446, per iteration time 28.908679485321045, generator_loss 0.7312079528183915, generator_grad_norm 1.4516998529434204, dmdtrain_gradient_norm 0.6875, critic_loss 0.3885651230812073, critic_grad_norm 0.3044121265411377
+step 447, per iteration time 11.664328336715698, critic_loss 0.47411924600601196, critic_grad_norm 0.06202790513634682
+step 448, per iteration time 10.542528867721558, critic_loss 0.9165576696395874, critic_grad_norm 0.2783588171005249
+step 449, per iteration time 12.720937252044678, critic_loss 1.1061888933181763, critic_grad_norm 0.17127132415771484
+step 450, per iteration time 12.44309377670288, critic_loss 0.7244092226028442, critic_grad_norm 0.22414147853851318
+step 451, per iteration time 26.719489812850952, generator_loss 0.5185605894253178, generator_grad_norm 1.244244933128357, dmdtrain_gradient_norm 0.439453125, critic_loss 1.1194008588790894, critic_grad_norm 0.48686328530311584
+step 452, per iteration time 14.786962270736694, critic_loss 0.06396484375, critic_grad_norm 0.19437870383262634
+step 453, per iteration time 13.767526149749756, critic_loss 1.0909143686294556, critic_grad_norm 0.11698788404464722
+step 454, per iteration time 11.763669729232788, critic_loss 0.04931640625, critic_grad_norm 0.13341635465621948
+step 455, per iteration time 13.059735774993896, critic_loss 1.1757643222808838, critic_grad_norm 0.18105238676071167
+step 456, per iteration time 30.806506633758545, generator_loss 0.500505544832283, generator_grad_norm 1.1199698448181152, dmdtrain_gradient_norm 0.435546875, critic_loss 0.507128894329071, critic_grad_norm 0.5910733342170715
+step 457, per iteration time 10.520174980163574, critic_loss 0.9325904846191406, critic_grad_norm 0.18652868270874023
+step 458, per iteration time 13.79652714729309, critic_loss 1.044677734375, critic_grad_norm 0.16744422912597656
+step 459, per iteration time 11.565398931503296, critic_loss 0.05646428465843201, critic_grad_norm 0.1111154556274414
+step 460, per iteration time 10.584125757217407, critic_loss 0.7544352412223816, critic_grad_norm 0.16758118569850922
+step 461, per iteration time 31.220983505249023, generator_loss 0.6456706151262388, generator_grad_norm 0.7105778455734253, dmdtrain_gradient_norm 0.51171875, critic_loss 0.9460805654525757, critic_grad_norm 0.13617759943008423
+step 462, per iteration time 13.447137117385864, critic_loss 0.24222348630428314, critic_grad_norm 0.09257134795188904
+step 463, per iteration time 13.023419857025146, critic_loss 1.1159846782684326, critic_grad_norm 0.10759510099887848
+step 464, per iteration time 12.628751277923584, critic_loss 0.9283566474914551, critic_grad_norm 0.06850489228963852
+step 465, per iteration time 10.547288179397583, critic_loss 1.022216796875, critic_grad_norm 0.5834442973136902
+step 466, per iteration time 29.280490159988403, generator_loss 0.386238605425386, generator_grad_norm 1.0095188617706299, dmdtrain_gradient_norm 0.455078125, critic_loss 0.9334961175918579, critic_grad_norm 0.20173314213752747
+step 467, per iteration time 11.482768774032593, critic_loss 0.17538908123970032, critic_grad_norm 0.36483973264694214
+step 468, per iteration time 10.893020391464233, critic_loss 0.0242919921875, critic_grad_norm 0.3593420684337616
+step 469, per iteration time 12.400899648666382, critic_loss 0.7161567211151123, critic_grad_norm 0.3013211190700531
+step 470, per iteration time 12.779589891433716, critic_loss 1.1576441526412964, critic_grad_norm 0.519113302230835
+step 471, per iteration time 28.269556999206543, generator_loss 0.4886790740647993, generator_grad_norm 0.6591076850891113, dmdtrain_gradient_norm 0.5, critic_loss 1.1090246438980103, critic_grad_norm 0.23365062475204468
+step 472, per iteration time 11.817310571670532, critic_loss 0.033203125, critic_grad_norm 0.12138158082962036
+step 473, per iteration time 10.536611795425415, critic_loss 1.0685629844665527, critic_grad_norm 0.3916066884994507
+step 474, per iteration time 13.360982656478882, critic_loss 0.9748735427856445, critic_grad_norm 0.15914399921894073
+step 475, per iteration time 10.799237489700317, critic_loss 1.1451948881149292, critic_grad_norm 0.20948703587055206
+step 476, per iteration time 28.701470851898193, generator_loss 0.961912946462107, generator_grad_norm 1.455230474472046, dmdtrain_gradient_norm 0.85546875, critic_loss 0.7734797596931458, critic_grad_norm 0.5788404941558838
+step 477, per iteration time 11.959364891052246, critic_loss 0.6428908109664917, critic_grad_norm 0.30663371086120605
+step 478, per iteration time 10.810425043106079, critic_loss 1.0721418857574463, critic_grad_norm 0.40713006258010864
+step 479, per iteration time 11.520254373550415, critic_loss 0.772667646408081, critic_grad_norm 0.07505950331687927
+step 480, per iteration time 13.868257522583008, critic_loss 0.046630859375, critic_grad_norm 0.08755974471569061
+step 481, per iteration time 26.99396538734436, generator_loss 0.5225420724329569, generator_grad_norm 0.9835444688796997, dmdtrain_gradient_norm 0.56640625, critic_loss 0.611872673034668, critic_grad_norm 0.19554948806762695
+step 482, per iteration time 11.512326002120972, critic_loss 1.009448766708374, critic_grad_norm 0.1580096036195755
+step 483, per iteration time 10.58529806137085, critic_loss 1.1072152853012085, critic_grad_norm 0.4417853355407715
+step 484, per iteration time 11.885333061218262, critic_loss 1.1852270364761353, critic_grad_norm 0.3521105945110321
+step 485, per iteration time 10.56696081161499, critic_loss 0.6789053082466125, critic_grad_norm 0.5727761387825012
+step 486, per iteration time 27.750385999679565, generator_loss 0.445741554106839, generator_grad_norm 1.748961329460144, dmdtrain_gradient_norm 0.50390625, critic_loss 0.021240234375, critic_grad_norm 0.5125933885574341
+step 487, per iteration time 10.549884796142578, critic_loss 0.06441406160593033, critic_grad_norm 0.13843412697315216
+step 488, per iteration time 10.553662300109863, critic_loss 1.0542038679122925, critic_grad_norm 0.09711343795061111
+step 489, per iteration time 10.552051544189453, critic_loss 0.0361328125, critic_grad_norm 0.2410130351781845
+step 490, per iteration time 12.517309427261353, critic_loss 0.7845905423164368, critic_grad_norm 0.08059388399124146
+step 491, per iteration time 27.466850996017456, generator_loss 0.718684239478286, generator_grad_norm 1.2570278644561768, dmdtrain_gradient_norm 0.58203125, critic_loss 0.8511168956756592, critic_grad_norm 0.35617774724960327
+step 492, per iteration time 10.525154113769531, critic_loss 1.1917070150375366, critic_grad_norm 0.3631005585193634
+step 493, per iteration time 10.574549674987793, critic_loss 1.0527139902114868, critic_grad_norm 0.31855839490890503
+step 494, per iteration time 12.457955837249756, critic_loss 0.042724609375, critic_grad_norm 0.0657140389084816
+step 495, per iteration time 14.79342532157898, critic_loss 0.8252975344657898, critic_grad_norm 0.18635398149490356
+step 496, per iteration time 27.704903841018677, generator_loss 0.5454234056638814, generator_grad_norm 0.9477699995040894, dmdtrain_gradient_norm 0.474609375, critic_loss 0.8775848150253296, critic_grad_norm 0.17120856046676636
+step 497, per iteration time 13.172904253005981, critic_loss 0.4133701026439667, critic_grad_norm 0.08512253314256668
+step 498, per iteration time 12.811901569366455, critic_loss 0.9750319123268127, critic_grad_norm 0.3183881938457489
+step 499, per iteration time 13.349289655685425, critic_loss 1.0924804210662842, critic_grad_norm 0.15904369950294495
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Model saved to /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000500/model.pt
+Checkpoint cleanup: Found 6 checkpoints, removing 1 oldest ones (keeping 5)
+  Removing: checkpoint_model_000098 (step 98)
+Checkpoint cleanup completed: removed 1/1 old checkpoints
+step 500, per iteration time 35.640137672424316, critic_loss 0.7516902685165405, critic_grad_norm 0.1332433670759201
+step 501, per iteration time 33.821956634521484, generator_loss 0.8980239096204764, generator_grad_norm 0.6019698977470398, dmdtrain_gradient_norm 0.7265625, critic_loss 0.9354339241981506, critic_grad_norm 0.4364476203918457
+step 502, per iteration time 13.318541765213013, critic_loss 0.6174983382225037, critic_grad_norm 0.11144554615020752
+step 503, per iteration time 11.736013889312744, critic_loss 0.0279541015625, critic_grad_norm 0.2810594141483307
+step 504, per iteration time 12.415899991989136, critic_loss 0.05567476153373718, critic_grad_norm 0.10290969908237457
+step 505, per iteration time 10.537627935409546, critic_loss 1.4314942359924316, critic_grad_norm 0.04511700198054314
+step 506, per iteration time 26.776113271713257, generator_loss 0.612457650117796, generator_grad_norm 1.5078190565109253, dmdtrain_gradient_norm 0.5234375, critic_loss 1.2114559412002563, critic_grad_norm 0.5116679668426514
+step 507, per iteration time 10.47693681716919, critic_loss 0.7428755164146423, critic_grad_norm 0.07869969308376312
+step 508, per iteration time 12.373855352401733, critic_loss 0.25544270873069763, critic_grad_norm 0.07075078785419464
+step 509, per iteration time 12.433239221572876, critic_loss 1.103028416633606, critic_grad_norm 0.18311265110969543
+step 510, per iteration time 10.526075839996338, critic_loss 0.037353515625, critic_grad_norm 0.1930760145187378
+step 511, per iteration time 29.17089033126831, generator_loss 0.7536448799603069, generator_grad_norm 1.6522886753082275, dmdtrain_gradient_norm 0.7265625, critic_loss 0.9057161211967468, critic_grad_norm 0.5043972134590149
+step 512, per iteration time 10.485953330993652, critic_loss 1.2398247718811035, critic_grad_norm 0.5888230800628662
+step 513, per iteration time 10.548506736755371, critic_loss 0.7240904569625854, critic_grad_norm 0.1118822991847992
+step 514, per iteration time 10.682960510253906, critic_loss 0.9444727301597595, critic_grad_norm 0.5249177813529968
+step 515, per iteration time 13.492724180221558, critic_loss 0.6347907185554504, critic_grad_norm 0.19599489867687225
+step 516, per iteration time 27.4741268157959, generator_loss 0.40440519137450487, generator_grad_norm 1.5837568044662476, dmdtrain_gradient_norm 0.5546875, critic_loss 0.14657118916511536, critic_grad_norm 0.21383900940418243
+step 517, per iteration time 11.494455575942993, critic_loss 0.7691871523857117, critic_grad_norm 0.10797100514173508
+step 518, per iteration time 12.91346526145935, critic_loss 0.0390625, critic_grad_norm 0.1036965623497963
+step 519, per iteration time 10.53930115699768, critic_loss 1.071054220199585, critic_grad_norm 0.36272144317626953
+step 520, per iteration time 10.558332443237305, critic_loss 0.553594708442688, critic_grad_norm 0.07619678974151611
+step 521, per iteration time 28.85404348373413, generator_loss 0.5564894775391837, generator_grad_norm 0.878852903842926, dmdtrain_gradient_norm 0.515625, critic_loss 1.0495619773864746, critic_grad_norm 0.3809756338596344
+step 522, per iteration time 13.641986846923828, critic_loss 0.8117774724960327, critic_grad_norm 0.09677497297525406
+step 523, per iteration time 14.73038911819458, critic_loss 1.1174956560134888, critic_grad_norm 0.10784108936786652
+step 524, per iteration time 11.516864538192749, critic_loss 0.9261168837547302, critic_grad_norm 0.3234780728816986
+step 525, per iteration time 12.911377668380737, critic_loss 1.050783634185791, critic_grad_norm 0.09327222406864166
+step 526, per iteration time 27.588127851486206, generator_loss 0.6342839121470829, generator_grad_norm 1.2218743562698364, dmdtrain_gradient_norm 0.6015625, critic_loss 0.7920569777488708, critic_grad_norm 0.5805736184120178
+step 527, per iteration time 15.097723484039307, critic_loss 0.25288552045822144, critic_grad_norm 0.14478443562984467
+step 528, per iteration time 13.617810726165771, critic_loss 0.054931640625, critic_grad_norm 0.11946539580821991
+step 529, per iteration time 12.564985275268555, critic_loss 0.4571358859539032, critic_grad_norm 0.34867092967033386
+step 530, per iteration time 10.564143896102905, critic_loss 0.7361304759979248, critic_grad_norm 0.3343936800956726
+step 531, per iteration time 28.511471271514893, generator_loss 0.5967612209230951, generator_grad_norm 0.5551255941390991, dmdtrain_gradient_norm 0.42578125, critic_loss 0.9881440997123718, critic_grad_norm 0.36717525124549866
+step 532, per iteration time 12.51165246963501, critic_loss 1.0760995149612427, critic_grad_norm 0.1090560257434845
+step 533, per iteration time 12.430025339126587, critic_loss 0.16769206523895264, critic_grad_norm 0.39829057455062866
+step 534, per iteration time 11.544516324996948, critic_loss 0.8886331915855408, critic_grad_norm 0.6119264960289001
+step 535, per iteration time 12.050562620162964, critic_loss 0.46140190958976746, critic_grad_norm 0.1424933522939682
+step 536, per iteration time 28.892943620681763, generator_loss 0.7533172753003349, generator_grad_norm 1.3913514614105225, dmdtrain_gradient_norm 0.7734375, critic_loss 1.0346627235412598, critic_grad_norm 0.5707638263702393
+step 537, per iteration time 10.861777782440186, critic_loss 1.0673828125, critic_grad_norm 0.4174843728542328
+step 538, per iteration time 12.41768765449524, critic_loss 0.7807015776634216, critic_grad_norm 0.3898806571960449
+step 539, per iteration time 13.3454008102417, critic_loss 1.2048394680023193, critic_grad_norm 0.37548884749412537
+step 540, per iteration time 12.498784303665161, critic_loss 1.04736328125, critic_grad_norm 0.14077086746692657
+step 541, per iteration time 26.24532651901245, generator_loss 0.9323835350818123, generator_grad_norm 1.3093678951263428, dmdtrain_gradient_norm 0.796875, critic_loss 1.099503993988037, critic_grad_norm 0.14357249438762665
+step 542, per iteration time 13.327213525772095, critic_loss 1.0638909339904785, critic_grad_norm 0.2792651355266571
+step 543, per iteration time 10.629769563674927, critic_loss 0.8774018883705139, critic_grad_norm 0.09907881170511246
+step 544, per iteration time 10.797540426254272, critic_loss 0.043701171875, critic_grad_norm 0.0707365944981575
+step 545, per iteration time 11.448036432266235, critic_loss 0.045654296875, critic_grad_norm 0.07053375244140625
+step 546, per iteration time 26.66842031478882, generator_loss 0.7742584752814727, generator_grad_norm 0.6886657476425171, dmdtrain_gradient_norm 0.734375, critic_loss 1.1212996244430542, critic_grad_norm 0.13048560917377472
+step 547, per iteration time 12.744581699371338, critic_loss 0.9075599312782288, critic_grad_norm 0.06558596342802048
+step 548, per iteration time 11.556136131286621, critic_loss 0.0478515625, critic_grad_norm 0.05646295100450516
+step 549, per iteration time 12.431573390960693, critic_loss 1.1851916313171387, critic_grad_norm 0.8045747876167297
+step 550, per iteration time 12.424733400344849, critic_loss 0.040771484375, critic_grad_norm 0.07347951084375381
+step 551, per iteration time 25.633742332458496, generator_loss 0.39657138854378376, generator_grad_norm 1.3143054246902466, dmdtrain_gradient_norm 0.3671875, critic_loss 1.13565993309021, critic_grad_norm 0.46190911531448364
+step 552, per iteration time 12.391454219818115, critic_loss 0.7988718152046204, critic_grad_norm 0.35864266753196716
+step 553, per iteration time 13.415548086166382, critic_loss 1.1717493534088135, critic_grad_norm 0.1544571965932846
+step 554, per iteration time 13.605536460876465, critic_loss 0.043701171875, critic_grad_norm 0.1623603254556656
+step 555, per iteration time 11.534047842025757, critic_loss 0.07373046875, critic_grad_norm 0.2454119622707367
+step 556, per iteration time 27.97001361846924, generator_loss 0.38986241200982097, generator_grad_norm 1.5271984338760376, dmdtrain_gradient_norm 0.396484375, critic_loss 0.9796020984649658, critic_grad_norm 0.061224281787872314
+step 557, per iteration time 10.869976043701172, critic_loss 0.9156098365783691, critic_grad_norm 0.07106111943721771
+step 558, per iteration time 12.566450119018555, critic_loss 0.7695702910423279, critic_grad_norm 0.2416411191225052
+step 559, per iteration time 11.158884525299072, critic_loss 0.8264138698577881, critic_grad_norm 0.22747421264648438
+step 560, per iteration time 10.900704622268677, critic_loss 0.0849609375, critic_grad_norm 0.4804404377937317
+step 561, per iteration time 25.33967137336731, generator_loss 0.3694364543416584, generator_grad_norm 1.427859902381897, dmdtrain_gradient_norm 0.5234375, critic_loss 0.045166015625, critic_grad_norm 0.09742054343223572
+step 562, per iteration time 11.810300350189209, critic_loss 0.8592122793197632, critic_grad_norm 0.5273742079734802
+step 563, per iteration time 11.494763374328613, critic_loss 0.9204926490783691, critic_grad_norm 0.6794230341911316
+step 564, per iteration time 10.556140661239624, critic_loss 0.17356523871421814, critic_grad_norm 0.37595129013061523
+step 565, per iteration time 10.948802709579468, critic_loss 0.0308837890625, critic_grad_norm 0.42597439885139465
+step 566, per iteration time 28.52453088760376, generator_loss 0.6244100948683602, generator_grad_norm 0.4639887809753418, dmdtrain_gradient_norm 0.5546875, critic_loss 1.1355191469192505, critic_grad_norm 0.05913360044360161
+step 567, per iteration time 11.770424365997314, critic_loss 0.48442381620407104, critic_grad_norm 0.6276726126670837
+step 568, per iteration time 13.360428094863892, critic_loss 0.056884765625, critic_grad_norm 0.30905207991600037
+step 569, per iteration time 14.433401584625244, critic_loss 0.8185492157936096, critic_grad_norm 0.1668919175863266
+step 570, per iteration time 12.427932739257812, critic_loss 1.2021280527114868, critic_grad_norm 0.3206717073917389
+step 571, per iteration time 29.962015628814697, generator_loss 0.8845817317142822, generator_grad_norm 0.770736813545227, dmdtrain_gradient_norm 0.76953125, critic_loss 1.1709097623825073, critic_grad_norm 0.1920185536146164
+step 572, per iteration time 12.44078540802002, critic_loss 1.1758432388305664, critic_grad_norm 0.4516649842262268
+step 573, per iteration time 13.768024206161499, critic_loss 1.2670824527740479, critic_grad_norm 0.22233347594738007
+step 574, per iteration time 14.547806978225708, critic_loss 0.994162917137146, critic_grad_norm 0.24452470242977142
+step 575, per iteration time 10.551019430160522, critic_loss 1.1496913433074951, critic_grad_norm 0.2916157841682434
+step 576, per iteration time 30.66431760787964, generator_loss 0.6833040620682381, generator_grad_norm 1.3708339929580688, dmdtrain_gradient_norm 0.79296875, critic_loss 0.052490234375, critic_grad_norm 0.2168978601694107
+step 577, per iteration time 13.838367938995361, critic_loss 1.148392677307129, critic_grad_norm 0.16854675114154816
+step 578, per iteration time 12.48236632347107, critic_loss 0.9189201593399048, critic_grad_norm 0.2708698809146881
+step 579, per iteration time 13.986706972122192, critic_loss 0.38296037912368774, critic_grad_norm 0.17407803237438202
+step 580, per iteration time 14.011298894882202, critic_loss 0.04052734375, critic_grad_norm 0.62263423204422
+step 581, per iteration time 29.47544240951538, generator_loss 0.6233444275943967, generator_grad_norm 1.3580327033996582, dmdtrain_gradient_norm 0.61328125, critic_loss 1.0769416093826294, critic_grad_norm 0.09871850907802582
+step 582, per iteration time 10.63247299194336, critic_loss 0.033203125, critic_grad_norm 0.06018950417637825
+step 583, per iteration time 13.434385538101196, critic_loss 1.1694221496582031, critic_grad_norm 0.289976567029953
+step 584, per iteration time 13.952731370925903, critic_loss 1.0913211107254028, critic_grad_norm 0.3741433322429657
+step 585, per iteration time 13.813995599746704, critic_loss 1.0340816974639893, critic_grad_norm 0.27867406606674194
+step 586, per iteration time 31.269046306610107, generator_loss 0.468469764690593, generator_grad_norm 0.6736493706703186, dmdtrain_gradient_norm 0.46875, critic_loss 0.5999860167503357, critic_grad_norm 0.07534051686525345
+step 587, per iteration time 13.131129741668701, critic_loss 0.0400390625, critic_grad_norm 0.5169327259063721
+step 588, per iteration time 11.49111557006836, critic_loss 0.7522786855697632, critic_grad_norm 0.1283237487077713
+step 589, per iteration time 10.567399501800537, critic_loss 0.7544189691543579, critic_grad_norm 0.2403232306241989
+step 590, per iteration time 11.517822980880737, critic_loss 0.3252658545970917, critic_grad_norm 0.10253913700580597
+step 591, per iteration time 26.269049167633057, generator_loss 0.35340889922482854, generator_grad_norm 1.3212027549743652, dmdtrain_gradient_norm 0.5078125, critic_loss 0.041015625, critic_grad_norm 0.386800616979599
+step 592, per iteration time 10.542052507400513, critic_loss 0.037841796875, critic_grad_norm 0.08536894619464874
+step 593, per iteration time 13.808038711547852, critic_loss 0.984988808631897, critic_grad_norm 0.11443290114402771
+step 594, per iteration time 12.821486949920654, critic_loss 0.0546875, critic_grad_norm 0.20640918612480164
+step 595, per iteration time 12.428791046142578, critic_loss 0.8342824578285217, critic_grad_norm 0.4489783048629761
+step 596, per iteration time 25.51253581047058, generator_loss 0.6680286421704906, generator_grad_norm 3.4090709686279297, dmdtrain_gradient_norm 0.59375, critic_loss 0.41729819774627686, critic_grad_norm 0.4627676010131836
+step 597, per iteration time 12.981550693511963, critic_loss 0.04296875, critic_grad_norm 0.1734238564968109
+step 598, per iteration time 13.79753565788269, critic_loss 0.7469997406005859, critic_grad_norm 0.19230841100215912
+step 599, per iteration time 11.526388883590698, critic_loss 1.049407720565796, critic_grad_norm 0.055199068039655685
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Generating video of length 21
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+Generating video of length 21
+
+[Block 0] Generating frames 0 to 3
+Generating video of length 21
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 0] Generating frames 0 to 3
+Model saved to /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000600/model.pt
+Checkpoint cleanup: Found 6 checkpoints, removing 1 oldest ones (keeping 5)
+  Removing: checkpoint_model_000100 (step 100)
+Checkpoint cleanup completed: removed 1/1 old checkpoints
+step 600, per iteration time 34.588112354278564, critic_loss 0.0361328125, critic_grad_norm 0.4553224444389343
+Generating video of length 21
+[ActionInference] kv_cache_size: 18720 (policy: local, size=12)
+
+[Block 0] Generating frames 0 to 3
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 1] Generating frames 3 to 6
+
+[Block 2] Generating frames 6 to 9
+[Block 2] Generating frames 6 to 9
+
+
+[Block 2] Generating frames 6 to 9
+
+[Block 2] Generating frames 6 to 9
+
+[Block 3] Generating frames 9 to 12
+[Block 3] Generating frames 9 to 12
+
+
+[Block 3] Generating frames 9 to 12
+
+[Block 3] Generating frames 9 to 12
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 4] Generating frames 12 to 15
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 5] Generating frames 15 to 18
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+
+[Block 6] Generating frames 18 to 21
+step 601, per iteration time 34.098647356033325, generator_loss 0.1728019437231017, generator_grad_norm 1.8386893272399902, dmdtrain_gradient_norm 0.373046875, critic_loss 0.04931640625, critic_grad_norm 0.07458247244358063
+step 602, per iteration time 13.373124599456787, critic_loss 0.04443359375, critic_grad_norm 0.05520404502749443
+step 603, per iteration time 13.856378078460693, critic_loss 0.043701171875, critic_grad_norm 0.07924633473157883
+step 604, per iteration time 10.562970399856567, critic_loss 0.8077744841575623, critic_grad_norm 0.1224391907453537
+step 605, per iteration time 11.519447803497314, critic_loss 1.0897796154022217, critic_grad_norm 0.8756244778633118
+step 606, per iteration time 27.729413986206055, generator_loss 0.48814316307956807, generator_grad_norm 0.6459892392158508, dmdtrain_gradient_norm 0.42578125, critic_loss 0.6973527669906616, critic_grad_norm 0.24952253699302673
+step 607, per iteration time 13.365233898162842, critic_loss 1.0915637016296387, critic_grad_norm 0.07498174160718918
+step 608, per iteration time 10.542556285858154, critic_loss 0.7252686023712158, critic_grad_norm 0.41317060589790344
+step 609, per iteration time 11.846539497375488, critic_loss 0.06711523234844208, critic_grad_norm 0.2524828612804413
+step 610, per iteration time 12.898979902267456, critic_loss 1.046875, critic_grad_norm 0.177266463637352
+step 611, per iteration time 30.675158977508545, generator_loss 0.23619890518855496, generator_grad_norm 1.5756924152374268, dmdtrain_gradient_norm 0.431640625, critic_loss 0.032470703125, critic_grad_norm 0.07492513954639435
+step 612, per iteration time 13.402499675750732, critic_loss 0.9702697396278381, critic_grad_norm 0.27868136763572693
+step 613, per iteration time 10.962225914001465, critic_loss 1.0569733381271362, critic_grad_norm 0.1787809431552887
+step 614, per iteration time 12.4495267868042, critic_loss 0.043212890625, critic_grad_norm 0.0864274650812149
+step 615, per iteration time 10.541731834411621, critic_loss 0.0380859375, critic_grad_norm 0.15348182618618011
+step 616, per iteration time 27.723169803619385, generator_loss 0.2306282233745375, generator_grad_norm 1.3304082155227661, dmdtrain_gradient_norm 0.451171875, critic_loss 0.041748046875, critic_grad_norm 0.23216979205608368
+step 617, per iteration time 12.381358623504639, critic_loss 0.7622438073158264, critic_grad_norm 0.12701399624347687
+step 618, per iteration time 10.668182373046875, critic_loss 1.087122917175293, critic_grad_norm 0.06808945536613464
+step 619, per iteration time 13.318720579147339, critic_loss 1.0825800895690918, critic_grad_norm 0.30642297863960266
+step 620, per iteration time 10.545499801635742, critic_loss 0.5945062041282654, critic_grad_norm 0.108521468937397
+step 621, per iteration time 25.796064376831055, generator_loss 0.5032784328489474, generator_grad_norm 1.3441048860549927, dmdtrain_gradient_norm 0.431640625, critic_loss 0.5406162738800049, critic_grad_norm 0.16474317014217377
+step 622, per iteration time 12.687806844711304, critic_loss 1.2086632251739502, critic_grad_norm 0.19010674953460693
+step 623, per iteration time 14.053280591964722, critic_loss 0.8509795665740967, critic_grad_norm 0.5520379543304443
+step 624, per iteration time 11.313095808029175, critic_loss 1.1912195682525635, critic_grad_norm 0.2524056136608124
+step 625, per iteration time 14.178581237792969, critic_loss 0.8033730983734131, critic_grad_norm 0.3985126316547394
+step 626, per iteration time 29.63230609893799, generator_loss 0.3856257391014279, generator_grad_norm 0.42254525423049927, dmdtrain_gradient_norm 0.380859375, critic_loss 0.522265613079071, critic_grad_norm 0.3127277195453644
+step 627, per iteration time 10.518730640411377, critic_loss 0.060302734375, critic_grad_norm 0.30328401923179626
+step 628, per iteration time 13.386048078536987, critic_loss 0.980654239654541, critic_grad_norm 0.3417336344718933
+step 629, per iteration time 13.3981351852417, critic_loss 0.04296875, critic_grad_norm 0.17159795761108398
+step 630, per iteration time 11.509972095489502, critic_loss 0.8089361786842346, critic_grad_norm 0.1628739982843399
+step 631, per iteration time 24.902843952178955, generator_loss 0.4309826030463251, generator_grad_norm 1.6862835884094238, dmdtrain_gradient_norm 0.39453125, critic_loss 0.8434392213821411, critic_grad_norm 0.39520373940467834
+step 632, per iteration time 11.147524356842041, critic_loss 0.05859375, critic_grad_norm 0.13340596854686737
+step 633, per iteration time 14.328250408172607, critic_loss 0.9683203101158142, critic_grad_norm 0.8587368726730347
+step 634, per iteration time 13.797567129135132, critic_loss 1.0605462789535522, critic_grad_norm 0.649620771408081
+step 635, per iteration time 13.92460012435913, critic_loss 0.4298369288444519, critic_grad_norm 0.21601934731006622
+step 636, per iteration time 26.377559185028076, generator_loss 0.4807766109124637, generator_grad_norm 1.754109501838684, dmdtrain_gradient_norm 0.412109375, critic_loss 1.0907200574874878, critic_grad_norm 0.2648499011993408
+step 637, per iteration time 16.271263360977173, critic_loss 1.324723482131958, critic_grad_norm 0.35154369473457336
+step 638, per iteration time 13.415879964828491, critic_loss 0.9953935146331787, critic_grad_norm 0.10016807168722153
+step 639, per iteration time 13.334196329116821, critic_loss 1.2139028310775757, critic_grad_norm 0.1288345754146576
+step 640, per iteration time 13.384813070297241, critic_loss 1.1808198690414429, critic_grad_norm 0.153794527053833
+step 641, per iteration time 30.22681951522827, generator_loss 0.4170457552236593, generator_grad_norm 1.9133988618850708, dmdtrain_gradient_norm 0.388671875, critic_loss 0.3593806028366089, critic_grad_norm 0.09160854667425156
+step 642, per iteration time 11.446428298950195, critic_loss 0.41835951805114746, critic_grad_norm 0.11801207065582275
+step 643, per iteration time 10.658641815185547, critic_loss 1.0930397510528564, critic_grad_norm 0.1429055780172348
+step 644, per iteration time 16.334433555603027, critic_loss 1.0654296875, critic_grad_norm 0.09408112615346909
+step 645, per iteration time 13.741162776947021, critic_loss 0.7529929876327515, critic_grad_norm 0.20845703780651093
+step 646, per iteration time 29.732422351837158, generator_loss 0.18170904919684522, generator_grad_norm 0.2354244440793991, dmdtrain_gradient_norm 0.369140625, critic_loss 0.056396484375, critic_grad_norm 0.6343348026275635
+step 647, per iteration time 11.42639946937561, critic_loss 0.7329590320587158, critic_grad_norm 0.17770113050937653
+step 648, per iteration time 11.909249305725098, critic_loss 0.8628171682357788, critic_grad_norm 0.24994349479675293
+step 649, per iteration time 12.867197275161743, critic_loss 1.2550075054168701, critic_grad_norm 0.2511434853076935
+step 650, per iteration time 10.545751571655273, critic_loss 0.8028249144554138, critic_grad_norm 0.2405233383178711
+step 651, per iteration time 26.93514108657837, generator_loss 0.6869624235377372, generator_grad_norm 2.8462741374969482, dmdtrain_gradient_norm 0.546875, critic_loss 0.865973174571991, critic_grad_norm 0.09746474772691727
+step 652, per iteration time 10.524293422698975, critic_loss 0.9840205907821655, critic_grad_norm 0.18633133172988892
+step 653, per iteration time 13.863464117050171, critic_loss 0.16015625, critic_grad_norm 0.6335196495056152
+step 654, per iteration time 12.784523248672485, critic_loss 1.173630714416504, critic_grad_norm 0.49287155270576477
+step 655, per iteration time 14.739145517349243, critic_loss 0.9078613519668579, critic_grad_norm 0.07976024597883224
+step 656, per iteration time 29.131170988082886, generator_loss 0.9073151670523825, generator_grad_norm 1.6242293119430542, dmdtrain_gradient_norm 0.65625, critic_loss 0.5295536518096924, critic_grad_norm 0.4482174813747406
+step 657, per iteration time 18.678727388381958, critic_loss 0.1767578125, critic_grad_norm 0.6992957592010498
+step 658, per iteration time 13.356345176696777, critic_loss 0.7227957844734192, critic_grad_norm 0.34959644079208374
+step 659, per iteration time 10.5791654586792, critic_loss 0.6285566687583923, critic_grad_norm 0.16263622045516968
+step 660, per iteration time 12.485536098480225, critic_loss 1.0577192306518555, critic_grad_norm 0.2833397388458252
+step 661, per iteration time 25.879776000976562, generator_loss 0.8122422420216896, generator_grad_norm 3.0403900146484375, dmdtrain_gradient_norm 0.640625, critic_loss 1.1741267442703247, critic_grad_norm 0.4687045216560364
+step 662, per iteration time 13.68368935585022, critic_loss 0.080078125, critic_grad_norm 0.1654154658317566
+step 663, per iteration time 11.523513555526733, critic_loss 1.1119587421417236, critic_grad_norm 0.28722071647644043
+step 664, per iteration time 10.57255244255066, critic_loss 0.8632459044456482, critic_grad_norm 0.41228005290031433
+step 665, per iteration time 10.566060543060303, critic_loss 1.1630983352661133, critic_grad_norm 0.09026475995779037
+step 666, per iteration time 31.12945532798767, generator_loss 0.7311983747813008, generator_grad_norm 3.0995726585388184, dmdtrain_gradient_norm 0.439453125, critic_loss 1.1427555084228516, critic_grad_norm 0.6143757700920105
+step 667, per iteration time 11.551684379577637, critic_loss 1.1356194019317627, critic_grad_norm 0.8038317561149597
+step 668, per iteration time 12.510017395019531, critic_loss 1.2151987552642822, critic_grad_norm 0.2753005623817444
+step 669, per iteration time 11.61851716041565, critic_loss 1.1770479679107666, critic_grad_norm 0.41609394550323486
+step 670, per iteration time 10.998162984848022, critic_loss 0.7782136797904968, critic_grad_norm 0.25884369015693665
+step 671, per iteration time 30.924569129943848, generator_loss 0.5573152441355663, generator_grad_norm 1.723090410232544, dmdtrain_gradient_norm 0.423828125, critic_loss 1.110849142074585, critic_grad_norm 0.0857260674238205
+step 672, per iteration time 14.262351274490356, critic_loss 0.7255696058273315, critic_grad_norm 0.15822449326515198
+step 673, per iteration time 12.493812799453735, critic_loss 0.04541015625, critic_grad_norm 0.6540657877922058
+step 674, per iteration time 13.412982702255249, critic_loss 0.8342261910438538, critic_grad_norm 0.2509016990661621
+step 675, per iteration time 11.52478575706482, critic_loss 1.0234668254852295, critic_grad_norm 0.23522473871707916
+step 676, per iteration time 28.672395944595337, generator_loss 0.47764729789778143, generator_grad_norm 1.937865138053894, dmdtrain_gradient_norm 0.328125, critic_loss 1.1381680965423584, critic_grad_norm 0.15820086002349854
+step 677, per iteration time 13.358160495758057, critic_loss 0.7982045412063599, critic_grad_norm 0.2637448310852051
+step 678, per iteration time 12.48394513130188, critic_loss 1.1643307209014893, critic_grad_norm 0.17748737335205078
+step 679, per iteration time 11.726551532745361, critic_loss 0.05126953125, critic_grad_norm 0.4087085425853729
+step 680, per iteration time 11.600553035736084, critic_loss 0.934845507144928, critic_grad_norm 0.08912832289934158
+step 681, per iteration time 25.580000162124634, generator_loss 0.5457841126379491, generator_grad_norm 0.7875065207481384, dmdtrain_gradient_norm 0.326171875, critic_loss 0.9941145777702332, critic_grad_norm 0.1557474583387375
+step 682, per iteration time 11.037373781204224, critic_loss 1.269655704498291, critic_grad_norm 0.25067949295043945
+step 683, per iteration time 13.368817329406738, critic_loss 0.05126953125, critic_grad_norm 0.06140516698360443
+step 684, per iteration time 10.550661563873291, critic_loss 0.7914546728134155, critic_grad_norm 0.46926602721214294
+step 685, per iteration time 12.912156105041504, critic_loss 0.7933640480041504, critic_grad_norm 0.06821509450674057
+step 686, per iteration time 31.230504512786865, generator_loss 0.3500537654448995, generator_grad_norm 0.6990643739700317, dmdtrain_gradient_norm 0.447265625, critic_loss 0.07275390625, critic_grad_norm 0.5460923910140991
+step 687, per iteration time 12.385486602783203, critic_loss 0.8946071863174438, critic_grad_norm 0.1867869794368744
+step 688, per iteration time 11.50231122970581, critic_loss 1.1327260732650757, critic_grad_norm 0.11866302788257599
+step 689, per iteration time 10.594335556030273, critic_loss 0.7475008964538574, critic_grad_norm 0.4097239673137665
+step 690, per iteration time 13.086812973022461, critic_loss 0.7654785513877869, critic_grad_norm 0.0615602508187294
+step 691, per iteration time 30.522061347961426, generator_loss 0.30688680171273974, generator_grad_norm 0.7921415567398071, dmdtrain_gradient_norm 0.3984375, critic_loss 0.20791015028953552, critic_grad_norm 0.4806898832321167
+step 692, per iteration time 11.889293193817139, critic_loss 0.7405273914337158, critic_grad_norm 0.08119776099920273
+step 693, per iteration time 13.389548540115356, critic_loss 1.2533129453659058, critic_grad_norm 0.5646882057189941
+step 694, per iteration time 10.618710994720459, critic_loss 0.9475848078727722, critic_grad_norm 0.06926596164703369
+step 695, per iteration time 11.525863885879517, critic_loss 0.0703125, critic_grad_norm 0.05850069969892502
+step 696, per iteration time 27.678128957748413, generator_loss 0.6697433866209368, generator_grad_norm 1.2334811687469482, dmdtrain_gradient_norm 0.57421875, critic_loss 0.38390669226646423, critic_grad_norm 0.1478152722120285
+step 697, per iteration time 13.705282926559448, critic_loss 0.9398242831230164, critic_grad_norm 0.3193078637123108
+step 698, per iteration time 10.71375846862793, critic_loss 1.110277771949768, critic_grad_norm 0.06373300403356552
+step 699, per iteration time 12.482780933380127, critic_loss 0.6525899171829224, critic_grad_norm 0.1458493024110794
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Start gathering distributed model states...
+Model saved to /scratch/u5dk/as1748.u5dk/frodobots/dmd2/logs_N_d2_lam_v2/dmd2-init-N-d2-lam-v2/checkpoint_model_000700/model.pt
+Checkpoint cleanup: Found 6 checkpoints, removing 1 oldest ones (keeping 5)
+  Removing: checkpoint_model_000200 (step 200)
+Checkpoint cleanup completed: removed 1/1 old checkpoints
+step 700, per iteration time 36.714958906173706, critic_loss 1.1277704238891602, critic_grad_norm 0.2536390423774719
+step 701, per iteration time 28.709198474884033, generator_loss 0.587780766026696, generator_grad_norm 0.6000772714614868, dmdtrain_gradient_norm 0.41015625, critic_loss 0.9244554042816162, critic_grad_norm 0.2195202112197876
+Training completed on Mon Nov 17 02:10:12 AM UTC 2025

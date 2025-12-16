@@ -86,6 +86,22 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         self.latent_feature_dim = latent_channels
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         self.action_head_hidden_dim = int(getattr(args, "action_head_hidden_dim", 256))
+        axis_weights = getattr(args, "action_axis_weights", None)
+        if axis_weights is not None:
+            if len(axis_weights) != self.action_dim:
+                raise ValueError(
+                    f"action_axis_weights length {len(axis_weights)} does not match action_dim {self.action_dim}"
+                )
+            self._action_axis_weights = torch.tensor(axis_weights, dtype=torch.float32)
+        else:
+            self._action_axis_weights = None
+        self.compute_video_metrics = bool(getattr(args, "compute_video_metrics", False))
+        self.video_metrics_interval = int(getattr(args, "compute_video_metrics_interval", 50))
+        self._video_metrics_counter = 0
+        self._video_metrics_initialized = False
+        self._video_metrics_available = False
+        self._video_metrics_error: Optional[str] = None
+        self._lpips_metric: Optional[nn.Module] = None
 
         if (self.gan_loss_weight > 0.0 or self.guidance_cls_loss_weight > 0.0) and hasattr(self.fake_score, "adding_cls_branch"):
             self.fake_score.adding_cls_branch(
@@ -250,6 +266,161 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         preds = outputs[-1]
         return preds
 
+    def _action_l1_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        apply_axis_weights: bool = True,
+    ) -> torch.Tensor:
+        """L1 loss with optional per-axis weights to emphasize steering dimensions."""
+        tgt = target.to(device=pred.device, dtype=pred.dtype)
+        diff = torch.abs(pred - tgt)
+        if apply_axis_weights and self._action_axis_weights is not None:
+            weights = self._action_axis_weights.to(device=diff.device, dtype=diff.dtype)
+            view_shape = [1] * (diff.dim() - 1) + [weights.shape[0]]
+            weights = weights.view(*view_shape)
+            diff = diff * weights
+        return diff.mean()
+
+    def _action_batch_stats(self, actions: Optional[torch.Tensor], prefix: str) -> dict:
+        """Lightweight scalars describing the input action distribution for logging."""
+        if actions is None:
+            return {}
+        stats: dict = {}
+        actions_f = actions.to(dtype=torch.float32)
+        for i in range(min(actions_f.shape[-1], 3)):
+            stats[f"{prefix}_dim{i}_mean"] = actions_f[..., i].mean().detach()
+            stats[f"{prefix}_dim{i}_std"] = actions_f[..., i].std(unbiased=False).detach()
+        mag = torch.linalg.norm(actions_f, dim=-1)
+        stats[f"{prefix}_mag_mean"] = mag.mean().detach()
+        stats[f"{prefix}_mag_std"] = mag.std(unbiased=False).detach()
+        return stats
+
+    def _compute_action_metrics(self, pred: torch.Tensor, target: torch.Tensor, prefix: str) -> dict:
+        """Action faithfulness/consistency metrics for logging."""
+        metrics: dict = {}
+        pred_f = pred.to(dtype=torch.float32)
+        tgt_f = target.to(dtype=torch.float32)
+        diff = pred_f - tgt_f
+        metrics[f"{prefix}_l1"] = diff.abs().mean().detach()
+        metrics[f"{prefix}_l2"] = torch.linalg.norm(diff, dim=-1).mean().detach()
+
+        # Cosine similarity and sign agreement to capture directional alignment.
+        pred_norm = torch.linalg.norm(pred_f, dim=-1)
+        tgt_norm = torch.linalg.norm(tgt_f, dim=-1)
+        denom = (pred_norm * tgt_norm).clamp_min(1e-6)
+        cos = (pred_f * tgt_f).sum(dim=-1) / denom
+        metrics[f"{prefix}_cos"] = cos.mean().detach()
+        sign_agree = torch.sign(pred_f) * torch.sign(tgt_f)
+        metrics[f"{prefix}_sign_agree"] = (sign_agree > 0).float().mean().detach()
+
+        # Heading/angle error when at least 2-D actions are available.
+        if pred_f.shape[-1] >= 2 and tgt_f.shape[-1] >= 2:
+            pred_angle = torch.atan2(pred_f[..., 1], pred_f[..., 0])
+            tgt_angle = torch.atan2(tgt_f[..., 1], tgt_f[..., 0])
+            angle_delta = torch.remainder(pred_angle - tgt_angle + math.pi, 2 * math.pi) - math.pi
+            metrics[f"{prefix}_angle_deg"] = torch.rad2deg(angle_delta).abs().mean().detach()
+
+        # Magnitude alignment and Pearson-style correlation by axis.
+        metrics[f"{prefix}_mag_mean"] = pred_norm.mean().detach()
+        metrics[f"{prefix}_mag_ratio"] = (pred_norm / tgt_norm.clamp_min(1e-6)).clamp(0.0, 10.0).mean().detach()
+        for i in range(min(pred_f.shape[-1], tgt_f.shape[-1], 3)):
+            x = pred_f[..., i]
+            y = tgt_f[..., i]
+            xm = x.mean()
+            ym = y.mean()
+            cov = ((x - xm) * (y - ym)).mean()
+            corr = cov / (x.std(unbiased=False).clamp_min(1e-6) * y.std(unbiased=False).clamp_min(1e-6))
+            metrics[f"{prefix}_dim{i}_corr"] = corr.detach()
+        return metrics
+
+    def _init_video_metrics(self):
+        if self._video_metrics_initialized:
+            return
+        self._video_metrics_initialized = True
+        try:
+            from torchmetrics.functional import peak_signal_noise_ratio
+            from torchmetrics.functional.image import structural_similarity_index_measure
+            from torchmetrics.functional.video import frechet_video_distance
+            from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+        except Exception as e:
+            self._video_metrics_error = str(e)
+            self._video_metrics_available = False
+            return
+        self._peak_signal_noise_ratio = peak_signal_noise_ratio
+        self._structural_similarity_index_measure = structural_similarity_index_measure
+        self._frechet_video_distance = frechet_video_distance
+        self._lpips_metric_cls = LearnedPerceptualImagePatchSimilarity
+        self._video_metrics_available = True
+
+    def _compute_video_metrics(
+        self,
+        pred_latents: torch.Tensor,
+        target_latents: Optional[torch.Tensor],
+    ) -> dict:
+        """Decode latents to pixels and compute holistic video metrics if enabled and available."""
+        if (not self.compute_video_metrics) or target_latents is None:
+            return {}
+        self._init_video_metrics()
+        if not self._video_metrics_available:
+            return {"video_metrics_status": f"unavailable:{self._video_metrics_error}"}
+
+        with torch.no_grad():
+            min_frames = min(pred_latents.shape[1], target_latents.shape[1])
+            pred_clip = pred_latents[:, :min_frames]
+            tgt_clip = target_latents[:, :min_frames].to(device=pred_clip.device, dtype=pred_clip.dtype)
+
+            # Decode latents to pixel space [-1,1].
+            pred_px = self.generator.decode_to_pixel(pred_clip)
+            tgt_px = self.generator.decode_to_pixel(tgt_clip)
+
+            # Normalize to [0,1] for metrics.
+            pred_px = ((pred_px + 1.0) * 0.5).clamp(0.0, 1.0).float()
+            tgt_px = ((tgt_px + 1.0) * 0.5).clamp(0.0, 1.0).float()
+
+            metrics = {}
+            try:
+                metrics["video_psnr"] = self._peak_signal_noise_ratio(pred_px, tgt_px, data_range=1.0).detach()
+            except Exception:
+                pass
+
+            try:
+                # Flatten frames for SSIM (expects [N, C, H, W]); average across frames.
+                b, f, c, h, w = pred_px.shape
+                ssim_val = self._structural_similarity_index_measure(
+                    pred_px.view(b * f, c, h, w),
+                    tgt_px.view(b * f, c, h, w),
+                    data_range=1.0,
+                )
+                metrics["video_ssim"] = ssim_val.detach()
+            except Exception:
+                pass
+
+            try:
+                # LPIPS expects 3-channel images; flatten frames and average.
+                if pred_px.shape[2] == 3:
+                    if self._lpips_metric is None:
+                        self._lpips_metric = self._lpips_metric_cls(net_type="vgg").to(device=pred_px.device)
+                    lpips_val = self._lpips_metric(
+                        pred_px.view(-1, 3, pred_px.shape[-2], pred_px.shape[-1]),
+                        tgt_px.view(-1, 3, tgt_px.shape[-2], tgt_px.shape[-1]),
+                    )
+                    metrics["video_lpips"] = lpips_val.mean().detach()
+            except Exception:
+                pass
+
+            try:
+                metrics["video_fvd"] = self._frechet_video_distance(
+                    pred_px, tgt_px, feature_extractor="i3d"
+                ).detach()
+            except Exception:
+                pass
+
+            if not metrics:
+                metrics["video_metrics_status"] = "failed_all"
+            return metrics
+
     def _compute_motion_weights(self, reference: torch.Tensor) -> torch.Tensor:
         if (not self.motion_enabled_loss) or reference.ndim < 5:
             return torch.ones_like(reference, dtype=reference.dtype)
@@ -325,12 +496,15 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         model_out = self.latent_action_model(windows.to(dtype=torch.float32))  # [B*num_windows, action_dim]
         model_out = model_out.view(pred_frames.shape[0], num_windows, -1)
         action_targets = actions[:, LATENT_ACTION_PRED_INDEX:target_stop].to(dtype=model_out.dtype)
-        base_loss = F.l1_loss(model_out, action_targets, reduction="mean")
-        loss = (base_loss * self.indep_lat_act_weight).to(dtype=pred_frames.dtype)
+        weighted_loss = self._action_l1_loss(model_out, action_targets, apply_axis_weights=True)
+        unweighted_loss = self._action_l1_loss(model_out, action_targets, apply_axis_weights=False)
+        loss = (weighted_loss * self.indep_lat_act_weight).to(dtype=pred_frames.dtype)
         logs = {
             "latent_action_loss": loss.detach(),
-            "latent_action_loss_raw": base_loss.detach(),
+            "latent_action_loss_raw": unweighted_loss.detach(),
+            "latent_action_loss_weighted_raw": weighted_loss.detach(),
         }
+        logs.update(self._compute_action_metrics(model_out.detach(), action_targets.detach(), "latent_action"))
         return loss, logs
 
     def compute_distribution_matching_loss(
@@ -473,6 +647,7 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
             "loss_time": loss_time,
             "generator_dmd_loss": dmd_loss.detach(),
         })
+        log_dict.update(self._action_batch_stats(actions, "actions"))
 
         if self.generator_mse_loss_weight > 0.0:
             mse_target = None
@@ -542,17 +717,35 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
             min_frames = min(action_preds.shape[1], actions.shape[1])
             actions_for_loss = actions[:, :min_frames]
             pred_for_loss = action_preds[:, :min_frames]
-            act_loss = F.l1_loss(pred_for_loss, actions_for_loss.to(device=pred_image.device, dtype=pred_image.dtype)) * self.action_loss_weight
+            action_targets = actions_for_loss.to(device=pred_image.device, dtype=pred_image.dtype)
+            act_loss_weighted = self._action_l1_loss(pred_for_loss, action_targets, apply_axis_weights=True)
+            act_loss_unweighted = self._action_l1_loss(pred_for_loss, action_targets, apply_axis_weights=False)
+            act_loss = act_loss_weighted * self.action_loss_weight
             total_loss = total_loss + act_loss
             log_dict.update({
                 "generator_act_loss": act_loss.detach(),
+                "generator_act_loss_raw": act_loss_weighted.detach(),
+                "generator_act_loss_unweighted": act_loss_unweighted.detach(),
             })
+            log_dict.update(self._compute_action_metrics(pred_for_loss.detach(), action_targets.detach(), "generator_action"))
         # INSERT HERE: latent action model loss - changed conditional_dict to rgs_conditional 12/11/2025
         latent_action_loss, latent_action_logs = self._compute_latent_action_loss(
             pred_image, actions
         )
         total_loss = total_loss + latent_action_loss
         log_dict.update(latent_action_logs)
+
+        # Optional holistic video metrics (decode to RGB; uses real_latents when available).
+        if self.compute_video_metrics:
+            self._video_metrics_counter += 1
+            if (self._video_metrics_counter % max(self.video_metrics_interval, 1)) == 0:
+                if real_latents is not None:
+                    video_metrics = self._compute_video_metrics(pred_image.detach(), real_latents.detach())
+                    log_dict.update(video_metrics)
+                else:
+                    log_dict["video_metrics_status"] = "skipped:no_real_latents"
+            else:
+                log_dict["video_metrics_status"] = "skipped:not_interval"
 
         loss_time = time.time() - _t_loss_start
         log_dict["loss_time"] = loss_time
@@ -730,12 +923,18 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
             min_frames = min(live_actions.shape[1], actions.shape[1])
             live_actions_for_loss = live_actions[:, :min_frames]
             actions_for_loss = actions[:, :min_frames]
-            rgs_loss = F.l1_loss(live_actions_for_loss, actions_for_loss.to(device=self.device, dtype=torch.float32)) * self.guidance_rgs_loss_weight
+            actions_target = actions_for_loss.to(device=live_actions_for_loss.device, dtype=live_actions_for_loss.dtype)
+            rgs_loss_weighted = self._action_l1_loss(live_actions_for_loss, actions_target, apply_axis_weights=True)
+            rgs_loss_unweighted = self._action_l1_loss(live_actions_for_loss, actions_target, apply_axis_weights=False)
+            rgs_loss = rgs_loss_weighted * self.guidance_rgs_loss_weight
             action_log_dict = {
                 "critic_rgs_loss": rgs_loss.detach(),
+                "critic_rgs_loss_raw": rgs_loss_weighted.detach(),
+                "critic_rgs_loss_unweighted": rgs_loss_unweighted.detach(),
                 "critic_action_pred_mean": live_actions.detach().mean(),
                 "critic_action_target_mean": actions.detach().mean(),
             }
+            action_log_dict.update(self._compute_action_metrics(live_actions_for_loss.detach(), actions_target.detach(), "critic_action"))
 
         total_loss = denoising_loss + cls_loss + rgs_loss
 
@@ -751,5 +950,6 @@ class DMD2RealMSELAM_Actions(SelfForcingModel):
         }
         critic_log_dict.update(gan_log_dict)
         critic_log_dict.update(action_log_dict)
+        critic_log_dict.update(self._action_batch_stats(actions, "actions"))
 
         return total_loss, critic_log_dict
