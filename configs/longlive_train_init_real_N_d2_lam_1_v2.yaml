@@ -1,6 +1,6 @@
 config_name: 'init-real-dmd2mseganlam-d2-lam_de_v2'
 text_pre_encoded: true
-negative_prompt_encoded_path: /projects/u5dk/frodobots_captions/negative/longlive_train_init_real_negative_1.json
+negative_prompt_encoded_path: /projects/u5dk/as1748/frodobots_captions/negative/longlive_train_init_real_negative_1.json
 action_patch_enabled: true
 cls_on_clean_image: true #what does this do?
 gan_type: 'relative'
@@ -21,8 +21,6 @@ generator_mse_loss_weight: 0.1 #raised from 0.05
 generator_mse_loss_weight_decay: 0.0
 motion_enabled_loss: false
 motion_weight_c: 2.0
-compute_video_metrics: true
-compute_video_metrics_interval: 50
 compute_video_metrics: true
 compute_video_metrics_interval: 50
 generator_ckpt: /scratch/u5dk/as1748.u5dk/checkpoints/ode_init.pt
@@ -62,10 +60,10 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
-real_latent_root: /projects/u5dk/frodobots_encoded/train
-caption_root: /projects/u5dk/frodobots_captions/train
-val_real_latent_root: /projects/u5dk/frodobots_encoded/test
-val_caption_root: /projects/u5dk/frodobots_captions/test
+real_latent_root: /projects/u5dk/as1748/frodobots_encoded/train
+caption_root: /projects/u5dk/as1748/frodobots_captions/train
+val_real_latent_root: /projects/u5dk/as1748/frodobots_encoded/test
+val_caption_root: /projects/u5dk/as1748/frodobots_captions/test
 data_blacklist_path: /home/u5dk/as1748.u5dk/ARRWM/data_blacklist.txt
 batch_size: 1
 gradient_accumulation_steps: 1
