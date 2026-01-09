@@ -32,6 +32,7 @@ from model import (
     DMD2RealMSE,
     DMD2RealMSELAM,
     DMD2RealMSELAM_Actions,
+    DMD2FlowSquared,
 )
 from model.streaming_training import StreamingTrainingModel
 from latent_actions.train_latent_action_model import Action3DCNN
@@ -235,6 +236,8 @@ class Trainer:
                 device=self.device,
                 latent_action_model=latent_action_model,
             )
+        elif config.distribution_loss == "dmd2flowganflow_actions":
+            self.model = DMD2FlowSquared(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
 
@@ -568,8 +571,12 @@ class Trainer:
         if self.one_logger is not None:
             self.one_logger.on_optimizer_init_start()
 
+        if hasattr(self.model, "get_generator_parameters"):
+            generator_params_iter = self.model.get_generator_parameters()
+        else:
+            generator_params_iter = self.model.generator.parameters()
         generator_params: list[torch.nn.Parameter] = [
-            param for param in self.model.generator.parameters() if param.requires_grad
+            param for param in generator_params_iter if param.requires_grad
         ]
 
         self.generator_optimizer = torch.optim.AdamW(
@@ -590,8 +597,11 @@ class Trainer:
                     weight_decay=config.weight_decay,
                 )
 
-        critic_params = [param for param in self.model.fake_score.parameters()
-                         if param.requires_grad]
+        if hasattr(self.model, "get_critic_parameters"):
+            critic_params_iter = self.model.get_critic_parameters()
+        else:
+            critic_params_iter = self.model.fake_score.parameters()
+        critic_params = [param for param in critic_params_iter if param.requires_grad]
         if (
             getattr(config, "distribution_loss", None) in ("dmd2realmselam", "dmd2realmselam_actions")
             and getattr(self.model, "latent_action_model", None) is not None
@@ -620,7 +630,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2flowganflow_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -654,7 +664,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2flowganflow_actions", "dmd2realmselam_action", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -1314,13 +1324,56 @@ class Trainer:
             ):
                 if self.is_main_process:
                     critic_state_dict = self.model.fake_score.module.state_dict()
-            full_critic_optim = FSDP.full_optim_state_dict(
-                self.model.fake_score,
-                self.critic_optimizer,
-                rank0_only=True,
-            )
-            if self.is_main_process and full_critic_optim is not None:
-                critic_opim_state_dict = full_critic_optim
+            
+            # Handle optimizer state: FSDP-wrapped modules (fake_score) and non-FSDP modules (flow_discriminator)
+            # FSDP.full_optim_state_dict only works for FSDP-wrapped parameters
+            # We need to handle flow_discriminator parameters separately
+            flow_disc = getattr(self.model, "flow_discriminator", None)
+            if flow_disc is not None:
+                # Get parameter sets to split optimizer state
+                # Note: optimizer.state.keys() are parameter objects, not IDs
+                fake_score_params = {p for p in self.model.fake_score.parameters()}
+                flow_disc_params = {p for p in flow_disc.parameters()}
+                
+                # Split optimizer state into FSDP and non-FSDP parts
+                fsdp_optim_state = {}
+                flow_disc_optim_state = {}
+                for param, state in self.critic_optimizer.state.items():
+                    if param in fake_score_params:
+                        fsdp_optim_state[param] = state
+                    elif param in flow_disc_params:
+                        flow_disc_optim_state[param] = state
+                
+                # Create temporary optimizer with only FSDP parameters for FSDP.full_optim_state_dict
+                fake_score_params = [p for p in self.model.fake_score.parameters() if p.requires_grad and p in fsdp_optim_state]
+                if fake_score_params:
+                    temp_optim = torch.optim.AdamW(fake_score_params, lr=1.0)
+                    temp_optim.state = fsdp_optim_state
+                    full_critic_optim = FSDP.full_optim_state_dict(
+                        self.model.fake_score,
+                        temp_optim,
+                        rank0_only=True,
+                    )
+                else:
+                    full_critic_optim = {}
+                
+                # Merge flow_discriminator optimizer state with FSDP optimizer state
+                if self.is_main_process and full_critic_optim is not None:
+                    # Map flow_discriminator parameters to their names for saving
+                    param_to_name = {p: name for name, p in flow_disc.named_parameters() if p.requires_grad}
+                    for param, state in flow_disc_optim_state.items():
+                        if param in param_to_name:
+                            full_critic_optim[f"flow_discriminator.{param_to_name[param]}"] = state
+                    critic_opim_state_dict = full_critic_optim
+            else:
+                # No flow_discriminator, use standard FSDP path
+                full_critic_optim = FSDP.full_optim_state_dict(
+                    self.model.fake_score,
+                    self.critic_optimizer,
+                    rank0_only=True,
+                )
+                if self.is_main_process and full_critic_optim is not None:
+                    critic_opim_state_dict = full_critic_optim
             if not self.is_main_process:
                 critic_state_dict = {}
                 critic_opim_state_dict = {}
@@ -1454,7 +1507,7 @@ class Trainer:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
         if (
             self._action_patch_enabled
-            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'mse_dmd_lam', 'mse_dmd_lam_action')
+            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2flowganflow_actions', 'dmd2realmselam_action', 'mse_dmd_lam', 'mse_dmd_lam_action')
             and actions is None
         ):
             raise ValueError('Batch is missing action annotations required for action-guided training.')
@@ -1489,9 +1542,9 @@ class Trainer:
                 clean_latent=None,
                 initial_latent=None,
             )
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2flowganflow_actions'):
                 generator_kwargs['real_latents'] = real_latents
-            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2flowganflow_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['actions'] = actions
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
@@ -1536,9 +1589,9 @@ class Trainer:
             clean_latent=None,
             initial_latent=None,
         )
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2flowganflow_actions'):
             critic_kwargs['real_latents'] = real_latents
-        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2flowganflow_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['actions'] = actions
         if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['clean_latent'] = real_latents
@@ -1961,6 +2014,18 @@ class Trainer:
                         generator_log_dict = {}
                     
                     critic_grad_norm = self.model.fake_score.clip_grad_norm_(self.max_grad_norm_critic)
+                    if hasattr(self.model, "flow_discriminator") and self.model.flow_discriminator is not None:
+                        flow_disc_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.flow_discriminator.parameters(),
+                            self.max_grad_norm_critic,
+                        )
+                        if isinstance(flow_disc_norm, torch.Tensor):
+                            critic_grad_norm = torch.max(critic_grad_norm, flow_disc_norm)
+                        else:
+                            critic_grad_norm = torch.max(
+                                critic_grad_norm,
+                                torch.tensor(flow_disc_norm, device=critic_grad_norm.device),
+                            )
                     critic_log_dict = merge_dict_list(accumulated_critic_logs)
                     critic_log_dict["critic_grad_norm"] = critic_grad_norm
                     
@@ -2025,6 +2090,18 @@ class Trainer:
                         generator_log_dict = {}
                     
                     critic_grad_norm = self.model.fake_score.clip_grad_norm_(self.max_grad_norm_critic)
+                    if hasattr(self.model, "flow_discriminator") and self.model.flow_discriminator is not None:
+                        flow_disc_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.flow_discriminator.parameters(),
+                            self.max_grad_norm_critic,
+                        )
+                        if isinstance(flow_disc_norm, torch.Tensor):
+                            critic_grad_norm = torch.max(critic_grad_norm, flow_disc_norm)
+                        else:
+                            critic_grad_norm = torch.max(
+                                critic_grad_norm,
+                                torch.tensor(flow_disc_norm, device=critic_grad_norm.device),
+                            )
                     critic_log_dict = merge_dict_list(accumulated_critic_logs)
                     critic_log_dict["critic_grad_norm"] = critic_grad_norm
                     
@@ -2069,40 +2146,44 @@ class Trainer:
                             return
                         wandb_loss_dict[rename or key] = value
 
+                    def _collect_all_metrics(log_dict, prefix=""):
+                        """Automatically collect all metrics from log_dict."""
+                        if not log_dict:
+                            return
+                        for key, value in log_dict.items():
+                            try:
+                                if isinstance(value, torch.Tensor):
+                                    value = value.detach()
+                                    # Handle different tensor shapes
+                                    if value.numel() == 1:
+                                        value = value.item()
+                                    else:
+                                        value = value.float().mean().item()
+                                elif isinstance(value, (float, int)):
+                                    value = float(value)
+                                else:
+                                    continue  # Skip non-numeric values
+                                
+                                # Add prefix if provided
+                                wandb_key = f"{prefix}{key}" if prefix else key
+                                wandb_loss_dict[wandb_key] = value
+                            except Exception:
+                                # Skip metrics that can't be converted to float
+                                continue
+
+                    # Collect all metrics from generator log_dict
                     if TRAIN_GENERATOR and generator_log_dict:
-                        for metric in (
-                            "generator_loss",
-                            "generator_grad_norm",
-                            "dmdtrain_gradient_norm",
-                            "generator_mse_loss",
-                            "generator_mse_raw",
-                            "generator_dwt_loss",
-                            "generator_dwt_raw",
-                            "generator_gan_loss",
-                            "generator_gan_logits",
-                            "generator_gan_real_prob",
-                            "generator_gan_logits_std",
-                            "generator_adaptive_gan_weight",
-                        ):
-                            _collect_metric(generator_log_dict, metric)
-                        _collect_metric(generator_log_dict, "latent_action_loss", rename="action_loss")
-                        _collect_metric(generator_log_dict, "latent_action_loss_raw")
+                        # Collect all metrics automatically (including generator_loss)
+                        _collect_all_metrics(generator_log_dict, prefix="")
+                        # Handle special case for latent_action_loss -> action_loss rename (keep both)
+                        if "latent_action_loss" in generator_log_dict:
+                            _collect_metric(generator_log_dict, "latent_action_loss", rename="action_loss")
 
-                    for metric in (
-                        "critic_loss",
-                        "critic_grad_norm",
-                        "critic_denoising_loss",
-                        "critic_gan_loss",
-                        "critic_cls_loss",
-                        "critic_real_logits",
-                        "critic_fake_logits",
-                        "critic_real_prob",
-                        "critic_fake_prob",
-                        "critic_real_accuracy",
-                        "critic_fake_accuracy",
-                    ):
-                        _collect_metric(critic_log_dict, metric)
+                    # Collect all metrics from critic log_dict
+                    if critic_log_dict:
+                        _collect_all_metrics(critic_log_dict, prefix="")
 
+                    # Add loss weight metrics
                     if hasattr(self.model, "generator_mse_loss_weight"):
                         wandb_loss_dict["generator_mse_loss_weight_current"] = float(self.model.generator_mse_loss_weight)
                     if hasattr(self.model, "dmd_loss_weight"):

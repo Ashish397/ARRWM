@@ -719,19 +719,8 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                                 crossattn_cache=self.crossattn_cache,
                                 current_start=current_start_frame * self.frame_seq_length
                             )
-                            # Compute target flow: (x_t - x_0) / sigma_t
-                            # Get sigma_t for current timestep
-                            timestep_flat = timestep.flatten(0, 1)
-                            timestep_id = torch.argmin(
-                                (self.scheduler.timesteps.unsqueeze(0) - timestep_flat.unsqueeze(1)).abs(),
-                                dim=1
-                            )
-                            sigma_t = self.scheduler.sigmas[timestep_id].reshape(-1, 1, 1, 1)
-                            # Compute target flow from actual noisy_input and noiseless_input
-                            flow_target = (noisy_input.flatten(0, 1) - noiseless_input.flatten(0, 1)) / sigma_t
-                            flow_target = flow_target.view_as(noisy_input)
-                            err = ((flow_pred - flow_target) ** 2).mean()
-                            flow_losses.append(err)
+                        err = ((flow_pred - (this_noise - noiseless_input)) ** 2).mean()
+                        flow_losses.append(err)
                     break
 
             # Step 3.3: rerun with timestep zero to update the cache

@@ -20,7 +20,11 @@ class BaseModel(nn.Module):
         cfg_flag = getattr(args, "action_patch_enabled", None)
         self._action_patch_enabled = bool(cfg_flag)
         object.__setattr__(self, "_action_projection_ref", None)
-        self._action_dim: Optional[int] = None
+        # Set action_dim from args if action patches are enabled
+        if self._action_patch_enabled:
+            self._action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
+        else:
+            self._action_dim: Optional[int] = None
         self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
         self._initialize_models(args, device)
 
@@ -34,15 +38,10 @@ class BaseModel(nn.Module):
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
-        base_model_name = getattr(args, "model_name", None)
-        self.real_model_name = getattr(args, "real_name", base_model_name) or "Wan2.1-T2V-1.3B"
-        self.fake_model_name = getattr(args, "fake_name", base_model_name) or "Wan2.1-T2V-1.3B"
-
-        model_kwargs = self._to_dict(getattr(args, "model_kwargs", None))
-        self.local_attn_size = model_kwargs.get("local_attn_size", -1)
-        if "model_name" not in model_kwargs:
-            model_kwargs["model_name"] = self.real_model_name
-        self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
+        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
+        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+        self.local_attn_size = getattr(args, "model_kwargs", {}).get("local_attn_size", -1)
+        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         # Apply action patches before any distributed/FSDP wrapping so the inner
         # module gains the extended signature and hooks.
         if self._action_patch_enabled:
@@ -52,8 +51,7 @@ class BaseModel(nn.Module):
                 raise RuntimeError(
                     "Action patches are enabled but action_projection failed to initialize."
                 )
-            self.action_projection.requires_grad_(True)
-            
+            self.action_projection.requires_grad_(True)            
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
@@ -71,7 +69,7 @@ class BaseModel(nn.Module):
         else:
             self.text_encoder = None
 
-        self.vae = WanVAEWrapper(model_name=self.real_model_name)
+        self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()
@@ -81,12 +79,10 @@ class BaseModel(nn.Module):
         if not self._action_patch_enabled:
             self._set_action_projection(None)
             return
-        action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
-        self._action_dim = action_dim
         model_dim = getattr(self.generator.model, "dim", 2048)
         dtype = torch.bfloat16 if args.mixed_precision else torch.float32
         module = ActionModulationProjection(
-            action_dim=action_dim,
+            action_dim=self._action_dim,
             hidden_dim=model_dim,
             num_frames=1,
             zero_init=True,
@@ -140,7 +136,6 @@ class BaseModel(nn.Module):
                 dtype=torch.long
             ).repeat(1, num_frame)
             return timestep
-
         else:
             timestep = torch.randint(
                 min_timestep,
@@ -239,18 +234,6 @@ class SelfForcingModel(BaseModel):
             detach=detach_modulation,
             frame_start=frame_start,
         )
-        if (
-            modulation is not None
-            and target_num_frames is not None
-            and modulation.shape[1] != target_num_frames
-        ):
-            if modulation.shape[1] < target_num_frames:
-                raise ValueError(
-                    f"action_modulation has only {modulation.shape[1]} frames; "
-                    f"{target_num_frames} required to match critic timestep."
-                )
-            modulation = modulation[:, :target_num_frames]
-
         if modulation is None:
             raise ValueError("action_modulation is required")
         conditioned = dict(base_conditional)
@@ -264,7 +247,8 @@ class SelfForcingModel(BaseModel):
         initial_latent: torch.tensor = None,
         slice_last_frames: int = 21,
         action_inputs: Optional[object] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[int], Optional[int], int]:
+        noise: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[int], Optional[int], torch.Tensor]:
         """
         Optionally simulate the generator's input from noise using backward simulation
         and then run the generator for one-step.
@@ -274,9 +258,14 @@ class SelfForcingModel(BaseModel):
             - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
             - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
             - initial_latent: a tensor containing the initial latents [B, F, C, H, W].
+            - noise: optional pre-sampled noise tensor. If None, noise will be sampled.
         Output:
             - pred_image: a tensor with shape [B, F, C, H, W].
-            - denoised_timestep: an integer
+            - gradient_mask: a tensor with shape [B, F, C, H, W] or None
+            - denoised_timestep_from: an integer or None
+            - denoised_timestep_to: an integer or None
+            - t_exit_full: a tensor with shape [B, F] containing exit timesteps
+            - noise: the noise tensor used (same as input if provided, or newly sampled)
         """
         # Step 1: Sample noise and backward simulate the generator's input
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
@@ -287,30 +276,39 @@ class SelfForcingModel(BaseModel):
         else:
             noise_shape = image_or_video_shape.copy()
 
-        # During training, the number of generated frames should be uniformly sampled from
-        # [min_num_frames, self.num_training_frames], but still being a multiple of self.num_frame_per_block.
-        # If `min_num_frames` is not provided, we fallback to the original default behaviour.
-        min_num_frames = (self.min_num_training_frames - 1) if self.args.independent_first_frame else self.min_num_training_frames
-        max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
-        assert max_num_frames % self.num_frame_per_block == 0
-        assert min_num_frames % self.num_frame_per_block == 0
-        max_num_blocks = max_num_frames // self.num_frame_per_block
-        min_num_blocks = min_num_frames // self.num_frame_per_block
-        num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
-        dist.broadcast(num_generated_blocks, src=0)
-        num_generated_blocks = num_generated_blocks.item()
-        num_generated_frames = num_generated_blocks * self.num_frame_per_block
-        if dist.get_rank() == 0 and DEBUG:
-            print(f"num_generated_frames: {num_generated_frames}")
-        if self.args.independent_first_frame and initial_latent is None:
-            num_generated_frames += 1
-            min_num_frames += 1
-        # Sync num_generated_frames across all processes
-        noise_shape[1] = num_generated_frames
+        if noise is None:
+            # During training, the number of generated frames should be uniformly sampled from
+            # [min_num_frames, self.num_training_frames], but still being a multiple of self.num_frame_per_block.
+            # If `min_num_frames` is not provided, we fallback to the original default behaviour.
+            min_num_frames = (self.min_num_training_frames - 1) if self.args.independent_first_frame else self.min_num_training_frames
+            max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
+            assert max_num_frames % self.num_frame_per_block == 0
+            assert min_num_frames % self.num_frame_per_block == 0
+            max_num_blocks = max_num_frames // self.num_frame_per_block
+            min_num_blocks = min_num_frames // self.num_frame_per_block
+            num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
+            dist.broadcast(num_generated_blocks, src=0)
+            num_generated_blocks = num_generated_blocks.item()
+            num_generated_frames = num_generated_blocks * self.num_frame_per_block
+            if dist.get_rank() == 0 and DEBUG:
+                print(f"num_generated_frames: {num_generated_frames}")
+            if self.args.independent_first_frame and initial_latent is None:
+                num_generated_frames += 1
+                min_num_frames += 1
+            # Sync num_generated_frames across all processes
+            noise_shape[1] = num_generated_frames
+            noise = torch.randn(noise_shape, device=self.device, dtype=self.dtype)
+        else:
+            # Infer num_generated_frames from noise.shape[1]
+            num_generated_frames = noise.shape[1]
+            # Compute min_num_frames for gradient_mask logic (consistent with sampling path)
+            if self.args.independent_first_frame and initial_latent is None:
+                min_num_frames = self.min_num_training_frames
+            else:
+                min_num_frames = (self.min_num_training_frames - 1) if self.args.independent_first_frame else self.min_num_training_frames
 
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
-            noise=torch.randn(noise_shape,
-                              device=self.device, dtype=self.dtype),
+            noise=noise,
             slice_last_frames=slice_last_frames,
             action_inputs=action_inputs,
             **conditional_dict,
@@ -337,8 +335,6 @@ class SelfForcingModel(BaseModel):
         else:
             pred_image_or_video_sliced = pred_image_or_video
 
-        frame_start_index = max(0, pred_image_or_video.shape[1] - pred_image_or_video_sliced.shape[1])
-
         if num_generated_frames != min_num_frames:
             # Currently, we do not use gradient for the first chunk, since it contains image latents
             gradient_mask = torch.ones_like(pred_image_or_video_sliced, dtype=torch.bool)
@@ -355,7 +351,6 @@ class SelfForcingModel(BaseModel):
             gradient_mask,
             denoised_timestep_from,
             denoised_timestep_to,
-            frame_start_index,
         )
 
     def _consistency_backward_simulation(
@@ -364,7 +359,7 @@ class SelfForcingModel(BaseModel):
         slice_last_frames: int = 21,
         action_inputs: Optional[object] = None,
         **conditional_dict: dict
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[int], Optional[int], torch.Tensor]:
         """
         Simulate the generator's input from noise to avoid training/inference mismatch.
         See Sec 4.5 of the DMD2 paper (https://arxiv.org/abs/2405.14867) for details.
@@ -373,16 +368,14 @@ class SelfForcingModel(BaseModel):
             - noise: a tensor sampled from N(0, 1) with shape [B, F, C, H, W] where the number of frame is 1 for images.
             - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
         Output:
-            - output: a tensor with shape [B, T, F, C, H, W].
-            T is the total number of timesteps. output[0] is a pure noise and output[i] and i>0
-            represents the x0 prediction at each timestep.
+            - output: a tensor with shape [B, F, C, H, W].
+            - denoised_timestep_from: an integer or None
+            - denoised_timestep_to: an integer or None
+            - t_exit_full: a tensor with shape [B, F] containing exit timesteps
         """
         if self.inference_pipeline is None:
             self._initialize_inference_pipeline()
 
-        kwargs = {
-            k: v for k, v in conditional_dict.items() if k != "initial_latent"
-        }
         if self._action_patch_enabled:
             return self.inference_pipeline.inference_with_trajectory(
                 noise=noise,
@@ -396,6 +389,29 @@ class SelfForcingModel(BaseModel):
                 **conditional_dict,
                 slice_last_frames=slice_last_frames,
             )
+
+    def _run_generator_flow(
+        self,
+        conditional_dict: dict,
+        initial_latent: torch.tensor = None,
+        slice_last_frames: int = 21,
+        action_inputs: object = None,
+        real_latents_x0: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Flow version that reuses t_exit_full from the DMD rollout.
+        Returns the differentiable flow-space reconstruction loss computed on real latents.
+        """
+        if initial_latent is not None:
+            conditional_dict["initial_latent"] = initial_latent
+
+        return self.inference_pipeline.inference_with_trajectory_for_flow(
+            initial_latent=initial_latent,
+            slice_last_frames=slice_last_frames,
+            action_inputs=action_inputs,
+            real_latents_x0=real_latents_x0,
+            **conditional_dict,
+        )
 
     def _initialize_inference_pipeline(self):
         """
