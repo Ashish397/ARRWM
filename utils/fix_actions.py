@@ -10,8 +10,8 @@ from typing import Iterator, List, Sequence, Tuple, Union
 
 DEFAULT_INPUT_ROOT = Path("/projects/u5as/frodobots")
 DEFAULT_OUTPUT_ROOT = Path("/projects/u5as/frodobots_actions")
-DEFAULT_MAX_FRAMES = 6001
-DEFAULT_MAX_ROWS = 501
+DEFAULT_MAX_FRAMES = 6000
+DEFAULT_MAX_ROWS = 500
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_ROWS,
         help="Maximum number of output action rows per file.",
+    )
+    parser.add_argument(
+        "--independent-first-frame",
+        action="store_true",
+        default=False,
+        help="If True, first frame gets action (0, 0) and remaining frames are processed in blocks. If False, all frames are processed in blocks starting from frame 0.",
+    )
+    parser.add_argument(
+        "--folder",
+        type=str,
+        default="train",
+        help="Folder name to use in output path (default: 'train').",
     )
     return parser.parse_args(argv)
 
@@ -143,20 +155,22 @@ def compute_actions(
     control_samples: Sequence[ControlSample],
     max_actions: int,
     frames_per_block: int = 12,
-) -> Tuple[List[Action], int, float, int]:
+    independent_first_frame: bool = False,
+) -> List[Action]:
     control_timestamps = [sample.timestamp for sample in control_samples]
     last_control_ts = control_timestamps[-1] if control_timestamps else 0.0
-    first_camera_ts = camera_samples[0].timestamp if camera_samples else 0.0
     actions: List[Action] = []
-    nan_count = 0
     
-    # Block 0: Independent first frame - action is always (0, 0)
-    actions.append(Action(linear=0.0, angular=0.0))
-    end_frame_id = 0
-    end_timestamp = first_camera_ts
+    if independent_first_frame:
+        # Block 0: Independent first frame - action is always (0, 0)
+        actions.append(Action(linear=0.0, angular=0.0))
+        
+        # Process remaining frames in blocks starting from frame 1
+        frame_idx = 1
+    else:
+        # Process all frames in blocks starting from frame 0
+        frame_idx = 0
     
-    # Process remaining frames in blocks starting from frame 1
-    frame_idx = 1
     while frame_idx < len(camera_samples) and len(actions) < max_actions:
         chunk_end = min(frame_idx + frames_per_block, len(camera_samples))
         chunk = camera_samples[frame_idx:chunk_end]
@@ -178,18 +192,15 @@ def compute_actions(
             else:
                 # Gap in control data or control hasn't started yet - use NaN
                 actions.append(Action(linear=math.nan, angular=math.nan))
-                nan_count += 1
         else:
             weight = len(window)
             linear_avg = sum(sample.linear for sample in window) / weight
             angular_avg = sum(sample.angular for sample in window) / weight
             actions.append(Action(linear=linear_avg, angular=angular_avg))
         
-        end_frame_id = chunk[-1].frame_id
-        end_timestamp = chunk[-1].timestamp
         frame_idx = chunk_end
     
-    return (actions, end_frame_id, end_timestamp, nan_count)
+    return actions
 
 
 def write_actions(output_path: Path, actions: Sequence[Action], max_rows: int) -> None:
@@ -206,20 +217,6 @@ def write_actions(output_path: Path, actions: Sequence[Action], max_rows: int) -
                 writer.writerow([block_idx, f"{action.linear:.6f}", f"{action.angular:.6f}"])
 
 
-def write_start_frame(
-    output_path: Path, 
-    end_frame_id: int,
-    end_timestamp: float,
-    nan_count: int,
-) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["frame_id", "timestamp"])
-        writer.writerow([end_frame_id, f"{end_timestamp:.6f}"])
-        writer.writerow([nan_count, "nan_blocks"])
-
-
 def process_pair(
     front_path: Path,
     control_path: Path,
@@ -228,6 +225,8 @@ def process_pair(
     max_frames: int,
     max_rows: int,
     frames_per_block: int = 12,
+    independent_first_frame: bool = False,
+    folder: str = "none",
 ) -> Tuple[str, int]:
     """Process a pair and return (status, num_actions). Status: 'error', 'zero', 'few', 'incomplete', 'full'"""
     camera_samples = read_camera_samples(front_path, max_frames)
@@ -236,11 +235,12 @@ def process_pair(
         print(f"[skip] Missing data for {front_path}", file=sys.stderr)
         return ("error", 0)
     
-    actions, end_frame_id, end_timestamp, nan_count = compute_actions(
+    actions = compute_actions(
         camera_samples, 
         control_samples, 
         max_actions=max_rows, 
         frames_per_block=frames_per_block,
+        independent_first_frame=independent_first_frame,
     )
     if not actions:
         print(f"[skip] No actions computed for {front_path}", file=sys.stderr)
@@ -250,18 +250,14 @@ def process_pair(
     
     relative = front_path.relative_to(input_root)
     parts = relative.parts
-    output_relative = Path("train") / Path(*parts[:-1])
+    output_relative = Path(folder) / Path(*parts[:-1])
     
     input_actions_path = output_root / output_relative / relative.name.replace(
         "front_camera_timestamps_", "input_actions_"
     )
-    start_frame_path = output_root / output_relative / relative.name.replace(
-        "front_camera_timestamps_", "start_frame_"
-    )
 
     write_actions(input_actions_path, actions, max_rows)
-    write_start_frame(start_frame_path, end_frame_id, end_timestamp, nan_count)
-    print(f"[ok] Wrote {num_actions} rows -> {input_actions_path}, start_frame -> {start_frame_path}")
+    print(f"[ok] Wrote {num_actions} rows -> {input_actions_path}")
     
     # Determine status
     if num_actions >= max_rows:
@@ -307,6 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_frames=args.max_frames,
                 max_rows=args.max_rows,
                 frames_per_block=args.frames_per_block,
+                independent_first_frame=args.independent_first_frame,
+                folder=args.folder,
             )
             stats[status] += 1
     

@@ -15,7 +15,7 @@ causal: true
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
 prompt_path: prompts/MovieGenVideoBench.txt
-wan_model_path: /home/u5dk/as1748.u5dk/ARRWM/wan_models/
+wan_model_path: /scratch/u5dk/as1748.u5dk/wan_models/
 eval_first_n: 64
 num_samples: 1
 height: 480

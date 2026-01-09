@@ -179,9 +179,10 @@ class VideoLatentCaptionDataset(Dataset):
             self._resolve_action_root(action_root) if include_actions else None
         )
 
-        self._action_cache: dict[Path, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._action_cache: dict[Path, "VideoLatentCaptionDataset._ActionCacheEntry"] = {}
         self._action_value_keys: Optional[tuple[str, ...]] = None
         self._short_action_warned: set[Path] = set()
+        self._nan_action_warned: set[Path] = set()
         self._blacklisted_dirs: set[Path] = set()
         if self.blacklist_path is not None:
             self._load_blacklist(self.blacklist_path)
@@ -270,6 +271,9 @@ class VideoLatentCaptionDataset(Dataset):
 
         if not self.samples:
             raise RuntimeError("No paired latent/caption samples were found.")
+
+        if self.include_actions:
+            self._prune_samples_without_valid_windows()
 
     def _resolve_action_root(self, action_root: Optional[str]) -> Path:
         if action_root is not None:
@@ -431,10 +435,59 @@ class VideoLatentCaptionDataset(Dataset):
 
         return f"{caption} {STYLE_SUFFIX}"
 
-    def _load_actions_tensor(self, actions_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
+    @dataclass
+    class _ActionCacheEntry:
+        frames: torch.Tensor
+        values: torch.Tensor
+        valid_starts: list[int]
+
+    def _prune_samples_without_valid_windows(self) -> None:
+        """Ensure every sampled sequence has at least one NaN-free window."""
+        valid_samples: list[VideoLatentCaptionDataset.Sample] = []
+        removed = 0
+        for sample in self.samples:
+            if sample.actions_path is None:
+                valid_samples.append(sample)
+                continue
+            try:
+                _, _, valid_starts = self._load_actions_tensor(sample.actions_path)
+            except Exception as exc:
+                print(f"{sample.actions_path}: failed to load actions ({exc}), skipping sample")
+                removed += 1
+                continue
+            if not valid_starts:
+                rel_dir = sample.actions_path.parent.relative_to(self.actions_root)
+                if sample.actions_path not in self._nan_action_warned:
+                    print(
+                        f"{rel_dir}: no NaN-free action window of length {self.num_frames}, "
+                        f"skipping sample"
+                    )
+                    self._nan_action_warned.add(sample.actions_path)
+                removed += 1
+                continue
+            valid_samples.append(sample)
+        if removed:
+            print(f"VideoLatentCaptionDataset: filtered out {removed} samples with invalid action windows.")
+        self.samples = valid_samples
+
+    def _compute_valid_window_starts(self, finite_mask: torch.Tensor, window: int) -> list[int]:
+        """Return list of start indices for contiguous finite windows."""
+        if finite_mask.numel() < window:
+            return []
+        mask_int = finite_mask.to(dtype=torch.int32)
+        cumsum = torch.cumsum(mask_int, dim=0)
+        prefix = torch.zeros_like(cumsum)
+        prefix[window:] = cumsum[:-window]
+        window_sums = cumsum[window - 1:] - prefix[window - 1:]
+        if window_sums.numel() == 0:
+            return []
+        valid = (window_sums == window).nonzero(as_tuple=False).flatten()
+        return valid.tolist()
+
+    def _load_actions_tensor(self, actions_path: Path) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
         cached = self._action_cache.get(actions_path)
         if cached is not None:
-            return cached
+            return cached.frames, cached.values, cached.valid_starts
 
         try:
             with actions_path.open("r", encoding="utf-8") as fh:
@@ -457,6 +510,8 @@ class VideoLatentCaptionDataset(Dataset):
 
         frame_tensor = torch.tensor(frames, dtype=torch.long)
         value_tensor = torch.tensor(values, dtype=torch.float32)
+        finite_mask = torch.isfinite(value_tensor).all(dim=1)
+        valid_starts = self._compute_valid_window_starts(finite_mask, self.num_frames)
 
         if self._action_value_keys is None:
             self._action_value_keys = tuple(value_keys)
@@ -465,8 +520,13 @@ class VideoLatentCaptionDataset(Dataset):
                 f"Action columns mismatch in {actions_path}; expected {self._action_value_keys}, got {tuple(value_keys)}"
             )
 
-        self._action_cache[actions_path] = (frame_tensor, value_tensor)
-        return frame_tensor, value_tensor
+        entry = self._ActionCacheEntry(
+            frames=frame_tensor,
+            values=value_tensor,
+            valid_starts=valid_starts,
+        )
+        self._action_cache[actions_path] = entry
+        return entry.frames, entry.values, entry.valid_starts
 
     def _relativize_latent_path(self, path: Path) -> Path:
         try:
@@ -481,82 +541,110 @@ class VideoLatentCaptionDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        sample = self.samples[idx]
+        total_samples = len(self.samples)
+        current_idx = idx % total_samples
+        attempts = 0
 
-        #load latent
-        latents = torch.load(sample.latent_path, map_location="cpu")[0]
+        while attempts < total_samples:
+            sample = self.samples[current_idx]
+            attempts += 1
 
-        if not isinstance(latents, torch.Tensor) or latents.ndim != 4:
-            raise ValueError(f"Unexpected latent format at {sample.latent_path}")
-        if latents.shape[0] == 0:
-            raise ValueError(f"Latent sequence empty: {sample.latent_path}")
+            # load latent
+            latents = torch.load(sample.latent_path, map_location="cpu")[0]
 
-        if self.include_actions:
-            #load actions
-            actions_path = sample.actions_path
-            if actions_path is None:
-                raise RuntimeError("Actions path missing for sample.")
+            if not isinstance(latents, torch.Tensor) or latents.ndim != 4:
+                raise ValueError(f"Unexpected latent format at {sample.latent_path}")
+            if latents.shape[0] == 0:
+                raise ValueError(f"Latent sequence empty: {sample.latent_path}")
 
-            action_frames, action_values = self._load_actions_tensor(actions_path)
+            if self.include_actions:
+                # load actions
+                actions_path = sample.actions_path
+                if actions_path is None:
+                    raise RuntimeError("Actions path missing for sample.")
 
-            total = min(latents.shape[0], action_frames.shape[0])
-        else:
-            total = latents.shape[0]
+                action_frames, action_values, valid_starts = self._load_actions_tensor(actions_path)
+                total = min(latents.shape[0], action_frames.shape[0])
+                if total < self.num_frames:
+                    raise RuntimeError("Not enough frames with accompanying actions in the sample.")
 
-        if total >= self.num_frames:
-            start_max = total - self.num_frames
-            start = random.randint(0, start_max) if start_max > 0 else 0
+                # Trim to the shared length so we don't look beyond the valid region.
+                latents = latents[:total]
+                action_frames = action_frames[:total]
+                action_values = action_values[:total]
+
+                # Identify viable window start positions that contain no NaNs.
+                max_start = total - self.num_frames
+                valid_candidates = [idx for idx in valid_starts if idx <= max_start]
+                if not valid_candidates:
+                    if actions_path not in self._nan_action_warned:
+                        print(
+                            f"{actions_path}: skipping sample because no NaN-free action window "
+                            f"of length {self.num_frames} is available."
+                        )
+                        self._nan_action_warned.add(actions_path)
+                    current_idx = (current_idx + 1) % total_samples
+                    continue
+                start = random.choice(valid_candidates)
+            else:
+                total = latents.shape[0]
+                if total < self.num_frames:
+                    raise RuntimeError("Not enough frames in the sample.")
+                max_start = total - self.num_frames
+                start = random.randint(0, max_start) if max_start > 0 else 0
+
             end = start + self.num_frames
-        else:
-            raise RuntimeError("Not enough frames in the sample.")
 
-        latents = latents[start:end]
-        latents = latents.contiguous().float()
-        prompt_text = sample.prompt_text or ""
+            latents_slice = latents[start:end].contiguous().float()
+            prompt_text = sample.prompt_text or ""
 
-        if self.include_actions:
-            action_frames = action_frames[start:end]
-            action_values = action_values[start:end]
+            if self.include_actions:
+                action_frames_slice = action_frames[start:end]
+                action_values_slice = action_values[start:end]
 
-            sample_dict = {
-                "idx": idx,
-                "prompts": prompt_text,
-                "real_latents": latents,
-                "action_frames": action_frames.clone(),
-                "actions": action_values.clone(),
-            }
-        else:
-            sample_dict = {
-                "idx": idx,
-                "prompts": prompt_text,
-                "real_latents": latents,
-            }
+                sample_dict = {
+                    "idx": current_idx,
+                    "prompts": prompt_text,
+                    "real_latents": latents_slice,
+                    "action_frames": action_frames_slice.clone(),
+                    "actions": action_values_slice.clone(),
+                }
+            else:
+                sample_dict = {
+                    "idx": current_idx,
+                    "prompts": prompt_text,
+                    "real_latents": latents_slice,
+                }
 
-        if sample.encoded_path is not None:
-            try:
-                with sample.encoded_path.open("r", encoding="utf-8") as fh:
-                    payload = json.load(fh)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to read encoded caption from {sample.encoded_path}: {exc}"
-                ) from exc
+            if sample.encoded_path is not None:
+                try:
+                    with sample.encoded_path.open("r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to read encoded caption from {sample.encoded_path}: {exc}"
+                    ) from exc
 
-            embedding = payload.get("caption_encoded")
-            if embedding is None:
-                raise ValueError(f"'caption_encoded' missing in {sample.encoded_path}")
+                embedding = payload.get("caption_encoded")
+                if embedding is None:
+                    raise ValueError(f"'caption_encoded' missing in {sample.encoded_path}")
 
-            prompt_embeds = torch.tensor(embedding, dtype=torch.float32)
-            if prompt_embeds.ndim != 2:
-                raise ValueError(
-                    f"Encoded caption at {sample.encoded_path} has unexpected shape {prompt_embeds.shape}"
-                )
+                prompt_embeds = torch.tensor(embedding, dtype=torch.float32)
+                if prompt_embeds.ndim != 2:
+                    raise ValueError(
+                        f"Encoded caption at {sample.encoded_path} has unexpected shape {prompt_embeds.shape}"
+                    )
 
-            sample_dict["prompt_embeds"] = prompt_embeds
-        elif self.text_pre_encoded and not prompt_text:
-            raise RuntimeError("Encoded caption path missing for sample with pre-encoded text.")
+                sample_dict["prompt_embeds"] = prompt_embeds
+            elif self.text_pre_encoded and not prompt_text:
+                raise RuntimeError("Encoded caption path missing for sample with pre-encoded text.")
 
-        return sample_dict
+            return sample_dict
 
+        raise RuntimeError(
+            "Failed to find any sample with a valid non-NaN action window. "
+            "Consider filtering or regenerating the affected actions."
+        )
 
 def cycle(dl):
     while True:
