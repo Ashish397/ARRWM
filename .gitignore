@@ -8,4 +8,12 @@ checkpoints/
 logs/
 wandb/
 *.err
+*.out
+*.sbatch
 *.outcore
+
+test_grid_outputs/
+test_predictions/
+cotracker/
+
+action_analysis_results.md
