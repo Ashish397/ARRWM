@@ -587,16 +587,16 @@ print("=" * 80)
 # models = ['mu', 'mu', 'mu', 'mu']
 # steps = [4000, 4537, 5000, 6000]
 
-models = ['lambda', 'lambda', 'lambda', 'lambda']
-steps = [5000, 5000, 5000, 5000]
-co_noises = [0.02, 0.05, 0.1, 0.2]
+models = ['nu', 'xi', 'omicron', 'pi']
+steps = [8000, 8244, 8000, 8000]
+noises = [0.02, 0.05, 0.02, 0.05]
 
 model_labels = ['A', 'B', 'C', 'D']
 original_actions_dict = {}
 predicted_actions_dict = {}
 
-for model_name, step, co_noise in zip(models, steps, co_noises):
-    csv_path = predictions_dir / f"predictions_{model_name}_noise{noise_level}_step{step}_motion_noised_{co_noise}.csv"
+for model_name, step, noise_level in zip(models, steps, noises):
+    csv_path = predictions_dir / f"predictions_{model_name}_noise{noise_level}_step{step}.csv"
     if not csv_path.exists():
         print(f"Warning: {csv_path} not found, skipping...")
         continue
@@ -622,19 +622,19 @@ pa_d = predicted_actions_dict.get(models[3] + '_' + str(steps[3]))
 
 print("\nLoaded model predictions:")
 if pa_a is not None:
-    print(f"  pa_a (alpha): {predictions_dir / f'predictions_{models[0]}_noise{noise_level}_step{steps[0]}_motion_noise_{co_noises[0]}.csv'}")
+    print(f"  pa_a (alpha): {predictions_dir / f'predictions_{models[0]}_noise{noises[0]}_step{steps[0]}.csv'}")
 else:
     print(f"  pa_a (alpha): Not loaded")
 if pa_b is not None:
-    print(f"  pa_b (beta): {predictions_dir / f'predictions_{models[1]}_noise{noise_level}_step{steps[1]}_motion_noised_{co_noises[1]}.csv'}")
+    print(f"  pa_b (beta): {predictions_dir / f'predictions_{models[1]}_noise{noises[1]}_step{steps[1]}.csv'}")
 else:
     print(f"  pa_b (beta): Not loaded")
 if pa_c is not None:
-    print(f"  pa_c (gamma): {predictions_dir / f'predictions_{models[2]}_noise{noise_level}_step{steps[2]}_motion_noised_{co_noises[2]}.csv'}")
+    print(f"  pa_c (gamma): {predictions_dir / f'predictions_{models[2]}_noise{noises[2]}_step{steps[2]}.csv'}")
 else:
     print(f"  pa_c (gamma): Not loaded")
 if pa_d is not None:
-    print(f"  pa_d (delta): {predictions_dir / f'predictions_{models[3]}_noise{noise_level}_step{steps[3]}_motion_noised_{co_noises[3]}.csv'}")
+    print(f"  pa_d (delta): {predictions_dir / f'predictions_{models[3]}_noise{noises[3]}_step{steps[3]}.csv'}")
 else:
     print(f"  pa_d (delta): Not loaded")
 

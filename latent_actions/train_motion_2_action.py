@@ -20,82 +20,82 @@ import argparse
 random.seed(42)
 
 #################################
-# Configuration
+# Configuration - commented out as importing results in errors otherwise
 #################################
 
-device = 'cuda'
-motion_base = Path("/projects/u5dk/as1748/frodobots_motion")
-actions_base = Path("/projects/u5dk/as1748/frodobots_actions/train")
-data_base = Path("/projects/u5dk/as1748/frodobots_encoded/train")
+# device = 'cuda'
+# motion_base = Path("/projects/u5dk/as1748/frodobots_motion")
+# actions_base = Path("/projects/u5dk/as1748/frodobots_actions/train")
+# data_base = Path("/projects/u5dk/as1748/frodobots_encoded/train")
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--name", type=str, required=True, help="Name for checkpoint files")
-parser.add_argument("--head_mode", type=str, default="distribution", choices=["regression", "distribution"],
-                    help="Head mode: regression or distribution")
-parser.add_argument("--weighted_loss", action="store_true", default=False, help="Use weighted loss")
-parser.add_argument("--batch_size", type=int, default=1024, help="Batch size")
-parser.add_argument("--learning_rate", type=float, default=5e-4, help="Learning rate")
-parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for distribution loss (only used in distribution mode)")
-parser.add_argument("--zero_motion", action="store_true", default=False, help="Zeros motion to ablate motion conditioning")
-parser.add_argument("--noise_level", type=float, default=0.02, help="Noise level for data augmentation")
-args = parser.parse_args()
+# # Parse command-line arguments
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--name", type=str, required=True, help="Name for checkpoint files")
+# parser.add_argument("--head_mode", type=str, default="distribution", choices=["regression", "distribution"],
+#                     help="Head mode: regression or distribution")
+# parser.add_argument("--weighted_loss", action="store_true", default=False, help="Use weighted loss")
+# parser.add_argument("--batch_size", type=int, default=1024, help="Batch size")
+# parser.add_argument("--learning_rate", type=float, default=5e-4, help="Learning rate")
+# parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for distribution loss (only used in distribution mode)")
+# parser.add_argument("--zero_motion", action="store_true", default=False, help="Zeros motion to ablate motion conditioning")
+# parser.add_argument("--noise_level", type=float, default=0.02, help="Noise level for data augmentation")
+# args = parser.parse_args()
 
-# Training
-batch_size = args.batch_size
-learning_rate = 5e-4
-num_epochs = 50
-num_workers = 0
-noise_level = args.noise_level
-checkpoint_name = args.name
-head_mode = args.head_mode
-early_stopping_patience = 50
-zero_motion = args.zero_motion
+# # Training
+# batch_size = args.batch_size
+# learning_rate = 5e-4
+# num_epochs = 50
+# num_workers = 0
+# noise_level = args.noise_level
+# checkpoint_name = args.name
+# head_mode = args.head_mode
+# early_stopping_patience = 50
+# zero_motion = args.zero_motion
 
-# Parse output_rides list (convert to integers)
-# output_rides_list = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
-output_rides_list = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-test_output_rides_list = [21, 22, 23] #[18]
+# # Parse output_rides list (convert to integers)
+# # output_rides_list = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
+# output_rides_list = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+# test_output_rides_list = [21, 22, 23] #[18]
 
-# Model config
-motion_norm = True
-film_hidden_dim = 1024
+# # Model config
+# motion_norm = True
+# film_hidden_dim = 1024
 
-action_minmax = (-1.0, 1.0)  # Shared range for both linear and angular actions
+# action_minmax = (-1.0, 1.0)  # Shared range for both linear and angular actions
 
-# Distribution head config (only used when head_mode="distribution")
-aux_huber_weight = 0.1
-std_reg_weight = 0.01
-target_eps = 1e-6  # Clamp targets away from ±1 to avoid tanh boundary issues
-temperature = args.temperature  # Temperature scaling for NLL loss
+# # Distribution head config (only used when head_mode="distribution")
+# aux_huber_weight = 0.1
+# std_reg_weight = 0.01
+# target_eps = 1e-6  # Clamp targets away from ±1 to avoid tanh boundary issues
+# temperature = args.temperature  # Temperature scaling for NLL loss
 
-# Directories
-log_dir = Path("logs")
-checkpoint_dir = Path("/scratch/u5dk/as1748.u5dk/frodobots_lam/checkpoints")
-checkpoint_dir.mkdir(parents=True, exist_ok=True)
-log_dir.mkdir(exist_ok=True)
+# # Directories
+# log_dir = Path("logs")
+# checkpoint_dir = Path("/scratch/u5dk/as1748.u5dk/frodobots_lam/checkpoints")
+# checkpoint_dir.mkdir(parents=True, exist_ok=True)
+# log_dir.mkdir(exist_ok=True)
 
-#################################
-# Global Variables
-#################################
+# #################################
+# # Global Variables
+# #################################
 
-GLOBAL_WEIGHTS = {
-    "0": 0.5, # stationary
-    "1": 0.5, # strong forward
-    "2": 1.0, # med forward
-    "3": 2.0, # strong reverse
-    "4": 3.0, # med reverse
-    "5": 4.0, # strong right
-    "6": 4.0, # med right
-    "7": 2.0, # strong left
-    "8": 2.0, # med left
-}
+# GLOBAL_WEIGHTS = {
+#     "0": 0.5, # stationary
+#     "1": 0.5, # strong forward
+#     "2": 1.0, # med forward
+#     "3": 2.0, # strong reverse
+#     "4": 3.0, # med reverse
+#     "5": 4.0, # strong right
+#     "6": 4.0, # med right
+#     "7": 2.0, # strong left
+#     "8": 2.0, # med left
+# }
 
-# How much of the batch imbalance signal to apply per batch (small!)
-BIAS_STRENGTH = 0.10   # 0.05–0.20 is typical
-# How fast GLOBAL_WEIGHTS evolves over time (very small!)
-EMA_ALPHA = 0.005      # 0.001–0.01 is typical
-W_MIN, W_MAX = 0.5, 5.0
+# # How much of the batch imbalance signal to apply per batch (small!)
+# BIAS_STRENGTH = 0.10   # 0.05–0.20 is typical
+# # How fast GLOBAL_WEIGHTS evolves over time (very small!)
+# EMA_ALPHA = 0.005      # 0.001–0.01 is typical
+# W_MIN, W_MAX = 0.5, 5.0
 
 #################################
 # Model

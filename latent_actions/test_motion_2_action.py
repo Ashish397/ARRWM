@@ -37,6 +37,7 @@ parser.add_argument("--find_method", type=str, default="latest", choices=["highe
                     help="Method to find checkpoint: 'highest' (by number in filename) or 'latest' (by modification time)")
 parser.add_argument("--step", type=int, default=None,
                     help="Specific checkpoint step to load (e.g., 4000, 4333). If provided, overrides find_method")
+parser.add_argument("--zero_motion", action="store_true", help="Use zero motion")
 args = parser.parse_args()
 
 # Testing
@@ -45,6 +46,7 @@ num_workers = 4
 noise_level = args.noise_level
 checkpoint_name = args.name
 checkpoint_step = args.step
+zero_motion = args.zero_motion
 
 # Model config
 test_head_mode = args.head_mode
@@ -355,6 +357,7 @@ class LatentsMotionActionsIterable(IterableDataset):
         self.batch_size = int(batch_size)
         self.noise_level = noise_level
         self.output_rides_list = output_rides_list
+        self.zero_motion = zero_motion
     def __iter__(self):
         batch_latents = None
         batch_motion = None
@@ -364,6 +367,8 @@ class LatentsMotionActionsIterable(IterableDataset):
             nonlocal batch_latents, batch_motion, batch_actions, cur
             #We want to ensure that motion is normalised roughly by dividing by 10
             batch_motion = batch_motion / 10.0
+            if self.zero_motion:
+                batch_motion = torch.zeros_like(batch_motion)
             out = {
                 "latents": batch_latents + torch.randn_like(batch_latents) * self.noise_level,
                 "motion": batch_motion + torch.randn_like(batch_motion) * self.noise_level,
@@ -548,7 +553,7 @@ def test():
         motion_base=motion_base,
         data_base=data_base,
         batch_size=batch_size,
-        noise_level=0.0,  # No noise for testing
+        noise_level=0.02,  # No noise for testing
         output_rides_list=test_output_rides_list,
     )
     
