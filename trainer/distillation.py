@@ -32,9 +32,11 @@ from model import (
     DMD2RealMSE,
     DMD2RealMSELAM,
     DMD2RealMSELAM_Actions,
+    DMD2B2BLAM,
 )
 from model.streaming_training import StreamingTrainingModel
-from latent_actions.train_latent_action_model import Action3DCNN
+from latent_actions.train_motion_2_action import Motion2ActionModel
+from cotracker.predictor import CoTrackerPredictor
 import torch
 import torch.nn as nn
 import wandb
@@ -234,6 +236,15 @@ class Trainer:
                 config,
                 device=self.device,
                 latent_action_model=latent_action_model,
+            )
+        elif config.distribution_loss == "dmd2b2blam":
+            latent_action_model = self._build_latent_action_model(config)
+            motion_model = self._build_motion_model(config)
+            self.model = DMD2B2BLAM(
+                config,
+                device=self.device,
+                latent_action_model=latent_action_model,
+                motion_model=motion_model,
             )
         else:
             raise ValueError("Invalid distribution matching loss")
@@ -593,12 +604,21 @@ class Trainer:
         critic_params = [param for param in self.model.fake_score.parameters()
                          if param.requires_grad]
         if (
-            getattr(config, "distribution_loss", None) in ("dmd2realmselam", "dmd2realmselam_actions")
+            getattr(config, "distribution_loss", None) in ("dmd2realmselam", "dmd2realmselam_actions", "dmd2b2blam")
             and getattr(self.model, "latent_action_model", None) is not None
         ):
             critic_params.extend(
                 param
                 for param in self.model.latent_action_model.parameters()
+                if param.requires_grad
+            )
+        if (
+            getattr(config, "distribution_loss", None) in ("dmd2b2blam")
+            and getattr(self.model, "motion_model", None) is not None
+        ):
+            critic_params.extend(
+                param
+                for param in self.model.motion_model.parameters()
                 if param.requires_grad
             )
         self.critic_optimizer = torch.optim.AdamW(
@@ -620,7 +640,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2b2blam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -654,7 +674,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "dmd2b2blam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -977,72 +997,59 @@ class Trainer:
             self.model.action_loss_weight = weight
 
     def _build_latent_action_model(self, config):
-        checkpoint_path_cfg = getattr(config, "latent_action_checkpoint", None)
-        dropout = float(getattr(config, "latent_action_dropout", 0.0))
-        hidden_dims_cfg = getattr(config, "latent_action_hidden_dims", (256, 128))
-        hidden_dims = list(hidden_dims_cfg) if hidden_dims_cfg else []
-        action_dim_cfg = getattr(
-            config,
-            "latent_action_action_dim",
-            getattr(config, "raw_action_dim", getattr(config, "action_dim", 2)),
+        """Build Motion2ActionModel for dmd2b2blam."""
+        # Get checkpoint path from config
+        checkpoint_path = getattr(config, "latent_action_checkpoint", None)
+        
+        # Load checkpoint
+        checkpoint = _load_checkpoint_with_storage_fallback(checkpoint_path, map_location="cpu")
+        checkpoint_config = checkpoint.get('config', {})
+        film_hidden_dim = checkpoint_config.get('film_hidden_dim', 1024)
+        head_mode = checkpoint_config.get('head_mode', 'distribution')
+        
+        # Initialize model
+        motion2action_model = Motion2ActionModel(
+            latent_channels=16,
+            film_hidden_dim=film_hidden_dim,
+            motion_grid_size=10,
+            film_gamma_scale=0.5,
+            head_out_t=2,
+            head_out_h=2,
+            head_out_w=4,
+            action_minmax=(-1.0, 1.0),
+            head_mode=head_mode,
+            log_std_bounds=(-5.0, 2.0),
+            dist_eps=1e-6,
+            return_dist=(head_mode == "distribution"),
         )
-        in_channels_cfg = getattr(config, "latent_action_in_channels", None)
-
-        if not checkpoint_path_cfg:
-            raise ValueError("latent_action_checkpoint must be set in the config.")
-        checkpoint_path = Path(checkpoint_path_cfg).expanduser()
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"latent_action_checkpoint not found: {checkpoint_path}")
-
-        state_dict = None
-        if checkpoint_path:
-            payload = _load_checkpoint_with_storage_fallback(checkpoint_path, map_location="cpu")
-            state_dict = payload.get("model_state", payload)
-            if isinstance(payload, dict):
-                hidden_dims_payload = payload.get("hidden_dims")
-                if hidden_dims_payload:
-                    hidden_dims = list(hidden_dims_payload)
-                metadata = payload.get("metadata", {})
-                dropout = metadata.get("dropout", dropout)
-                action_dim_cfg = payload.get("action_dim", action_dim_cfg)
-
-            if "encoder.0.weight" not in state_dict:
-                raise KeyError(
-                    "Latent action checkpoint missing 'encoder.0.weight' needed to infer input channels."
-                )
-            in_channels_cfg = state_dict["encoder.0.weight"].shape[1]
-            if "head.-1.weight" in state_dict:
-                action_dim_cfg = state_dict["head.-1.weight"].shape[0]
-
-        if not hidden_dims:
-            hidden_dims = [256, 128]
-
-        if in_channels_cfg is None:
-            image_shape = getattr(config, "image_or_video_shape", None)
-            if not image_shape or len(image_shape) < 3:
-                raise ValueError(
-                    "latent_action_in_channels not provided and image_or_video_shape is invalid."
-                )
-            in_channels_cfg = int(image_shape[2])
-
-        action_dim = int(action_dim_cfg)
-        in_channels = int(in_channels_cfg)
-
-        latent_action_model = Action3DCNN(
-            in_channels=in_channels,
-            action_dim=action_dim,
-            hidden_dims=hidden_dims,
-            dropout=dropout,
-        )
-
-        if state_dict is not None:
-            latent_action_model.load_state_dict(state_dict, strict=True)
-
-        latent_action_model.to(device=self.device, dtype=torch.float32)
-        latent_action_model.eval()
-        for param in latent_action_model.parameters():
+        
+        # Load model state
+        motion2action_model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Move to device and freeze
+        motion2action_model.to(device=self.device, dtype=torch.float32)
+        motion2action_model.eval()
+        for param in motion2action_model.parameters():
             param.requires_grad_(False)
-        return latent_action_model
+        
+        return motion2action_model
+
+    def _build_motion_model(self, config):
+        """Build MotionModel for dmd2b2blam."""
+        # Get checkpoint path from config
+        checkpoint_path = getattr(config, "motion_checkpoint", None)
+        
+        # CoTrackerPredictor handles checkpoint loading internally
+        cotracker = CoTrackerPredictor(
+                        checkpoint=checkpoint_path,
+                        offline=True,
+                        window_len=60,
+                    ).to(device='cpu').to(device=self.device).eval()
+
+        for param in cotracker.parameters():
+            param.requires_grad_(False)
+
+        return cotracker
         
     def _move_optimizer_to_device(self, optimizer, device):
         """Move optimizer state to the specified device."""
@@ -1454,7 +1461,7 @@ class Trainer:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
         if (
             self._action_patch_enabled
-            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'mse_dmd_lam', 'mse_dmd_lam_action')
+            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'dmd2b2blam', 'mse_dmd_lam', 'mse_dmd_lam_action')
             and actions is None
         ):
             raise ValueError('Batch is missing action annotations required for action-guided training.')
@@ -1489,9 +1496,9 @@ class Trainer:
                 clean_latent=None,
                 initial_latent=None,
             )
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam'):
                 generator_kwargs['real_latents'] = real_latents
-            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['actions'] = actions
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
@@ -1536,9 +1543,9 @@ class Trainer:
             clean_latent=None,
             initial_latent=None,
         )
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam'):
             critic_kwargs['real_latents'] = real_latents
-        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['actions'] = actions
         if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['clean_latent'] = real_latents
