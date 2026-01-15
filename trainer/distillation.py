@@ -1250,9 +1250,11 @@ class Trainer:
     def save(self):
         print("Start gathering distributed model states...")
         if getattr(self, 'one_logger', None) is not None and self.is_main_process:
+            print("About to call on_save_checkpoint_start")
             self.one_logger.on_save_checkpoint_start(global_step=self.step)
 
         if self.is_lora_enabled:
+            print("About to call _gather_lora_state_dict for generator")
             gen_lora_sd = self._gather_lora_state_dict(
                 self.model.generator.model,
                 adapter_name=getattr(self, "generator_adapter_name", None),
@@ -1284,18 +1286,26 @@ class Trainer:
                     self.action_projection_optimizer.state_dict()
                 )
         else:
+            print("Else so no LORA")
             if torch.cuda.is_available():
+                print("About to synchronize")
                 torch.cuda.synchronize(self.device)
             if dist.is_initialized():
+                print("About to barrier")
                 dist.barrier()
+            print("About to ensure FSDP idle")
             self._ensure_fsdp_idle(self.model.generator, module_name="generator")
+            print("About to summon full params for generator")
             generator_state_dict: dict[str, object] = {}
             generator_opim_state_dict: dict[str, object] = {}
             with FSDP.summon_full_params(
                 self.model.generator, writeback=False, rank0_only=True
             ):
+                print("About to get state dict")
                 if self.is_main_process:
+                    print("Getting state dict")
                     generator_state_dict = self.model.generator.module.state_dict()
+            print("About to get full optim state dict")
             full_gen_optim = FSDP.full_optim_state_dict(
                 self.model.generator,
                 self.generator_optimizer,
@@ -1309,11 +1319,14 @@ class Trainer:
             action_proj_opim_state_dict: dict[str, object] = {}
             if self.action_projection_optimizer is not None:
                 if self.is_main_process:
+                    print("About to get state dict for action projection optimizer")
                     action_proj_opim_state_dict = self.action_projection_optimizer.state_dict()
                 else:
                     action_proj_opim_state_dict = {}
 
+            print("About to ensure FSDP idle for critic")
             self._ensure_fsdp_idle(self.model.fake_score, module_name="critic")
+            print("About to summon full params for critic")
             critic_state_dict: dict[str, object] = {}
             critic_opim_state_dict: dict[str, object] = {}
             with FSDP.summon_full_params(
@@ -1364,6 +1377,7 @@ class Trainer:
             checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_file = os.path.join(checkpoint_dir, "model.pt")
+            print("About to save model to", checkpoint_file)
             torch.save(state_dict, checkpoint_file)
             print("Model saved to", checkpoint_file)
             
