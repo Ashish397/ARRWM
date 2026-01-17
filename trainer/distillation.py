@@ -67,6 +67,15 @@ from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
 import time
 
 
+def grad_norm(parameters):
+    """Compute gradient norm from parameters."""
+    parameters = [p for p in parameters if p.grad is not None]
+    if len(parameters) == 0:
+        return torch.tensor(0.0)
+    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in parameters]))
+    return total_norm
+
+
 def _load_checkpoint_with_storage_fallback(path, **torch_load_kwargs):
     """
     Load a checkpoint while handling storages that were saved as non-resizable.
@@ -1504,19 +1513,6 @@ class Trainer:
                 generator_kwargs['clean_latent'] = real_latents
             generator_loss, generator_log_dict = self.model.generator_loss(**generator_kwargs)
 
-            # # Compute action faithfulness loss if applicable
-            # if actions is not None and hasattr(self.model, 'last_generated_latents') and self.model.last_generated_latents is not None:
-            #     try:
-            #         action_mae, action_log_dict = compute_action_faithfulness_loss(
-            #             pred_latents=self.model.last_generated_latents,
-            #             gt_actions=actions,
-            #             device=self.device
-            #         )
-            #         generator_log_dict.update(action_log_dict)
-            #     except Exception as e:
-            #         if dist.get_rank() == 0:
-            #             print(f"Warning: Failed to compute action faithfulness loss: {e}")
-
             # Scale loss for gradient accumulation and backward
             scaled_generator_loss = generator_loss / self.gradient_accumulation_steps
             scaled_generator_loss.backward()
@@ -1953,6 +1949,11 @@ class Trainer:
                         generator_grad_norm = generator_core_norm.detach()
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
                         generator_log_dict["generator_core_grad_norm"] = generator_grad_norm
+                        action_proj = getattr(self.model.generator.model, "action_projection", None)
+                        if action_proj is not None:
+                            generator_log_dict["action_proj_grad_norm"] = grad_norm(action_proj.parameters())
+                        else:
+                            generator_log_dict["action_proj_grad_norm"] = torch.tensor(0.0)
 
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                             print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
@@ -2020,6 +2021,11 @@ class Trainer:
                         generator_grad_norm = generator_core_norm.detach()
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
                         generator_log_dict["generator_core_grad_norm"] = generator_grad_norm
+                        action_proj = getattr(self.model.generator.model, "action_projection", None)
+                        if action_proj is not None:
+                            generator_log_dict["action_proj_grad_norm"] = grad_norm(action_proj.parameters())
+                        else:
+                            generator_log_dict["action_proj_grad_norm"] = torch.tensor(0.0)
 
                         self._warn_if_no_generator_grads(generator_grad_norm.item() > 0.0)
 
@@ -2462,6 +2468,44 @@ class Trainer:
                 )
                 video_tensor = torch.from_numpy(video_np.astype("uint8"))
                 write_video(out_path, video_tensor, fps=16)
+                
+                # Save actions to a txt file
+                if action_inputs is not None:
+                    # Remove .mp4 extension and add _actions.txt
+                    base_name = video_name.rsplit('.mp4', 1)[0]
+                    action_path = os.path.join(step_vis_dir, f"{base_name}_actions.txt")
+                    
+                    with open(action_path, "w") as f:
+                        if isinstance(action_inputs, torch.Tensor):
+                            # Handle tensor: could be [num_frames*3, 2] or [batch_size, num_frames*3, 2]
+                            if action_inputs.dim() == 2:
+                                # Single sample: [num_frames*3, 2]
+                                actions_np = action_inputs.cpu().numpy()
+                            else:
+                                # Multiple samples: [batch_size, num_frames*3, 2] - take sample idx
+                                actions_np = action_inputs[idx].cpu().numpy()
+                            
+                            # Write actions (one per line: frame_idx, action_0, action_1)
+                            f.write("frame_idx,action_0,action_1\n")
+                            for frame_idx, action in enumerate(actions_np):
+                                f.write(f"{frame_idx},{action[0]:.6f},{action[1]:.6f}\n")
+                        elif isinstance(action_inputs, dict):
+                            # Handle dict format
+                            act_tensor = action_inputs.get('actions') or action_inputs.get('action_features')
+                            if act_tensor is not None and isinstance(act_tensor, torch.Tensor):
+                                if act_tensor.dim() == 2:
+                                    actions_np = act_tensor.cpu().numpy()
+                                else:
+                                    actions_np = act_tensor[idx].cpu().numpy()
+                                f.write("frame_idx,action_0,action_1\n")
+                                for frame_idx, action in enumerate(actions_np):
+                                    f.write(f"{frame_idx},{action[0]:.6f},{action[1]:.6f}\n")
+                            else:
+                                f.write(f"Actions format: {type(action_inputs)}\n")
+                                f.write(str(action_inputs))
+                        else:
+                            f.write(f"Actions format: {type(action_inputs)}\n")
+                            f.write(str(action_inputs))
 
             # After saving current length videos, release related tensors to reduce peak memory
             del videos, video_np, video_tensor  # type: ignore

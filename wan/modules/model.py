@@ -325,29 +325,33 @@ class WanAttentionBlock(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, 6, C]
+            e(Tensor): Shape [B, F, 6, C] (expanded to per-frame)
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         # assert e.dtype == torch.float32
         # with amp.autocast(dtype=torch.float32):
-        e = (self.modulation + e).chunk(6, dim=1)
+        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         # assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn(
-            self.norm1(x) * (1 + e[1]) + e[0], seq_lens, grid_sizes,
+            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
+            seq_lens, grid_sizes,
             freqs)
         # with amp.autocast(dtype=torch.float32):
-        x = x + y * e[2]
+        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
+            y = self.ffn(
+                (self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
+            )
             # with amp.autocast(dtype=torch.float32):
-            x = x + y * e[5]
+            x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
@@ -700,8 +704,8 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).type_as(x))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
         # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
@@ -864,8 +868,8 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).type_as(x))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
         # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context

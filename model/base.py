@@ -230,29 +230,15 @@ class SelfForcingModel(BaseModel):
         frame_start: int = 0,
         target_num_frames: Optional[int] = None,
     ) -> dict:
-        effective_num_frames = target_num_frames if target_num_frames is not None else num_frames
         modulation = self._compute_action_modulation_tensor(
             actions,
-            effective_num_frames,
+            num_frames,
             device,
             dtype,
             detach=detach_modulation,
             frame_start=frame_start,
         )
-        if (
-            modulation is not None
-            and target_num_frames is not None
-            and modulation.shape[1] != target_num_frames
-        ):
-            if modulation.shape[1] < target_num_frames:
-                raise ValueError(
-                    f"action_modulation has only {modulation.shape[1]} frames; "
-                    f"{target_num_frames} required to match critic timestep."
-                )
-            modulation = modulation[:, :target_num_frames]
 
-        if modulation is None:
-            raise ValueError("action_modulation is required")
         conditioned = dict(base_conditional)
         conditioned["_action_modulation"] = modulation
         return conditioned

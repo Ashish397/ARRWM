@@ -69,12 +69,13 @@ class DMD2B2BLAM(SelfForcingModel):
         # DMD2-specific configuration
         self.gan_loss_weight = getattr(args, "gan_loss_weight", 0.0)
         self.action_loss_weight = float(getattr(args, "action_loss_weight", 0.0))
-        self.indep_lat_act_weight = getattr(args, "indep_lat_act_weight", 0.0)
+        self.indep_lat_act_weight = getattr(args, "indep_lat_act_weight", None)
         self.guidance_cls_loss_weight = getattr(args, "guidance_cls_loss_weight", self.gan_loss_weight)
         self.guidance_rgs_loss_weight = getattr(args, "guidance_rgs_loss_weight", self.action_loss_weight)
         self.diffusion_gan = getattr(args, "diffusion_gan", False)
         self.diffusion_gan_max_timestep = getattr(args, "diffusion_gan_max_timestep", self.num_train_timestep)
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
+        self.action_cfg_enabled = getattr(args, "action_cfg_enabled", False)
         object.__setattr__(self, "_latent_action_model_ref", None)
         if latent_action_model is not None:
             try:
@@ -405,21 +406,27 @@ class DMD2B2BLAM(SelfForcingModel):
         # motion_volume: [total_windows, N, 3] -> need [B, N, 3] per batch sample
         # actions: [B, F, ...] -> need [B, 2] per batch sample (average over frames or select)
         
+        # Detach motion_out to cut gradients from CoTracker
+        # Gradients will flow from pred_frames -> latents_for_model -> motion2action_model
+        # motion_out = motion_out.detach()
+        
         # Reshape pred_frames to [B, C, F, H, W] (model expects [B, C, T, H, W])
+        # This preserves gradients from pred_frames
         latents_for_model = pred_frames.reshape(7, 3, 16, 60, 104).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
         
         # Run model inference (model is frozen in eval mode, but gradients flow through to inputs)
-        # This allows gradients to flow back to pred_frames through the model
+        # Gradients flow: loss -> pred_actions -> model -> latents_for_model -> pred_frames
+        # motion_out is detached, so no gradients flow through CoTracker
         model_output = self.latent_action_model(latents_for_model, motion_out)
         
         if isinstance(model_output, tuple) and len(model_output) == 3:
             # return_dist=True: (dist, mean_action, log_std)
             _, pred_actions, log_std = model_output
-            std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
+            # std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
         elif isinstance(model_output, tuple) and len(model_output) == 2:
             # return_dist=False: (mean_action, log_std)
             pred_actions, log_std = model_output
-            std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
+            # std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
         else:
             raise ValueError("Invalid model output")
 
@@ -428,7 +435,7 @@ class DMD2B2BLAM(SelfForcingModel):
         # Gradients flow back through pred_actions -> model -> latents_for_model -> pred_frames
         diff = pred_actions - actions[:, ::3]  # [B, 2]
         # Use absolute value of diff/std as loss (or squared)
-        normalized_diff = diff / std  # [B, 2]
+        normalized_diff = diff #/ std  # [B, 2]
         loss_per_sample = normalized_diff.abs().mean(dim=1)  # [B] - sum over action dimensions
         loss = loss_per_sample.mean()  # Scalar loss
         
@@ -436,7 +443,7 @@ class DMD2B2BLAM(SelfForcingModel):
             "latent_action_loss": loss.detach(),
             "latent_action_pred_mean": pred_actions.detach().mean(),
             "latent_action_target_mean": actions.detach().mean(),
-            "latent_action_std_mean": std.detach().mean(),
+            # "latent_action_std_mean": std.detach().mean(),
         }
 
         return loss, logs
@@ -473,17 +480,24 @@ class DMD2B2BLAM(SelfForcingModel):
             num_frame,
             image_or_video.device,
             image_or_video.dtype,
-            frame_start=frame_start,
-            target_num_frames=1,
         )
+        if self.action_cfg_enabled:
+            #opposite actions are given to the unconditional conditioning to push the model toward the right action and away from the opposite action
+            # we have to make it by negating both dimensions of the actions. When actions are both near 0 (less than 0.1,0.1), the model should do action_0 = sign(action_0) * 1 - abs(action_0) and the same for action 1
+            opposite_actions = 1.0 - actions ** 2
+            cond_with_opp_action = self._with_action_conditioning(
+                conditional_dict,
+                opposite_actions,
+                num_frame,
+                image_or_video.device,
+                image_or_video.dtype,
+            )
         uncond_with_action = self._with_action_conditioning(
             unconditional_dict,
             actions,
             num_frame,
             image_or_video.device,
             image_or_video.dtype,
-            frame_start=frame_start,
-            target_num_frames=1,
         )
 
         with torch.no_grad():
@@ -522,13 +536,54 @@ class DMD2B2BLAM(SelfForcingModel):
                 unconditional_dict=uncond_with_action
             )
 
+            if self.action_cfg_enabled:
+                action_grad, action_dmd_log_dict = self._compute_kl_grad(
+                    noisy_image_or_video=noisy_latent,
+                    estimated_clean_image_or_video=original_latent,
+                    timestep=timestep,
+                    conditional_dict=cond_with_action,
+                    unconditional_dict=cond_with_opp_action
+                )
+                opp_action_grad, opp_action_dmd_log_dict = self._compute_kl_grad(
+                    noisy_image_or_video=noisy_latent,
+                    estimated_clean_image_or_video=original_latent,
+                    timestep=timestep,
+                    conditional_dict=cond_with_opp_action,
+                    unconditional_dict=uncond_with_action
+                )
+
         if gradient_mask is not None:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
+            dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], (
+                original_latent.double() - grad.double()
+                ).detach()[gradient_mask], reduction="mean")
         else:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
-        return dmd_loss, dmd_log_dict
+            dmd_loss = 0.5 * F.mse_loss(original_latent.double(), (
+                original_latent.double() - grad.double()
+                ).detach(), reduction="mean")
+
+        if self.action_cfg_enabled:
+            if gradient_mask is not None:
+                cond_cond_dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], (
+                    original_latent.double() - action_grad.double()
+                    ).detach()[gradient_mask], reduction="mean")
+            else:
+                cond_cond_dmd_loss = 0.5 * F.mse_loss(original_latent.double(), (
+                    original_latent.double() - action_grad.double()
+                ).detach(), reduction="mean")
+            if gradient_mask is not None:
+                opp_act_dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], (
+                    original_latent.double() - opp_action_grad.double()
+                    ).detach()[gradient_mask], reduction="mean")
+            else:
+                opp_act_dmd_loss = 0.5 * F.mse_loss(original_latent.double(), (
+                    original_latent.double() - opp_action_grad.double()
+                ).detach(), reduction="mean")
+
+            total_dmd_loss = dmd_loss * 0.5 + cond_cond_dmd_loss * 0.05 + opp_act_dmd_loss * 0.5
+        else:
+            total_dmd_loss = dmd_loss
+
+        return total_dmd_loss, dmd_log_dict
 
     def generator_loss(
         self,
@@ -547,7 +602,7 @@ class DMD2B2BLAM(SelfForcingModel):
 
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         _t_gen_start = time.time()
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to, frame_start_index = self._run_generator(
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
             initial_latent=initial_latent,
@@ -568,7 +623,6 @@ class DMD2B2BLAM(SelfForcingModel):
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to,
             actions=actions,
-            frame_start=frame_start_index,
         )
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory("Generator loss: After compute_distribution_matching_loss", device=self.device, rank=dist.get_rank())
@@ -589,9 +643,7 @@ class DMD2B2BLAM(SelfForcingModel):
                     pred_image.shape[1],
                     pred_image.device,
                     pred_image.dtype,
-                    detach_modulation=True,
-                    frame_start=frame_start_index,
-                    target_num_frames=1,
+                    # detach_modulation=True,
                 )
                 cls_conditional.pop("_action_modulation", None)
                 logits_fake = self._classifier_logits(pred_image, cls_conditional)
@@ -614,9 +666,7 @@ class DMD2B2BLAM(SelfForcingModel):
                     pred_image.shape[1],
                     pred_image.device,
                     pred_image.dtype,
-                    detach_modulation=True,
-                    frame_start=frame_start_index,
-                    target_num_frames=1,
+                    # detach_modulation=True,
                 )
                 rgs_conditional.pop("_action_modulation", None)
                 action_preds = self._regressor_preds(pred_image, rgs_conditional)
@@ -638,7 +688,7 @@ class DMD2B2BLAM(SelfForcingModel):
         latent_action_loss, latent_action_logs = self._compute_latent_action_loss(
             pred_image, actions
         )
-        total_loss = total_loss + latent_action_loss
+        total_loss = total_loss + latent_action_loss * self.indep_lat_act_weight
         log_dict.update(latent_action_logs)
 
         loss_time = time.time() - _t_loss_start
@@ -681,7 +731,7 @@ class DMD2B2BLAM(SelfForcingModel):
         with torch.no_grad():
             if DEBUG and dist.get_rank() == 0:
                 print(f"critic_rollout")
-            generated_image, _, denoised_timestep_from, denoised_timestep_to, frame_start_index = self._run_generator(
+            generated_image, _, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent,
@@ -699,8 +749,6 @@ class DMD2B2BLAM(SelfForcingModel):
             generated_image.device,
             generated_image.dtype,
             detach_modulation=True,
-            frame_start=frame_start_index,
-            target_num_frames=1,
         )
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"Critic loss: After generator unroll", device=self.device, rank=dist.get_rank())
@@ -775,8 +823,6 @@ class DMD2B2BLAM(SelfForcingModel):
                 real_latents.device,
                 real_latents.dtype,
                 detach_modulation=True,
-                frame_start=0,
-                target_num_frames=1,
             )
             real_conditional.pop("_action_modulation", None)
             real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), real_conditional)
@@ -809,8 +855,6 @@ class DMD2B2BLAM(SelfForcingModel):
                 real_latents.device,
                 real_latents.dtype,
                 detach_modulation=True,
-                frame_start=0,
-                target_num_frames=1,
             )
             real_conditional.pop("_action_modulation", None)
             live_actions = self._regressor_preds(real_latents.to(self.device, dtype=torch.float32), real_conditional)
