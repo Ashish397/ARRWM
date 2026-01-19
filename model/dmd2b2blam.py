@@ -71,7 +71,6 @@ class DMD2B2BLAM(SelfForcingModel):
         self.action_loss_weight = float(getattr(args, "action_loss_weight", 0.0))
         self.indep_lat_act_weight = getattr(args, "indep_lat_act_weight", None)
         self.guidance_cls_loss_weight = getattr(args, "guidance_cls_loss_weight", self.gan_loss_weight)
-        self.guidance_rgs_loss_weight = getattr(args, "guidance_rgs_loss_weight", self.action_loss_weight)
         self.diffusion_gan = getattr(args, "diffusion_gan", False)
         self.diffusion_gan_max_timestep = getattr(args, "diffusion_gan_max_timestep", self.num_train_timestep)
         self.concat_time_embeddings = getattr(args, "concat_time_embeddings", False)
@@ -107,20 +106,83 @@ class DMD2B2BLAM(SelfForcingModel):
             self.fake_score.adding_cls_branch(
                 time_embed_dim=1536 if self.concat_time_embeddings else 0,
             )
-        # Only initialize regression branch if action loss weights are non-zero
-        if (self.action_loss_weight > 0.0 or self.guidance_rgs_loss_weight > 0.0) and hasattr(self.fake_score, "adding_rgs_branch"):
-            self.fake_score.adding_rgs_branch(
-                time_embed_dim=1536 if self.concat_time_embeddings else 0,
-                num_frames=self.num_training_frames,
-                num_class=self.action_dim,
-            )
     
+    def _estimate_action_from_motion(self, pred_frames: torch.Tensor, estimated_motion: torch.Tensor) -> torch.Tensor:
+        # Use pre-initialized motion2action model (initialized in __init__ for FSDP compatibility)
+        if self.latent_action_model is None:
+            raise RuntimeError("motion2action model not initialized")
+
+        latents_for_model = pred_frames.reshape(7, 3, 16, 60, 104).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+        
+        # Run model inference (model is frozen in eval mode, but gradients flow through to inputs)
+        # Gradients flow: loss -> pred_actions -> model -> latents_for_model -> pred_frames
+        # motion_out is detached, so no gradients flow through CoTracker
+        model_output = self.latent_action_model(latents_for_model, estimated_motion)
+        
+        if isinstance(model_output, tuple) and len(model_output) == 3:
+            # return_dist=True: (dist, mean_action, log_std)
+            _, pred_actions, log_std = model_output
+            # std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
+        elif isinstance(model_output, tuple) and len(model_output) == 2:
+            # return_dist=False: (mean_action, log_std)
+            pred_actions, log_std = model_output
+            # std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
+        else:
+            raise ValueError("Invalid model output")
+        
+        return pred_actions, log_std
+
+    def _estimate_motion(self, pred_frames: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            # Decode latents to pixel space
+            # Use self.dtype to match VAE's dtype (bfloat16 if mixed_precision, float32 otherwise)
+            # Create a modified version with dummy frame for VAE decode (preserve original pred_frames for gradients)
+            pred_frames_with_dummy = torch.cat([pred_frames[:, 0:1], pred_frames], dim=1)
+            pixels = self.vae.decode_to_pixel(pred_frames_with_dummy.to(dtype=self.dtype))[:, 1:, ...]  # [B, F, 3, H, W] in [-1, 1] range
+
+            # Convert to format expected by cotracker: [B, T, C, H, W]
+            # VAE decode returns pixels in [-1, 1] range, scale to [0, 255] as cotracker expects
+            # Similar to test_motion_2_action_scratch.py line 454
+            video_pixels = (255 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()  # [B, F, 3, H, W] in [0, 255] range
+
+            #Convert video pixels from shape [1, 84, 3, H, W] to [7, 12, 3, H, W]
+            batch_size, num_frames, num_channels, height, width = video_pixels.shape
+            assert num_frames == 84
+            video_pixels = video_pixels.reshape(7, 12, num_channels, height, width)
+            grid_size = 10
+            N = grid_size ** 2
+
+            # Use pre-initialized cotracker model (initialized in __init__ for FSDP compatibility)
+            if self.motion_model is None:
+                raise RuntimeError("cotracker not initialized")
+
+            # Run cotracker on frame window (similar to test_motion_2_action_scratch.py line 493)
+            with torch.amp.autocast(device_type='cuda', enabled=True):
+                tracks_w, vis_w = self.motion_model(video_pixels, grid_size=grid_size)  # [B, T_window, N, 2], [B, T_window, N]
+
+            #pred_tracks will have shape [7, 12, N, 2], pred_visibility will have shape [7, 12, N]
+
+            # Vectorized motion computation - compute all deltas at once (similar to test_motion_2_action_scratch.py line 508)
+            motion_out = (tracks_w[:, 1:] - tracks_w[:, :-1]).mean(dim=1)  # output shape [7, N, 2]
+
+            # Visibility: single conversion and mean (similar to test_motion_2_action_scratch.py line 511)
+            vis_out = vis_w.float().mean(dim=1).unsqueeze(-1)  # [7, N, 1]
+
+            # Single concatenation (similar to test_motion_2_action_scratch.py line 514)
+            motion_out = torch.cat([motion_out, vis_out], dim=-1)  # [7, N, 3]
+
+        return motion_out.detach()
+
     def _compute_kl_grad(
-        self, noisy_image_or_video: torch.Tensor,
+        self, 
+        noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
-        conditional_dict: dict, unconditional_dict: dict,
-        normalization: bool = True
+        conditional_dict_pos: dict, 
+        unconditional_dict: dict,
+        normalization: bool = True,
+        conditional_dict_neg = None,
+        fake_guidance_scale = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -138,19 +200,19 @@ class DMD2B2BLAM(SelfForcingModel):
         # Step 1: Compute the fake score
         _, pred_fake_image_cond = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict,
+            conditional_dict=conditional_dict_pos,
             timestep=timestep
         )
 
-        if self.fake_guidance_scale != 0.0:
+        if (conditional_dict_neg is not None) and (fake_guidance_scale is not None):
             _, pred_fake_image_uncond = self.fake_score(
                 noisy_image_or_video=noisy_image_or_video,
-                conditional_dict=unconditional_dict,
+                conditional_dict=conditional_dict_neg,
                 timestep=timestep
             )
             pred_fake_image = pred_fake_image_cond + (
                 pred_fake_image_cond - pred_fake_image_uncond
-            ) * self.fake_guidance_scale
+            ) * fake_guidance_scale
         else:
             pred_fake_image = pred_fake_image_cond
 
@@ -159,7 +221,7 @@ class DMD2B2BLAM(SelfForcingModel):
         # and add them together to achieve cfg (https://arxiv.org/abs/2207.12598)
         _, pred_real_image_cond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict,
+            conditional_dict=conditional_dict_neg,
             timestep=timestep
         )
 
@@ -249,23 +311,6 @@ class DMD2B2BLAM(SelfForcingModel):
         logits = outputs[-1]
         return logits.squeeze(-1)
 
-    def _regressor_preds(self, latents: torch.Tensor, conditional_dict: dict) -> torch.Tensor:
-        if not hasattr(self.fake_score, "adding_rgs_branch"):
-            raise RuntimeError("fake_score does not support regression branch required for Action loss.")
-
-        noisy_latents, timestep_full = self._build_classifier_inputs(latents, conditional_dict)
-
-        outputs = self.fake_score(
-            noisy_image_or_video=noisy_latents,
-            conditional_dict=conditional_dict,
-            timestep=timestep_full,
-            regress_mode=True,
-            concat_time_embeddings=self.concat_time_embeddings,
-        )
-
-        preds = outputs[-1]
-        return preds
-
     @property
     def latent_action_model(self) -> Optional[nn.Module]:
         return getattr(self, "_latent_action_model_ref", None)
@@ -273,23 +318,6 @@ class DMD2B2BLAM(SelfForcingModel):
     @property
     def motion_model(self) -> Optional[nn.Module]:
         return getattr(self, "_motion_model_ref", None)
-
-    def _action_l1_loss(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        *,
-        apply_axis_weights: bool = True,
-    ) -> torch.Tensor:
-        """L1 loss with optional per-axis weights to emphasize steering dimensions."""
-        tgt = target.to(device=pred.device, dtype=pred.dtype)
-        diff = torch.abs(pred - tgt)
-        if apply_axis_weights and self._action_axis_weights is not None:
-            weights = self._action_axis_weights.to(device=diff.device, dtype=diff.dtype)
-            view_shape = [1] * (diff.dim() - 1) + [weights.shape[0]]
-            weights = weights.view(*view_shape)
-            diff = diff * weights
-        return diff.mean()
 
     def _action_batch_stats(self, actions: Optional[torch.Tensor], prefix: str) -> dict:
         """Lightweight scalars describing the input action distribution for logging."""
@@ -305,135 +333,20 @@ class DMD2B2BLAM(SelfForcingModel):
         stats[f"{prefix}_mag_std"] = mag.std(unbiased=False).detach()
         return stats
 
-    def _compute_action_metrics(self, pred: torch.Tensor, target: torch.Tensor, prefix: str) -> dict:
-        """Action faithfulness/consistency metrics for logging."""
-        metrics: dict = {}
-        pred_f = pred.to(dtype=torch.float32)
-        tgt_f = target.to(dtype=torch.float32)
-        diff = pred_f - tgt_f
-        metrics[f"{prefix}_l1"] = diff.abs().mean().detach()
-        metrics[f"{prefix}_l2"] = torch.linalg.norm(diff, dim=-1).mean().detach()
-
-        # Cosine similarity and sign agreement to capture directional alignment.
-        pred_norm = torch.linalg.norm(pred_f, dim=-1)
-        tgt_norm = torch.linalg.norm(tgt_f, dim=-1)
-        denom = (pred_norm * tgt_norm).clamp_min(1e-6)
-        cos = (pred_f * tgt_f).sum(dim=-1) / denom
-        metrics[f"{prefix}_cos"] = cos.mean().detach()
-        sign_agree = torch.sign(pred_f) * torch.sign(tgt_f)
-        metrics[f"{prefix}_sign_agree"] = (sign_agree > 0).float().mean().detach()
-
-        # Heading/angle error when at least 2-D actions are available.
-        if pred_f.shape[-1] >= 2 and tgt_f.shape[-1] >= 2:
-            pred_angle = torch.atan2(pred_f[..., 1], pred_f[..., 0])
-            tgt_angle = torch.atan2(tgt_f[..., 1], tgt_f[..., 0])
-            angle_delta = torch.remainder(pred_angle - tgt_angle + math.pi, 2 * math.pi) - math.pi
-            metrics[f"{prefix}_angle_deg"] = torch.rad2deg(angle_delta).abs().mean().detach()
-
-        # Magnitude alignment and Pearson-style correlation by axis.
-        metrics[f"{prefix}_mag_mean"] = pred_norm.mean().detach()
-        metrics[f"{prefix}_mag_ratio"] = (pred_norm / tgt_norm.clamp_min(1e-6)).clamp(0.0, 10.0).mean().detach()
-        for i in range(min(pred_f.shape[-1], tgt_f.shape[-1], 3)):
-            x = pred_f[..., i]
-            y = tgt_f[..., i]
-            xm = x.mean()
-            ym = y.mean()
-            cov = ((x - xm) * (y - ym)).mean()
-            corr = cov / (x.std(unbiased=False).clamp_min(1e-6) * y.std(unbiased=False).clamp_min(1e-6))
-            metrics[f"{prefix}_dim{i}_corr"] = corr.detach()
-        return metrics
-
     def _compute_latent_action_loss(
         self,
         pred_frames: torch.Tensor,  # [B, 21, C, H, W]
-        actions: Optional[torch.Tensor],  # [B, 21, ...]
+        actions: torch.Tensor,  # [B, 21, ...]
+        estimated_motion: torch.Tensor,  # [B, 21, N, 2]
+        estimated_action: torch.Tensor,  # [B, 21, 2]
+        estimated_action_log_std: torch.Tensor,  # [B, 21, 2]
     ) -> Tuple[torch.Tensor, dict]:
-        zero = torch.zeros((), device=pred_frames.device, dtype=pred_frames.dtype)
-        if (
-            self.latent_action_model is None
-            or self.motion_model is None
-            or self.indep_lat_act_weight <= 0.0
-            or actions is None
-        ):
-            return zero, {}
-        # VAE decode and cotracker processing don't need gradients (VAE is frozen, cotracker is eval-only)
-        # This saves significant memory by not keeping gradients for VAE decoder activations.
-        # Gradients still flow through pred_frames -> latents_for_model -> motion2action_model
-        with torch.no_grad():
-            # Decode latents to pixel space
-            # Use self.dtype to match VAE's dtype (bfloat16 if mixed_precision, float32 otherwise)
-            # Create a modified version with dummy frame for VAE decode (preserve original pred_frames for gradients)
-            pred_frames_with_dummy = torch.cat([pred_frames[:, 0:1], pred_frames], dim=1)
-            pixels = self.vae.decode_to_pixel(pred_frames_with_dummy.to(dtype=self.dtype))[:, 1:, ...]  # [B, F, 3, H, W] in [-1, 1] range
-
-            # Convert to format expected by cotracker: [B, T, C, H, W]
-            # VAE decode returns pixels in [-1, 1] range, scale to [0, 255] as cotracker expects
-            # Similar to test_motion_2_action_scratch.py line 454
-            video_pixels = (255 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()  # [B, F, 3, H, W] in [0, 255] range
-
-            #Convert video pixels from shape [1, 84, 3, H, W] to [7, 12, 3, H, W]
-            batch_size, num_frames, num_channels, height, width = video_pixels.shape
-            assert num_frames == 84
-            video_pixels = video_pixels.reshape(7, 12, num_channels, height, width)
-            grid_size = 10
-            N = grid_size ** 2
-
-            # Use pre-initialized cotracker model (initialized in __init__ for FSDP compatibility)
-            if self.motion_model is None:
-                raise RuntimeError("cotracker not initialized")
-
-            # Run cotracker on frame window (similar to test_motion_2_action_scratch.py line 493)
-            with torch.amp.autocast(device_type='cuda', enabled=True):
-                tracks_w, vis_w = self.motion_model(video_pixels, grid_size=grid_size)  # [B, T_window, N, 2], [B, T_window, N]
-
-            #pred_tracks will have shape [7, 12, N, 2], pred_visibility will have shape [7, 12, N]
-
-            # Vectorized motion computation - compute all deltas at once (similar to test_motion_2_action_scratch.py line 508)
-            motion_out = (tracks_w[:, 1:] - tracks_w[:, :-1]).mean(dim=1)  # output shape [7, N, 2]
-
-            # Visibility: single conversion and mean (similar to test_motion_2_action_scratch.py line 511)
-            vis_out = vis_w.float().mean(dim=1).unsqueeze(-1)  # [7, N, 1]
-
-            # Single concatenation (similar to test_motion_2_action_scratch.py line 514)
-            motion_out = torch.cat([motion_out, vis_out], dim=-1)  # [7, N, 3]
-
-        # Use pre-initialized motion2action model (initialized in __init__ for FSDP compatibility)
-        if self.latent_action_model is None:
-            raise RuntimeError("motion2action model not initialized")
-
-        # Process inputs for the model
-        # pred_frames: [B, F, C, H, W] -> need [B, C, T, H, W] where T=3 (frames per action)
-        # motion_volume: [total_windows, N, 3] -> need [B, N, 3] per batch sample
-        # actions: [B, F, ...] -> need [B, 2] per batch sample (average over frames or select)
-        
-        # Detach motion_out to cut gradients from CoTracker
-        # Gradients will flow from pred_frames -> latents_for_model -> motion2action_model
-        # motion_out = motion_out.detach()
-        
-        # Reshape pred_frames to [B, C, F, H, W] (model expects [B, C, T, H, W])
-        # This preserves gradients from pred_frames
-        latents_for_model = pred_frames.reshape(7, 3, 16, 60, 104).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-        
-        # Run model inference (model is frozen in eval mode, but gradients flow through to inputs)
-        # Gradients flow: loss -> pred_actions -> model -> latents_for_model -> pred_frames
-        # motion_out is detached, so no gradients flow through CoTracker
-        model_output = self.latent_action_model(latents_for_model, motion_out)
-        
-        if isinstance(model_output, tuple) and len(model_output) == 3:
-            # return_dist=True: (dist, mean_action, log_std)
-            _, pred_actions, log_std = model_output
-            # std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
-        elif isinstance(model_output, tuple) and len(model_output) == 2:
-            # return_dist=False: (mean_action, log_std)
-            pred_actions, log_std = model_output
-            # std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
-        else:
-            raise ValueError("Invalid model output")
+        assert estimated_action.requires_grad == True, "estimated_action detached on arrival"
 
         # Compute loss: diff / std where diff = |pred_actions - actions_for_model|
         # Large diff/std = large loss, small diff/std = small loss
         # Gradients flow back through pred_actions -> model -> latents_for_model -> pred_frames
-        diff = pred_actions - actions[:, ::3]  # [B, 2]
+        diff = estimated_action - actions.reshape(actions.shape[0], 7, 3, actions.shape[2]).mean(dim=2).squeeze(2)  # [B, 2]
         # Use absolute value of diff/std as loss (or squared)
         normalized_diff = diff #/ std  # [B, 2]
         loss_per_sample = normalized_diff.abs().mean(dim=1)  # [B] - sum over action dimensions
@@ -441,16 +354,70 @@ class DMD2B2BLAM(SelfForcingModel):
         
         logs = {
             "latent_action_loss": loss.detach(),
-            "latent_action_pred_mean": pred_actions.detach().mean(),
+            "latent_action_pred_mean": estimated_action.detach().mean(),
             "latent_action_target_mean": actions.detach().mean(),
-            # "latent_action_std_mean": std.detach().mean(),
+            "latent_action_std_mean": estimated_action_log_std.detach().mean(),
         }
 
         return loss, logs
 
+    def _cat(self, a: torch.Tensor, eps: float = 0.1) -> torch.Tensor:  # [B,21,2] -> [B,21] in {0..4}
+        a0, a1 = a[..., 0], a[..., 1]
+        is_zero = (a0.abs() < eps) & (a1.abs() < eps)
+        dom0 = (a0.abs() >= a1.abs()) & (~is_zero)
+        dom1 = (~dom0) & (~is_zero)
+
+        cat = torch.zeros_like(a0, dtype=torch.long)          # 0 = zero
+        cat = torch.where(dom0 & (a0 > 0), 1, cat)            # 1 = forward
+        cat = torch.where(dom0 & (a0 < 0), 2, cat)            # 2 = backward
+        cat = torch.where(dom1 & (a1 > 0), 3, cat)            # 3 = right
+        cat = torch.where(dom1 & (a1 < 0), 4, cat)            # 4 = left
+        return cat
+
+    def _build_action_cfg(
+        self,
+        conditional_dict: dict,
+        actions: torch.Tensor,            # [B,21,2]  (given / intended)
+        estimated_action: torch.Tensor,   # [B,21,2]  (estimated)
+        num_frame: int,
+        device,
+        dtype,
+    ):
+        actions = actions.to(device=device, dtype=dtype)
+        estimated_action = estimated_action.to(device=device, dtype=dtype)
+
+        given_cat = self._cat(actions)            # [B,21]
+        est_cat = self._cat(estimated_action.unsqueeze(0).repeat(1,3,1))     # [B,21]
+        success = (given_cat == est_cat)     # [B,21]
+
+        # Default (NOT success): guidance=0, repel given action, nothing to attract
+        pos = actions.clone()  # repel
+        neg = actions.clone()  # attract (unused because guidance=0)
+
+        # Success: attract given action; repel forward (1,0) except forward-success -> repel (-1,0)
+        fwd = torch.zeros_like(actions); fwd[..., 0] = 1.0
+        bwd = torch.zeros_like(actions); bwd[..., 0] = -1.0
+
+        pos = torch.where(success.unsqueeze(-1), fwd, pos)
+        pos = torch.where((success & (given_cat == 1)).unsqueeze(-1), bwd, pos)  # special case
+        neg = torch.where(success.unsqueeze(-1), actions, neg)
+
+        guidance = torch.where(
+            success,
+            torch.tensor(float(self.fake_guidance_scale), device=device, dtype=dtype),
+            torch.tensor(0.0, device=device, dtype=dtype),
+        )  # [B,21]
+        guidance = guidance[:, :, None, None, None]  # [B,21,1,1,1] for broadcasting with [B,21,C,H,W]
+
+        cond_pos = self._with_action_conditioning(conditional_dict, pos, num_frame, device, dtype)
+        cond_neg = self._with_action_conditioning(conditional_dict, neg, num_frame, device, dtype)
+        return cond_pos, cond_neg, guidance
+            
     def compute_distribution_matching_loss(
         self,
         image_or_video: torch.Tensor,
+        estimated_action: torch.Tensor,
+        estimated_action_log_std: torch.Tensor,
         conditional_dict: dict,
         unconditional_dict: dict,
         gradient_mask: Optional[torch.Tensor] = None,
@@ -474,30 +441,13 @@ class DMD2B2BLAM(SelfForcingModel):
         original_latent = image_or_video
 
         batch_size, num_frame = image_or_video.shape[:2]
-        cond_with_action = self._with_action_conditioning(
-            conditional_dict,
-            actions,
+
+        cond_pos, cond_neg, per_sample_fake_scale = self._build_action_cfg(
+            conditional_dict, 
+            actions, 
+            estimated_action, 
             num_frame,
-            image_or_video.device,
-            image_or_video.dtype,
-        )
-        if self.action_cfg_enabled:
-            #opposite actions are given to the unconditional conditioning to push the model toward the right action and away from the opposite action
-            # we have to make it by negating both dimensions of the actions. When actions are both near 0 (less than 0.1,0.1), the model should do action_0 = sign(action_0) * 1 - abs(action_0) and the same for action 1
-            opposite_actions = 1.0 - actions ** 2
-            cond_with_opp_action = self._with_action_conditioning(
-                conditional_dict,
-                opposite_actions,
-                num_frame,
-                image_or_video.device,
-                image_or_video.dtype,
-            )
-        uncond_with_action = self._with_action_conditioning(
-            unconditional_dict,
-            actions,
-            num_frame,
-            image_or_video.device,
-            image_or_video.dtype,
+            image_or_video.device, image_or_video.dtype
         )
 
         with torch.no_grad():
@@ -532,25 +482,11 @@ class DMD2B2BLAM(SelfForcingModel):
                 noisy_image_or_video=noisy_latent,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
-                conditional_dict=cond_with_action,
-                unconditional_dict=uncond_with_action
+                conditional_dict_pos=cond_pos,
+                conditional_dict_neg=cond_neg,
+                unconditional_dict=unconditional_dict,
+                fake_guidance_scale=per_sample_fake_scale,
             )
-
-            if self.action_cfg_enabled:
-                action_grad, action_dmd_log_dict = self._compute_kl_grad(
-                    noisy_image_or_video=noisy_latent,
-                    estimated_clean_image_or_video=original_latent,
-                    timestep=timestep,
-                    conditional_dict=cond_with_action,
-                    unconditional_dict=cond_with_opp_action
-                )
-                opp_action_grad, opp_action_dmd_log_dict = self._compute_kl_grad(
-                    noisy_image_or_video=noisy_latent,
-                    estimated_clean_image_or_video=original_latent,
-                    timestep=timestep,
-                    conditional_dict=cond_with_opp_action,
-                    unconditional_dict=uncond_with_action
-                )
 
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], (
@@ -561,29 +497,7 @@ class DMD2B2BLAM(SelfForcingModel):
                 original_latent.double() - grad.double()
                 ).detach(), reduction="mean")
 
-        if self.action_cfg_enabled:
-            if gradient_mask is not None:
-                cond_cond_dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], (
-                    original_latent.double() - action_grad.double()
-                    ).detach()[gradient_mask], reduction="mean")
-            else:
-                cond_cond_dmd_loss = 0.5 * F.mse_loss(original_latent.double(), (
-                    original_latent.double() - action_grad.double()
-                ).detach(), reduction="mean")
-            if gradient_mask is not None:
-                opp_act_dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], (
-                    original_latent.double() - opp_action_grad.double()
-                    ).detach()[gradient_mask], reduction="mean")
-            else:
-                opp_act_dmd_loss = 0.5 * F.mse_loss(original_latent.double(), (
-                    original_latent.double() - opp_action_grad.double()
-                ).detach(), reduction="mean")
-
-            total_dmd_loss = dmd_loss * 0.5 + cond_cond_dmd_loss * 0.05 + opp_act_dmd_loss * 0.5
-        else:
-            total_dmd_loss = dmd_loss
-
-        return total_dmd_loss, dmd_log_dict
+        return dmd_loss, dmd_log_dict
 
     def generator_loss(
         self,
@@ -609,6 +523,11 @@ class DMD2B2BLAM(SelfForcingModel):
             slice_last_frames=slice_last_frames,
             action_inputs=actions,
         )
+
+        estimated_motion = self._estimate_motion(pred_image)
+        estimated_action, estimated_action_log_std = self._estimate_action_from_motion(pred_image, estimated_motion)
+        estimated_action_log_std = estimated_action_log_std.detach()
+
         assert pred_image.requires_grad, "generator rollout returned a detached tensor"
         gen_time = time.time() - _t_gen_start
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -617,6 +536,8 @@ class DMD2B2BLAM(SelfForcingModel):
         _t_loss_start = time.time()
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
+            estimated_action=estimated_action.detach(),
+            estimated_action_log_std=estimated_action_log_std,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             gradient_mask=gradient_mask,
@@ -643,9 +564,8 @@ class DMD2B2BLAM(SelfForcingModel):
                     pred_image.shape[1],
                     pred_image.device,
                     pred_image.dtype,
-                    # detach_modulation=True,
+                    # detach_modulation=True, #we don't detach modulation as we want the generator loss to be able to change the modulation
                 )
-                cls_conditional.pop("_action_modulation", None)
                 logits_fake = self._classifier_logits(pred_image, cls_conditional)
             gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
             total_loss = total_loss + gan_loss
@@ -656,37 +576,8 @@ class DMD2B2BLAM(SelfForcingModel):
                 "generator_gan_logits_std": logits_fake.detach().std(unbiased=False),
             })
 
-        if self.action_loss_weight > 0.0 and hasattr(self.fake_score, "adding_rgs_branch"):
-            if actions is None:
-                raise ValueError("Actions tensor required for generator action regression loss.")
-            with self._freeze_fake_score_params():
-                rgs_conditional = self._with_action_conditioning(
-                    conditional_dict,
-                    actions,
-                    pred_image.shape[1],
-                    pred_image.device,
-                    pred_image.dtype,
-                    # detach_modulation=True,
-                )
-                rgs_conditional.pop("_action_modulation", None)
-                action_preds = self._regressor_preds(pred_image, rgs_conditional)
-            min_frames = min(action_preds.shape[1], actions.shape[1])
-            actions_for_loss = actions[:, :min_frames]
-            pred_for_loss = action_preds[:, :min_frames]
-            action_targets = actions_for_loss.to(device=pred_image.device, dtype=pred_image.dtype)
-            act_loss_weighted = self._action_l1_loss(pred_for_loss, action_targets, apply_axis_weights=True)
-            act_loss_unweighted = self._action_l1_loss(pred_for_loss, action_targets, apply_axis_weights=False)
-            act_loss = act_loss_weighted * self.action_loss_weight
-            total_loss = total_loss + act_loss
-            log_dict.update({
-                "generator_act_loss": act_loss.detach(),
-                "generator_act_loss_raw": act_loss_weighted.detach(),
-                "generator_act_loss_unweighted": act_loss_unweighted.detach(),
-            })
-            log_dict.update(self._compute_action_metrics(pred_for_loss.detach(), action_targets.detach(), "generator_action"))
-        # INSERT HERE: latent action model loss - changed conditional_dict to rgs_conditional 12/11/2025
         latent_action_loss, latent_action_logs = self._compute_latent_action_loss(
-            pred_image, actions
+            pred_image, actions, estimated_motion, estimated_action, estimated_action_log_std
         )
         total_loss = total_loss + latent_action_loss * self.indep_lat_act_weight
         log_dict.update(latent_action_logs)
@@ -815,17 +706,8 @@ class DMD2B2BLAM(SelfForcingModel):
 
         cls_loss = torch.tensor(0.0, device=self.device)
         gan_log_dict = {}
-        if (self.guidance_cls_loss_weight > 0.0 and real_latents is not None and hasattr(self.fake_score, "adding_cls_branch")):
-            real_conditional = self._with_action_conditioning(
-                conditional_dict,
-                actions,
-                real_latents.shape[1],
-                real_latents.device,
-                real_latents.dtype,
-                detach_modulation=True,
-            )
-            real_conditional.pop("_action_modulation", None)
-            real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), real_conditional)
+        if (self.guidance_cls_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch")):
+            real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), critic_conditional)
             fake_logits = self._classifier_logits(generated_image.detach(), critic_conditional)
             loss_real = F.softplus(-real_logits).mean()
             loss_fake = F.softplus(fake_logits).mean()
@@ -841,40 +723,7 @@ class DMD2B2BLAM(SelfForcingModel):
                 "critic_cls_loss": cls_loss.detach(),
             }
 
-        rgs_loss = torch.tensor(0.0, device=self.device)
-        action_log_dict = {}
-        if self.guidance_rgs_loss_weight > 0.0 and hasattr(self.fake_score, "adding_rgs_branch"):
-            if real_latents is None:
-                raise ValueError("Real latents required for critic action regression loss.")
-            if actions is None:
-                raise ValueError("Actions tensor required for critic action regression loss.")
-            real_conditional = self._with_action_conditioning(
-                conditional_dict,
-                actions,
-                real_latents.shape[1],
-                real_latents.device,
-                real_latents.dtype,
-                detach_modulation=True,
-            )
-            real_conditional.pop("_action_modulation", None)
-            live_actions = self._regressor_preds(real_latents.to(self.device, dtype=torch.float32), real_conditional)
-            min_frames = min(live_actions.shape[1], actions.shape[1])
-            live_actions_for_loss = live_actions[:, :min_frames]
-            actions_for_loss = actions[:, :min_frames]
-            actions_target = actions_for_loss.to(device=live_actions_for_loss.device, dtype=live_actions_for_loss.dtype)
-            rgs_loss_weighted = self._action_l1_loss(live_actions_for_loss, actions_target, apply_axis_weights=True)
-            rgs_loss_unweighted = self._action_l1_loss(live_actions_for_loss, actions_target, apply_axis_weights=False)
-            rgs_loss = rgs_loss_weighted * self.guidance_rgs_loss_weight
-            action_log_dict = {
-                "critic_rgs_loss": rgs_loss.detach(),
-                "critic_rgs_loss_raw": rgs_loss_weighted.detach(),
-                "critic_rgs_loss_unweighted": rgs_loss_unweighted.detach(),
-                "critic_action_pred_mean": live_actions.detach().mean(),
-                "critic_action_target_mean": actions.detach().mean(),
-            }
-            action_log_dict.update(self._compute_action_metrics(live_actions_for_loss.detach(), actions_target.detach(), "critic_action"))
-
-        total_loss = denoising_loss + cls_loss + rgs_loss
+        total_loss = denoising_loss + cls_loss
 
         loss_time = time.time() - _t_loss_start
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -887,7 +736,6 @@ class DMD2B2BLAM(SelfForcingModel):
             "critic_denoising_loss": denoising_loss.detach(),
         }
         critic_log_dict.update(gan_log_dict)
-        critic_log_dict.update(action_log_dict)
         critic_log_dict.update(self._action_batch_stats(actions, "actions"))
 
         return total_loss, critic_log_dict

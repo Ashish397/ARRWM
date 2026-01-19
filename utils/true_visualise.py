@@ -534,7 +534,7 @@ class VisualizationTrainer:
         step_vis_dir = os.path.join(self.vis_output_dir, f"step_{self.step:07d}")
         os.makedirs(step_vis_dir, exist_ok=True)
 
-        # Create dummy actions for 8 directions with Gaussian noise (used if not using dataset actions)
+        # Create dummy actions for 9 directions with Gaussian noise (used if not using dataset actions)
         action_directions = [
             (0.75, 0.75),
             (0.75, 0),
@@ -544,6 +544,7 @@ class VisualizationTrainer:
             (-0.75, 0),
             (-0.75, 0.75),
             (-0.75, -0.75),
+            (0, 0),
         ]
         num_frames = 21
         action_noise_std = 0.1
@@ -658,10 +659,10 @@ class VisualizationTrainer:
             rank = dist.get_rank() if dist.is_initialized() else 0
             print(f"[Rank {rank}] Processing prompts: {prompt_list}")
             
-            # Generate videos with dummy actions (8 directions) for each prompt
-            # This gives 8 prompts × 8 directions = 64 videos total
+            # Generate videos with dummy actions (9 directions) for each prompt
+            # This gives 8 prompts × 9 directions = 72 videos total
             if not self.dataset_actions_only:
-                print(f"[Rank {rank}] Generating videos with dummy actions (8 directions) for {len(prompt_list)} prompts...")
+                print(f"[Rank {rank}] Generating videos with dummy actions (9 directions) for {len(prompt_list)} prompts...")
                 for prompt_idx in prompt_list:
                     sample = samples[prompt_idx]
                     for dir_idx, (dir_x, dir_y) in enumerate(action_directions):
