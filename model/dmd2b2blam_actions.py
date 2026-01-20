@@ -24,7 +24,7 @@ if str(_latent_actions_path) not in sys.path:
 from train_motion_2_action import Motion2ActionModel
 from cotracker.predictor import CoTrackerPredictor
 
-class DMD2B2BLAM(SelfForcingModel):
+class DMD2B2BLAM_actions(SelfForcingModel):
     def __init__(self, args, device, latent_action_model: Optional[nn.Module] = None, motion_model: Optional[nn.Module] = None):
         """
         Initialize the DMD (Distribution Matching Distillation) module.
@@ -100,10 +100,9 @@ class DMD2B2BLAM(SelfForcingModel):
         else:
             self._action_axis_weights = None
 
-        if (self.gan_loss_weight > 0.0 or self.guidance_cls_loss_weight > 0.0) and hasattr(self.fake_score, "adding_cls_branch"):
-            self.fake_score.adding_cls_branch(
-                time_embed_dim=0,
-            )
+        self.fake_score.adding_cls_branch(
+            time_embed_dim=0,
+        )
     
     def _estimate_action_from_motion(self, pred_frames: torch.Tensor, estimated_motion: torch.Tensor) -> torch.Tensor:
         # Use pre-initialized motion2action model (initialized in __init__ for FSDP compatibility)
@@ -264,51 +263,6 @@ class DMD2B2BLAM(SelfForcingModel):
             for p, rg in zip(self.fake_score.parameters(), requires_grad):
                 p.requires_grad_(rg)
 
-    def _build_classifier_inputs(self, latents: torch.Tensor, conditional_dict: dict, reuse_noise: Optional[torch.Tensor] = None):
-        batch_size, num_frames = latents.shape[:2]
-        device = latents.device
-        latents = latents.float()
-
-        if self.diffusion_gan:
-            timesteps = torch.randint(
-                0,
-                self.diffusion_gan_max_timestep,
-                (batch_size,),
-                device=device,
-                dtype=torch.long,
-            )
-        else:
-            timesteps = torch.zeros((batch_size,), device=device, dtype=torch.long)
-
-        timestep_full = timesteps[:, None].repeat(1, num_frames)
-
-        if self.diffusion_gan:
-            noise = reuse_noise if reuse_noise is not None else torch.randn_like(latents)
-            noisy_latents = self.scheduler.add_noise(
-                latents.flatten(0, 1),
-                noise.flatten(0, 1),
-                timestep_full.flatten(0, 1),
-            ).unflatten(0, (batch_size, num_frames))
-        else:
-            noisy_latents = latents
-
-        return noisy_latents, timestep_full
-
-    def _classifier_logits(self, latents: torch.Tensor, conditional_dict: dict) -> torch.Tensor:
-        if not hasattr(self.fake_score, "adding_cls_branch"):
-            raise RuntimeError("fake_score does not support classification branch required for DMD2 GAN loss.")
-
-        noisy_latents, timestep_full = self._build_classifier_inputs(latents, conditional_dict)
-        outputs = self.fake_score(
-            noisy_image_or_video=noisy_latents,
-            conditional_dict=conditional_dict,
-            timestep=timestep_full,
-            classify_mode=True,
-            concat_time_embeddings=self.concat_time_embeddings,
-        )
-        logits = outputs[-1]
-        return logits.squeeze(-1)
-
     @property
     def latent_action_model(self) -> Optional[nn.Module]:
         return getattr(self, "_latent_action_model_ref", None)
@@ -316,6 +270,28 @@ class DMD2B2BLAM(SelfForcingModel):
     @property
     def motion_model(self) -> Optional[nn.Module]:
         return getattr(self, "_motion_model_ref", None)
+
+    def _classifier_logits(self, latents: torch.Tensor, conditional_dict: dict) -> torch.Tensor:
+        """
+        Efficiently extract only classification logits from fake_score.
+        Uses clean latents (no noise) for faster computation, matching dmd2realmselam_actions.py.
+        """
+        if not hasattr(self.fake_score, "adding_cls_branch"):
+            raise RuntimeError("fake_score does not support classification branch required for DMD2 GAN loss.")
+        
+        batch_size, num_frames = latents.shape[:2]
+        device = latents.device
+        # Use clean latents (no noise) for classification - much faster than adding noise
+        timestep_full = torch.zeros((batch_size, num_frames), device=device, dtype=torch.long)
+        
+        outputs = self.fake_score(
+            noisy_image_or_video=latents.float(),
+            conditional_dict=conditional_dict,
+            timestep=timestep_full,
+            classify_mode=True,
+        )
+        logits = outputs[-1]
+        return logits.squeeze(-1)
 
     def _action_batch_stats(self, actions: Optional[torch.Tensor], prefix: str) -> dict:
         """Lightweight scalars describing the input action distribution for logging."""
@@ -631,25 +607,25 @@ class DMD2B2BLAM(SelfForcingModel):
         })
         log_dict.update(self._action_batch_stats(actions, "actions"))
 
-        if self.gan_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch"):
-            with self._freeze_fake_score_params():
-                cls_conditional = self._with_action_conditioning(
-                    conditional_dict,
-                    actions,
-                    pred_image.shape[1],
-                    pred_image.device,
-                    pred_image.dtype,
-                    # detach_modulation=True, #we do not detach modulation as this is equivalent to the same prompt that generated the latents
-                )
-                logits_fake = self._classifier_logits(pred_image, cls_conditional)
-            gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
-            total_loss = total_loss + gan_loss
-            log_dict.update({
-                "generator_gan_loss": gan_loss.detach(),
-                "generator_gan_logits": logits_fake.detach().mean(),
-                "generator_gan_real_prob": torch.sigmoid(logits_fake.detach()).mean(),
-                "generator_gan_logits_std": logits_fake.detach().std(unbiased=False),
-            })
+        with self._freeze_fake_score_params():
+            cls_conditional = self._with_action_conditioning(
+                conditional_dict,
+                actions,
+                pred_image.shape[1],
+                pred_image.device,
+                pred_image.dtype,
+                # detach_modulation=True, #we do not detach modulation as this is equivalent to the same prompt that generated the latents
+            )
+            # Use optimized helper that only computes logits (no denoising prediction)
+            logits_fake = self._classifier_logits(pred_image, cls_conditional)
+        gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
+        total_loss = total_loss + gan_loss
+        log_dict.update({
+            "generator_gan_loss": gan_loss.detach(),
+            "generator_gan_logits": logits_fake.detach().mean(),
+            "generator_gan_real_prob": torch.sigmoid(logits_fake.detach()).mean(),
+            "generator_gan_logits_std": logits_fake.detach().std(unbiased=False),
+        })
 
         latent_action_loss, latent_action_logs = self._compute_latent_action_loss(
             pred_image, actions, estimated_motion, estimated_action, estimated_action_log_std
@@ -745,10 +721,11 @@ class DMD2B2BLAM(SelfForcingModel):
             critic_timestep.flatten(0, 1)
         ).unflatten(0, (batch_size, num_frame))
 
+        # Compute denoising prediction (needs noisy input)
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_generated_image,
             conditional_dict=critic_conditional,
-            timestep=critic_timestep
+            timestep=critic_timestep,
         )
 
         # Step 3: Compute the denoising loss for the fake critic
@@ -781,11 +758,25 @@ class DMD2B2BLAM(SelfForcingModel):
 
         cls_loss = torch.tensor(0.0, device=self.device)
         gan_log_dict = {}
-        if (self.guidance_cls_loss_weight > 0.0 and hasattr(self.fake_score, "adding_cls_branch")):
-            real_logits = self._classifier_logits(real_latents.to(self.device, dtype=torch.float32), critic_conditional)
+
+        # For GAN classification loss, use clean latents (much faster than noisy)
+        # Only compute if guidance_cls_loss_weight > 0 to avoid unnecessary computation
+        if self.guidance_cls_loss_weight > 0.0 and real_latents is not None:
+            # Prepare conditional dict for real latents (may have different frame count)
+            real_conditional = self._with_action_conditioning(
+                conditional_dict,
+                actions,
+                real_latents.shape[1],
+                real_latents.generated_image.device,
+                real_latents.generated_image.dtype,
+                detach_modulation=True,
+            )
+            # Only extract logits, not denoising predictions (uses clean latents, no noise)
             fake_logits = self._classifier_logits(generated_image.detach(), critic_conditional)
-            loss_real = F.softplus(-real_logits).mean()
-            loss_fake = F.softplus(fake_logits).mean()
+            real_logits = self._classifier_logits(real_latents.to(generated_image.device, dtype=generated_image.dtype), real_conditional)
+            
+            loss_real = F.softplus(-real_logits.squeeze(-1)).mean()
+            loss_fake = F.softplus(fake_logits.squeeze(-1)).mean()
             cls_loss = (loss_real + loss_fake) * self.guidance_cls_loss_weight
             gan_log_dict = {
                 "critic_gan_loss": cls_loss.detach(),

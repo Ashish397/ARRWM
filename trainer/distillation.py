@@ -33,6 +33,7 @@ from model import (
     DMD2RealMSELAM,
     DMD2RealMSELAM_Actions,
     DMD2B2BLAM,
+    DMD2B2BLAM_actions,
 )
 from model.streaming_training import StreamingTrainingModel
 from latent_actions.train_motion_2_action import Motion2ActionModel
@@ -250,6 +251,15 @@ class Trainer:
             latent_action_model = self._build_latent_action_model(config)
             motion_model = self._build_motion_model(config)
             self.model = DMD2B2BLAM(
+                config,
+                device=self.device,
+                latent_action_model=latent_action_model,
+                motion_model=motion_model,
+            )
+        elif config.distribution_loss == "dmd2b2blam_actions":
+            latent_action_model = self._build_latent_action_model(config)
+            motion_model = self._build_motion_model(config)
+            self.model = DMD2B2BLAM_actions(
                 config,
                 device=self.device,
                 latent_action_model=latent_action_model,
@@ -612,24 +622,6 @@ class Trainer:
 
         critic_params = [param for param in self.model.fake_score.parameters()
                          if param.requires_grad]
-        # if (
-        #     getattr(config, "distribution_loss", None) in ("dmd2realmselam", "dmd2realmselam_actions", "dmd2b2blam")
-        #     and getattr(self.model, "latent_action_model", None) is not None
-        # ):
-        #     critic_params.extend(
-        #         param
-        #         for param in self.model.latent_action_model.parameters()
-        #         if param.requires_grad
-        #     )
-        # if (
-        #     getattr(config, "distribution_loss", None) in ("dmd2b2blam")
-        #     and getattr(self.model, "motion_model", None) is not None
-        # ):
-        #     critic_params.extend(
-        #         param
-        #         for param in self.model.motion_model.parameters()
-        #         if param.requires_grad
-        #     )
         self.critic_optimizer = torch.optim.AdamW(
             critic_params,
             lr=config.lr_critic if hasattr(config, "lr_critic") else config.lr,
@@ -649,7 +641,7 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
-        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2b2blam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+        elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2b2blam", "dmd2b2blam_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
             dataset = VideoLatentCaptionDataset(
                 config.real_latent_root,
                 config.caption_root,
@@ -683,7 +675,7 @@ class Trainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "dmd2b2blam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "dmd2b2blam", "dmd2b2blam_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
                 val_latent_root = getattr(config, "val_real_latent_root", None)
                 val_caption_root = getattr(config, "val_caption_root", None)
 
@@ -1470,7 +1462,7 @@ class Trainer:
                 actions = torch.stack(actions).to(self.device, dtype=torch.float32)
         if (
             self._action_patch_enabled
-            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'dmd2b2blam', 'mse_dmd_lam', 'mse_dmd_lam_action')
+            and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2realmselam_action', 'dmd2b2blam', 'dmd2b2blam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action')
             and actions is None
         ):
             raise ValueError('Batch is missing action annotations required for action-guided training.')
@@ -1505,9 +1497,9 @@ class Trainer:
                 clean_latent=None,
                 initial_latent=None,
             )
-            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam'):
+            if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'dmd2b2blam_actions'):
                 generator_kwargs['real_latents'] = real_latents
-            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+            if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'dmd2b2blam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['actions'] = actions
             if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
                 generator_kwargs['clean_latent'] = real_latents
@@ -1539,9 +1531,9 @@ class Trainer:
             clean_latent=None,
             initial_latent=None,
         )
-        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam'):
+        if getattr(self.config, 'distribution_loss', '') in ('dmd2', 'dmd2mse', 'dmd2real', 'dmd2realmse', 'dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'dmd2b2blam_actions'):
             critic_kwargs['real_latents'] = real_latents
-        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'mse_dmd_lam', 'mse_dmd_lam_action'):
+        if actions is not None and getattr(self.config, 'distribution_loss', '') in ('dmd2realmselam', 'dmd2realmselam_actions', 'dmd2b2blam', 'dmd2b2blam_actions', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['actions'] = actions
         if getattr(self.config, 'distribution_loss', '') in ('mse_dmd', 'mse_dmd_lam', 'mse_dmd_lam_action'):
             critic_kwargs['clean_latent'] = real_latents
