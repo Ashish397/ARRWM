@@ -10,6 +10,7 @@ This module generates modulation parameters (scale, shift, gate) from action fea
 to condition the diffusion model's transformer blocks.
 """
 
+import math
 import torch
 import torch.nn as nn
 
@@ -25,13 +26,20 @@ class ActionModulationProjection(nn.Module):
     def __init__(
         self,
         action_dim: int,
+        activation: str,
         hidden_dim: int = 2048,
+        mlp_dim: int = 512,
         num_frames: int = 1,
         zero_init: bool = True,
+        use_fourier: bool = True,
+        fourier_frequencies: int = 8,
+        include_raw_actions: bool = True,
+        zero_init_std: float = 1e-3,
     ):
         """
         Args:
             action_dim: dimension of input action features
+            activation: activation function to use, one of "leakyrelu", "silu", or "tanh"
             hidden_dim: hidden dimension of the model (default 2048 for Wan-1.3B)
             num_frames: number of frames to generate modulation for
             zero_init: if True, initialize output layer to zero (adaLN-Zero)
@@ -40,25 +48,58 @@ class ActionModulationProjection(nn.Module):
         
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+        self.mlp_dim = mlp_dim
         self.num_frames = num_frames
+        self.use_fourier = use_fourier
+        self.fourier_frequencies = fourier_frequencies
+        self.include_raw_actions = include_raw_actions
+        self.zero_init_std = zero_init_std
+        self.activation = activation
+
+        self.shift_scale = 1.0 #0.5
+        self.gate_scale = 0.2 #0.1
+
+        # Get activation function based on string
+        activation_fn = self._get_activation(activation)
+
+        # Fourier features (like time embeddings, but for actions in [-1, 1])
+        if self.use_fourier:
+            freq = (2.0 ** torch.arange(self.fourier_frequencies, dtype=torch.float32)) * math.pi
+            self.register_buffer("fourier_freq_bands", freq, persistent=False)
+            fourier_dim = action_dim * self.fourier_frequencies * 2  # sin+cos
+            in_dim = fourier_dim + (action_dim if self.include_raw_actions else 0)
+        else:
+            in_dim = action_dim
         
-        # Action embedding network
+        # Shallow, sign-symmetric-ish MLP with activation + LayerNorm
         self.action_embedding = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(in_dim, mlp_dim),
+            nn.LayerNorm(mlp_dim),
+            activation_fn(),
+            nn.Linear(mlp_dim, mlp_dim),
+            activation_fn(),
         )
-        
-        # Projection to modulation parameters (6 params per frame)
-        self.action_projection = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim * 6),
-        )
+
+        # Projection to modulation parameters (6 params per frame -> dim)
+        self.action_projection = nn.Linear(mlp_dim, hidden_dim * 6)
         
         # Initialize with zeros for adaLN-Zero
         if zero_init:
-            nn.init.zeros_(self.action_projection[-1].weight)
-            nn.init.zeros_(self.action_projection[-1].bias)
+            # "Near-zero" init so gradients flow through the whole branch immediately
+            nn.init.normal_(self.action_projection.weight, mean=0.0, std=self.zero_init_std)
+            nn.init.zeros_(self.action_projection.bias)
+    
+    def _get_activation(self, activation_str: str):
+        """Get the appropriate activation class based on string."""
+        activation_str = activation_str.lower()
+        if activation_str == "leakyrelu":
+            return lambda: nn.LeakyReLU(negative_slope=0.2)
+        elif activation_str == "silu":
+            return nn.SiLU
+        elif activation_str == "tanh":
+            return nn.Tanh
+        else:
+            raise ValueError(f"Unknown activation function: {activation_str}. Must be one of 'leakyrelu', 'silu', or 'tanh'")
     
     def forward(self, action_features: torch.Tensor, num_frames: int | None = None) -> torch.Tensor:
         """
@@ -71,26 +112,31 @@ class ActionModulationProjection(nn.Module):
         Returns:
             modulation_params: [batch_size, num_frames, 6, hidden_dim]
         """
-        batch_size = action_features.shape[0]
-        
-        # Handle both 2D and 3D inputs
-        if action_features.dim() == 2:
-            # [B, action_dim] -> expand to all frames
-            if num_frames is None:
-                num_frames = self.num_frames
-            action_features = action_features.unsqueeze(1).expand(-1, num_frames, -1)
-        
         # [B, F, action_dim]
         assert action_features.dim() == 3
         num_frames = action_features.shape[1]
+        batch_size = action_features.shape[0]
+
+        x = action_features
+        # Fourier features
+        if self.use_fourier:
+            # x: [B, F, A] -> [B, F, A, K]
+            xb = x[..., None] * self.fourier_freq_bands[None, None, None, :]
+            ff = torch.cat([torch.sin(xb), torch.cos(xb)], dim=-1)  # [B,F,A,2K]
+            ff = ff.reshape(batch_size, num_frames, -1)            # [B,F,2AK]
+            if self.include_raw_actions:
+                x = torch.cat([x, ff], dim=-1)                     # [B,F,A+2AK]
+            else:
+                x = ff                                             # [B,F,2AK]
         
         # Flatten for processing
-        action_flat = action_features.flatten(0, 1)  # [B*F, action_dim]
+        action_flat = x.flatten(0, 1)  # [B*F, in_dim]
         ref_weight = next(self.action_embedding.parameters(), None)
         if ref_weight is None:
             raise RuntimeError("action_embedding must have parameters to determine device/dtype.")
         action_flat = action_flat.to(device=ref_weight.device, dtype=ref_weight.dtype)
-        # Embed action without breaking autograd or dtype
+
+        # Embed action
         action_emb = self.action_embedding(action_flat)  # [B*F, hidden_dim]
 
         # Project to modulation parameters
@@ -98,6 +144,12 @@ class ActionModulationProjection(nn.Module):
         # Reshape to [B, F, 6, hidden_dim]
         modulation = modulation.view(batch_size, num_frames, 6, self.hidden_dim)
         
+        scale = modulation.new_tensor([
+            self.shift_scale, self.shift_scale, self.gate_scale,
+            self.shift_scale, self.shift_scale, self.gate_scale
+        ]).view(1, 1, 6, 1)
+
+        modulation = modulation * scale
         return modulation
 
 
@@ -165,6 +217,7 @@ class ActionConditionedWrapper:
 
 def create_action_modulation_module(
     action_dim: int,
+    activation: str,
     model_hidden_dim: int = 2048,
     num_frames: int = 1,
     zero_init: bool = True,
@@ -175,6 +228,7 @@ def create_action_modulation_module(
     
     Args:
         action_dim: dimension of action features
+        activation: activation function to use, one of "leakyrelu", "silu", or "tanh"
         model_hidden_dim: hidden dimension of the diffusion model
         num_frames: number of frames
         zero_init: whether to use zero initialization (adaLN-Zero)
@@ -185,6 +239,7 @@ def create_action_modulation_module(
     """
     module = ActionModulationProjection(
         action_dim=action_dim,
+        activation=activation,
         hidden_dim=model_hidden_dim,
         num_frames=num_frames,
         zero_init=zero_init,

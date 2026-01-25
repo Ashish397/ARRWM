@@ -764,14 +764,22 @@ class WanModel(ModelMixin, ConfigMixin):
             else:
                 x = block(x, **kwargs)
 
-            if classify_mode and ii in [13, 21, 29]:
+            if classify_mode and ii in [7, 13, 21, 29]:
                 gan_token = registers[:, gan_idx: gan_idx + 1]
-                final_x.append(gan_ca_blocks[gan_idx](x, gan_token))
+                # Apply multiple GanAttentionBlocks sequentially for progressive feature refinement
+                token_features = gan_token
+                for block in gan_ca_blocks[gan_idx]:
+                    token_features = block(x, token_features)
+                final_x.append(token_features)
                 gan_idx += 1
 
-            if regress_mode and ii in [13, 21, 29]:
+            if regress_mode and ii in [7, 13, 21, 29]:
                 gan_token_rgs = registers_rgs[:, gan_idx_rgs: gan_idx_rgs + 1]
-                final_x_rgs.append(gan_ca_blocks_rgs[gan_idx_rgs](x, gan_token_rgs))
+                # Apply multiple GanAttentionBlocks sequentially for progressive feature refinement
+                token_features_rgs = gan_token_rgs
+                for block in gan_ca_blocks_rgs[gan_idx_rgs]:
+                    token_features_rgs = block(x, token_features_rgs)
+                final_x_rgs.append(token_features_rgs)
                 gan_idx_rgs += 1
 
         if classify_mode:

@@ -39,6 +39,7 @@ random.seed(42)
 # parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for distribution loss (only used in distribution mode)")
 # parser.add_argument("--zero_motion", action="store_true", default=False, help="Zeros motion to ablate motion conditioning")
 # parser.add_argument("--noise_level", type=float, default=0.02, help="Noise level for data augmentation")
+# parser.add_argument("--offset_weight", type=float, default=0.0, help="Offset weight for data augmentation")
 # args = parser.parse_args()
 
 # # Training
@@ -51,7 +52,7 @@ random.seed(42)
 # head_mode = args.head_mode
 # early_stopping_patience = 50
 # zero_motion = args.zero_motion
-
+# offset_weight = args.offset_weight
 # # Parse output_rides list (convert to integers)
 # # output_rides_list = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
 # output_rides_list = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
@@ -75,9 +76,9 @@ random.seed(42)
 # checkpoint_dir.mkdir(parents=True, exist_ok=True)
 # log_dir.mkdir(exist_ok=True)
 
-# #################################
-# # Global Variables
-# #################################
+# # #################################
+# # # Global Variables
+# # #################################
 
 # GLOBAL_WEIGHTS = {
 #     "0": 0.5, # stationary
@@ -378,7 +379,7 @@ class Motion2ActionModel(nn.Module):
 #################################
 
 class LatentsMotionActionsIterable(IterableDataset):
-    def __init__(self, actions_base, motion_base, data_base, batch_size, noise_level, output_rides_list, zero_motion):
+    def __init__(self, actions_base, motion_base, data_base, batch_size, noise_level, output_rides_list, zero_motion, offset_weight=0.0):
         super().__init__()
         self.actions_base = actions_base
         self.motion_base = motion_base
@@ -387,6 +388,7 @@ class LatentsMotionActionsIterable(IterableDataset):
         self.noise_level = noise_level
         self.output_rides_list = output_rides_list
         self.zero_motion = zero_motion
+        self.offset_weight = offset_weight
     def __iter__(self):
         batch_latents = None
         batch_motion = None
@@ -438,11 +440,15 @@ class LatentsMotionActionsIterable(IterableDataset):
                 motion_arr = np.load(motion_file, mmap_mode="r")  # [N,100,3]
                 latents = torch.load(latent_files[0], map_location="cpu")[0]
                 min_length = min(len(actions_arr), len(motion_arr))
-                if len(latents) < int(min_length*3):
+                if len(latents) < (int(min_length*3)+2):
                     continue
                 actions_arr = actions_arr[:min_length]
                 motion_arr = motion_arr[:min_length]
-                latents = latents[:int(min_length*3)]
+                if self.offset_weight > 0.0:
+                    latents = latents[1:int(min_length*3)+2]
+                    latents = latents[1:] + (latents[1:] - latents[:-1]) * self.offset_weight
+                else:
+                    latents = latents[1:int(min_length*3)+1]
                 # Reshape to [B, T, C, H, W] then permute to [B, C, T, H, W] for Conv3d
                 latents = latents.view(latents.shape[0] // 3, 3, latents.shape[1], latents.shape[2], latents.shape[3])
                 latents = latents.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W] -> [B, C, T, H, W]
@@ -531,6 +537,7 @@ def train():
         noise_level=noise_level,
         output_rides_list=output_rides_list,
         zero_motion=zero_motion,
+        offset_weight=offset_weight,
     )
 
     dataloader = DataLoader(
@@ -549,6 +556,7 @@ def train():
         noise_level=0.0,
         output_rides_list=test_output_rides_list,
         zero_motion=zero_motion,
+        offset_weight=offset_weight,
     )
 
     test_dataloader = DataLoader(

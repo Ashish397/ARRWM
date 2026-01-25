@@ -73,6 +73,7 @@ class DMD2B2BLAM(SelfForcingModel):
         self.action_cfg_enabled = getattr(args, "action_cfg_enabled", False)
         self.action_cfg_type = getattr(args, "action_cfg_type", "framewise")
         self.action_cfg_side_multiplier = getattr(args, "action_cfg_side_multiplier", 1.25)
+        self.action_cfg_opposite_method = getattr(args, "action_cfg_opposite_method", "invert")
         object.__setattr__(self, "_latent_action_model_ref", None)
         if latent_action_model is not None:
             try:
@@ -176,10 +177,10 @@ class DMD2B2BLAM(SelfForcingModel):
         noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
-        conditional_dict_pos: dict, 
+        conditional_dict_alt: dict, 
         unconditional_dict: dict,
         normalization: bool = True,
-        conditional_dict_neg = None,
+        conditional_dict_ori = None,
         fake_guidance_scale = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
@@ -196,19 +197,22 @@ class DMD2B2BLAM(SelfForcingModel):
             - kl_log_dict: a dictionary containing the intermediate tensors for logging.
         """
         # Step 1: Compute the fake score
+        # Note: cond_ori contains original actions (to attract), cond_alt contains alternative actions (to repel)
+        # CFG formula: pred = pred_cond + (pred_cond - pred_uncond) * scale
+        # We want to encourage original actions (cond_ori) and discourage alternatives (cond_alt)
         _, pred_fake_image_cond = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict_pos,
+            conditional_dict=conditional_dict_ori,  # Use cond_ori (original actions) for conditional prediction
             timestep=timestep
         )
 
-        if (conditional_dict_neg is not None) and (fake_guidance_scale is not None):
+        if (conditional_dict_ori is not None) and (fake_guidance_scale is not None):
             _, pred_fake_image_uncond = self.fake_score(
                 noisy_image_or_video=noisy_image_or_video,
-                conditional_dict=conditional_dict_neg,
+                conditional_dict=conditional_dict_alt,  # Use cond_alt (alternative actions) for unconditional prediction
                 timestep=timestep
             )
-            pred_fake_image = pred_fake_image_cond + (
+            pred_fake_image = pred_fake_image_cond - (
                 pred_fake_image_cond - pred_fake_image_uncond
             ) * fake_guidance_scale
         else:
@@ -219,7 +223,7 @@ class DMD2B2BLAM(SelfForcingModel):
         # and add them together to achieve cfg (https://arxiv.org/abs/2207.12598)
         _, pred_real_image_cond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict_neg,
+            conditional_dict=conditional_dict_ori,
             timestep=timestep
         )
 
@@ -344,12 +348,20 @@ class DMD2B2BLAM(SelfForcingModel):
         # Compute loss: diff / std where diff = |pred_actions - actions_for_model|
         # Large diff/std = large loss, small diff/std = small loss
         # Gradients flow back through pred_actions -> model -> latents_for_model -> pred_frames
-        diff = estimated_action - actions.reshape(actions.shape[0], 7, 3, actions.shape[2]).mean(dim=2).squeeze(2)  # [B, 2]
-        # Use absolute value of diff/std as loss (or squared)
-        normalized_diff = diff #/ std  # [B, 2]
-        loss_per_sample = normalized_diff.abs().mean(dim=1)  # [B] - sum over action dimensions
-        loss = loss_per_sample.mean()  # Scalar loss
-        
+        diff = None  # computed below
+
+        # Reduce targets to segment-level to match the motion2action head (e.g. 21 frames -> 7 segments)
+        actions_seg = actions.reshape(actions.shape[0], actions.shape[1] // 3, 3, actions.shape[2]).mean(dim=2)  # [B,F,2]
+
+        pred = estimated_action
+        if pred.dim() == 2:
+            pred = pred.unsqueeze(0)  # [1,F,2] for broadcasting with actions_seg
+        diff = pred - actions_seg  # [B,F,2]
+
+        loss_per_seg = diff.abs().mean(dim=-1)  # [B,F]
+
+        loss = loss_per_seg.mean()
+
         logs = {
             "latent_action_loss": loss.detach(),
             "latent_action_pred_mean": estimated_action.detach().mean(),
@@ -377,106 +389,174 @@ class DMD2B2BLAM(SelfForcingModel):
         conditional_dict: dict,
         actions: torch.Tensor,            # [B,21,2]  (given / intended)
         estimated_action: torch.Tensor,   # [B,21,2]  (estimated)
+        estimated_action_log_std: Optional[torch.Tensor],  # [B,21,2] (or [21,2]) log-std
         num_frame: int,
         device,
         dtype,
     ):
-        actions = actions.to(device=device, dtype=dtype)
-        estimated_action = estimated_action.to(device=device, dtype=dtype).unsqueeze(0).repeat_interleave(3, axis=1)
+        actions = actions.to(device=device, dtype=dtype).reshape(actions.shape[0], actions.shape[1] // 3, 3, actions.shape[2]).mean(dim=2)
+        estimated_action = estimated_action.to(device=device, dtype=dtype).unsqueeze(0)
+        assert estimated_action.shape == actions.shape, f"expected estimated_action [B,21,2] with B==actions.shape[0], got {tuple(estimated_action.shape)}"
 
         given_cat = self._cat(actions)            # [B,21]
         est_cat = self._cat(estimated_action)     # [B,21]
         success = (given_cat == est_cat)     # [B,21]
 
-        # Default (NOT success): guidance=0, repel given action, nothing to attract
-        pos = actions.clone()  # repel
-        neg = actions.clone()  # attract (unused because guidance=0)
-
-        # Success: attract given action; repel -actions (unless zero, then repel forward [1,0])
-        is_zero_action = (given_cat == 0)  # [B,21] - check if zero action
-        fwd = torch.zeros_like(actions); fwd[..., 0] = 1.0
-        negated_actions = -actions  # [B,21,2] - opposite action
-
-        pos = torch.where(
-            success.unsqueeze(-1),
-            torch.where(
-                is_zero_action.unsqueeze(-1),
-                fwd,  # forward [1,0] for zero
-                negated_actions  # -actions for non-zero
-            ),
-            pos  # keep original actions when not success
-        )
-        neg = torch.where(success.unsqueeze(-1), actions, neg)
-
-        guidance = torch.where(
-            success,
-            torch.tensor(float(self.fake_guidance_scale), device=device, dtype=dtype),
-            torch.tensor(0.0, device=device, dtype=dtype),
-        )  # [B,21]
-        guidance = guidance[:, :, None, None, None]  # [B,21,1,1,1] for broadcasting with [B,21,C,H,W]
-
-        cond_pos = self._with_action_conditioning(conditional_dict, pos, num_frame, device, dtype)
-        cond_neg = self._with_action_conditioning(conditional_dict, neg, num_frame, device, dtype)
-        return cond_pos, cond_neg, guidance
-        
-    def _build_action_cfg_samplewise(
-        self,
-        conditional_dict: dict,
-        actions: torch.Tensor,            # [B,21,2]  (given / intended)
-        estimated_action: torch.Tensor,   # [B,21,2]  (estimated)
-        num_frame: int,
-        device,
-        dtype,
-    ):
-        actions = actions.to(device=device, dtype=dtype)
-        estimated_action = estimated_action.to(device=device, dtype=dtype).unsqueeze(0)
-
-        # Sample-wise: compute mean actions across all frames
-        mean_actions = actions.mean(dim=1)  # [B, 2] - average across frame dimension
-        mean_estimated_action = estimated_action.mean(dim=1)  # [B, 2] - average across frame dimension
-
-        # Categorize the mean actions (sample-wise)
-        mean_given_cat = self._cat(mean_actions.unsqueeze(1))  # [B, 1] -> squeeze to [B]
-        mean_est_cat = self._cat(mean_estimated_action.unsqueeze(1))  # [B, 1] -> squeeze to [B]
-        
-        # Check if categories match (sample-wise)
-        mean_given_cat = mean_given_cat.squeeze(1) if mean_given_cat.dim() > 1 else mean_given_cat
-        mean_est_cat = mean_est_cat.squeeze(1) if mean_est_cat.dim() > 1 else mean_est_cat
-        success = (mean_given_cat == mean_est_cat)  # [B] - sample-wise success
-
-        # If categories match: cond_neg = actions given, cond_pos = -actions (unless zero, then [1,0])
-        # If categories don't match: guidance = 0, cond_pos = actions given
-        is_zero_action = (mean_given_cat == 0)  # [B] - check if zero action
-        forward_action = torch.tensor([1.0, 0.0], device=device, dtype=dtype)
-        negated_actions = -actions  # [B,21,2] - opposite action
-        
-        # When success: use -actions unless zero (then use forward), otherwise use actions
-        pos = torch.where(
-            success.unsqueeze(-1).unsqueeze(-1),
-            torch.where(
-                is_zero_action.unsqueeze(-1).unsqueeze(-1),
-                forward_action.unsqueeze(0).unsqueeze(0).expand(actions.shape[0], actions.shape[1], -1),  # [1,0] * 21 for zero
-                negated_actions  # -actions for non-zero
-            ),
-            actions.clone()  # actions given when categories don't match
-        )
-        neg = actions.clone()  # actions given for cond_neg (used when categories match)
-
-        # Set guidance scale: fake_guidance_scale if categories match, 0 otherwise
-        guidance = torch.where(
-            success,
-            torch.tensor(float(self.fake_guidance_scale), device=device, dtype=dtype),
-            torch.tensor(0.0, device=device, dtype=dtype),
-        )  # [B]
-        
-        # Expand guidance to [B,21,1,1,1] for broadcasting with [B,21,C,H,W]
-        guidance = guidance.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B,1,1,1,1]
-        guidance = guidance.expand(-1, num_frame, -1, -1, -1)  # [B,21,1,1,1]
-
-        cond_pos = self._with_action_conditioning(conditional_dict, pos, num_frame, device, dtype)
-        cond_neg = self._with_action_conditioning(conditional_dict, neg, num_frame, device, dtype)
-        return cond_pos, cond_neg, guidance
+        other = None  # [B,F,2] action to use as "something else"
+        if self.action_cfg_opposite_method == 'rand':
+            # Random actions behavior: repel actions from a different category
+            # Choose a different category and generate a deterministic random action in that category
+            # Vectorized implementation
+            B, F = given_cat.shape
             
+            # Create batch and frame indices for seed computation
+            b_indices = torch.arange(B, device=device)[:, None]  # [B, 1]
+            f_indices = torch.arange(F, device=device)[None, :]  # [1, F]
+            
+            # Compute seed values for all positions [B, F]
+            seed_vals = (b_indices * 97 + f_indices * 31 + given_cat * 7) % 1000
+            
+            # Create lookup table: for each current_cat (0-4), what are the 4 available alternative categories
+            # Format: [current_cat][alternative_idx] -> selected_cat
+            category_lookup = torch.tensor([
+                [1, 2, 3, 4],  # if current=0, alternatives are [1,2,3,4]
+                [0, 2, 3, 4],  # if current=1, alternatives are [0,2,3,4]
+                [0, 1, 3, 4],  # if current=2, alternatives are [0,1,3,4]
+                [0, 1, 2, 4],  # if current=3, alternatives are [0,1,2,4]
+                [0, 1, 2, 3],  # if current=4, alternatives are [0,1,2,3]
+            ], device=device, dtype=torch.long)  # [5, 4]
+            
+            # Select alternative category index (0-3) for each position
+            alt_cat_idx = seed_vals % 4  # [B, F]
+            
+            # Get selected category for each position [B, F]
+            selected_cats = category_lookup[given_cat, alt_cat_idx]
+            
+            # Generate seeds for action value computation
+            a0_seeds = (seed_vals * 13) % 1000 / 1000.0  # [B, F]
+            a1_seeds = (seed_vals * 23) % 1000 / 1000.0  # [B, F]
+            
+            # Initialize action tensors for each category type
+            # Category 0 (zero): [0, 0]
+            cat0_actions = torch.zeros(B, F, 2, device=device, dtype=dtype)
+            
+            # Category 1 (forward): positive a0, |a0| >= |a1|
+            cat1_a0 = 0.5 + a0_seeds * 1.0  # [0.5, 1.5]
+            cat1_a1_range = 0.8 * cat1_a0
+            cat1_a1 = (-cat1_a1_range + a1_seeds * 2 * cat1_a1_range) / self.action_cfg_side_multiplier
+            cat1_actions = torch.stack([cat1_a0, cat1_a1], dim=-1)  # [B, F, 2]
+            
+            # Category 2 (backward): negative a0, |a0| >= |a1|
+            cat2_a0 = -1.5 + a0_seeds * 1.0  # [-1.5, -0.5]
+            cat2_a1_range = 0.8 * cat2_a0.abs()
+            cat2_a1 = (-cat2_a1_range + a1_seeds * 2 * cat2_a1_range) / self.action_cfg_side_multiplier
+            cat2_actions = torch.stack([cat2_a0, cat2_a1], dim=-1)  # [B, F, 2]
+            
+            # Category 3 (right): positive a1, |a1| > |a0|
+            cat3_a1_mult = 0.5 + a0_seeds * 1.0  # [0.5, 1.5] after multiplier
+            cat3_a0_range = 0.8 * cat3_a1_mult
+            cat3_a0 = -cat3_a0_range + a1_seeds * 2 * cat3_a0_range
+            cat3_actions = torch.stack([cat3_a0, cat3_a1_mult], dim=-1)  # [B, F, 2]
+            
+            # Category 4 (left): negative a1, |a1| > |a0|
+            cat4_a1_mult = -1.5 + a0_seeds * 1.0  # [-1.5, -0.5] after multiplier
+            cat4_a0_range = 0.8 * cat4_a1_mult.abs()
+            cat4_a0 = -cat4_a0_range + a1_seeds * 2 * cat4_a0_range
+            cat4_actions = torch.stack([cat4_a0, cat4_a1_mult], dim=-1)  # [B, F, 2]
+            
+            # Select actions based on selected category [B, F, 2]
+            # Create masks for each category
+            cat0_mask = (selected_cats == 0).unsqueeze(-1)  # [B, F, 1]
+            cat1_mask = (selected_cats == 1).unsqueeze(-1)  # [B, F, 1]
+            cat2_mask = (selected_cats == 2).unsqueeze(-1)  # [B, F, 1]
+            cat3_mask = (selected_cats == 3).unsqueeze(-1)  # [B, F, 1]
+            cat4_mask = (selected_cats == 4).unsqueeze(-1)  # [B, F, 1]
+            
+            # Combine actions using masks
+            selected_actions = (
+                cat0_actions * cat0_mask +
+                cat1_actions * cat1_mask +
+                cat2_actions * cat2_mask +
+                cat3_actions * cat3_mask +
+                cat4_actions * cat4_mask
+            )
+            other = selected_actions  # [B,F,2]
+            
+        elif self.action_cfg_opposite_method == 'invert':
+            # "Other" is opposite action (or forward when zero)
+            other = actions.clone()
+            other[..., 1] = -other[..., 1]  # flip yaw/turn
+        else:
+            raise ValueError(f"Invalid action_cfg_opposite_method: {self.action_cfg_opposite_method} has to be 'rand' or 'invert'")
+
+        # Core logic (always-on guidance):
+        #   success: attract given, repel other
+        #   failure: attract other, repel given
+        success_mask = success.unsqueeze(-1)  # [B,F,1]
+        attract_seg = actions  # [B,F,2]
+        repel_seg   = other  # [B,F,2]
+
+        attract = attract_seg.repeat_interleave(3, dim=1)  # [B,3F,2]
+        repel   = repel_seg.repeat_interleave(3, dim=1)    # [B,3F,2]
+
+        # # ----------------------------
+        # # Per-segment (B,F) guidance scale = base * mismatch * confidence(u)
+        # #     Right now, guidance goes to 0 if mismatch is also 0, and it goes to
+        # #     2 if mismatch is high. This is the wrong direction. We want high 
+        # #     guidance for low mismatch and low guidance for high mismatch - the
+        # #     highest mismatch should get 0 as it's guidance, and the a mismatch
+        # #     mismatch of 0 should get guidance value 1. I want you to put this through
+        # #     a sigmoid so that it is between 0 and 1. 
+        # # ----------------------------
+
+        # # 1) Continuous mismatch between predicted mean and target action
+        # #    (use same side multiplier on angular that you use elsewhere)
+        # diff = (estimated_action.to(torch.float32) - actions.to(torch.float32))          # [B,F,2]
+        # diff[..., 1] = diff[..., 1] * float(self.action_cfg_side_multiplier)
+        # err = torch.linalg.norm(diff, dim=-1)                                           # [B,F]
+
+        # # Smoothly "stop pushing when already correct":
+        # # gate in [0,1), ~0 when err~0, ~1 when err >> tau
+        # tau = float(getattr(self.args, "action_cfg_err_tau", 0.25))
+        # w_mismatch = err / (err + tau)                                                  # [B,F]
+
+        # # 2) Confidence from your combined uncertainty u (relative, not calibrated)
+        # if estimated_action_log_std is not None:
+        #     log_std = estimated_action_log_std.to(device=device, dtype=torch.float32)  # [B,F,2] (or broadcastable)
+        #     std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
+
+        #     std_lin = std[..., 0]
+        #     std_ang = std[..., 1] * float(self.action_cfg_side_multiplier)
+
+        #     # Your fitted combo (defaults; keep as args if you want to tune)
+        #     w_lin = float(getattr(self.args, "action_cfg_u_w_lin", 0.067))
+        #     w_ang = float(getattr(self.args, "action_cfg_u_w_ang", 0.190))
+        #     u = w_lin * std_lin + w_ang * std_ang                                      # [B,F]
+
+        #     # Your recommended smoothing (defaults)
+        #     u_thr  = float(getattr(self.args, "action_cfg_u_thr", 0.24))
+        #     u_temp = float(getattr(self.args, "action_cfg_u_temp", 0.04))
+
+        #     # Weight near-1 for most frames, drops for noisiest ones
+        #     w_conf = torch.sigmoid((u_thr - u) / (u_temp + 1e-8))                       # [B,F]
+        # else:
+        #     w_conf = torch.ones_like(w_mismatch, dtype=torch.float32)
+
+        # # 3) Final per-seg scale
+        # base = float(self.fake_guidance_scale)
+        # guidance_seg = (base * w_mismatch * w_conf).to(dtype=dtype)                     # [B,F]
+
+        guidance_seg = torch.full_like(success, float(self.fake_guidance_scale), dtype=dtype, device=device)
+        # expand to frames: you already repeat_interleave(3) for actions->frames
+        guidance = guidance_seg.repeat_interleave(3, dim=1)                             # [B,3F]
+        guidance = guidance[:, :, None, None, None]      
+        
+        # IMPORTANT: _compute_kl_grad expects:
+        #   cond_ori = original/intended (attract), cond_alt = alternative (repel)
+        cond_alt = self._with_action_conditioning(conditional_dict, repel, num_frame, device, dtype)     # repel
+        cond_ori = self._with_action_conditioning(conditional_dict, attract, num_frame, device, dtype)   # attract
+        return cond_alt, cond_ori, guidance
+    
     def compute_distribution_matching_loss(
         self,
         image_or_video: torch.Tensor,
@@ -506,24 +586,15 @@ class DMD2B2BLAM(SelfForcingModel):
 
         batch_size, num_frame = image_or_video.shape[:2]
 
-        if self.action_cfg_type == "framewise":
-            cond_pos, cond_neg, per_sample_fake_scale = self._build_action_cfg_framewise(
-                conditional_dict, 
-                actions, 
-                estimated_action, 
-                num_frame,
-                image_or_video.device, 
-                image_or_video.dtype,
-            )
-        elif self.action_cfg_type == "samplewise":
-            cond_pos, cond_neg, per_sample_fake_scale = self._build_action_cfg_samplewise(
-                conditional_dict, 
-                actions, 
-                estimated_action, 
-                num_frame,
-                image_or_video.device, 
-                image_or_video.dtype,
-            )
+        cond_alt, cond_ori, per_sample_fake_scale = self._build_action_cfg_framewise(
+            conditional_dict, 
+            actions, 
+            estimated_action, 
+            estimated_action_log_std,
+            num_frame,
+            image_or_video.device, 
+            image_or_video.dtype,
+        )
 
         with torch.no_grad():
             # Step 1: Randomly sample timestep based on the given schedule and corresponding noise
@@ -557,8 +628,8 @@ class DMD2B2BLAM(SelfForcingModel):
                 noisy_image_or_video=noisy_latent,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
-                conditional_dict_pos=cond_pos,
-                conditional_dict_neg=cond_neg,
+                conditional_dict_alt=cond_alt,
+                conditional_dict_ori=cond_ori,
                 unconditional_dict=unconditional_dict,
                 fake_guidance_scale=per_sample_fake_scale,
             )
@@ -639,7 +710,7 @@ class DMD2B2BLAM(SelfForcingModel):
                     pred_image.shape[1],
                     pred_image.device,
                     pred_image.dtype,
-                    # detach_modulation=True, #we do not detach modulation as this is equivalent to the same prompt that generated the latents
+                    detach_modulation=True, #we detach modulation as this is not the same prompt that generated the latents
                 )
                 logits_fake = self._classifier_logits(pred_image, cls_conditional)
             gan_loss = F.softplus(-logits_fake).mean() * self.gan_loss_weight
@@ -798,7 +869,53 @@ class DMD2B2BLAM(SelfForcingModel):
                 "critic_cls_loss": cls_loss.detach(),
             }
 
-        total_loss = denoising_loss + cls_loss
+        # ------------------------------------------------------------
+        # Action-separation regularizer (flip-turn-only)
+        # Trains fake_score to be action-sensitive so generator can't "win"
+        # by making cond ≈ uncond under action CFG.
+        # ------------------------------------------------------------
+        action_sep_loss = torch.tensor(0.0, device=self.device)
+        sep_w = float(getattr(self.args, "fake_action_sep_weight", 0.0))
+        if sep_w > 0.0 and (actions is not None):
+            # Flip turn/yaw only: actions[..., 1] assumed to be angular component
+            other_actions = actions.detach().clone()
+            if other_actions.shape[-1] >= 2:
+                other_actions[..., 1] = -other_actions[..., 1]
+            else:
+                # If your action vector isn't [lin, ang], adjust indexing here.
+                raise ValueError(f"Expected actions last-dim >= 2, got {other_actions.shape}")
+
+            critic_conditional_other = self._with_action_conditioning(
+                conditional_dict,
+                other_actions,
+                num_frame,
+                generated_image.device,
+                generated_image.dtype,
+                detach_modulation=True,
+            )
+
+            # Second forward under "other" action condition (NO torch.no_grad!)
+            _, pred_fake_other = self.fake_score(
+                noisy_image_or_video=noisy_generated_image,
+                conditional_dict=critic_conditional_other,
+                timestep=critic_timestep
+            )
+
+            # Separation metric on x0 predictions (compute in fp32 for stability)
+            sep = (pred_fake_image.float() - pred_fake_other.float()).abs().mean()
+
+            # Margin: only penalize if sep is too small (squared hinge is smoother)
+            m = float(getattr(self.args, "fake_action_sep_margin", 0.02))
+            action_sep_loss = sep_w * F.relu(m - sep).pow(2)
+
+            gan_log_dict.update({
+                "critic_action_sep": sep.detach(),
+                "critic_action_sep_loss": action_sep_loss.detach(),
+                "critic_action_sep_margin": torch.tensor(m, device=self.device),
+                "critic_action_sep_weight": torch.tensor(sep_w, device=self.device),
+            })
+
+        total_loss = denoising_loss + cls_loss + action_sep_loss
 
         loss_time = time.time() - _t_loss_start
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:

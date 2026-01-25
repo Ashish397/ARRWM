@@ -82,11 +82,13 @@ class BaseModel(nn.Module):
             self._set_action_projection(None)
             return
         action_dim = int(getattr(args, "raw_action_dim", getattr(args, "action_dim", 2)))
+        activation = getattr(args, "action_modulation_activation", None)
         self._action_dim = action_dim
         model_dim = getattr(self.generator.model, "dim", 2048)
         dtype = torch.bfloat16 if args.mixed_precision else torch.float32
         module = ActionModulationProjection(
             action_dim=action_dim,
+            activation=activation,
             hidden_dim=model_dim,
             num_frames=1,
             zero_init=True,

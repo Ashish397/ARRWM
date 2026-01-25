@@ -38,16 +38,17 @@ parser.add_argument("--find_method", type=str, default="latest", choices=["highe
 parser.add_argument("--step", type=int, default=None,
                     help="Specific checkpoint step to load (e.g., 4000, 4333). If provided, overrides find_method")
 parser.add_argument("--zero_motion", action="store_true", help="Use zero motion")
+parser.add_argument("--offset_weight", type=float, default=0.0, help="Offset weight for data augmentation")
 args = parser.parse_args()
 
 # Testing
 batch_size = 512
-num_workers = 4
+num_workers = 0
 noise_level = args.noise_level
 checkpoint_name = args.name
 checkpoint_step = args.step
 zero_motion = args.zero_motion
-
+offset_weight = args.offset_weight
 # Model config
 test_head_mode = args.head_mode
 find_method = args.find_method
@@ -349,7 +350,7 @@ class Motion2ActionModel(nn.Module):
 #################################
 
 class LatentsMotionActionsIterable(IterableDataset):
-    def __init__(self, actions_base, motion_base, data_base, batch_size, noise_level, output_rides_list):
+    def __init__(self, actions_base, motion_base, data_base, batch_size, noise_level, output_rides_list, offset_weight=0.0):
         super().__init__()
         self.actions_base = actions_base
         self.motion_base = motion_base
@@ -358,6 +359,7 @@ class LatentsMotionActionsIterable(IterableDataset):
         self.noise_level = noise_level
         self.output_rides_list = output_rides_list
         self.zero_motion = zero_motion
+        self.offset_weight = offset_weight
     def __iter__(self):
         batch_latents = None
         batch_motion = None
@@ -390,7 +392,9 @@ class LatentsMotionActionsIterable(IterableDataset):
             encoded_dir = self.data_base / output_rides_name
             if not motion_dir.exists() or not encoded_dir.exists():
                 continue
-            for ride_actions_dir in sorted(actions_dir.glob("ride_*")):
+            ride_dirs = sorted(actions_dir.glob("ride_*"))
+            print(f"[Dataset] Processing {len(ride_dirs)} rides in {output_rides_name}")
+            for ride_idx, ride_actions_dir in enumerate(ride_dirs):
                 if not ride_actions_dir.is_dir():
                     continue
                 ride_name = ride_actions_dir.name
@@ -405,15 +409,29 @@ class LatentsMotionActionsIterable(IterableDataset):
                 if not action_files:
                     continue
                 # Load per-ride sources
+                if ride_idx == 0:
+                    print(f"[Dataset] Loading first ride: {ride_name} (this may take a moment...)")
                 actions_arr = pd.read_csv(action_files[0]).to_numpy()[...,1:]
+                if ride_idx == 0:
+                    print(f"[Dataset] Loaded actions CSV: {actions_arr.shape}")
                 motion_arr = np.load(motion_file, mmap_mode="r")  # [N,100,3]
+                if ride_idx == 0:
+                    print(f"[Dataset] Loaded motion array: {motion_arr.shape}")
+                if ride_idx == 0:
+                    print(f"[Dataset] Loading latent file: {latent_files[0]} (this may be slow...)")
                 latents = torch.load(latent_files[0], map_location="cpu")[0]
+                if ride_idx == 0:
+                    print(f"[Dataset] Loaded latents: {latents.shape}")
                 min_length = min(len(actions_arr), len(motion_arr))
-                if len(latents) < int(min_length*3):
+                if len(latents) < (int(min_length*3)+2):
                     continue
                 actions_arr = actions_arr[:min_length]
                 motion_arr = motion_arr[:min_length]
-                latents = latents[:int(min_length*3)]
+                if self.offset_weight > 0.0:
+                    latents = latents[1:int(min_length*3)+2]
+                    latents = latents[1:] + (latents[1:] - latents[:-1]) * self.offset_weight
+                else:
+                    latents = latents[1:int(min_length*3)+1]
                 # Reshape to [B, T, C, H, W] then permute to [B, C, T, H, W] for Conv3d
                 latents = latents.view(latents.shape[0] // 3, 3, latents.shape[1], latents.shape[2], latents.shape[3])
                 latents = latents.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W] -> [B, C, T, H, W]
@@ -555,6 +573,7 @@ def test():
         batch_size=batch_size,
         noise_level=0.02,  # No noise for testing
         output_rides_list=test_output_rides_list,
+        offset_weight=offset_weight,
     )
     
     dataloader = DataLoader(
@@ -566,8 +585,11 @@ def test():
     
     # Collect all original (ground truth from input_actions) and predicted actions
     print(f"\nRunning inference on test set...")
+    print(f"[Inference] Starting DataLoader iteration (this may take a moment to load first batch)...")
     original_actions = []
     predicted_actions = []
+    log_std_values = []
+    std_values = []
     samples_processed = 0
     batch_count = 0
     
@@ -584,13 +606,16 @@ def test():
                 model_output = model(latents, motion)
                 if isinstance(model_output, tuple) and len(model_output) == 3:
                     # return_dist=True: (dist, mean_action, log_std)
-                    _, mean_action, _ = model_output
+                    _, mean_action, log_std = model_output
                     pred_bounded = mean_action
                 else:
                     # return_dist=False: (mean_action, log_std)
-                    mean_action, _ = model_output
+                    mean_action, log_std = model_output
                     pred_bounded = mean_action
                 pred_actions = pred_bounded.cpu().numpy()
+                log_std_np = log_std.cpu().numpy()
+                # Calculate std from log_std: std = exp(log_std) + dist_eps
+                std_np = np.exp(log_std_np) + model.dist_eps
             else:
                 # Regression mode: Model outputs unbounded values u ∈ R^2
                 pred_unbounded = model(latents, motion)  # [B, 2] - unbounded values
@@ -598,6 +623,9 @@ def test():
                 pred_bounded = torch.tanh(pred_unbounded)  # (-1,1)
                 pred_bounded = model._scale_from_tanh(pred_bounded)  # [low,high]
                 pred_actions = pred_bounded.cpu().numpy()
+                # In regression mode, log_std and std are not available
+                log_std_np = np.full_like(pred_actions, np.nan)
+                std_np = np.full_like(pred_actions, np.nan)
             
             # Convert to numpy
             actions_np = actions.cpu().numpy()
@@ -607,6 +635,8 @@ def test():
             for i in range(batch_size_actual):
                 original_actions.append((actions_np[i, 0], actions_np[i, 1]))
                 predicted_actions.append((pred_actions[i, 0], pred_actions[i, 1]))
+                log_std_values.append((log_std_np[i, 0], log_std_np[i, 1]))
+                std_values.append((std_np[i, 0], std_np[i, 1]))
                 samples_processed += 1
             
             batch_count += 1
@@ -621,12 +651,16 @@ def test():
         csv_filename = f"predictions_{checkpoint_name}_noise{test_noise_level}.csv"
     csv_path = predictions_dir / csv_filename
     
-    # Create DataFrame with original and predicted actions
+    # Create DataFrame with original and predicted actions, log_std, and std
     df = pd.DataFrame({
         'original_linear': [a[0] for a in original_actions],
         'original_angular': [a[1] for a in original_actions],
         'predicted_linear': [a[0] for a in predicted_actions],
         'predicted_angular': [a[1] for a in predicted_actions],
+        'log_std_linear': [a[0] for a in log_std_values],
+        'log_std_angular': [a[1] for a in log_std_values],
+        'std_linear': [a[0] for a in std_values],
+        'std_angular': [a[1] for a in std_values],
     })
     
     df.to_csv(csv_path, index=False)

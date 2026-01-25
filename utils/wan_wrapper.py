@@ -22,6 +22,23 @@ _default_wan_model_path = _default_config.get("wan_model_path", "/home/ashish/Wa
 if not _default_wan_model_path.endswith("/"):
     _default_wan_model_path = _default_wan_model_path + "/"
 
+class ResidualMLPBlock(nn.Module):
+    """Residual block for classification head with dropout."""
+    def __init__(self, dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.linear = nn.Linear(dim, dim)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = self.linear(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return x + residual  # Residual connection
+
 class WanTextEncoder(torch.nn.Module):
     def __init__(
         self,
@@ -186,24 +203,69 @@ class WanDiffusionWrapper(torch.nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
 
-    def adding_cls_branch(self, atten_dim=1536, num_class=1, time_embed_dim=0) -> None:
-        # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
-        self._cls_pred_branch = nn.Sequential(
-            # Input: [B, 384, 21, 60, 104]
-            nn.LayerNorm(atten_dim * 3 + time_embed_dim),
-            nn.Linear(atten_dim * 3 + time_embed_dim, 1536),
-            nn.SiLU(),
-            nn.Linear(atten_dim, num_class)
-        )
+    def adding_cls_branch(
+        self, 
+        atten_dim=1536, 
+        num_class=1, 
+        hidden_dim=3072,
+        num_layers=4,
+        dropout=0.2,
+        gan_blocks_per_token=2,
+    ) -> None:
+        """
+        Add classification branch with deeper layers, dropout, and residual connections.
+        
+        Args:
+            atten_dim: Attention dimension (default 1536)
+            num_class: Number of output classes (default 1 for binary real/fake)
+            hidden_dim: Hidden dimension for intermediate layers (default 3072)
+            num_layers: Number of residual layers in classification head (default 4)
+            dropout: Dropout rate (default 0.2)
+            gan_blocks_per_token: Number of GanAttentionBlocks to stack per register token (default 2).
+                                 Using multiple blocks allows progressive refinement of features
+                                 from each transformer layer, improving feature extraction.
+        """
+        # Multi-scale feature extraction: default to extracting from more layers
+        layer_indices = [7, 13, 21, 29]
+        num_registers = len(layer_indices)
+                
+        # Input dimension: num_registers * atten_dim
+        input_dim = num_registers * atten_dim
+        
+        # Build deeper classification head with residual connections
+        layers = []
+        
+        # Initial projection and normalization
+        layers.append(nn.LayerNorm(input_dim))
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        
+        # Residual blocks
+        for _ in range(num_layers - 1):  # -1 because we have final layer
+            layers.append(ResidualMLPBlock(hidden_dim, dropout=dropout))
+        
+        # Final output layer (no residual connection)
+        layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Linear(hidden_dim, num_class))
+        
+        self._cls_pred_branch = nn.Sequential(*layers)
         self._cls_pred_branch.requires_grad_(True)
-        num_registers = 3
+        
+        # Register tokens for each layer we extract from
         self._register_tokens = RegisterTokens(num_registers=num_registers, dim=atten_dim)
         self._register_tokens.requires_grad_(True)
 
+        # Stack multiple GAN cross-attention blocks per token for richer feature extraction
+        # Structure: ModuleList[ModuleList[GanAttentionBlock]] - one ModuleList per token
         gan_ca_blocks = []
         for _ in range(num_registers):
-            block = GanAttentionBlock()
-            gan_ca_blocks.append(block)
+            token_blocks = []
+            for _ in range(gan_blocks_per_token):
+                block = GanAttentionBlock()
+                token_blocks.append(block)
+            gan_ca_blocks.append(nn.ModuleList(token_blocks))
         self._gan_ca_blocks = nn.ModuleList(gan_ca_blocks)
         self._gan_ca_blocks.requires_grad_(True)
         # self.has_cls_branch = True
@@ -304,7 +366,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         prompt_embeds = conditional_dict["prompt_embeds"]
         if getattr(self, "_action_patch_applied", False):
             action_modulation = conditional_dict.get("_action_modulation", None)
-            if action_modulation is None and not (classify_mode or regress_mode):
+            if action_modulation is None:
                 raise ValueError(
                     "action_modulation is required for generation forward pass. "
                     "Got None in conditional_dict."

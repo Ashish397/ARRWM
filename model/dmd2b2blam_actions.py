@@ -100,8 +100,12 @@ class DMD2B2BLAM_actions(SelfForcingModel):
         else:
             self._action_axis_weights = None
 
+        # Enhanced GAN classification branch with deeper layers, dropout, and multi-scale features
         self.fake_score.adding_cls_branch(
-            time_embed_dim=0,
+            hidden_dim=getattr(args, "gan_hidden_dim", 3072),
+            num_layers=getattr(args, "gan_num_layers", 4),
+            dropout=getattr(args, "gan_dropout", 0.2),
+            gan_blocks_per_token=getattr(args, "gan_blocks_per_token", 4),  # Stack multiple blocks per token
         )
     
     def _estimate_action_from_motion(self, pred_frames: torch.Tensor, estimated_motion: torch.Tensor) -> torch.Tensor:
@@ -614,7 +618,7 @@ class DMD2B2BLAM_actions(SelfForcingModel):
                 pred_image.shape[1],
                 pred_image.device,
                 pred_image.dtype,
-                # detach_modulation=True, #we do not detach modulation as this is equivalent to the same prompt that generated the latents
+                detach_modulation=True, #we detach modulation as this is not the same prompt that generated the latents
             )
             # Use optimized helper that only computes logits (no denoising prediction)
             logits_fake = self._classifier_logits(pred_image, cls_conditional)
@@ -767,8 +771,8 @@ class DMD2B2BLAM_actions(SelfForcingModel):
                 conditional_dict,
                 actions,
                 real_latents.shape[1],
-                real_latents.generated_image.device,
-                real_latents.generated_image.dtype,
+                generated_image.device,
+                generated_image.dtype,
                 detach_modulation=True,
             )
             # Only extract logits, not denoising predictions (uses clean latents, no noise)

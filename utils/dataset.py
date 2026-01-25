@@ -155,6 +155,7 @@ class VideoLatentCaptionDataset(Dataset):
         include_dir_substrings: Optional[list[str]] = None,
         include_actions: bool = True,
         blacklist_path: Optional[str] = None,
+        undersample_actions: bool = True,
     ):
         self.latent_root = Path(latent_root)
         self.caption_root = Path(caption_root)
@@ -162,6 +163,7 @@ class VideoLatentCaptionDataset(Dataset):
         self.text_pre_encoded = text_pre_encoded
         self.encoded_suffix = encoded_suffix
         self.include_actions = include_actions
+        self.undersample_actions = undersample_actions
 
         if not self.latent_root.exists():
             raise FileNotFoundError(f"Latent root does not exist: {latent_root}")
@@ -372,6 +374,7 @@ class VideoLatentCaptionDataset(Dataset):
             raise ValueError(f"Invalid latent format at {sample.latent_path}")
 
         #reshape latents such that
+        latents = latents[1:]
         latents = latents[:(latents.shape[0]//3)*3].unsqueeze(0)
         latents = latents.reshape(latents.shape[1]//3, 3, 16, 60, 104)
 
@@ -399,6 +402,25 @@ class VideoLatentCaptionDataset(Dataset):
             # Apply mask
             latents = latents[valid_mask]
             action_values = action_values[valid_mask]
+
+            # Undersample popular action categories (linear dominant and noop)
+            if self.undersample_actions and action_values.shape[1] >= 2:
+                # Only keep 10% of linear dominant samples
+                # Check linear dominance: first action dimension dominates second and > 0.1
+                ld = (torch.abs(action_values[:, 0]) > torch.abs(action_values[:, 1])) & (action_values[:, 0] > 0.1)
+                # No-op: both action dimensions are < 0.1
+                noop = (torch.abs(action_values[:, 0]) < 0.1) & (torch.abs(action_values[:, 1]) < 0.1)
+                # Random sampling: keep 10% of linear dominant, 4% of noop, 100% of others
+                r = torch.rand(action_values.shape[0], device=action_values.device)
+                keep = (~ld & ~noop) | (ld & (r < 0.1)) | (noop & (r < 0.2))
+                
+                if keep.sum() < self.num_frames:
+                    # Retry with next sample if not enough frames remain after undersampling
+                    return self.__getitem__(idx + 1)
+                
+                # Apply undersampling mask
+                latents = latents[keep]
+                action_values = action_values[keep]
 
             # Select random window
             max_start = len(latents) - self.num_frames
