@@ -1,0 +1,4 @@
+This config is meant to be the baseline, we have cut gradient for motion, we use batch size 32, num steps 700, we don't mess with CFG here, and action lr is roughly 
+double gen lr
+
+Very importantly, a bug that reduces action modulation to only it's first output was removed. This is a huge bug fix.

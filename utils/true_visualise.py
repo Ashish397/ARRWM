@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import numpy as np
 from omegaconf import OmegaConf
 from torchvision.io import write_video
 
@@ -32,6 +33,8 @@ from model import (
     DMD2RealMSELAM,
     DMD2RealMSELAM_Actions,
     DMD2B2BLAM,
+    DMD2B2BLAM_grad,
+    DMD2B2BLAM_actions
 )
 from model.streaming_training import StreamingTrainingModel
 from latent_actions.train_motion_2_action import Motion2ActionModel
@@ -178,6 +181,24 @@ class VisualizationTrainer:
                 latent_action_model=latent_action_model,
                 motion_model=motion_model,
             )
+        elif self.config.distribution_loss == "dmd2b2blam_grad":
+            latent_action_model = self._build_latent_action_model()
+            motion_model = self._build_motion_model()
+            self.model = DMD2B2BLAM_grad(
+                self.config,
+                device=self.device,
+                latent_action_model=latent_action_model,
+                motion_model=motion_model,
+            )
+        elif self.config.distribution_loss == "dmd2b2blam_actions":
+            latent_action_model = self._build_latent_action_model()
+            motion_model = self._build_motion_model()
+            self.model = DMD2B2BLAM_actions(
+                self.config,
+                device=self.device,
+                latent_action_model=latent_action_model,
+                motion_model=motion_model,
+            )
         else:
             raise ValueError(f"Invalid distribution matching loss: {self.config.distribution_loss}")
     
@@ -186,12 +207,11 @@ class VisualizationTrainer:
         # Get checkpoint path from config
         checkpoint_path = getattr(self.config, "latent_action_checkpoint", None)
         if checkpoint_path is None:
-            return None
+            raise ValueError("latent_action_checkpoint must be set in config for dmd2b2blam model")
         
         checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
-            print(f"[Warning] Latent action checkpoint not found: {checkpoint_path}")
-            return None
+            raise FileNotFoundError(f"Latent action checkpoint not found: {checkpoint_path}")
         
         # Load checkpoint
         checkpoint = _load_checkpoint_with_storage_fallback(str(checkpoint_path), map_location="cpu")
@@ -226,23 +246,9 @@ class VisualizationTrainer:
         return motion2action_model
     
     def _build_motion_model(self):
-        """Build MotionModel (CoTracker) for dmd2b2blam."""
-        # Get checkpoint path from config
-        checkpoint_path = getattr(self.config, "motion_checkpoint", None)
-        if checkpoint_path is None:
-            return None
-        
-        checkpoint_path = Path(checkpoint_path)
-        if not checkpoint_path.exists():
-            print(f"[Warning] Motion checkpoint not found: {checkpoint_path}")
-            return None
-        
+        """Build MotionModel (CoTracker) for dmd2b2blam."""        
         # CoTrackerPredictor handles checkpoint loading internally
-        cotracker = CoTrackerPredictor(
-            checkpoint=str(checkpoint_path),
-            offline=True,
-            window_len=60,
-        ).to(device='cpu').to(device=self.device).eval()
+        cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(self.device)
         
         for param in cotracker.parameters():
             param.requires_grad_(False)
@@ -325,7 +331,7 @@ class VisualizationTrainer:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
                 val_dataset = TwoTextDataset(val_data_path, self.config.val_switch_prompt_path)
-            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "dmd2b2blam", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
+            elif self.config.distribution_loss in ("dmd2", "dmd2mse", "dmd2real", "dmd2realmse", "dmd2realmselam", "dmd2realmselam_actions", "dmd2realmselam_action", "dmd2b2blam", "dmd2b2blam_grad", "dmd2b2blam_actions", "mse_dmd", "mse_dmd_lam", "mse_dmd_lam_action"):
                 val_latent_root = getattr(self.config, "val_real_latent_root", None)
                 val_caption_root = getattr(self.config, "val_caption_root", None)
                 
@@ -464,7 +470,7 @@ class VisualizationTrainer:
                 dtype=self.dtype
             )
         with torch.no_grad():
-            video, _ = pipeline.inference(
+            video, latents = pipeline.inference(
                 noise=sampled_noise,
                 text_prompts=prompts if not self.text_pre_encoded else None,
                 prompt_embeds=prompt_embeds if self.text_pre_encoded else None,
@@ -473,13 +479,18 @@ class VisualizationTrainer:
             )
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
         pipeline.vae.model.clear_cache()
-        return current_video
+        return current_video, latents
     
     def generate_video_with_switch(self, pipeline, num_frames, prompts, switch_prompts, switch_frame_index, image=None):
         """Generate video with switch prompts - placeholder for switch models."""
         # This would be the same as generate_video but with switch logic
         # For now, just call generate_video
-        return self.generate_video(pipeline, num_frames, prompts, image=image)
+        result = self.generate_video(pipeline, num_frames, prompts, image=image)
+        # Handle both old (video only) and new (video, latents) return formats
+        if isinstance(result, tuple):
+            return result
+        else:
+            return result, None
     
     def _visualize(self):
         """Generate and save sample videos to monitor training progress - exact copy from Trainer."""
@@ -604,17 +615,40 @@ class VisualizationTrainer:
                 
                 # Generate video
                 if isinstance(self.vis_pipeline, SwitchCausalInferencePipeline):
-                    videos = self.generate_video_with_switch(self.vis_pipeline, vid_len, single_prompts, single_switch_prompts, switch_frame_index, image=image)
+                    _, all_latents = self.generate_video_with_switch(self.vis_pipeline, vid_len, single_prompts, single_switch_prompts, switch_frame_index, image=image)
                 else:
-                    videos = self.generate_video(self.vis_pipeline, vid_len, single_prompts, prompt_embeds=single_prompt_embeds, image=image, action_inputs=actions)
+                    _, all_latents = self.generate_video(self.vis_pipeline, vid_len, single_prompts, prompt_embeds=single_prompt_embeds, image=image, action_inputs=actions)
+
+                # Generate noise and add it to latents
+                noise = torch.randn_like(all_latents)
+                flattened_latents = all_latents.flatten(0, 1)  # [B*T, C, H, W]
+                flattened_noise = noise.flatten(0, 1)  # [B*T, C, H, W]
+                batch_timesteps = flattened_latents.shape[0]  # B*T
+                timesteps = torch.full((batch_timesteps,), 25, dtype=torch.long, device=all_latents.device)  # [B*T]
+                
+                noisy_latent = self.model.scheduler.add_noise(
+                    flattened_latents,
+                    flattened_noise,
+                    timesteps
+                ).detach().unflatten(0, all_latents.shape[:2])
+
+                videos = self.vis_pipeline.vae.decode_to_pixel(noisy_latent)
+                # decode_to_pixel returns tensor in [-1, 1] range, convert to [0, 1] then [0, 255]
+                videos = (videos * 0.5 + 0.5).clamp(0, 1)  # [B, F, C, H, W] in [0, 1]
+                videos = (videos * 255.0).round().to(torch.uint8)  # [B, F, C, H, W] in [0, 255]
+                videos = videos.permute(0, 1, 3, 4, 2).cpu().numpy()  # [B, F, H, W, C] for write_video
 
                 # Save video
                 for idx, video_np in enumerate(videos):
                     rank = dist.get_rank() if dist.is_initialized() else 0
                     # Include direction or dataset in filename
                     if dir_idx is not None:
-                        dir_x, dir_y = action_directions[dir_idx]
-                        direction_suffix = f"_dir_{dir_idx}_{dir_x:+.2f}_{dir_y:+.2f}".replace(".", "p").replace("+", "pos").replace("-", "neg")
+                        if dir_idx < len(action_directions):
+                            dir_x, dir_y = action_directions[dir_idx]
+                            direction_suffix = f"_dir_{dir_idx}_{dir_x:+.2f}_{dir_y:+.2f}".replace(".", "p").replace("+", "pos").replace("-", "neg")
+                        else:
+                            # dir_9: dataset actions
+                            direction_suffix = "_dir_9_dataset"
                     else:
                         direction_suffix = "_dataset"
                     
@@ -630,20 +664,213 @@ class VisualizationTrainer:
                     write_video(out_path, video_tensor, fps=16)
                     
                     # Save actions to a txt file
-                    if actions is not None:
-                        # Remove .mp4 extension and add _actions.txt
-                        base_name = video_name.rsplit('.mp4', 1)[0]
-                        action_path = os.path.join(step_vis_dir, f"{base_name}_actions.txt")
-                        
-                        with open(action_path, "w") as f:
+                    base_name = video_name.rsplit('.mp4', 1)[0]
+                    action_path = os.path.join(step_vis_dir, f"{base_name}_actions.txt")
+                    
+                    with open(action_path, "w") as f:
+                        # Write input actions if available
+                        if actions is not None:
                             actions_np = actions.cpu().numpy()
                             # Handle batch dimension: [1, num_frames, 2] -> [num_frames, 2]
                             if actions_np.ndim == 3:
                                 actions_np = actions_np[0]  # Remove batch dimension
-                            # Write actions (one per line: frame_idx, action_0, action_1)
+                            # Write input actions (one per line: frame_idx, action_0, action_1)
+                            f.write("# Input actions\n")
                             f.write("frame_idx,action_0,action_1\n")
                             for frame_idx, action in enumerate(actions_np):
                                 f.write(f"{frame_idx},{action[0]:.6f},{action[1]:.6f}\n")
+                        # Use pipeline outputs directly - NO encoding or decoding
+                        original_num_frames = video_np.shape[0]  # Store original frame count for truncation later
+                        
+                        # Prepare decoded video (pixels) for CoTracker
+                        # video_np is [num_frames, H, W, C] from pipeline output
+                        # Pipeline: video = (decode_to_pixel(...) * 0.5 + 0.5).clamp(0, 1)  # [0, 1] range
+                        # Then: current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0  # [0, 255] range
+                        # So video_np is already in [0, 255] range
+                        # Convert to tensor: [num_frames, H, W, C] -> [1, num_frames, C, H, W]
+                        video_tensor = torch.from_numpy(video_np).float()  # [num_frames, H, W, C] in [0, 255]
+                        video_tensor = video_tensor.permute(0, 3, 1, 2)  # [num_frames, C, H, W]
+                        video_tensor = video_tensor.unsqueeze(0)  # [1, num_frames, C, H, W]
+                        video_tensor = video_tensor.to(device=self.device)
+                        
+                        # Ensure values are in [0, 255] range (clamp to be safe)
+                        # Match test_motion_from_scratch.py: pixels are in [0, 255] range
+                        video_tensor = video_tensor.clamp(0, 255)
+                        
+                        # Debug: print video stats to verify normalization
+                        if idx == 0:  # Only print for first video to avoid spam
+                            print(f"[Debug] Video tensor stats: min={video_tensor.min().item():.2f}, max={video_tensor.max().item():.2f}, mean={video_tensor.mean().item():.2f}, shape={video_tensor.shape}")
+                        
+                        # Prepare original latents for motion2action - use latents directly from pipeline
+                        # Motion2action expects 21 frames (7*3), NOT 84 frames
+                        video_latents_reshaped = None
+                        if all_latents is not None:
+                            # Get latents for this video (handle batch dimension)
+                            if isinstance(all_latents, (list, tuple)):
+                                video_latents = all_latents[idx] if idx < len(all_latents) else all_latents[0]
+                            else:
+                                # If all_latents is a tensor, extract the batch index
+                                if all_latents.dim() == 5:  # [B, F, C, H, W]
+                                    video_latents = all_latents[idx:idx+1] if idx < all_latents.shape[0] else all_latents[0:1]
+                                else:
+                                    video_latents = all_latents
+                            
+                            # Ensure latents are on the correct device and dtype
+                            # CRITICAL: Use float32 (not self.dtype) to match test_action_from_motion.py
+                            if isinstance(video_latents, torch.Tensor):
+                                video_latents = video_latents.to(device=self.device, dtype=torch.float32)
+                                latent_num_frames = video_latents.shape[1]
+                                
+                                # Motion2action expects 21 frames (7 segments * 3 frames per segment)
+                                # Use original frame count, don't pad to 84
+                                if latent_num_frames < 21:
+                                    # Pad with last frame to reach 21
+                                    frames_needed = 21 - latent_num_frames
+                                    last_frame = video_latents[:, -1:, ...]
+                                    padding = last_frame.repeat(1, frames_needed, 1, 1, 1)
+                                    video_latents = torch.cat([video_latents, padding], dim=1)
+                                elif latent_num_frames > 21:
+                                    # Truncate to 21 frames (motion2action expects exactly 21)
+                                    video_latents = video_latents[:, :21, ...]
+                                
+                                # Reshape to [7, 3, 16, 60, 104] then permute to [7, 16, 3, 60, 104] as expected by motion2action
+                                # This matches dmd2b2blam.py: pred_frames.reshape(7, 3, 16, 60, 104).permute(0, 2, 1, 3, 4)
+                                video_latents_reshaped = video_latents.reshape(7, 3, 16, 60, 104).permute(0, 2, 1, 3, 4)  # [7, 16, 3, 60, 104]
+                        
+                        # Run cotracker to estimate motion (using pixels)
+                        # CRITICAL: Match test_motion_from_scratch.py EXACTLY - process in chunks
+                        grid_size = 10
+                        output_chunk_size = 12  # frames per output window
+                        compute_T = 48  # frames per compute chunk - MUST MATCH test_motion_from_scratch.py
+                        N = grid_size ** 2
+                        n_out_full = compute_T // output_chunk_size
+                        assert compute_T % output_chunk_size == 0
+                        
+                        # Ensure motion_model is on device and in eval mode - EXACTLY like test_motion_from_scratch.py line 103
+                        motion_model = self.model.motion_model.to(device=self.device).eval()
+                        
+                        # Process video in chunks matching test_motion_from_scratch.py exactly
+                        all_motion_windows = []
+                        T_total = video_tensor.shape[1]
+                        num_chunks = (T_total + compute_T - 1) // compute_T
+                        
+                        print(f"Processing {T_total} frames in {num_chunks} chunks of {compute_T} frames...")
+                        
+                        # Process in chunks of compute_T frames - EXACTLY like test_motion_from_scratch.py
+                        with torch.inference_mode():
+                            dropped_first = False
+                            for chunk_idx, chunk_start in enumerate(range(0, T_total, compute_T)):
+                                if chunk_idx % 5 == 0 or chunk_idx == num_chunks - 1:
+                                    print(f"  Processing chunk {chunk_idx + 1}/{num_chunks}...")
+                                chunk_end = min(chunk_start + compute_T, T_total)
+                                frames_chunk = video_tensor[:, chunk_start:chunk_end, :, :, :]  # [1, T_chunk, 3, H, W]
+                                
+                                # Drop first frame overall - EXACTLY like test_motion_from_scratch.py line 123-130
+                                if not dropped_first:
+                                    if frames_chunk.shape[1] == 0:
+                                        continue
+                                    frames_chunk = frames_chunk[:, 1:, :, :, :]
+                                    dropped_first = True
+                                    if frames_chunk.shape[1] == 0:
+                                        continue
+                                
+                                # Keep only complete 12-frame windows - EXACTLY like test_motion_from_scratch.py line 132-138
+                                n_out = frames_chunk.shape[1] // output_chunk_size
+                                if n_out == 0:
+                                    continue
+                                
+                                used_frames = n_out * output_chunk_size
+                                frames_chunk = frames_chunk[:, :used_frames, :, :, :].clone()
+                                
+                                # Run CoTracker - EXACTLY like test_motion_from_scratch.py line 141-142
+                                with torch.amp.autocast(device_type='cuda', enabled=True):
+                                    pred_tracks, pred_visibility = motion_model(frames_chunk, grid_size=grid_size)  # [B,T,N,2], [B,T,N] or [B,T,N,1]
+                                
+                                B = pred_tracks.shape[0]
+                                T_chunk = pred_tracks.shape[1]
+                                
+                                # Group into disjoint 12-frame windows - EXACTLY like test_motion_from_scratch.py line 148-153
+                                tracks_w = pred_tracks.reshape(B, n_out, output_chunk_size, N, 2)  # [B,n_out,12,N,2]
+                                # Handle visibility shape - EXACTLY like test_motion_from_scratch.py line 150-153
+                                if pred_visibility.dim() == 3:  # [B,T,N]
+                                    vis_w = pred_visibility.reshape(B, n_out, output_chunk_size, N).unsqueeze(-1)  # [B,n_out,12,N,1]
+                                else:  # [B,T,N,1]
+                                    vis_w = pred_visibility.reshape(B, n_out, output_chunk_size, N, 1)  # [B,n_out,12,N,1]
+                                
+                                # Compute motion: mean within-window deltas (11 deltas for 12 frames) - EXACTLY like test_motion_from_scratch.py line 156-162
+                                d_w = tracks_w[:, :, 1:] - tracks_w[:, :, :-1]  # [B,n_out,11,N,2]
+                                motion_out = d_w.mean(dim=2)  # [B,n_out,N,2]
+                                
+                                # Mean visibility over 12 frames
+                                vis_out = vis_w.to(dtype=motion_out.dtype).mean(dim=2)  # [B,n_out,N,1]
+                                
+                                motion_window = torch.cat([motion_out, vis_out], dim=-1).squeeze(0)  # [n_out,N,3]
+                                all_motion_windows.append(motion_window)
+                        
+                        # Check results OUTSIDE inference_mode block - EXACTLY like test_motion_from_scratch.py line 165
+                        if not all_motion_windows:
+                            print("ERROR: No motion windows computed!")
+                            estimated_motion = None
+                        else:
+                            # Concatenate all windows: [total_windows, N, 3] - EXACTLY like test_motion_from_scratch.py line 169
+                            estimated_motion = torch.cat(all_motion_windows, dim=0)  # [total_out, N, 3]
+                            print(f"Motion computation complete. Final motion shape: {estimated_motion.shape}")
+                            
+                            # We need exactly 7 windows for motion2action
+                            if estimated_motion.shape[0] < 7:
+                                # Pad with last window
+                                last_window = estimated_motion[-1:, :, :]
+                                padding = last_window.repeat(7 - estimated_motion.shape[0], 1, 1)
+                                estimated_motion = torch.cat([estimated_motion, padding], dim=0)
+                            elif estimated_motion.shape[0] > 7:
+                                # Truncate to 7 windows
+                                estimated_motion = estimated_motion[:7, :, :]
+                            
+                            # Debug: print motion stats
+                            if idx == 0:  # Only print for first video
+                                print(f"[Debug] Estimated motion shape: {estimated_motion.shape}")
+                                print(f"[Debug] Estimated motion stats: min={estimated_motion.min().item():.4f}, max={estimated_motion.max().item():.4f}, mean={estimated_motion.mean().item():.4f}")
+                            
+                            # CRITICAL: Normalize motion by dividing by 10.0 
+                            # Matches test_motion_2_action.py line 372 and test_motion_2_action_scratch.py line 382
+                            # This is required for the motion2action model to work correctly
+                            # CRITICAL: Move motion to device and dtype (float32) before normalization, matching test_action_from_motion.py line 147
+                            estimated_motion = estimated_motion.to(device=self.device, dtype=torch.float32) / 10.0
+                            
+                            # Run motion2action model with original latents
+                            if video_latents_reshaped is not None and estimated_motion is not None:
+                                model_output = self.model.latent_action_model(video_latents_reshaped, estimated_motion)
+                                if isinstance(model_output, tuple) and len(model_output) == 3:
+                                    _, estimated_action, _ = model_output
+                                elif isinstance(model_output, tuple) and len(model_output) == 2:
+                                    estimated_action, _ = model_output
+                                else:
+                                    estimated_action = model_output
+                                
+                                # Convert to numpy and write
+                                estimated_action_np = estimated_action.cpu().numpy()
+                                # Handle batch dimension: [7, 2] or [1, num_frames, 2] -> [num_frames, 2]
+                                if estimated_action_np.ndim == 2 and estimated_action_np.shape[0] == 7:
+                                    # It's [7, 2] - need to expand to frame level (7 segments -> 21 frames, 3 frames per segment)
+                                    estimated_action_expanded = []
+                                    for seg_idx in range(7):
+                                        for _ in range(3):
+                                            estimated_action_expanded.append(estimated_action_np[seg_idx])
+                                    estimated_action_np = np.array(estimated_action_expanded)
+                                elif estimated_action_np.ndim == 3:
+                                    estimated_action_np = estimated_action_np[0]  # Remove batch dimension
+                                
+                                # Truncate to original frame count if we padded
+                                if original_num_frames < 84:
+                                    estimated_action_np = estimated_action_np[:original_num_frames]
+                                
+                                # Write estimated actions
+                                f.write("\n# Estimated actions (from CoTracker + motion2action model)\n")
+                                f.write("frame_idx,action_0,action_1\n")
+                                for frame_idx, action in enumerate(estimated_action_np):
+                                    f.write(f"{frame_idx},{action[0]:.6f},{action[1]:.6f}\n")
+                            else:
+                                f.write("\n# Estimated actions: Failed - could not obtain latents or motion\n")
 
                 # After saving videos, release related tensors
                 del videos  # type: ignore
@@ -659,18 +886,48 @@ class VisualizationTrainer:
             rank = dist.get_rank() if dist.is_initialized() else 0
             print(f"[Rank {rank}] Processing prompts: {prompt_list}")
             
-            # Generate videos with dummy actions (9 directions) for each prompt
-            # This gives 8 prompts × 9 directions = 72 videos total
+            # Generate videos with dummy actions (10 directions: 9 fixed + 1 from dataset) for each prompt
+            # This gives 8 prompts × 10 directions = 80 videos total
             if not self.dataset_actions_only:
-                print(f"[Rank {rank}] Generating videos with dummy actions (9 directions) for {len(prompt_list)} prompts...")
+                print(f"[Rank {rank}] Generating videos with dummy actions (10 directions: 9 fixed + 1 from dataset) for {len(prompt_list)} prompts...")
                 for prompt_idx in prompt_list:
                     sample = samples[prompt_idx]
+                    # First 9 directions: fixed directions with noise
                     for dir_idx, (dir_x, dir_y) in enumerate(action_directions):
                         # Generate dummy actions for this direction
                         base_action = torch.tensor([[dir_x, dir_y]], dtype=torch.float32).repeat(num_frames, 1)
                         noise = torch.randn(num_frames, 2, dtype=torch.float32) * action_noise_std
                         actions = (base_action + noise).unsqueeze(0).to(device=self.device)
                         generate_and_save_video(sample, actions, f"dummy_dir_{dir_idx}", prompt_idx, dir_idx=dir_idx)
+                    
+                    # 10th direction (dir_9): use actions from the sample file for this prompt
+                    if "actions" in sample:
+                        # Use dataset actions: shape is [num_frames*3, 2] or [1, num_frames*3, 2]
+                        dataset_actions = sample["actions"]
+                        if dataset_actions.dim() == 2:
+                            # [num_frames*3, 2] -> [1, num_frames*3, 2]
+                            dataset_actions = dataset_actions.unsqueeze(0)
+                        # Downsample from repeated-per-frame actions
+                        # Validate that actions are repeated 3x before downsampling
+                        if dataset_actions.shape[1] % 3 != 0:
+                            raise ValueError(f"Expected actions length to be a multiple of 3, got {dataset_actions.shape[1]}")
+                        trip = dataset_actions.view(dataset_actions.shape[0], -1, 3, dataset_actions.shape[-1])
+                        if not (torch.allclose(trip[:, :, 0, :], trip[:, :, 1, :], atol=1e-6) and torch.allclose(trip[:, :, 0, :], trip[:, :, 2, :], atol=1e-6)):
+                            raise ValueError("Actions are not repeated in triplets; dataset action alignment is likely broken")
+                        # Take one action per triplet: [B, T*3, 2] -> [B, T, 2]
+                        dataset_actions = trip[:, :, 0, :].to(device=self.device)
+                        # Ensure we have exactly num_frames
+                        if dataset_actions.shape[1] > num_frames:
+                            dataset_actions = dataset_actions[:, :num_frames, :]
+                        elif dataset_actions.shape[1] < num_frames:
+                            # Pad with last frame
+                            last_frame = dataset_actions[:, -1:, :]
+                            padding = last_frame.repeat(1, num_frames - dataset_actions.shape[1], 1)
+                            dataset_actions = torch.cat([dataset_actions, padding], dim=1)
+                        actions = dataset_actions
+                        generate_and_save_video(sample, actions, "dummy_dir_9_dataset", prompt_idx, dir_idx=9)
+                    else:
+                        print(f"[Warning] Sample {prompt_idx} has no actions, skipping dir_9")
             else:
                 # Generate videos with dataset actions instead
                 print(f"[Rank {rank}] Generating videos with dataset actions for {len(prompt_list)} prompts...")
@@ -684,8 +941,15 @@ class VisualizationTrainer:
                         if dataset_actions.dim() == 2:
                             # [num_frames*3, 2] -> [1, num_frames*3, 2]
                             dataset_actions = dataset_actions.unsqueeze(0)
-                        # Take every 3rd frame to get [1, num_frames, 2] (since actions are repeated 3x)
-                        dataset_actions = dataset_actions[:, ::3, :].to(device=self.device)
+                        # Downsample from repeated-per-frame actions
+                        # Validate that actions are repeated 3x before downsampling
+                        if dataset_actions.shape[1] % 3 != 0:
+                            raise ValueError(f"Expected actions length to be a multiple of 3, got {dataset_actions.shape[1]}")
+                        trip = dataset_actions.view(dataset_actions.shape[0], -1, 3, dataset_actions.shape[-1])
+                        if not (torch.allclose(trip[:, :, 0, :], trip[:, :, 1, :], atol=1e-6) and torch.allclose(trip[:, :, 0, :], trip[:, :, 2, :], atol=1e-6)):
+                            raise ValueError("Actions are not repeated in triplets; dataset action alignment is likely broken")
+                        # Take one action per triplet: [B, T*3, 2] -> [B, T, 2]
+                        dataset_actions = trip[:, :, 0, :].to(device=self.device)
                         # Ensure we have exactly num_frames
                         if dataset_actions.shape[1] > num_frames:
                             dataset_actions = dataset_actions[:, :num_frames, :]
@@ -730,6 +994,19 @@ def main() -> None:
         base_cfg = OmegaConf.create({})
     user_cfg = OmegaConf.load(args.config_path)
     config = OmegaConf.merge(base_cfg, user_cfg)
+
+    # Force this visualization script to use a single diffusion pass instead of the
+    # usual multi-step denoising schedule. We keep one timestep from the configured
+    # list (by default the last / smallest timestep).
+    # if hasattr(config, "denoising_step_list") and config.denoising_step_list:
+    #     try:
+    #         # Convert to a plain Python list in case it's an OmegaConf ListConfig
+    #         _steps = list(config.denoising_step_list)
+    #         # Keep just one step (use the last by default)
+    #         config.denoising_step_list = _steps[:-1]
+    #         print(f"[true_visualise] Forcing single diffusion pass with denoising_step_list={config.denoising_step_list}")
+    #     except Exception as e:
+    #         print(f"[true_visualise] Warning: failed to clamp denoising_step_list to single step: {e}")
     
     # Set device - when using SLURM with --gpus-per-task=1, CUDA_VISIBLE_DEVICES
     # is set to expose only one GPU per task, which is always cuda:0 from the task's perspective

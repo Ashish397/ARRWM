@@ -429,7 +429,7 @@ class VideoLatentCaptionDataset(Dataset):
 
             latents_slice = latents[start:end].contiguous().float().reshape(self.num_frames*3, 16, 60, 104)
             #repeat the elements of action values 3 times such that [1,2,3] -> [1,1,1,2,2,2,3,3,3]
-            action_values_slice = action_values[start:end].repeat(3, 1)
+            action_values_slice = action_values[start:end].repeat_interleave(3, dim=0)
 
             sample_dict = {
                 "idx": idx,

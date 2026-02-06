@@ -7,16 +7,13 @@ action_cfg_opposite_method: rand   # (your code's "invert" now flips turn only)
 gan_type: 'relative'
 action_cfg_enabled: true
 action_cfg_type: framewise
-action_cfg_side_multiplier: 2.0
+action_cfg_side_multiplier: 1.0
 # --- Per-frame mismatch × confidence scaling ---
-action_cfg_err_tau: 0.25            # smooth "stop pushing when correct"
-action_cfg_u_w_lin: 0.067           # from your fit
-action_cfg_u_w_ang: 0.190           # from your fit
 action_cfg_u_thr: 0.24              # ~p75
-action_cfg_u_temp: 0.04             # ~p75 - p50
+action_cfg_u_temp: 0.20             # ~p75 - p50
 # --- Critic action-sensitivity regularizer ---
-fake_action_sep_weight: 0.1        # start small (try 0.02–0.05 if needed)
-fake_action_sep_margin: 0.1        # try 0.01–0.05
+fake_action_sep_weight: 0.04        # start small (try 0.02–0.05 if needed)
+fake_action_sep_margin: 0.08        # try 0.01–0.05
 dmd_loss_weight: 1.0
 dmd_loss_weight_decay: 0.0
 gan_loss_weight: 0.00
@@ -55,7 +52,7 @@ ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 5.0
 real_guidance_scale: 3.0
-fake_guidance_scale: 2.0
+fake_guidance_scale: 3.0
 denoising_loss_type: flow
 mixed_precision: true
 seed: 0

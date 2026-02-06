@@ -1038,14 +1038,7 @@ class Trainer:
     def _build_motion_model(self, config):
         """Build MotionModel for dmd2b2blam."""
         # Get checkpoint path from config
-        checkpoint_path = getattr(config, "motion_checkpoint", None)
-        
-        # CoTrackerPredictor handles checkpoint loading internally
-        cotracker = CoTrackerPredictor(
-                        checkpoint=checkpoint_path,
-                        offline=True,
-                        window_len=60,
-                    ).to(device='cpu').to(device=self.device).eval()
+        cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(self.device)
 
         for param in cotracker.parameters():
             param.requires_grad_(False)
@@ -1939,9 +1932,10 @@ class Trainer:
                         generator_core_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
                         generator_grad_norm = generator_core_norm.detach()
+                        assert generator_grad_norm.item() > 0.01, "Generator grad norm streaming is 0"
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
                         generator_log_dict["generator_core_grad_norm"] = generator_grad_norm
-                        action_proj = getattr(self.model.generator.model, "action_projection", None)
+                        action_proj = getattr(self.model, "action_projection", None)
                         if action_proj is not None:
                             generator_log_dict["action_proj_grad_norm"] = grad_norm(action_proj.parameters())
                         else:
@@ -2011,6 +2005,7 @@ class Trainer:
                         generator_core_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
                         generator_grad_norm = generator_core_norm.detach()
+                        assert generator_grad_norm.item() > 0.01, "Generator grad norm is 0"
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
                         generator_log_dict["generator_core_grad_norm"] = generator_grad_norm
                         action_proj = getattr(self.model.generator.model, "action_projection", None)
@@ -2075,38 +2070,18 @@ class Trainer:
                         wandb_loss_dict[rename or key] = value
 
                     if TRAIN_GENERATOR and generator_log_dict:
-                        for metric in (
-                            "generator_loss",
-                            "generator_grad_norm",
-                            "dmdtrain_gradient_norm",
-                            "generator_mse_loss",
-                            "generator_mse_raw",
-                            "generator_dwt_loss",
-                            "generator_dwt_raw",
-                            "generator_gan_loss",
-                            "generator_gan_logits",
-                            "generator_gan_real_prob",
-                            "generator_gan_logits_std",
-                            "generator_adaptive_gan_weight",
-                        ):
-                            _collect_metric(generator_log_dict, metric)
-                        _collect_metric(generator_log_dict, "latent_action_loss", rename="action_loss")
-                        _collect_metric(generator_log_dict, "latent_action_loss_raw")
+                        # Collect all metrics from generator_log_dict by default
+                        for key in generator_log_dict.keys():
+                            # Special handling for latent_action_loss -> action_loss rename
+                            if key == "latent_action_loss":
+                                _collect_metric(generator_log_dict, key, rename="action_loss")
+                            else:
+                                _collect_metric(generator_log_dict, key)
 
-                    for metric in (
-                        "critic_loss",
-                        "critic_grad_norm",
-                        "critic_denoising_loss",
-                        "critic_gan_loss",
-                        "critic_cls_loss",
-                        "critic_real_logits",
-                        "critic_fake_logits",
-                        "critic_real_prob",
-                        "critic_fake_prob",
-                        "critic_real_accuracy",
-                        "critic_fake_accuracy",
-                    ):
-                        _collect_metric(critic_log_dict, metric)
+                    # Collect all metrics from critic_log_dict by default
+                    if critic_log_dict:
+                        for key in critic_log_dict.keys():
+                            _collect_metric(critic_log_dict, key)
 
                     if hasattr(self.model, "generator_mse_loss_weight"):
                         wandb_loss_dict["generator_mse_loss_weight_current"] = float(self.model.generator_mse_loss_weight)
