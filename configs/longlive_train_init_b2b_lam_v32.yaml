@@ -1,13 +1,19 @@
-config_name: 'init-dmd2-lam-b2b-v17'
+config_name: 'init-dmd2-lam-b2b-v32'
 text_pre_encoded: true
 negative_prompt_encoded_path: /projects/u5dk/as1748/frodobots_captions/negative/longlive_train_init_real_negative_1.json
 action_patch_enabled: true
-action_modulation_activation: "silu"
-action_cfg_opposite_method: rand
+action_modulation_activation: "tanh"
+action_cfg_opposite_method: rand   # (your code's "invert" now flips turn only)
 gan_type: 'relative'
 action_cfg_enabled: true
 action_cfg_type: framewise
 action_cfg_side_multiplier: 2.0
+# --- Per-frame mismatch × confidence scaling ---
+action_cfg_u_thr: 0.24              # ~p75
+action_cfg_u_temp: 0.04             # ~p75 - p50
+# --- Critic action-sensitivity regularizer ---
+fake_action_sep_weight: 0.1        # start small (try 0.02–0.05 if needed)
+fake_action_sep_margin: 0.1        # try 0.01–0.05
 dmd_loss_weight: 1.0
 dmd_loss_weight_decay: 0.0
 gan_loss_weight: 0.00
@@ -56,7 +62,7 @@ wandb_project: frodobots_wm
 use_one_logger: False
 sharding_strategy: hybrid_full
 lr: 2.0e-06
-ap_lr: 1.0e-06
+ap_lr: 2.0e-06
 lr_critic: 4.0e-07
 beta1: 0.0
 beta2: 0.999
@@ -71,7 +77,7 @@ batch_size: 1
 gradient_accumulation_steps: 1
 ema_weight: 0.99
 ema_start_step: 200
-total_batch_size: 32
+total_batch_size: 4
 log_iters: 100
 max_checkpoints: 5
 max_iters: 700

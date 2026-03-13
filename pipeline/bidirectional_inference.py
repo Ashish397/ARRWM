@@ -100,6 +100,7 @@ class BidirectionalInferencePipeline(nn.Module):
         conditional, unconditional = self._prepare_conditionals(
             text_prompts=text_prompts,
             prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=getattr(self, '_negative_prompt_embeds', None),
             dtype=dtype,
         )
 
@@ -212,6 +213,7 @@ class BidirectionalInferencePipeline(nn.Module):
         *,
         text_prompts: Optional[List[str]],
         prompt_embeds: Optional[torch.Tensor],
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
         dtype: torch.dtype,
     ) -> Tuple[dict, Optional[dict]]:
         if self.text_pre_encoded:
@@ -224,7 +226,14 @@ class BidirectionalInferencePipeline(nn.Module):
                 embeds = embeds.unsqueeze(0)
             conditional = {"prompt_embeds": embeds.to(device=self.device, dtype=dtype)}
             if self.guidance_scale > 0:
-                # Guidance is unsupported without raw prompts.
+                # Support guidance with pre-encoded negative prompts
+                if negative_prompt_embeds is not None:
+                    neg_embeds = negative_prompt_embeds
+                    if neg_embeds.dim() == 2:
+                        neg_embeds = neg_embeds.unsqueeze(0)
+                    unconditional = {"prompt_embeds": neg_embeds.to(device=self.device, dtype=dtype)}
+                    return conditional, unconditional
+                # Guidance is unsupported without raw prompts or negative embeddings.
                 return conditional, None
             return conditional, None
 

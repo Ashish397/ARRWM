@@ -6,9 +6,12 @@ longlive_models
 wan_models
 
 videos
+saved_videos
+prompts
 checkpoints/
 logs/
 wandb/
+pre_encode.log
 *.err
 *.out
 *.sbatch
