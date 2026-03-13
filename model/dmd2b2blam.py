@@ -78,6 +78,10 @@ class DMD2B2BLAM(SelfForcingModel):
         if latent_action_model is not None:
             try:
                 latent_action_model.to(device=device)
+                latent_action_model.eval()  # Set to eval mode for batch norm, dropout, etc.
+                # Freeze parameters but allow gradients to flow through
+                for p in latent_action_model.parameters():
+                    p.requires_grad_(False)
             except AttributeError:
                 pass
             object.__setattr__(self, "_latent_action_model_ref", latent_action_model)
@@ -86,9 +90,22 @@ class DMD2B2BLAM(SelfForcingModel):
         if motion_model is not None:
             try:
                 motion_model.to(device=device)
+                motion_model.eval()  # Set to eval mode for batch norm, dropout, etc.
+                # Freeze parameters but allow gradients to flow through
+                for p in motion_model.parameters():
+                    p.requires_grad_(False)
             except AttributeError:
                 pass
             object.__setattr__(self, "_motion_model_ref", motion_model)
+        
+        # Freeze VAE decoder parameters but allow gradients to flow through
+        if hasattr(self, 'vae') and self.vae is not None:
+            self.vae.eval()  # Set to eval mode for batch norm, dropout, etc.
+            for p in self.vae.parameters():
+                p.requires_grad_(False)
+            # Enable gradient checkpointing on VAE to save memory when gradients flow through
+            if hasattr(self.vae, 'enable_gradient_checkpointing'):
+                self.vae.enable_gradient_checkpointing()
 
         self.action_dim = int(getattr(args, "action_dim", getattr(args, "raw_action_dim", 2)))
         axis_weights = getattr(args, "action_axis_weights", None)
@@ -132,45 +149,129 @@ class DMD2B2BLAM(SelfForcingModel):
         return pred_actions, log_std
 
     def _estimate_motion(self, pred_frames: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            # Decode latents to pixel space
-            # Use self.dtype to match VAE's dtype (bfloat16 if mixed_precision, float32 otherwise)
-            # Create a modified version with dummy frame for VAE decode (preserve original pred_frames for gradients)
-            pred_frames_with_dummy = torch.cat([pred_frames[:, 0:1], pred_frames], dim=1)
-            pixels = self.vae.decode_to_pixel(pred_frames_with_dummy.to(dtype=self.dtype))[:, 1:, ...]  # [B, F, 3, H, W] in [-1, 1] range
+        # CRITICAL: Match test_motion_from_scratch.py EXACTLY for proper motion computation
+        # NOTE: We use eval() mode and frozen parameters, but allow gradients to flow through
+        # (no torch.inference_mode() or torch.no_grad() to preserve gradient flow)
+        # Decode latents to pixel space
+        # Use self.dtype to match VAE's dtype (bfloat16 if mixed_precision, float32 otherwise)
+        # Create a modified version with dummy frame for VAE decode (preserve original pred_frames for gradients)
+        pred_frames_with_dummy = torch.cat([pred_frames[:, 0:1], pred_frames], dim=1)
+        
+        noise = torch.randn_like(pred_frames_with_dummy.flatten(0,1))
+        timestep = torch.full((noise.shape[0],), 25, dtype=torch.long, device=pred_frames_with_dummy.device)
+        noisy_latent = self.scheduler.add_noise(
+            pred_frames_with_dummy.flatten(0, 1),
+            noise,
+            timestep
+        ).unflatten(0, (pred_frames_with_dummy.shape[:2]))
+        assert noisy_latent.requires_grad
+        assert pred_frames_with_dummy.requires_grad
 
-            # Convert to format expected by cotracker: [B, T, C, H, W]
-            # VAE decode returns pixels in [-1, 1] range, scale to [0, 255] as cotracker expects
-            # Similar to test_motion_2_action_scratch.py line 454
-            video_pixels = (255 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()  # [B, F, 3, H, W] in [0, 255] range
+        # Use gradient checkpointing for VAE decode to save memory
+        # This trades computation for memory by recomputing activations during backward pass
+        def _decode_with_checkpoint(x):
+            return self.vae.decode_to_pixel(x)
+        
+        # Only use checkpointing if gradients are enabled (during training)
+        if torch.is_grad_enabled():
+            pixels = torch.utils.checkpoint.checkpoint(
+                _decode_with_checkpoint,
+                noisy_latent.to(dtype=self.dtype),
+                use_reentrant=False,
+            )[:, 1:, ...]  # [B, F, 3, H, W] in [-1, 1] range
+        else:
+            pixels = self.vae.decode_to_pixel(noisy_latent.to(dtype=self.dtype))[:, 1:, ...]  # [B, F, 3, H, W] in [-1, 1] range
 
-            #Convert video pixels from shape [1, 84, 3, H, W] to [7, 12, 3, H, W]
-            batch_size, num_frames, num_channels, height, width = video_pixels.shape
-            assert num_frames == 84
-            video_pixels = video_pixels.reshape(7, 12, num_channels, height, width)
-            grid_size = 10
-            N = grid_size ** 2
+        # Convert to format expected by cotracker: [B, T, C, H, W]
+        # VAE decode returns pixels in [-1, 1] range, scale to [0, 255] as cotracker expects
+        video_pixels = (255 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()  # [B, F, 3, H, W] in [0, 255] range
 
-            # Use pre-initialized cotracker model (initialized in __init__ for FSDP compatibility)
-            if self.motion_model is None:
-                raise RuntimeError("cotracker not initialized")
+        # Convert from [B, F, C, H, W] to [1, T, C, H, W] format for chunking
+        batch_size, num_frames, num_channels, height, width = video_pixels.shape
+        # For training, we expect exactly 84 frames (7*12)
+        assert num_frames == 84, f"Expected 84 frames, got {num_frames}"
+        video_tensor = video_pixels.reshape(1, num_frames, num_channels, height, width)  # [1, 84, 3, H, W]
+        
+        # CRITICAL: Use chunking approach matching test_motion_from_scratch.py
+        grid_size = 10
+        output_chunk_size = 12  # frames per output window
+        compute_T = 48  # frames per compute chunk - MUST MATCH test_motion_from_scratch.py
+        N = grid_size ** 2
+        n_out_full = compute_T // output_chunk_size
+        assert compute_T % output_chunk_size == 0
 
-            # Run cotracker on frame window (similar to test_motion_2_action_scratch.py line 493)
-            with torch.amp.autocast(device_type='cuda', enabled=True):
-                tracks_w, vis_w = self.motion_model(video_pixels, grid_size=grid_size)  # [B, T_window, N, 2], [B, T_window, N]
+        # Ensure motion_model is on device and in eval mode
+        motion_model = self.motion_model.to(device=video_tensor.device).eval()
+        if motion_model is None:
+            raise RuntimeError("cotracker not initialized")
 
-            #pred_tracks will have shape [7, 12, N, 2], pred_visibility will have shape [7, 12, N]
+        # Process video in chunks matching test_motion_from_scratch.py exactly
+        all_motion_windows = []
+        T_total = video_tensor.shape[1]
+        num_chunks = (T_total + compute_T - 1) // compute_T
 
-            # Vectorized motion computation - compute all deltas at once (similar to test_motion_2_action_scratch.py line 508)
-            motion_out = (tracks_w[:, 1:] - tracks_w[:, :-1]).mean(dim=1)  # output shape [7, N, 2]
+        # Process in chunks of compute_T frames - EXACTLY like test_motion_from_scratch.py
+        for chunk_idx, chunk_start in enumerate(range(0, T_total, compute_T)):
+            chunk_end = min(chunk_start + compute_T, T_total)
+            frames_chunk = video_tensor[:, chunk_start:chunk_end, :, :, :]  # [1, T_chunk, 3, H, W]
+            
+            # Keep only complete 12-frame windows - EXACTLY like test_motion_from_scratch.py line 132-138
+            n_out = frames_chunk.shape[1] // output_chunk_size
+            if n_out == 0:
+                continue
+            
+            used_frames = n_out * output_chunk_size
+            frames_chunk = frames_chunk[:, :used_frames, :, :, :].clone()
+            
+            # Run CoTracker - EXACTLY like test_motion_from_scratch.py line 141-142
+            # Use gradient checkpointing for motion model to save memory
+            def _motion_forward(chunk):
+                with torch.amp.autocast(device_type='cuda', enabled=True):
+                    return motion_model(chunk, grid_size=grid_size)
+            
+            if torch.is_grad_enabled():
+                pred_tracks, pred_visibility = torch.utils.checkpoint.checkpoint(
+                    _motion_forward,
+                    frames_chunk,
+                    use_reentrant=False,
+                )  # [B,T,N,2], [B,T,N] or [B,T,N,1]
+            else:
+                with torch.amp.autocast(device_type='cuda', enabled=True):
+                    pred_tracks, pred_visibility = motion_model(frames_chunk, grid_size=grid_size)  # [B,T,N,2], [B,T,N] or [B,T,N,1]
+            
+            B = pred_tracks.shape[0]
+            T_chunk = pred_tracks.shape[1]
+            
+            # Group into disjoint 12-frame windows - EXACTLY like test_motion_from_scratch.py line 148-153
+            tracks_w = pred_tracks.reshape(B, n_out, output_chunk_size, N, 2)  # [B,n_out,12,N,2]
+            # Handle visibility shape - EXACTLY like test_motion_from_scratch.py line 150-153
+            if pred_visibility.dim() == 3:  # [B,T,N]
+                vis_w = pred_visibility.reshape(B, n_out, output_chunk_size, N).unsqueeze(-1)  # [B,n_out,12,N,1]
+            else:  # [B,T,N,1]
+                vis_w = pred_visibility.reshape(B, n_out, output_chunk_size, N, 1)  # [B,n_out,12,N,1]
+            
+            # Compute motion: mean within-window deltas (11 deltas for 12 frames) - EXACTLY like test_motion_from_scratch.py line 156-162
+            d_w = tracks_w[:, :, 1:] - tracks_w[:, :, :-1]  # [B,n_out,11,N,2]
+            motion_out = d_w.mean(dim=2)  # [B,n_out,N,2]
+            
+            # Mean visibility over 12 frames
+            vis_out = vis_w.to(dtype=motion_out.dtype).mean(dim=2)  # [B,n_out,N,1]
+            
+            motion_window = torch.cat([motion_out, vis_out], dim=-1).squeeze(0)  # [n_out,N,3]
+            all_motion_windows.append(motion_window)
+        
+        # Check results - EXACTLY like test_motion_from_scratch.py line 165
+        if not all_motion_windows:
+            raise RuntimeError("ERROR: No motion windows computed!")
+        
+        # Concatenate all windows: [total_windows, N, 3] - EXACTLY like test_motion_from_scratch.py line 169
+        estimated_motion = torch.cat(all_motion_windows, dim=0)  # [total_out, N, 3]
+                
+        # CRITICAL: Normalize motion by dividing by 10.0 - REQUIRED for motion2action model
+        # Matches test_action_from_motion.py line 147
+        estimated_motion = estimated_motion.to(device=pred_frames.device, dtype=torch.float32) / 10.0
 
-            # Visibility: single conversion and mean (similar to test_motion_2_action_scratch.py line 511)
-            vis_out = vis_w.float().mean(dim=1).unsqueeze(-1)  # [7, N, 1]
-
-            # Single concatenation (similar to test_motion_2_action_scratch.py line 514)
-            motion_out = torch.cat([motion_out, vis_out], dim=-1)  # [7, N, 3]
-
-        return motion_out.detach()
+        return estimated_motion#.detach()
 
     def _compute_kl_grad(
         self, 
@@ -353,10 +454,7 @@ class DMD2B2BLAM(SelfForcingModel):
         # Reduce targets to segment-level to match the motion2action head (e.g. 21 frames -> 7 segments)
         actions_seg = actions.reshape(actions.shape[0], actions.shape[1] // 3, 3, actions.shape[2]).mean(dim=2)  # [B,F,2]
 
-        pred = estimated_action
-        if pred.dim() == 2:
-            pred = pred.unsqueeze(0)  # [1,F,2] for broadcasting with actions_seg
-        diff = pred - actions_seg  # [B,F,2]
+        diff= estimated_action.unsqueeze(0) - actions_seg # [B,F,2]
 
         loss_per_seg = diff.abs().mean(dim=-1)  # [B,F]
 
@@ -486,6 +584,10 @@ class DMD2B2BLAM(SelfForcingModel):
             # "Other" is opposite action (or forward when zero)
             other = actions.clone()
             other[..., 1] = -other[..., 1]  # flip yaw/turn
+        elif self.action_cfg_opposite_method == 'forward':
+            other = actions.clone()
+            other[..., 1] = 0.0
+            other[..., 0] = 1.0
         else:
             raise ValueError(f"Invalid action_cfg_opposite_method: {self.action_cfg_opposite_method} has to be 'rand' or 'invert'")
 
@@ -499,54 +601,36 @@ class DMD2B2BLAM(SelfForcingModel):
         attract = attract_seg.repeat_interleave(3, dim=1)  # [B,3F,2]
         repel   = repel_seg.repeat_interleave(3, dim=1)    # [B,3F,2]
 
-        # # ----------------------------
-        # # Per-segment (B,F) guidance scale = base * mismatch * confidence(u)
-        # #     Right now, guidance goes to 0 if mismatch is also 0, and it goes to
-        # #     2 if mismatch is high. This is the wrong direction. We want high 
-        # #     guidance for low mismatch and low guidance for high mismatch - the
-        # #     highest mismatch should get 0 as it's guidance, and the a mismatch
-        # #     mismatch of 0 should get guidance value 1. I want you to put this through
-        # #     a sigmoid so that it is between 0 and 1. 
-        # # ----------------------------
+        if self.action_cfg_enabled:
+            # ----------------------------
+            # Per-segment (B,F) guidance schedule (xi model)
+            #
+            # Let g = self.fake_guidance_scale (e.g. 2). We want guidance to decrease with error:
+            #   err == 0                  -> guidance = 2
+            #   err == 0.5                -> guidance = 1.18
+            #   err == 1.0                -> guidance = 0.84
+            #   err == 1.5                -> guidance = 0.58
+            #   err == 3.0                -> guidance = 0.0
+            #   err >= 3.0                -> guidance = 0.0
+            #
+            # ----------------------------
 
-        # # 1) Continuous mismatch between predicted mean and target action
-        # #    (use same side multiplier on angular that you use elsewhere)
-        # diff = (estimated_action.to(torch.float32) - actions.to(torch.float32))          # [B,F,2]
-        # diff[..., 1] = diff[..., 1] * float(self.action_cfg_side_multiplier)
-        # err = torch.linalg.norm(diff, dim=-1)                                           # [B,F]
+            # This is hard set for fake guidance scale of 2.0
+            g = float(self.fake_guidance_scale)           # "base rate" / max guidance
+            assert self.fake_guidance_scale == 2.0, "This is hard optimised for fake guidance scale of 2.0, please change it back to 2.0"
 
-        # # Smoothly "stop pushing when already correct":
-        # # gate in [0,1), ~0 when err~0, ~1 when err >> tau
-        # tau = float(getattr(self.args, "action_cfg_err_tau", 0.25))
-        # w_mismatch = err / (err + tau)                                                  # [B,F]
+            diff = (estimated_action.to(torch.float32) - actions.to(torch.float32))          # [B,F,2]
+            # diff[..., 1] = diff[..., 1] * float(self.action_cfg_side_multiplier)
+            err = torch.sum(torch.abs(diff), dim=-1)                                           # [B,F]
 
-        # # 2) Confidence from your combined uncertainty u (relative, not calibrated)
-        # if estimated_action_log_std is not None:
-        #     log_std = estimated_action_log_std.to(device=device, dtype=torch.float32)  # [B,F,2] (or broadcastable)
-        #     std = torch.exp(torch.clamp(log_std, -5.0, 2.0)) + 1e-6
+            multiplier = 0.57735 * (1.732 - torch.sqrt(err))
+            max_comparison = torch.where(success, 0.5, 0.0) #0.0 or above, except where succesful, where it is 0.5 or above
+            min_comparison = torch.full_like(multiplier, 1.0) #1.0 or below
+            multiplier = torch.min(torch.max(multiplier, max_comparison), min_comparison)
+            guidance_seg = (g * multiplier).to(dtype=dtype, device=device) 
 
-        #     std_lin = std[..., 0]
-        #     std_ang = std[..., 1] * float(self.action_cfg_side_multiplier)
-
-        #     # Your fitted combo (defaults; keep as args if you want to tune)
-        #     w_lin = float(getattr(self.args, "action_cfg_u_w_lin", 0.067))
-        #     w_ang = float(getattr(self.args, "action_cfg_u_w_ang", 0.190))
-        #     u = w_lin * std_lin + w_ang * std_ang                                      # [B,F]
-
-        #     # Your recommended smoothing (defaults)
-        #     u_thr  = float(getattr(self.args, "action_cfg_u_thr", 0.24))
-        #     u_temp = float(getattr(self.args, "action_cfg_u_temp", 0.04))
-
-        #     # Weight near-1 for most frames, drops for noisiest ones
-        #     w_conf = torch.sigmoid((u_thr - u) / (u_temp + 1e-8))                       # [B,F]
-        # else:
-        #     w_conf = torch.ones_like(w_mismatch, dtype=torch.float32)
-
-        # # 3) Final per-seg scale
-        # base = float(self.fake_guidance_scale)
-        # guidance_seg = (base * w_mismatch * w_conf).to(dtype=dtype)                     # [B,F]
-
-        guidance_seg = torch.full_like(success, float(self.fake_guidance_scale), dtype=dtype, device=device)
+        else:
+            guidance_seg = torch.full_like(success, float(self.fake_guidance_scale), dtype=dtype, device=device)
         # expand to frames: you already repeat_interleave(3) for actions->frames
         guidance = guidance_seg.repeat_interleave(3, dim=1)                             # [B,3F]
         guidance = guidance[:, :, None, None, None]      
@@ -643,6 +727,16 @@ class DMD2B2BLAM(SelfForcingModel):
                 original_latent.double() - grad.double()
                 ).detach(), reduction="mean")
 
+        # Log guidance statistics
+        with torch.no_grad():
+            guidance_flat = per_sample_fake_scale.flatten()
+            dmd_log_dict.update({
+                "guidance_median": torch.median(guidance_flat).detach(),
+                "guidance_mean": torch.mean(guidance_flat).detach(),
+                "guidance_min": torch.min(guidance_flat).detach(),
+                "guidance_max": torch.max(guidance_flat).detach(),
+            })
+
         return dmd_loss, dmd_log_dict
 
     def generator_loss(
@@ -682,7 +776,7 @@ class DMD2B2BLAM(SelfForcingModel):
         _t_loss_start = time.time()
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
-            estimated_action=estimated_action.detach(),
+            estimated_action=estimated_action,#.detach(),
             estimated_action_log_std=estimated_action_log_std,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,

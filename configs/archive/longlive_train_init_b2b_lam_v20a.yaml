@@ -1,0 +1,109 @@
+config_name: 'init-dmd2-lam-b2b-v17'
+text_pre_encoded: true
+negative_prompt_encoded_path: /projects/u5dk/as1748/frodobots_captions/negative/longlive_train_init_real_negative_1.json
+action_patch_enabled: true
+action_modulation_activation: "silu"
+gan_type: 'relative'
+action_cfg_enabled: true
+action_cfg_type: framewise
+action_cfg_side_multiplier: 2.0
+dmd_loss_weight: 1.0
+dmd_loss_weight_decay: 0.0
+gan_loss_weight: 0.00
+gan_loss_weight_decay: 0.0
+action_loss_weight: 0.0
+action_loss_weight_decay: 0.0
+indep_lat_act_weight: 0.5
+guidance_cls_loss_weight: 0.0
+guidance_rgs_loss_weight: 0.0
+diffusion_gan: False
+diffusion_gan_max_timestep: 400
+min_score_timestep: 100
+concat_time_embeddings: true
+motion_enabled_loss: false
+motion_weight_c: 2.0
+generator_ckpt: /scratch/u5dk/as1748.u5dk/checkpoints/ode_init.pt
+latent_action_checkpoint: /scratch/u5dk/as1748.u5dk/frodobots_lam/checkpoints/checkpoint_lambda_noise0.02_step6000.pth
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-1.3B
+# real_name: Wan2.1-T2V-14B
+fake_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+
+teacher_lora: 256
+teacher_lora_weights: /scratch/u5dk/as1748.u5dk/weights/retrain_no_gan_256/logs/diffusion_lora_step0018600.pt
+lora_ckpt:
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+real_guidance_scale: 3.0
+fake_guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
+wandb_entity: ashish397-university-of-exeter
+wandb_project: frodobots_wm
+use_one_logger: False
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+ap_lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+real_latent_root: /projects/u5dk/as1748/frodobots_encoded/train
+caption_root: /projects/u5dk/as1748/frodobots_captions/train
+val_real_latent_root: /projects/u5dk/as1748/frodobots_encoded/test
+val_caption_root: /projects/u5dk/as1748/frodobots_captions/test
+data_blacklist_path: /home/u5dk/as1748.u5dk/ARRWM/data_blacklist.txt
+batch_size: 1
+gradient_accumulation_steps: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 32
+log_iters: 100
+max_checkpoints: 5
+max_iters: 700
+reset_base_checkpoint_step: true
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 21 # unused in sequential training
+- 16
+- 60
+- 104
+distribution_loss: dmd2b2blam
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+
+# Visualization
+vis_interval: 50
+vis_ema: false
+vis_video_lengths:
+- 21
+val_batch_size: 1
+val_data_path: prompts/vidprom_filtered_extended.txt
+
+min_num_training_frames: 21
+num_training_frames: 21
+slice_last_frames: 21
+
+action_dim: 2

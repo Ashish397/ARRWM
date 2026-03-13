@@ -215,8 +215,8 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             print(f"[SeqTrain-Pipeline] Block config: num_blocks={num_blocks}, all_num_frames={all_num_frames}")
             print(f"[SeqTrain-Pipeline] independent_first_frame={self.independent_first_frame}")
             
-        # Prepare output tensor
-        output = torch.zeros_like(noise)
+        # Collect outputs per block to preserve autograd graph (avoid in-place slice writes)
+        output_parts: List[torch.Tensor] = []
 
         # Randomly select denoising steps (synced across ranks)
         num_denoising_steps = len(self.denoising_step_list)
@@ -326,21 +326,21 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                         )
                     break
             
-            # Record output
-            output[:, local_start_frame:local_start_frame + current_num_frames] = denoised_pred
+            # Record output (preserve graph)
+            output_parts.append(denoised_pred)
             
-            # Update cache with context noise
+            # Update cache with context noise (explicitly detach to avoid keeping extra graph branches)
             context_timestep = torch.ones_like(timestep) * self.context_noise
-            context_noisy = self.scheduler.add_noise(
-                denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
-                context_timestep.flatten(0, 1),
-            ).unflatten(0, denoised_pred.shape[:2])
             
             if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
             
             with torch.no_grad():
+                context_noisy = self.scheduler.add_noise(
+                    denoised_pred.detach().flatten(0, 1),
+                    torch.randn_like(denoised_pred.detach().flatten(0, 1)),
+                    context_timestep.flatten(0, 1),
+                ).unflatten(0, denoised_pred.shape[:2])
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=cond_with_action,
@@ -352,6 +352,9 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             
             local_start_frame += current_num_frames
         
+        # Concatenate all blocks to produce [B, chunk_frames, C, H, W] while preserving grad
+        output = torch.cat(output_parts, dim=1)
+
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"SeqTrain-Pipeline: After all blocks generated", device=noise.device, rank=dist.get_rank() if dist.is_initialized() else 0)
         
@@ -397,11 +400,8 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             num_blocks = (num_frames - 1) // self.num_frame_per_block
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
-        output = torch.zeros(
-            [batch_size, num_output_frames, num_channels, height, width],
-            device=noise.device,
-            dtype=noise.dtype
-        )
+        # Collect output parts to preserve gradient connections (avoid in-place slice writes)
+        output_parts: List[torch.Tensor] = []
 
         # Step 1: Initialize KV cache to all zeros
         self._initialize_kv_cache(
@@ -423,7 +423,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                 dtype=initial_latent.dtype,
             )
             # Assume num_input_frames is 1 + self.num_frame_per_block * num_input_blocks
-            output[:, :1] = initial_latent
+            output_parts.append(initial_latent)
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=initial_latent,
@@ -441,7 +441,11 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
             all_num_frames = [1] + all_num_frames
         num_denoising_steps = len(self.denoising_step_list)
         exit_flags = self.generate_and_sync_list(len(all_num_frames), num_denoising_steps, device=noise.device)
-        start_gradient_frame_index = num_output_frames - slice_last_frames
+        # Guard: slice_last_frames < 0 means "all frames" (enable grads everywhere)
+        if slice_last_frames < 0:
+            start_gradient_frame_index = 0
+        else:
+            start_gradient_frame_index = max(0, num_output_frames - slice_last_frames)
 
         grad_enable_mask = torch.zeros((batch_size, sum(all_num_frames)), dtype=torch.bool)
         # If static local_attn_size, set it first
@@ -526,23 +530,21 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                     break
 
             # Step 3.2: record the model's output
-            output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+            output_parts.append(denoised_pred)
 
-            # Step 3.3: rerun with timestep zero to update the cache
+            # Step 3.3: rerun with timestep zero to update the cache (detach to avoid graph retention)
             context_timestep = torch.ones_like(timestep) * self.context_noise
-            # add context noise
-            denoised_pred = self.scheduler.add_noise(
-                denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
-                context_timestep * torch.ones(
-                    [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
-            ).unflatten(0, denoised_pred.shape[:2])
             if DEBUG and dist.get_rank() == 0:
                 print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
                 print(f"rank {dist.get_rank()}, rerun_for_cache")
             with torch.no_grad():
+                context_noisy = self.scheduler.add_noise(
+                    denoised_pred.detach().flatten(0, 1),
+                    torch.randn_like(denoised_pred.detach().flatten(0, 1)),
+                    context_timestep.flatten(0, 1),
+                ).unflatten(0, denoised_pred.shape[:2])
                 self.generator(
-                    noisy_image_or_video=denoised_pred,
+                    noisy_image_or_video=context_noisy,
                     conditional_dict=cond_with_action,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
@@ -568,6 +570,13 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                 (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0] + 1].cuda()).abs(), dim=0).item()
             denoised_timestep_from = 1000 - torch.argmin(
                 (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0).item()
+
+        # Concatenate parts to [B, num_output_frames, C, H, W] while preserving grad
+        output = torch.cat(output_parts, dim=1)
+
+        # Guard: output must carry grad history during training rollouts
+        if torch.is_grad_enabled():
+            assert output.grad_fn is not None, "Rollout output is detached (grad_fn is None)."
 
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1

@@ -30,6 +30,7 @@ data_base = Path("/projects/u5dk/as1748/frodobots_encoded/train")
 # Parse command-line arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--noise_level", type=float, default=0.02, help="Noise level used during training")
+parser.add_argument("--data-noise_level", type=float, default=0.02, help="Noise level to be used during testing")
 parser.add_argument("--name", type=str, required=True, help="Name of the checkpoint to load")
 parser.add_argument("--head_mode", type=str, default="distribution", choices=["regression", "distribution"],
                     help="Head mode: regression or distribution (should match training)")
@@ -45,6 +46,7 @@ args = parser.parse_args()
 batch_size = 512
 num_workers = 0
 noise_level = args.noise_level
+data_noise_level = args.data_noise_level
 checkpoint_name = args.name
 checkpoint_step = args.step
 zero_motion = args.zero_motion
@@ -63,7 +65,6 @@ test_output_rides_list = [20, 21, 22, 23]
 # Directories
 log_dir = Path("logs")
 checkpoint_dir = Path("/scratch/u5dk/as1748.u5dk/frodobots_lam/checkpoints")
-checkpoint_dir.mkdir(parents=True, exist_ok=True)
 log_dir.mkdir(exist_ok=True)
 predictions_dir = Path("/home/u5dk/as1748.u5dk/ARRWM/test_predictions")
 predictions_dir.mkdir(parents=True, exist_ok=True)
@@ -571,7 +572,7 @@ def test():
         motion_base=motion_base,
         data_base=data_base,
         batch_size=batch_size,
-        noise_level=0.02,  # No noise for testing
+        noise_level=data_noise_level,  # Use noise_level argument for test-time noise
         output_rides_list=test_output_rides_list,
         offset_weight=offset_weight,
     )
