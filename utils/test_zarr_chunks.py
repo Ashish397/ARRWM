@@ -33,12 +33,16 @@ SS_VAE_CKPT     = Path("/home/ashish/ARRWM/action_query/checkpoints/ss_vae_8free
 MOTION_VAE_BATCH = 128
 
 
-def find_first_encoded_zarr():
+def find_encoded_zarr(index: int = 0):
+    """Return the index-th encoded zarr that has latents, or None."""
+    found = 0
     for z in sorted(ENCODED_DIR.glob("*.zarr")):
         try:
             g = zarr_lib.open_group(str(z), mode="r")
             if "latents" in g and g["latents"].shape[0] > 0:
-                return z
+                if found == index:
+                    return z
+                found += 1
         except Exception:
             continue
     return None
@@ -331,11 +335,16 @@ def main():
         help="Motion autoencoder: 'ss_vae' = disentangled VAE (8 free dims, shows latent overlay), "
              "'vae' = beta-VAE, 'pca' = trained PCA, 'none' = raw motion",
     )
+    parser.add_argument(
+        "--index", "-n",
+        type=int, default=0,
+        help="Which encoded zarr to use (0-indexed, sorted alphabetically). Default: 0 (first).",
+    )
     args = parser.parse_args()
 
-    zpath = find_first_encoded_zarr()
+    zpath = find_encoded_zarr(args.index)
     if not zpath:
-        print("No encoded zarr with latents found")
+        print(f"No encoded zarr with latents found at index {args.index}")
         return
 
     g = zarr_lib.open_group(str(zpath), mode="r")
@@ -437,7 +446,7 @@ def main():
 
     # Write MP4
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / f"{zpath.stem}_chunk0.mp4"
+    out_path = OUT_DIR / f"{zpath.stem}_idx{args.index}_chunk0.mp4"
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",

@@ -500,9 +500,6 @@ class DMD2RealMSELAM(SelfForcingModel):
         slice_last_frames = getattr(self.args, "slice_last_frames", 21)
         # Step 1: Run generator on backward simulated noisy input
         _t_gen_start = time.time()
-        with torch.no_grad():
-            if DEBUG and dist.get_rank() == 0:
-                print(f"critic_rollout")
         generated_image, _, denoised_timestep_from, denoised_timestep_to, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
