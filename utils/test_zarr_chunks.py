@@ -62,7 +62,7 @@ def load_aligned_actions(attrs, video_pts: np.ndarray) -> np.ndarray:
     ts_7k = np.asarray(z7["observation.images.front.timestamp"][start_row:end_row])
     actions_all = np.asarray(z7["action"][start_row:end_row])  # [N, 2]
 
-    action_start = float(attrs["action_start_sec"])
+    action_start = float(attrs["action_start_sec"]) - 0.8
     abs_times = action_start + video_pts
 
     # For each decoded frame, find nearest action by timestamp
@@ -198,7 +198,7 @@ def encode_motion_ss_vae(motion_per_frame: np.ndarray, model, scale: float,
 
 
 def draw_latent_overlay(frame: np.ndarray, latent: np.ndarray,
-                         clip: float = 3.0) -> np.ndarray:
+                         clip: float = 25.0) -> np.ndarray:
     """Draw ss_vae latent values as a bar panel overlaid on the right edge of the frame.
 
     latent: 1-D float array, length = latent_ch (e.g. 8).
@@ -292,13 +292,46 @@ def draw_motion_overlay(frame: np.ndarray, motion_vecs: np.ndarray, mag_scale: f
     return out
 
 
+def draw_latent_dial(frame: np.ndarray, latent: np.ndarray,
+                     turn_idx: int = 2, fwd_idx: int = 7,
+                     scale: float = 0.15) -> np.ndarray:
+    """Draw a dial driven by latent dims: z[turn_idx] -> left/right, z[fwd_idx] -> fwd/back.
+
+    Placed to the left of the action dial in the bottom bar.
+    scale converts latent magnitude to the same range as the action dial.
+    """
+    h, w = frame.shape[:2]
+    out = frame
+    bar_h = 60
+    cx, cy = w - 110, h - bar_h + 30
+
+    cv2.circle(out, (cx, cy), 22, (60, 60, 80), -1)
+    cv2.circle(out, (cx, cy), 22, (180, 180, 255), 1)
+
+    z_turn = float(latent[turn_idx])
+    z_fwd = float(latent[fwd_idx])
+
+    arrow_len = 18
+    dx = int(z_turn / 25.0 * arrow_len)
+    dy = int(-z_fwd / 5.0 * arrow_len)
+    dx = max(-arrow_len, min(arrow_len, dx))
+    dy = max(-arrow_len, min(arrow_len, dy))
+    color = (255, 200, 100) if z_fwd >= 0 else (100, 150, 255)
+    cv2.arrowedLine(out, (cx, cy), (cx + dx, cy + dy), color, 2, tipLength=0.35)
+
+    cv2.putText(out, "z", (cx - 5, cy - 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 255), 1, cv2.LINE_AA)
+
+    return out
+
+
 def draw_action_overlay(frame: np.ndarray, action: np.ndarray, pts: float, idx: int) -> np.ndarray:
     """Draw action info on frame. action = [left_motor, right_motor]."""
     h, w = frame.shape[:2]
     out = frame.copy()
     left, right = float(action[0]), float(action[1])
     fwd = (left + right) / 2.0
-    turn = (right - left) / 2.0
+    turn = -((right - left) / 2.0 - (-0.225))
 
     # Semi-transparent black bar at bottom
     bar_h = 60
@@ -441,6 +474,7 @@ def main():
         f = draw_action_overlay(f, actions[i], video_pts[i], i)
         if latents_per_frame is not None:
             f = draw_latent_overlay(f, latents_per_frame[i])
+            f = draw_latent_dial(f, latents_per_frame[i])
         annotated_frames.append(f)
     annotated = np.stack(annotated_frames)
 
