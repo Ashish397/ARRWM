@@ -1,0 +1,78 @@
+config_name: causal-lora-diffusion-teacher
+load_checkpoint_config_name: causal-lora-diffusion-teacher
+
+trainer: causal_lora_diffusion
+
+seed: 0
+mixed_precision: true
+autocast_dtype: bf16
+max_iters: 30000
+log_interval: 10
+ckpt_interval: 300
+max_grad_norm: 1.0
+auto_resume: true
+allow_checkpoint_config_mismatch: true
+wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
+wandb_entity: ashish397-university-of-exeter
+wandb_project: frodobots_wm
+wandb_group: causal-lora-teacher
+wandb_tags:
+  - causal
+  - teacher-forcing
+  - ar-diffusion
+  - streaming
+
+# Causal-specific settings
+teacher_forcing: true
+num_frame_per_block: 3
+noise_augmentation_max_timestep: 0
+
+# Lockstep window batching
+window_size: 21                 # latent frames per non-overlapping window
+
+# Data -- zarr ride-level pipeline with LockstepRideBatcher
+encoded_root: /projects/u6ej/fbots/frodobots_encoded
+caption_root: /projects/u6ej/fbots/frodobots_captions/train
+motion_root: /projects/u6ej/fbots/frodobots_motion
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+# Action conditioning (8D ss_vae latent: z2=turn, z7=forward)
+model_variant: action-injection
+raw_action_dim: 8
+enable_adaln_zero: true
+
+# LoRA adapter settings
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+
+# Optimizer
+lr: 5.0e-05
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+gradient_accumulation_steps: 1
+
+# Model settings
+model_name: Wan2.1-T2V-1.3B
+num_training_frames: 21
+num_train_timestep: 1000
+denoising_loss_type: flow
+gradient_checkpointing: true
+num_workers: 8
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: -1
+  sink_size: 0
+
+# Pretrained LoRA weights to initialise from (bidirectional run checkpoint).
+# Only the 'lora' key is loaded; optimizer and step are NOT restored.
+pretrained_lora_ckpt: /scratch/u5as/as1748.u5as/frodobots/retrain_no_gan_256/logs/diffusion_lora_step0012000.pt
+
+# Logging
+logdir: /scratch/u6ej/as1748.u6ej/ARRWM/logs/causal_lora_teacher

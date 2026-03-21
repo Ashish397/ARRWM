@@ -19,6 +19,7 @@ pre_encode.log
 
 test_grid_outputs/
 test_predictions/
+testing/outputs/
 cotracker/
 
 action_analysis_results.md

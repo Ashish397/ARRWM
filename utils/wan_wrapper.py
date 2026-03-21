@@ -17,7 +17,7 @@ from wan.modules.causal_model import CausalWanModel
 # Load default config to get wan_model_path
 default_config_path = Path(__file__).parent.parent / "configs" / "default_config.yaml"
 _default_config = OmegaConf.load(default_config_path)
-_default_wan_model_path = _default_config.get("wan_model_path", "/home/ashish/Wan2.1/")
+_default_wan_model_path = _default_config.get("wan_model_path", "/scratch/u6ej/as1748.u6ej/frodobots")
 # Ensure path ends with a slash
 if not _default_wan_model_path.endswith("/"):
     _default_wan_model_path = _default_wan_model_path + "/"

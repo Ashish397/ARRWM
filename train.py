@@ -7,6 +7,7 @@ import wandb
 
 from trainer import ScoreDistillationTrainer
 from trainer import LoRADiffusionTrainer
+from trainer import CausalLoRADiffusionTrainer
 
 def main():
     parser = argparse.ArgumentParser()
@@ -40,6 +41,8 @@ def main():
         trainer = ScoreDistillationTrainer(config)
     elif config.trainer == "lora_diffusion":
         trainer = LoRADiffusionTrainer(config)
+    elif config.trainer == "causal_lora_diffusion":
+        trainer = CausalLoRADiffusionTrainer(config)
     trainer.train()
 
     wandb.finish()
