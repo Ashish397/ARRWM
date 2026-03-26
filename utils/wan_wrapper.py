@@ -198,7 +198,12 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
         self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
+        self._base_seq_len = self.seq_len
         self.post_init()
+
+    def adjust_seq_len_for_action_tokens(self, num_frames: int = 21, action_per_frame: int = 1):
+        """Increase seq_len capacity to accommodate per-frame action tokens."""
+        self.seq_len = self._base_seq_len + num_frames * action_per_frame
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
@@ -365,13 +370,19 @@ class WanDiffusionWrapper(torch.nn.Module):
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
         if getattr(self, "_action_patch_applied", False):
+            action_mod_kwargs = {}
             action_modulation = conditional_dict.get("_action_modulation", None)
-            if action_modulation is None:
-                raise ValueError(
-                    "action_modulation is required for generation forward pass. "
-                    "Got None in conditional_dict."
-                )
-            action_mod_kwargs = {"action_modulation": action_modulation}
+            if action_modulation is not None:
+                action_mod_kwargs["action_modulation"] = action_modulation
+            am_clean = conditional_dict.get("_action_modulation_clean", None)
+            if am_clean is not None:
+                action_mod_kwargs["action_modulation_clean"] = am_clean
+            at = conditional_dict.get("_action_tokens", None)
+            if at is not None:
+                action_mod_kwargs["action_tokens"] = at
+            at_clean = conditional_dict.get("_action_tokens_clean", None)
+            if at_clean is not None:
+                action_mod_kwargs["action_tokens_clean"] = at_clean
         else:
             action_mod_kwargs = {}
 

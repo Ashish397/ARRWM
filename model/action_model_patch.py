@@ -74,15 +74,48 @@ def patch_causal_wan_model_for_action(model):
         seq_len,
         *args,
         action_modulation=None,
+        action_tokens=None,
         **kwargs,
     ):
         self._action_modulation = action_modulation
         try:
-            return orig_inf(x, t, context, seq_len, *args, **kwargs)
+            return orig_inf(x, t, context, seq_len, *args,
+                            action_tokens=action_tokens, **kwargs)
         finally:
             self._action_modulation = None
 
     model._forward_inference = _forward_inference_with_action.__get__(model, type(model))
+
+    # 3) Thread modulation through _forward_train.
+    orig_train = model._forward_train
+
+    @wraps(orig_train)
+    def _forward_train_with_action(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        *args,
+        action_modulation=None,
+        action_modulation_clean=None,
+        action_tokens=None,
+        action_tokens_clean=None,
+        **kwargs,
+    ):
+        self._action_modulation = action_modulation
+        self._action_modulation_clean = action_modulation_clean
+        try:
+            return orig_train(x, t, context, seq_len, *args,
+                              action_tokens=action_tokens,
+                              action_tokens_clean=action_tokens_clean,
+                              **kwargs)
+        finally:
+            self._action_modulation = None
+            self._action_modulation_clean = None
+
+    model._forward_train = _forward_train_with_action.__get__(model, type(model))
+
     model._action_causal_patched = True
     return model
 

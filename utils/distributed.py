@@ -93,7 +93,7 @@ def launch_distributed_job(backend: str = "nccl"):
     else:  # IPv4
         init_method = f"tcp://{host}:{port}"
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=30))
+                            init_method=init_method, timeout=timedelta(minutes=120))
     torch.cuda.set_device(local_rank)
 
 

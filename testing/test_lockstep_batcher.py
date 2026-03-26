@@ -20,20 +20,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from model.causal_teacher_streaming import LockstepRideBatcher, _RideSlot
 
 
+_FAKE_Z_ACTIONS: dict = {}
+
+
 def _fake_ride(n_latent: int, name: str = "ride.zarr") -> dict:
+    z = torch.randn(n_latent, 8)
+    path = f"/fake/{name}"
+    _FAKE_Z_ACTIONS[path] = z
     return {
-        "zarr_path": f"/fake/{name}",
+        "zarr_path": path,
         "prompt_embeds": torch.randn(77, 512),
-        "z_actions": torch.randn(n_latent, 8),
         "n_latent_frames": n_latent,
     }
+
+
+def _fake_encode_fn(zarr_path, n_latent_frames, start, end):
+    """Test-only encode_fn that slices from the pre-generated fake tensors."""
+    return _FAKE_Z_ACTIONS[zarr_path][start:end]
 
 
 class TestLockstepRideBatcher(unittest.TestCase):
     """Core batcher logic."""
 
     def test_batch_size_1_sequential_windows(self):
-        """batch_size=1: yields [0:21], [21:42], ... until ride ends."""
+        """batch_size=1: yields context-prepended windows until ride ends."""
         batcher = LockstepRideBatcher(
             window_size=21, num_frame_per_block=3, batch_size=1,
         )
@@ -41,9 +51,9 @@ class TestLockstepRideBatcher(unittest.TestCase):
         batcher.load_group([ride])
 
         self.assertFalse(batcher.needs_new_group())
-        self.assertEqual(batcher.group_total_windows, 3)
+        self.assertEqual(batcher.group_total_windows, 2)
 
-        expected = [(0, 21), (21, 42), (42, 63)]
+        expected = [(0, 24), (21, 45)]
         for i, (exp_s, exp_e) in enumerate(expected):
             self.assertEqual(batcher.current_window_idx, i)
             bounds = batcher.get_window_bounds()
@@ -62,14 +72,14 @@ class TestLockstepRideBatcher(unittest.TestCase):
         ride_b = _fake_ride(84, "rideB.zarr")
         batcher.load_group([ride_a, ride_b])
 
-        # Truncated to the shorter ride → 3 windows
-        self.assertEqual(batcher.group_total_windows, 3)
+        # Truncated to the shorter ride and context-aware -> 2 windows.
+        self.assertEqual(batcher.group_total_windows, 2)
 
-        for win in range(3):
+        for win in range(2):
             bounds = batcher.get_window_bounds()
             self.assertEqual(len(bounds), 2)
-            self.assertEqual(bounds[0], (win * 21, (win + 1) * 21))
-            self.assertEqual(bounds[1], (win * 21, (win + 1) * 21))
+            self.assertEqual(bounds[0], (win * 21, win * 21 + 24))
+            self.assertEqual(bounds[1], (win * 21, win * 21 + 24))
             batcher.advance()
 
         self.assertTrue(batcher.needs_new_group())
@@ -83,7 +93,7 @@ class TestLockstepRideBatcher(unittest.TestCase):
         long_ = _fake_ride(210, "long.zarr")
         batcher.load_group([short, long_])
 
-        self.assertEqual(batcher.group_total_windows, 2)
+        self.assertEqual(batcher.group_total_windows, 1)
 
     def test_max_windows_per_ride(self):
         """max_windows_per_ride caps window count."""
@@ -127,8 +137,16 @@ class TestLockstepRideBatcher(unittest.TestCase):
         self.assertEqual(batcher.group_total_windows, 0)
         self.assertTrue(batcher.needs_new_group())
 
+    def test_exact_minimum_length_gives_one_window(self):
+        batcher = LockstepRideBatcher(
+            window_size=21, num_frame_per_block=3, batch_size=1,
+        )
+        batcher.load_group([_fake_ride(24)])
+        self.assertEqual(batcher.group_total_windows, 1)
+        self.assertEqual(batcher.get_window_bounds()[0], (0, 24))
+
     def test_z_actions_batch(self):
-        """load_z_actions_batch returns correctly sliced tensors."""
+        """load_z_actions_batch returns correctly sliced tensors via encode_fn."""
         batcher = LockstepRideBatcher(
             window_size=21, num_frame_per_block=3, batch_size=2,
         )
@@ -136,14 +154,32 @@ class TestLockstepRideBatcher(unittest.TestCase):
         ride_b = _fake_ride(63, "b.zarr")
         batcher.load_group([ride_a, ride_b])
 
-        z_batch = batcher.load_z_actions_batch(torch.device("cpu"))
-        self.assertEqual(z_batch.shape, (2, 21, 8))
-        torch.testing.assert_close(z_batch[0], ride_a["z_actions"][:21])
-        torch.testing.assert_close(z_batch[1], ride_b["z_actions"][:21])
+        z_batch = batcher.load_z_actions_batch(
+            torch.device("cpu"), encode_fn=_fake_encode_fn,
+        )
+        self.assertEqual(z_batch.shape, (2, 24, 8))
+        torch.testing.assert_close(
+            z_batch[0], _FAKE_Z_ACTIONS[ride_a["zarr_path"]][:24],
+        )
+        torch.testing.assert_close(
+            z_batch[1], _FAKE_Z_ACTIONS[ride_b["zarr_path"]][:24],
+        )
 
         batcher.advance()
-        z_batch2 = batcher.load_z_actions_batch(torch.device("cpu"))
-        torch.testing.assert_close(z_batch2[0], ride_a["z_actions"][21:42])
+        z_batch2 = batcher.load_z_actions_batch(
+            torch.device("cpu"), encode_fn=_fake_encode_fn,
+        )
+        torch.testing.assert_close(
+            z_batch2[0], _FAKE_Z_ACTIONS[ride_a["zarr_path"]][21:45],
+        )
+
+    def test_z_actions_batch_requires_encode_fn(self):
+        batcher = LockstepRideBatcher(
+            window_size=21, num_frame_per_block=3, batch_size=1,
+        )
+        batcher.load_group([_fake_ride(63, "requires_encode.zarr")])
+        with self.assertRaises(RuntimeError):
+            batcher.load_z_actions_batch(torch.device("cpu"))
 
     def test_prompt_embeds_batch(self):
         batcher = LockstepRideBatcher(
@@ -165,7 +201,7 @@ class TestLockstepRideBatcher(unittest.TestCase):
         batcher.load_group([_fake_ride(63, "test.zarr")])
         s = batcher.summary()
         self.assertIn("test.zarr", s)
-        self.assertIn("win=0/3", s)
+        self.assertIn("win=0/2", s)
 
     def test_multiple_groups(self):
         """After exhausting one group, loading another works correctly."""
@@ -173,13 +209,12 @@ class TestLockstepRideBatcher(unittest.TestCase):
             window_size=21, num_frame_per_block=3, batch_size=1,
         )
         batcher.load_group([_fake_ride(42, "first.zarr")])
-        self.assertEqual(batcher.group_total_windows, 2)
-        batcher.advance()
+        self.assertEqual(batcher.group_total_windows, 1)
         batcher.advance()
         self.assertTrue(batcher.needs_new_group())
 
         batcher.load_group([_fake_ride(63, "second.zarr")])
-        self.assertEqual(batcher.group_total_windows, 3)
+        self.assertEqual(batcher.group_total_windows, 2)
         self.assertEqual(batcher.current_window_idx, 0)
         self.assertTrue(batcher.is_first_window)
 

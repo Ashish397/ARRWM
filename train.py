@@ -5,9 +5,6 @@ import os
 from omegaconf import OmegaConf
 import wandb
 
-from trainer import ScoreDistillationTrainer
-from trainer import LoRADiffusionTrainer
-from trainer import CausalLoRADiffusionTrainer
 
 def main():
     parser = argparse.ArgumentParser()
@@ -29,20 +26,23 @@ def main():
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
 
-    # get the filename of config_path
-    # config_name = os.path.basename(args.config_path).split(".")[0]
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb
-    config.auto_resume = not args.no_auto_resume  # Default to True unless --no-auto-resume is specified
+    config.auto_resume = not args.no_auto_resume
     config.use_one_logger = not args.no_one_logger
 
     if config.trainer == "score_distillation":
+        from trainer.distillation import Trainer as ScoreDistillationTrainer
         trainer = ScoreDistillationTrainer(config)
     elif config.trainer == "lora_diffusion":
+        from trainer.diffusion_train import LoRADiffusionTrainer
         trainer = LoRADiffusionTrainer(config)
     elif config.trainer == "causal_lora_diffusion":
+        from trainer.causal_diffusion_teacher_train import CausalLoRADiffusionTrainer
         trainer = CausalLoRADiffusionTrainer(config)
+    else:
+        raise ValueError(f"Unknown trainer: {config.trainer}")
     trainer.train()
 
     wandb.finish()

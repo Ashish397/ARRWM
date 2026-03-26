@@ -8,7 +8,7 @@ mixed_precision: true
 autocast_dtype: bf16
 max_iters: 30000
 log_interval: 10
-ckpt_interval: 300
+ckpt_interval: 50
 max_grad_norm: 1.0
 auto_resume: true
 allow_checkpoint_config_mismatch: true
@@ -25,21 +25,34 @@ wandb_tags:
 # Causal-specific settings
 teacher_forcing: true
 num_frame_per_block: 3
+context_frames: 3               # clean context prepended to each window (one full block)
 noise_augmentation_max_timestep: 0
 
-# Lockstep window batching
-window_size: 21                 # latent frames per non-overlapping window
+# Streaming lockstep training (LockstepRideBatcher)
+#   Each step loads window_size + context_frames = 24 latent frames.
+#   The first 21 become clean_x, the last 21 become noisy_x (shifted by 3).
+#   Loss is computed on 7 uniform chunks of 3 (the 21 noisy frames).
+streaming_chunk_size: 21        # supervised target length per window
 
-# Data -- zarr ride-level pipeline with LockstepRideBatcher
+# Held-out evaluation
+test_start_index: 0             # first zarr index reserved for eval
+test_num_rides: 20              # number of rides held out for evaluation
+eval_interval: 50               # run eval every N steps (rank 0 only)
+eval_inference_steps: 48        # ODE steps for eval generation
+grad_norm_interval: 50          # log gradient norms every N steps
+
+# Data -- zarr ride-level pipeline
 encoded_root: /projects/u6ej/fbots/frodobots_encoded
 caption_root: /projects/u6ej/fbots/frodobots_captions/train
 motion_root: /projects/u6ej/fbots/frodobots_motion
 ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
 
-# Action conditioning (8D ss_vae latent: z2=turn, z7=forward)
+# Action conditioning (z2=turn, z7=forward from 8D ss_vae latent)
 model_variant: action-injection
-raw_action_dim: 8
+raw_action_dim: 2
+action_dims: [2, 7]              # indices into the 8D z_actions to keep
 enable_adaln_zero: true
+action_conditioning_mode: both  # adaln | action_tokens | both
 
 # LoRA adapter settings
 adapter:
@@ -56,6 +69,7 @@ beta2: 0.999
 weight_decay: 0.01
 batch_size: 1
 gradient_accumulation_steps: 1
+warmup_steps: 200
 
 # Model settings
 model_name: Wan2.1-T2V-1.3B
@@ -72,7 +86,19 @@ model_kwargs:
 
 # Pretrained LoRA weights to initialise from (bidirectional run checkpoint).
 # Only the 'lora' key is loaded; optimizer and step are NOT restored.
-pretrained_lora_ckpt: /scratch/u5as/as1748.u5as/frodobots/retrain_no_gan_256/logs/diffusion_lora_step0012000.pt
+pretrained_lora_ckpt: /scratch/u6ej/as1748.u6ej/frodobots/pretrained_weights/retrain_no_gan_256/logs/diffusion_lora_step0018600.pt
+
+# Action critic (chunkwise 3D-convolutional learned critic)
+action_critic_enabled: true
+action_critic_noise_timestep: 25
+action_critic_dims: [2, 7]
+action_critic_z_loss_weight: 1.0
+action_critic_reward_loss_weight: 0.1
+generator_action_z_guidance_weight: 0.0
+generator_action_reward_guidance_weight: 0.0
+critic_lr: 3.0e-04                  # separate critic learning rate
+action_critic_base_channels: 128    # 3D CNN stem width (was 64)
+action_critic_num_blocks: 4         # residual blocks in trunk (was 3)
 
 # Logging
 logdir: /scratch/u6ej/as1748.u6ej/ARRWM/logs/causal_lora_teacher

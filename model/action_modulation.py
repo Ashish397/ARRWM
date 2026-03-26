@@ -151,3 +151,85 @@ class ActionModulationProjection(nn.Module):
 
         modulation = modulation * scale
         return modulation
+
+
+class ActionTokenProjection(nn.Module):
+    """Projects per-frame action features into a single token embedding per frame.
+
+    Shares the same Fourier-feature + MLP front-end as
+    ``ActionModulationProjection`` but outputs a single ``[B, F, dim]``
+    token instead of the ``[B, F, 6, dim]`` adaLN modulation tensor.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        activation: str,
+        hidden_dim: int = 2048,
+        mlp_dim: int = 512,
+        zero_init: bool = True,
+        use_fourier: bool = True,
+        fourier_frequencies: int = 8,
+        include_raw_actions: bool = True,
+        zero_init_std: float = 1e-3,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.use_fourier = use_fourier
+        self.fourier_frequencies = fourier_frequencies
+        self.include_raw_actions = include_raw_actions
+
+        activation_fn = ActionModulationProjection._get_activation(None, activation)
+
+        if self.use_fourier:
+            freq = (2.0 ** torch.arange(self.fourier_frequencies, dtype=torch.float32)) * math.pi
+            self.register_buffer("fourier_freq_bands", freq, persistent=False)
+            fourier_dim = action_dim * self.fourier_frequencies * 2
+            in_dim = fourier_dim + (action_dim if self.include_raw_actions else 0)
+        else:
+            in_dim = action_dim
+
+        self.action_embedding = nn.Sequential(
+            nn.Linear(in_dim, mlp_dim),
+            nn.LayerNorm(mlp_dim),
+            activation_fn(),
+            nn.Linear(mlp_dim, mlp_dim),
+            activation_fn(),
+        )
+
+        self.token_projection = nn.Linear(mlp_dim, hidden_dim)
+
+        if zero_init:
+            nn.init.normal_(self.token_projection.weight, mean=0.0, std=zero_init_std)
+            nn.init.zeros_(self.token_projection.bias)
+
+    def forward(self, action_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            action_features: ``[B, F, action_dim]``
+        Returns:
+            action_tokens: ``[B, F, hidden_dim]``
+        """
+        assert action_features.dim() == 3
+        batch_size, num_frames = action_features.shape[:2]
+
+        x = action_features
+        if self.use_fourier:
+            xb = x[..., None] * self.fourier_freq_bands[None, None, None, :]
+            ff = torch.cat([torch.sin(xb), torch.cos(xb)], dim=-1)
+            ff = ff.reshape(batch_size, num_frames, -1)
+            if self.include_raw_actions:
+                x = torch.cat([x, ff], dim=-1)
+            else:
+                x = ff
+
+        flat = x.flatten(0, 1)
+        ref = next(self.action_embedding.parameters(), None)
+        if ref is None:
+            raise RuntimeError("action_embedding has no parameters")
+        flat = flat.to(device=ref.device, dtype=ref.dtype)
+
+        emb = self.action_embedding(flat)
+        tokens = self.token_projection(emb)
+        return tokens.view(batch_size, num_frames, self.hidden_dim)

@@ -13,6 +13,7 @@ within each ride, so DistributedSampler(shuffle=False) naturally iterates rides 
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -40,10 +41,10 @@ _MOTION_WINDOW_FRAMES = 12
 # ss_vae encoding batch size.
 _ENCODE_BATCH = 128
 
-# Per-dimension tanh squash scales.  Values outside ±scale are soft-saturated.
-# z2 = turn/sides (raw range ≈ ±25), z7 = fwd/back (raw range ≈ ±5).
+# Per-dimension tanh squash scales: tanh(z / scale) -> asymptotic ±1.
+# z2 = turn/sides (raw range ≈ ±25), z7 = fwd/back (raw range ≈ ±10).
 _ZACTION_SCALES = torch.full((8,), 25.0, dtype=torch.float32)
-_ZACTION_SCALES[2] = 50.0
+_ZACTION_SCALES[2] = 25.0
 _ZACTION_SCALES[7] = 10.0
 
 
@@ -234,6 +235,117 @@ def _load_prompt_embeds(encoded_json: Path) -> torch.Tensor:
 # Dataset
 # ---------------------------------------------------------------------------
 
+_MANIFEST_VERSION = 2
+
+
+def _index_single_zarr(
+    zpath: Path,
+    caption_root: Path,
+) -> Tuple[torch.Tensor, dict, int]:
+    """Read metadata and captions for one zarr — no motion encoding."""
+    g = zarr_lib.open_group(str(zpath), mode="r")
+    attrs = dict(g.attrs)
+    n_latent_frames = g["latents"].shape[0]
+
+    ride_dir_2k = attrs.get("ride_dir_2k", "")
+    if not ride_dir_2k:
+        raise RuntimeError("ride_dir_2k missing from zarr attrs")
+    ride_path = Path(ride_dir_2k)
+    try:
+        ride_path.relative_to(_DATA_ROOT)
+    except ValueError:
+        raise RuntimeError(f"ride_dir_2k={ride_dir_2k} not under {_DATA_ROOT}")
+
+    caption_file = _find_encoded_caption(caption_root, ride_path.relative_to(_DATA_ROOT))
+    if caption_file is None:
+        raise FileNotFoundError(f"No encoded caption for {ride_path}")
+    prompt_embeds = _load_prompt_embeds(caption_file)
+
+    return prompt_embeds, attrs, n_latent_frames
+
+
+def build_ride_manifest(
+    encoded_root: str,
+    caption_root: str,
+    min_ride_frames: int = 21,
+    cache_path: Optional[str] = None,
+) -> List[dict]:
+    """Scan all zarr rides and return a manifest list, with optional disk caching.
+
+    Each entry is ``{"zarr_path": str, "prompt_embeds": Tensor, "attrs": dict,
+    "n_latent_frames": int}``.  The list is sorted by zarr filename.
+
+    If *cache_path* points to a valid manifest whose *encoded_root* and zarr
+    file count match the current directory, it is loaded directly (typically
+    <0.5 s vs. minutes for a fresh scan).
+    """
+    enc = Path(encoded_root)
+    zarr_paths = sorted(enc.glob("*.zarr"))
+    n_zarr = len(zarr_paths)
+
+    if cache_path:
+        try:
+            cached = torch.load(cache_path, map_location="cpu")
+            if (
+                cached.get("version") == _MANIFEST_VERSION
+                and cached.get("encoded_root") == str(enc)
+                and cached.get("n_zarr_files") == n_zarr
+            ):
+                rides = cached["rides"]
+                logging.info(
+                    "Loaded ride manifest from cache (%d rides, %d zarr files): %s",
+                    len(rides), n_zarr, cache_path,
+                )
+                return rides
+            logging.info("Manifest cache stale (root/count mismatch), rebuilding.")
+        except Exception:
+            logging.info("No usable manifest cache at %s, building from scratch.", cache_path)
+
+    cap_root = Path(caption_root)
+    logging.info("Scanning %d zarr files in %s (ride-level)", n_zarr, enc)
+    t0 = time.perf_counter()
+    rides: List[dict] = []
+    skipped = 0
+    for zpath in zarr_paths:
+        try:
+            prompt_embeds, zarr_attrs, n_lat = _index_single_zarr(zpath, cap_root)
+        except Exception as exc:
+            logging.warning("Skipping %s: %s", zpath.name, exc)
+            skipped += 1
+            continue
+        if n_lat < min_ride_frames:
+            skipped += 1
+            continue
+        rides.append({
+            "zarr_path": str(zpath),
+            "prompt_embeds": prompt_embeds,
+            "attrs": zarr_attrs,
+            "n_latent_frames": n_lat,
+        })
+    elapsed = time.perf_counter() - t0
+    logging.info(
+        "Ride manifest: %d rides indexed (%d skipped) in %.1fs (%.2fs/ride)",
+        len(rides), skipped, elapsed, elapsed / max(len(rides), 1),
+    )
+    if not rides:
+        raise RuntimeError("No valid rides found. Check encoded_root, caption_root, motion_root.")
+
+    if cache_path:
+        try:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "version": _MANIFEST_VERSION,
+                "encoded_root": str(enc),
+                "n_zarr_files": n_zarr,
+                "rides": rides,
+            }, cache_path)
+            logging.info("Saved ride manifest cache to %s", cache_path)
+        except Exception as exc:
+            logging.warning("Failed to save manifest cache: %s", exc)
+
+    return rides
+
+
 class ZarrRideDataset(Dataset):
     """Ride-level zarr dataset for streaming training.
 
@@ -241,16 +353,12 @@ class ZarrRideDataset(Dataset):
     full-ride z_actions so the trainer can slice arbitrary chunks during
     the streaming loop.  Latents are loaded lazily via ``load_latent_chunk``.
 
-    Args:
-        encoded_root: directory containing ``*.zarr`` ride files.
-        caption_root: directory tree with ``*_encoded.json`` caption files.
-        motion_root: directory tree with ``motion.npy`` motion files.
-        ss_vae_checkpoint: path to the ss_vae_8free.pt checkpoint.
-        min_ride_frames: minimum latent frames for a ride to be included.
-        device: device for ss_vae inference (default "cpu").
-        ss_vae_device: override device specifically for ss_vae encoding at init.
-        start_zarr_index: rotate the zarr file list so this index is first.
-        max_rides: cap the number of rides indexed (None = all).
+    Motion encoding through the ss_vae is deferred until a ride is first
+    accessed (``__getitem__``), so dataset construction only validates
+    metadata and is fast regardless of how many rides exist.
+
+    Construct either via ``__init__`` (full scan) or via the faster
+    ``from_manifest`` class method (pre-built ride list, no scan).
     """
 
     def __init__(
@@ -279,8 +387,54 @@ class ZarrRideDataset(Dataset):
         self._ss_scale = float(ss_scale)
         self._ss_dev = ss_dev
 
-        self._rides: List[Tuple[Path, torch.Tensor, torch.Tensor, int]] = []
+        self._rides: List[Tuple[Path, torch.Tensor, dict, int]] = []
+        self._attrs_by_path: dict = {}
         self._build_index()
+
+    @classmethod
+    def from_manifest(
+        cls,
+        rides_data: List[dict],
+        motion_root: str,
+        ss_vae_checkpoint: str,
+        device: str = "cpu",
+        ss_vae_device: Optional[str] = None,
+        _share_ss_vae: Optional["ZarrRideDataset"] = None,
+    ) -> "ZarrRideDataset":
+        """Construct from a pre-built manifest (no zarr scan needed).
+
+        Pass ``_share_ss_vae`` to reuse another dataset's ss_vae model
+        instead of loading a second copy.
+        """
+        obj = object.__new__(cls)
+        obj.motion_root = Path(motion_root)
+        obj.encoded_root = Path(rides_data[0]["zarr_path"]).parent if rides_data else Path(".")
+        obj.caption_root = Path(".")
+        obj.min_ride_frames = 0
+        obj.start_zarr_index = 0
+        obj.max_rides = None
+
+        if _share_ss_vae is not None:
+            obj._ss_vae = _share_ss_vae._ss_vae
+            obj._ss_scale = _share_ss_vae._ss_scale
+            obj._ss_dev = _share_ss_vae._ss_dev
+        else:
+            ss_dev = ss_vae_device or device
+            logging.info("Loading ss_vae from %s on %s", ss_vae_checkpoint, ss_dev)
+            ss_vae_model, ss_scale = load_ss_vae(ss_vae_checkpoint, ss_dev)
+            obj._ss_vae = ss_vae_model
+            obj._ss_scale = float(ss_scale)
+            obj._ss_dev = ss_dev
+
+        obj._rides = []
+        obj._attrs_by_path = {}
+        for r in rides_data:
+            zpath = Path(r["zarr_path"])
+            obj._rides.append((zpath, r["prompt_embeds"], r["attrs"], r["n_latent_frames"]))
+            obj._attrs_by_path[r["zarr_path"]] = r["attrs"]
+
+        logging.info("ZarrRideDataset.from_manifest: %d rides loaded (no scan)", len(obj._rides))
+        return obj
 
     def _build_index(self) -> None:
         zarr_paths = sorted(self.encoded_root.glob("*.zarr"))
@@ -289,13 +443,14 @@ class ZarrRideDataset(Dataset):
             zarr_paths = zarr_paths[start:] + zarr_paths[:start]
         logging.info("Scanning %d zarr files in %s (ride-level)", len(zarr_paths), self.encoded_root)
 
+        t_index_start = time.perf_counter()
         skipped = 0
         for zpath in zarr_paths:
             if self.max_rides is not None and len(self._rides) >= self.max_rides:
                 logging.info("Reached ride cap (%d); stopping index build.", self.max_rides)
                 break
             try:
-                prompt_embeds, z_actions_latent, n_latent_frames = self._process_zarr(zpath)
+                prompt_embeds, zarr_attrs, n_latent_frames = _index_single_zarr(zpath, self.caption_root)
             except Exception as exc:
                 logging.warning("Skipping %s: %s", zpath.name, exc)
                 skipped += 1
@@ -305,62 +460,79 @@ class ZarrRideDataset(Dataset):
                 skipped += 1
                 continue
 
-            self._rides.append((zpath, prompt_embeds, z_actions_latent, n_latent_frames))
+            self._rides.append((zpath, prompt_embeds, zarr_attrs, n_latent_frames))
+            self._attrs_by_path[str(zpath)] = zarr_attrs
 
+        elapsed = time.perf_counter() - t_index_start
         logging.info(
-            "ZarrRideDataset: %d rides indexed (%d skipped)",
-            len(self._rides), skipped,
+            "ZarrRideDataset: %d rides indexed (%d skipped) in %.1fs (%.2fs/ride)",
+            len(self._rides), skipped, elapsed,
+            elapsed / max(len(self._rides), 1),
         )
         if not self._rides:
             raise RuntimeError("No valid rides found. Check encoded_root, caption_root, motion_root.")
 
-    def _process_zarr(self, zpath: Path) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        g = zarr_lib.open_group(str(zpath), mode="r")
-        attrs = dict(g.attrs)
-        lat_ds = g["latents"]
-        n_latent_frames = lat_ds.shape[0]
+    def encode_z_actions_window(
+        self,
+        zarr_path: str,
+        n_latent_frames: int,
+        latent_start: int,
+        latent_end: int,
+    ) -> torch.Tensor:
+        """Encode motion only for the latent frames in ``[latent_start, latent_end)``.
 
-        ride_dir_2k = attrs.get("ride_dir_2k", "")
-        if not ride_dir_2k:
-            raise RuntimeError("ride_dir_2k missing from zarr attrs")
-        ride_path = Path(ride_dir_2k)
-        try:
-            rel = ride_path.relative_to(_DATA_ROOT)
-        except ValueError:
-            raise RuntimeError(f"ride_dir_2k={ride_dir_2k} not under {_DATA_ROOT}")
+        Loads the full motion.npy (cheap, ~3 ms), then subsamples to the
+        video-frame indices that correspond to the requested latent window
+        before pushing through the ss_vae.  For a 21-frame window this
+        encodes ~21 frames instead of the full ride (often 10 000+).
 
-        caption_file = _find_encoded_caption(self.caption_root, rel)
-        if caption_file is None:
-            raise FileNotFoundError(f"No encoded caption for {rel}")
-        prompt_embeds = _load_prompt_embeds(caption_file)
-
+        Returns ``[latent_end - latent_start, z_dim]`` float32 tensor.
+        """
+        zarr_attrs = self._attrs_by_path[zarr_path]
         n_video_frames = 1 + _LATENT_TO_VIDEO * (n_latent_frames - 1)
 
-        motion_per_video = _load_aligned_motion_for_zarr(
-            attrs, n_video_frames, self.motion_root
+        t0 = time.perf_counter()
+        motion_all = _load_aligned_motion_for_zarr(
+            zarr_attrs, n_video_frames, self.motion_root,
         )
-        z_per_video = _encode_motion_ss_vae(
-            motion_per_video, self._ss_vae, self._ss_scale, self._ss_dev
+        t_loaded = time.perf_counter()
+
+        n_out = latent_end - latent_start
+        if motion_all.shape[0] == 0:
+            logging.warning(
+                "  z_actions [%d:%d]: empty motion for %s, returning zeros",
+                latent_start, latent_end, zarr_path,
+            )
+            return torch.zeros(n_out, 8, dtype=torch.float32)
+
+        vid_indices = np.arange(latent_start, latent_end) * _LATENT_TO_VIDEO
+        vid_indices = np.clip(vid_indices, 0, max(motion_all.shape[0] - 1, 0))
+        motion_window = motion_all[vid_indices]
+
+        z_window = _encode_motion_ss_vae(
+            motion_window, self._ss_vae, self._ss_scale, self._ss_dev,
         )
+        t_encoded = time.perf_counter()
 
-        latent_indices = np.arange(n_latent_frames) * _LATENT_TO_VIDEO
-        latent_indices = np.clip(latent_indices, 0, n_video_frames - 1)
-        z_per_latent = z_per_video[latent_indices]
-
-        z_tensor = torch.from_numpy(z_per_latent)
+        z_tensor = torch.from_numpy(z_window)
         z_squashed = _tanh_squash(z_tensor)
 
-        return prompt_embeds, z_squashed, n_latent_frames
+        logging.info(
+            "  z_actions [%d:%d]: encode %d frames | "
+            "motion_load=%.3fs  ss_vae=%.3fs  total=%.3fs",
+            latent_start, latent_end, len(vid_indices),
+            t_loaded - t0, t_encoded - t_loaded, time.perf_counter() - t0,
+        )
+        return z_squashed
 
     def __len__(self) -> int:
         return len(self._rides)
 
     def __getitem__(self, idx: int) -> dict:
-        zpath, prompt_embeds, z_actions, n_frames = self._rides[idx]
+        zpath, prompt_embeds, _attrs, n_frames = self._rides[idx]
         return {
             "zarr_path": str(zpath),
             "prompt_embeds": prompt_embeds,
-            "z_actions": z_actions,
             "n_latent_frames": n_frames,
         }
 
@@ -402,12 +574,14 @@ class ZarrSequentialDataset(Dataset):
         log_every_n_validated: Optional[int] = None,
         start_zarr_index: int = 0,
         max_samples: Optional[int] = None,
+        context_frames: int = 3,
     ):
         self.encoded_root = Path(encoded_root)
         self.caption_root = Path(caption_root)
         self.motion_root = Path(motion_root)
         self.window_size = window_size
         self.window_stride = window_stride
+        self.context_frames = context_frames
         self.log_every_n_validated = log_every_n_validated
         self.start_zarr_index = start_zarr_index
         self.max_samples = max_samples
@@ -446,8 +620,8 @@ class ZarrSequentialDataset(Dataset):
                 skipped += 1
                 continue
 
-            # Slide window over latent frames
-            max_start = n_latent_frames - self.window_size
+            # Slide window over latent frames (account for context prepended to each window)
+            max_start = n_latent_frames - (self.window_size + self.context_frames)
             if max_start < 0:
                 skipped += 1
                 continue
@@ -561,17 +735,17 @@ class ZarrSequentialDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         zpath, prompt_embeds, z_actions_latent, start = self._samples[idx]
 
-        end = start + self.window_size
+        end = start + self.window_size + self.context_frames
 
-        # Load latents lazily from zarr (only the required window)
+        # Load latents lazily from zarr (window + leading context)
         g = zarr_lib.open_group(str(zpath), mode="r")
-        lat_np = g["latents"][start:end]  # (window_size, 16, 60, 104) float16
-        latents = torch.from_numpy(lat_np.astype(np.float32))  # float32
+        lat_np = g["latents"][start:end]  # (window_size+context_frames, 16, 60, 104)
+        latents = torch.from_numpy(lat_np.astype(np.float32))
 
-        z_window = z_actions_latent[start:end]  # (window_size, 8)
+        z_window = z_actions_latent[start:end]  # (window_size+context_frames, 8)
 
         return {
-            "real_latents": latents,          # (window_size, 16, 60, 104)
+            "real_latents": latents,          # (window_size+context_frames, 16, 60, 104)
             "prompt_embeds": prompt_embeds,   # (seq_len, dim)
-            "z_actions": z_window,            # (window_size, 8)
+            "z_actions": z_window,            # (window_size+context_frames, 8)
         }

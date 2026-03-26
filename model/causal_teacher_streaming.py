@@ -5,7 +5,7 @@ window batcher that advances multiple rides in lockstep.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -16,7 +16,6 @@ class _RideSlot:
 
     zarr_path: str = ""
     prompt_embeds: Optional[torch.Tensor] = None
-    z_actions: Optional[torch.Tensor] = None
     n_latent_frames: int = 0
     n_windows: int = 0
 
@@ -46,12 +45,14 @@ class LockstepRideBatcher:
         num_frame_per_block: int = 3,
         batch_size: int = 1,
         max_windows_per_ride: Optional[int] = None,
+        context_frames: int = 3,
     ):
         assert window_size % num_frame_per_block == 0
         self.window_size = window_size
         self.num_frame_per_block = num_frame_per_block
         self.batch_size = batch_size
         self.max_windows_per_ride = max_windows_per_ride
+        self.context_frames = context_frames
 
         self._slots: List[_RideSlot] = [_RideSlot() for _ in range(batch_size)]
         self._window_idx: int = 0
@@ -67,7 +68,7 @@ class LockstepRideBatcher:
 
         Each element of *ride_dicts* must contain the keys returned by
         ``ZarrRideDataset.__getitem__``: ``zarr_path``, ``prompt_embeds``,
-        ``z_actions``, ``n_latent_frames``.
+        ``n_latent_frames``.
         """
         if len(ride_dicts) != self.batch_size:
             raise ValueError(
@@ -77,13 +78,12 @@ class LockstepRideBatcher:
         min_windows = None
         for i, rd in enumerate(ride_dicts):
             n_lat = int(rd["n_latent_frames"])
-            n_win = n_lat // self.window_size
+            n_win = (n_lat - self.context_frames) // self.window_size
             if self.max_windows_per_ride is not None:
                 n_win = min(n_win, self.max_windows_per_ride)
             self._slots[i] = _RideSlot(
                 zarr_path=rd["zarr_path"],
                 prompt_embeds=rd["prompt_embeds"],
-                z_actions=rd["z_actions"],
                 n_latent_frames=n_lat,
                 n_windows=n_win,
             )
@@ -117,9 +117,13 @@ class LockstepRideBatcher:
     # ------------------------------------------------------------------
 
     def get_window_bounds(self) -> List[Tuple[int, int]]:
-        """Return ``[(start, end), ...]`` for each slot at the current window."""
+        """Return ``[(start, end), ...]`` for each slot at the current window.
+
+        When ``context_frames > 0`` the returned range includes the
+        leading context: ``end - start == window_size + context_frames``.
+        """
         start = self._window_idx * self.window_size
-        end = start + self.window_size
+        end = start + self.window_size + self.context_frames
         return [(start, end)] * self.batch_size
 
     def get_slot_info(self) -> List[_RideSlot]:
@@ -140,7 +144,7 @@ class LockstepRideBatcher:
     ) -> torch.Tensor:
         """Lazy-load the current window's latents for all slots.
 
-        Returns ``[B, window_size, C, H, W]``.
+        Returns ``[B, window_size + context_frames, C, H, W]``.
         """
         from utils.zarr_dataset import ZarrRideDataset
 
@@ -157,12 +161,27 @@ class LockstepRideBatcher:
         self,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        encode_fn: Optional[Callable] = None,
     ) -> torch.Tensor:
-        """Return z_actions for the current window, ``[B, window_size, D]``."""
+        """Return z_actions for the current window, ``[B, window_size + context_frames, D]``.
+
+        Parameters
+        ----------
+        encode_fn : callable
+            ``(zarr_path, n_latent_frames, start, end) -> Tensor[end-start, D]``
+            Encodes motion on-the-fly for just the current window.
+        """
+        if encode_fn is None:
+            raise RuntimeError(
+                "load_z_actions_batch requires encode_fn; "
+                "per-ride z_actions are no longer pre-computed."
+            )
         bounds = self.get_window_bounds()
         actions = []
         for slot, (start, end) in zip(self._slots, bounds):
-            actions.append(slot.z_actions[start:end])
+            actions.append(
+                encode_fn(slot.zarr_path, slot.n_latent_frames, start, end)
+            )
         return torch.stack(actions).to(device=device, dtype=dtype)
 
     def load_prompt_embeds_batch(

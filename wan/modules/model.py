@@ -37,7 +37,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 # @amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs, temporal_offset=0):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -52,7 +52,7 @@ def rope_apply(x, grid_sizes, freqs):
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[0][temporal_offset:f + temporal_offset].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],

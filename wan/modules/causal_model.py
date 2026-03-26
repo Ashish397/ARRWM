@@ -60,6 +60,30 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
+def _separate_action_tokens(x, grid_sizes, action_per_frame):
+    """Pull interleaved action tokens out of the sequence for clean RoPE.
+
+    Layout per frame: [spatial_0 … spatial_{hw-1}, action_0 … action_{a-1}]
+    Returns (spatial_flat, action_flat) where spatial has shape
+    [B, F*H*W, ...] and action has [B, F*a, ...].
+    """
+    f, h, w = grid_sizes[0].tolist()
+    spatial = h * w
+    frame_seq = spatial + action_per_frame
+    # [B, F*frame_seq, ...] -> [B, F, frame_seq, ...]
+    x_framed = x.unflatten(1, (f, frame_seq))
+    return x_framed[:, :, :spatial].flatten(1, 2), x_framed[:, :, spatial:].flatten(1, 2)
+
+
+def _merge_action_tokens(spatial, action, grid_sizes, action_per_frame):
+    """Re-interleave action tokens back into the per-frame sequence."""
+    f, h, w = grid_sizes[0].tolist()
+    spatial_per_frame = h * w
+    sp = spatial.unflatten(1, (f, spatial_per_frame))
+    ac = action.unflatten(1, (f, action_per_frame))
+    return torch.cat([sp, ac], dim=2).flatten(1, 2)
+
+
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -78,6 +102,7 @@ class CausalWanSelfAttention(nn.Module):
         self.sink_size = sink_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.action_tokens_per_frame = 0
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
             values = list(local_attn_size)
@@ -93,6 +118,7 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.tf_rope_offset = 0
 
     def forward(
         self,
@@ -126,6 +152,22 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        a_per_f = self.action_tokens_per_frame
+
+        def _rope_one_chunk(q_c, k_c, gs, offset=0):
+            """Apply RoPE to a single chunk, handling interleaved action tokens."""
+            if a_per_f > 0:
+                q_sp, q_act = _separate_action_tokens(q_c, gs, a_per_f)
+                k_sp, k_act = _separate_action_tokens(k_c, gs, a_per_f)
+                rq_sp = rope_apply(q_sp, gs, freqs, temporal_offset=offset)
+                rk_sp = rope_apply(k_sp, gs, freqs, temporal_offset=offset)
+                return (
+                    _merge_action_tokens(rq_sp, q_act, gs, a_per_f),
+                    _merge_action_tokens(rk_sp, k_act, gs, a_per_f),
+                )
+            return rope_apply(q_c, gs, freqs, temporal_offset=offset), \
+                   rope_apply(k_c, gs, freqs, temporal_offset=offset)
+
         if kv_cache is None:
             # if it is teacher forcing training?
             is_tf = (s == seq_lens[0].item() * 2)
@@ -134,12 +176,12 @@ class CausalWanSelfAttention(nn.Module):
                 k_chunk = torch.chunk(k, 2, dim=1)
                 roped_query = []
                 roped_key = []
-                # rope should be same for clean and noisy parts
+                # ii=0 → clean (positions 0..F-1), ii=1 → noisy (offset by tf_rope_offset)
                 for ii in range(2):
-                    rq = rope_apply(q_chunk[ii], grid_sizes, freqs).type_as(v)
-                    rk = rope_apply(k_chunk[ii], grid_sizes, freqs).type_as(v)
-                    roped_query.append(rq)
-                    roped_key.append(rk)
+                    offset = self.tf_rope_offset if ii == 1 else 0
+                    rq, rk = _rope_one_chunk(q_chunk[ii], k_chunk[ii], grid_sizes, offset)
+                    roped_query.append(rq.type_as(v))
+                    roped_key.append(rk.type_as(v))
 
                 roped_query = torch.cat(roped_query, dim=1)
                 roped_key = torch.cat(roped_key, dim=1)
@@ -172,8 +214,9 @@ class CausalWanSelfAttention(nn.Module):
                 )[:, :, :-padded_length].transpose(2, 1)
 
             else:
-                roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-                roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+                rq, rk = _rope_one_chunk(q, k, grid_sizes)
+                roped_query = rq.type_as(v)
+                roped_key = rk.type_as(v)
 
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
@@ -624,6 +667,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
+        self.context_shift = 0
+        self.action_tokens_per_frame = 0
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -687,7 +732,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _prepare_teacher_forcing_mask(
         device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1
+        frame_seqlen: int = 1560, num_frame_per_block=1,
+        context_shift: int = 0,
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -741,7 +787,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             noise_noise_ends[start:end] = end
             # attend to context tokens in previous blocks
             # noise_context_starts[start:end] = 0
-            noise_context_ends[start:end] = block_index * attention_block_size
+            noise_context_ends[start:end] = (block_index + context_shift) * attention_block_size
 
         def attention_mask(b, h, q_idx, kv_idx):
             # first design the mask for clean frames
@@ -895,7 +941,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        action_tokens=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1053,6 +1100,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        action_tokens=None,
+        action_tokens_clean=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1075,9 +1124,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
-        pass
-        raise NotImplementedError()
-    
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
@@ -1085,7 +1131,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # Construct blockwise causal attn mask
+        a_per_f = self.action_tokens_per_frame
+
+        rope_offset = self.context_shift * self.num_frame_per_block if clean_x is not None else 0
+        for block in self.blocks:
+            block.self_attn.tf_rope_offset = rope_offset
+            block.self_attn.action_tokens_per_frame = a_per_f
+
+        # Compute spatial frame_seqlen and effective frame_seqlen (incl. action tokens)
+        spatial_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
+        frame_seqlen = spatial_seqlen + a_per_f
+
+        # Construct blockwise causal attn mask (invalidate if frame_seqlen changed)
         if self.block_mask is None:
             if clean_x is not None:
                 if self.independent_first_frame:
@@ -1093,21 +1150,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 else:
                     self.block_mask = self._prepare_teacher_forcing_mask(
                         device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block
+                        frame_seqlen=frame_seqlen,
+                        num_frame_per_block=self.num_frame_per_block,
+                        context_shift=self.context_shift,
                     )
             else:
                 if self.independent_first_frame:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
                         device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
                 else:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask(
                         device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
@@ -1123,19 +1181,27 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x = [u.flatten(2).transpose(1, 2) for u in x]
 
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
                       dim=1) for u in x
         ])
 
+        # Insert action tokens (appended after spatial tokens per frame)
+        num_frames_local = grid_sizes[0, 0].item()
+        if action_tokens is not None and a_per_f > 0:
+            x = x[:, :num_frames_local * spatial_seqlen]
+            x = x.unflatten(1, (num_frames_local, spatial_seqlen))
+            at = action_tokens.unsqueeze(2).to(dtype=x.dtype, device=x.device)
+            x = torch.cat([x, at], dim=2).flatten(1, 2)
+
+        seq_lens = torch.tensor([x.shape[1]], dtype=torch.long).expand(x.shape[0])
+        assert seq_lens.max() <= seq_len + num_frames_local * a_per_f
+
         # time embeddings
-        # with amp.autocast(dtype=torch.float32):
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
         e0 = self.time_projection(e).unflatten(
             1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-        # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         context_lens = None
@@ -1155,18 +1221,30 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             clean_x = [u.flatten(2).transpose(1, 2) for u in clean_x]
 
             seq_lens_clean = torch.tensor([u.size(1) for u in clean_x], dtype=torch.long)
-            assert seq_lens_clean.max() <= seq_len
             clean_x = torch.cat([
                 torch.cat([u, u.new_zeros(1, seq_lens_clean[0] - u.size(1), u.size(2))], dim=1) for u in clean_x
             ])
 
+            # Insert clean action tokens
+            if action_tokens_clean is not None and a_per_f > 0:
+                clean_x = clean_x[:, :num_frames_local * spatial_seqlen]
+                clean_x = clean_x.unflatten(1, (num_frames_local, spatial_seqlen))
+                at_c = action_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device)
+                clean_x = torch.cat([clean_x, at_c], dim=2).flatten(1, 2)
+
             x = torch.cat([clean_x, x], dim=1)
+            # Update seq_lens for TF detection (should be half of total)
+            seq_lens = torch.tensor([x.shape[1] // 2], dtype=torch.long).expand(x.shape[0])
+
             if aug_t is None:
                 aug_t = torch.zeros_like(t)
+            saved_am = getattr(self, '_action_modulation', None)
+            self._action_modulation = getattr(self, '_action_modulation_clean', None)
             e_clean = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
             e0_clean = self.time_projection(e_clean).unflatten(
                 1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+            self._action_modulation = saved_am
             e0 = torch.cat([e0_clean, e0], dim=1)
 
         # arguments
@@ -1195,6 +1273,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 x = block(x, **kwargs)
         if clean_x is not None:
             x = x[:, x.shape[1] // 2:]
+
+        # Strip action tokens before head/unpatchify
+        if a_per_f > 0:
+            x = x.unflatten(1, (num_frames_local, frame_seqlen))
+            x = x[:, :, :spatial_seqlen].flatten(1, 2)
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))

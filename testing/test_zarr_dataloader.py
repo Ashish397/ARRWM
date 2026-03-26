@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Test ZarrRideDataset with the lockstep ride batcher.
 
-Mirrors the ``LockstepRideBatcher`` training semantics:
+Mirrors the context-shifted teacher-forcing training semantics:
   - ``batch_size`` rides are selected per group.
   - All rides in the group are advanced in lockstep through non-overlapping
-    ``window_size``-frame windows.
+    ``window_size``-frame windows, each prepended with ``context_frames``
+    leading context (default 3).
+  - Each window loads ``window_size + context_frames`` latent frames.
   - Each slot's VAE decoder cache is reset only when the ride changes.
 
 For each slot × window, decodes latents through the Wan VAE, overlays
@@ -15,6 +17,7 @@ Usage:
     python testing/test_zarr_dataloader.py \\
         --num_rides 4 --windows_per_ride 3 --batch_size 2 \\
         --output_dir testing/outputs \\
+        [--context_frames 3] \\
         [--seed 42] \\
         [--wan_model_path /path/to/Wan2.1/]
 """
@@ -222,7 +225,10 @@ def main() -> None:
     parser.add_argument("--windows_per_ride", type=int, default=3,
                         help="Max non-overlapping windows to decode per ride.")
     parser.add_argument("--window_size", type=int, default=21,
-                        help="Latent frames per window (matches training).")
+                        help="Supervised latent frames per window (matches training).")
+    parser.add_argument("--context_frames", type=int, default=3,
+                        help="Leading context frames prepended to each window "
+                             "(loaded total = window_size + context_frames).")
     parser.add_argument("--encoded_root", default="/projects/u6ej/fbots/frodobots_encoded")
     parser.add_argument("--caption_root", default="/projects/u6ej/fbots/frodobots_captions/train")
     parser.add_argument("--motion_root", default="/projects/u6ej/fbots/frodobots_motion")
@@ -250,8 +256,11 @@ def main() -> None:
 
     start_zarr_index = args.seed % len(zarr_paths)
     logging.info(
-        "Building ZarrRideDataset (start_zarr=%d, max_rides=%d) ...",
+        "Building ZarrRideDataset (start_zarr=%d, max_rides=%d, "
+        "min_ride_frames=%d [window=%d + context=%d]) ...",
         start_zarr_index, args.num_rides,
+        args.window_size + args.context_frames,
+        args.window_size, args.context_frames,
     )
 
     dataset = ZarrRideDataset(
@@ -259,7 +268,7 @@ def main() -> None:
         caption_root=args.caption_root,
         motion_root=args.motion_root,
         ss_vae_checkpoint=args.ss_vae_checkpoint,
-        min_ride_frames=args.window_size,
+        min_ride_frames=args.window_size + args.context_frames,
         device="cpu",
         start_zarr_index=start_zarr_index,
         max_rides=args.num_rides,
@@ -311,6 +320,7 @@ def main() -> None:
         num_frame_per_block=3,
         batch_size=args.batch_size,
         max_windows_per_ride=args.windows_per_ride,
+        context_frames=args.context_frames,
     )
 
     ride_cursor = 0
@@ -346,10 +356,9 @@ def main() -> None:
 
         slots = batcher.get_slot_info()
 
-        # Per-slot state: VAE cache, video cursor, motion, z_actions, combined frames
+        # Per-slot state: VAE cache, video cursor, motion, combined frames
         per_slot_vid_cursor = [0] * args.batch_size
         per_slot_motion: list = []
-        per_slot_z_act: list = []
         per_slot_combined: list = [[] for _ in range(args.batch_size)]
         per_slot_zarr_name: list = []
         per_slot_fps: list = []
@@ -365,11 +374,6 @@ def main() -> None:
             n_video = _latent_to_video_frames(slot.n_latent_frames)
             per_slot_motion.append(_load_motion(slot.zarr_path, n_video))
 
-            total_lat = batcher.group_total_windows * args.window_size
-            per_slot_z_act.append(
-                slot.z_actions[:total_lat].cpu().numpy()
-            )
-
         # Reset VAE cache on every device at the start of each group
         for v in vaes.values():
             v.model.clear_cache()
@@ -383,7 +387,10 @@ def main() -> None:
                 slot = slots[s]
                 zarr_name = per_slot_zarr_name[s]
                 fps = per_slot_fps[s]
-                z_act = per_slot_z_act[s]
+
+                z_act_window = dataset.encode_z_actions_window(
+                    slot.zarr_path, slot.n_latent_frames, lat_s, lat_e,
+                ).numpy()
 
                 dev = slot_device(s)
                 vae = vaes[dev]
@@ -418,15 +425,17 @@ def main() -> None:
                 for j in range(n_vid):
                     f = batch_frames[j].copy()
                     abs_vid_j = vid_cursor + j
-                    lat_j = min(abs_vid_j // _LATENT_TO_VIDEO, z_act.shape[0] - 1)
+                    lat_j_abs = min(abs_vid_j // _LATENT_TO_VIDEO, lat_e - 1)
+                    lat_j_win = lat_j_abs - lat_s
+                    lat_j_win = max(0, min(lat_j_win, z_act_window.shape[0] - 1))
                     motion = per_slot_motion[s]
                     if motion is not None and abs_vid_j < motion.shape[0]:
                         f = draw_motion_overlay(f, motion[abs_vid_j])
                     f = draw_frame_info(
-                        f, s, win_idx, j, lat_j, lat_s, zarr_name,
+                        f, s, win_idx, j, lat_j_abs, lat_s, zarr_name,
                     )
-                    f = draw_latent_overlay(f, z_act[lat_j])
-                    f = draw_latent_dial(f, z_act[lat_j])
+                    f = draw_latent_overlay(f, z_act_window[lat_j_win])
+                    f = draw_latent_dial(f, z_act_window[lat_j_win])
                     annotated_frames.append(f)
                 annotated = np.stack(annotated_frames)
                 per_slot_vid_cursor[s] += n_vid

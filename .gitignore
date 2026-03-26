@@ -23,3 +23,6 @@ testing/outputs/
 cotracker/
 
 action_analysis_results.md
+testing/motion_habitat_gpu0/
+Causal-Forcing/
+RollingForcing/
