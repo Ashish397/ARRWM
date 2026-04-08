@@ -42,7 +42,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # hard code for Wan2.1-T2V-1.3B
         self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        self._spatial_frame_seq_length = 1560
 
         self.kv_cache1 = None
         self.args = args
@@ -56,6 +56,11 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+    @property
+    def frame_seq_length(self) -> int:
+        extra = int(getattr(self.generator.model, "action_tokens_per_frame", 0))
+        return self._spatial_frame_seq_length + extra
 
     def inference(
         self,
@@ -180,7 +185,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
@@ -188,6 +193,7 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    denoised_pred = model_out[1]
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -197,7 +203,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # for getting real output
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
@@ -205,6 +211,7 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    denoised_pred = model_out[1]
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
             # Step 2.3: rerun with timestep zero to update KV cache using clean context

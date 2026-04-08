@@ -1,10 +1,15 @@
-"""Lockstep ride batcher for causal teacher training.
+"""Streaming ride batcher for causal teacher training.
 
-Provides ``LockstepRideBatcher`` — a deterministic non-overlapping
-window batcher that advances multiple rides in lockstep.
+Provides ``LockstepRideBatcher`` — a per-slot independent window batcher
+that advances each batch slot through its own ride. When a slot's ride
+is exhausted, only that slot is replaced with a fresh ride.
+
+Each slot also receives a random block-aligned start offset so that
+batch members begin at different temporal positions in their rides.
 """
 
-from dataclasses import dataclass
+import random
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -18,25 +23,35 @@ class _RideSlot:
     prompt_embeds: Optional[torch.Tensor] = None
     n_latent_frames: int = 0
     n_windows: int = 0
+    window_idx: int = 0
+    start_offset: int = 0
+    loaded: bool = False
 
 
 class LockstepRideBatcher:
-    """Deterministic non-overlapping window batcher for multiple rides.
+    """Per-slot independent window batcher for multiple rides.
 
-    Maintains ``batch_size`` slots.  All slots share the same window
-    index and advance in lockstep.  When any slot's ride is exhausted,
-    the entire group is replaced with the next ``batch_size`` rides.
+    Each batch slot tracks its own ride, window index, and start offset.
+    When a slot's ride is exhausted the caller replaces just that slot
+    via :meth:`refill_slots`.  The initial fill is done through
+    :meth:`load_group` for backward compatibility.
 
     Parameters
     ----------
     window_size : int
         Latent frames per window (e.g. 21).
     num_frame_per_block : int
-        Block size for block-aligned truncation (e.g. 3).
+        Block size for block-aligned start offsets (e.g. 3).
     batch_size : int
         Number of simultaneous rides.
     max_windows_per_ride : int or None
         Optional cap on how many windows to use from each ride.
+    context_frames : int
+        Clean context frames prepended to each window.
+    max_start_offset : int
+        Upper bound (inclusive) for per-slot random start offset.
+        Actual offset is rounded down to a multiple of
+        ``num_frame_per_block``.
     """
 
     def __init__(
@@ -46,6 +61,7 @@ class LockstepRideBatcher:
         batch_size: int = 1,
         max_windows_per_ride: Optional[int] = None,
         context_frames: int = 3,
+        max_start_offset: int = 40,
     ):
         assert window_size % num_frame_per_block == 0
         self.window_size = window_size
@@ -53,85 +69,133 @@ class LockstepRideBatcher:
         self.batch_size = batch_size
         self.max_windows_per_ride = max_windows_per_ride
         self.context_frames = context_frames
+        self.max_start_offset = max_start_offset
 
         self._slots: List[_RideSlot] = [_RideSlot() for _ in range(batch_size)]
-        self._window_idx: int = 0
-        self._group_n_windows: int = 0
-        self._group_loaded: bool = False
 
     # ------------------------------------------------------------------
-    # Group lifecycle
+    # Slot-level helpers
+    # ------------------------------------------------------------------
+
+    def _random_start_offset(self) -> int:
+        """Sample a block-aligned start offset in ``[0, max_start_offset]``."""
+        if self.max_start_offset <= 0:
+            return 0
+        raw = random.randint(0, self.max_start_offset)
+        return (raw // self.num_frame_per_block) * self.num_frame_per_block
+
+    def _init_slot(self, idx: int, rd: dict) -> None:
+        """Populate slot *idx* from a ride dict with a fresh random offset."""
+        n_lat = int(rd["n_latent_frames"])
+        offset = self._random_start_offset()
+        usable = n_lat - offset - self.context_frames
+        if usable < self.window_size:
+            offset = 0
+            usable = n_lat - self.context_frames
+        n_win = max(0, usable // self.window_size)
+        if self.max_windows_per_ride is not None:
+            n_win = min(n_win, self.max_windows_per_ride)
+        self._slots[idx] = _RideSlot(
+            zarr_path=rd["zarr_path"],
+            prompt_embeds=rd["prompt_embeds"],
+            n_latent_frames=n_lat,
+            n_windows=n_win,
+            window_idx=0,
+            start_offset=offset,
+            loaded=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Group lifecycle (backward-compatible initial fill)
     # ------------------------------------------------------------------
 
     def load_group(self, ride_dicts: List[dict]) -> None:
         """Fill all slots with a new group of rides.
 
-        Each element of *ride_dicts* must contain the keys returned by
-        ``ZarrRideDataset.__getitem__``: ``zarr_path``, ``prompt_embeds``,
-        ``n_latent_frames``.
+        Each element of *ride_dicts* must contain ``zarr_path``,
+        ``prompt_embeds``, ``n_latent_frames``.
         """
         if len(ride_dicts) != self.batch_size:
             raise ValueError(
                 f"Expected {self.batch_size} rides, got {len(ride_dicts)}"
             )
-
-        min_windows = None
         for i, rd in enumerate(ride_dicts):
-            n_lat = int(rd["n_latent_frames"])
-            n_win = (n_lat - self.context_frames) // self.window_size
-            if self.max_windows_per_ride is not None:
-                n_win = min(n_win, self.max_windows_per_ride)
-            self._slots[i] = _RideSlot(
-                zarr_path=rd["zarr_path"],
-                prompt_embeds=rd["prompt_embeds"],
-                n_latent_frames=n_lat,
-                n_windows=n_win,
-            )
-            if min_windows is None or n_win < min_windows:
-                min_windows = n_win
+            self._init_slot(i, rd)
 
-        self._group_n_windows = min_windows or 0
-        self._window_idx = 0
-        self._group_loaded = True
+    # ------------------------------------------------------------------
+    # Per-slot refill
+    # ------------------------------------------------------------------
+
+    def exhausted_slot_indices(self) -> List[int]:
+        """Return indices of slots that need a new ride."""
+        return [
+            i for i, s in enumerate(self._slots)
+            if not s.loaded or s.window_idx >= s.n_windows
+        ]
+
+    def refill_slots(self, slot_indices: List[int], ride_dicts: List[dict]) -> None:
+        """Replace specific exhausted slots with fresh rides."""
+        if len(slot_indices) != len(ride_dicts):
+            raise ValueError(
+                f"Got {len(slot_indices)} indices but {len(ride_dicts)} rides"
+            )
+        for idx, rd in zip(slot_indices, ride_dicts):
+            self._init_slot(idx, rd)
+
+    def needs_refill(self) -> bool:
+        """True if any slot needs a new ride, or batch not yet initialised."""
+        return len(self.exhausted_slot_indices()) > 0
 
     def needs_new_group(self) -> bool:
-        """True when the current group is exhausted or not yet loaded."""
-        if not self._group_loaded:
-            return True
-        return self._window_idx >= self._group_n_windows
+        """Backward-compatible alias for :meth:`needs_refill`."""
+        return self.needs_refill()
+
+    # ------------------------------------------------------------------
+    # Properties (backward-compatible)
+    # ------------------------------------------------------------------
 
     @property
     def current_window_idx(self) -> int:
-        return self._window_idx
+        """Max window index across all active slots (for logging)."""
+        active = [s.window_idx for s in self._slots if s.loaded]
+        return max(active) if active else 0
 
     @property
     def is_first_window(self) -> bool:
-        return self._window_idx == 0
+        return all(s.window_idx == 0 for s in self._slots if s.loaded)
 
     @property
     def group_total_windows(self) -> int:
-        return self._group_n_windows
+        """Minimum n_windows across all active slots (for logging)."""
+        active = [s.n_windows for s in self._slots if s.loaded]
+        return min(active) if active else 0
 
     # ------------------------------------------------------------------
     # Per-step interface
     # ------------------------------------------------------------------
 
     def get_window_bounds(self) -> List[Tuple[int, int]]:
-        """Return ``[(start, end), ...]`` for each slot at the current window.
+        """Return ``[(start, end), ...]`` for each slot at its current window.
 
-        When ``context_frames > 0`` the returned range includes the
-        leading context: ``end - start == window_size + context_frames``.
+        Each slot has its own start offset and window index, so bounds
+        may differ across slots.  When ``context_frames > 0`` the
+        returned range includes the leading context.
         """
-        start = self._window_idx * self.window_size
-        end = start + self.window_size + self.context_frames
-        return [(start, end)] * self.batch_size
+        bounds = []
+        for s in self._slots:
+            start = s.start_offset + s.window_idx * self.window_size
+            end = start + self.window_size + self.context_frames
+            bounds.append((start, end))
+        return bounds
 
     def get_slot_info(self) -> List[_RideSlot]:
         return list(self._slots)
 
     def advance(self) -> None:
-        """Move to the next window."""
-        self._window_idx += 1
+        """Advance every non-exhausted slot to the next window."""
+        for s in self._slots:
+            if s.loaded and s.window_idx < s.n_windows:
+                s.window_idx += 1
 
     # ------------------------------------------------------------------
     # Convenience: build batched tensors
@@ -195,8 +259,8 @@ class LockstepRideBatcher:
 
     def summary(self) -> str:
         """Human-readable one-line summary of current state."""
-        names = [s.zarr_path.split("/")[-1] if s.zarr_path else "?" for s in self._slots]
-        return (
-            f"win={self._window_idx}/{self._group_n_windows} "
-            f"rides=[{', '.join(names)}]"
-        )
+        parts = []
+        for s in self._slots:
+            name = s.zarr_path.split("/")[-1] if s.zarr_path else "?"
+            parts.append(f"{name}[w={s.window_idx}/{s.n_windows},off={s.start_offset}]")
+        return f"slots=[{', '.join(parts)}]"

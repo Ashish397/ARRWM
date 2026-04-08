@@ -288,7 +288,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                         print(f"[SeqTrain-Pipeline] Block {block_index} intermediate steps (no grad)")
                         
                     with torch.no_grad():
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_with_action,
                             timestep=timestep,
@@ -296,6 +296,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+                        denoised_pred = model_out[1]
                         
                         # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
@@ -316,7 +317,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                     
                     context_manager = torch.enable_grad() if enable_grad else torch.no_grad()
                     with context_manager:
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_with_action,
                             timestep=timestep,
@@ -324,6 +325,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+                        denoised_pred = model_out[1]
                     break
             
             # Record output (preserve graph)
@@ -487,7 +489,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                     print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
                 if not exit_flag:
                     with torch.no_grad():
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_with_action,
                             timestep=timestep,
@@ -495,6 +497,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
+                        denoised_pred = model_out[1]
                         next_timestep = self.denoising_step_list[index + 1]
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
@@ -508,7 +511,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                     if current_start_frame < start_gradient_frame_index:
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = False
                         with torch.no_grad():
-                            _, denoised_pred = self.generator(
+                            model_out = self.generator(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=cond_with_action,
                                 timestep=timestep,
@@ -516,10 +519,11 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                                 crossattn_cache=self.crossattn_cache,
                                 current_start=current_start_frame * self.frame_seq_length
                             )
+                            denoised_pred = model_out[1]
                     else:
                         # print(f"enable grad: {current_start_frame}")
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = True
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_with_action,
                             timestep=timestep,
@@ -527,6 +531,7 @@ class ActionSelfForcingTrainingPipeline(SelfForcingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
+                        denoised_pred = model_out[1]
                     break
 
             # Step 3.2: record the model's output

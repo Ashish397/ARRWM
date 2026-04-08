@@ -11,11 +11,14 @@ prompts
 checkpoints/
 logs/
 wandb/
+
+# Local eval runs (videos, checkpoints of outputs)
+eval/
 pre_encode.log
 *.err
 *.out
-*.sbatch
 *.outcore
+# Slurm job scripts live in sbatch/ and are tracked (do not add *.sbatch here).
 
 test_grid_outputs/
 test_predictions/

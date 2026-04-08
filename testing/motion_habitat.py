@@ -317,9 +317,9 @@ def load_videos(config, num_videos: int, device: torch.device,
         target_latents = full_latents[context_frames:]
 
         z_actions = dataset.encode_z_actions_window(
-            zarr_path, n_latent_frames, context_frames, min_ride_frames,
+            zarr_path, n_latent_frames, 0, min_ride_frames,
         )
-        z_actions_sliced = z_actions[..., action_dims]
+        z_actions_sliced = z_actions[context_frames:][..., action_dims]
 
         videos.append({
             "context_latents": context_latents,

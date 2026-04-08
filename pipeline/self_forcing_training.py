@@ -30,7 +30,7 @@ class SelfForcingTrainingPipeline:
 
         # Wan specific hyperparameters
         self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        self._spatial_frame_seq_length = 1560
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
         self.i2v = False
@@ -69,9 +69,15 @@ class SelfForcingTrainingPipeline:
                 return min(base + slice_last_frames, num_training_frames)
 
         kv_frames = _resolve_kv_frames(self.local_attn_size)
+        self.kv_frames = int(kv_frames)
         if DEBUG:
             print(f"[KV policy] local_attn_size={self.local_attn_size} slice_last_frames={slice_last_frames} num_training_frames={num_training_frames} -> kv_frames={kv_frames}")
-        self.kv_cache_size = int(kv_frames) * self.frame_seq_length
+        self.kv_cache_size = self.kv_frames * self.frame_seq_length
+
+    @property
+    def frame_seq_length(self) -> int:
+        extra = int(getattr(self.generator.model, "action_tokens_per_frame", 0))
+        return self._spatial_frame_seq_length + extra
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -205,7 +211,7 @@ class SelfForcingTrainingPipeline:
                         print(f"[SeqTrain-Pipeline] Block {block_index} intermediate steps (no grad)")
                         
                     with torch.no_grad():
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=conditional_dict,
                             timestep=timestep,
@@ -213,6 +219,7 @@ class SelfForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+                        denoised_pred = model_out[1]
                         
                         # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
@@ -233,7 +240,7 @@ class SelfForcingTrainingPipeline:
                     
                     context_manager = torch.enable_grad() if enable_grad else torch.no_grad()
                     with context_manager:
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=conditional_dict,
                             timestep=timestep,
@@ -241,6 +248,7 @@ class SelfForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+                        denoised_pred = model_out[1]
                     break
             
             # Record output
@@ -403,7 +411,7 @@ class SelfForcingTrainingPipeline:
                     print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
                 if not exit_flag:
                     with torch.no_grad():
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=conditional_dict,
                             timestep=timestep,
@@ -411,6 +419,7 @@ class SelfForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
+                        denoised_pred = model_out[1]
                         next_timestep = self.denoising_step_list[index + 1]
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
@@ -424,7 +433,7 @@ class SelfForcingTrainingPipeline:
                     if current_start_frame < start_gradient_frame_index:
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = False
                         with torch.no_grad():
-                            _, denoised_pred = self.generator(
+                            model_out = self.generator(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=conditional_dict,
                                 timestep=timestep,
@@ -432,10 +441,11 @@ class SelfForcingTrainingPipeline:
                                 crossattn_cache=self.crossattn_cache,
                                 current_start=current_start_frame * self.frame_seq_length
                             )
+                            denoised_pred = model_out[1]
                     else:
                         # print(f"enable grad: {current_start_frame}")
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = True
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=conditional_dict,
                             timestep=timestep,
@@ -443,6 +453,7 @@ class SelfForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
+                        denoised_pred = model_out[1]
                     break
 
             # Step 3.2: record the model's output
@@ -498,13 +509,15 @@ class SelfForcingTrainingPipeline:
         """
         Initialize a Per-GPU KV cache for the Wan model.
         """
+        kv_cache_size = self.kv_frames * self.frame_seq_length
+        self.kv_cache_size = kv_cache_size
         kv_cache1 = []
         if DEBUG:
-            print(f"rank {dist.get_rank()} initialize kv cache with batch_size: {batch_size}, kv_cache_size: {self.kv_cache_size}")
+            print(f"rank {dist.get_rank()} initialize kv cache with batch_size: {batch_size}, kv_cache_size: {kv_cache_size}")
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })

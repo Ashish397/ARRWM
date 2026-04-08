@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GPU integration test for the action critic pipeline.
 
-Two modes:
+Three modes:
   1. ``--mode visual``  — Loads one real zarr window, noises it to t=25,
      runs the full teacher-target pipeline (VAE decode → CoTracker → ss_vae),
      saves annotated MP4s showing decoded pixels and extracted z2/z7.
@@ -9,6 +9,11 @@ Two modes:
   2. ``--mode train``   — Builds the real model, critic, and frozen evaluator,
      runs 1 training step with batch_size=1, then reports every loss term,
      gradient norms on every parameter group, and runs sanity assertions.
+
+  3. ``--mode teacher`` — Decodes real zarr latents to pixels, runs
+     CoTracker → ss_vae (the same path training uses), and compares the
+     resulting z2/z7 against the saved motion-file targets for the same
+     ride window.
 
 Usage:
     # Visual pipeline test
@@ -221,18 +226,18 @@ def run_visual_test(args) -> None:
         latents = chunk.unsqueeze(0).to(device=device, dtype=torch.float32)
 
         num_frames = lat_end - lat_start - cf
-        clean_latents = latents[:, :num_frames]
+        target_latents = latents[:, cf:]
 
         z_actions = dataset.encode_z_actions_window(
             zarr_path, n_lat, lat_start, lat_end,
         ).unsqueeze(0).to(device=device)
-        z_target = z_actions[:, cf:, :][:, :num_frames]
+        z_target = z_actions[:, cf:]
         z_target_27 = z_target[..., [2, 7]]
         logging.info("Target z2/z7: %s  mean=%.3f", tuple(z_target_27.shape), z_target_27.mean().item())
 
         # ── Add noise ──
-        dummy = clean_latents[:, 0:1]
-        latents_with_dummy = torch.cat([dummy, clean_latents], dim=1)
+        dummy = target_latents[:, 0:1]
+        latents_with_dummy = torch.cat([dummy, target_latents], dim=1)
         B, Fp1, C, H, W = latents_with_dummy.shape
 
         noise = torch.randn_like(latents_with_dummy.flatten(0, 1))
@@ -312,9 +317,10 @@ def run_visual_test(args) -> None:
             logging.info("  seg %d tgt: %s", i, tgt_vals)
             logging.info("")
 
-        # Reward
+        # Reward (asymmetric: overshoot penalised less than undershoot)
         target_seg_27 = z_target_27[0, :n_seg * 3].reshape(n_seg, 3, 2).mean(dim=1) if n_seg * 3 <= z_target_27.shape[1] else gen_z27 * 0
-        reward = -((gen_z27 - target_seg_27) ** 2).mean(dim=-1)
+        diff = _asymmetric_action_diff(gen_z27, target_seg_27)
+        reward = -torch.log(diff + 1e-6).mean(dim=-1)
         logging.info("Per-segment reward: %s", reward.cpu().tolist()[:7])
         logging.info("Mean reward: %.6f", reward.mean().item())
 
@@ -486,9 +492,12 @@ def run_train_test(args) -> None:
     scheduler.set_timesteps(1000, training=True)
 
     # ── Build action critic + frozen evaluator ──
-    logging.info("Building ActionCritic + frozen evaluator ...")
+    logging.info("Building ActionCritic (reward-only) + frozen evaluator ...")
     num_frame_per_block = 3
-    critic = ActionCritic(latent_channels=16, z_dim=2, base_channels=64, num_res_blocks=3, chunk_frames=num_frame_per_block).to(device)
+    critic = ActionCritic(
+        latent_channels=16, action_dim=2, base_channels=64,
+        num_res_blocks=3, chunk_frames=num_frame_per_block,
+    ).to(device)
     critic.train()
 
     frozen_vae = WanVAEWrapper().to(device=device, dtype=dtype).eval()
@@ -585,26 +594,24 @@ def run_train_test(args) -> None:
         )
         t_teacher = time.perf_counter() - t0
 
-        # ── Critic + generator losses (chunkwise -- no temporal pooling) ──
+        # ── Reward critic + generator guidance ──
         n_chunks = teacher_z.shape[1]
+        chunk_t = ts[:, ::num_frame_per_block][:, :n_chunks]
+        chunk_actions = _chunk_actions(target_action_z, num_frame_per_block)[:, :n_chunks]
+
         with torch.amp.autocast(device_type="cuda", dtype=dtype):
-            pred_z_c, pred_r_c = critic(pred_x0.detach())
-            pred_z_c = pred_z_c[:, :n_chunks].float()
+            # Critic training loss (detached pred_x0)
+            pred_r_c = critic(pred_x0.detach(), chunk_t, chunk_actions)
             pred_r_c = pred_r_c[:, :n_chunks].float()
 
-            critic_z_loss = F.mse_loss(pred_z_c, teacher_z.float())
-            critic_r_loss = F.mse_loss(pred_r_c, teacher_reward.float())
-            critic_loss = critic_z_loss + 0.1 * critic_r_loss
+            critic_loss = F.mse_loss(pred_r_c, teacher_reward.float())
 
+            # Generator guidance (frozen critic, gradient through pred_x0)
             critic.requires_grad_(False)
-            gen_z, gen_r = critic(pred_x0)
-            gen_z = gen_z[:, :n_chunks].float()
+            gen_r = critic(pred_x0, chunk_t, chunk_actions)
             gen_r = gen_r[:, :n_chunks].float()
-            target_chunk = _chunk_actions(target_action_z, num_frame_per_block)[:, :n_chunks].float()
-
-            gen_z_loss = F.mse_loss(gen_z, target_chunk)
             gen_reward_loss = -gen_r.mean()
-            gen_action_loss = 1.0 * gen_z_loss + 0.1 * gen_reward_loss
+            gen_action_loss = 1.0 * gen_reward_loss
             critic.requires_grad_(True)
 
             total_loss = flow_loss + critic_loss + gen_action_loss
@@ -622,10 +629,9 @@ def run_train_test(args) -> None:
         logging.info("  timing: fwd=%.2fs  teacher=%.2fs  bwd=%.2fs  step=%.2fs",
                      t_fwd, t_teacher, t_bwd, t_step)
         logging.info("  flow_loss       = %.6f", flow_loss.item())
-        logging.info("  critic_z_loss   = %.6f   critic_r_loss = %.6f   critic_total = %.6f",
-                     critic_z_loss.item(), critic_r_loss.item(), critic_loss.item())
-        logging.info("  gen_z_loss      = %.6f   gen_reward    = %.6f   gen_total    = %.6f",
-                     gen_z_loss.item(), gen_reward_loss.item(), gen_action_loss.item())
+        logging.info("  critic_loss     = %.6f", critic_loss.item())
+        logging.info("  gen_reward_loss = %.6f   gen_total   = %.6f",
+                     gen_reward_loss.item(), gen_action_loss.item())
         logging.info("  TOTAL           = %.6f", total_loss.item())
 
     # ── Final gradient report + sanity checks (last step only) ──
@@ -673,8 +679,13 @@ def run_train_test(args) -> None:
     check("adaLN projection grads non-zero", gn_adaln > 0)
     check("action token projection grads non-zero", gn_atokp > 0)
     check("critic grads non-zero", gn_critic > 0)
-    check("teacher_z has correct dims", teacher_z.shape[-1] == 2)
     check("teacher_reward has correct dims", teacher_reward.shape[-1] == 1)
+    check("critic returns single reward per chunk",
+          pred_r_c.shape == (bsz, n_chunks, 1))
+    check("timestep embedding works (critic has time_embed params)",
+          any("time_embed" in n for n, _ in critic.named_parameters()))
+    check("action embedding works (critic has action_embed params)",
+          any("action_embed" in n for n, _ in critic.named_parameters()))
     check("gen grads flow through pred_x0 to model",
           gn_model > 0 and gn_critic > 0)
 
@@ -693,6 +704,230 @@ def run_train_test(args) -> None:
 
 
 # ===================================================================
+# Teacher pipeline regression test (latent → VAE decode → CoTracker → ss_vae)
+# ===================================================================
+
+def run_teacher_pipeline_test(args) -> None:
+    """Decode real zarr latents, run the teacher pipeline, compare against saved motion z-actions.
+
+    This mirrors what training does: start from encoded latents, VAE-decode to
+    pixels, run CoTracker → ss_vae, and check that the resulting z2/z7 values
+    are aligned with the motion-file-derived targets for the same ride window.
+    """
+    from utils.wan_wrapper import WanVAEWrapper
+    from utils.zarr_dataset import (
+        ZarrRideDataset,
+        _tanh_squash,
+        _LATENT_TO_VIDEO,
+    )
+    from action_query.ss_vae_model import load_ss_vae
+
+    device = torch.device(args.device)
+    action_dims = [2, 7]
+    window_size = 24
+    cf = 3
+    num_frames = window_size - cf
+    noise_t = args.noise_t
+
+    # ── Load dataset ──
+    logging.info("Building ZarrRideDataset ...")
+    dataset = ZarrRideDataset(
+        encoded_root=args.encoded_root,
+        caption_root=args.caption_root,
+        motion_root=args.motion_root,
+        ss_vae_checkpoint=args.ss_vae_checkpoint,
+        min_ride_frames=window_size,
+        device="cpu",
+        max_rides=max(args.ride_index + 1, 4),
+    )
+    if len(dataset) <= args.ride_index:
+        raise IndexError(f"ride_index={args.ride_index} out of range for dataset size {len(dataset)}")
+
+    ride = dataset[args.ride_index]
+    zarr_path = ride["zarr_path"]
+    n_lat = int(ride["n_latent_frames"])
+    logging.info("Using ride index %d: %s  (%d latent frames)", args.ride_index, zarr_path, n_lat)
+
+    # ── Load latents + z-actions for one window ──
+    chunk = ZarrRideDataset.load_latent_chunk(zarr_path, 0, window_size)
+    latents = chunk.unsqueeze(0).to(device=device, dtype=torch.float32)
+    # Match training: teacher pipeline operates on target latents (after context)
+    target_latents = latents[:, cf:]          # [1, num_frames, C, H, W]
+
+    z_actions = dataset.encode_z_actions_window(
+        zarr_path, n_lat, 0, window_size,
+    ).unsqueeze(0).to(device=device)
+    z_target = z_actions[:, cf:]              # same temporal span as target_latents
+    z_target_27 = z_target[..., action_dims]
+    logging.info("Target latents: %s   z_target_27: %s", tuple(target_latents.shape), tuple(z_target_27.shape))
+
+    # ── Load heavy models ──
+    from utils.scheduler import FlowMatchScheduler
+    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+    scheduler.set_timesteps(1000, training=True)
+
+    logging.info("Loading VAE ...")
+    vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
+    vae.requires_grad_(False)
+
+    logging.info("Loading CoTracker ...")
+    cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
+    cotracker.eval()
+    for p in cotracker.parameters():
+        p.requires_grad_(False)
+
+    logging.info("Loading ss_vae ...")
+    ss_vae, scale = load_ss_vae(args.ss_vae_checkpoint, device=str(device))
+    ss_vae.eval()
+    ss_vae.requires_grad_(False)
+
+    grid_size = 10
+    output_chunk_size = 12
+    N = grid_size ** 2
+
+    # ── Prepare latents (optionally add noise, matching training pipeline) ──
+    dummy = target_latents[:, 0:1]
+    latents_with_dummy = torch.cat([dummy, target_latents], dim=1)
+    B, Fp1, C, H, W = latents_with_dummy.shape
+
+    if noise_t > 0:
+        noise = torch.randn_like(latents_with_dummy.flatten(0, 1))
+        t_fixed = torch.full((noise.shape[0],), noise_t, dtype=torch.long, device=device)
+        decode_input = scheduler.add_noise(
+            latents_with_dummy.flatten(0, 1), noise, t_fixed,
+        ).unflatten(0, (B, Fp1))
+    else:
+        decode_input = latents_with_dummy
+    logging.info("Decode input (noise_t=%d): %s", noise_t, tuple(decode_input.shape))
+
+    # ── VAE decode → pixels ──
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        pixels = vae.decode_to_pixel(decode_input.to(dtype=torch.bfloat16))
+    pixels = pixels[:, 1:, ...]
+    t_dec = time.perf_counter() - t0
+    logging.info("Decoded pixels: %s  (%.2fs)", tuple(pixels.shape), t_dec)
+
+    video_0255 = (255.0 * 0.5 * (pixels.float() + 1.0)).clamp(0, 255)
+
+    # ── CoTracker ──
+    vid = video_0255[0].unsqueeze(0)
+    T_total = vid.shape[1]
+
+    logging.info("Running CoTracker on %d video frames ...", T_total)
+    t0 = time.perf_counter()
+    all_motion = []
+    for cs in range(0, T_total, 48):
+        ce = min(cs + 48, T_total)
+        ch = vid[:, cs:ce]
+        n_out = ch.shape[1] // output_chunk_size
+        if n_out == 0:
+            continue
+        used = n_out * output_chunk_size
+        ch = ch[:, :used].clone()
+        with torch.amp.autocast(device_type="cuda", enabled=True):
+            tracks, vis = cotracker(ch, grid_size=grid_size)
+        tw = tracks.reshape(1, n_out, output_chunk_size, N, 2)
+        if vis.dim() == 3:
+            vw = vis.reshape(1, n_out, output_chunk_size, N).unsqueeze(-1)
+        else:
+            vw = vis.reshape(1, n_out, output_chunk_size, N, 1)
+        dw = tw[:, :, 1:] - tw[:, :, :-1]
+        mo = dw.mean(dim=2)
+        vo = vw.to(dtype=mo.dtype).mean(dim=2)
+        mw = torch.cat([mo, vo], dim=-1).squeeze(0)
+        all_motion.append(mw)
+
+    est_motion = torch.cat(all_motion, dim=0)
+    t_ct = time.perf_counter() - t0
+    n_seg = est_motion.shape[0]
+    logging.info("CoTracker done: %d segments  (%.2fs)", n_seg, t_ct)
+
+    # ── ss_vae encode ──
+    xy = est_motion[:, :, :2].reshape(n_seg, 10, 10, 2)
+    x_in = xy.permute(0, 3, 1, 2).float() / scale
+    with torch.no_grad():
+        mu, _ = ss_vae.encoder(x_in.to(device))
+    z_full = _tanh_squash(mu.squeeze(-1).squeeze(-1))
+    teacher_z27 = z_full[:, action_dims].float().cpu()
+    logging.info("Teacher z (all 8): %s  z2/z7: %s", tuple(z_full.shape), tuple(teacher_z27.shape))
+
+    # ── Build comparable motion-file targets ──
+    # z_target_27 is [1, num_frames, 2] at latent frame rate.
+    # teacher_z27 is [n_seg, 2] at 12-video-frame segments.
+    # Map each segment to the mean of the corresponding latent-frame targets.
+    target_seg_list = []
+    for seg_i in range(n_seg):
+        vid_start = seg_i * output_chunk_size
+        vid_end = vid_start + output_chunk_size
+        lat_start = vid_start // _LATENT_TO_VIDEO
+        lat_end = min((vid_end + _LATENT_TO_VIDEO - 1) // _LATENT_TO_VIDEO, z_target_27.shape[1])
+        target_seg_list.append(z_target_27[0, lat_start:lat_end].mean(dim=0))
+    motion_target_z = torch.stack(target_seg_list).cpu()
+
+    n_compare = min(teacher_z27.shape[0], motion_target_z.shape[0])
+    teacher_z27 = teacher_z27[:n_compare]
+    motion_target_z = motion_target_z[:n_compare]
+
+    # ── Metrics ──
+    mse = F.mse_loss(teacher_z27, motion_target_z).item()
+    mae = F.l1_loss(teacher_z27, motion_target_z).item()
+    zero_mse = F.mse_loss(torch.zeros_like(motion_target_z), motion_target_z).item()
+    prev_shift_mse = F.mse_loss(teacher_z27[1:], motion_target_z[:-1]).item()
+    next_shift_mse = F.mse_loss(teacher_z27[:-1], motion_target_z[1:]).item()
+
+    logging.info("=" * 60)
+    logging.info("TEACHER PIPELINE RESULTS")
+    logging.info("=" * 60)
+    logging.info("Teacher z2/z7 shape: %s", tuple(teacher_z27.shape))
+    logging.info("Motion target z2/z7 shape: %s", tuple(motion_target_z.shape))
+
+    for i in range(n_compare):
+        tz = teacher_z27[i].numpy()
+        mz = motion_target_z[i].numpy()
+        logging.info("  seg %d  teacher=[%+.4f, %+.4f]  motion=[%+.4f, %+.4f]  err=[%.4f, %.4f]",
+                     i, tz[0], tz[1], mz[0], mz[1], abs(tz[0] - mz[0]), abs(tz[1] - mz[1]))
+
+    logging.info("Alignment: mse=%.6f mae=%.6f", mse, mae)
+    logging.info("Baselines: zero=%.6f prev_shift=%.6f next_shift=%.6f",
+                 zero_mse, prev_shift_mse, next_shift_mse)
+
+    # ── Checks ──
+    checks_passed = 0
+    checks_total = 0
+
+    def check(name, condition):
+        nonlocal checks_passed, checks_total
+        checks_total += 1
+        if condition:
+            checks_passed += 1
+            logging.info("  [PASS] %s", name)
+        else:
+            logging.error("  [FAIL] %s", name)
+
+    check("teacher shape matches motion target", teacher_z27.shape == motion_target_z.shape)
+    check("teacher z finite", torch.isfinite(teacher_z27).all().item())
+    check("motion target z finite", torch.isfinite(motion_target_z).all().item())
+    check("teacher beats zero baseline (mse %.6f < %.6f)" % (mse, zero_mse), mse < zero_mse)
+    check("teacher beats prev-shift baseline (mse %.6f < %.6f)" % (mse, prev_shift_mse), mse < prev_shift_mse)
+    check("teacher beats next-shift baseline (mse %.6f < %.6f)" % (mse, next_shift_mse), mse < next_shift_mse)
+    check("per-segment MAE < 0.5", mae < 0.5)
+
+    logging.info("=" * 60)
+    logging.info("TEACHER PIPELINE: %d/%d checks passed", checks_passed, checks_total)
+    logging.info("=" * 60)
+
+    del vae, cotracker, ss_vae
+    torch.cuda.empty_cache()
+
+    if checks_passed < checks_total:
+        logging.error("TEACHER PIPELINE TEST FAILED")
+        sys.exit(1)
+
+    logging.info("TEACHER PIPELINE TEST PASSED")
+
+
+# ===================================================================
 # Shared helpers
 # ===================================================================
 
@@ -702,6 +937,23 @@ def _chunk_actions(per_frame: torch.Tensor, chunk_frames: int) -> torch.Tensor:
     n_chunks = F_len // chunk_frames
     trimmed = per_frame[:, :n_chunks * chunk_frames]
     return trimmed.reshape(B, n_chunks, chunk_frames, D).mean(dim=2)
+
+
+def _asymmetric_action_diff(
+    gen: torch.Tensor,
+    target: torch.Tensor,
+    over_weight: float = 0.5,
+    under_weight: float = 1.0,
+) -> torch.Tensor:
+    """Asymmetric action error: undershoot penalised more than overshoot."""
+    raw_err = gen - target
+    dir_sign = torch.sign(target)
+    signed_err = raw_err * dir_sign
+    over_err = torch.relu(signed_err)
+    under_err = torch.relu(-signed_err)
+    asym = over_weight * over_err + under_weight * under_err
+    sym = raw_err.abs()
+    return torch.where(target.abs() > 1e-3, asym, sym)
 
 
 def _reduce_to_segments(per_frame: torch.Tensor, n_seg: int) -> torch.Tensor:
@@ -787,7 +1039,8 @@ def _compute_teacher_targets(
 
         gz_chunked = _reduce_to_segments(gz, n_chunks)
         target_chunked = _reduce_to_segments(target_action_z[b], n_chunks)
-        reward = -((gz_chunked - target_chunked) ** 2).mean(dim=-1, keepdim=True)
+        diff = _asymmetric_action_diff(gz_chunked, target_chunked)
+        reward = -torch.log(diff + 1e-6).mean(dim=-1, keepdim=True)
         all_z.append(gz_chunked)
         all_r.append(reward)
 
@@ -830,7 +1083,7 @@ def main():
         description="GPU integration test for the action critic pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--mode", choices=["visual", "train", "both"], default="both")
+    parser.add_argument("--mode", choices=["visual", "train", "both", "teacher", "all"], default="both")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--encoded_root", default="/projects/u6ej/fbots/frodobots_encoded")
     parser.add_argument("--caption_root", default="/projects/u6ej/fbots/frodobots_captions/train")
@@ -842,6 +1095,8 @@ def main():
                         help="Number of consecutive windows to process (visual mode)")
     parser.add_argument("--steps", type=int, default=1,
                         help="Number of training steps to run (train mode)")
+    parser.add_argument("--ride_index", type=int, default=0,
+                        help="Ride index for teacher pipeline test")
     parser.add_argument("--output_dir", default="testing/outputs")
     args = parser.parse_args()
 
@@ -849,13 +1104,17 @@ def main():
         logging.error("This test requires a GPU. Run on a compute node.")
         sys.exit(1)
 
-    if args.mode in ("visual", "both"):
+    if args.mode in ("visual", "both", "all"):
         logging.info(">>> Running VISUAL pipeline test <<<")
         run_visual_test(args)
 
-    if args.mode in ("train", "both"):
+    if args.mode in ("train", "both", "all"):
         logging.info(">>> Running TRAINING step test <<<")
         run_train_test(args)
+
+    if args.mode in ("teacher", "all"):
+        logging.info(">>> Running TEACHER PIPELINE regression test <<<")
+        run_teacher_pipeline_test(args)
 
 
 if __name__ == "__main__":

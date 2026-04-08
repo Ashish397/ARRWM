@@ -159,7 +159,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 if not exit_flag:
                     # Intermediate steps: no gradients
                     with torch.no_grad():
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_in_use,
                             timestep=timestep,
@@ -167,6 +167,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+                        denoised_pred = model_out[1]
                         
                         # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
@@ -187,7 +188,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                     
                     context_manager = torch.enable_grad() if enable_grad else torch.no_grad()
                     with context_manager:
-                        _, denoised_pred = self.generator(
+                        model_out = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_in_use,
                             timestep=timestep,
@@ -195,6 +196,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+                        denoised_pred = model_out[1]
                     break
             
             # Record output

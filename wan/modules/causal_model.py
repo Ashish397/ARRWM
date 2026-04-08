@@ -8,7 +8,7 @@ from wan.modules.model import (
     WAN_CROSSATTENTION_CLASSES,
     rope_params,
     MLPProj,
-    sinusoidal_embedding_1d
+    sinusoidal_embedding_1d,
 )
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -61,11 +61,17 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 
 
 def _separate_action_tokens(x, grid_sizes, action_per_frame):
-    """Pull interleaved action tokens out of the sequence for clean RoPE.
+    """Pull appended non-spatial tokens out of the sequence before RoPE.
 
-    Layout per frame: [spatial_0 … spatial_{hw-1}, action_0 … action_{a-1}]
-    Returns (spatial_flat, action_flat) where spatial has shape
-    [B, F*H*W, ...] and action has [B, F*a, ...].
+    ``action_per_frame`` is the total count of *all* non-spatial tokens
+    appended after the spatial tokens in each frame — this includes both
+    action-conditioning tokens and state tokens.  RoPE is applied only to
+    the spatial portion; the non-spatial tokens are left unrotated and
+    re-merged afterwards via ``_merge_action_tokens``.
+
+    Layout per frame: [spatial_0 … spatial_{hw-1}, extra_0 … extra_{a-1}]
+    Returns (spatial_flat, extras_flat) where spatial has shape
+    [B, F*H*W, ...] and extras has [B, F*a, ...].
     """
     f, h, w = grid_sizes[0].tolist()
     spatial = h * w
@@ -76,7 +82,7 @@ def _separate_action_tokens(x, grid_sizes, action_per_frame):
 
 
 def _merge_action_tokens(spatial, action, grid_sizes, action_per_frame):
-    """Re-interleave action tokens back into the per-frame sequence."""
+    """Re-interleave non-spatial tokens back into the per-frame sequence after RoPE."""
     f, h, w = grid_sizes[0].tolist()
     spatial_per_frame = h * w
     sp = spatial.unflatten(1, (f, spatial_per_frame))
@@ -155,7 +161,7 @@ class CausalWanSelfAttention(nn.Module):
         a_per_f = self.action_tokens_per_frame
 
         def _rope_one_chunk(q_c, k_c, gs, offset=0):
-            """Apply RoPE to a single chunk, handling interleaved action tokens."""
+            """Apply RoPE to spatial tokens only; non-spatial tokens are excluded."""
             if a_per_f > 0:
                 q_sp, q_act = _separate_action_tokens(q_c, gs, a_per_f)
                 k_sp, k_act = _separate_action_tokens(k_c, gs, a_per_f)
@@ -245,7 +251,7 @@ class CausalWanSelfAttention(nn.Module):
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            frame_seqlen = math.prod(grid_sizes[0][1:]).item() + self.action_tokens_per_frame
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
@@ -535,6 +541,123 @@ class CausalHead(nn.Module):
         return x
 
 
+class StateProbeLayer(nn.Module):
+    """Cross-attention layer that reads transformer features into probe queries."""
+
+    def __init__(self, model_dim: int, probe_dim: int, num_heads: int = 8, ffn_mult: int = 2):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(probe_dim)
+        self.norm_kv = nn.LayerNorm(model_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=probe_dim, num_heads=num_heads,
+            kdim=model_dim, vdim=model_dim, batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(probe_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(probe_dim, probe_dim * ffn_mult),
+            nn.GELU(),
+            nn.Linear(probe_dim * ffn_mult, probe_dim),
+        )
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        q_n = self.norm_q(q)
+        kv_n = self.norm_kv(kv)
+        attn_out, _ = self.cross_attn(q_n, kv_n, kv_n)
+        q = q + attn_out
+        q = q + self.ffn(self.norm_ff(q))
+        return q
+
+
+class StateProbeModule(nn.Module):
+    """Chunk-local cross-attention probe for extracting per-chunk action state.
+
+    A single learned query is applied independently to each temporal chunk's
+    features, tapped at multiple transformer depths.  Because every chunk
+    sees the *same* query, the probe transfers directly to causal inference
+    where only the current chunk's features are available.
+
+    During teacher-forcing training all chunks are processed in parallel by
+    folding them into the batch dimension.
+
+    Only *spatial* tokens are used as KV for cross-attention; any per-frame
+    action tokens are stripped so the probe must learn to read video content
+    rather than shortcutting through the action conditioning embedding.
+    """
+
+    def __init__(
+        self,
+        n_chunks: int,
+        model_dim: int,
+        probe_dim: int = 256,
+        z_out_dim: int = 2,
+        num_heads: int = 8,
+        n_taps: int = 6,
+        num_frame_per_block: int = 3,
+        action_tokens_per_frame: int = 0,
+    ):
+        super().__init__()
+        self.n_chunks = n_chunks
+        self.probe_dim = probe_dim
+        self.num_frame_per_block = num_frame_per_block
+        self.action_tokens_per_frame = action_tokens_per_frame
+
+        self.query_init = nn.Parameter(torch.randn(1, probe_dim) * 0.02)
+        self.probe_layers = nn.ModuleList([
+            StateProbeLayer(model_dim, probe_dim, num_heads)
+            for _ in range(n_taps)
+        ])
+        self.readout = nn.Linear(probe_dim, z_out_dim)
+        nn.init.normal_(self.readout.weight, std=1e-3)
+        nn.init.zeros_(self.readout.bias)
+
+    def forward(self, tapped_features: list, noisy_start: int, frame_seqlen: int):
+        """
+        Args:
+            tapped_features: list of ``[B, total_seq, model_dim]`` at each tap.
+                             Must have exactly ``len(self.probe_layers)`` entries.
+            noisy_start:     token index where the noisy-side begins
+            frame_seqlen:    tokens per frame (spatial + action tokens)
+        Returns:
+            ``(state_preds, probe_hidden)`` with shapes
+            ``[B, n_chunks, z_out_dim]`` and ``[B, n_chunks, probe_dim]``
+        """
+        assert len(tapped_features) == len(self.probe_layers), (
+            f"StateProbeModule expected {len(self.probe_layers)} tapped features "
+            f"(one per probe layer), but got {len(tapped_features)}"
+        )
+
+        B = tapped_features[0].shape[0]
+        C = self.n_chunks
+        fpb = self.num_frame_per_block
+        chunk_tokens = fpb * frame_seqlen
+        a_per_f = self.action_tokens_per_frame
+        spatial_per_frame = frame_seqlen - a_per_f
+
+        # Shared query expanded for all batch×chunk pairs
+        q = self.query_init.unsqueeze(0).expand(B * C, -1, -1)          # [B*C, 1, D]
+        q = q.to(dtype=tapped_features[0].dtype, device=tapped_features[0].device)
+
+        for feat, layer in zip(tapped_features, self.probe_layers):
+            # Slice noisy side then reshape into per-chunk KV
+            noisy = feat[:, noisy_start:]                                # [B, noisy_seq, D]
+            noisy_chunked = noisy[:, :C * chunk_tokens]
+            kv = noisy_chunked.reshape(B * C, chunk_tokens, -1)         # [B*C, chunk_tok, D]
+
+            if a_per_f > 0:
+                # Strip action tokens so the probe only sees spatial features.
+                # Layout per frame: [spatial_0..spatial_{s-1}, action_0..action_{a-1}]
+                kv = kv.unflatten(1, (fpb, frame_seqlen))               # [B*C, fpb, frame_seqlen, D]
+                kv = kv[:, :, :spatial_per_frame].flatten(1, 2)          # [B*C, fpb*spatial, D]
+
+            q = layer(q, kv)
+
+        q = q.reshape(B, C, self.probe_dim)                             # [B, C, probe_dim]
+        preds = torch.nn.functional.linear(
+            q.float(), self.readout.weight.float(), self.readout.bias.float(),
+        )
+        return preds, q
+
+
 class CausalWanModel(ModelMixin, ConfigMixin):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
@@ -668,7 +791,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_frame_per_block = 1
         self.independent_first_frame = False
         self.context_shift = 0
+        # Total non-spatial tokens appended per frame (action + state).
+        # RoPE is applied only to spatial tokens; this count tells the
+        # separation helpers how many trailing tokens to skip.
         self.action_tokens_per_frame = 0
+        self.state_tokens_per_frame = 0
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -687,6 +814,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # we do right padding to get to a multiple of 128
         padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        torch.cuda.empty_cache()
 
         ends = torch.zeros(total_length + padded_length,
                            device=device, dtype=torch.long)
@@ -708,24 +837,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
             else:
                 return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (q_idx == kv_idx)
-            # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
-                                       KV_LEN=total_length + padded_length, _compile=False, device=device)
-
-        import torch.distributed as dist
-        if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-            pass
-
-        # import imageio
-        # import numpy as np
-        # from torch.nn.attention.flex_attention import create_mask
-
-        # mask = create_mask(attention_mask, B=None, H=None, Q_LEN=total_length +
-        #                    padded_length, KV_LEN=total_length + padded_length, device=device)
-        # import cv2
-        # mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
-        # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
+                                       KV_LEN=total_length + padded_length, _compile=True, device=device)
 
         return block_mask
 
@@ -750,6 +864,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # we do right padding to get to a multiple of 128
         padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        # Free cached GPU memory before the large transient allocation
+        # needed by create_block_mask (~4 GiB dense intermediate).
+        torch.cuda.empty_cache()
 
         clean_ends = num_frames * frame_seqlen
         # for clean context frames, we can construct their flex attention mask based on a [start, end] interval
@@ -802,7 +920,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return eye_mask | clean_mask | noise_mask
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
-                                       KV_LEN=total_length + padded_length, _compile=False, device=device)
+                                       KV_LEN=total_length + padded_length, _compile=True, device=device)
 
         if DEBUG:
             import imageio
@@ -943,6 +1061,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         current_start: int = 0,
         cache_start: int = 0,
         action_tokens=None,
+        state_tokens=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -975,6 +1094,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
+        s_per_f = self.state_tokens_per_frame
+        a_per_f = self.action_tokens_per_frame
+        for block in self.blocks:
+            block.self_attn.action_tokens_per_frame = a_per_f
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -987,8 +1110,27 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
+
+        spatial_seqlen = math.prod(grid_sizes[0][1:]).item()
+        num_frames_local = grid_sizes[0, 0].item()
+        if a_per_f > 0:
+            x = [u[:, :num_frames_local * spatial_seqlen].unflatten(1, (num_frames_local, spatial_seqlen)) for u in x]
+            x_with_extras = []
+            for batch_idx, u in enumerate(x):
+                extras = []
+                if action_tokens is not None:
+                    extras.append(action_tokens[batch_idx:batch_idx + 1].unsqueeze(2).to(dtype=u.dtype, device=u.device))
+                if state_tokens is not None:
+                    extras.append(state_tokens[batch_idx:batch_idx + 1].unsqueeze(2).to(dtype=u.dtype, device=u.device))
+                if extras:
+                    u = torch.cat([u] + extras, dim=2).flatten(1, 2)
+                else:
+                    u = u.flatten(1, 2)
+                x_with_extras.append(u)
+            x = x_with_extras
+
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        assert seq_lens.max() <= seq_len + num_frames_local * a_per_f
         x = torch.cat(x)
         """
         torch.cat([
@@ -1084,10 +1226,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if kv_cache is not None and cache_update_infos:
             self._apply_cache_updates(kv_cache, cache_update_infos)
 
+        state_hidden = None
+        if a_per_f > 0:
+            frame_seqlen = spatial_seqlen + a_per_f
+            x_framed = x.unflatten(1, (num_frames_local, frame_seqlen))
+            if s_per_f > 0:
+                state_hidden = x_framed[:, :, -s_per_f:].squeeze(2)
+            x = x_framed[:, :, :spatial_seqlen].flatten(1, 2)
+
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        if state_hidden is not None:
+            return torch.stack(x), state_hidden
         return torch.stack(x)
 
     def _forward_train(
@@ -1102,9 +1254,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         y=None,
         action_tokens=None,
         action_tokens_clean=None,
+        state_tokens=None,
+        state_tokens_clean=None,
     ):
         r"""
-        Forward pass through the diffusion model
+        Forward pass through the diffusion model.
 
         Args:
             x (List[Tensor]):
@@ -1119,10 +1273,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            state_tokens (Tensor, *optional*):
+                Per-frame learned state tokens [B, F, dim] for the noisy half.
+            state_tokens_clean (Tensor, *optional*):
+                Per-frame learned state tokens [B, F, dim] for the clean half.
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            Tensor or (Tensor, Tensor):
+                Denoised video tensors [B, C_out, F, H/8, W/8], and optionally
+                per-frame state hidden states [B, F, dim] when state tokens are used.
         """
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
@@ -1131,6 +1290,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
+        s_per_f = self.state_tokens_per_frame
         a_per_f = self.action_tokens_per_frame
 
         rope_offset = self.context_shift * self.num_frame_per_block if clean_x is not None else 0
@@ -1138,7 +1298,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block.self_attn.tf_rope_offset = rope_offset
             block.self_attn.action_tokens_per_frame = a_per_f
 
-        # Compute spatial frame_seqlen and effective frame_seqlen (incl. action tokens)
+        # Compute spatial frame_seqlen and effective frame_seqlen (incl. extra tokens)
         spatial_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
         frame_seqlen = spatial_seqlen + a_per_f
 
@@ -1186,13 +1346,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                       dim=1) for u in x
         ])
 
-        # Insert action tokens (appended after spatial tokens per frame)
+        # Insert extra per-frame tokens (action tokens + state tokens)
         num_frames_local = grid_sizes[0, 0].item()
-        if action_tokens is not None and a_per_f > 0:
+        if a_per_f > 0:
             x = x[:, :num_frames_local * spatial_seqlen]
             x = x.unflatten(1, (num_frames_local, spatial_seqlen))
-            at = action_tokens.unsqueeze(2).to(dtype=x.dtype, device=x.device)
-            x = torch.cat([x, at], dim=2).flatten(1, 2)
+            extras = []
+            if action_tokens is not None:
+                extras.append(action_tokens.unsqueeze(2).to(dtype=x.dtype, device=x.device))
+            if state_tokens is not None:
+                extras.append(state_tokens.unsqueeze(2).to(dtype=x.dtype, device=x.device))
+            if extras:
+                x = torch.cat([x] + extras, dim=2).flatten(1, 2)
+            else:
+                x = x.flatten(1, 2)
 
         seq_lens = torch.tensor([x.shape[1]], dtype=torch.long).expand(x.shape[0])
         assert seq_lens.max() <= seq_len + num_frames_local * a_per_f
@@ -1225,12 +1392,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 torch.cat([u, u.new_zeros(1, seq_lens_clean[0] - u.size(1), u.size(2))], dim=1) for u in clean_x
             ])
 
-            # Insert clean action tokens
-            if action_tokens_clean is not None and a_per_f > 0:
+            # Insert clean extra tokens (action + state)
+            if a_per_f > 0:
                 clean_x = clean_x[:, :num_frames_local * spatial_seqlen]
                 clean_x = clean_x.unflatten(1, (num_frames_local, spatial_seqlen))
-                at_c = action_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device)
-                clean_x = torch.cat([clean_x, at_c], dim=2).flatten(1, 2)
+                extras_clean = []
+                if action_tokens_clean is not None:
+                    extras_clean.append(action_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device))
+                if state_tokens_clean is not None:
+                    extras_clean.append(state_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device))
+                if extras_clean:
+                    clean_x = torch.cat([clean_x] + extras_clean, dim=2).flatten(1, 2)
+                else:
+                    clean_x = clean_x.flatten(1, 2)
 
             x = torch.cat([clean_x, x], dim=1)
             # Update seq_lens for TF detection (should be half of total)
@@ -1262,7 +1436,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return module(*inputs, **kwargs)
             return custom_forward
 
-        for block in self.blocks:
+        probe_tap_set = getattr(self, '_state_probe_tap_set', None)
+        tapped = [] if probe_tap_set else None
+
+        for i, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
@@ -1271,10 +1448,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 )
             else:
                 x = block(x, **kwargs)
+            if tapped is not None and i in probe_tap_set:
+                tapped.append(x)
+
         if clean_x is not None:
             x = x[:, x.shape[1] // 2:]
 
-        # Strip action tokens before head/unpatchify
+        # Extract state token hidden states before stripping extra tokens
+        state_hidden = None
+        if s_per_f > 0 and a_per_f > 0:
+            x_framed = x.unflatten(1, (num_frames_local, frame_seqlen))
+            state_hidden = x_framed[:, :, -s_per_f:].squeeze(2)  # [B, F, dim]
+
+        # Strip all extra tokens before head/unpatchify
         if a_per_f > 0:
             x = x.unflatten(1, (num_frames_local, frame_seqlen))
             x = x[:, :, :spatial_seqlen].flatten(1, 2)
@@ -1284,6 +1470,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+
+        if state_hidden is not None:
+            return torch.stack(x), state_hidden
+
+        if tapped:
+            return torch.stack(x), tapped
+
         return torch.stack(x)
 
     def forward(

@@ -4,7 +4,9 @@
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -28,6 +30,20 @@ def _import_rope_helpers():
         from wan.modules.model import rope_apply, rope_params
 
     return rope_apply, rope_params
+
+
+def _import_wan_wrapper():
+    with patch("torch.cuda.current_device", return_value=0):
+        from utils.wan_wrapper import WanDiffusionWrapper
+
+    return WanDiffusionWrapper
+
+
+def _import_trainer_class():
+    with patch("torch.cuda.current_device", return_value=0):
+        from trainer.causal_diffusion_teacher_train import CausalLoRADiffusionTrainer
+
+    return CausalLoRADiffusionTrainer
 
 
 class TestShiftedSplitLogic(unittest.TestCase):
@@ -1487,6 +1503,653 @@ class TestResBlock3d(unittest.TestCase):
         # but residual + act(out + x) should be close to act(x)
         self.assertEqual(out.shape, x.shape)
         self.assertTrue(torch.isfinite(out).all())
+
+
+# ---------------------------------------------------------------
+# State-token tests
+# ---------------------------------------------------------------
+
+def _make_dummy_wrapper(n_chunks=7, z_out_dim=2, dim=64, num_frame_per_block=3):
+    """Build a minimal WanDiffusionWrapper with state-token branch for CPU tests."""
+    from unittest.mock import MagicMock
+
+    n_frames = n_chunks * num_frame_per_block
+    wrapper = MagicMock()
+    wrapper._state_token_init = torch.nn.Parameter(torch.randn(n_frames, dim) * 0.02)
+    wrapper._state_readout = torch.nn.Linear(dim, z_out_dim)
+    torch.nn.init.normal_(wrapper._state_readout.weight, std=1e-3)
+    torch.nn.init.zeros_(wrapper._state_readout.bias)
+    wrapper._state_n_chunks = n_chunks
+    wrapper._state_z_out_dim = z_out_dim
+    wrapper._state_num_frame_per_block = num_frame_per_block
+    return wrapper
+
+
+class _RecordingWrapperModel(torch.nn.Module):
+    def __init__(self, return_state_hidden: bool = False, hidden_dim: int = 4):
+        super().__init__()
+        self.return_state_hidden = return_state_hidden
+        self.hidden_dim = hidden_dim
+        self.calls = []
+
+    def forward(self, x, **kwargs):
+        self.calls.append({
+            "x_shape": tuple(x.shape),
+            "kwargs": dict(kwargs),
+        })
+        if self.return_state_hidden:
+            b, _, f, _, _ = x.shape
+            state_hidden = torch.arange(
+                b * f * self.hidden_dim, dtype=x.dtype, device=x.device
+            ).reshape(b, f, self.hidden_dim)
+            return x, state_hidden
+        return x
+
+
+class _RecordingInferenceBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = SimpleNamespace(action_tokens_per_frame=0, tf_rope_offset=0)
+        self.last_x_shape = None
+        self.last_kwargs = None
+
+    def forward(self, x, **kwargs):
+        self.last_x_shape = tuple(x.shape)
+        self.last_kwargs = dict(kwargs)
+        return x
+
+
+class _FakeHead(torch.nn.Module):
+    def forward(self, x, e):
+        return x
+
+
+class _IdentityPatchEmbedding(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        return x
+
+
+class TestStateTokenShapes(unittest.TestCase):
+    """Verify state-token init and readout produce correct shapes."""
+
+    def test_state_token_init_shape(self):
+        n_chunks, dim, fpb = 7, 64, 3
+        wrapper = _make_dummy_wrapper(n_chunks=n_chunks, dim=dim, num_frame_per_block=fpb)
+        self.assertEqual(wrapper._state_token_init.shape, (n_chunks * fpb, dim))
+
+    def test_state_readout_output_shape(self):
+        n_chunks, dim, z_out = 7, 64, 2
+        wrapper = _make_dummy_wrapper(n_chunks=n_chunks, z_out_dim=z_out, dim=dim)
+        pooled = torch.randn(2, n_chunks, dim)
+        out = wrapper._state_readout(pooled)
+        self.assertEqual(out.shape, (2, n_chunks, z_out))
+
+    def test_build_state_tokens_expansion(self):
+        """Per-frame state token init should expand to [B, F, dim]."""
+        n_chunks, dim, fpb = 7, 64, 3
+        total_frames = n_chunks * fpb
+
+        init = torch.nn.Parameter(torch.randn(total_frames, dim) * 0.02)
+        st = init.unsqueeze(0).expand(2, -1, -1)
+
+        self.assertEqual(st.shape, (2, total_frames, dim))
+        for f_idx in range(total_frames):
+            torch.testing.assert_close(st[0, f_idx], init[f_idx])
+            torch.testing.assert_close(st[1, f_idx], init[f_idx])
+
+    def test_per_chunk_pooling(self):
+        """Per-frame state hidden → per-chunk average pooling."""
+        B, n_chunks, fpb, dim = 2, 7, 3, 64
+        state_hidden = torch.randn(B, n_chunks * fpb, dim)
+        pooled = state_hidden.reshape(B, n_chunks, fpb, dim).mean(dim=2)
+        self.assertEqual(pooled.shape, (B, n_chunks, dim))
+
+
+class TestStateTokenGradientFlow(unittest.TestCase):
+    """Verify gradient flow semantics for the state-token path."""
+
+    def test_teacher_loss_grads_flow_to_readout_and_init(self):
+        """Teacher supervision should produce grads on both readout and init."""
+        n_chunks, dim, z_out = 7, 64, 8
+        fpb = 3
+        n_frames = n_chunks * fpb
+        init = torch.nn.Parameter(torch.randn(n_frames, dim) * 0.02)
+        readout = torch.nn.Linear(dim, z_out)
+
+        st = init.unsqueeze(0)
+        fake_transformer_out = st + torch.randn_like(st) * 0.01
+        pooled = fake_transformer_out.reshape(1, n_chunks, fpb, dim).mean(dim=2)
+        preds = readout(pooled)
+
+        target = torch.randn(1, n_chunks, z_out)
+        loss = F.mse_loss(preds, target)
+        loss.backward()
+
+        self.assertIsNotNone(init.grad)
+        self.assertTrue(init.grad.abs().sum() > 0)
+        self.assertIsNotNone(readout.weight.grad)
+        self.assertTrue(readout.weight.grad.abs().sum() > 0)
+
+    def test_frozen_readout_guidance_grads_skip_readout(self):
+        """Frozen-readout guidance should NOT produce grads on readout weights."""
+        n_chunks, dim, z_out = 7, 64, 8
+        fpb = 3
+        n_frames = n_chunks * fpb
+        init = torch.nn.Parameter(torch.randn(n_frames, dim) * 0.02)
+        readout = torch.nn.Linear(dim, z_out)
+
+        st = init.unsqueeze(0)
+        fake_transformer_out = st + torch.randn_like(st) * 0.01
+        pooled = fake_transformer_out.reshape(1, n_chunks, fpb, dim).mean(dim=2)
+
+        frozen_preds = F.linear(pooled, readout.weight.detach(), readout.bias.detach())
+        target = torch.randn(1, n_chunks, z_out)
+        loss = F.mse_loss(frozen_preds, target)
+        loss.backward()
+
+        self.assertIsNotNone(init.grad)
+        self.assertTrue(init.grad.abs().sum() > 0)
+        self.assertIsNone(readout.weight.grad)
+        self.assertIsNone(readout.bias.grad)
+
+    def test_frozen_readout_still_grads_through_pooled(self):
+        """Frozen readout must still propagate grads through pooled hidden states."""
+        dim, z_out = 64, 2
+        pooled = torch.randn(1, 7, dim, requires_grad=True)
+        readout = torch.nn.Linear(dim, z_out)
+
+        frozen_preds = F.linear(pooled, readout.weight.detach(), readout.bias.detach())
+        loss = frozen_preds.sum()
+        loss.backward()
+
+        self.assertIsNotNone(pooled.grad)
+        self.assertTrue(pooled.grad.abs().sum() > 0)
+
+
+class TestStateTokenSequenceLayout(unittest.TestCase):
+    """Verify the per-frame sequence layout with action + state tokens."""
+
+    def test_frame_seqlen_with_state_tokens(self):
+        """frame_seqlen = spatial + action_tokens_per_frame (which includes state)."""
+        spatial = 1560
+        action_per_frame = 2
+        frame_seqlen = spatial + action_per_frame
+        self.assertEqual(frame_seqlen, 1562)
+
+    def test_extra_token_stripping(self):
+        """Stripping extra tokens should recover only spatial tokens."""
+        B, F, spatial, extra = 1, 21, 10, 2
+        frame_seqlen = spatial + extra
+        x = torch.randn(B, F * frame_seqlen, 64)
+
+        x_framed = x.unflatten(1, (F, frame_seqlen))
+        state_hidden = x_framed[:, :, -1:]  # last 1 per frame
+        spatial_only = x_framed[:, :, :spatial].flatten(1, 2)
+
+        self.assertEqual(state_hidden.shape, (B, F, 1, 64))
+        self.assertEqual(spatial_only.shape, (B, F * spatial, 64))
+
+    def test_state_token_extraction_matches_insertion(self):
+        """State tokens extracted at the end should match those inserted."""
+        B, F, spatial, dim = 2, 21, 10, 32
+        action_tok = torch.randn(B, F, dim)
+        state_tok = torch.randn(B, F, dim)
+
+        x_spatial = torch.randn(B, F, spatial, dim)
+        x_with_extras = torch.cat([
+            x_spatial,
+            action_tok.unsqueeze(2),
+            state_tok.unsqueeze(2),
+        ], dim=2).flatten(1, 2)
+
+        frame_seqlen = spatial + 2
+        x_framed = x_with_extras.unflatten(1, (F, frame_seqlen))
+        extracted_state = x_framed[:, :, -1].squeeze(2)
+
+        torch.testing.assert_close(extracted_state, state_tok)
+
+
+class TestWrapperForwardStateTokenIntegration(unittest.TestCase):
+    """Exercise the real ``WanDiffusionWrapper.forward`` codepath."""
+
+    def _make_wrapper(self, *, has_state: bool, return_state_hidden: bool, state_out_dim: int = 8):
+        WanDiffusionWrapper = _import_wan_wrapper()
+        wrapper = WanDiffusionWrapper.__new__(WanDiffusionWrapper)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.model = _RecordingWrapperModel(return_state_hidden=return_state_hidden, hidden_dim=4)
+        wrapper.seq_len = 128
+        wrapper.scheduler = SimpleNamespace(
+            sigmas=torch.tensor([0.0, 1.0]),
+            timesteps=torch.tensor([0.0, 1.0]),
+        )
+        wrapper._convert_flow_pred_to_x0 = lambda flow_pred, xt, timestep: xt
+        wrapper._action_patch_applied = False
+        if has_state:
+            wrapper._state_token_init = torch.nn.Parameter(torch.randn(2, 4))
+            wrapper._state_readout = torch.nn.Linear(4, state_out_dim)
+            wrapper._state_n_chunks = 2
+            wrapper._state_z_out_dim = state_out_dim
+            wrapper._state_num_frame_per_block = 1
+        else:
+            wrapper._state_token_init = None
+        return wrapper
+
+    def test_wrapper_forward_without_state_returns_pair(self):
+        wrapper = self._make_wrapper(has_state=False, return_state_hidden=False)
+        noisy = torch.randn(1, 2, 4, 2, 2)
+        timestep = torch.zeros(1, 2)
+        conditional = {"prompt_embeds": torch.randn(1, 1, 4)}
+
+        out = wrapper(noisy, conditional, timestep)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(wrapper.model.calls[0]["x_shape"], (1, 4, 2, 2, 2))
+
+    def test_wrapper_forward_with_state_returns_quad(self):
+        wrapper = self._make_wrapper(has_state=True, return_state_hidden=True)
+        noisy = torch.randn(1, 2, 4, 2, 2)
+        timestep = torch.zeros(1, 2)
+        conditional = {"prompt_embeds": torch.randn(1, 1, 4)}
+
+        out = wrapper(noisy, conditional, timestep)
+        self.assertEqual(len(out), 4)
+        _, _, state_preds, pooled = out
+        self.assertEqual(state_preds.shape, (1, 2, 8))
+        self.assertEqual(pooled.shape, (1, 2, 4))
+        self.assertIn("state_tokens", wrapper.model.calls[0]["kwargs"])
+
+    def test_wrapper_forward_with_state_and_kv_cache_returns_quad(self):
+        wrapper = self._make_wrapper(has_state=True, return_state_hidden=True)
+        noisy = torch.randn(1, 2, 4, 2, 2)
+        timestep = torch.zeros(1, 2)
+        conditional = {"prompt_embeds": torch.randn(1, 1, 4)}
+        kv_cache = [None]
+        crossattn_cache = [None]
+
+        out = wrapper(
+            noisy, conditional, timestep,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start=0,
+            cache_start=0,
+        )
+        self.assertEqual(len(out), 4)
+        _, _, state_preds, pooled = out
+        self.assertEqual(state_preds.shape, (1, 2, 8))
+        self.assertEqual(pooled.shape, (1, 2, 4))
+        call_kwargs = wrapper.model.calls[0]["kwargs"]
+        self.assertIn("state_tokens", call_kwargs)
+        self.assertEqual(call_kwargs["state_tokens"].shape, (1, 2, 4))
+
+
+class TestCausalModelCachedInferenceIntegration(unittest.TestCase):
+    """Exercise the real ``CausalWanModel._forward_inference`` codepath."""
+
+    def test_forward_inference_inserts_and_strips_state_tokens(self):
+        CausalWanModel = _import_causal_model()
+        block = _RecordingInferenceBlock()
+
+        fake_model = SimpleNamespace()
+        fake_model.model_type = "t2v"
+        fake_model.patch_embedding = _IdentityPatchEmbedding()
+        fake_model.freqs = torch.zeros(1024, 4)
+        fake_model.action_tokens_per_frame = 2
+        fake_model.state_tokens_per_frame = 1
+        fake_model.gradient_checkpointing = False
+        fake_model.freq_dim = 4
+        fake_model.dim = 8
+        fake_model.text_len = 1
+        fake_model.time_embedding = torch.nn.Linear(4, 8, bias=False)
+        fake_model.time_projection = torch.nn.Linear(8, 48, bias=False)
+        fake_model.text_embedding = torch.nn.Identity()
+        fake_model.img_emb = None
+        fake_model.block_mask = None
+        fake_model.blocks = [block]
+        fake_model.head = _FakeHead()
+        fake_model.unpatchify = lambda x, grid_sizes: [
+            torch.zeros(8, int(gs[0]), int(gs[1]), int(gs[2]), dtype=x.dtype, device=x.device)
+            for gs in grid_sizes
+        ]
+
+        x = torch.randn(1, 8, 2, 2, 2)
+        t = torch.zeros(1, 2)
+        context = torch.randn(1, 1, 8)
+        action_tokens = torch.randn(1, 2, 8)
+        state_tokens = torch.randn(1, 2, 8)
+
+        out = CausalWanModel._forward_inference(
+            fake_model,
+            x,
+            t,
+            context,
+            seq_len=8,
+            kv_cache=[None],
+            crossattn_cache=[None],
+            current_start=0,
+            cache_start=0,
+            action_tokens=action_tokens,
+            state_tokens=state_tokens,
+        )
+
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(len(out), 2)
+        video_out, state_hidden = out
+        self.assertEqual(block.self_attn.action_tokens_per_frame, 2)
+        self.assertEqual(block.last_x_shape[1], 12)  # 2 frames * (4 spatial + 2 extras)
+        self.assertEqual(video_out.shape, (1, 8, 2, 2, 2))
+        self.assertEqual(state_hidden.shape, (1, 2, 8))
+
+
+class TestFreshEvalStateReadout(unittest.TestCase):
+    """Exercise the real trainer eval helper and verify the extra final readout."""
+
+    def test_generate_eval_recomputes_state_on_final_latents(self):
+        CausalLoRADiffusionTrainer = _import_trainer_class()
+
+        class FakeWrapper:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, latents, conditional, timestep, clean_x=None, aug_t=None):
+                self.calls.append({
+                    "latents": latents.clone(),
+                    "timestep": timestep.clone(),
+                })
+                flow_pred = torch.zeros_like(latents)
+                pred_x0 = latents + 1
+                state_preds = latents.mean(dim=(2, 3, 4)).unsqueeze(-1).repeat(1, 1, 2)
+                return flow_pred, pred_x0, state_preds
+
+        trainer = CausalLoRADiffusionTrainer.__new__(CausalLoRADiffusionTrainer)
+        trainer.eval_inference_steps = 2
+        trainer.device = torch.device("cpu")
+        trainer.dtype = torch.float32
+        trainer._state_head_built = True
+
+        wrapper = FakeWrapper()
+        conditional = {"prompt_embeds": torch.randn(1, 1, 4)}
+        context_latents = torch.randn(1, 2, 4, 2, 2)
+
+        with patch("torch.amp.autocast", side_effect=lambda *args, **kwargs: nullcontext()):
+            latents, state_preds = trainer._generate_eval(wrapper, conditional, context_latents, num_frames=2)
+
+        self.assertEqual(len(wrapper.calls), trainer.eval_inference_steps + 1)
+        self.assertTrue(torch.equal(wrapper.calls[-1]["timestep"], torch.zeros(1, 2)))
+        expected_final = wrapper.calls[-1]["latents"].mean(dim=(2, 3, 4)).unsqueeze(-1).repeat(1, 1, 2)
+        torch.testing.assert_close(state_preds, expected_final)
+        self.assertEqual(latents.shape, (1, 2, 4, 2, 2))
+
+
+class TestRoPEExcludesNonSpatialTokens(unittest.TestCase):
+    """Integration: verify _separate/_merge round-trips correctly, and that
+    only spatial tokens pass through RoPE while extras are untouched."""
+
+    def test_separate_merge_roundtrip(self):
+        """Separate then merge should reconstruct the original tensor."""
+        with patch("torch.cuda.current_device", return_value=0):
+            from wan.modules.causal_model import (
+                _separate_action_tokens,
+                _merge_action_tokens,
+            )
+
+        F_val, H, W, a_per_f, dim = 5, 4, 4, 2, 32
+        spatial = H * W
+        frame_seq = spatial + a_per_f
+        grid_sizes = torch.tensor([[F_val, H, W]])
+
+        x = torch.randn(1, F_val * frame_seq, dim)
+        sp, act = _separate_action_tokens(x, grid_sizes, a_per_f)
+        reconstructed = _merge_action_tokens(sp, act, grid_sizes, a_per_f)
+        torch.testing.assert_close(reconstructed, x)
+
+    def test_rope_preserves_extras_untouched(self):
+        """Non-spatial tokens should be identical before and after the
+        separate → rope → merge pipeline (RoPE is a no-op on them)."""
+        with patch("torch.cuda.current_device", return_value=0):
+            from wan.modules.causal_model import (
+                _separate_action_tokens,
+                _merge_action_tokens,
+            )
+
+        rope_apply, rope_params = _import_rope_helpers()
+
+        F_val, H, W, a_per_f = 5, 4, 4, 2
+        dim = 128
+        n_heads = 4
+        head_dim = dim // n_heads
+        spatial = H * W
+        frame_seq = spatial + a_per_f
+        grid_sizes = torch.tensor([[F_val, H, W]])
+
+        x = torch.randn(1, F_val * frame_seq, n_heads, head_dim)
+        _, extras_before = _separate_action_tokens(x, grid_sizes, a_per_f)
+
+        sp, act = _separate_action_tokens(x, grid_sizes, a_per_f)
+        freqs = rope_params(1024, head_dim, theta=256)
+        rsp = rope_apply(sp, grid_sizes, freqs)
+        merged = _merge_action_tokens(rsp, act, grid_sizes, a_per_f)
+
+        _, extras_after = _separate_action_tokens(merged, grid_sizes, a_per_f)
+        torch.testing.assert_close(extras_after, extras_before,
+                                   msg="Non-spatial tokens should not be modified by RoPE")
+
+
+# ---------------------------------------------------------------
+# V10 State-Token Upgrade tests
+# ---------------------------------------------------------------
+
+class TestPerFrameStateTokenInit(unittest.TestCase):
+    """Verify per-frame state tokens have distinct learned embeddings."""
+
+    def test_distinct_per_frame_embeddings(self):
+        """Each frame should have its own learned init, not a broadcast from chunks."""
+        n_chunks, fpb, dim = 7, 3, 64
+        n_frames = n_chunks * fpb
+        init = torch.nn.Parameter(torch.randn(n_frames, dim) * 0.02)
+
+        for i in range(n_frames - 1):
+            self.assertFalse(
+                torch.equal(init[i], init[i + 1]),
+                f"Frame {i} and {i+1} should have different init embeddings",
+            )
+
+    def test_wrapper_build_state_tokens_per_frame(self):
+        """WanDiffusionWrapper._build_state_tokens should produce [B, F, dim]."""
+        WanDiffusionWrapper = _import_wan_wrapper()
+        wrapper = WanDiffusionWrapper.__new__(WanDiffusionWrapper)
+        torch.nn.Module.__init__(wrapper)
+
+        n_chunks, fpb, dim = 7, 3, 64
+        n_frames = n_chunks * fpb
+        wrapper._state_token_init = torch.nn.Parameter(torch.randn(n_frames, dim) * 0.02)
+        wrapper._state_n_chunks = n_chunks
+        wrapper._state_num_frame_per_block = fpb
+
+        st = wrapper._build_state_tokens(batch_size=4, dtype=torch.float32, device=torch.device("cpu"))
+        self.assertEqual(st.shape, (4, n_frames, dim))
+        torch.testing.assert_close(st[0], st[2])
+
+    def test_adding_state_token_branch_creates_per_frame_init(self):
+        """adding_state_token_branch should create [n_frames, dim] init parameter."""
+        WanDiffusionWrapper = _import_wan_wrapper()
+        wrapper = WanDiffusionWrapper.__new__(WanDiffusionWrapper)
+        torch.nn.Module.__init__(wrapper)
+
+        CausalWanModel = _import_causal_model()
+        with unittest.mock.patch("torch.cuda.current_device", return_value=0):
+            model = CausalWanModel(
+                dim=64, ffn_dim=128, freq_dim=32, text_dim=64,
+                num_heads=4, num_layers=1, in_dim=4, out_dim=4,
+                patch_size=(1, 1, 1), text_len=4,
+            )
+        model.action_tokens_per_frame = 1
+        wrapper.model = model
+        wrapper.seq_len = 100
+
+        wrapper.adding_state_token_branch(n_chunks=7, z_out_dim=8, dim=64, num_frame_per_block=3)
+        self.assertEqual(wrapper._state_token_init.shape, (21, 64))
+        self.assertEqual(wrapper._state_readout.out_features, 8)
+
+
+class TestFull8DStateHead(unittest.TestCase):
+    """Verify 8D state head readout and z2/z7 guidance slicing."""
+
+    def test_readout_produces_8d(self):
+        """State readout should produce [B, n_chunks, 8]."""
+        dim, z_out = 64, 8
+        n_chunks = 7
+        readout = torch.nn.Linear(dim, z_out)
+        pooled = torch.randn(2, n_chunks, dim)
+        out = readout(pooled)
+        self.assertEqual(out.shape, (2, n_chunks, 8))
+
+    def test_guidance_uses_z2z7_slice_only(self):
+        """Frozen-readout guidance should slice z2/z7 from the 8D readout."""
+        dim, z_out = 64, 8
+        n_chunks = 7
+        action_critic_dims = [2, 7]
+        readout = torch.nn.Linear(dim, z_out)
+        pooled = torch.randn(1, n_chunks, dim, requires_grad=True)
+
+        frozen_preds_8d = F.linear(pooled, readout.weight.detach(), readout.bias.detach())
+        frozen_preds_z27 = frozen_preds_8d[:, :, action_critic_dims]
+
+        self.assertEqual(frozen_preds_8d.shape, (1, n_chunks, 8))
+        self.assertEqual(frozen_preds_z27.shape, (1, n_chunks, 2))
+
+        cmd_target = torch.randn(1, n_chunks, 2)
+        loss = F.mse_loss(frozen_preds_z27, cmd_target)
+        loss.backward()
+
+        self.assertIsNotNone(pooled.grad)
+        self.assertTrue(pooled.grad.abs().sum() > 0)
+
+    def test_teacher_loss_uses_full_8d(self):
+        """Teacher supervision loss should use all 8 dims."""
+        dim, z_out = 64, 8
+        n_chunks = 7
+        readout = torch.nn.Linear(dim, z_out)
+        pooled = torch.randn(1, n_chunks, dim)
+        preds = readout(pooled)
+
+        teacher_z_8d = torch.randn(1, n_chunks, 8)
+        loss = F.mse_loss(preds, teacher_z_8d)
+        self.assertEqual(preds.shape[-1], 8)
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_full_8d_checkpoint_shape_mismatch_detected(self):
+        """Old 2D checkpoint should fail to load into 8D readout."""
+        readout_old = torch.nn.Linear(64, 2)
+        readout_new = torch.nn.Linear(64, 8)
+        self.assertNotEqual(readout_old.weight.shape, readout_new.weight.shape)
+        with self.assertRaises(RuntimeError):
+            readout_new.load_state_dict(readout_old.state_dict())
+
+
+class TestSafeCorrelation(unittest.TestCase):
+    """Verify _safe_corr helper handles edge cases correctly."""
+
+    def test_perfect_positive_correlation(self):
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+        a = torch.arange(10, dtype=torch.float32)
+        b = a * 2.0 + 1.0
+        corr = _safe_corr(a, b)
+        self.assertAlmostEqual(corr, 1.0, places=4)
+
+    def test_perfect_negative_correlation(self):
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+        a = torch.arange(10, dtype=torch.float32)
+        b = -a
+        corr = _safe_corr(a, b)
+        self.assertAlmostEqual(corr, -1.0, places=4)
+
+    def test_zero_variance_returns_zero(self):
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+        a = torch.ones(10)
+        b = torch.arange(10, dtype=torch.float32)
+        corr = _safe_corr(a, b)
+        self.assertEqual(corr, 0.0)
+
+    def test_single_element_returns_zero(self):
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+        a = torch.tensor([1.0])
+        b = torch.tensor([2.0])
+        corr = _safe_corr(a, b)
+        self.assertEqual(corr, 0.0)
+
+    def test_uncorrelated_near_zero(self):
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+        torch.manual_seed(42)
+        a = torch.randn(10000)
+        b = torch.randn(10000)
+        corr = _safe_corr(a, b)
+        self.assertAlmostEqual(corr, 0.0, places=1)
+
+    def test_multidim_flattening(self):
+        """Correlation should flatten multi-dimensional inputs."""
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+        a = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        b = a * 3.0 + 5.0
+        corr = _safe_corr(a, b)
+        self.assertAlmostEqual(corr, 1.0, places=4)
+
+
+class TestStateDiagnosticComputation(unittest.TestCase):
+    """Verify the diagnostic metric computation logic matches expectations."""
+
+    def test_diagnostics_reveal_near_identity_branch(self):
+        """If state_preds ≈ commanded_actions, corr(state, teacher) < corr(state, cmd)."""
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+
+        torch.manual_seed(7)
+        teacher_z27 = torch.randn(1, 7, 2)
+        cmd_z27 = torch.randn(1, 7, 2)
+        state_z27 = cmd_z27 + torch.randn_like(cmd_z27) * 0.01
+
+        corr_st = _safe_corr(state_z27, teacher_z27)
+        corr_sc = _safe_corr(state_z27, cmd_z27)
+        self.assertGreater(corr_sc, corr_st,
+                           "State preds near cmd should be more correlated with cmd than teacher")
+
+    def test_diagnostics_reveal_useful_branch(self):
+        """If state_preds ≈ teacher, corr(state, teacher) > corr(state, cmd)."""
+        from trainer.causal_diffusion_teacher_train import _safe_corr
+
+        torch.manual_seed(7)
+        teacher_z27 = torch.randn(1, 7, 2)
+        cmd_z27 = torch.randn(1, 7, 2)
+        state_z27 = teacher_z27 + torch.randn_like(teacher_z27) * 0.01
+
+        corr_st = _safe_corr(state_z27, teacher_z27)
+        corr_sc = _safe_corr(state_z27, cmd_z27)
+        self.assertGreater(corr_st, corr_sc,
+                           "State preds near teacher should be more correlated with teacher than cmd")
+
+
+class TestGuidanceSlicingGradFlow(unittest.TestCase):
+    """Verify that slicing z2/z7 from 8D readout still propagates grads correctly."""
+
+    def test_frozen_readout_8d_sliced_to_z27_grads_flow_through_pooled(self):
+        dim, z_out = 64, 8
+        n_chunks = 7
+        action_critic_dims = [2, 7]
+        readout = torch.nn.Linear(dim, z_out)
+        init = torch.nn.Parameter(torch.randn(n_chunks * 3, dim) * 0.02)
+
+        pooled = init.reshape(1, n_chunks, 3, dim).mean(dim=2)
+        frozen_8d = F.linear(pooled, readout.weight.detach(), readout.bias.detach())
+        frozen_z27 = frozen_8d[:, :, action_critic_dims]
+
+        cmd = torch.randn(1, n_chunks, 2)
+        loss = F.mse_loss(frozen_z27, cmd)
+        loss.backward()
+
+        self.assertIsNotNone(init.grad)
+        self.assertTrue(init.grad.abs().sum() > 0)
+        self.assertIsNone(readout.weight.grad)
 
 
 if __name__ == "__main__":

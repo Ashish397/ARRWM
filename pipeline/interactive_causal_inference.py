@@ -215,7 +215,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 )
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
                         timestep=timestep,
@@ -223,6 +223,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    denoised_pred = model_out[1]
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -233,7 +234,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         ),
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
                         timestep=timestep,
@@ -241,6 +242,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    denoised_pred = model_out[1]
 
             # Record output
             output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)

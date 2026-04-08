@@ -354,8 +354,6 @@ def main() -> None:
             group_counter, batcher.summary(),
         )
 
-        slots = batcher.get_slot_info()
-
         # Per-slot state: VAE cache, video cursor, motion, combined frames
         per_slot_vid_cursor = [0] * args.batch_size
         per_slot_motion: list = []
@@ -363,28 +361,88 @@ def main() -> None:
         per_slot_zarr_name: list = []
         per_slot_fps: list = []
 
-        for s, slot in enumerate(slots):
-            zarr_name = Path(slot.zarr_path).name
-            per_slot_zarr_name.append(zarr_name)
+        def _refresh_slot_state(slot_idx: int) -> None:
+            slot = batcher.get_slot_info()[slot_idx]
+            per_slot_vid_cursor[slot_idx] = 0
+            per_slot_combined[slot_idx] = []
+            per_slot_zarr_name[slot_idx] = Path(slot.zarr_path).name
 
             g = zarr_lib.open_group(slot.zarr_path, mode="r")
-            fps = float(dict(g.attrs).get("fps", 20.0))
-            per_slot_fps.append(fps)
+            per_slot_fps[slot_idx] = float(dict(g.attrs).get("fps", 20.0))
 
             n_video = _latent_to_video_frames(slot.n_latent_frames)
-            per_slot_motion.append(_load_motion(slot.zarr_path, n_video))
+            per_slot_motion[slot_idx] = _load_motion(slot.zarr_path, n_video)
+
+        def _flush_combined_slot(slot_idx: int, slot) -> None:
+            nonlocal saved_count
+            if not args.combined or not per_slot_combined[slot_idx]:
+                return
+            all_arr = np.concatenate(per_slot_combined[slot_idx])
+            stem = Path(slot.zarr_path).stem
+            fps = per_slot_fps[slot_idx]
+            out_path = (
+                out_dir
+                / f"g{group_counter:02d}_s{slot_idx}_{stem}"
+                  f"_{len(per_slot_combined[slot_idx])}x{args.window_size}lat.mp4"
+            )
+            rc = _save_mp4(all_arr, out_path, fps)
+            if rc == 0:
+                logging.info(
+                    "  Saved %s  (%d frames, %.1f s @ %.0f fps)",
+                    out_path, all_arr.shape[0],
+                    all_arr.shape[0] / fps, fps,
+                )
+                saved_count += 1
+            else:
+                logging.error("  ffmpeg failed with exit code %d", rc)
+            per_slot_combined[slot_idx] = []
+            del all_arr
+
+        per_slot_motion.extend([None] * args.batch_size)
+        per_slot_zarr_name.extend([""] * args.batch_size)
+        per_slot_fps.extend([20.0] * args.batch_size)
+
+        for s in range(args.batch_size):
+            _refresh_slot_state(s)
 
         # Reset VAE cache on every device at the start of each group
         for v in vaes.values():
             v.model.clear_cache()
 
-        while not batcher.needs_new_group():
-            win_idx = batcher.current_window_idx
+        dataset_exhausted = False
+        while True:
+            exhausted = batcher.exhausted_slot_indices()
+            if exhausted and not dataset_exhausted:
+                available = len(dataset) - ride_cursor
+                n_fill = min(len(exhausted), max(available, 0))
+                fill_indices = exhausted[:n_fill]
+                if fill_indices:
+                    for s in fill_indices:
+                        _flush_combined_slot(s, batcher.get_slot_info()[s])
+                    ride_dicts = [dataset[ride_cursor + i] for i in range(n_fill)]
+                    ride_cursor += n_fill
+                    batcher.refill_slots(fill_indices, ride_dicts)
+                    for s in fill_indices:
+                        _refresh_slot_state(s)
+                    for v in vaes.values():
+                        v.model.clear_cache()
+                if n_fill < len(exhausted):
+                    dataset_exhausted = True
+
+            slots = batcher.get_slot_info()
+            active_slots = [
+                s for s, slot in enumerate(slots)
+                if slot.loaded and slot.window_idx < slot.n_windows
+            ]
+            if not active_slots:
+                break
+
             bounds = batcher.get_window_bounds()
 
-            for s in range(args.batch_size):
+            for s in active_slots:
                 lat_s, lat_e = bounds[s]
                 slot = slots[s]
+                win_idx = slot.window_idx
                 zarr_name = per_slot_zarr_name[s]
                 fps = per_slot_fps[s]
 
@@ -466,27 +524,7 @@ def main() -> None:
         # Write combined videos for each slot if requested
         if args.combined:
             for s in range(args.batch_size):
-                if not per_slot_combined[s]:
-                    continue
-                all_arr = np.concatenate(per_slot_combined[s])
-                stem = Path(slots[s].zarr_path).stem
-                fps = per_slot_fps[s]
-                out_path = (
-                    out_dir
-                    / f"g{group_counter:02d}_s{s}_{stem}"
-                      f"_{batcher.group_total_windows}x{args.window_size}lat.mp4"
-                )
-                rc = _save_mp4(all_arr, out_path, fps)
-                if rc == 0:
-                    logging.info(
-                        "  Saved %s  (%d frames, %.1f s @ %.0f fps)",
-                        out_path, all_arr.shape[0],
-                        all_arr.shape[0] / fps, fps,
-                    )
-                    saved_count += 1
-                else:
-                    logging.error("  ffmpeg failed with exit code %d", rc)
-                del all_arr
+                _flush_combined_slot(s, batcher.get_slot_info()[s])
 
         for v in vaes.values():
             v.model.clear_cache()

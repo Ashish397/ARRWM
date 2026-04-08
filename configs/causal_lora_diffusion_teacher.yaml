@@ -15,12 +15,14 @@ allow_checkpoint_config_mismatch: true
 wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
 wandb_entity: ashish397-university-of-exeter
 wandb_project: frodobots_wm
+wandb_run_name: z-critic-v12-probe-fixes
 wandb_group: causal-lora-teacher
 wandb_tags:
   - causal
   - teacher-forcing
   - ar-diffusion
   - streaming
+  - z-critic
 
 # Causal-specific settings
 teacher_forcing: true
@@ -88,17 +90,31 @@ model_kwargs:
 # Only the 'lora' key is loaded; optimizer and step are NOT restored.
 pretrained_lora_ckpt: /scratch/u6ej/as1748.u6ej/frodobots/pretrained_weights/retrain_no_gan_256/logs/diffusion_lora_step0018600.pt
 
-# Action critic (chunkwise 3D-convolutional learned critic)
+# Z-predictor critic (timestep-conditioned, action-aware differentiable proxy)
 action_critic_enabled: true
-action_critic_noise_timestep: 25
-action_critic_dims: [2, 7]
-action_critic_z_loss_weight: 1.0
-action_critic_reward_loss_weight: 0.1
-generator_action_z_guidance_weight: 0.0
-generator_action_reward_guidance_weight: 0.0
-critic_lr: 3.0e-04                  # separate critic learning rate
-action_critic_base_channels: 128    # 3D CNN stem width (was 64)
-action_critic_num_blocks: 4         # residual blocks in trunk (was 3)
+action_critic_dims: [2, 7]              # commanded action dims (input to critic)
+action_critic_z_out_dim: 8              # predict full 8D ss_vae latent
+action_critic_z_loss_weight: 1.0        # weight for critic z-prediction loss
+generator_action_z_guidance_weight: 1.5 # generator guidance via z-prediction
+z_guidance_warmup_steps: 200            # linearly ramp guidance weight after LR warmup
+critic_lr: 3.0e-04                      # separate critic learning rate
+critic_updates_per_step: 2              # critic optimizer steps per generator step
+action_critic_base_channels: 128        # 3D CNN stem width
+action_critic_num_blocks: 4             # residual blocks in trunk
+
+# State action head — cross-attention probes tapping transformer at multiple depths
+state_head_enabled: true
+state_probe_mode: true                  # use cross-attention probes instead of in-sequence tokens
+state_probe_dim: 256                    # probe hidden dimension
+state_probe_n_taps: 6                   # number of transformer layers to tap
+state_probe_num_heads: 8                # attention heads per probe layer
+state_head_loss_weight: 1.5
+state_head_out_dim: 2                   # predict teacher z2/z7 only
+
+# Frozen-readout generator guidance (state-token head as differentiable evaluator)
+state_guidance_weight: 0.5              # weight for frozen-readout guidance loss
+state_guidance_warmup_steps: 200        # ramp guidance after LR warmup
+state_guidance_action_scale: 1.1        # overshoot multiplier on commanded actions
 
 # Logging
 logdir: /scratch/u6ej/as1748.u6ej/ARRWM/logs/causal_lora_teacher

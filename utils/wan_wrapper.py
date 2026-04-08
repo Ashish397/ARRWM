@@ -306,6 +306,88 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.num_frames = num_frames
         self.num_class = num_class
 
+    def adding_state_token_branch(
+        self,
+        n_chunks: int = 7,
+        z_out_dim: int = 2,
+        dim: int = 2048,
+        num_frame_per_block: int = 3,
+    ) -> None:
+        """Add per-frame state tokens that evolve inside the transformer.
+
+        Creates learned initial state embeddings (one per *frame*) that are
+        inserted per-frame into the sequence alongside visual and action
+        tokens.  After the transformer, state hidden states are pooled
+        per-chunk and mapped to the teacher latent via a linear readout.
+
+        Must be called before DDP wrapping and after action token setup.
+        """
+        n_frames = n_chunks * num_frame_per_block
+        self._state_token_init = nn.Parameter(
+            torch.randn(n_frames, dim) * 0.02,
+        )
+        self._state_readout = nn.Linear(dim, z_out_dim)
+        nn.init.normal_(self._state_readout.weight, std=1e-3)
+        nn.init.zeros_(self._state_readout.bias)
+
+        self._state_n_chunks = n_chunks
+        self._state_z_out_dim = z_out_dim
+        self._state_num_frame_per_block = num_frame_per_block
+
+        # Unwrap PeftModel (if LoRA has been applied) so attributes land on
+        # the actual CausalWanModel that reads them inside _forward_train.
+        base_model = self.model
+        if hasattr(base_model, 'get_base_model'):
+            base_model = base_model.get_base_model()
+        base_model.state_tokens_per_frame = 1
+        base_model.action_tokens_per_frame += 1
+        self.seq_len += n_frames
+
+    def _build_state_tokens(self, batch_size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Expand per-frame learned state inits to [B, F, dim]."""
+        st = self._state_token_init.unsqueeze(0).expand(batch_size, -1, -1)
+        return st.to(dtype=dtype, device=device)
+
+    def adding_state_probe_branch(
+        self,
+        n_chunks: int = 7,
+        z_out_dim: int = 2,
+        dim: int = 2048,
+        probe_dim: int = 256,
+        num_heads: int = 8,
+        n_taps: int = 6,
+        num_frame_per_block: int = 3,
+    ) -> None:
+        """Add cross-attention state probes that tap transformer features at
+        multiple depths instead of injecting state tokens into the sequence.
+
+        Must be called before DDP wrapping and after LoRA application.
+        """
+        from wan.modules.causal_model import StateProbeModule
+
+        base_model = self.model
+        if hasattr(base_model, 'get_base_model'):
+            base_model = base_model.get_base_model()
+
+        a_per_f = int(getattr(base_model, 'action_tokens_per_frame', 0))
+        self._state_probe = StateProbeModule(
+            n_chunks=n_chunks,
+            model_dim=dim,
+            probe_dim=probe_dim,
+            z_out_dim=z_out_dim,
+            num_heads=num_heads,
+            n_taps=n_taps,
+            num_frame_per_block=num_frame_per_block,
+            action_tokens_per_frame=a_per_f,
+        )
+        self._state_n_chunks = n_chunks
+        self._state_z_out_dim = z_out_dim
+
+        n_blocks = len(base_model.blocks)
+        tap_indices = [int(round(i * (n_blocks - 1) / (n_taps - 1))) for i in range(n_taps)]
+        base_model._state_probe_tap_set = set(tap_indices)
+        base_model._state_probe_tap_indices = tap_indices
+
     def _convert_flow_pred_to_x0(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """
         Convert flow matching's prediction to x0 prediction.
@@ -394,9 +476,36 @@ class WanDiffusionWrapper(torch.nn.Module):
         input_timestep = timestep
 
         logits = None
+        has_state = getattr(self, "_state_token_init", None) is not None
+        has_probe = getattr(self, "_state_probe", None) is not None
+        state_hidden = None
+        tapped_features = None
+
+        # Build state tokens once. Cached inference only supports the noisy-side
+        # tokens, while teacher-forcing also threads a clean-side copy.
+        state_kwargs = {}
+        if has_state:
+            B = noisy_image_or_video.shape[0]
+            st = self._build_state_tokens(B, noisy_image_or_video.dtype, noisy_image_or_video.device)
+            if kv_cache is not None:
+                model_for_shape = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+                patch_size = getattr(model_for_shape, "patch_size", (1, 2, 2))
+                spatial_tokens_per_frame = (
+                    noisy_image_or_video.shape[-2] * noisy_image_or_video.shape[-1]
+                ) // (patch_size[1] * patch_size[2])
+                tokens_per_frame = spatial_tokens_per_frame + int(
+                    getattr(model_for_shape, "action_tokens_per_frame", 0)
+                )
+                frame_start = int(current_start or 0) // max(tokens_per_frame, 1)
+                frame_end = frame_start + noisy_image_or_video.shape[1]
+                st = st[:, frame_start:frame_end].contiguous()
+            state_kwargs["state_tokens"] = st
+            if clean_x is not None and kv_cache is None:
+                state_kwargs["state_tokens_clean"] = st
+
         # X0 prediction
         if kv_cache is not None:
-            flow_pred = self.model(
+            model_out = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
@@ -405,60 +514,111 @@ class WanDiffusionWrapper(torch.nn.Module):
                 current_start=current_start,
                 cache_start=cache_start,
                 **action_mod_kwargs,
-            ).permute(0, 2, 1, 3, 4)
-        else:
-            if clean_x is not None:
-                # teacher forcing
-                flow_pred = self.model(
-                    noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                    t=input_timestep, context=prompt_embeds,
-                    seq_len=self.seq_len,
-                    clean_x=clean_x.permute(0, 2, 1, 3, 4),
-                    aug_t=aug_t,
-                    **action_mod_kwargs,
-                ).permute(0, 2, 1, 3, 4)
+                **state_kwargs,
+            )
+            if isinstance(model_out, tuple):
+                flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
+                state_hidden = model_out[1]
             else:
-                if classify_mode:
-                    flow_pred, logits = self.model(
-                        noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
-                        classify_mode=True,
-                        register_tokens=self._register_tokens,
-                        cls_pred_branch=self._cls_pred_branch,
-                        gan_ca_blocks=self._gan_ca_blocks,
-                        concat_time_embeddings=concat_time_embeddings,
-                        **action_mod_kwargs,
-                    )
-                    flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
-                elif regress_mode:
-                    flow_pred, logits = self.model(
-                        noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
-                        regress_mode=True,
-                        register_tokens_rgs=self._register_tokens_rgs,
-                        rgs_pred_branch=self._rgs_pred_branch,
-                        gan_ca_blocks_rgs=self._gan_ca_blocks_rgs,
-                        num_frames_rgs=self.num_frames,
-                        num_class_rgs=self.num_class,
-                        concat_time_embeddings=concat_time_embeddings,
-                        **action_mod_kwargs,
-                    )
-                    flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+                flow_pred = model_out.permute(0, 2, 1, 3, 4)
+        elif clean_x is not None:
+            model_out = self.model(
+                noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                t=input_timestep, context=prompt_embeds,
+                seq_len=self.seq_len,
+                clean_x=clean_x.permute(0, 2, 1, 3, 4),
+                aug_t=aug_t,
+                **action_mod_kwargs,
+                **state_kwargs,
+            )
+            if isinstance(model_out, tuple):
+                flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
+                aux = model_out[1]
+                if isinstance(aux, list):
+                    tapped_features = aux
                 else:
-                    flow_pred = self.model(
-                        noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
-                        **action_mod_kwargs,
-                    ).permute(0, 2, 1, 3, 4)
+                    state_hidden = aux
+            else:
+                flow_pred = model_out.permute(0, 2, 1, 3, 4)
+        elif classify_mode:
+            flow_pred, logits = self.model(
+                noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                t=input_timestep, context=prompt_embeds,
+                seq_len=self.seq_len,
+                classify_mode=True,
+                register_tokens=self._register_tokens,
+                cls_pred_branch=self._cls_pred_branch,
+                gan_ca_blocks=self._gan_ca_blocks,
+                concat_time_embeddings=concat_time_embeddings,
+                **action_mod_kwargs,
+            )
+            flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+        elif regress_mode:
+            flow_pred, logits = self.model(
+                noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                t=input_timestep, context=prompt_embeds,
+                seq_len=self.seq_len,
+                regress_mode=True,
+                register_tokens_rgs=self._register_tokens_rgs,
+                rgs_pred_branch=self._rgs_pred_branch,
+                gan_ca_blocks_rgs=self._gan_ca_blocks_rgs,
+                num_frames_rgs=self.num_frames,
+                num_class_rgs=self.num_class,
+                concat_time_embeddings=concat_time_embeddings,
+                **action_mod_kwargs,
+            )
+            flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+        else:
+            model_out = self.model(
+                noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                t=input_timestep, context=prompt_embeds,
+                seq_len=self.seq_len,
+                **action_mod_kwargs,
+                **state_kwargs,
+            )
+            if isinstance(model_out, tuple):
+                flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
+                aux = model_out[1]
+                if isinstance(aux, list):
+                    tapped_features = aux
+                else:
+                    state_hidden = aux
+            else:
+                flow_pred = model_out.permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
             flow_pred=flow_pred.flatten(0, 1),
             xt=noisy_image_or_video.flatten(0, 1),
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
+
+        # Cross-attention probe readout
+        if has_probe and tapped_features is not None:
+            noisy_start = tapped_features[0].shape[1] // 2 if clean_x is not None else 0
+            # Compute tokens-per-frame from the noisy-side sequence length
+            num_frames = noisy_image_or_video.shape[1]
+            noisy_seq = tapped_features[0].shape[1] - noisy_start
+            frame_seqlen = noisy_seq // num_frames
+            state_preds, probe_hidden = self._state_probe(
+                tapped_features, noisy_start, frame_seqlen,
+            )
+            return flow_pred, pred_x0, state_preds.float(), probe_hidden
+
+        # State-token readout: pool per chunk and map to z2/z7
+        if has_state and state_hidden is not None:
+            fpb = self._state_num_frame_per_block
+            n_c = self._state_n_chunks
+            B = state_hidden.shape[0]
+            actual_frames = state_hidden.shape[1]
+            if kv_cache is not None and actual_frames < n_c * fpb:
+                actual_chunks = max(1, actual_frames // fpb)
+                used = actual_chunks * fpb
+                pooled = state_hidden[:, :used].reshape(B, actual_chunks, fpb, -1).mean(dim=2)
+            else:
+                pooled = state_hidden[:, :n_c * fpb].reshape(B, n_c, fpb, -1).mean(dim=2)
+            readout_dtype = next(self._state_readout.parameters()).dtype
+            state_preds = self._state_readout(pooled.to(readout_dtype)).float()
+            return flow_pred, pred_x0, state_preds, pooled
 
         if logits is not None:
             return flow_pred, pred_x0, logits

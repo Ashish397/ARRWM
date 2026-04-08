@@ -366,7 +366,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                 
                 if index < len(self.denoising_step_list) - 1:
                     # 中间去噪步骤
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_with_action,
                         timestep=timestep,
@@ -374,6 +374,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    denoised_pred = model_out[1]
                     
                     # 添加噪声到下一步
                     next_timestep = self.denoising_step_list[index + 1]
@@ -388,7 +389,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # 最后一步，获取干净输出
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_with_action,
                         timestep=timestep,
@@ -396,6 +397,7 @@ class ActionCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    denoised_pred = model_out[1]
 
             # 记录模型输出
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)

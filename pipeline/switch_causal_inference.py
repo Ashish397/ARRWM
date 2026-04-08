@@ -183,7 +183,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
             for index, current_timestep in enumerate(self.denoising_step_list):
                 timestep = torch.ones([batch_size, current_num_frames], device=noise.device, dtype=torch.int64) * current_timestep
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
                         timestep=timestep,
@@ -191,6 +191,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    denoised_pred = model_out[1]
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -198,7 +199,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
                         next_timestep * torch.ones([batch_size * current_num_frames], device=noise.device, dtype=torch.long),
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    _, denoised_pred = self.generator(
+                    model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
                         timestep=timestep,
@@ -206,6 +207,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    denoised_pred = model_out[1]
 
             output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 

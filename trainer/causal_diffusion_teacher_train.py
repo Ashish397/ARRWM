@@ -75,19 +75,57 @@ def _chunk_actions(per_frame: torch.Tensor, chunk_frames: int) -> torch.Tensor:
     return trimmed.reshape(B, n_chunks, chunk_frames, D).mean(dim=2)
 
 
-def _draw_triplet_action_overlay(
+def _safe_corr(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Pearson correlation between flattened tensors, safe against zero variance."""
+    a_flat = a.detach().float().flatten()
+    b_flat = b.detach().float().flatten()
+    if a_flat.numel() < 2:
+        return 0.0
+    a_c = a_flat - a_flat.mean()
+    b_c = b_flat - b_flat.mean()
+    denom = a_c.norm() * b_c.norm()
+    if denom < 1e-8:
+        return 0.0
+    return (a_c @ b_c / denom).item()
+
+
+def _asymmetric_action_diff(
+    gen: torch.Tensor,
+    target: torch.Tensor,
+    over_weight: float = 0.5,
+    under_weight: float = 1.0,
+) -> torch.Tensor:
+    """Compute asymmetric action error that penalises undershoot more than overshoot.
+
+    Overshoot = same direction as target but greater magnitude (e.g. gen=-5
+    for target=-4).  Undershoot = less magnitude or wrong direction.
+
+    Near-zero targets (``|target| < 1e-3``) fall back to symmetric absolute error.
+    """
+    raw_err = gen - target
+    dir_sign = torch.sign(target)
+    signed_err = raw_err * dir_sign
+
+    over_err = torch.relu(signed_err)
+    under_err = torch.relu(-signed_err)
+    asym = over_weight * over_err + under_weight * under_err
+
+    sym = raw_err.abs()
+    return torch.where(target.abs() > 1e-3, asym, sym)
+
+
+def _draw_z_action_overlay(
     frame: np.ndarray,
     teacher_z: np.ndarray,
     critic_z: np.ndarray,
     target_z: np.ndarray,
-    teacher_reward: float,
-    critic_reward: float,
     title: str,
     frame_idx: int,
     seg_idx: int,
     clip: float = 1.0,
+    state_z: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Draw teacher/critic/target action bars for z2 and z7."""
+    """Draw teacher / critic / state / target action bars for z2 and z7."""
     h, w = frame.shape[:2]
     out = frame.copy()
     panel_w = 220
@@ -114,51 +152,64 @@ def _draw_triplet_action_overlay(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(out, f"frame={frame_idx} seg={seg_idx}", (panel_x0 + 8, 32),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(out, "teacher(g) critic(o) target(b)", (panel_x0 + 8, 48),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (180, 180, 180), 1, cv2.LINE_AA)
+
+    has_state = state_z is not None
+    if has_state:
+        cv2.putText(out, "teach(g) crit(c) state(o) tgt(b)", (panel_x0 + 8, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.26, (180, 180, 180), 1, cv2.LINE_AA)
+        step = 16
+        z2_y0, z7_y0 = 74, 146
+    else:
+        cv2.putText(out, "teacher(g) critic(c) target(b)", (panel_x0 + 8, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (180, 180, 180), 1, cv2.LINE_AA)
+        step = 18
+        z2_y0, z7_y0 = 78, 138
 
     rows = [
-        ("z2", float(teacher_z[0]), float(critic_z[0]), float(target_z[0]), 82),
-        ("z7", float(teacher_z[1]), float(critic_z[1]), float(target_z[1]), 140),
+        ("z2", float(teacher_z[0]), float(critic_z[0]), float(target_z[0]),
+         float(state_z[0]) if has_state else None, z2_y0),
+        ("z7", float(teacher_z[1]), float(critic_z[1]), float(target_z[1]),
+         float(state_z[1]) if has_state else None, z7_y0),
     ]
-    for z_name, teacher_val, critic_val, target_val, y0 in rows:
-        cv2.putText(out, z_name, (panel_x0 + 8, y0 - 18),
+    for z_name, teacher_val, critic_val, target_val, state_val, y0 in rows:
+        cv2.putText(out, z_name, (panel_x0 + 8, y0 - 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 120), 1, cv2.LINE_AA)
-        draw_bar(y0, teacher_val, (80, 220, 80), "t")
-        draw_bar(y0 + 16, critic_val, (0, 170, 255), "c")
-        draw_bar(y0 + 32, target_val, (80, 80, 220), "y")
+        y = y0
+        draw_bar(y, teacher_val, (80, 220, 80), "t")
+        y += step
+        draw_bar(y, critic_val, (100, 200, 255), "c")
+        y += step
+        if has_state:
+            draw_bar(y, state_val, (50, 170, 255), "s")
+            y += step
+        draw_bar(y, target_val, (80, 80, 220), "y")
 
-    cv2.putText(out, f"teacher_r {teacher_reward:+.4f}", (panel_x0 + 8, h - 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (100, 255, 100), 1, cv2.LINE_AA)
-    cv2.putText(out, f"critic_r  {critic_reward:+.4f}", (panel_x0 + 8, h - 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (100, 200, 255), 1, cv2.LINE_AA)
     return out
 
 
 def _annotate_action_video(
     video_np: np.ndarray,
     est_motion: torch.Tensor,
-    teacher_z: torch.Tensor,
-    teacher_reward: torch.Tensor,
-    critic_z: torch.Tensor,
-    critic_reward: torch.Tensor,
+    teacher_z2z7: torch.Tensor,
+    critic_z2z7: torch.Tensor,
     target_action_z: torch.Tensor,
     title: str,
     grid_size: int = 10,
     output_chunk_size: int = 12,
+    state_z2z7: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
-    """Overlay evaluator motion + teacher/critic/target action summaries.
+    """Overlay evaluator motion + teacher/critic/state/target z2/z7 bars.
 
     ``target_action_z`` should already be chunked to ``[B, n_chunks, D]``,
-    matching the dimensionality of ``teacher_z`` and ``critic_z``.
+    matching the dimensionality of ``teacher_z2z7``.
+    ``state_z2z7``, when provided, should be ``[B, n_chunks, 2]``.
     """
-    teacher_np = teacher_z[0].detach().cpu().numpy()
-    teacher_reward_np = teacher_reward[0].squeeze(-1).detach().cpu().numpy()
-    critic_np = critic_z[0].detach().cpu().numpy()
-    critic_reward_np = critic_reward[0].squeeze(-1).detach().cpu().numpy()
-    n_seg = teacher_z.shape[1]
+    teacher_np = teacher_z2z7[0].detach().cpu().numpy()
+    critic_np = critic_z2z7[0].detach().cpu().numpy()
+    n_seg = teacher_z2z7.shape[1]
     target_seg_np = target_action_z[0, :n_seg].detach().float().cpu().numpy()
     motion_np = est_motion[0].detach().cpu().numpy()
+    state_np = state_z2z7[0].detach().cpu().numpy() if state_z2z7 is not None else None
 
     n_frames = video_np.shape[0]
     annotated = []
@@ -184,10 +235,11 @@ def _annotate_action_video(
                     color = (0, 255, 0) if vis_val >= 0.5 else (0, 200, 255)
                     cv2.arrowedLine(f, (cx_pt, cy_pt), (ex_pt, ey_pt), color, 1, tipLength=0.3)
 
-        f = _draw_triplet_action_overlay(
+        state_seg = state_np[seg_idx] if state_np is not None and seg_idx < state_np.shape[0] else None
+        f = _draw_z_action_overlay(
             f, teacher_np[seg_idx], critic_np[seg_idx], target_seg_np[seg_idx],
-            float(teacher_reward_np[seg_idx]), float(critic_reward_np[seg_idx]),
             title=title, frame_idx=frame_idx, seg_idx=seg_idx,
+            state_z=state_seg,
         )
         annotated.append(f)
     return np.stack(annotated)
@@ -333,13 +385,18 @@ class CausalLoRADiffusionTrainer:
 
         # Action critic config
         self.action_critic_enabled = bool(getattr(config, "action_critic_enabled", False))
-        self.action_critic_noise_timestep = int(getattr(config, "action_critic_noise_timestep", 25))
+        self.critic_updates_per_step = int(getattr(config, "critic_updates_per_step", 1))
         critic_dims_cfg = getattr(config, "action_critic_dims", None)
         self.action_critic_dims = list(critic_dims_cfg) if critic_dims_cfg is not None else [2, 7]
-        self.action_critic_z_loss_weight = float(getattr(config, "action_critic_z_loss_weight", 1.0))
-        self.action_critic_reward_loss_weight = float(getattr(config, "action_critic_reward_loss_weight", 0.1))
-        self.generator_action_z_guidance_weight = float(getattr(config, "generator_action_z_guidance_weight", 0.0))
-        self.generator_action_reward_guidance_weight = float(getattr(config, "generator_action_reward_guidance_weight", 0.0))
+        self.action_critic_z_loss_weight = float(
+            getattr(config, "action_critic_z_loss_weight",
+                    getattr(config, "action_critic_reward_loss_weight", 0.1)))
+        self.generator_action_z_guidance_weight = float(
+            getattr(config, "generator_action_z_guidance_weight",
+                    getattr(config, "generator_action_reward_guidance_weight", 0.0)))
+        self.z_guidance_warmup_steps = int(
+            getattr(config, "z_guidance_warmup_steps",
+                    getattr(config, "reward_guidance_warmup_steps", 500)))
         self.critic_lr = float(getattr(config, "critic_lr", 3e-4))
         self.action_critic = None
         self.critic_optimizer = None
@@ -347,6 +404,23 @@ class CausalLoRADiffusionTrainer:
         self._frozen_cotracker = None
         self._frozen_ss_vae = None
         self._frozen_ss_vae_scale = 1.0
+
+        # State-token action head config
+        self.state_head_enabled = bool(getattr(config, "state_head_enabled", False))
+        self.state_head_loss_weight = float(getattr(config, "state_head_loss_weight", 0.005))
+        self.state_head_out_dim = int(getattr(config, "state_head_out_dim", 2))
+        self._state_head_built = False
+
+        # Cross-attention state probe config
+        self.state_probe_mode = bool(getattr(config, "state_probe_mode", False))
+        self.state_probe_dim = int(getattr(config, "state_probe_dim", 256))
+        self.state_probe_n_taps = int(getattr(config, "state_probe_n_taps", 6))
+        self.state_probe_num_heads = int(getattr(config, "state_probe_num_heads", 8))
+
+        # Frozen-readout state guidance config
+        self.state_guidance_weight = float(getattr(config, "state_guidance_weight", 0.0))
+        self.state_guidance_warmup_steps = int(getattr(config, "state_guidance_warmup_steps", 500))
+        self.state_guidance_action_scale = float(getattr(config, "state_guidance_action_scale", 1.1))
 
         # LR schedule
         self.warmup_steps = int(getattr(config, "warmup_steps", 0))
@@ -555,6 +629,44 @@ class CausalLoRADiffusionTrainer:
         self.lora_config = lora_cfg
         wrapper.model = self._apply_lora(wrapper.model, lora_cfg)
 
+        # State-token or cross-attention probe (before DDP wrap, after action tokens)
+        if self.state_head_enabled:
+            n_chunks = num_train_frames // self.num_frame_per_block
+            if self.state_probe_mode:
+                wrapper.adding_state_probe_branch(
+                    n_chunks=n_chunks,
+                    z_out_dim=self.state_head_out_dim,
+                    dim=wrapper.model.dim,
+                    probe_dim=self.state_probe_dim,
+                    num_heads=self.state_probe_num_heads,
+                    n_taps=self.state_probe_n_taps,
+                    num_frame_per_block=self.num_frame_per_block,
+                )
+                self._state_head_built = True
+                if self.is_main_process:
+                    base_m = wrapper.model.get_base_model() if hasattr(wrapper.model, 'get_base_model') else wrapper.model
+                    logging.info(
+                        "State cross-attention probes: %d chunks, out_dim=%d, "
+                        "probe_dim=%d, n_taps=%d, taps=%s, weight=%.4f",
+                        n_chunks, self.state_head_out_dim, self.state_probe_dim,
+                        self.state_probe_n_taps,
+                        getattr(base_m, '_state_probe_tap_indices', []),
+                        self.state_head_loss_weight,
+                    )
+            else:
+                wrapper.adding_state_token_branch(
+                    n_chunks=n_chunks,
+                    z_out_dim=self.state_head_out_dim,
+                    dim=wrapper.model.dim,
+                    num_frame_per_block=self.num_frame_per_block,
+                )
+                self._state_head_built = True
+                if self.is_main_process:
+                    logging.info(
+                        "State-token action head: %d chunks, out_dim=%d, weight=%.4f",
+                        n_chunks, self.state_head_out_dim, self.state_head_loss_weight,
+                    )
+
         wrapper.to(self.device)
         wrapper.train()
         if self.is_distributed:
@@ -574,12 +686,14 @@ class CausalLoRADiffusionTrainer:
     # ------------------------------------------------------------------
 
     def _build_action_critic(self) -> None:
-        z_dim = len(self.action_critic_dims)
+        action_dim = len(self.action_critic_dims)
         base_channels = int(getattr(self.config, "action_critic_base_channels", 64))
         num_res_blocks = int(getattr(self.config, "action_critic_num_blocks", 3))
+        z_out_dim = int(getattr(self.config, "action_critic_z_out_dim", 8))
         self.action_critic = ActionCritic(
             latent_channels=16,
-            z_dim=z_dim,
+            action_dim=action_dim,
+            z_out_dim=z_out_dim,
             base_channels=base_channels,
             num_res_blocks=num_res_blocks,
             chunk_frames=self.num_frame_per_block,
@@ -598,7 +712,7 @@ class CausalLoRADiffusionTrainer:
         if self.is_main_process:
             critic_mod = self.action_critic.module if isinstance(self.action_critic, DDP) else self.action_critic
             n_params = sum(p.numel() for p in critic_mod.parameters())
-            logging.info("Action critic: %d params, z_dim=%d", n_params, z_dim)
+            logging.info("Action critic: %d params, action_dim=%d", n_params, action_dim)
 
     def _build_frozen_evaluator_modules(self) -> None:
         self._frozen_vae = WanVAEWrapper()
@@ -639,16 +753,14 @@ class CausalLoRADiffusionTrainer:
     def _compute_action_teacher_targets(
         self,
         pred_x0: torch.Tensor,
-        target_action_z: torch.Tensor,
     ):
-        """Produce teacher z2/z7 and scalar reward from pred_x0.
+        """Produce full 8-D teacher z from pred_x0 via the motion pipeline.
 
         Returns exactly ``n_chunks = F // chunk_frames`` segments so that
         the outputs align 1-to-1 with the chunkwise critic's predictions.
 
         Returns:
-            teacher_z: ``[B, n_chunks, z_dim]``
-            teacher_reward: ``[B, n_chunks, 1]``
+            teacher_z_8d: ``[B, n_chunks, 8]``
         """
         B, F, C, H, W = pred_x0.shape
         n_chunks = F // self.num_frame_per_block
@@ -656,17 +768,8 @@ class CausalLoRADiffusionTrainer:
         dummy = pred_x0[:, 0:1]
         latents_with_dummy = torch.cat([dummy, pred_x0], dim=1)
 
-        noise = torch.randn_like(latents_with_dummy.flatten(0, 1))
-        t_fixed = torch.full(
-            (noise.shape[0],), self.action_critic_noise_timestep,
-            dtype=torch.long, device=pred_x0.device,
-        )
-        noisy_latents = self.scheduler.add_noise(
-            latents_with_dummy.flatten(0, 1), noise, t_fixed,
-        ).unflatten(0, (B, F + 1))
-
         pixels = self._frozen_vae.decode_to_pixel(
-            noisy_latents.float(),
+            latents_with_dummy.float(),
         )[:, 1:, ...]
 
         video = (255.0 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()
@@ -677,7 +780,6 @@ class CausalLoRADiffusionTrainer:
         N = grid_size ** 2
 
         all_teacher_z = []
-        all_teacher_reward = []
 
         for b in range(B):
             vid = video[b]
@@ -710,9 +812,7 @@ class CausalLoRADiffusionTrainer:
                 motion_windows.append(mw)
 
             if not motion_windows:
-                z_dim = len(self.action_critic_dims)
-                all_teacher_z.append(torch.zeros(n_chunks, z_dim, device=pred_x0.device))
-                all_teacher_reward.append(torch.zeros(n_chunks, 1, device=pred_x0.device))
+                all_teacher_z.append(torch.zeros(n_chunks, 8, device=pred_x0.device))
                 continue
 
             est_motion = torch.cat(motion_windows, dim=0)
@@ -723,25 +823,16 @@ class CausalLoRADiffusionTrainer:
             z_full_8d = mu.squeeze(-1).squeeze(-1)
             z_full_8d = _tanh_squash(z_full_8d)
 
-            gen_z = z_full_8d[:, self.action_critic_dims]  # [raw_n, z_dim]
-
-            # Remap raw segments -> n_chunks to match critic output contract
-            gen_z_chunked = self._reduce_to_segments(gen_z, n_chunks)
-            target_chunked = self._reduce_to_segments(target_action_z[b], n_chunks)
-            reward = -torch.log((gen_z_chunked - target_chunked).abs() + 1e-6).mean(dim=-1, keepdim=True)
-
-            all_teacher_z.append(gen_z_chunked)
-            all_teacher_reward.append(reward)
+            z_chunked = self._reduce_to_segments(z_full_8d, n_chunks)
+            all_teacher_z.append(z_chunked)
 
         teacher_z = torch.stack(all_teacher_z, dim=0)
-        teacher_reward = torch.stack(all_teacher_reward, dim=0)
-        return teacher_z.detach(), teacher_reward.detach()
+        return teacher_z.detach()
 
     @torch.no_grad()
     def _compute_teacher_visuals(
         self,
         pred_x0: torch.Tensor,
-        target_action_z: torch.Tensor,
     ):
         """Like teacher targets but also returns motion for overlays.
 
@@ -750,8 +841,7 @@ class CausalLoRADiffusionTrainer:
 
         Returns:
             motion: ``[B, n_chunks, N, 3]``
-            teacher_z: ``[B, n_chunks, z_dim]``
-            teacher_reward: ``[B, n_chunks, 1]``
+            teacher_z_8d: ``[B, n_chunks, 8]``
         """
         B, F, C, H, W = pred_x0.shape
         n_chunks = F // self.num_frame_per_block
@@ -759,17 +849,8 @@ class CausalLoRADiffusionTrainer:
         dummy = pred_x0[:, 0:1]
         latents_with_dummy = torch.cat([dummy, pred_x0], dim=1)
 
-        noise = torch.randn_like(latents_with_dummy.flatten(0, 1))
-        t_fixed = torch.full(
-            (noise.shape[0],), self.action_critic_noise_timestep,
-            dtype=torch.long, device=pred_x0.device,
-        )
-        noisy_latents = self.scheduler.add_noise(
-            latents_with_dummy.flatten(0, 1), noise, t_fixed,
-        ).unflatten(0, (B, F + 1))
-
         pixels = self._frozen_vae.decode_to_pixel(
-            noisy_latents.float(),
+            latents_with_dummy.float(),
         )[:, 1:, ...]
         video = (255.0 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()
 
@@ -780,7 +861,6 @@ class CausalLoRADiffusionTrainer:
 
         all_motion = []
         all_z = []
-        all_r = []
 
         for b in range(B):
             vid = video[b].unsqueeze(0)
@@ -809,8 +889,7 @@ class CausalLoRADiffusionTrainer:
 
             if not mws:
                 all_motion.append(torch.zeros(n_chunks, N, 3, device=pred_x0.device))
-                all_z.append(torch.zeros(n_chunks, len(self.action_critic_dims), device=pred_x0.device))
-                all_r.append(torch.zeros(n_chunks, 1, device=pred_x0.device))
+                all_z.append(torch.zeros(n_chunks, 8, device=pred_x0.device))
                 continue
 
             est_motion = torch.cat(mws, dim=0)
@@ -819,24 +898,18 @@ class CausalLoRADiffusionTrainer:
             x_in = xy.permute(0, 3, 1, 2).float() / self._frozen_ss_vae_scale
             mu, _ = self._frozen_ss_vae.encoder(x_in.to(self.device))
             z8 = _tanh_squash(mu.squeeze(-1).squeeze(-1))
-            gz = z8[:, self.action_critic_dims]
 
-            # Remap raw segments -> n_chunks to match critic output contract
-            gz_chunked = self._reduce_to_segments(gz, n_chunks)
+            z8_chunked = self._reduce_to_segments(z8, n_chunks)
             motion_chunked = self._reduce_to_segments(
                 est_motion.reshape(raw_n, -1), n_chunks,
             ).reshape(n_chunks, N, 3)
-            target_chunked = self._reduce_to_segments(target_action_z[b], n_chunks)
-            reward = -torch.log((gz_chunked - target_chunked).abs() + 1e-6).mean(dim=-1, keepdim=True)
 
             all_motion.append(motion_chunked)
-            all_z.append(gz_chunked)
-            all_r.append(reward)
+            all_z.append(z8_chunked)
 
         motion = torch.stack(all_motion)
         tz = torch.stack(all_z)
-        tr = torch.stack(all_r)
-        return motion.detach(), tz.detach(), tr.detach()
+        return motion.detach(), tz.detach()
 
     @staticmethod
     def _reduce_to_segments(per_frame: torch.Tensor, n_seg: int) -> torch.Tensor:
@@ -1127,6 +1200,54 @@ class CausalLoRADiffusionTrainer:
             if self.is_main_process:
                 logging.info("Restored action token projection from checkpoint")
 
+        if self._state_head_built:
+            if hasattr(base, '_state_probe') and "state_probe" in checkpoint:
+                missing, unexpected = base._state_probe.load_state_dict(
+                    checkpoint["state_probe"], strict=False,
+                )
+                if self.is_main_process:
+                    if missing or unexpected:
+                        logging.warning(
+                            "State probe: %d missing, %d unexpected keys",
+                            len(missing), len(unexpected),
+                        )
+                    else:
+                        logging.info("Restored state_probe from checkpoint")
+            elif hasattr(base, '_state_probe'):
+                if self.is_main_process:
+                    logging.info("No state_probe in checkpoint (training from scratch)")
+            else:
+                for key, attr_name in [
+                    ("state_token_init", "_state_token_init"),
+                    ("state_readout", "_state_readout"),
+                ]:
+                    if key in checkpoint:
+                        obj = getattr(base, attr_name)
+                        if isinstance(obj, nn.Parameter):
+                            saved = checkpoint[key]
+                            if isinstance(saved, dict) and "weight" in saved:
+                                saved = saved["weight"]
+                            if isinstance(saved, torch.Tensor) and saved.shape == obj.shape:
+                                obj.data.copy_(saved)
+                                if self.is_main_process:
+                                    logging.info("Restored %s from checkpoint", key)
+                            else:
+                                if self.is_main_process:
+                                    logging.warning("Shape mismatch for %s, training from scratch", key)
+                        else:
+                            missing, unexpected = obj.load_state_dict(checkpoint[key], strict=False)
+                            if self.is_main_process:
+                                if missing or unexpected:
+                                    logging.warning(
+                                        "State-token %s: %d missing, %d unexpected keys",
+                                        key, len(missing), len(unexpected),
+                                    )
+                                else:
+                                    logging.info("Restored %s from checkpoint", key)
+                    else:
+                        if self.is_main_process:
+                            logging.info("No %s in checkpoint (new modules will be trained from scratch)", key)
+
     def _save_checkpoint(self, step: int, keep_last: int = 3) -> None:
         path = self._checkpoint_path(step)
         if path is None:
@@ -1147,6 +1268,12 @@ class CausalLoRADiffusionTrainer:
             state["action_projection"] = self.action_projection.state_dict()
         if self.action_token_projection is not None:
             state["action_token_projection"] = self.action_token_projection.state_dict()
+        if self._state_head_built:
+            if hasattr(base, '_state_probe'):
+                state["state_probe"] = base._state_probe.state_dict()
+            else:
+                state["state_token_init"] = base._state_token_init.data
+                state["state_readout"] = base._state_readout.state_dict()
         if self.is_main_process:
             torch.save(state, path)
             logging.info("Saved checkpoint to %s", path)
@@ -1206,59 +1333,111 @@ class CausalLoRADiffusionTrainer:
         weights = self.scheduler.training_weight(timesteps.flatten(0, 1)).view(bsz, num_frames)
         return (flow_loss * weights).mean()
 
-    def _compute_action_critic_losses(self, pred_x0, target_action_z):
-        """Compute critic-training and generator-guidance losses using chunkwise outputs.
+    def _weighted_z_mse(self, pred_z, target_z):
+        """Weighted MSE over 8-D z with 2x weight on action-relevant dims."""
+        w = torch.ones(pred_z.shape[-1], device=pred_z.device, dtype=pred_z.dtype)
+        for dim_idx in self.action_critic_dims:
+            w[dim_idx] = 2.0
+        return (w * (pred_z - target_z) ** 2).mean()
 
-        The critic now directly outputs one prediction per 3-frame chunk,
-        so no ``_temporal_pool`` is needed on critic outputs.
+    def _compute_action_critic_losses(self, pred_x0, target_action_z, timesteps, current_step):
+        """Compute z-predictor training and generator guidance losses.
+
+        Runs ``critic_updates_per_step`` independent critic optimiser steps
+        (each with its own zero-grad / backward / clip / step) so the critic
+        can track the evolving generator more tightly.  Then computes the
+        generator guidance loss (frozen critic, gradients through pred_x0).
+
+        Args:
+            pred_x0: ``[B, F, C, H, W]`` predicted clean latents.
+            target_action_z: ``[B, F, z_dim]`` commanded action per frame (z2/z7).
+            timesteps: ``[B, F]`` diffusion timesteps (same within each block).
+            current_step: current training step (for guidance warmup).
+
+        Returns:
+            generator_action_loss, logs, teacher_z_8d
         """
         critic_mod = self.action_critic.module if isinstance(self.action_critic, DDP) else self.action_critic
         chunk_frames = self.num_frame_per_block
+        B = pred_x0.shape[0]
+        n_chunks = pred_x0.shape[1] // chunk_frames
 
-        teacher_z, teacher_reward = self._compute_action_teacher_targets(
-            pred_x0.detach(), target_action_z,
-        )
-        n_chunks = teacher_z.shape[1]
+        chunk_t = timesteps[:, ::chunk_frames][:, :n_chunks]
+        chunk_actions = _chunk_actions(target_action_z, chunk_frames)[:, :n_chunks]  # [B, n_chunks, 2]
 
-        # --- critic training: call through DDP wrapper so backward hooks
-        #     fire and gradients are all-reduced across ranks. ---
-        pred_z, pred_reward = self.action_critic(pred_x0.detach())
-        pred_z = pred_z[:, :n_chunks]
-        pred_reward = pred_reward[:, :n_chunks]
+        zero = torch.tensor(0.0, device=pred_x0.device)
 
-        critic_z_loss = F.mse_loss(pred_z, teacher_z)
-        critic_r_loss = F.mse_loss(pred_reward, teacher_reward)
-        critic_loss = (
-            self.action_critic_z_loss_weight * critic_z_loss
-            + self.action_critic_reward_loss_weight * critic_r_loss
-        )
+        # Teacher targets: full 8D z from motion pipeline (computed once)
+        teacher_z_8d = self._compute_action_teacher_targets(pred_x0.detach())
+        teacher_z_8d = teacher_z_8d[:, :n_chunks]  # [B, n_chunks, 8]
 
-        # --- generator guidance: unwrapped module with frozen weights
-        #     (no DDP needed since no critic gradients flow here). ---
-        critic_mod.requires_grad_(False)
-        gen_pred_z, gen_pred_reward = critic_mod(pred_x0)
-        gen_pred_z = gen_pred_z[:, :n_chunks]
-        gen_pred_reward = gen_pred_reward[:, :n_chunks]
+        pred_x0_detached = pred_x0.detach()
 
-        target_chunk = _chunk_actions(target_action_z, chunk_frames)[:, :n_chunks]
+        # --- Multi-step critic training (self-contained optimiser loop) ---
+        for _k in range(self.critic_updates_per_step):
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            pred_z = self.action_critic(pred_x0_detached, chunk_t, chunk_actions)
+            pred_z = pred_z[:, :n_chunks]
 
-        gen_z_loss = F.mse_loss(gen_pred_z, target_chunk)
-        gen_reward_loss = -gen_pred_reward.mean()
-        generator_action_loss = (
-            self.generator_action_z_guidance_weight * gen_z_loss
-            + self.generator_action_reward_guidance_weight * gen_reward_loss
-        )
-        critic_mod.requires_grad_(True)
+            critic_z_loss = self._weighted_z_mse(pred_z, teacher_z_8d)
+            critic_loss_k = self.action_critic_z_loss_weight * critic_z_loss
+
+            if self.scaler.is_enabled():
+                self.scaler.scale(critic_loss_k).backward()
+                self.scaler.unscale_(self.critic_optimizer)
+            else:
+                critic_loss_k.backward()
+
+            if self.grad_clip is not None and self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(critic_mod.parameters(), self.grad_clip)
+
+            if self.scaler.is_enabled():
+                self.scaler.step(self.critic_optimizer)
+            else:
+                self.critic_optimizer.step()
+
+        # --- Generator guidance: frozen critic, gradient through pred_x0 ---
+        warmup_start = self.warmup_steps
+        if current_step < warmup_start:
+            guidance_scale = 0.0
+        elif self.z_guidance_warmup_steps > 0:
+            ramp = min(1.0, (current_step - warmup_start) / self.z_guidance_warmup_steps)
+            guidance_scale = ramp * self.generator_action_z_guidance_weight
+        else:
+            guidance_scale = self.generator_action_z_guidance_weight
+
+        if guidance_scale > 0:
+            critic_mod.requires_grad_(False)
+            gen_pred_z = critic_mod(pred_x0, chunk_t, chunk_actions)
+            gen_pred_z = gen_pred_z[:, :n_chunks]  # [B, n_chunks, 8]
+
+            gen_z2z7 = gen_pred_z[:, :, self.action_critic_dims]  # [B, n_chunks, 2]
+            target_z2z7 = 1.1 * chunk_actions  # [B, n_chunks, 2]
+            gen_z_loss = F.mse_loss(gen_z2z7, target_z2z7)
+            generator_action_loss = guidance_scale * gen_z_loss
+            critic_mod.requires_grad_(True)
+        else:
+            gen_z_loss = zero
+            generator_action_loss = zero
+
+        # Per-dim MSE for logging (from the last critic training step)
+        with torch.no_grad():
+            z2_idx, z7_idx = self.action_critic_dims[0], self.action_critic_dims[1]
+            z2_mse = F.mse_loss(pred_z[:, :, z2_idx], teacher_z_8d[:, :, z2_idx]).item()
+            z7_mse = F.mse_loss(pred_z[:, :, z7_idx], teacher_z_8d[:, :, z7_idx]).item()
 
         logs = {
             "train/critic_z_loss": critic_z_loss.detach().item(),
-            "train/critic_r_loss": critic_r_loss.detach().item(),
-            "train/critic_loss": critic_loss.detach().item(),
-            "train/gen_action_z_loss": gen_z_loss.detach().item(),
-            "train/gen_action_reward": gen_pred_reward.mean().detach().item(),
-            "train/gen_action_loss": generator_action_loss.detach().item(),
+            "train/critic_loss": critic_loss_k.detach().item(),
+            "train/critic_z2_mse": z2_mse,
+            "train/critic_z7_mse": z7_mse,
+            "train/gen_z_loss": gen_z_loss.detach().item() if torch.is_tensor(gen_z_loss) else 0.0,
+            "train/gen_action_loss": generator_action_loss.detach().item() if torch.is_tensor(generator_action_loss) else 0.0,
+            "train/teacher_z2_mean": teacher_z_8d[:, :, z2_idx].mean().item(),
+            "train/teacher_z7_mean": teacher_z_8d[:, :, z7_idx].mean().item(),
+            "train/z_guidance_scale": guidance_scale,
         }
-        return critic_loss, generator_action_loss, logs
+        return generator_action_loss, logs, teacher_z_8d
 
     def _optim_step(self, base_module: torch.nn.Module) -> None:
         # Sync gradients for modules not wrapped in DDP (projections are
@@ -1274,8 +1453,6 @@ class CausalLoRADiffusionTrainer:
         if self.grad_clip is not None and self.grad_clip > 0:
             if self.scaler.is_enabled():
                 self.scaler.unscale_(self.optimizer)
-                if self.critic_optimizer is not None:
-                    self.scaler.unscale_(self.critic_optimizer)
 
             gen_params = list(base_module.parameters())
             if self.action_projection is not None:
@@ -1284,19 +1461,11 @@ class CausalLoRADiffusionTrainer:
                 gen_params.extend(self.action_token_projection.parameters())
             torch.nn.utils.clip_grad_norm_(gen_params, self.grad_clip)
 
-            if self.critic_optimizer is not None:
-                c = self.action_critic.module if isinstance(self.action_critic, DDP) else self.action_critic
-                torch.nn.utils.clip_grad_norm_(c.parameters(), self.grad_clip)
-
         if self.scaler.is_enabled():
             self.scaler.step(self.optimizer)
-            if self.critic_optimizer is not None:
-                self.scaler.step(self.critic_optimizer)
             self.scaler.update()
         else:
             self.optimizer.step()
-            if self.critic_optimizer is not None:
-                self.critic_optimizer.step()
 
     # ------------------------------------------------------------------
     # Gradient norm logging
@@ -1326,6 +1495,18 @@ class CausalLoRADiffusionTrainer:
             if grads:
                 norms["grad_norm/critic"] = torch.norm(torch.stack([g.norm() for g in grads])).item()
 
+        if self._state_head_built:
+            state_params = []
+            if hasattr(base, "_state_probe"):
+                state_params.extend([p.grad for p in base._state_probe.parameters() if p.grad is not None])
+            else:
+                if hasattr(base, "_state_token_init") and base._state_token_init.grad is not None:
+                    state_params.append(base._state_token_init.grad)
+                if hasattr(base, "_state_readout"):
+                    state_params.extend([p.grad for p in base._state_readout.parameters() if p.grad is not None])
+            if state_params:
+                norms["grad_norm/state_tokens"] = torch.norm(torch.stack([g.norm() for g in state_params])).item()
+
         return norms
 
     # ------------------------------------------------------------------
@@ -1346,6 +1527,18 @@ class CausalLoRADiffusionTrainer:
         if self.critic_optimizer is not None:
             for pg in self.critic_optimizer.param_groups:
                 pg["lr"] = self.critic_lr * scale
+
+    def _state_guidance_scale(self, step: int) -> float:
+        """Compute state-guidance weight with linear warmup after LR warmup."""
+        if self.state_guidance_weight <= 0:
+            return 0.0
+        warmup_start = self.warmup_steps
+        if step < warmup_start:
+            return 0.0
+        if self.state_guidance_warmup_steps > 0:
+            ramp = min(1.0, (step - warmup_start) / self.state_guidance_warmup_steps)
+            return ramp * self.state_guidance_weight
+        return self.state_guidance_weight
 
     # ------------------------------------------------------------------
     # Periodic evaluation – memory management
@@ -1399,6 +1592,13 @@ class CausalLoRADiffusionTrainer:
         Passes ``clean_x=context_latents`` so the model can condition on
         real visual context, matching the training regime.  The caller
         must free enough GPU memory beforehand (see ``_offload_training_state``).
+
+        After the denoising loop finishes, runs one extra forward pass on the
+        final generated latents so the returned state-token predictions
+        correspond to the actual generated sample, not a stale mid-loop readout.
+
+        Returns:
+            latents, state_preds (state_preds is None when state-token branch is absent)
         """
         from utils.scheduler import FlowMatchScheduler
 
@@ -1413,15 +1613,28 @@ class CausalLoRADiffusionTrainer:
         for t in scheduler.timesteps:
             timestep = t * torch.ones([B, num_frames], device=self.device, dtype=torch.float32)
             with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
-                flow_pred, pred_x0 = wrapper(
+                model_out = wrapper(
                     latents, conditional, timestep,
                     clean_x=context_latents, aug_t=None,
                 )
+                flow_pred = model_out[0]
             latents = scheduler.step(
                 flow_pred.flatten(0, 1), timestep.flatten(0, 1), latents.flatten(0, 1),
             ).unflatten(dim=0, sizes=flow_pred.shape[:2])
 
-        return latents
+        # Fresh state-token readout on the final generated sample (t=0).
+        state_preds = None
+        if self._state_head_built:
+            t_zero = torch.zeros([B, num_frames], device=self.device, dtype=torch.float32)
+            with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+                final_out = wrapper(
+                    latents, conditional, t_zero,
+                    clean_x=context_latents, aug_t=None,
+                )
+                if isinstance(final_out, tuple) and len(final_out) >= 3:
+                    state_preds = final_out[2]
+
+        return latents, state_preds
 
     @torch.no_grad()
     def _decode_latents(self, latents):
@@ -1492,34 +1705,77 @@ class CausalLoRADiffusionTrainer:
 
             conditional = self._build_conditional(prompt_embeds_eval, z_noisy, z_clean, num_frames)
 
-            gen_latents = self._generate_eval(wrapper, conditional, context_latents, num_frames)
+            gen_latents, state_preds = self._generate_eval(wrapper, conditional, context_latents, num_frames)
             video_np = self._decode_latents(gen_latents)
 
             eval_log: Dict[str, Any] = {"eval/step": step + 1}
+
+            state_z2z7 = None
+            if state_preds is not None and self._state_head_built:
+                _eval_need_slice = (self.state_head_out_dim <= len(self.action_critic_dims))
+                state_z2z7 = state_preds.float() if _eval_need_slice else state_preds.float()[:, :, self.action_critic_dims]
 
             if self.action_critic is not None:
                 critic_mod = self.action_critic.module if isinstance(self.action_critic, DDP) else self.action_critic
                 critic_mod.eval()
 
-                motion, teacher_z, teacher_reward = self._compute_teacher_visuals(
-                    gen_latents, target_action_z,
-                )
-                critic_z, critic_r = critic_mod(gen_latents)
-                n_chunks = teacher_z.shape[1]
-                critic_z = critic_z[:, :n_chunks]
-                critic_r = critic_r[:, :n_chunks]
-
+                motion, teacher_z_8d = self._compute_teacher_visuals(gen_latents)
+                n_chunks = teacher_z_8d.shape[1]
                 target_chunk = _chunk_actions(target_action_z, self.num_frame_per_block)[:, :n_chunks]
 
+                eval_t = torch.zeros(1, n_chunks, device=self.device)
+                critic_pred_z = critic_mod(gen_latents, eval_t, target_chunk)
+                critic_pred_z = critic_pred_z[:, :n_chunks]  # [1, n_chunks, 8]
+
+                teacher_z2z7 = teacher_z_8d[:, :, self.action_critic_dims]
+                critic_z2z7 = critic_pred_z[:, :, self.action_critic_dims]
+
                 annotated = _annotate_action_video(
-                    video_np, motion, teacher_z, teacher_reward,
-                    critic_z, critic_r, target_chunk,
+                    video_np, motion, teacher_z2z7, critic_z2z7,
+                    target_chunk,
                     title=f"eval step {step + 1}",
+                    state_z2z7=state_z2z7,
                 )
-                eval_log["eval/critic_z_mse"] = F.mse_loss(critic_z.float(), teacher_z.float()).item()
-                eval_log["eval/gen_z_mse"] = F.mse_loss(
-                    critic_z.float(), target_chunk.float()
+                eval_log["eval/critic_z_mse"] = self._weighted_z_mse(
+                    critic_pred_z.float(), teacher_z_8d.float()
                 ).item()
+                z2_idx, z7_idx = self.action_critic_dims[0], self.action_critic_dims[1]
+                eval_log["eval/teacher_z2_mean"] = teacher_z_8d[:, :, z2_idx].mean().item()
+                eval_log["eval/teacher_z7_mean"] = teacher_z_8d[:, :, z7_idx].mean().item()
+                eval_log["eval/critic_z2_mse"] = F.mse_loss(
+                    critic_pred_z[:, :, z2_idx].float(), teacher_z_8d[:, :, z2_idx].float()
+                ).item()
+                eval_log["eval/critic_z7_mse"] = F.mse_loss(
+                    critic_pred_z[:, :, z7_idx].float(), teacher_z_8d[:, :, z7_idx].float()
+                ).item()
+
+                if state_z2z7 is not None:
+                    teacher_z27_chunked = teacher_z2z7[:, :n_chunks]
+                    state_z27_trimmed = state_z2z7[:, :n_chunks]
+                    eval_log["eval/state_z2_mse"] = F.mse_loss(
+                        state_z27_trimmed[:, :, 0], teacher_z27_chunked[:, :, 0]
+                    ).item()
+                    eval_log["eval/state_z7_mse"] = F.mse_loss(
+                        state_z27_trimmed[:, :, 1], teacher_z27_chunked[:, :, 1]
+                    ).item()
+                if state_preds is not None and self._state_head_built:
+                    state_trimmed = state_preds.float()[:, :n_chunks]
+                    if _eval_need_slice:
+                        teacher_matched = teacher_z2z7[:, :n_chunks]
+                    else:
+                        teacher_matched = teacher_z_8d[:, :n_chunks]
+                    eval_log["eval/state_mse"] = F.mse_loss(
+                        state_trimmed, teacher_matched.float()
+                    ).item()
+
+                    state_z27_eval = state_trimmed if _eval_need_slice else state_trimmed[:, :, self.action_critic_dims]
+                    teacher_z27_eval = teacher_z2z7[:, :n_chunks]
+                    cmd_z27_eval = target_chunk
+                    eval_log["eval/corr_state_teacher_z27"] = _safe_corr(state_z27_eval, teacher_z27_eval)
+                    eval_log["eval/corr_state_cmd_z27"] = _safe_corr(state_z27_eval, cmd_z27_eval)
+                    eval_log["eval/mse_teacher_cmd_z27"] = F.mse_loss(
+                        teacher_z27_eval.float(), cmd_z27_eval.float()
+                    ).item()
 
                 critic_mod.train()
             else:
@@ -1551,6 +1807,7 @@ class CausalLoRADiffusionTrainer:
             if was_training:
                 wrapper.train()
             self._restore_training_state()
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Training loop
@@ -1593,18 +1850,23 @@ class CausalLoRADiffusionTrainer:
         def _encode_z_window(zarr_path, n_latent_frames, start, end):
             return self.dataset.encode_z_actions_window(zarr_path, n_latent_frames, start, end)
 
-        def _fill_group() -> None:
-            rides: list = []
-            for _ in range(micro_batch):
-                raw = next(self.data_iter)
-                rides.append({
-                    "zarr_path": raw["zarr_path"][0],
-                    "prompt_embeds": raw["prompt_embeds"][0],
-                    "n_latent_frames": int(raw["n_latent_frames"][0].item()),
-                })
-            batcher.load_group(rides)
+        def _next_ride() -> dict:
+            raw = next(self.data_iter)
+            return {
+                "zarr_path": raw["zarr_path"][0],
+                "prompt_embeds": raw["prompt_embeds"][0],
+                "n_latent_frames": int(raw["n_latent_frames"][0].item()),
+            }
+
+        def _refill_exhausted() -> None:
+            """Replace only the slots whose rides have run out."""
+            needs = batcher.exhausted_slot_indices()
+            if not needs:
+                return
+            rides = [_next_ride() for _ in needs]
+            batcher.refill_slots(needs, rides)
             if self.is_main_process:
-                logging.info("Loaded ride group: %s", batcher.summary())
+                logging.info("Refilled %d slot(s): %s", len(needs), batcher.summary())
 
         for step in range(self.start_step, self.max_steps):
             if self.is_distributed:
@@ -1614,10 +1876,14 @@ class CausalLoRADiffusionTrainer:
 
             self._update_lr(step)
             self.optimizer.zero_grad(set_to_none=True)
-            if self.critic_optimizer is not None:
-                self.critic_optimizer.zero_grad(set_to_none=True)
             accumulated_loss = 0.0
             accumulated_flow_loss = 0.0
+            accumulated_state_loss = 0.0
+            accumulated_state_guidance_loss = 0.0
+            diag_corr_state_teacher = 0.0
+            diag_corr_state_cmd = 0.0
+            diag_mse_teacher_cmd = 0.0
+            diag_count = 0
             windows_this_step = 0
             critic_logs: Dict[str, Any] = {}
 
@@ -1625,8 +1891,7 @@ class CausalLoRADiffusionTrainer:
             num_frames = self.streaming_chunk_size
 
             for _ in range(self.gradient_accumulation):
-                if batcher.needs_new_group():
-                    _fill_group()
+                _refill_exhausted()
 
                 bsz = micro_batch
 
@@ -1664,24 +1929,94 @@ class CausalLoRADiffusionTrainer:
                 )
 
                 with autocast(dtype=self.autocast_dtype, enabled=self.use_mixed_precision):
-                    flow_pred, pred_x0 = forward_model(
+                    model_out = forward_model(
                         noisy_latents, conditional, timesteps,
                         clean_x=clean_latent_aug, aug_t=aug_timestep,
                     )
+                    if isinstance(model_out, tuple) and len(model_out) == 4:
+                        flow_pred, pred_x0, state_preds, state_pooled = model_out
+                    elif isinstance(model_out, tuple) and len(model_out) == 3:
+                        flow_pred, pred_x0, state_preds = model_out
+                        state_pooled = None
+                    else:
+                        flow_pred, pred_x0 = model_out[:2]
+                        state_preds = None
+                        state_pooled = None
 
                     flow_loss = self._compute_flow_loss(flow_pred, training_target, timesteps, bsz, num_frames)
                     loss = flow_loss
 
+                    teacher_z_8d = None
                     if self.action_critic_enabled and self.action_critic is not None:
                         target_action_z = z_actions_full_raw[:, cf:][..., self.action_critic_dims]
-                        c_loss, gen_loss, critic_logs = self._compute_action_critic_losses(pred_x0, target_action_z)
-                        loss = loss + c_loss + gen_loss
+                        gen_loss, critic_logs, teacher_z_8d = self._compute_action_critic_losses(
+                            pred_x0, target_action_z, timesteps, step,
+                        )
+                        loss = loss + gen_loss
+
+                    # State-token head loss: supervise against teacher z-features.
+                    # When state_head_out_dim == 2, target is z2/z7 only;
+                    # when 8, target is the full 8D teacher latent.
+                    state_guidance_loss_val = 0.0
+                    if state_preds is not None and self._state_head_built:
+                        n_c_g = num_frames // self.num_frame_per_block
+                        _need_z_slice = (self.state_head_out_dim <= len(self.action_critic_dims))
+                        if teacher_z_8d is not None:
+                            t_z = teacher_z_8d[:, :n_c_g]
+                            state_target = (t_z[:, :, self.action_critic_dims] if _need_z_slice else t_z).detach()
+                        else:
+                            target_z_pf = z_actions_full_raw[:, cf:]
+                            t_z = _chunk_actions(target_z_pf, self.num_frame_per_block)[:, :n_c_g]
+                            state_target = t_z[:, :, self.action_critic_dims] if _need_z_slice else t_z
+                        state_z = state_preds[:, :n_c_g].float()
+                        state_loss = F.mse_loss(state_z, state_target.float())
+                        loss = loss + self.state_head_loss_weight * state_loss
+
+                        # Frozen-readout generator guidance: compare readout
+                        # predictions to commanded actions (z2/z7 only).
+                        # Gradients flow through the generator (via pooled hidden
+                        # states) but not through the readout head weights.
+                        state_g_scale = self._state_guidance_scale(step)
+                        if state_g_scale > 0 and state_pooled is not None:
+                            readout = (base_module._state_probe.readout
+                                       if hasattr(base_module, '_state_probe')
+                                       else base_module._state_readout)
+                            frozen_preds_raw = F.linear(
+                                state_pooled[:, :n_c_g].float(),
+                                readout.weight.detach(),
+                                readout.bias.detach(),
+                            )
+                            frozen_preds = frozen_preds_raw if _need_z_slice else frozen_preds_raw[:, :, self.action_critic_dims]
+                            cmd_z = _chunk_actions(
+                                z_actions_full_raw[:, cf:][..., self.action_critic_dims],
+                                self.num_frame_per_block,
+                            )[:, :n_c_g]
+                            cmd_target = self.state_guidance_action_scale * cmd_z
+                            state_guidance_loss = F.mse_loss(frozen_preds, cmd_target.float())
+                            loss = loss + state_g_scale * state_guidance_loss
+                            state_guidance_loss_val = state_guidance_loss.detach().item()
+
+                        # Diagnostics: correlation & MSE between state preds, teacher, and commands
+                        if teacher_z_8d is not None and self.is_main_process:
+                            teacher_z27 = teacher_z_8d[:, :n_c_g, self.action_critic_dims].detach()
+                            state_z27 = state_z if _need_z_slice else state_z[:, :, self.action_critic_dims]
+                            cmd_z27 = _chunk_actions(
+                                z_actions_full_raw[:, cf:][..., self.action_critic_dims],
+                                self.num_frame_per_block,
+                            )[:, :n_c_g]
+                            diag_corr_state_teacher += _safe_corr(state_z27, teacher_z27)
+                            diag_corr_state_cmd += _safe_corr(state_z27, cmd_z27)
+                            diag_mse_teacher_cmd += F.mse_loss(teacher_z27.float(), cmd_z27.float()).item()
+                            diag_count += 1
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at step {step + 1}")
 
                 accumulated_loss += loss.detach().item()
                 accumulated_flow_loss += flow_loss.detach().item()
+                if state_preds is not None and self._state_head_built:
+                    accumulated_state_loss += state_loss.detach().item()
+                    accumulated_state_guidance_loss += state_guidance_loss_val
                 scaled_loss = loss / self.gradient_accumulation
 
                 if self.scaler.is_enabled():
@@ -1730,6 +2065,16 @@ class CausalLoRADiffusionTrainer:
                         "train/windows": windows_this_step,
                         "train/window_idx": batcher.current_window_idx,
                     }
+                    if self._state_head_built and accumulated_state_loss > 0:
+                        avg_state = accumulated_state_loss / self.gradient_accumulation
+                        payload["train/state_z_loss"] = avg_state
+                    if accumulated_state_guidance_loss > 0:
+                        payload["train/state_guidance_loss"] = accumulated_state_guidance_loss / self.gradient_accumulation
+                        payload["train/state_guidance_scale"] = self._state_guidance_scale(step)
+                    if diag_count > 0:
+                        payload["train/corr_state_teacher_z27"] = diag_corr_state_teacher / diag_count
+                        payload["train/corr_state_cmd_z27"] = diag_corr_state_cmd / diag_count
+                        payload["train/mse_teacher_cmd_z27"] = diag_mse_teacher_cmd / diag_count
                     if critic_logs:
                         critic_logs.pop("train/flow_loss", None)
                         payload.update(critic_logs)
@@ -1746,6 +2091,9 @@ class CausalLoRADiffusionTrainer:
 
             # Periodic eval
             self._maybe_eval(step)
+
+            if step == self.start_step:
+                torch.cuda.empty_cache()
 
         barrier()
         self._save_checkpoint(self.max_steps)
