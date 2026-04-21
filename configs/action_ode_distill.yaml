@@ -227,9 +227,9 @@ state_head_out_dim: 8
 # linear warmup. Dormant at 0.0 (ODE-only distill); match the teacher
 # by setting to 0.5 with a 500-step warmup once we've confirmed the
 # student's base distill tracks stably.
-state_guidance_weight: 0.0
+state_guidance_weight: 0.2
 state_guidance_warmup_steps: 0
-state_guidance_action_scale: 1.1
+state_guidance_action_scale: 1.0
 
 # Optimiser (mirrors causal-forcing ODE stage). If training is visibly
 # too slow after the first ~500 steps and/or we bump ``batch_size``
