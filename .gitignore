@@ -11,21 +11,47 @@ prompts
 checkpoints/
 logs/
 wandb/
-
-# Local eval runs (videos, checkpoints of outputs)
-eval/
 pre_encode.log
 *.err
 *.out
+# NOTE: ``*.sbatch`` is *not* ignored — every submission script in
+# ``sbatch/`` is version-controlled (launch commands, cluster params,
+# and env fixes like the conda-activate arg hygiene in
+# ``run_action_ode_distill_8n.sbatch`` need to survive across clones).
 *.outcore
-# Slurm job scripts live in sbatch/ and are tracked (do not add *.sbatch here).
 
 test_grid_outputs/
 test_predictions/
-testing/outputs/
 cotracker/
 
 action_analysis_results.md
-testing/motion_habitat_gpu0/
+
+# Project logbook and working notes (not for version control)
+.claude/
+claude/
+
+# Heavyweight working directories — never belong in the repo.
+#   * noise_model/ : model weights + caches (~2.6 GB)
+#   * vis/         : rendered visualisation outputs (~611 MB)
+#   * eval/        : saved eval videos / diagnostics (~3.2 GB, grows)
+noise_model/
+vis/
+eval/
+
+# Test artefacts (outputs only — the .py test scripts *are* tracked).
+# ``testing/outputs/`` is an mp4 dumping ground; the individual ignore
+# patterns below also catch stray renders that end up elsewhere inside
+# testing/ (e.g. under testing/motion_habitat_out/).
+testing/outputs/
+testing/**/*.mp4
+
+# Third-party upstream clones vendored at repo root. Each of these has
+# its own ``.git/``, so leaving them untracked risks a future
+# ``git add .`` creating broken gitlinks. They are not maintained as
+# submodules intentionally; re-clone from upstream if you need them.
+CausVid/
 Causal-Forcing/
 RollingForcing/
+
+# Editor / tooling scratch.
+*.bak

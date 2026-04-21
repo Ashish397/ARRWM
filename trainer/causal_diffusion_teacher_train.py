@@ -329,6 +329,9 @@ class CausalLoRADiffusionTrainer:
         self.noise_augmentation_max_timestep = int(
             getattr(config, "noise_augmentation_max_timestep", 0)
         )
+        self.noise_augmentation_warmup_steps = int(
+            getattr(config, "noise_augmentation_warmup_steps", 0)
+        )
 
         action_dims_cfg = getattr(config, "action_dims", None)
         self.action_dims = list(action_dims_cfg) if action_dims_cfg is not None else None
@@ -514,6 +517,24 @@ class CausalLoRADiffusionTrainer:
         train_start = self.test_start_index + self.test_num_rides
         eval_rides = all_rides[self.test_start_index : self.test_start_index + self.test_num_rides]
         train_rides = all_rides[train_start:] + all_rides[:self.test_start_index]
+
+        # Optional override: pick specific rides by zarr filename for eval (preserves
+        # caller ordering; removes them from train so the model never sees them).
+        eval_ride_zarrs = list(getattr(self.config, "eval_ride_zarrs", []) or [])
+        if eval_ride_zarrs:
+            from pathlib import Path as _P
+            order = {name: i for i, name in enumerate(eval_ride_zarrs)}
+            picked = [r for r in all_rides if _P(r["zarr_path"]).name in order]
+            picked.sort(key=lambda r: order[_P(r["zarr_path"]).name])
+            missing = set(eval_ride_zarrs) - {_P(r["zarr_path"]).name for r in picked}
+            if missing and self.is_main_process:
+                logging.warning("eval_ride_zarrs missing from manifest: %s", sorted(missing))
+            eval_rides = picked
+            excluded = {_P(r["zarr_path"]).name for r in eval_rides}
+            train_rides = [r for r in all_rides if _P(r["zarr_path"]).name not in excluded]
+            if self.is_main_process:
+                logging.info("eval_ride_zarrs override active: %d eval rides (was %d)",
+                             len(eval_rides), self.test_num_rides)
 
         self.dataset = ZarrRideDataset.from_manifest(
             rides_data=train_rides,
@@ -1158,11 +1179,32 @@ class CausalLoRADiffusionTrainer:
         base = self.model.module if isinstance(self.model, DDP) else self.model
         set_peft_model_state_dict(base.model, checkpoint["lora"])
 
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        for state in self.optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(self.device)
+        # Detect state-probe shape mismatch (e.g. state_head_out_dim changed).
+        # If mismatched, we drop the probe weights and the full optimizer state
+        # since the optimizer's momentum tensors are tied to the old shapes.
+        _sp_shape_ok = True
+        if self._state_head_built and hasattr(base, "_state_probe") and "state_probe" in checkpoint:
+            cur_sp = base._state_probe.state_dict()
+            for _k, _v in checkpoint["state_probe"].items():
+                if _k in cur_sp and cur_sp[_k].shape != _v.shape:
+                    _sp_shape_ok = False
+                    if self.is_main_process:
+                        logging.warning(
+                            "state_probe shape mismatch for %s (ckpt %s vs cur %s); "
+                            "dropping probe weights + optimizer state.",
+                            _k, tuple(_v.shape), tuple(cur_sp[_k].shape),
+                        )
+                    break
+
+        if _sp_shape_ok:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+        else:
+            if self.is_main_process:
+                logging.warning("Skipping generator optimizer state restore (state_probe shape changed). Momentum will rebuild over a few hundred steps.")
         self.start_step = int(checkpoint.get("step", 0))
 
         if self.action_critic is not None and "action_critic" in checkpoint:
@@ -1201,7 +1243,7 @@ class CausalLoRADiffusionTrainer:
                 logging.info("Restored action token projection from checkpoint")
 
         if self._state_head_built:
-            if hasattr(base, '_state_probe') and "state_probe" in checkpoint:
+            if hasattr(base, '_state_probe') and "state_probe" in checkpoint and _sp_shape_ok:
                 missing, unexpected = base._state_probe.load_state_dict(
                     checkpoint["state_probe"], strict=False,
                 )
@@ -1307,9 +1349,17 @@ class CausalLoRADiffusionTrainer:
         index = self._make_blockwise_index(batch_size, num_frames, len(timesteps))
         return timesteps[index]
 
-    def _make_teacher_context(self, latents, noise, bsz, num_frames):
+    def _make_teacher_context(self, latents, noise, bsz, num_frames, current_step=None):
         if self.teacher_forcing and self.noise_augmentation_max_timestep > 0:
-            aug_index = self._make_blockwise_index(bsz, num_frames, self.noise_augmentation_max_timestep)
+            max_t = self.noise_augmentation_max_timestep
+            if self.noise_augmentation_warmup_steps > 0 and current_step is not None:
+                ramp = min(1.0, current_step / self.noise_augmentation_warmup_steps)
+                max_t = max(1, int(ramp * max_t))
+            # Timesteps are descending (index 0 = max noise). Sample from the
+            # low-noise end: indices in [n_steps - max_t, n_steps).
+            n_steps = len(self.scheduler.timesteps)
+            offset = n_steps - max_t
+            aug_index = self._make_blockwise_index(bsz, num_frames, max_t) + offset
             aug_timestep = self.scheduler.timesteps[aug_index]
             clean_latent_aug = self.scheduler.add_noise(
                 latents.flatten(0, 1), noise.flatten(0, 1), aug_timestep.flatten(0, 1),
@@ -1412,7 +1462,7 @@ class CausalLoRADiffusionTrainer:
             gen_pred_z = gen_pred_z[:, :n_chunks]  # [B, n_chunks, 8]
 
             gen_z2z7 = gen_pred_z[:, :, self.action_critic_dims]  # [B, n_chunks, 2]
-            target_z2z7 = 1.1 * chunk_actions  # [B, n_chunks, 2]
+            target_z2z7 = 1.0 * chunk_actions  # [B, n_chunks, 2]  # v13b: removed 1.1x overshoot
             gen_z_loss = F.mse_loss(gen_z2z7, target_z2z7)
             generator_action_loss = guidance_scale * gen_z_loss
             critic_mod.requires_grad_(True)
@@ -1673,7 +1723,8 @@ class CausalLoRADiffusionTrainer:
         causal_model.block_mask = None
 
         try:
-            ride_idx = step % len(self.eval_dataset)
+            _eval_ivl = max(1, int(self.eval_interval))
+            ride_idx = (step // _eval_ivl) % len(self.eval_dataset)
             ride = self.eval_dataset[ride_idx]
             zarr_path = ride["zarr_path"]
             prompt_embeds_eval = ride["prompt_embeds"].unsqueeze(0).to(self.device, dtype=self.dtype)
@@ -1925,7 +1976,7 @@ class CausalLoRADiffusionTrainer:
                 ).view_as(target_latents)
 
                 clean_latent_aug, aug_timestep = self._make_teacher_context(
-                    context_latents, noise, bsz, num_frames,
+                    context_latents, noise, bsz, num_frames, current_step=step,
                 )
 
                 with autocast(dtype=self.autocast_dtype, enabled=self.use_mixed_precision):
@@ -1969,7 +2020,15 @@ class CausalLoRADiffusionTrainer:
                             t_z = _chunk_actions(target_z_pf, self.num_frame_per_block)[:, :n_c_g]
                             state_target = t_z[:, :, self.action_critic_dims] if _need_z_slice else t_z
                         state_z = state_preds[:, :n_c_g].float()
-                        state_loss = F.mse_loss(state_z, state_target.float())
+                        if _need_z_slice:
+                            state_loss = F.mse_loss(state_z, state_target.float())
+                        else:
+                            # 8D supervision: up-weight action-relevant dims (z2/z7)
+                            _w = torch.ones(state_z.shape[-1], device=state_z.device, dtype=state_z.dtype)
+                            _act_weight = float(getattr(self.config, "state_head_action_dim_weight", 3.0))
+                            for _d in self.action_critic_dims:
+                                _w[_d] = _act_weight
+                            state_loss = (_w * (state_z - state_target.float()) ** 2).mean()
                         loss = loss + self.state_head_loss_weight * state_loss
 
                         # Frozen-readout generator guidance: compare readout

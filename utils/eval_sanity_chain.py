@@ -1,29 +1,11 @@
 #!/usr/bin/env python3
-"""Independent video evaluation: 4 GPUs × 4 segments (one checkpoint per GPU).
+"""Sanity eval: eval_chain but using clean-side actions as noisy-side (replay GT actions).
 
-**Noisy actions:** Fixed schedules shared on all ranks.  ``z2`` (forward/back) is
-constant per segment: ``0.5``, ``-0.5``, ``0.25``, ``-1.0``.  ``z7`` (turn) runs in
-seven 3-frame blocks: ``+0.25, -0.25, +0.5, -0.5, +0.75, -0.75``, then ``0`` (straight).
+Uses 3 specific rides (one each from Madrid, Rome, Stockholm) from the v10 manifest.
+Single GPU, runs v12 checkpoint only. Noisy-side actions = clean-side actions from motion.
 
-**Denoising noise:** Per-segment CUDA seeds (shared across GPUs) make each segment a
-different rollout while keeping cross-model comparison fair for that segment.
-
-**Training-aligned window:** ``clean_x`` is 21 consecutive ride latents; clean-side
-actions come from motion (ss_vae) on ``[offset, offset+24)``.
-
-MP4 prepends the first **3** ride latents of **that segment’s** zarr window.
-
-Each segment uses a **different** manifest ride (distinct ``zarr_path``), scanned from
-``--test_ride_idx`` in manifest order, skipping rides shorter than ``offset+24`` latents.
-
-A frozen **v12** action critic is loaded on every rank for comparable critic bars.
-
-Usage (via torchrun on 4 GPUs):
-    torchrun --nproc_per_node=4 utils/eval_chain.py --output_dir eval/eval_chain_out
-
-Single-GPU smoke (``WORLD_SIZE=1``), e.g. assignment slot 3::
-
-    CUDA_VISIBLE_DEVICES=0 python utils/eval_chain.py --assignment_index 3 --num_segments 1 ...
+Usage:
+    CUDA_VISIBLE_DEVICES=0 python utils/eval_sanity_chain.py --output_dir vis/sanity_chain
 """
 
 import argparse
@@ -66,11 +48,6 @@ RAW_ACTION_DIM = 2
 CRITIC_ACTION_DIMS = [2, 7]
 CRITIC_Z_OUT = 8
 
-# Default fallback roots for building ride entries on-the-fly (e.g. OOD zarrs
-# that aren't in a training manifest). See _load_ride_entry_from_disk.
-DEFAULT_CAPTION_ROOT = "/projects/u6ex/fbots/frodobots_captions/train"
-DEFAULT_ENCODED_ROOT = "/projects/u6ex/fbots/frodobots_encoded"
-
 # Same critic for all models → apples-to-apples critic readout (8-D head, bc=128).
 EVAL_ACTION_CRITIC_CKPT = "logs/z_critic_v12_probe_fixes/causal_lora_step0003250.pt"
 EVAL_CRITIC_BASE_CH = 128
@@ -91,61 +68,16 @@ MODEL_ASSIGNMENTS = [
         "critic_base_ch": 128,
         "critic_res_blocks": 4,
     },
-    {
-        "ckpt": "logs/z_critic_v8_aux_critic/causal_lora_step0002900.pt",
-        "label": "v8_aux_critic",
-        "has_critic": True,
-        "has_adaln": True,
-        "has_action_tokens": True,
-        "critic_base_ch": 128,
-        "critic_res_blocks": 4,
-    },
-    {
-        "ckpt": "logs/reward_critic_v5b/causal_lora_step0001400.pt",
-        "label": "v5_reward_critic",
-        "has_critic": True,
-        "has_adaln": True,
-        "has_action_tokens": True,
-        "critic_base_ch": 128,
-        "critic_res_blocks": 4,
-    },
-    {
-        "ckpt": "logs/z_critic_v10_state_tokens/causal_lora_step0001650.pt",
-        "label": "v10_state_tokens",
-        "has_critic": True,
-        "has_adaln": True,
-        "has_action_tokens": True,
-        "critic_base_ch": 128,
-        "critic_res_blocks": 4,
-    },
-    {
-        "ckpt": "logs/v13_balanced_weunz/causal_lora_step0004550.pt",
-        "label": "v13_balanced_weunz",
-        "has_critic": True,
-        "has_adaln": True,
-        "has_action_tokens": True,
-        "critic_base_ch": 128,
-        "critic_res_blocks": 4,
-    },
-    {
-        "ckpt": "logs/v14_balanced_weunz/causal_lora_step0006600.pt",
-        "label": "v14_balanced_weunz",
-        "has_critic": True,
-        "has_adaln": True,
-        "has_action_tokens": True,
-        "critic_base_ch": 128,
-        "critic_res_blocks": 4,
-    },
 ]
 
 # Per-segment denoising noise: same across all GPUs for a given segment index.
 VIDEO_NOISE_SEED_STRIDE = 7919
-NUM_EVAL_SEGMENTS = 4
+NUM_EVAL_SEGMENTS = 3
 NUM_ACTION_CHUNKS = NUM_FRAMES // NUM_FRAME_PER_BLOCK
 
 # Noisy-side z2 (forward / back) constant within each segment; z7 (turn) in 7×3-frame blocks.
 # Turn pattern: +0.25 right, -0.25 left, +0.5 right, -0.5 left, +0.75 right, -0.75 left, then straight.
-NOISY_Z2_BY_SEGMENT = np.array([0.5, -0.5, 0.25, -1.0], dtype=np.float32)
+NOISY_Z2_BY_SEGMENT = np.array([0.5, -0.5, 0.25], dtype=np.float32)  # unused in sanity mode
 NOISY_Z7_CHUNKS = np.array(
     [0.25, -0.25, 0.5, -0.5, 0.75, -0.75, 0.0], dtype=np.float32
 )
@@ -560,88 +492,6 @@ def _count_latent_frames(zpath: str) -> int:
     return int(g["latents"].shape[0])
 
 
-# ---------------------------------------------------------------------------
-# Disk-based ride-entry fallback (for rides absent from a training manifest,
-# e.g. OOD cities the v14 model wasn't trained on).
-# ---------------------------------------------------------------------------
-
-_TS_TO_RIDE_DIR_CACHE: Dict[str, Dict[str, Path]] = {}
-
-
-def _build_ts_to_ride_dir(caption_root: Path) -> Dict[str, Path]:
-    """Map ride_ts -> Path(caption_root/output_rides_N/ride_<id>_<ts>).
-
-    Cached per caption_root for cheap re-use across ranks in-process.
-    """
-    key = str(caption_root.resolve())
-    cached = _TS_TO_RIDE_DIR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    mapping: Dict[str, Path] = {}
-    if not caption_root.exists():
-        _TS_TO_RIDE_DIR_CACHE[key] = mapping
-        return mapping
-    for out_dir in caption_root.iterdir():
-        if not out_dir.is_dir():
-            continue
-        for ride_dir in out_dir.iterdir():
-            if not ride_dir.is_dir():
-                continue
-            ts = ride_dir.name.split("_")[-1]
-            mapping.setdefault(ts, ride_dir)
-    _TS_TO_RIDE_DIR_CACHE[key] = mapping
-    return mapping
-
-
-def _load_prompt_embeds_from_encoded_json(ride_dir: Path) -> torch.Tensor:
-    """Load T5 prompt embeds (shape [512, 4096]) from *_encoded.json."""
-    p = ride_dir / f"{ride_dir.name}_video_captions_OpenGVLab_InternVL3_8B_encoded.json"
-    if not p.exists():
-        raise FileNotFoundError(
-            f"Encoded caption JSON not found for ride {ride_dir.name} at {p}"
-        )
-    with open(p, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    arr = data.get("caption_encoded")
-    if arr is None:
-        raise RuntimeError(f"'caption_encoded' key missing in {p}")
-    return torch.tensor(arr, dtype=torch.float32)
-
-
-def _load_ride_entry_from_disk(
-    zarr_basename: str,
-    encoded_root: Path,
-    caption_root: Path,
-    ts_to_ride_dir: Dict[str, Path],
-) -> dict:
-    """Build a manifest-compatible ride dict from disk for OOD / missing zarrs.
-
-    Returns the same keys ZarrRideDataset.from_manifest expects:
-    {zarr_path, prompt_embeds, attrs, n_latent_frames}.
-    """
-    import zarr as zarr_lib
-
-    zpath = encoded_root / zarr_basename
-    if not zpath.exists():
-        raise FileNotFoundError(f"Encoded zarr not found: {zpath}")
-    ts = zpath.name.removesuffix(".zarr")
-    ride_dir = ts_to_ride_dir.get(ts)
-    if ride_dir is None:
-        raise FileNotFoundError(
-            f"No caption ride dir found for ts={ts} under caption_root."
-        )
-    pe = _load_prompt_embeds_from_encoded_json(ride_dir)
-    g = zarr_lib.open_group(str(zpath), mode="r")
-    attrs = dict(g.attrs)
-    n_lat = int(g["latents"].shape[0])
-    return {
-        "zarr_path": str(zpath),
-        "prompt_embeds": pe,
-        "attrs": attrs,
-        "n_latent_frames": n_lat,
-    }
-
-
 def load_seed_frames(
     device,
     manifest_path,
@@ -651,19 +501,12 @@ def load_seed_frames(
     motion_root: str = "",
     ss_vae_checkpoint: str = "action_query/checkpoints/ss_vae_8free.pt",
     action_dims: Optional[List[int]] = None,
-    eval_zarr_list: Optional[List[str]] = None,
-    fallback_encoded_root: Optional[str] = None,
-    fallback_caption_root: Optional[str] = None,
-    per_rank_load: bool = False,
 ):
     """Load one distinct zarr ride per segment (clean latents, caption, motion z).
 
-    If ``eval_zarr_list`` is provided, those zarrs are used in the given order
-    (matched by basename or full path against manifest entries). Otherwise,
-    the manifest is scanned from ``test_ride_idx`` (wrapping), keeping rides
-    with ≥ ``latent_start_offset + STREAM_LATENT_SPAN`` latents, skipping
-    duplicate ``zarr_path`` strings so each segment uses a different file
-    when possible.
+    Scans the manifest from ``test_ride_idx`` (wrapping), keeps rides with
+    ≥ ``latent_start_offset + STREAM_LATENT_SPAN`` latents, and skips duplicate
+    ``zarr_path`` strings so each segment uses a different file when possible.
     """
     if action_dims is None:
         action_dims = [2, 7]
@@ -672,11 +515,7 @@ def load_seed_frames(
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     payload = [None]
 
-    # In per-rank mode every rank loads its own rides; otherwise only rank 0 loads
-    # and broadcasts so all ranks share the same rides.
-    do_load = True if per_rank_load else (rank == 0)
-
-    if do_load:
+    if rank == 0:
         log.info("Loading manifest from %s ...", manifest_path)
         manifest = torch.load(manifest_path, map_location="cpu", weights_only=False)
         rides, source = _unwrap_manifest_rides(manifest)
@@ -689,111 +528,37 @@ def load_seed_frames(
         )
 
         n_r = len(rides)
+        start_i = min(max(0, test_ride_idx), n_r - 1)
+        order = list(range(start_i, n_r)) + list(range(0, start_i))
+
         chosen: List[Tuple[int, dict, str, int]] = []
-
-        if eval_zarr_list:
-            # Explicit zarr list: match by basename (fall back to full-path match).
-            by_base: Dict[str, Tuple[int, dict]] = {}
-            by_full: Dict[str, Tuple[int, dict]] = {}
-            for i, r in enumerate(rides):
-                zp = str(r["zarr_path"])
-                by_full[zp] = (i, r)
-                by_base.setdefault(Path(zp).name, (i, r))
-
-            # Prepare disk-fallback lookup once (only if fallback roots were provided).
-            ts_to_ride_dir: Dict[str, Path] = {}
-            enc_root_path: Optional[Path] = None
-            cap_root_path: Optional[Path] = None
-            if fallback_encoded_root and fallback_caption_root:
-                enc_root_path = Path(fallback_encoded_root)
-                cap_root_path = Path(fallback_caption_root)
-                ts_to_ride_dir = _build_ts_to_ride_dir(cap_root_path)
+        used_paths = set()
+        for idx in order:
+            if len(chosen) >= num_segments:
+                break
+            cand = rides[idx]
+            zp = str(cand["zarr_path"])
+            n_lat = _count_latent_frames(zp)
+            if n_lat < need:
                 log.info(
-                    "Disk-fallback enabled: encoded_root=%s caption_root=%s "
-                    "(indexed %d ride_dirs)",
-                    enc_root_path, cap_root_path, len(ts_to_ride_dir),
+                    "Skipping ride idx=%d (%s): %d latents < required %d",
+                    idx, Path(zp).name, n_lat, need,
                 )
-
-            n_synth = -1
-            for req in eval_zarr_list:
-                req_str = str(req).strip()
-                key = req_str if req_str in by_full else Path(req_str).name
-                entry = by_full.get(req_str) or by_base.get(key)
-                if entry is not None:
-                    midx, ride = entry
-                    zp = str(ride["zarr_path"])
-                    n_lat = _count_latent_frames(zp)
-                    if n_lat < need:
-                        raise RuntimeError(
-                            f"Ride {Path(zp).name} has {n_lat} latents < required {need}; "
-                            f"increase --latent_start_offset tolerance or pick another zarr."
-                        )
-                    chosen.append((midx, ride, zp, n_lat))
-                    continue
-
-                # Not in manifest → try disk fallback.
-                if enc_root_path is None:
-                    raise RuntimeError(
-                        f"Requested eval zarr {req_str!r} not found in manifest "
-                        f"({manifest_path}) and no fallback roots provided. "
-                        "Pass --encoded_root / --caption_root to enable disk fallback."
-                    )
-                basename = Path(req_str).name
-                try:
-                    ride = _load_ride_entry_from_disk(
-                        basename, enc_root_path, cap_root_path, ts_to_ride_dir,
-                    )
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Disk fallback failed for {basename!r}: {exc}"
-                    ) from exc
-                if ride["n_latent_frames"] < need:
-                    raise RuntimeError(
-                        f"Ride {basename} has {ride['n_latent_frames']} latents < required {need}."
-                    )
-                # Use a synthetic manifest_idx so we can still log it.
-                chosen.append((n_synth, ride, ride["zarr_path"], ride["n_latent_frames"]))
+                continue
+            if zp in used_paths:
                 log.info(
-                    "  [disk-fallback] loaded %s (%d latents) from %s",
-                    basename, ride["n_latent_frames"], enc_root_path,
+                    "Skipping ride idx=%d (%s): duplicate zarr_path (already used)",
+                    idx, Path(zp).name,
                 )
-                n_synth -= 1
+                continue
+            chosen.append((idx, cand, zp, n_lat))
+            used_paths.add(zp)
 
-            log.info(
-                "Using explicit eval_zarr_list (%d rides): %s",
-                len(chosen), [Path(p).name for _, _, p, _ in chosen],
+        if len(chosen) < num_segments:
+            raise RuntimeError(
+                f"Need {num_segments} distinct eligible rides (≥{need} latents each); "
+                f"found only {len(chosen)}. test_ride_idx={start_i}, manifest has {n_r} rides."
             )
-        else:
-            start_i = min(max(0, test_ride_idx), n_r - 1)
-            order = list(range(start_i, n_r)) + list(range(0, start_i))
-
-            used_paths = set()
-            for idx in order:
-                if len(chosen) >= num_segments:
-                    break
-                cand = rides[idx]
-                zp = str(cand["zarr_path"])
-                n_lat = _count_latent_frames(zp)
-                if n_lat < need:
-                    log.info(
-                        "Skipping ride idx=%d (%s): %d latents < required %d",
-                        idx, Path(zp).name, n_lat, need,
-                    )
-                    continue
-                if zp in used_paths:
-                    log.info(
-                        "Skipping ride idx=%d (%s): duplicate zarr_path (already used)",
-                        idx, Path(zp).name,
-                    )
-                    continue
-                chosen.append((idx, cand, zp, n_lat))
-                used_paths.add(zp)
-
-            if len(chosen) < num_segments:
-                raise RuntimeError(
-                    f"Need {num_segments} distinct eligible rides (≥{need} latents each); "
-                    f"found only {len(chosen)}. test_ride_idx={start_i}, manifest has {n_r} rides."
-                )
 
         from utils.zarr_dataset import ZarrRideDataset
         import zarr as zarr_lib
@@ -856,7 +621,7 @@ def load_seed_frames(
         payload[0] = {"segments": segments_out, "ride_meta": ride_meta_out}
         del manifest, rides
 
-    if dist.is_available() and dist.is_initialized() and not per_rank_load:
+    if dist.is_available() and dist.is_initialized():
         dist.broadcast_object_list(payload, src=0)
 
     data = payload[0]
@@ -881,6 +646,9 @@ def main():
                         default="logs/z_critic_v10_state_tokens/.ride_manifest.pt")
     parser.add_argument("--test_ride_idx", type=int, default=0,
                         help="First manifest index to scan for segment-1 zarr; each segment uses the next distinct eligible ride")
+    parser.add_argument("--city_ride_timestamps", type=str, nargs="+",
+                        default=["20240216101235", "20240314074715", "20240319110620"],
+                        help="Specific ride timestamps to use (Madrid, Rome, Stockholm)")
     parser.add_argument(
         "--latent_start_offset", type=int, default=EVAL_LATENT_START_OFFSET,
         help="Start index into ride latents for clean_x (needs offset+24 latents for motion z window)",
@@ -899,69 +667,6 @@ def main():
         default=None,
         help=f"If set, how many rollout segments to run (default {NUM_EVAL_SEGMENTS}).",
     )
-    parser.add_argument(
-        "--eval_zarrs",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Explicit list of zarr basenames (e.g. 20240216101235.zarr) or full paths "
-            "to use as eval rides, in order. If given, overrides --test_ride_idx / "
-            "manifest scanning. num_segments defaults to len(eval_zarrs)."
-        ),
-    )
-    parser.add_argument(
-        "--noisy_mode",
-        type=str,
-        choices=["fixed", "dataset", "dataset_plus_cf"],
-        default="fixed",
-        help=(
-            "How to drive the noisy-side action conditioning. "
-            "'fixed' (default) uses the hardcoded z2/z7 schedule per segment. "
-            "'dataset' uses the ride's own clean z-actions (same as clean side). "
-            "'dataset_plus_cf' produces TWO videos per segment: normal (noisy=dataset) "
-            "and counterfactual (noisy=-dataset). Both share the same denoising seed."
-        ),
-    )
-    parser.add_argument(
-        "--per_rank_zarrs",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "List of per-rank comma-separated zarr lists. Item i is used by rank i. "
-            "E.g. --per_rank_zarrs 'madrid1.zarr,rome1.zarr,wellington1.zarr' "
-            "'madrid1.zarr,rome1.zarr,brighton1.zarr'. Overrides --eval_zarrs / --test_ride_idx. "
-            "Output goes to output_dir/<label>/rank<i>/."
-        ),
-    )
-    parser.add_argument(
-        "--encoded_root",
-        type=str,
-        default=DEFAULT_ENCODED_ROOT,
-        help=(
-            "Fallback encoded zarr root for rides NOT in the manifest (e.g. OOD cities). "
-            "Defaults to the big shared dataset."
-        ),
-    )
-    parser.add_argument(
-        "--caption_root",
-        type=str,
-        default=DEFAULT_CAPTION_ROOT,
-        help=(
-            "Fallback caption root for loading prompt-embeds from *_encoded.json "
-            "when a ride is not in the manifest."
-        ),
-    )
-    parser.add_argument(
-        "--force_same_assignment",
-        action="store_true",
-        help=(
-            "Force ALL ranks to use MODEL_ASSIGNMENTS[--assignment_index] (same checkpoint). "
-            "Typical with --per_rank_zarrs for running one model across different rides "
-            "per GPU via torchrun."
-        ),
-    )
     args = parser.parse_args()
 
     rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -974,80 +679,26 @@ def main():
     torch.cuda.manual_seed(args.seed + rank)
 
     if args.assignment_index is not None:
+        if world != 1:
+            raise SystemExit(
+                "--assignment_index only works with a single process (omit torchrun or use WORLD_SIZE=1)."
+            )
         if not (0 <= args.assignment_index < len(MODEL_ASSIGNMENTS)):
             raise SystemExit(
                 f"--assignment_index must be in [0, {len(MODEL_ASSIGNMENTS) - 1}]"
             )
-        if world != 1 and not args.force_same_assignment:
-            raise SystemExit(
-                "--assignment_index with multi-rank requires --force_same_assignment "
-                "(all ranks run the same checkpoint)."
-            )
         eff_rank = args.assignment_index
-    elif args.force_same_assignment:
-        raise SystemExit("--force_same_assignment requires --assignment_index to be set.")
     else:
         eff_rank = rank
 
-    # Resolve per-rank zarr list if --per_rank_zarrs was given.
-    rank_zarrs: Optional[List[str]] = None
-    if args.per_rank_zarrs is not None:
-        if args.eval_zarrs is not None:
-            raise SystemExit("Use either --per_rank_zarrs or --eval_zarrs, not both.")
-        if len(args.per_rank_zarrs) < world:
-            raise SystemExit(
-                f"--per_rank_zarrs has {len(args.per_rank_zarrs)} groups but world_size={world}."
-            )
-        grp = args.per_rank_zarrs[rank]
-        rank_zarrs = [z.strip() for z in grp.split(",") if z.strip()]
-        if not rank_zarrs:
-            raise SystemExit(f"Rank {rank} per_rank_zarrs group is empty: {grp!r}")
-        log.info("Rank %d: per_rank_zarrs group = %s", rank, rank_zarrs)
-
-    effective_zarr_list = rank_zarrs if rank_zarrs is not None else args.eval_zarrs
-
-    if effective_zarr_list:
-        default_n = len(effective_zarr_list)
-    else:
-        default_n = NUM_EVAL_SEGMENTS
-    n_seg = args.num_segments if args.num_segments is not None else default_n
+    n_seg = args.num_segments if args.num_segments is not None else NUM_EVAL_SEGMENTS
     if n_seg < 1:
         raise SystemExit("--num_segments must be >= 1")
-    if args.noisy_mode == "fixed" and n_seg > NUM_EVAL_SEGMENTS:
-        raise SystemExit(
-            f"--num_segments must be <= {NUM_EVAL_SEGMENTS} when --noisy_mode=fixed "
-            f"(the hardcoded z2/z7 schedule only has {NUM_EVAL_SEGMENTS} segments)."
-        )
-    if effective_zarr_list and n_seg != len(effective_zarr_list):
-        raise SystemExit(
-            f"--num_segments ({n_seg}) must match len(effective zarr list) ({len(effective_zarr_list)})."
-        )
+    if n_seg > 10:
+        raise SystemExit("--num_segments must be <= 10")
 
-    if args.noisy_mode == "fixed":
-        segment_actions_np = build_all_segment_noisy_frame_actions(args.seed, NUM_EVAL_SEGMENTS)
-    else:
-        segment_actions_np = None  # driven from per-segment dataset z-actions instead
-
+    # Sanity mode: noisy actions will be set to clean actions per-segment (below)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    if rank == 0 and args.noisy_mode == "fixed":
-        meta_path = Path(args.output_dir) / "segment_noisy_frame_actions.json"
-        with open(meta_path, "w", encoding="utf-8") as fh:
-            json.dump(
-                {
-                    "cli_seed": args.seed,
-                    "noisy_z2_by_segment": NOISY_Z2_BY_SEGMENT.tolist(),
-                    "noisy_z7_chunks": NOISY_Z7_CHUNKS.tolist(),
-                    "segments": [a.tolist() for a in segment_actions_np],
-                },
-                fh,
-                indent=2,
-            )
-        log.info("Wrote shared per-segment noisy actions (all GPUs): %s", meta_path)
-    elif rank == 0:
-        log.info(
-            "noisy_mode=%s: per-segment noisy actions will be derived from dataset z-actions.",
-            args.noisy_mode,
-        )
 
     if eff_rank >= len(MODEL_ASSIGNMENTS):
         log.info("Rank %d has no model assignment, exiting.", eff_rank)
@@ -1057,13 +708,7 @@ def main():
     label = assignment["label"]
     log.info("Rank %d (assignment %d) → %s  (%s)", rank, eff_rank, label, assignment["ckpt"])
 
-    # When ranks run different rides (per_rank_zarrs OR force_same_assignment with world>1),
-    # split outputs into per-rank subdirs to avoid cross-rank file collisions.
-    needs_rank_subdir = (rank_zarrs is not None) or (args.force_same_assignment and world > 1)
-    if needs_rank_subdir:
-        out_dir = Path(args.output_dir) / label / f"rank{rank}"
-    else:
-        out_dir = Path(args.output_dir) / label
+    out_dir = Path(args.output_dir) / label
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pipe = ChainPipeline(device)
@@ -1075,8 +720,55 @@ def main():
     motion_root = str(_cfg.get("motion_root", "") or "")
     if not motion_root:
         raise ValueError("config motion_root is required for clean-side motion encoding")
+    # Fix u6ej -> u6ex paths
+    if "u6ej" in motion_root:
+        motion_root = motion_root.replace("u6ej", "u6ex")
     ss_vae_ckpt = str(_cfg.get("ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt"))
     action_dims = list(_cfg.get("action_dims", [2, 7]))
+
+    # Find specific city rides in the manifest by timestamp
+    log.info("Loading manifest to find city rides...")
+    manifest = torch.load(args.manifest, map_location="cpu", weights_only=False)
+    rides_all, _ = _unwrap_manifest_rides(manifest)
+    target_ts = args.city_ride_timestamps[:n_seg]
+
+    # Find matching rides and set test_ride_idx to the first one
+    ts_to_idx = {}
+    for i, r in enumerate(rides_all):
+        ts = os.path.basename(r["zarr_path"]).replace(".zarr", "")
+        # Also check with u6ex path
+        ts_to_idx[ts] = i
+
+    found_indices = []
+    for ts in target_ts:
+        idx = ts_to_idx.get(ts)
+        if idx is None:
+            log.warning("Ride %s not found in manifest, will use sequential scan", ts)
+        else:
+            found_indices.append(idx)
+            log.info("Found %s at manifest index %d", ts, idx)
+
+    # Replace all u6ej paths with u6ex
+    for r in rides_all:
+        zp = r["zarr_path"]
+        if "u6ej" in zp:
+            r["zarr_path"] = zp.replace("/projects/u6ej/fbots/frodobots_encoded",
+                                        "/projects/u6ex/fbots/frodobots_encoded")
+
+    # Reorder manifest so our target rides come first
+    if len(found_indices) == len(target_ts):
+        reordered = [rides_all[i] for i in found_indices]
+        rest = [r for i, r in enumerate(rides_all) if i not in found_indices]
+        rides_all = reordered + rest
+    else:
+        log.warning("Not all city rides found, falling back to sequential scan")
+    del manifest
+
+    # Rebuild a temp manifest file with reordered rides
+    import tempfile
+    fd, temp_manifest = tempfile.mkstemp(suffix=".pt")
+    os.close(fd)
+    torch.save({"rides": rides_all, "encoded_root": "/projects/u6ex/fbots/frodobots_encoded"}, temp_manifest)
 
     (
         per_seg_seed,
@@ -1085,29 +777,16 @@ def main():
         per_seg_clean_actions,
         ride_meta,
     ) = load_seed_frames(
-        device, args.manifest, n_seg,
-        test_ride_idx=args.test_ride_idx,
+        device, temp_manifest, n_seg,
+        test_ride_idx=0,
         latent_start_offset=args.latent_start_offset,
         motion_root=motion_root,
         ss_vae_checkpoint=ss_vae_ckpt,
         action_dims=action_dims,
-        eval_zarr_list=effective_zarr_list,
-        fallback_encoded_root=args.encoded_root,
-        fallback_caption_root=args.caption_root,
-        per_rank_load=(rank_zarrs is not None),
     )
-    # Write per-segment clean-ride manifest. Keep metadata co-located with the
-    # video output: if each rank writes to its own subdir (per_rank_zarrs OR
-    # force_same_assignment + world>1), each rank also writes its own JSON
-    # next to its videos. Otherwise rank 0 writes a single shared file under
-    # output_dir/.
-    if needs_rank_subdir:
-        rides_path = out_dir / "segment_clean_rides.json"
-        write_meta = True
-    else:
+    os.unlink(temp_manifest)
+    if rank == 0:
         rides_path = Path(args.output_dir) / "segment_clean_rides.json"
-        write_meta = rank == 0
-    if write_meta:
         with open(rides_path, "w", encoding="utf-8") as fh:
             json.dump(
                 {
@@ -1117,101 +796,62 @@ def main():
                 fh,
                 indent=2,
             )
-        log.info("Wrote per-segment clean zarr paths: %s", rides_path)
+        log.info("Wrote per-segment clean zarr paths (all GPUs): %s", rides_path)
 
-    total_videos = 0
+    city_labels = ["Madrid", "Rome", "Stockholm"]
     for seg_idx in range(n_seg):
-        seg_label_base = f"{label} seg{seg_idx + 1}"
-        log.info("[%s] === Segment %d/%d ===", label, seg_idx + 1, n_seg)
+        city_label = city_labels[seg_idx] if seg_idx < len(city_labels) else f"seg{seg_idx+1}"
+        seg_label = f"{label} {city_label}"
+        log.info("[%s] === Segment %d/%d (%s) ===", label, seg_idx + 1, n_seg, city_label)
+
+        # Sanity: use clean-side actions as noisy-side actions (replay GT)
+        noisy_frame_actions = per_seg_clean_actions[seg_idx].to(dtype=pipe.dtype)
+        chunk_actions_dev = frame_actions_to_chunk_actions(noisy_frame_actions)
+        log.info("[%s]   Using clean-side actions as noisy (replay GT)", label)
 
         prompt_embeds_seg = per_seg_prompt[seg_idx].to(dtype=pipe.dtype)
         clean_frame_actions_seg = per_seg_clean_actions[seg_idx].to(dtype=pipe.dtype)
         context_latents_3 = per_seg_seed[seg_idx].unsqueeze(0)
         clean_x = per_seg_clean_x[seg_idx]
 
-        zarr_name = Path(ride_meta[seg_idx]["zarr_path"]).stem if ride_meta else ""
+        cond = pipe.build_conditional(
+            prompt_embeds_seg, noisy_frame_actions, clean_frame_actions_seg,
+            assignment.get("has_adaln", False),
+            assignment.get("has_action_tokens", False),
+        )
 
-        # Build list of (cond_tag, noisy_frame_actions_tensor) to run for this segment.
-        conditions: List[Tuple[str, torch.Tensor]] = []
-        if args.noisy_mode == "fixed":
-            a = segment_actions_np[seg_idx]
-            log.info(
-                "[%s]   Fixed noisy cmd z2=%.2f (const) z7 blocks %s",
-                label, float(NOISY_Z2_BY_SEGMENT[seg_idx]), NOISY_Z7_CHUNKS.tolist(),
-            )
-            noisy_fa = torch.from_numpy(a).unsqueeze(0).to(device=device, dtype=pipe.dtype)
-            conditions.append(("fixed", noisy_fa))
-        else:
-            dataset_fa = clean_frame_actions_seg.clone()
-            if args.noisy_mode == "dataset":
-                conditions.append(("normal", dataset_fa))
-                log.info("[%s]   Noisy = dataset z-actions", label)
-            elif args.noisy_mode == "dataset_plus_cf":
-                conditions.append(("normal", dataset_fa))
-                conditions.append(("counterfactual", -dataset_fa))
-                log.info(
-                    "[%s]   Running BOTH normal (noisy=dataset) and counterfactual (noisy=-dataset)",
-                    label,
-                )
+        noise_seed = args.seed + VIDEO_NOISE_BASE + seg_idx * VIDEO_NOISE_SEED_STRIDE
+        torch.manual_seed(noise_seed)
+        torch.cuda.manual_seed(noise_seed)
 
-        for cond_tag, noisy_frame_actions in conditions:
-            chunk_actions_dev = frame_actions_to_chunk_actions(noisy_frame_actions)
+        t0 = time.time()
+        gen_latents = pipe.generate(cond, clean_x)
+        log.info("[%s]   Generated in %.1fs (noise_seed=%s)", label, time.time() - t0, noise_seed)
 
-            cond = pipe.build_conditional(
-                prompt_embeds_seg, noisy_frame_actions, clean_frame_actions_seg,
-                assignment.get("has_adaln", False),
-                assignment.get("has_action_tokens", False),
-            )
+        context_np = pipe.decode_latents(context_latents_3)
+        video_np = pipe.decode_latents(gen_latents)
+        video_with_context_np = np.concatenate([context_np, video_np], axis=0)
 
-            # Same denoising seed across sibling conditions (e.g. normal vs cf) of the
-            # same segment → clean A/B comparison at the noise-init level.
-            noise_seed = args.seed + VIDEO_NOISE_BASE + seg_idx * VIDEO_NOISE_SEED_STRIDE
-            torch.manual_seed(noise_seed)
-            torch.cuda.manual_seed(noise_seed)
+        motion, teacher_z_8d = pipe.compute_teacher_visuals(gen_latents)
+        n_c = teacher_z_8d.shape[1]
+        teacher_z2z7 = teacher_z_8d[:, :, CRITIC_ACTION_DIMS]
 
-            t0 = time.time()
-            gen_latents = pipe.generate(cond, clean_x)
-            log.info(
-                "[%s]   [%s] Generated in %.1fs (noise_seed=%s)",
-                label, cond_tag, time.time() - t0, noise_seed,
-            )
+        critic_z2z7 = None
+        if pipe.action_critic is not None:
+            cp = pipe.run_critic(gen_latents, chunk_actions_dev)
+            if cp is not None:
+                critic_z2z7 = cp[:, :, CRITIC_ACTION_DIMS]
 
-            context_np = pipe.decode_latents(context_latents_3)
-            video_np = pipe.decode_latents(gen_latents)
-            video_with_context_np = np.concatenate([context_np, video_np], axis=0)
+        target_z = chunk_actions_dev[:, :n_c].contiguous()
 
-            motion, teacher_z_8d = pipe.compute_teacher_visuals(gen_latents)
-            n_c = teacher_z_8d.shape[1]
-            teacher_z2z7 = teacher_z_8d[:, :, CRITIC_ACTION_DIMS]
+        ann = annotate_video(video_np, teacher_z2z7, critic_z2z7, target_z, motion, seg_label)
+        ann_with_context = np.concatenate([context_np, ann], axis=0)
+        frames_to_mp4(ann_with_context, str(out_dir / f"{city_label}_annotated.mp4"))
+        frames_to_mp4(video_with_context_np, str(out_dir / f"{city_label}_raw.mp4"))
 
-            critic_z2z7 = None
-            if pipe.action_critic is not None:
-                cp = pipe.run_critic(gen_latents, chunk_actions_dev)
-                if cp is not None:
-                    critic_z2z7 = cp[:, :, CRITIC_ACTION_DIMS]
+        torch.cuda.empty_cache()
 
-            target_z = chunk_actions_dev[:, :n_c].contiguous()
-
-            seg_label = f"{seg_label_base} {cond_tag}"
-            if args.noisy_mode == "fixed":
-                fname_stem = f"seg{seg_idx + 1}"
-            else:
-                pieces = [f"seg{seg_idx + 1}"]
-                if zarr_name:
-                    pieces.append(zarr_name)
-                pieces.append(cond_tag)
-                fname_stem = "_".join(pieces)
-
-            ann = annotate_video(video_np, teacher_z2z7, critic_z2z7, target_z, motion, seg_label)
-            ann_with_context = np.concatenate([context_np, ann], axis=0)
-            frames_to_mp4(ann_with_context, str(out_dir / f"{fname_stem}_annotated.mp4"))
-            frames_to_mp4(video_with_context_np, str(out_dir / f"{fname_stem}_raw.mp4"))
-            total_videos += 1
-
-            torch.cuda.empty_cache()
-
-    log.info("[%s] Done! Saved %d video(s) across %d segment(s) to %s",
-             label, total_videos, n_seg, out_dir)
+    log.info("[%s] Done! Saved %d segment video(s) to %s", label, n_seg, out_dir)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

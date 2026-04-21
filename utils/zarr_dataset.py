@@ -32,6 +32,21 @@ from action_query.ss_vae_model import load_ss_vae
 # machine; we strip this prefix to get the relative path used for motion/caption lookup.
 _DATA_ROOT = Path("/home/ashish/frodobots/frodobots_data")
 
+
+def _extract_ride_rel(ride_dir_2k: str) -> Path:
+    """Extract the relative ride path (output_rides_X/ride_Y) from any absolute prefix."""
+    parts = Path(ride_dir_2k).parts
+    for i, part in enumerate(parts):
+        if part.startswith("output_rides_"):
+            return Path(*parts[i:])
+    try:
+        return Path(ride_dir_2k).relative_to(_DATA_ROOT)
+    except ValueError:
+        raise RuntimeError(
+            f"ride_dir_2k={ride_dir_2k}: cannot find output_rides_*/ride_* "
+            f"and is not under {_DATA_ROOT}"
+        )
+
 # Latent temporal compression: 1 latent frame corresponds to 4 video frames.
 _LATENT_TO_VIDEO = 4
 
@@ -124,13 +139,7 @@ def _load_aligned_motion_for_zarr(
     if not ride_dir_2k:
         raise RuntimeError("ride_dir_2k not present in zarr attrs")
 
-    ride_path = Path(ride_dir_2k)
-    try:
-        rel = ride_path.relative_to(_DATA_ROOT)
-    except ValueError:
-        raise RuntimeError(
-            f"ride_dir_2k={ride_dir_2k} is not under {_DATA_ROOT}"
-        )
+    rel = _extract_ride_rel(ride_dir_2k)
 
     motion_path = motion_root / rel / "motion.npy"
     if not motion_path.exists():
@@ -250,15 +259,11 @@ def _index_single_zarr(
     ride_dir_2k = attrs.get("ride_dir_2k", "")
     if not ride_dir_2k:
         raise RuntimeError("ride_dir_2k missing from zarr attrs")
-    ride_path = Path(ride_dir_2k)
-    try:
-        ride_path.relative_to(_DATA_ROOT)
-    except ValueError:
-        raise RuntimeError(f"ride_dir_2k={ride_dir_2k} not under {_DATA_ROOT}")
+    rel = _extract_ride_rel(ride_dir_2k)
 
-    caption_file = _find_encoded_caption(caption_root, ride_path.relative_to(_DATA_ROOT))
+    caption_file = _find_encoded_caption(caption_root, rel)
     if caption_file is None:
-        raise FileNotFoundError(f"No encoded caption for {ride_path}")
+        raise FileNotFoundError(f"No encoded caption for {rel}")
     prompt_embeds = _load_prompt_embeds(caption_file)
 
     return prompt_embeds, attrs, n_latent_frames
@@ -462,6 +467,9 @@ class ZarrRideDataset(Dataset):
 
             self._rides.append((zpath, prompt_embeds, zarr_attrs, n_latent_frames))
             self._attrs_by_path[str(zpath)] = zarr_attrs
+            resolved = str(zpath.resolve())
+            if resolved != str(zpath):
+                self._attrs_by_path[resolved] = zarr_attrs
 
         elapsed = time.perf_counter() - t_index_start
         logging.info(
@@ -689,11 +697,7 @@ class ZarrSequentialDataset(Dataset):
         ride_dir_2k = attrs.get("ride_dir_2k", "")
         if not ride_dir_2k:
             raise RuntimeError("ride_dir_2k missing from zarr attrs")
-        ride_path = Path(ride_dir_2k)
-        try:
-            rel = ride_path.relative_to(_DATA_ROOT)
-        except ValueError:
-            raise RuntimeError(f"ride_dir_2k={ride_dir_2k} not under {_DATA_ROOT}")
+        rel = _extract_ride_rel(ride_dir_2k)
 
         # Caption
         caption_file = _find_encoded_caption(self.caption_root, rel)
