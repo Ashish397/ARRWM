@@ -201,8 +201,8 @@ teacher_lora:
 action_critic_enabled: true
 action_critic_dims: [2, 7]
 action_critic_z_out_dim: 8
-action_critic_z_loss_weight: 0.5
-generator_action_z_guidance_weight: 0.25
+action_critic_z_loss_weight: 0.25
+generator_action_z_guidance_weight: 0.125
 critic_lr: 3.0e-04
 critic_updates_per_step: 2
 action_critic_base_channels: 128
@@ -214,8 +214,8 @@ state_probe_mode: true
 state_probe_dim: 256
 state_probe_n_taps: 6
 state_probe_num_heads: 8
-state_head_loss_weight: 0.1
-state_head_action_dim_weight: 3.0
+state_head_loss_weight: 0.05
+state_head_action_dim_weight: 1.5
 state_head_out_dim: 8
 
 # Frozen-readout state guidance (teacher parity).
@@ -227,8 +227,8 @@ state_head_out_dim: 8
 # linear warmup. Dormant at 0.0 (ODE-only distill); match the teacher
 # by setting to 0.5 with a 500-step warmup once we've confirmed the
 # student's base distill tracks stably.
-state_guidance_weight: 0.2
-state_guidance_warmup_steps: 0
+state_guidance_weight: 0.025
+state_guidance_warmup_steps: 100
 state_guidance_action_scale: 1.0
 
 # Optimiser (mirrors causal-forcing ODE stage). If training is visibly
