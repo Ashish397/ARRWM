@@ -147,6 +147,25 @@ def _initialize_crossattn_cache(
     return crossattn_cache
 
 
+def _reset_kv_cache(kv_cache: list) -> None:
+    """Zero out every per-layer K/V buffer and rewind the end-index
+    counters so the cache behaves like a freshly allocated one.
+
+    Used by the ``cache_refresh="full_fifo"`` path in ``generate_ar``,
+    which rebuilds the entire KV cache from raw FIFO latents at every
+    chunk boundary. Also clears any ``_frozen_*_end_index`` attributes
+    that may have been left dangling on per-block attention modules by
+    earlier forwards (these are used by the train-time "freeze cache"
+    hack in ``CausalWanModel`` and would otherwise override the reset
+    values on the next forward).
+    """
+    for entry in kv_cache:
+        entry["k"].zero_()
+        entry["v"].zero_()
+        entry["global_end_index"].fill_(0)
+        entry["local_end_index"].fill_(0)
+
+
 def _set_attention_window(base_dit, *, local_attn_size_frames: int, max_tokens: int) -> None:
     """Propagate ``local_attn_size`` (frames) and ``max_attention_size``
     (tokens) to every attention block + top-level module."""
@@ -416,18 +435,47 @@ class ODEChainPipeline(ChainPipeline):
         chunks_per_step: int = 1,
         context_noise_timestep: float = 0.0,
         ar_cache: bool = True,
+        cache_refresh: str = "append",
     ) -> torch.Tensor:
         """Streaming AR rollout with a KV cache.
 
+        ``cache_refresh`` selects how the KV cache is maintained as
+        new chunks are committed:
+
+          * ``"append"`` (default) — original AR-baseline behaviour.
+            After each chunk is denoised, a single cache-refresh forward
+            pushes the newly committed chunk's K/V into the next free
+            slot of the ring buffer. K/V for older context chunks are
+            computed ONCE (when each was first committed) and never
+            touched again. Over the course of the rollout the cache
+            holds progressively staler K/V for older context.
+
+          * ``"full_fifo"`` — chain-style freshness at chunk boundary
+            (Variant A). The cache is treated as a FIFO of the last
+            ``cache_chunks`` committed latents. At the *start* of every
+            new chunk the cache is zero'd and re-populated from the FIFO
+            by running a clean cache-refresh forward for each FIFO
+            entry in temporal order. Every chunk's 4 denoise passes
+            therefore see K/V that were freshly computed, in sequence,
+            from the *current* FIFO state — exactly what chain does at
+            the context-K/V level, but done once per chunk rather than
+            once per denoise step (so the 4 denoise passes share the
+            refreshed cache, unlike ``eval_causal_AR_chain.py``'s
+            ``generate_ar_refresh`` which recomputes on every step).
+            Costs roughly 1.75× of a 3-frame forward per chunk at
+            steady state (3 refresh + 4 denoise passes, each at
+            Q=3 frames).
+
         **Chain-equivalent real seed (always on).** Regardless of
-        ``ar_cache``, the FIRST block of ``initial_latents`` (= the first
-        ``num_frame_per_block`` latent frames, which is 3 at the canonical
-        ``chunks_per_step=1`` — matching ``eval_causal_chain`` 's
-        ``CONTEXT_FRAMES`` / ``seed_lat``) is ALWAYS pushed into the KV
-        cache through a clean cache-refresh forward at
-        ``context_noise_timestep``. This guarantees the student sees the
-        same 3 real seed frames that chain evaluates with, which is
-        essential for head-to-head AR-vs-chain comparisons.
+        ``ar_cache`` or ``cache_refresh``, the FIRST block of
+        ``initial_latents`` (= the first ``num_frame_per_block`` latent
+        frames, which is 3 at the canonical ``chunks_per_step=1`` —
+        matching ``eval_causal_chain`` 's ``CONTEXT_FRAMES`` /
+        ``seed_lat``) is ALWAYS pushed into the KV cache through a
+        clean cache-refresh forward at ``context_noise_timestep``. This
+        guarantees the student sees the same 3 real seed frames that
+        chain evaluates with, which is essential for head-to-head
+        AR-vs-chain comparisons.
 
         After the mandatory real seed, ``ar_cache`` controls what
         populates the rest of the cache:
@@ -483,6 +531,18 @@ class ODEChainPipeline(ChainPipeline):
         assert self.ode_model is not None and self.wrapper is not None
         assert self.denoising_step_list is not None, "call set_denoising_steps() first"
         assert chunks_per_step >= 1
+        if cache_refresh not in ("append", "full_fifo"):
+            raise SystemExit(
+                f"[AR] unknown cache_refresh={cache_refresh!r} "
+                "(expected 'append' or 'full_fifo')"
+            )
+        if cache_refresh == "full_fifo" and not ar_cache:
+            raise SystemExit(
+                "[AR] cache_refresh='full_fifo' is incompatible with "
+                "--no-ar_cache (clean-fill). full_fifo always rebuilds "
+                "the cache from a FIFO of committed latents, so the "
+                "cache-fill strategy must be generated-fill."
+            )
 
         base_dit = self.wrapper.model
         if hasattr(base_dit, "get_base_model"):
@@ -667,8 +727,53 @@ class ODEChainPipeline(ChainPipeline):
         #    ``total_gen_chunks`` covers the bootstrap (if ar_cache=True)
         #    plus the main-gen; each streaming step emits ``chunks_per_step``
         #    chunks.
+        #
+        #    Behaviour branches on ``cache_refresh``:
+        #      * ``"append"`` — incremental KV cache (original AR logic).
+        #                       Each chunk's cache-refresh writes only the
+        #                       newly committed chunk's K/V, appended at
+        #                       ``current_start`` which advances by
+        #                       ``num_frame_per_block`` per chunk.
+        #      * ``"full_fifo"`` — at the START of every chunk, zero the
+        #                         cache and re-run refresh forwards for
+        #                         each entry of a FIFO of the last
+        #                         ``cache_chunks`` committed latent
+        #                         blocks, in temporal order. The FIFO is
+        #                         seeded with the real seed block and
+        #                         grows one chunk per step until it
+        #                         saturates; thereafter the oldest entry
+        #                         is evicted before the newest pred_x0 is
+        #                         pushed. The 4 denoise passes of a chunk
+        #                         share the refreshed cache — only the 3
+        #                         current-chunk frames get fresh K/V per
+        #                         denoise step.
         # ------------------------------------------------------------------
         generated: List[torch.Tensor] = []
+
+        # FIFO state used only by cache_refresh="full_fifo". Entries are
+        # (latent_block [B, num_frame_per_block, C, H, W], global frame
+        # lo index into noisy_fa_full). The seed-prefill above already
+        # pushed the first block into the cache; full_fifo does not
+        # reuse those K/V — it rebuilds the cache from raw latents at
+        # the start of every chunk — but the seed latents themselves
+        # go into the FIFO as the initial context for chunk 0.
+        fifo_lat: List[torch.Tensor] = []
+        fifo_frame_lo: List[int] = []
+        if cache_refresh == "full_fifo":
+            # Seed the FIFO with every block of ``initial_latents`` that
+            # was already pushed into the cache above (seed + clean-fill
+            # bootstrap). For ``ar_cache=True`` that is just the first
+            # block (the chain-equivalent 3-frame seed); ``ar_cache=False``
+            # is explicitly rejected at entry.
+            fifo_lat.append(initial_latents_dev[:, :num_frame_per_block])
+            fifo_frame_lo.append(0)
+            log.info(
+                "[AR] cache-fill strategy: FULL_FIFO (FIFO size=%d chunks, "
+                "seed=%d chunk(s), main=%d chunk(s) AR-gen; cache is "
+                "rebuilt from raw FIFO latents before every chunk).",
+                cache_chunks, seed_chunks, num_gen_chunks,
+            )
+
         total_gen_chunks = bootstrap_chunks + num_gen_chunks
         if total_gen_chunks % chunks_per_step != 0:
             raise SystemExit(
@@ -678,7 +783,38 @@ class ODEChainPipeline(ChainPipeline):
             )
         num_steps_needed = total_gen_chunks // chunks_per_step
         for step_idx in range(num_steps_needed):
-            frame_lo = current_start_frame
+            if cache_refresh == "full_fifo":
+                # Rebuild the cache from raw FIFO latents. Each block is
+                # refreshed in temporal order so the K/V at higher
+                # transformer layers see freshly-refreshed K/V of their
+                # causal predecessors — matching what a single
+                # full-window chain forward would produce.
+                _reset_kv_cache(kv_cache)
+                current_start_frame = 0
+                for f_lat, f_lo in zip(fifo_lat, fifo_frame_lo):
+                    f_hi = f_lo + num_frame_per_block
+                    f_block_fa = noisy_fa_full[:, f_lo:f_hi]
+                    f_cond = self._build_action_cond_chunk(
+                        prompt_embeds_dev, f_block_fa,
+                        num_frames=num_frame_per_block,
+                    )
+                    with torch.amp.autocast("cuda", dtype=self.dtype):
+                        self.wrapper(
+                            noisy_image_or_video=f_lat,
+                            conditional_dict=f_cond,
+                            timestep=refresh_t_block,
+                            kv_cache=kv_cache,
+                            crossattn_cache=crossattn_cache,
+                            current_start=current_start_frame * frame_seq_length,
+                        )
+                    current_start_frame += num_frame_per_block
+                # current_start_frame is now exactly where the incoming
+                # chunk's 3 frames will be queried from.
+                cur_frame_lo = (seed_chunks + step_idx) * num_frame_per_block
+            else:
+                cur_frame_lo = current_start_frame
+
+            frame_lo = cur_frame_lo
             frame_hi = frame_lo + num_frame_per_block
             block_fa = noisy_fa_full[:, frame_lo:frame_hi]
             cond = self._build_action_cond_chunk(
@@ -723,26 +859,46 @@ class ODEChainPipeline(ChainPipeline):
                     )
             assert pred_x0 is not None
 
-            # Cache-refresh on the clean pred_x0 so the next step sees
-            # clean-context KVs (matches CausalInferencePipeline).
-            with torch.amp.autocast("cuda", dtype=self.dtype):
-                self.wrapper(
-                    noisy_image_or_video=pred_x0,
-                    conditional_dict=cond,
-                    timestep=refresh_t_block,
-                    kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=current_start_frame * frame_seq_length,
-                )
             generated.append(pred_x0.detach().to(torch.float32))
-            current_start_frame += num_frame_per_block
-            log.info(
-                "[AR] step %d/%d emitted chunks [%d:%d] at frames [%d:%d]",
-                step_idx + 1, num_steps_needed,
-                (current_start_frame - num_frame_per_block) // BASE_CHUNK_FRAMES,
-                current_start_frame // BASE_CHUNK_FRAMES,
-                current_start_frame - num_frame_per_block, current_start_frame,
-            )
+
+            if cache_refresh == "append":
+                # Cache-refresh on the clean pred_x0 so the next step sees
+                # clean-context KVs (matches CausalInferencePipeline).
+                with torch.amp.autocast("cuda", dtype=self.dtype):
+                    self.wrapper(
+                        noisy_image_or_video=pred_x0,
+                        conditional_dict=cond,
+                        timestep=refresh_t_block,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start_frame * frame_seq_length,
+                    )
+                current_start_frame += num_frame_per_block
+                log.info(
+                    "[AR] step %d/%d emitted chunks [%d:%d] at frames [%d:%d]",
+                    step_idx + 1, num_steps_needed,
+                    (current_start_frame - num_frame_per_block) // BASE_CHUNK_FRAMES,
+                    current_start_frame // BASE_CHUNK_FRAMES,
+                    current_start_frame - num_frame_per_block, current_start_frame,
+                )
+            else:  # full_fifo
+                # Commit pred_x0 to the FIFO; next iteration's refresh
+                # phase will re-populate the cache from raw latents. We
+                # deliberately skip the AR-style cache-refresh-on-commit
+                # because it would be wasted work — the next chunk
+                # starts with a full reset.
+                if len(fifo_lat) >= cache_chunks:
+                    fifo_lat.pop(0)
+                    fifo_frame_lo.pop(0)
+                fifo_lat.append(pred_x0.detach())
+                fifo_frame_lo.append(cur_frame_lo)
+                log.info(
+                    "[AR/full_fifo] step %d/%d emitted chunk at frames "
+                    "[%d:%d] | fifo=%d/%d",
+                    step_idx + 1, num_steps_needed,
+                    cur_frame_lo, cur_frame_lo + num_frame_per_block,
+                    len(fifo_lat), cache_chunks,
+                )
 
         if ar_cache:
             # Real seed block (chain-equivalent CONTEXT_FRAMES) followed
@@ -963,6 +1119,21 @@ def main():
     parser.add_argument("--context_noise_timestep", type=float, default=0.0,
                         help="AR mode only: timestep passed on the post-denoise / prefill "
                              "cache-refresh forwards. Training uses 0.")
+    parser.add_argument("--ar_cache_refresh", choices=["append", "full_fifo"],
+                        default="append",
+                        help="AR mode only: KV cache maintenance strategy. "
+                             "'append' (default) = original AR behaviour: each "
+                             "chunk's cache-refresh writes only the newly "
+                             "committed chunk's K/V, older context K/V are "
+                             "computed once and never touched. "
+                             "'full_fifo' = chain-style freshness at chunk "
+                             "boundary (Variant A): at the start of every "
+                             "chunk the cache is zero'd and re-populated from "
+                             "a FIFO of the last --cache_chunks committed "
+                             "latents by running clean cache-refresh forwards "
+                             "for each FIFO entry in temporal order. The 4 "
+                             "denoise passes of the current chunk share this "
+                             "refreshed cache. Requires --ar_cache.")
 
     # ---- Per-rank data-path overrides (config doesn't always define these) ----
     parser.add_argument("--motion_root", type=str, default=None,
@@ -1190,6 +1361,10 @@ def main():
         torch.manual_seed(noise_seed)
         torch.cuda.manual_seed(noise_seed)
 
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated() / (1024 ** 2)
+
         t0 = time.time()
         full_latents = pipe.generate_ar(
             prompt_embeds=ar_prompt_embeds,
@@ -1200,13 +1375,19 @@ def main():
             chunks_per_step=args.chunks_per_step,
             context_noise_timestep=args.context_noise_timestep,
             ar_cache=args.ar_cache,
+            cache_refresh=args.ar_cache_refresh,
         )
+        peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
         log.info(
             "[AR][%s] rank=%d streaming rollout done in %.1fs "
-            "(K=%d, fill=%s, bootstrap=%d, main=%d, seed=%d)",
+            "(K=%d, fill=%s, refresh=%s, bootstrap=%d, main=%d, seed=%d) | "
+            "mem before=%.0f MiB  peak_alloc=%.0f MiB  peak_reserved=%.0f MiB",
             label, rank, time.time() - t0, args.denoising_steps,
-            cache_fill_tag, args.ar_initial_chunks if args.ar_cache else 0,
+            cache_fill_tag, args.ar_cache_refresh,
+            args.ar_initial_chunks if args.ar_cache else 0,
             args.ar_gen_chunks, noise_seed,
+            mem_before, peak_mb, reserved_mb,
         )
 
         full_latents = full_latents.detach()
@@ -1235,9 +1416,10 @@ def main():
                 critic_z2z7 = cp[:, :, CRITIC_ACTION_DIMS]
         target_z_ar = chunk_dev_gen[:, :n_c].contiguous()
 
+        refresh_tag = "" if args.ar_cache_refresh == "append" else f"_{args.ar_cache_refresh}"
         tag = (
             f"{label}_{cond_tag}_ar_c{args.cache_chunks}_cps{args.chunks_per_step}"
-            f"_{cache_fill_tag}"
+            f"_{cache_fill_tag}{refresh_tag}"
         )
         raw_path = out_dir / f"{tag}_rollout_raw.mp4"
         annot_path = out_dir / f"{tag}_rollout_annotated.mp4"
