@@ -10,7 +10,7 @@ from pipeline import SelfForcingTrainingPipeline, ActionSelfForcingTrainingPipel
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from model.action_model_patch import apply_action_patches, apply_action_patches_critic
-from model.action_modulation import ActionModulationProjection
+from model.action_modulation import ActionModulationProjection, ActionTokenProjection
 
 from utils.debug_option import DEBUG
 
@@ -20,8 +20,32 @@ class BaseModel(nn.Module):
         cfg_flag = getattr(args, "action_patch_enabled", None)
         self._action_patch_enabled = bool(cfg_flag)
         object.__setattr__(self, "_action_projection_ref", None)
+        object.__setattr__(self, "_action_token_projection_ref", None)
         self._action_dim: Optional[int] = None
         self.text_pre_encoded = bool(getattr(args, "text_pre_encoded", False))
+        # The action apparatus is an indivisible unit of four streams (AdaLN
+        # modulation + per-frame action tokens, on both the noisy and clean-x
+        # windows). The v14 teacher, ODE student, and Phase-1 DMD all train
+        # with ``action_conditioning_mode="both"`` (strictly enforced in
+        # ``action-forcing/af_model/ode_regression.py:138``). Running with
+        # only one of the two streams means feeding the DiT an input
+        # convention it was never trained on — AdaLN-only silently kills
+        # the per-frame-action-token input AND drops the frame's sequence
+        # length from 1561 to 1560, both of which are out-of-distribution.
+        # We refuse to proceed in a degraded mode.
+        if self._action_patch_enabled:
+            acm = str(getattr(args, "action_conditioning_mode", "both"))
+            if acm != "both":
+                raise RuntimeError(
+                    f"action_conditioning_mode must be 'both' for action-"
+                    f"aware training (got {acm!r}). The ODE student and v14 "
+                    f"teacher were both trained with both AdaLN modulation "
+                    f"AND per-frame action tokens active; running with only "
+                    f"one stream feeds the DiT an untrained input convention."
+                )
+            self._action_conditioning_mode = acm
+        else:
+            self._action_conditioning_mode = None
         self._initialize_models(args, device)
 
         self.device = device
@@ -53,15 +77,127 @@ class BaseModel(nn.Module):
                     "Action patches are enabled but action_projection failed to initialize."
                 )
             self.action_projection.requires_grad_(True)
-            
+
+            # Stream B: per-frame action tokens. Matches the ODE trainer's
+            # `ActionTokenProjection` + `adjust_seq_len_for_action_tokens`
+            # pair. Without this, the generator's per-frame sequence length
+            # stays at 1560 (pure spatial), and the DiT weights trained
+            # with 1561 tokens/frame (spatial + 1 action token) are run
+            # out-of-distribution.
+            self._init_action_token_projection(args, device)
+            if self.action_token_projection is None:
+                raise RuntimeError(
+                    "Action patches are enabled and action_conditioning_mode"
+                    "='both' requires Stream B (action-token projection) to "
+                    "be live, but ``action_token_projection`` failed to "
+                    "initialize."
+                )
+            self.action_token_projection.requires_grad_(True)
+            # Wire the wrapper to reserve seq-len for 1 action token / frame
+            # and tell the inner CausalWanModel how many action tokens it
+            # should split off per frame.
+            num_training_frames = int(
+                getattr(args, "num_training_frames", 21)
+            )
+            self.generator.model.action_tokens_per_frame = 1
+            self.generator.adjust_seq_len_for_action_tokens(
+                num_frames=num_training_frames, action_per_frame=1,
+            )
+            # Defensive: fail loud if the downstream pipeline ends up
+            # running without a matching ``action_tokens_per_frame > 0``
+            # on the inner DiT (means an upstream refactor silently
+            # dropped Stream B).
+            if int(getattr(self.generator.model, "action_tokens_per_frame", 0)) != 1:
+                raise RuntimeError(
+                    "Generator inner model has action_tokens_per_frame != 1 "
+                    "after Stream B wiring. The DiT will run at seq-len "
+                    "1560/frame instead of the 1561/frame it was trained on."
+                )
+
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        # ------------------------------------------------------------------
+        # real_score + fake_score (bidirectional WanModel).
+        #
+        # Both scorers must see the same two-stream action conditioning
+        # the generator was trained on:
+        #   - Stream A (AdaLN modulation)   via conditional_dict["_action_modulation"]
+        #   - Stream B (per-frame tokens)   via conditional_dict["_action_tokens"]
+        #
+        # Without the bidirectional action patch applied, the wrapper's
+        # forward silently drops BOTH streams — which is what was
+        # happening to ``real_score`` before this fix. Apply the patch to
+        # both, and configure ``action_tokens_per_frame = 1`` so the
+        # patched bidirectional _forward interleaves per-frame tokens at
+        # the trained 1561-tokens-per-frame layout.
+        #
+        # ``adjust_seq_len_for_action_tokens`` bumps the wrapper's
+        # ``seq_len`` upper bound to accommodate the extra per-frame
+        # token. For the scorers, seq_len MUST equal the actual
+        # ``num_frames * spatial_seqlen (+ action_tokens)`` of the input
+        # we feed them — NOT a max — because the bidirectional block's
+        # internal ``unflatten(dim=1, sizes=(num_frames, frame_seqlen))``
+        # computes ``frame_seqlen = x.shape[1] // e.shape[1]``. If we
+        # over-pad (e.g. seq_len=32781 but actually pass 12 frames),
+        # the integer division yields a garbage ``frame_seqlen`` and
+        # the unflatten asserts.
+        #
+        # In rolling-staircase DMD the scorers are called with a 4-slot
+        # batched window of exactly ``4 * num_frame_per_block`` frames
+        # (= 3 context + 1 target per slot, concatenated), so we size
+        # the scorers' ``_base_seq_len`` to that.
+        # ------------------------------------------------------------------
+        npb = int(getattr(args, "num_frame_per_block", 3))
+        # Real-score window: (real_k GT + 1 prev + 1 live) * npb frames.
+        # real_k defaults to 2 → 4 * npb (matches current 4-chunk window).
+        # Bumping to 3 or 4 widens real_score's GT context without touching
+        # fake_score (which stays at 3 ctx chunks + 1 live = 4 * npb).
+        real_k = int(getattr(args, "real_score_num_gt_chunks", 2))
+        real_scorer_num_frames = (real_k + 2) * npb
+        fake_scorer_num_frames = 4 * npb
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name, is_causal=False
+        )
+        # Override the wrapper's spatial-only ``_base_seq_len`` (default
+        # 32760 = 21 * 1560) to match the scorer's actual DMD input
+        # window. ``adjust_seq_len_for_action_tokens`` reads from
+        # ``_base_seq_len`` and adds the per-frame action token budget on
+        # top — must happen AFTER this reset.
+        self.real_score._base_seq_len = real_scorer_num_frames * 1560
+        self.real_score.seq_len = self.real_score._base_seq_len
+        if self._action_patch_enabled:
+            apply_action_patches_critic(self.real_score)
+            self.real_score.model.action_tokens_per_frame = 1
+            self.real_score.adjust_seq_len_for_action_tokens(
+                num_frames=real_scorer_num_frames, action_per_frame=1,
+            )
+            if int(getattr(self.real_score.model, "action_tokens_per_frame", 0)) != 1:
+                raise RuntimeError(
+                    "real_score inner model has action_tokens_per_frame "
+                    "!= 1 after Stream B wiring — the DiT will run at "
+                    "1560/frame instead of the trained 1561/frame."
+                )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name, is_causal=False
+        )
+        # See the matching comment on ``real_score`` above — size the
+        # fake-score wrapper's seq_len to the DMD batched window.
+        self.fake_score._base_seq_len = fake_scorer_num_frames * 1560
+        self.fake_score.seq_len = self.fake_score._base_seq_len
         if self._action_patch_enabled:
             apply_action_patches_critic(self.fake_score)
+            self.fake_score.model.action_tokens_per_frame = 1
+            self.fake_score.adjust_seq_len_for_action_tokens(
+                num_frames=fake_scorer_num_frames, action_per_frame=1,
+            )
+            if int(getattr(self.fake_score.model, "action_tokens_per_frame", 0)) != 1:
+                raise RuntimeError(
+                    "fake_score inner model has action_tokens_per_frame "
+                    "!= 1 after Stream B wiring — the DiT will run at "
+                    "1560/frame instead of the trained 1561/frame."
+                )
         self.fake_score.model.requires_grad_(True)
         self._fake_score_trainable = True
 
@@ -105,6 +241,50 @@ class BaseModel(nn.Module):
 
     def _sync_action_projection_params(self) -> None:
         module = getattr(self, "_action_projection_ref", None)
+        if module is None or not dist.is_initialized():
+            return
+        with torch.no_grad():
+            for param in module.parameters():
+                dist.broadcast(param.data, src=0)
+
+    # ------------------------------------------------------------------
+    # Stream B: per-frame action-token projection
+    # ------------------------------------------------------------------
+    def _init_action_token_projection(self, args, device) -> None:
+        """Instantiate the v14/ODE ``ActionTokenProjection`` Stream-B MLP.
+
+        Mirrors ``_init_action_projection`` but emits per-frame action
+        tokens (``[B, F, hidden_dim]``) instead of AdaLN modulation. Kept
+        outside the DDP-wrapped generator (same as ``action_projection``)
+        so its gradients must be manually all-reduced by the trainer.
+        """
+        if not self._action_patch_enabled:
+            self._set_action_token_projection(None)
+            return
+        action_dim = int(
+            getattr(args, "raw_action_dim", getattr(args, "action_dim", 2))
+        )
+        activation = getattr(args, "action_modulation_activation", None)
+        model_dim = getattr(self.generator.model, "dim", 2048)
+        dtype = torch.bfloat16 if args.mixed_precision else torch.float32
+        module = ActionTokenProjection(
+            action_dim=action_dim,
+            activation=activation,
+            hidden_dim=model_dim,
+            zero_init=True,
+        ).to(device=device, dtype=dtype)
+        self._set_action_token_projection(module)
+        self._sync_action_token_projection_params()
+
+    @property
+    def action_token_projection(self) -> Optional[nn.Module]:
+        return getattr(self, "_action_token_projection_ref", None)
+
+    def _set_action_token_projection(self, module: Optional[nn.Module]) -> None:
+        object.__setattr__(self, "_action_token_projection_ref", module)
+
+    def _sync_action_token_projection_params(self) -> None:
+        module = getattr(self, "_action_token_projection_ref", None)
         if module is None or not dist.is_initialized():
             return
         with torch.no_grad():

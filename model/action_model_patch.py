@@ -18,13 +18,28 @@ upstream implementation.
 
 from __future__ import annotations
 
+import math
 import types
 from functools import wraps
+
+import torch
 
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
 except Exception:  # pragma: no cover
     FSDP = None
+
+# Re-use the causal model's interleaved-token helpers so the bidirectional
+# scorers expose the exact same per-frame layout (spatial_0..spatial_{HW-1},
+# action_0..action_{a-1}) that the causal-trained weights were fine-tuned
+# against. Any divergence here feeds the scorers an out-of-distribution
+# sequence layout and silently degrades the DMD signal.
+from wan.modules.causal_model import (
+    _separate_action_tokens,
+    _merge_action_tokens,
+)
+from wan.modules.attention import flash_attention
+from wan.modules.model import rope_apply, sinusoidal_embedding_1d
 
 def _patch_time_projection(model):
     if getattr(model, "_action_tp_patched", False):
@@ -120,14 +135,284 @@ def patch_causal_wan_model_for_action(model):
     return model
 
 
+def _patch_bidirectional_self_attn_for_action(attn) -> None:
+    """Monkey-patch a bidirectional ``WanSelfAttention`` so it respects an
+    ``action_tokens_per_frame`` instance attribute during RoPE.
+
+    When ``action_tokens_per_frame > 0`` the block sees a per-frame
+    interleaved layout
+        [spatial_0 … spatial_{H*W-1}, action_0 … action_{a-1}]
+    (same layout the causal DiT's self-attn uses). RoPE must be applied to
+    spatial tokens only; the action slots are held out, RoPE'd-not, and
+    merged back so attention operates over the full sequence. Otherwise
+    RoPE would index action slots as if they were spatial positions, which
+    silently corrupts the attention pattern the causal weights were
+    trained with.
+
+    When ``action_tokens_per_frame == 0`` the patch falls through to the
+    original forward — bit-identical to upstream.
+    """
+    if getattr(attn, "_action_attn_patched", False):
+        return
+    if not hasattr(attn, "action_tokens_per_frame"):
+        attn.action_tokens_per_frame = 0
+
+    orig_forward = attn.forward
+
+    def forward_with_action(self_attn, x, seq_lens, grid_sizes, freqs):
+        a_per_f = int(getattr(self_attn, "action_tokens_per_frame", 0))
+        if a_per_f == 0:
+            return orig_forward(x, seq_lens, grid_sizes, freqs)
+
+        b, s = x.shape[0], x.shape[1]
+        n, d = self_attn.num_heads, self_attn.head_dim
+
+        q = self_attn.norm_q(self_attn.q(x)).view(b, s, n, d)
+        k = self_attn.norm_k(self_attn.k(x)).view(b, s, n, d)
+        v = self_attn.v(x).view(b, s, n, d)
+
+        # Strip padding for the RoPE step: _separate_action_tokens assumes
+        # seq = F * (H*W + a_per_f). `s` here may be ≥ that (padded to
+        # ``seq_len`` in the outer _forward).
+        f, h, w = grid_sizes[0].tolist()
+        frame_seq = h * w + a_per_f
+        valid_len = int(f) * frame_seq
+        if valid_len > s:
+            raise RuntimeError(
+                f"Bidirectional self_attn: interleaved valid_len={valid_len} "
+                f"exceeds padded seq length {s}. The outer _forward pad "
+                f"target is too small; bump seq_len or reduce F."
+            )
+
+        q_valid, q_tail = q[:, :valid_len], q[:, valid_len:]
+        k_valid, k_tail = k[:, :valid_len], k[:, valid_len:]
+
+        q_sp, q_act = _separate_action_tokens(q_valid, grid_sizes, a_per_f)
+        k_sp, k_act = _separate_action_tokens(k_valid, grid_sizes, a_per_f)
+
+        rq_sp = rope_apply(q_sp, grid_sizes, freqs)
+        rk_sp = rope_apply(k_sp, grid_sizes, freqs)
+
+        rq_valid = _merge_action_tokens(rq_sp, q_act, grid_sizes, a_per_f)
+        rk_valid = _merge_action_tokens(rk_sp, k_act, grid_sizes, a_per_f)
+
+        if q_tail.shape[1] > 0:
+            rq = torch.cat([rq_valid, q_tail], dim=1)
+            rk = torch.cat([rk_valid, k_tail], dim=1)
+        else:
+            rq, rk = rq_valid, rk_valid
+
+        x_out = flash_attention(
+            q=rq.type_as(v),
+            k=rk.type_as(v),
+            v=v,
+            k_lens=seq_lens,
+            window_size=self_attn.window_size,
+        )
+        x_out = x_out.flatten(2)
+        x_out = self_attn.o(x_out)
+        return x_out
+
+    attn.forward = types.MethodType(forward_with_action, attn)
+    attn._action_attn_patched = True
+
+
+def _bidir_forward_with_action_tokens(
+    self,
+    x,
+    t,
+    context,
+    seq_len,
+    action_tokens,
+    clip_fea=None,
+    y=None,
+):
+    """Replacement ``_forward`` body for the bidirectional WanModel that
+    interleaves Stream-B action tokens per frame before the transformer
+    blocks and strips them before ``head + unpatchify``.
+
+    Mirrors ``CausalWanModel._forward_inference`` lines 1116-1256 but
+    without KV-cache / probe tap machinery; the bidirectional scorers
+    only need the forward pass to (a) consume the action-conditioned
+    per-frame layout the causal weights were trained on and (b) return
+    spatial-only x0 predictions.
+
+    classify_mode / regress_mode are intentionally unsupported here —
+    those code paths power the GAN critic heads and Phase-1 rolling-
+    staircase DMD has the GAN disabled. If re-enabled they need their
+    own action-token handling.
+    """
+    if self.model_type == "i2v":
+        assert clip_fea is not None and y is not None
+
+    a_per_f = int(getattr(self, "action_tokens_per_frame", 0))
+    if a_per_f <= 0:
+        raise RuntimeError(
+            "_bidir_forward_with_action_tokens called with "
+            "action_tokens_per_frame <= 0; the dispatch in "
+            "_forward_with_action should have fallen through to orig_fwd."
+        )
+    if action_tokens is None:
+        raise RuntimeError(
+            "_bidir_forward_with_action_tokens called with "
+            "action_tokens=None; Stream B is advertised by "
+            "action_tokens_per_frame > 0 but no tokens were provided."
+        )
+
+    device = self.patch_embedding.weight.device
+    if self.freqs.device != device:
+        self.freqs = self.freqs.to(device)
+
+    if y is not None:
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+    # Patch embedding.
+    x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+    grid_sizes = torch.stack(
+        [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
+    )
+    x = [u.flatten(2).transpose(1, 2) for u in x]  # list of [1, F*H*W, C]
+
+    # Interleave action tokens per frame.
+    spatial_seqlen = int(math.prod(grid_sizes[0][1:]).item())
+    num_frames_local = int(grid_sizes[0, 0].item())
+    expected_at_frames = action_tokens.shape[1]
+    if expected_at_frames != num_frames_local:
+        raise RuntimeError(
+            f"action_tokens has {expected_at_frames} frames but spatial "
+            f"patch grid has {num_frames_local}; they must match."
+        )
+    x_interleaved = []
+    for batch_idx, u in enumerate(x):
+        u = u[:, : num_frames_local * spatial_seqlen].unflatten(
+            1, (num_frames_local, spatial_seqlen)
+        )
+        at = action_tokens[batch_idx : batch_idx + 1].unsqueeze(2).to(
+            dtype=u.dtype, device=u.device
+        )
+        u = torch.cat([u, at], dim=2).flatten(1, 2)
+        x_interleaved.append(u)
+    x = x_interleaved
+
+    seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+    # Extend pad target to fit the interleaved sequence (caller's seq_len
+    # tracks the spatial-only capacity).
+    pad_target = seq_len + num_frames_local * a_per_f
+    if int(seq_lens.max().item()) > pad_target:
+        raise RuntimeError(
+            f"interleaved seq_lens.max()={int(seq_lens.max().item())} "
+            f"exceeds pad_target={pad_target} (seq_len={seq_len} + "
+            f"F*a_per_f={num_frames_local * a_per_f})"
+        )
+    x = torch.cat(
+        [
+            torch.cat(
+                [u, u.new_zeros(1, pad_target - u.size(1), u.size(2))],
+                dim=1,
+            )
+            for u in x
+        ]
+    )
+
+    # Time embedding (identical to upstream _forward).
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x)
+    )
+    e0 = (
+        self.time_projection(e)
+        .unflatten(1, (6, self.dim))
+        .unflatten(dim=0, sizes=t.shape)
+    )
+
+    # Context (identical to upstream _forward).
+    context_lens = None
+    context = self.text_embedding(
+        torch.stack(
+            [
+                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]
+        )
+    )
+    if clip_fea is not None:
+        context_clip = self.img_emb(clip_fea)
+        context = torch.concat([context_clip, context], dim=1)
+
+    # Propagate a_per_f to each block's self_attn (blocks were patched at
+    # model-patch time; attribute needs refresh per forward because a_per_f
+    # may change between forwards of the same model instance).
+    for block in self.blocks:
+        block.self_attn.action_tokens_per_frame = a_per_f
+
+    block_kwargs = dict(
+        e=e0,
+        seq_lens=seq_lens,
+        grid_sizes=grid_sizes,
+        freqs=self.freqs,
+        context=context,
+        context_lens=context_lens,
+    )
+
+    def create_custom_forward(module):
+        def custom_forward(*inputs, **kw):
+            return module(*inputs, **kw)
+
+        return custom_forward
+
+    for block in self.blocks:
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(block),
+                x,
+                **block_kwargs,
+                use_reentrant=False,
+            )
+        else:
+            x = block(x, **block_kwargs)
+
+    # Strip action tokens before head + unpatchify.
+    frame_seqlen = spatial_seqlen + a_per_f
+    valid_len = num_frames_local * frame_seqlen
+    x = x[:, :valid_len].unflatten(1, (num_frames_local, frame_seqlen))
+    x = x[:, :, :spatial_seqlen].flatten(1, 2)
+
+    # Head with per-frame modulation (mirrors CausalHead.forward).
+    # Upstream's bidir ``Head.forward`` assumes ``e`` is ``[B, C]`` (scalar
+    # t per sample). When we pass per-frame ``t`` (e.g. DMD's
+    # ``[ctx_t=0, ..., target_t]``), ``e`` comes out as ``[B*F, C]`` and
+    # the default Head broadcasts a full-batch vector against a
+    # per-sample x — mis-shaped. Reproduce the causal head math here.
+    head_mod = getattr(self.head, "modulation")
+    head_norm = getattr(self.head, "norm")
+    head_lin = getattr(self.head, "head")
+    e_per_frame = e.unflatten(dim=0, sizes=t.shape)  # [B, F, C]
+    mod = head_mod.unsqueeze(1) + e_per_frame.unsqueeze(2)  # [B, F, 2, C]
+    mod_shift, mod_scale = mod.chunk(2, dim=2)  # each [B, F, 1, C]
+    x_framed = head_norm(x).unflatten(
+        dim=1, sizes=(num_frames_local, spatial_seqlen)
+    )  # [B, F, L1, C]
+    x_framed = x_framed * (1 + mod_scale) + mod_shift
+    x = head_lin(x_framed.flatten(1, 2))
+    x = self.unpatchify(x, grid_sizes)
+    return torch.stack(x)
+
+
 def patch_bidirectional_wan_model_for_action(model):
-    """Patch Wan's bidirectional model to support external action modulation."""
+    """Patch Wan's bidirectional model to support external action modulation
+    (Stream A, AdaLN) and per-frame action tokens (Stream B)."""
     if getattr(model, "_action_bidir_patched", False):
         return model
 
     _patch_time_projection(model)
     if not hasattr(model, "_forward"):
         raise AttributeError("Bidirectional Wan model is expected to define `_forward`.")
+
+    # Stream B attributes: default to 0 (no action tokens) so an un-wired
+    # forward is bit-identical to upstream.
+    if not hasattr(model, "action_tokens_per_frame"):
+        model.action_tokens_per_frame = 0
+    for block in model.blocks:
+        _patch_bidirectional_self_attn_for_action(block.self_attn)
 
     orig_fwd = model._forward
 
@@ -140,10 +425,51 @@ def patch_bidirectional_wan_model_for_action(model):
         seq_len,
         *args,
         action_modulation=None,
+        action_tokens=None,
         **kwargs,
     ):
         self._action_modulation = action_modulation
+
+        # Stream B dispatch: when the model is configured for action tokens
+        # AND a tensor was provided, route through the replacement forward
+        # that knows to interleave/strip. Otherwise fall through to orig.
+        #
+        # Fail loud on the misconfiguration "a_per_f > 0 but no tokens"
+        # because running orig_fwd in that state would silently feed the
+        # DiT a seq-len-1560-per-frame input while its weights expect
+        # 1561 tokens/frame — precisely the out-of-distribution case we
+        # explicitly refused for the generator.
+        a_per_f = int(getattr(self, "action_tokens_per_frame", 0))
+        if a_per_f > 0 and action_tokens is None:
+            raise RuntimeError(
+                "Bidirectional WanModel has action_tokens_per_frame="
+                f"{a_per_f} but no action_tokens were provided. The DiT "
+                "weights were trained with Stream B active; running with "
+                "Stream A only is out-of-distribution."
+            )
+
         try:
+            if a_per_f > 0 and action_tokens is not None:
+                # classify_mode / regress_mode don't support Stream B yet.
+                if kwargs.get("classify_mode", False) or kwargs.get(
+                    "regress_mode", False
+                ):
+                    raise RuntimeError(
+                        "classify_mode / regress_mode are not supported "
+                        "alongside Stream B. Disable GAN or drop Stream B "
+                        "for the critic head forward."
+                    )
+                # Route the small subset of relevant kwargs through.
+                return _bidir_forward_with_action_tokens(
+                    self,
+                    x,
+                    t,
+                    context,
+                    seq_len,
+                    action_tokens,
+                    clip_fea=kwargs.get("clip_fea"),
+                    y=kwargs.get("y"),
+                )
             return orig_fwd(x, t, context, seq_len, *args, **kwargs)
         finally:
             self._action_modulation = None

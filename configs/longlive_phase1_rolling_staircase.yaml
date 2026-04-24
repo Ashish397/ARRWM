@@ -1,0 +1,489 @@
+# Phase-1 Rolling-Staircase DMD config.
+#
+# Trains the ODE-distilled student with a rolling 4-slot staircase denoiser
+# (one action per step, slot-wise action decay, bidir self-attention within
+# the live window) under a DMD loss against the pre-ODE v14 teacher.
+# Fake-score updates ARE enabled in this remit (1:1 with generator), via
+# "Option A — shared forward" (fake_score's forward on the student chunk
+# is shared between the DMD gradient-surrogate and the fake-score's own
+# denoise loss). GAN is DROPPED this remit (gan_loss_weight=0).
+
+config_name: phase1-rolling-staircase
+run_name: phase1_rolling_staircase
+
+seed: 0
+mixed_precision: true
+log_interval: 2
+checkpoint_interval: 500
+vis_interval: 0
+max_steps: 10000
+max_grad_norm: 1.0
+auto_resume: true
+
+# W&B
+wandb_project: longlive-phase1
+wandb_dir: ./wandb
+disable_wandb: false
+
+log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
+
+# ---------------------------------------------------------------------------
+# Data (from configs/causal_lora_diffusion_teacher_v14.yaml)
+# ---------------------------------------------------------------------------
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
+caption_root: /projects/u6ex/fbots/frodobots_captions/train
+motion_root: /projects/u6ex/fbots/frodobots_motion
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+# Only use z2 (turn) and z7 (fwd/back) from the 8-D motion-z signal, matching
+# v14 action conditioning (action_dims: [2, 7]).
+action_dims: [2, 7]
+raw_action_dim: 2
+action_dim: 2
+enable_adaln_zero: true
+action_conditioning_mode: both
+
+# Minimum ride length in LATENT frames. Short rides spend most of their
+# wall-clock on priming + the 4-pass warmup (9 prime frames + 4 fill
+# passes) and only produce a handful of steady-state rolling steps
+# before exhausting, so the DDP lockstep keeps refilling and the slot
+# overhead dominates useful work. Bump to 160 so every ride contributes
+# a meaningful number of rolling steps (~50+ after warmup) before the
+# batcher has to reload.
+min_ride_frames: 160
+max_rides: null
+max_ride_frames: null   # roll to natural end of each ride (no cap).
+
+# Ride order across the training iter. "asc" = shortest first (curriculum
+# warm-up: small rides exercise every stage quickly and expose bugs on easy
+# data before we spend hours on long ones); "desc" = longest first; null or
+# "none" = glob-sorted path order with shuffled DistributedSampler (v14
+# default). When "asc"/"desc" is set, the sampler runs with shuffle=False
+# so the sorted order survives the epoch pass.
+sort_rides_by_length: asc
+
+num_workers: 2
+
+# ---------------------------------------------------------------------------
+# Rolling-staircase geometry (plan-locked)
+# ---------------------------------------------------------------------------
+# Convention: t=0 = clean, t=1000 = noise.
+#
+# Live-window topology:
+#   num_live_slots    : how many chunks sit in the live window (2 or 4).
+#   passes_per_step   : internal denoising passes per rolling step (1 or 2).
+#   Total ODE step budget per committed chunk = num_live_slots * passes_per_step.
+#
+# Supported configurations:
+#   - 4 x 1 (default): 4 slots, 1 pass/step. Ladder = [250, 500, 750, 1000].
+#                      Action decay = [1.0, 0.75, 0.5, 0.25].
+#                      DMD scorer batch up to NS=4 per rolling step.
+#   - 2 x 2         : 2 slots, 2 passes/step. Ladder = [500, 1000]
+#                      (pass-0 input; pass-1 input is derived as [250, 750]).
+#                      Action decay = [1.0, 0.5]. DMD grad attaches to ONE
+#                      randomly-chosen pass per rolling step (the other pass
+#                      runs under no_grad); scorer batch still up to NS=2.
+#
+# `denoising_step_list` is the pass-0 INPUT ladder (slot 0 .. slot NS-1).
+# The pipeline sorts it ascending and cross-checks against the topology.
+num_live_slots: 4
+passes_per_step: 1
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+
+num_frame_per_block: 3
+prime_kv_frames: 9
+# Decoupled KV-cache knobs:
+#   - kv_committed_max_frames = hard cap on the committed region of the KV
+#     cache. Enforced by pipeline-side FIFO trim after every slot-0 commit.
+#     9 frames = 3 chunks = LongLive parity.
+#   - kv_frames_total = physical buffer size (in frames). Must be big enough
+#     to hold committed + live scratch (= 9 + 12 = 21) during the live
+#     forward's temp_k construction.
+#   - local_attn_size = per-query attention reach in frames. Set to 21 so
+#     every live frame attends to all 9 committed past frames AND every
+#     other live frame (fully symmetric bidirectional attention inside the
+#     live window, causal-to-past for the committed region).
+kv_committed_max_frames: 9
+kv_frames_total: 21
+local_attn_size: 21
+
+# Per-slot action decay ladder. Length must match num_live_slots. Applied
+# identically across warmup passes and steady-state steps. The action INDEX
+# slides with the pass/step counter: at step k, slot s receives
+# decay[s] * gt_actions[current_start_frame + s*npb : ... + (s+1)*npb].
+# 4-slot default: [1.0, 0.75, 0.5, 0.25]. 2-slot: [1.0, 0.5].
+action_decay_per_slot: [1.0, 0.75, 0.5, 0.25]
+
+# Real-score left-context width. S_n^real = [GT_{n-k-1}, ..., GT_{n-2},
+# prev_{n-1}, live_n]. Default 2 matches original phase-1 behavior (4-chunk
+# real window). Bumping to 3 or 4 widens the GT history visible to the real
+# score without touching fake_score (which keeps its 3-chunk student-rolled
+# context). Max value bounded by `action_base_frame_idx >= (k+1)*npb` at
+# first rolling step (= 21 in steady state → k<=6).
+real_score_num_gt_chunks: 2
+
+# DMD scorer-batch subsetting. Generator still runs the full NS-slot
+# staircase unconditionally; this knob only limits which slots get
+# forwarded through real_score + fake_score. Savings scale ~linearly
+# with len(active).
+#   "all"        → score all NS slots (default, full DMD signal)
+#   "slot0"      → score only slot 0 (anchored to real ride prior)
+#   "random"     → sample `dmd_num_active_slots` slots per step (slot 0
+#                  is ALWAYS included for ladder grounding; the
+#                  remaining dmd_num_active_slots-1 are drawn uniformly
+#                  from {1..NS-1}). With dmd_num_active_slots=1 this
+#                  degenerates to [0] — use "random_any" for a truly
+#                  uniform single-slot pick.
+#   "random_any" → uniformly pick `dmd_num_active_slots` slots per step
+#                  from {0..NS-1} with NO slot-0 anchoring. Use this
+#                  for ablations where slot 0 should be picked only
+#                  1/NS of the time. DDP-synced (rank 0 rolls, broadcasts).
+# Overall iter time with policy="slot0" should drop by ~60% of the DMD
+# block (≈42% of total step time at real_k=2 on H100).
+dmd_active_slot_policy: all
+dmd_num_active_slots: 4  # used only when policy in {"random", "random_any"}
+
+# Steady-state rolling: stop at natural end-of-ride (trainer handles).
+# Only used in the legacy single-ride-per-iter path (slots_per_rank=1 AND
+# rolling_steps_per_iter=null).
+max_rolling_steps: null
+# aux_loss_weight used to down-weight slots != 0 in the legacy "slot 0 +
+# random aux" DMD scheme. Phase-1 now defaults to batched-S_n scoring
+# with gradients on ALL NS slots and a single DMD loss per rolling step,
+# so this multiplier no longer gates DMD — it only scales the per-slot
+# GAN and action_critic aux terms (both currently zero-weight or
+# slot-0-gated respectively, so at 1.0 this is effectively a no-op in
+# the default Phase-1 config). Keep at 1.0 to treat every slot's
+# supervision equally.
+aux_loss_weight: 1.0
+
+# ---------------------------------------------------------------------------
+# Multi-slot lockstep batching (Option 2)
+# ---------------------------------------------------------------------------
+# When either of these is set to a non-default value, the trainer switches
+# from one-ride-per-iter to a per-slot independent-ride batcher modelled on
+# model.causal_teacher_streaming.LockstepRideBatcher, but with the
+# "window" unit being ONE ROLLING STEP instead of a fixed frame count.
+#
+# slots_per_rank: how many independent rides each DDP rank carries
+#   simultaneously. Each slot has its own full pipeline state (KV cache,
+#   crossattn cache, live window, counters) so long-horizon context
+#   accumulates within each ride identically to the single-ride trainer.
+#   Memory cost per slot ~= 2.6 GB bf16 for the 30-block / 21-frame /
+#   12-head / 128-headdim CausalWan cache. 4 slots ~= 11 GB/rank on top
+#   of the ~30-40 GB for the three model copies. Drop to 2 on 40 GB GPUs.
+#
+# rolling_steps_per_iter: how many rolling-step forwards each slot
+#   performs per optimizer step. Total backwards per iter per rank
+#   = slots_per_rank * rolling_steps_per_iter. All but the last are
+#   wrapped in DDP `no_sync()`, so exactly ONE all-reduce fires per
+#   optimizer step regardless of this knob.
+#
+#   Larger -> fewer all-reduces per wall-second but more wasted ride
+#   tail per refill (up to rolling_steps_per_iter-1 steps per ride).
+#   16 is a reasonable default for 100-400 step rides (<=10% waste).
+#
+# Set slots_per_rank=1 and rolling_steps_per_iter=null to fall back to
+# the original one-ride-per-iter path (bit-identical to before).
+slots_per_rank: 4
+rolling_steps_per_iter: 16
+
+# ---------------------------------------------------------------------------
+# DDP correctness guards
+# ---------------------------------------------------------------------------
+# The multi-slot trainer accumulates gradients across many rolling-step
+# backwards under `no_sync()`, then fires ONE all-reduce on the final
+# backward. This is correct only if every rank backprops the SAME set
+# of parameters across the iter. Two guards:
+#
+#   debug_find_unused_parameters: dev-only flag. When True, DDP is
+#     initialized with find_unused_parameters=True, which walks the
+#     autograd graph on every backward and errors on any mismatched
+#     parameter touches across ranks. Run for ~10 iters on a real
+#     dataset, confirm it's clean, then flip back to False for
+#     production throughput.
+#
+#   assert_grad_uniformity: always-on runtime check. Before every
+#     optimizer.step, each rank counts its trainable params with
+#     non-None .grad and all-reduces MIN/MAX across ranks. If they
+#     mismatch -> raise. One extra int-allreduce per iter; negligible
+#     cost; catches silent divergence.
+debug_find_unused_parameters: false
+assert_grad_uniformity: true
+
+# NCCL watchdog timeout (minutes). PyTorch's default is 10 minutes, which
+# trips when rank 0 blocks for a long VAE-decode / wandb-upload during the
+# visualization flush. Bump to 60 min so a slow flush doesn't bring the
+# whole job down. Cost is purely the max-wait-on-stuck-rank bound; healthy
+# all-reduces return in milliseconds regardless.
+nccl_timeout_minutes: 60
+
+# ---------------------------------------------------------------------------
+# Multi-slot visualization (rank 0, ride_slot 0)
+# ---------------------------------------------------------------------------
+# Every `vis_wallclock_seconds` seconds, rank 0 logs a wandb Video panel
+# containing the last `vis_num_chunks` slot-0 committed chunks from
+# ride_slot 0, with per-frame overlay labels showing the source ride
+# and the chunk index within that ride. Buffer crosses ride boundaries
+# naturally: if the ride refilled mid-buffer, labels will reflect each.
+# Set vis_wallclock_seconds <= 0 to disable visualization entirely.
+#
+# `vis_to_wandb` (default true): route clips to wandb as `vis/slot0`
+#   Video panels. The raw mp4 lives only in the wandb artifact cache;
+#   nothing is written to the run's log_dir/vis directory.
+# `vis_save_local` (default: !vis_to_wandb): when true, also write
+#   mp4s to `log_dir/vis/step_*_slot0.mp4` (and a .pt fallback if no
+#   video encoder is installed).
+vis_wallclock_seconds: 1800   # 30 minutes
+vis_num_chunks: 10
+vis_fps: 8
+vis_to_wandb: true
+vis_save_local: false
+# When true, prime the vis timer so the very first non-empty flush fires
+# immediately — you get a "step-0" video within a few rolling steps of
+# train start instead of waiting one full `vis_wallclock_seconds`.
+# Subsequent flushes still respect the 30-minute cadence.
+vis_emit_on_first_step: true
+
+# ---------------------------------------------------------------------------
+# Model (generator + real_score + fake_score)
+# ---------------------------------------------------------------------------
+distribution_loss: dmd2b2blam_staircase
+model_name: Wan2.1-T2V-1.3B
+real_model_name: Wan2.1-T2V-1.3B
+fake_model_name: Wan2.1-T2V-1.3B
+num_training_frames: 21
+num_train_timestep: 1000
+denoising_loss_type: flow
+gradient_checkpointing: true
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 21
+  sink_size: 0
+
+i2v: false
+text_pre_encoded: true
+
+# ODE-init student (generator + fake-score mirror source).
+ode_generator_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/action_ode_distill_E/action_ode_step0001000.pt
+
+# v14 teacher for real_score (base Wan + v14 LoRA merged at load time).
+v14_teacher_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_balanced_weunz/causal_lora_step0006600.pt
+v14_lora:
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+
+# Action patch hooks on the generator (must match the ODE checkpoint's action
+# apparatus for the merged action_projection weights to make sense).
+action_patch_enabled: true
+action_modulation_activation: silu
+
+# ---------------------------------------------------------------------------
+# Auxiliary action-supervision heads (ODE-distilled, frozen in Phase 1)
+# ---------------------------------------------------------------------------
+# The v14 teacher + ODE student both carry an `action_critic` (chunkwise
+# 3D-conv critic that predicts ss_vae-z from pred_x0) and a `state_probe`
+# (cross-attention probe tapped at 6 transformer depths that predicts
+# z from intermediate hidden features). Phase 1 RE-USES both as frozen
+# auxiliary losses on top of DMD:
+#
+#   * `action_critic`: frozen; gradient through pred_x0 regresses the
+#     critic's action-dim readout toward the commanded action. Adds an
+#     explicit "the generated chunk must be *readable* as the commanded
+#     action" signal alongside DMD, which otherwise only cares about
+#     distribution matching.
+#   * `state_probe`: frozen; gradient through tapped activations (collected
+#     during the single cached forward per rolling step — no second
+#     generator forward needed) regresses the probe's action-dim readout
+#     toward the commanded action, pinning hidden-state action-readability.
+#
+# Both loads are non-strict so a mismatched-architecture checkpoint falls
+# back gracefully (logged) instead of crashing the run. Set either
+# `*_aux_enabled: false` or the corresponding `*_loss_weight: 0.0` to
+# disable that head; disabling skips instantiation entirely so the ckpt's
+# entry for that head is ignored at load time.
+#
+# Automatic off-switch: when `action_teacher_mode=off`, BOTH aux heads
+# are force-disabled at build time (with a warning log), even if the
+# two `*_aux_enabled` flags below are true. Rationale: without the
+# teacher-z target from the motion pipeline (VAE → CoTracker → ss_vae),
+# the critic/probe silently fall back to regressing against the
+# commanded action, which is not a valid standalone supervision signal.
+# If you want these losses, keep `action_teacher_mode` at `slot0`
+# or `all`.
+# ---------------------------------------------------------------------------
+# Auxiliary-head slot policy.
+#
+# Governs which slots the action_critic + state_probe + motion-teacher
+# losses supervise. Historically pinned to slot 0 because slots
+# 1..NS-1 receive DECAYED commanded actions (e.g. 0.75/0.5/0.25 x a_t
+# in 4x1, or 0.5 x a_t in 2x2) — regressing the critic/probe against
+# those via the commanded-action fallback biases the student toward
+# muted motion.
+#
+# The teacher-z branch (enabled via `action_teacher_mode != "off"`) does
+# NOT suffer that bias: targets are computed per-slot from pixels via
+# VAE → CoTracker3 → ss_vae. So when the teacher is active, the aux
+# heads can safely follow the random-chooser's picked slot(s).
+#
+# Options:
+#   "slot0"     → always supervise slot 0 only. Default. Safe with or
+#                 without teacher. Matches historical Phase-1 behavior.
+#   "match_dmd" → follow the DMD scorer's active slot set (governed by
+#                 `dmd_active_slot_policy`). E.g. with
+#                 `dmd_active_slot_policy=random` and
+#                 `dmd_num_active_slots=1` the aux heads supervise
+#                 exactly the one random slot DMD picked this step.
+#                 When DMD scores all NS slots ("all"), aux runs on
+#                 all grad slots.
+#   "random"    → independently pick one random slot per rolling step
+#                 from the grad-slot set (DDP-synced). Use this when
+#                 you want aux rotation but full DMD coverage.
+#
+# All policies intersect with the grad-slot set so every aux loss has
+# a live autograd path.
+#
+# HARD OVERRIDE: when ``action_teacher_mode=slot0``, this setting is
+# IGNORED and aux is pinned to slot 0. Only ``action_teacher_mode=all``
+# lets ``aux_loss_slot_policy`` take effect for match_dmd / random.
+aux_loss_slot_policy: slot0
+
+action_critic_aux_enabled: true
+action_critic_loss_weight: 0.25
+action_critic_z_out_dim: 8
+action_critic_base_channels: 128
+action_critic_num_blocks: 4
+
+state_probe_aux_enabled: true
+state_probe_loss_weight: 0.1
+state_head_out_dim: 8
+state_probe_dim: 256
+state_probe_num_heads: 8
+state_probe_n_taps: 6
+state_head_action_dim_weight: 3.0
+
+# Action teacher (CoTracker-3 offline + ss_vae encoder).
+#
+# Three-option enum (``action_teacher_mode``) — this is the SINGLE
+# source of truth for whether the action teacher is built:
+#   "off"   → teacher not built. The DMD model auto-disables the
+#             action_critic and state_probe aux heads (commanded-action
+#             fallback is NOT a valid standalone signal).
+#   "slot0" → teacher built. VAE+CoTracker run on the full live
+#             window (they need the context for tracking quality),
+#             but aux losses are HARD-PINNED to slot 0 regardless of
+#             ``aux_loss_slot_policy``. Rationale: slots 1..NS-1
+#             receive DECAYED commanded actions (e.g. 0.75/0.5/0.25x
+#             in 4x1, or 0.5x in 2x2) which aren't a clean target;
+#             the teacher-z for those slots isn't trustworthy as a
+#             supervision anchor.
+#   "all"   → teacher built, running on the full live window. ALL
+#             NS slots produce teacher-z vectors and aux supervision
+#             follows ``aux_loss_slot_policy`` (slot0 / match_dmd /
+#             random). Use this when you want the critic/probe to
+#             guide every live slot.
+#
+# Cost: ~200 ms/rolling step on a single H100 (VAE decode + CoTracker
+# forward + ss_vae encoder) for both "slot0" and "all" — CoTracker
+# needs the full window either way. Over a 200-step ride this is
+# ~40 s of extra wall-clock. Flip to "off" when throughput matters
+# more than action-apparatus training.
+#
+# YAML trap: OmegaConf's dotlist override path uses YAML 1.1, which
+# coerces the barewords ``off / no / n / false`` to ``False`` and
+# ``on / yes / y / true`` to ``True``. A command-line override like
+# ``action_teacher_mode=off`` therefore silently becomes the boolean
+# ``False``. As a safety net, ``utils/action_teacher.py::
+# resolve_action_teacher_mode`` accepts booleans and coerces
+# ``True → "slot0"``, ``False → "off"`` (with a WARNING log so the
+# sbatch author notices). To avoid the warning either quote the
+# override (``action_teacher_mode='"off"'``) or stick to
+# ``slot0`` / ``all`` / ``off`` with ``off`` written as string.
+action_teacher_mode: slot0
+
+# Optional: load CoTracker3-offline from a local ``scaled_offline.pth``
+# checkpoint instead of ``torch.hub.load("facebookresearch/co-tracker",
+# ...)``. When both are set AND exist, the trainer does:
+#   sys.path.append(cotracker_source_dir)
+#   from cotracker.predictor import CoTrackerPredictor
+#   CoTrackerPredictor(checkpoint=cotracker_checkpoint_path,
+#                      window_len=60, v2=False).to(device)
+# This matches v14's setup (no network call; uses the cached repo +
+# weights that ship in the cluster's torch-hub cache). When either path
+# is missing the trainer falls back to ``torch.hub.load(...)`` which
+# resolves from the torch-hub cache at ``${TORCH_HOME}/hub`` (default
+# ``~/.cache/torch/hub``).
+cotracker_source_dir: /home/u6ex/as1748.u6ex/.cache/torch/hub/facebookresearch_co-tracker_main
+cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/scaled_offline.pth
+
+# ---------------------------------------------------------------------------
+# DMD + GAN loss weights (LAM/CFG/action-sep + generator-MSE removed).
+# ---------------------------------------------------------------------------
+dmd_loss_weight: 1.0
+real_guidance_scale: 1.0
+fake_guidance_scale: 0.0
+timestep_shift: 5.0
+ts_schedule: true
+ts_schedule_max: false
+min_score_timestep: 0
+
+# GAN (DROPPED this remit — Phase-1 runs pure DMD + aux + fake-score
+# training, no clean-image GAN). All GAN-related weights / switches are
+# zeroed so the code paths gate off and no GAN tensor is constructed.
+# Knobs are retained (not deleted) because we may reintroduce the GAN
+# head later in this or a subsequent phase.
+gan_loss_weight: 0.0
+guidance_cls_loss_weight: 0.0
+diffusion_gan: false
+diffusion_gan_max_timestep: 1000
+concat_time_embeddings: false
+cls_on_clean_image: false
+adaptive_d_weight: false
+gan_type: relative
+
+# Fake-score updates: ENABLED this remit, stepped 1:1 with the generator.
+# Wired via "Option A — shared forward": the fake_score runs a SINGLE
+# forward on the student's pred_x0 slice that (a) produces the detached
+# fake-score velocity used in the DMD gradient-surrogate and (b) produces
+# the same velocity with gradients for the fake_score's own denoise MSE
+# loss. See model.dmd2b2blam_staircase._dmd_loss_batched_sn.
+fake_score_updates_enabled: true
+dfake_gen_update_ratio: 1
+
+# ---------------------------------------------------------------------------
+# Optimizer (generator + fake_score; separate AdamW each)
+# ---------------------------------------------------------------------------
+lr: 1.0e-05
+betas: [0.9, 0.999]
+eps: 1.0e-08
+weight_decay: 0.0
+# action_projection is ON the BaseModel but OUTSIDE the DDP wrapper around
+# the DiT. We're training it in Phase 1 because its content isn't perfectly
+# separated from the base DiT's video-content path — freezing the
+# projection means the only action signal reaching the DiT is the
+# zero-inited adaLN-zero modulation, which can silently decay as the DMD
+# loss drifts the DiT. Train it alongside the DiT and manually all-reduce
+# its grads each step (see trainer._all_reduce_extra_trainable_grads).
+# Flip back to `false` if it causes DMD instability (e.g. action_projection
+# norms blow up) — the rest of the action apparatus (critic / probe) will
+# still keep supervising action fidelity.
+train_action_projection: true
+# Stream B (per-frame action tokens). Paired with `action_projection` —
+# the two-stream action conditioning is calibrated jointly during ODE
+# distillation, so freezing one while training the other introduces a
+# drift between them as the DiT shifts under DMD. Train together by
+# default; flip to `false` as a pair with `train_action_projection` if
+# Stream B's gradients prove too noisy.
+train_action_token_projection: true
+
+# Fake-score optimizer. Defaults mirror the generator's optimizer but
+# can be tuned separately. `fake_max_grad_norm` defaults to `max_grad_norm`
+# if unset.
+fake_lr: 1.0e-05
+fake_betas: [0.9, 0.999]
+fake_eps: 1.0e-08
+fake_weight_decay: 0.0
+fake_max_grad_norm: 1.0

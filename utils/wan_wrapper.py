@@ -516,9 +516,22 @@ class WanDiffusionWrapper(torch.nn.Module):
                 **action_mod_kwargs,
                 **state_kwargs,
             )
+            # Return contract (mirrors _forward_inference):
+            #   plain tensor                      -> flow_pred only
+            #   (tensor, state_hidden)            -> action-token state path
+            #   (tensor, tapped_infer)            -> state-probe taps only
+            #   (tensor, state_hidden, tapped)    -> both
             if isinstance(model_out, tuple):
                 flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
-                state_hidden = model_out[1]
+                if len(model_out) == 3:
+                    state_hidden = model_out[1]
+                    tapped_features = model_out[2]
+                else:
+                    aux = model_out[1]
+                    if isinstance(aux, list):
+                        tapped_features = aux
+                    else:
+                        state_hidden = aux
             else:
                 flow_pred = model_out.permute(0, 2, 1, 3, 4)
         elif clean_x is not None:
@@ -599,10 +612,24 @@ class WanDiffusionWrapper(torch.nn.Module):
             num_frames = noisy_image_or_video.shape[1]
             noisy_seq = tapped_features[0].shape[1] - noisy_start
             frame_seqlen = noisy_seq // num_frames
-            state_preds, probe_hidden = self._state_probe(
-                tapped_features, noisy_start, frame_seqlen,
-            )
-            return flow_pred, pred_x0, state_preds.float(), probe_hidden
+            # The probe's `n_chunks * num_frame_per_block` window must
+            # exactly equal `num_frames` — otherwise the chunk-wise reshape
+            # inside `StateProbeModule.forward` asserts/shape-errors.
+            # In the rolling-staircase pipeline only the live-window forward
+            # (12 frames = 4 slots x 3 fpb) satisfies this; priming forwards
+            # (3 frames each) and commit forwards (3 frames each) do not.
+            # Silently skip the probe for those and fall through to the
+            # no-probe return — the taps are collected but discarded.
+            probe_n_chunks = int(getattr(self, "_state_n_chunks", 0))
+            probe_fpb = int(getattr(
+                self._state_probe, "num_frame_per_block", 0,
+            ) or 0)
+            expected_frames = probe_n_chunks * probe_fpb
+            if expected_frames > 0 and num_frames == expected_frames:
+                state_preds, probe_hidden = self._state_probe(
+                    tapped_features, noisy_start, frame_seqlen,
+                )
+                return flow_pred, pred_x0, state_preds.float(), probe_hidden
 
         # State-token readout: pool per chunk and map to z2/z7
         if has_state and state_hidden is not None:

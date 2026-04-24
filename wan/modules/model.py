@@ -609,12 +609,21 @@ class WanModel(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
+        # RoPE temporal table size. Upstream used 1024, which caps rides at
+        # ~1024 frames (~334 rolling staircase steps at npb=3). Phase-1 rolls
+        # to the natural end of each ride and can exceed that. We bump the
+        # table to 10000 positions: bit-identical at positions [0..1023]
+        # (same theta=10000, same torch.arange(i) formula) and safe up to
+        # ~theta before frequency aliasing would appear. This is the "naive
+        # RoPE" extension; it doesn't touch any learned weights.
+        _ROPE_MAX_SEQ_LEN = 10000
         self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
+            rope_params(_ROPE_MAX_SEQ_LEN, d - 4 * (d // 6)),
+            rope_params(_ROPE_MAX_SEQ_LEN, 2 * (d // 6)),
+            rope_params(_ROPE_MAX_SEQ_LEN, 2 * (d // 6))
         ],
             dim=1)
+        self.rope_max_seq_len = _ROPE_MAX_SEQ_LEN
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)

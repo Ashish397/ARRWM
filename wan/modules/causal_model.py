@@ -263,6 +263,28 @@ class CausalWanSelfAttention(nn.Module):
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
+            # Determinism-under-checkpoint fix:
+            # ``kv_cache["local_end_index"]`` and ``kv_cache["global_end_index"]``
+            # are mutable 0-d tensors that the rolling pipeline updates between
+            # a checkpointed live forward (``skip_cache_update=True``) and its
+            # backward recompute (via the subsequent clean-x0 commit forward +
+            # ``_trim_committed_kv_cache``). Reading them here would yield
+            # different slice sizes at recompute time, triggering
+            # ``CheckpointError: Recomputed values ... have different metadata``.
+            # The outer ``_forward_inference`` now snapshots both scalars into
+            # ``self._frozen_local_end_index`` / ``self._frozen_global_end_index``
+            # before each checkpointed block call; if they are present we use
+            # them, otherwise we fall back to the legacy live read.
+            _frozen_le = getattr(self, "_frozen_local_end_index", None)
+            _frozen_ge = getattr(self, "_frozen_global_end_index", None)
+            if _frozen_le is not None:
+                _cached_local_end_index = int(_frozen_le)
+            else:
+                _cached_local_end_index = int(kv_cache["local_end_index"].item())
+            if _frozen_ge is not None:
+                _cached_global_end_index = int(_frozen_ge)
+            else:
+                _cached_global_end_index = int(kv_cache["global_end_index"].item())
             # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
             #     print("***********before attention***********")
             #     print(f"kv_cache_size = {kv_cache_size / frame_seqlen}")
@@ -275,13 +297,13 @@ class CausalWanSelfAttention(nn.Module):
 
             # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
-            is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+            is_recompute = current_end <= _cached_global_end_index and current_start > 0
+            if self.local_attn_size != -1 and (current_end > _cached_global_end_index) and (
+                    num_new_tokens + _cached_local_end_index > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                num_evicted_tokens = num_new_tokens + _cached_local_end_index - kv_cache_size
+                num_rolled_tokens = _cached_local_end_index - num_evicted_tokens - sink_tokens
                 # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
                 #     print(f"need roll")
                 #     print(f"num_rolled_tokens: {num_rolled_tokens / frame_seqlen}")
@@ -289,8 +311,8 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"sink_tokens: {sink_tokens / frame_seqlen}")
 
                 # Compute updated local indices
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
+                local_end_index = _cached_local_end_index + current_end - \
+                    _cached_global_end_index - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)
@@ -333,7 +355,7 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"used kv cache size: local_end_index - local_start_index = {local_end_index - local_start_index}")
             else:
                 # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                local_end_index = _cached_local_end_index + current_end - _cached_global_end_index
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)
@@ -771,12 +793,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
+        # RoPE temporal table size. Upstream used 1024, which caps rides at
+        # ~1024 frames (~334 rolling staircase steps at npb=3). Phase-1 rolls
+        # to the natural end of each ride and can exceed that. We bump the
+        # table to 10000 positions: bit-identical at positions [0..1023]
+        # (same theta=10000, same torch.arange(i) formula) and safe up to
+        # ~theta before frequency aliasing would appear. This is the "naive
+        # RoPE" extension; it doesn't touch any learned weights.
+        _ROPE_MAX_SEQ_LEN = 10000
         self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
+            rope_params(_ROPE_MAX_SEQ_LEN, d - 4 * (d // 6)),
+            rope_params(_ROPE_MAX_SEQ_LEN, 2 * (d // 6)),
+            rope_params(_ROPE_MAX_SEQ_LEN, 2 * (d // 6))
         ],
             dim=1)
+        self.rope_max_seq_len = _ROPE_MAX_SEQ_LEN
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
@@ -1178,8 +1209,46 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
+        # State-probe tap collection (mirrors _forward_train). Opt-in via
+        # `_state_probe_tap_set`: when the state_probe branch is attached to
+        # the model, we snapshot intermediate activations at the probe layers
+        # so the wrapper can route them to `StateProbeModule.forward`. The
+        # taps carry autograd history, so backprop from probe loss flows
+        # through the full DiT — this is what gives Phase-1 DMD its
+        # state_probe auxiliary loss without an extra training forward.
+        probe_tap_set = getattr(self, '_state_probe_tap_set', None)
+        tapped_infer = [] if probe_tap_set else None
+
+        # --- Determinism-under-checkpoint snapshot factory ---
+        # Capture per-block ``local_end_index`` / ``global_end_index`` scalars
+        # into Python ints closed over by ``custom_forward``. The rolling
+        # pipeline mutates those 0-d tensors between a checkpointed live
+        # forward (``skip_cache_update=True``) and its backward recompute
+        # (via the slot-0 commit forward + ``_trim_committed_kv_cache``).
+        # Python ints are immutable and captured by the closure, so the
+        # attention sees the same values at save and recompute.
+        def create_custom_forward_with_frozen(module, frozen_le, frozen_ge):
+            def custom_forward(*inputs, **kwargs):
+                prev_le = getattr(module.self_attn, "_frozen_local_end_index", None)
+                prev_ge = getattr(module.self_attn, "_frozen_global_end_index", None)
+                module.self_attn._frozen_local_end_index = frozen_le
+                module.self_attn._frozen_global_end_index = frozen_ge
+                try:
+                    return module(*inputs, **kwargs)
+                finally:
+                    module.self_attn._frozen_local_end_index = prev_le
+                    module.self_attn._frozen_global_end_index = prev_ge
+            return custom_forward
+
         for block_index, block in enumerate(self.blocks):
             # print(f"block_index: {block_index}")
+            if kv_cache is not None:
+                blk_cache = kv_cache[block_index]
+                frozen_le_i = int(blk_cache["local_end_index"].item())
+                frozen_ge_i = int(blk_cache["global_end_index"].item())
+            else:
+                frozen_le_i = None
+                frozen_ge_i = None
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
                     {
@@ -1190,7 +1259,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 )
                 # print(f"forward checkpointing")
                 result = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+                    create_custom_forward_with_frozen(block, frozen_le_i, frozen_ge_i),
                     x, **kwargs,
                     use_reentrant=False,
                 )
@@ -1221,9 +1290,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     cache_update_info = block_cache_update_info[:2]  # (current_end, local_end_index)
                 else:
                     x = result
+            if tapped_infer is not None and block_index in probe_tap_set:
+                tapped_infer.append(x)
         # log_gpu_memory(f"in _forward_inference: {x[0].device}")
-        # After all blocks are processed, apply cache updates in a single pass
-        if kv_cache is not None and cache_update_infos:
+        # After all blocks are processed, apply cache updates in a single pass.
+        # `skip_cache_update` (module-level flag) lets callers run a forward
+        # through the KV-cache path *without* committing the current k/v into
+        # the persistent cache. Used by rolling-staircase training to do a
+        # 4-slot live forward (noisy slots 1-3) without polluting the clean
+        # cache; the pipeline then commits slot 0 with a separate clean-x0,
+        # t=0 forward that runs with this flag OFF.
+        if (
+            kv_cache is not None
+            and cache_update_infos
+            and not bool(getattr(self, "skip_cache_update", False))
+        ):
             self._apply_cache_updates(kv_cache, cache_update_infos)
 
         state_hidden = None
@@ -1238,8 +1319,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        # Return contract:
+        #   - plain tensor when no extras
+        #   - (tensor, state_hidden) when action/state tokens produce hidden
+        #   - (tensor, tapped_infer) when only probe taps were collected
+        #   - (tensor, state_hidden, tapped_infer) when both are present
+        # The wan_wrapper disambiguates by tuple length / element type.
+        if state_hidden is not None and tapped_infer is not None:
+            return torch.stack(x), state_hidden, tapped_infer
         if state_hidden is not None:
             return torch.stack(x), state_hidden
+        if tapped_infer is not None:
+            return torch.stack(x), tapped_infer
         return torch.stack(x)
 
     def _forward_train(

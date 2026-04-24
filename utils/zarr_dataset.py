@@ -377,6 +377,7 @@ class ZarrRideDataset(Dataset):
         ss_vae_device: Optional[str] = None,
         start_zarr_index: int = 0,
         max_rides: Optional[int] = None,
+        sort_by_length: Optional[str] = None,
     ):
         self.encoded_root = Path(encoded_root)
         self.caption_root = Path(caption_root)
@@ -384,6 +385,7 @@ class ZarrRideDataset(Dataset):
         self.min_ride_frames = min_ride_frames
         self.start_zarr_index = start_zarr_index
         self.max_rides = max_rides
+        self.sort_by_length = sort_by_length
 
         ss_dev = ss_vae_device or device
         logging.info("Loading ss_vae from %s on %s", ss_vae_checkpoint, ss_dev)
@@ -479,6 +481,27 @@ class ZarrRideDataset(Dataset):
         )
         if not self._rides:
             raise RuntimeError("No valid rides found. Check encoded_root, caption_root, motion_root.")
+
+        # Optional ride ordering by latent frame count. Driven by
+        # ``self.sort_by_length`` (set by the trainer via __init__
+        # kwarg or post-construction attribute):
+        #   "asc"  → shortest → longest (good for curriculum warm-up;
+        #            small rides exercise every stage quickly and expose
+        #            bugs on easy data before we spend hours on long ones)
+        #   "desc" → longest → shortest
+        #   None / "none" → leave in glob-sorted path order (default)
+        sort_mode = getattr(self, "sort_by_length", None)
+        if sort_mode in ("asc", "desc"):
+            reverse = (sort_mode == "desc")
+            self._rides.sort(key=lambda r: r[3], reverse=reverse)
+            lengths = [r[3] for r in self._rides]
+            logging.info(
+                "ZarrRideDataset: sorted %d rides by length (%s); "
+                "range [%d, %d], median=%d",
+                len(self._rides), sort_mode,
+                min(lengths), max(lengths),
+                sorted(lengths)[len(lengths) // 2],
+            )
 
     def encode_z_actions_window(
         self,
