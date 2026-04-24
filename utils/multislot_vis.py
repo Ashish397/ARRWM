@@ -114,7 +114,17 @@ class MultislotVisRecorder:
         if slot0 is None:
             return
 
-        pred = slot0.pred_x0
+        # Prefer ``pred_x0_committed`` — the detached x0 from the FINAL
+        # denoising pass, which is exactly what the KV cache absorbs. In
+        # ``passes_per_step == 1`` runs (e.g. 4x1) this is identical to
+        # ``pred_x0``; in multi-pass runs (e.g. 2x2) ``pred_x0`` belongs to
+        # a RANDOMLY selected grad-pass and can be a less-refined estimate
+        # than what was actually committed, producing a visible per-chunk
+        # jerk when the two passes disagree. Falling back to ``pred_x0``
+        # keeps older pipelines working.
+        pred = getattr(slot0, "pred_x0_committed", None)
+        if pred is None:
+            pred = slot0.pred_x0
         if not torch.is_tensor(pred):
             return
 

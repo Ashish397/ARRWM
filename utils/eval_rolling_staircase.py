@@ -534,7 +534,16 @@ def run_rollout_and_capture(
             if slot0 is None:
                 continue
 
-            pred = slot0.pred_x0.detach().to(
+            # Use the FINAL-pass detached prediction (what actually commits
+            # to the KV cache). For ``passes_per_step == 1`` this equals
+            # ``pred_x0``; for ``passes_per_step > 1`` ``pred_x0`` is the
+            # grad-pass output and can differ from the committed value,
+            # which would make this capture inconsistent with the student's
+            # rolling cache state.
+            pred_src = getattr(slot0, "pred_x0_committed", None)
+            if pred_src is None:
+                pred_src = slot0.pred_x0
+            pred = pred_src.detach().to(
                 device="cpu", dtype=torch.float32,
             ).clone()
             action_frame = getattr(slot0, "action_frame", None)

@@ -152,6 +152,19 @@ class RollingStepOutput:
     state_preds_live: Optional[torch.Tensor] = None
     per_slot_actions_live: Optional[torch.Tensor] = None
 
+    # --- Commit-stream payload (vis / eval) ---
+    # ``pred_x0_committed`` is the detached x0 from the FINAL denoising pass
+    # of the rolling step for this slot. For ``passes_per_step == 1`` this
+    # is identical (up to detach) to ``pred_x0``. For ``passes_per_step > 1``
+    # ``pred_x0`` is the GRAD-pass output (randomly selected pass, required
+    # for the DMD autograd path), whereas ``pred_x0_committed`` is what the
+    # KV cache / commit-history actually absorbs. Consumers that render or
+    # report the student's output (visualization, eval capture) must prefer
+    # ``pred_x0_committed`` so the rendered stream matches the cache state
+    # the student sees on the next step. Losses that need gradients (DMD,
+    # action/state aux) keep using ``pred_x0`` / ``pred_x0_all_slots``.
+    pred_x0_committed: Optional[torch.Tensor] = None
+
     # --- Batched-S_n DMD context (Option 4) ---
     pred_x0_all_slots: Optional[torch.Tensor] = None
     kv_anchor_chunk: Optional[torch.Tensor] = None
@@ -1020,6 +1033,12 @@ class RollingStaircaseTrainingPipeline:
                                 phase="warmup",
                                 state_preds_live=state_preds_live if is_first else None,
                                 per_slot_actions_live=per_slot_actions_live if is_first else None,
+                                # Warmup records are only emitted on the FINAL
+                                # pass (lockstep fill), so the "committed" view
+                                # equals this pass's pred_x0 detached. Kept in
+                                # sync so vis/eval can always reach for
+                                # pred_x0_committed regardless of phase.
+                                pred_x0_committed=pred_x0[:, f0:f1].detach().contiguous(),
                             )
                         )
 
@@ -1506,6 +1525,11 @@ class RollingStaircaseTrainingPipeline:
                 ).contiguous()
 
         step_outputs: List[RollingStepOutput] = []
+        # Final-pass detached x0 slice — what ACTUALLY gets committed /
+        # slid into the next step. Vis + eval consume this so the rendered
+        # stream matches the KV cache state, independent of which pass
+        # happened to carry the autograd graph.
+        assert pred_x0_final_detached is not None
         for i, slot_idx in enumerate(grad_slot_indices):
             f0 = slot_idx * npb
             f1 = f0 + npb
@@ -1521,6 +1545,7 @@ class RollingStaircaseTrainingPipeline:
                     phase="steady",
                     state_preds_live=state_preds_live if is_first else None,
                     per_slot_actions_live=per_slot_actions_live if is_first else None,
+                    pred_x0_committed=pred_x0_final_detached[:, f0:f1].contiguous(),
                     pred_x0_all_slots=pred_x0_all_slots_attach if is_first else None,
                     kv_anchor_chunk=kv_anchor_attach if is_first else None,
                     gt_context_chunks=gt_ctx_chunks_attach if is_first else None,
