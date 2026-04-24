@@ -91,6 +91,24 @@ passes_per_step: 1
 denoising_step_list: [1000, 750, 500, 250]
 warp_denoising_step: true
 
+# Eval-only switch for utils/eval_rolling_staircase.py: picks how the
+# sequential-commit rollout spreads its 4-step denoising budget across
+# in-flight chunks. The trainer ignores this key.
+#   rollout_num_slots: 4 -> 4-slot staircase, 1 pass per rolling step
+#                           (4 chunks in flight; 1 DiT forward per commit)
+#   rollout_num_slots: 2 -> 2-slot staircase, 2 passes per rolling step
+#                           (2 chunks in flight; 2 DiT forwards per commit)
+#   rollout_num_slots: 1 -> plain AR chain, 4 passes per chunk
+#                           (1 chunk in flight; 4 DiT forwards per commit)
+# All three spend the same total DiT work per committed chunk.
+rollout_num_slots: 1
+
+# Eval-only KV-cache budget for utils/eval_rolling_staircase.py: the
+# maximum number of committed chunks the cache retains before FIFO-
+# evicting the oldest. Match the Phase-1 training value (3 chunks =
+# kv_committed_max_frames: 9). The trainer ignores this key.
+rollout_cache_chunks: 3
+
 num_frame_per_block: 3
 prime_kv_frames: 9
 # Decoupled KV-cache knobs:

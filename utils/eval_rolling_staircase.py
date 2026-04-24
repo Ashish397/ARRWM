@@ -149,6 +149,7 @@ def build_student_and_pipeline(
     student_ckpt_path: str,
     device: torch.device,
     dtype: torch.dtype,
+    disable_renoise: bool = False,
 ) -> Tuple[Any, Any, Any]:
     """Build and return ``(ode_model, pipeline, vae)``.
 
@@ -229,45 +230,94 @@ def build_student_and_pipeline(
     # guaranteed to match.
     from pipeline.rolling_staircase_training import RollingStaircaseTrainingPipeline
 
-    denoising_step_list = list(
-        getattr(phase1_cfg, "denoising_step_list", [1000, 750, 500, 250])
-    )
-    num_live_slots = int(getattr(phase1_cfg, "num_live_slots", 4))
-    passes_per_step = int(getattr(phase1_cfg, "passes_per_step", 1))
-    default_decay = (
-        [1.0, 0.75, 0.5, 0.25] if num_live_slots == 4 else [1.0, 0.5]
-    )
-    action_decay_slot = tuple(
-        getattr(phase1_cfg, "action_decay_per_slot", default_decay)
-    )
+    # Single-knob rollout selector. ``rollout_num_slots`` in the Phase-1
+    # YAML picks among (1, 2, 4); passes_per_step is derived so that
+    # NS*P = 4 (the ODE student's total denoising budget per chunk). The
+    # ladder + default per-slot decay follow automatically. The trainer
+    # reads ``num_live_slots`` / ``passes_per_step`` directly, so leaving
+    # this key absent (or equal to ``num_live_slots``) preserves the
+    # existing 4-slot training behaviour.
+    trainer_num_live_slots = int(getattr(phase1_cfg, "num_live_slots", 4))
+    num_live_slots = int(getattr(
+        phase1_cfg, "rollout_num_slots", trainer_num_live_slots,
+    ))
+    if num_live_slots not in (1, 2, 4):
+        raise SystemExit(
+            f"rollout_num_slots must be 1, 2, or 4; got {num_live_slots}."
+        )
+    passes_per_step = 4 // num_live_slots  # NS*P == 4 invariant.
+
+    # Derive the pass-0 input ladder from (NS, P). With max_t=1000 and
+    # NS*P=4 the rung step is always 250.
+    max_t = 1000
+    step = max_t // (num_live_slots * passes_per_step)
+    denoising_step_list = [
+        step * (s * passes_per_step + passes_per_step)
+        for s in range(num_live_slots)
+    ]
+    # Default per-slot action decay. The user's deployment semantics:
+    # slot 0 carries the full chunk action; slots 1..NS-1 carry dimmer
+    # echoes (we don't know future ride actions at inference time).
+    default_decay_table = {
+        1: (1.0,),
+        2: (1.0, 0.5),
+        4: (1.0, 0.75, 0.5, 0.25),
+    }
+    default_decay = default_decay_table[num_live_slots]
+    # Only honour a user-provided override if its length matches NS; else
+    # fall back to the default (the YAML's default is 4-long for the
+    # trainer, which would be invalid for NS=1 or 2).
+    user_decay = getattr(phase1_cfg, "action_decay_per_slot", None)
+    if user_decay is not None and len(list(user_decay)) == num_live_slots:
+        action_decay_slot = tuple(float(x) for x in user_decay)
+    else:
+        action_decay_slot = default_decay
+
+    # Eval-only KV-cache sizing. The trainer's Phase-1 config caps the
+    # committed region at 3 chunks (kv_committed_max_frames=9) because the
+    # staircase only ever needs that much past context during training.
+    # At AR-style inference the student benefits from a deeper memory, so
+    # we size the cache off ``rollout_cache_chunks`` (default 12, matching
+    # eval_causal_AR's DEFAULT_CACHE_CHUNKS). live_frames = num_slots *
+    # num_frame_per_block; the physical buffer must hold committed + live.
+    npb = int(getattr(phase1_cfg, "num_frame_per_block", 3))
+    rollout_cache_chunks = int(getattr(phase1_cfg, "rollout_cache_chunks", 12))
+    rollout_kv_committed_max_frames = rollout_cache_chunks * npb
+    rollout_live_frames = num_live_slots * npb
+    rollout_kv_frames_total = rollout_kv_committed_max_frames + rollout_live_frames
+    rollout_local_attn_size = rollout_kv_frames_total
 
     pipeline = RollingStaircaseTrainingPipeline(
         denoising_step_list=denoising_step_list,
         scheduler=ode_model.scheduler,
         generator=ode_model.generator,
-        num_frame_per_block=int(getattr(phase1_cfg, "num_frame_per_block", 3)),
+        num_frame_per_block=npb,
         num_slots=num_live_slots,
         passes_per_step=passes_per_step,
         action_decay_per_slot=action_decay_slot,
         prime_kv_frames=int(getattr(phase1_cfg, "prime_kv_frames", 9)),
-        kv_frames_total=int(getattr(phase1_cfg, "kv_frames_total", 21)),
-        kv_committed_max_frames=int(
-            getattr(phase1_cfg, "kv_committed_max_frames", 9)
-        ),
-        local_attn_size=int(getattr(phase1_cfg, "local_attn_size", 21)),
+        kv_frames_total=rollout_kv_frames_total,
+        kv_committed_max_frames=rollout_kv_committed_max_frames,
+        local_attn_size=rollout_local_attn_size,
         action_projection=ode_model.action_projection,
         action_token_projection=ode_model.action_token_projection,
         real_score_num_gt_chunks=int(
             getattr(phase1_cfg, "real_score_num_gt_chunks", 2)
         ),
+        disable_renoise=bool(disable_renoise),
     )
     log.info(
         "Pipeline: num_live_slots=%d passes_per_step=%d denoising_step_list=%s "
-        "action_decay_per_slot=%s kv_committed_max_frames=%d local_attn_size=%d",
+        "action_decay_per_slot=%s rollout_cache_chunks=%d "
+        "kv_committed_max_frames=%d kv_frames_total=%d local_attn_size=%d "
+        "disable_renoise=%s",
         num_live_slots, passes_per_step, denoising_step_list,
         list(action_decay_slot),
-        int(getattr(phase1_cfg, "kv_committed_max_frames", 9)),
-        int(getattr(phase1_cfg, "local_attn_size", 21)),
+        rollout_cache_chunks,
+        rollout_kv_committed_max_frames,
+        rollout_kv_frames_total,
+        rollout_local_attn_size,
+        bool(disable_renoise),
     )
 
     # Separate VAE copy for decode (ODERegression doesn't expose one).
@@ -438,6 +488,116 @@ def build_v14_teacher(
 # ---------------------------------------------------------------------------
 # Rollout + capture
 # ---------------------------------------------------------------------------
+
+
+def run_sequential_rollout_and_capture(
+    *,
+    pipeline: Any,
+    gt_latents: torch.Tensor,     # [1, T, C, H, W]
+    gt_actions: torch.Tensor,     # [1, T, action_dim]
+    prompt_embeds: torch.Tensor,  # [1, L, C_txt]
+    num_frame_per_block: int,
+    prime_kv_frames: int,
+    max_commits: Optional[int] = None,
+    denoising_ladder: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """Run the sequential-commit rollout (additive warmup + one chunk per
+    rolling step) and collect the committed latents for visualization.
+
+    Layout of the returned ``commits`` list:
+
+      * chunks 0..P-1 are NOT in ``commits`` — they are the prime GT chunks
+        and show up separately via ``prime_latents``.
+      * The first commit in ``commits`` is chunk P (the chunk finished by
+        the end of the additive warmup) with ``phase="warmup"``.
+      * Each subsequent commit is the next sequential chunk in the ride
+        (P+1, P+2, ...) with ``phase="steady"``.
+      * There is no "transition" / "xition" commit — additive warmup
+        emits the first chunk directly.
+
+    Each entry in ``commits`` carries:
+      - ``latent``:       [B, npb, C, H, W] fp32 CPU (the committed clean x0)
+      - ``gt_latent``:    [B, npb, C, H, W] fp32 CPU (ride GT for that
+                          chunk, used for the stacked gen-vs-GT mp4)
+      - ``action``:       [action_dim] fp32 CPU (the chunk action value
+                          that drove this commit — same value across the 3
+                          frames since actions are chunk-wise)
+      - ``chunk_index``:  int (ride chunk index = frame_start // npb)
+      - ``global_frame_start``: int (= chunk_index * npb)
+      - ``slot_timestep``: int (always 0 — the commit is clean)
+      - ``phase``:         str ("warmup" for the first commit, "steady" after)
+      - ``rolling_steps_done``: int (1-indexed step counter)
+    """
+    device = gt_latents.device
+    npb = int(num_frame_per_block)
+
+    prime = gt_latents[:, :prime_kv_frames].detach().clone().to(
+        device="cpu", dtype=torch.float32,
+    )
+    prime_chunks = int(prime_kv_frames) // npb
+
+    commits: List[Dict[str, Any]] = []
+    t0 = time.time()
+    last_log = t0
+
+    it = pipeline.rollout_ride_sequential(
+        gt_latents=gt_latents,
+        gt_actions=gt_actions,
+        prompt_embeds=prompt_embeds,
+        max_commits=max_commits,
+        denoising_ladder=denoising_ladder,
+    )
+    for step_idx, rec in enumerate(it):
+        chunk_idx = int(rec["chunk_idx"])
+        gfs = chunk_idx * npb
+        # Pull GT latents for this chunk if available.
+        if gfs + npb <= int(gt_latents.shape[1]):
+            gt_chunk = gt_latents[:, gfs:gfs + npb].detach().to(
+                device="cpu", dtype=torch.float32,
+            ).clone()
+        else:
+            gt_chunk = None
+        # Action vector (chunk-wise, 1 entry per chunk).
+        action_tensor = rec["action"]  # [B, action_dim]
+        if torch.is_tensor(action_tensor) and action_tensor.numel() > 0:
+            action_vec = action_tensor[0].detach().float().cpu().clone()
+        else:
+            action_vec = None
+        commits.append({
+            "latent": rec["latent"],
+            "gt_latent": gt_chunk,
+            "action": action_vec,
+            "chunk_index": chunk_idx,
+            "global_frame_start": gfs,
+            "slot_timestep": int(rec.get("slot_timestep", 0)),
+            "phase": str(rec.get("phase", "steady")),
+            "rolling_steps_done": step_idx + 1,
+        })
+
+        now = time.time()
+        if now - last_log >= 15.0:
+            log.info(
+                "rollout: %d commits captured | wall=%.1fs | last chunk=%d",
+                len(commits), now - t0, commits[-1]["chunk_index"],
+            )
+            last_log = now
+
+    t1 = time.time()
+    stats = {
+        "n_commits": len(commits),
+        "wall_seconds": t1 - t0,
+        "rolling_steps_per_sec": len(commits) / max(t1 - t0, 1e-6),
+        "prime_chunks": prime_chunks,
+    }
+    log.info(
+        "rollout done: %d sequential commits | %.1fs | %.3f steps/s",
+        len(commits), stats["wall_seconds"], stats["rolling_steps_per_sec"],
+    )
+    return {
+        "prime_latents": prime,
+        "commits": commits,
+        "stats": stats,
+    }
 
 
 def run_rollout_and_capture(
@@ -1163,22 +1323,25 @@ def _annotate_and_write_mp4(
     t_start = time.time()
 
     # ------------------------------------------------------------------
-    # 1) Concatenate latents in display order:
-    #      prime (9 frames) + transition commit (if present) + commits
+    # 1) Build two parallel latent streams — one for the generated /
+    #    primed chunks (what the student produced) and one for the GT
+    #    reference at the same chunk positions (for stacked visual
+    #    comparison). Prime chunks are identical across both streams
+    #    since the prime latents come directly from the ride.
     # ------------------------------------------------------------------
-    pieces: List[torch.Tensor] = []
+    gen_pieces: List[torch.Tensor] = []
+    gt_pieces: List[torch.Tensor] = []
     piece_labels: List[Dict[str, Any]] = []
 
     npb = int(num_frame_per_block)
-    # Prime chunks: we show the prime_latents as ``prime_frames // npb``
-    # "prime" chunks with chunk indices 0..n-1 so the mp4's chronology
-    # is clean.
     prime_frames = int(prime_latents.shape[1])
     prime_chunks = prime_frames // npb
     for c in range(prime_chunks):
         lo = c * npb
         hi = lo + npb
-        pieces.append(prime_latents[:, lo:hi])
+        block = prime_latents[:, lo:hi]
+        gen_pieces.append(block)
+        gt_pieces.append(block)
         piece_labels.append({
             "label_top": f"{ride_basename} | chunk {c} (prime)",
             "label_bot": "t=0 | GT-primed",
@@ -1186,87 +1349,100 @@ def _annotate_and_write_mp4(
         })
 
     for e in commits:
-        pieces.append(e["latent"])
-        if e["phase"] == "transition":
-            top = f"{ride_basename} | chunk {prime_chunks} (xition)"
-            bot = "transition commit | t=0"
+        gen_pieces.append(e["latent"])
+        gt_block = e.get("gt_latent")
+        if torch.is_tensor(gt_block):
+            gt_pieces.append(gt_block)
         else:
-            gfs = int(e["global_frame_start"])
-            chunk_idx = gfs // npb if gfs >= 0 else -1
-            top = f"{ride_basename} | chunk {chunk_idx}"
-            bot = (
-                f"step {e['rolling_steps_done']} | "
-                f"t_in={e['slot_timestep']} | steady"
-            )
+            # End-of-ride padding: repeat last GT chunk if we ran off the
+            # ride (should not happen in typical runs, but keeps lengths
+            # aligned).
+            gt_pieces.append(gt_pieces[-1])
+        gfs = int(e["global_frame_start"])
+        chunk_idx = gfs // npb if gfs >= 0 else int(e.get("chunk_index", -1))
+        phase = str(e.get("phase", "steady"))
+        top = f"{ride_basename} | chunk {chunk_idx}"
+        bot = (
+            f"step {e['rolling_steps_done']} | "
+            f"t_in={e['slot_timestep']} | {phase}"
+        )
         piece_labels.append({
             "label_top": top,
             "label_bot": bot,
             "action": e.get("action"),
         })
 
-    lat_all = torch.cat(pieces, dim=1)
-    log.info("decode: %d total latents (%d prime + %d commits) on %s",
-             int(lat_all.shape[1]), prime_frames, len(commits), device)
+    gen_lat_all = torch.cat(gen_pieces, dim=1)
+    gt_lat_all = torch.cat(gt_pieces, dim=1)
+    log.info(
+        "decode: %d total latents x2 streams (%d prime + %d commits) on %s",
+        int(gen_lat_all.shape[1]), prime_frames, len(commits), device,
+    )
 
     # ------------------------------------------------------------------
-    # 2) Decode through VAE (fp32).
+    # 2) Decode both streams through the VAE (fp32).
     # ------------------------------------------------------------------
     t_before_decode = time.time()
-    # Chunk the decode to keep peak memory bounded on longer rollouts.
-    # We decode up to ``max_decode_frames`` latent frames at a time,
-    # re-apply the ``prepend-dummy-drop-first-pixel`` convention per
-    # chunk, and concatenate pixel tensors. Longer rollouts (200+
-    # commits = 600+ latent frames = ~1 min video @8fps) would otherwise
-    # exceed the VAE's peak memory envelope on an 80 GB H100.
-    max_decode_frames = 180  # ~8 GB peak at 16x60x104 latents.
-    if lat_all.shape[1] <= max_decode_frames:
-        pixels = _decode_latents(vae, lat_all.to(device=device))
-    else:
-        pieces_px: List[torch.Tensor] = []
-        n = int(lat_all.shape[1])
+    max_decode_frames = 180
+
+    def _decode_in_chunks(lat: torch.Tensor) -> torch.Tensor:
+        if lat.shape[1] <= max_decode_frames:
+            return _decode_latents(vae, lat.to(device=device))
+        out_px: List[torch.Tensor] = []
+        n = int(lat.shape[1])
         for lo in range(0, n, max_decode_frames):
             hi = min(lo + max_decode_frames, n)
-            chunk = lat_all[:, lo:hi].to(device=device)
-            pieces_px.append(_decode_latents(vae, chunk))
-        pixels = torch.cat(pieces_px, dim=1)
+            out_px.append(_decode_latents(vae, lat[:, lo:hi].to(device=device)))
+        return torch.cat(out_px, dim=1)
+
+    gen_pixels = _decode_in_chunks(gen_lat_all)
+    gt_pixels = _decode_in_chunks(gt_lat_all)
     t_after_decode = time.time()
 
-    arr = _pixels_to_uint8_hwc(pixels)
+    gen_arr = _pixels_to_uint8_hwc(gen_pixels)
+    gt_arr = _pixels_to_uint8_hwc(gt_pixels)
     t_after_cast = time.time()
 
     # ------------------------------------------------------------------
-    # 3) Annotate (cv2 — v14 style, see ``eval_chain.annotate_video``).
+    # 3) Annotate each frame pair and stack GT (top) over gen (bottom).
     # ------------------------------------------------------------------
-    n_pixel_frames = int(arr.shape[0])
-    # Distribute labels across pixel frames proportionally to latent span.
-    # Each ``pieces[i]`` has ``lat_pieces_frames[i]`` latent frames; after
-    # VAE upsampling the same proportion maps to pixel frames.
-    lat_pieces_frames = [int(p.shape[1]) for p in pieces]
+    assert gen_arr.shape == gt_arr.shape, (gen_arr.shape, gt_arr.shape)
+    n_pixel_frames = int(gen_arr.shape[0])
+    h_each, w_each = gen_arr.shape[1], gen_arr.shape[2]
+    h_gap = 8  # pixel divider between the two halves
+    out = np.zeros((n_pixel_frames, h_each * 2 + h_gap, w_each, 3), dtype=np.uint8)
+
+    lat_pieces_frames = [int(p.shape[1]) for p in gen_pieces]
     total_lat = sum(lat_pieces_frames)
-    # Compute pixel-frame boundaries so rounding errors don't accumulate.
     bounds: List[int] = [0]
     acc = 0
     for lf in lat_pieces_frames:
         acc += lf
         bounds.append(int(round(acc / max(total_lat, 1) * n_pixel_frames)))
 
-    out = np.empty_like(arr)
-    for pi in range(len(pieces)):
+    for pi in range(len(gen_pieces)):
         fa = bounds[pi]
         fb = bounds[pi + 1]
         if fb <= fa:
             continue
         lbl = piece_labels[pi]
+        top_label_gt = lbl["label_top"] + " [GT]"
+        top_label_gen = lbl["label_top"] + " [GEN]"
         for fi in range(fa, fb):
-            f = arr[fi].copy()
-            _draw_header(f, lbl["label_top"], lbl["label_bot"])
+            # Annotate GT half.
+            gt_f = gt_arr[fi].copy()
+            _draw_header(gt_f, top_label_gt, "ground truth")
+            _draw_tag(gt_f, ride_tag, embedded_step)
+            # Annotate gen half.
+            gen_f = gen_arr[fi].copy()
+            _draw_header(gen_f, top_label_gen, lbl["label_bot"])
             act = lbl.get("action")
             if act is not None:
-                _draw_action_panel(f, act)
-            # Bottom-right tag: run-level metadata so multi-mp4 grids
-            # from the same sbatch are self-describing.
-            _draw_tag(f, ride_tag, embedded_step)
-            out[fi] = f
+                _draw_action_panel(gen_f, act)
+            _draw_tag(gen_f, ride_tag, embedded_step)
+            # Stack GT on top, gen on bottom.
+            out[fi, :h_each] = gt_f
+            out[fi, h_each + h_gap:] = gen_f
     t_after_ann = time.time()
 
     # ------------------------------------------------------------------
@@ -1554,6 +1730,16 @@ def parse_args() -> argparse.Namespace:
         "--dtype", type=str, default="bfloat16",
         choices=["bfloat16", "float16", "float32"],
     )
+    p.add_argument(
+        "--disable_renoise", action="store_true",
+        help="Ablation: skip the Phase-1 staircase's carryover-renoise step. "
+             "After each rolling_step (and at transition_to_steady_state), "
+             "carryover slots are fed forward at t=0 instead of being "
+             "renoised to the ladder rungs; only the trailing slot is "
+             "seeded from fresh pure noise. Useful for checking whether "
+             "Phase-1 inference regresses because of the renoise exposure "
+             "the ODE student never saw at distill time.",
+    )
 
     # ---------------- debug_dmd mode ----------------
     p.add_argument(
@@ -1644,6 +1830,7 @@ def main() -> None:
         student_ckpt_path=args.student_ckpt,
         device=device,
         dtype=dtype,
+        disable_renoise=bool(args.disable_renoise),
     )
 
     # Freeze everything; this script is pure inference.
@@ -1802,18 +1989,46 @@ def main() -> None:
         )
         return
 
-    # -------------------- regular rolling-staircase mode --------------
-    capture = run_rollout_and_capture(
+    # -------------------- sequential-commit rolling-staircase mode ----
+    # Additive warmup + one chunk per rolling step. No xition, no chunk
+    # gap — slot-0 commits land sequentially (chunks P, P+1, P+2, ...).
+    #
+    # Denoising ladder mirrors eval_causal_AR.set_denoising_steps: if the
+    # total budget (NS*P) matches the length of the ODE student's trained
+    # ``denoising_step_list``, use that list (on-distribution rungs);
+    # otherwise fall back to linspace(1000, 50, total), which ends on a
+    # near-clean polish rung rather than a half-noise rung.
+    trained = ode_model.denoising_step_list.detach().float().cpu()
+    trained_sorted, _ = torch.sort(trained, descending=True)
+    NS = int(getattr(pipeline, "num_live_slots"))
+    P = int(getattr(pipeline, "passes_per_step"))
+    total_denoise = NS * P
+    if int(trained_sorted.shape[0]) == total_denoise:
+        denoising_ladder_values = [float(x) for x in trained_sorted.tolist()]
+        ladder_src = "trained"
+    else:
+        denoising_ladder_values = [
+            float(x) for x in torch.linspace(1000.0, 50.0, steps=total_denoise).tolist()
+        ]
+        ladder_src = "linspace(1000,50)"
+    log.info(
+        "Denoising ladder (%s, %d rungs): %s",
+        ladder_src, total_denoise,
+        [round(float(x), 2) for x in denoising_ladder_values],
+    )
+
+    capture = run_sequential_rollout_and_capture(
         pipeline=pipeline,
         gt_latents=gt_latents,
         gt_actions=gt_actions,
         prompt_embeds=prompt_embeds,
         num_frame_per_block=num_frame_per_block,
         prime_kv_frames=prime_kv_frames,
-        max_rolling_steps=(
+        max_commits=(
             int(args.max_rolling_steps)
             if args.max_rolling_steps is not None else None
         ),
+        denoising_ladder=denoising_ladder_values,
     )
     if not capture["commits"]:
         log.error("No rolling-step records captured — ride may be too short.")

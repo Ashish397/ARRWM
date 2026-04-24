@@ -31,11 +31,14 @@ these records to compute DMD + GAN losses on the designated grad slots.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
+log = logging.getLogger(__name__)
 
 from model.action_modulation import ActionModulationProjection, ActionTokenProjection
 from utils.scheduler import SchedulerInterface
@@ -271,6 +274,7 @@ class RollingStaircaseTrainingPipeline:
         action_projection: Optional[ActionModulationProjection] = None,
         action_token_projection: Optional[ActionTokenProjection] = None,
         real_score_num_gt_chunks: int = 2,
+        disable_renoise: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -282,15 +286,21 @@ class RollingStaircaseTrainingPipeline:
         # generator runs per rolling step. With P passes, each committed
         # chunk sees NS*P total denoising ops over its lifetime, matching
         # the ODE student's step budget (normally 4).
-        if int(num_slots) not in (2, 4):
+        if int(num_slots) not in (1, 2, 4):
             raise ValueError(
-                f"num_slots must be 2 or 4; got {num_slots}. Other values "
-                f"would require generalizing the transition-slide logic; "
-                f"add support explicitly before trying a new value."
+                f"num_slots must be 1, 2, or 4; got {num_slots}. Values "
+                f"outside this set would require generalizing the transition-"
+                f"slide logic and the rollout helpers further."
             )
-        if int(passes_per_step) not in (1, 2):
+        if int(passes_per_step) not in (1, 2, 4):
             raise ValueError(
-                f"passes_per_step must be 1 or 2; got {passes_per_step}."
+                f"passes_per_step must be 1, 2, or 4; got {passes_per_step}."
+            )
+        if int(num_slots) * int(passes_per_step) != 4:
+            raise ValueError(
+                f"num_slots * passes_per_step must equal 4 (the ODE student's "
+                f"total denoising budget per committed chunk); got "
+                f"num_slots={num_slots}, passes_per_step={passes_per_step}."
             )
         self.num_live_slots: int = int(num_slots)
         self.passes_per_step: int = int(passes_per_step)
@@ -366,6 +376,7 @@ class RollingStaircaseTrainingPipeline:
         self.context_noise = int(context_noise)
         self.action_projection = action_projection
         self.action_token_projection = action_token_projection
+        self.disable_renoise: bool = bool(disable_renoise)
         # Real-score GT context width (per-slot GT chunks). Defaults to 2
         # (S_n^real = [GT_{n-3}, GT_{n-2}, prev_{n-1}, live_n]). Increasing
         # this to 3 or 4 widens the left context with older GT chunks —
@@ -1147,23 +1158,34 @@ class RollingStaircaseTrainingPipeline:
 
         # --- Slide: clean slots 1..NS-1 into positions 0..NS-2; new slot NS-1
         # gets fresh noise. Renoise each slided clean chunk to the steady-
-        # state ladder level at its new slot index. ---
+        # state ladder level at its new slot index (unless
+        # ``self.disable_renoise`` is set, in which case carryover slots are
+        # fed through at t=0). ---
         NS = self.num_live_slots
+        max_t = self.ladder_timesteps[-1]
         slided_noisy: List[torch.Tensor] = []
         for new_slot in range(NS - 1):
             src_f0 = (new_slot + 1) * npb
             src_f1 = src_f0 + npb
             slided_clean = clean_live[:, src_f0:src_f1]
-            slided_noisy.append(
-                self._renoise(slided_clean, self.ladder_timesteps[new_slot])
-            )
+            if self.disable_renoise:
+                slided_noisy.append(slided_clean.contiguous())
+            else:
+                slided_noisy.append(
+                    self._renoise(slided_clean, self.ladder_timesteps[new_slot])
+                )
         # Fresh pure noise for the new slot NS-1 (max ladder step).
         fresh_noise = torch.randn_like(clean_live[:, :npb])
         slided_noisy.append(fresh_noise)
         live = torch.cat(slided_noisy, dim=1)
+        next_slot_timesteps = (
+            [0] * (NS - 1) + [int(max_t)]
+            if self.disable_renoise
+            else list(self.ladder_timesteps)
+        )
         state = LiveWindowState(
             noisy_latents=live.contiguous(),
-            slot_timesteps=list(self.ladder_timesteps),
+            slot_timesteps=next_slot_timesteps,
         )
         next_logical_start = prime_end + npb
         # Action base for the first steady-state step: slot 0 targets chunk
@@ -1344,14 +1366,24 @@ class RollingStaircaseTrainingPipeline:
 
         pred_x0_grad: Optional[torch.Tensor] = None
         state_preds_grad: Optional[torch.Tensor] = None
-        grad_pass_slot_timesteps: List[int] = list(self.pass_input_timesteps[grad_pass_idx])
+        # When disable_renoise is set, the live window's actual noise levels
+        # (state.slot_timesteps) diverge from the ladder-derived
+        # pass_input_timesteps; align both the DiT timestep tensor and the
+        # per-record ``grad_pass_slot_timesteps`` with the state in that case.
+        if self.disable_renoise:
+            grad_pass_slot_timesteps = list(state.slot_timesteps)
+        else:
+            grad_pass_slot_timesteps = list(self.pass_input_timesteps[grad_pass_idx])
         pred_x0_final_detached: Optional[torch.Tensor] = None
 
         live = state.noisy_latents
         self._set_skip_cache_update(True)
         try:
             for pass_p in range(self.passes_per_step):
-                pass_slot_ts = self.pass_input_timesteps[pass_p]
+                if self.disable_renoise and pass_p == 0:
+                    pass_slot_ts = list(state.slot_timesteps)
+                else:
+                    pass_slot_ts = self.pass_input_timesteps[pass_p]
                 timestep_p = self._build_live_timestep(
                     slot_timesteps=pass_slot_ts,
                     batch_size=batch_size,
@@ -1600,25 +1632,37 @@ class RollingStaircaseTrainingPipeline:
         #   new_slot_{NS-1} = fresh pure noise (implicitly ladder[NS-1] = max_t)
         # The "final-pass x0" is the cleanest prediction for each old slot;
         # it is detached (already done above via `pred_x0_final_detached`).
+        # With ``self.disable_renoise`` set, carryover slots pass their clean
+        # x0 through at t=0 (no noise added), only the trailing slot is seeded
+        # with fresh pure noise.
+        max_t = self.ladder_timesteps[-1]
         with torch.no_grad():
             x0_detached = pred_x0_final_detached
             slided: List[torch.Tensor] = []
             for new_slot in range(self.num_live_slots - 1):
                 src_f0 = (new_slot + 1) * npb
                 src_f1 = src_f0 + npb
-                slided.append(
-                    self._renoise(
-                        x0_detached[:, src_f0:src_f1],
-                        int(self.ladder_timesteps[new_slot]),
+                if self.disable_renoise:
+                    slided.append(x0_detached[:, src_f0:src_f1].contiguous())
+                else:
+                    slided.append(
+                        self._renoise(
+                            x0_detached[:, src_f0:src_f1],
+                            int(self.ladder_timesteps[new_slot]),
+                        )
                     )
-                )
             # Fresh noise for the new final slot (noise level = ladder[-1]).
             slided.append(torch.randn_like(x0_detached[:, :npb]))
             next_live = torch.cat(slided, dim=1)
 
+        next_slot_timesteps = (
+            [0] * (self.num_live_slots - 1) + [int(max_t)]
+            if self.disable_renoise
+            else list(self.ladder_timesteps)
+        )
         next_state = LiveWindowState(
             noisy_latents=next_live.contiguous(),
-            slot_timesteps=list(self.ladder_timesteps),
+            slot_timesteps=next_slot_timesteps,
         )
         return next_state, step_outputs, npb, npb, next_kv_anchor_chunk
 
@@ -1774,3 +1818,357 @@ class RollingStaircaseTrainingPipeline:
             logical_start_frame += logical_adv
             action_base_frame_idx += action_adv
             steps_done += 1
+
+    # -----------------------------------------------------------------
+    # Sequential-commit rollout (eval-only, additive warmup + per-step
+    # slot-0 commit). Not used by the trainer — this is the simpler
+    # "one chunk appears in the mp4 per rolling step" rollout the
+    # user wants for visualisation: prime with GT chunks 0..P-1, then
+    # progressively denoise a staircase and commit one fresh chunk per
+    # step starting at chunk index P.
+    # -----------------------------------------------------------------
+    def _chunk_action_value(
+        self,
+        gt_actions: torch.Tensor,
+        chunk_idx: int,
+    ) -> torch.Tensor:
+        """Pull the per-chunk action value as a ``[B, 1, action_dim]`` tensor.
+
+        Actions are semantically chunk-wise (the underlying motion encoding
+        produces one latent per chunk that is broadcast across the chunk's
+        ``num_frame_per_block`` frames). We take frame 0 of the chunk as the
+        canonical value; broadcasting to the 3 frames happens downstream in
+        ``_build_per_slot_actions_chunkwise`` via ``expand``.
+
+        Out-of-range chunk indices clamp to the last available frame.
+        """
+        npb = self.num_frame_per_block
+        f0 = int(chunk_idx) * npb
+        total = int(gt_actions.shape[1])
+        if f0 >= total:
+            f0 = max(0, total - 1)
+        return gt_actions[:, f0:f0 + 1, :].contiguous()
+
+    def _build_per_slot_actions_chunkwise(
+        self,
+        slot0_chunk_action: torch.Tensor,
+        num_live_slots: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build the ``[B, num_live_slots * npb, action_dim]`` per-frame
+        action tensor by broadcasting slot-0's chunk-wise action across all
+        live slots with the configured per-slot decay.
+
+        The returned tensor has one unique chunk-wise value per slot (the 3
+        frames within each slot share the same value), matching how the
+        training data's motion latents arrive at the projection modules.
+        """
+        B, _, D = slot0_chunk_action.shape
+        npb = self.num_frame_per_block
+        per_frame = torch.zeros(
+            B, num_live_slots * npb, D, device=device, dtype=dtype,
+        )
+        a = slot0_chunk_action.to(device=device, dtype=dtype)
+        for s in range(num_live_slots):
+            decay = float(self.action_decay_per_slot[s])
+            f0 = s * npb
+            f1 = f0 + npb
+            per_frame[:, f0:f1, :] = decay * a.expand(-1, npb, -1)
+        return per_frame
+
+    def _commit_slot0_clean(
+        self,
+        slot0_clean: torch.Tensor,
+        slot0_chunk_action: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        logical_frame: int,
+    ) -> None:
+        """Push slot-0's clean x0 into the persistent KV cache via a t=0
+        forward with cache-update enabled. ``slot0_chunk_action`` is the
+        [B, 1, D] chunk action value (broadcast to npb frames here)."""
+        device = slot0_clean.device
+        dtype = slot0_clean.dtype
+        B = slot0_clean.shape[0]
+        npb = self.num_frame_per_block
+        a_frames = slot0_chunk_action.to(device=device, dtype=dtype).expand(-1, npb, -1).contiguous()
+        modulation = self._compute_live_modulation(a_frames, device=device, dtype=dtype)
+        action_tokens = self._compute_live_action_tokens(a_frames, device=device, dtype=dtype)
+        cond = self._prepare_conditional(prompt_embeds, modulation, action_tokens)
+        ts0 = torch.zeros([B, npb], device=device, dtype=torch.int64)
+        self._set_skip_cache_update(False)
+        self.generator(
+            noisy_image_or_video=slot0_clean,
+            conditional_dict=cond,
+            timestep=ts0,
+            kv_cache=self.kv_cache1,
+            crossattn_cache=self.crossattn_cache,
+            current_start=logical_frame * self.frame_seq_length,
+        )
+        self._trim_committed_kv_cache()
+
+    @torch.inference_mode()
+    def rollout_ride_sequential(
+        self,
+        gt_latents: torch.Tensor,
+        gt_actions: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        *,
+        max_commits: Optional[int] = None,
+        denoising_ladder: Optional[List[float]] = None,
+    ) -> Iterable[dict]:
+        """Sequential-commit causal rollout — one fresh chunk per rolling step.
+
+        Layout:
+          1. Prime KV cache with ``prime_kv_frames`` GT latents (chunks 0..P-1,
+             P = prime_kv_frames / npb, default 3) via t=0 cache-refresh.
+          2. Additive warmup: passes 1..NS grow the live window one slot at a
+             time. Pass k has k live slots at timesteps
+             ``[ladder[NS-k], ..., ladder[NS-1]]``. Slot 0 in warmup is
+             always chunk P (the first chunk to be committed). Slots 1..k-1
+             carry decayed echoes of slot-0's chunk action (no future GT
+             peeking — this mirrors real-time deployment).
+          3. Pass NS brings slot 0 to t=0 and commits it → chunk P appears in
+             the output. From there steady state runs 1 commit per rolling
+             step: slide slots, add fresh noise at the trailing slot,
+             denoise once, commit slot 0.
+
+        Yields one dict per commit with keys:
+          - ``latent``:      [B, npb, C, H, W] fp32 CPU (the committed clean chunk)
+          - ``chunk_idx``:   int (ride chunk index of this commit)
+          - ``action``:      [B, action_dim] float CPU (the chunk action
+                             that drove this commit; taken from gt_actions)
+          - ``slot_timestep``: int (always 0 — the commit is clean)
+          - ``phase``:       str ("warmup" for the first commit that
+                             finishes the additive fill, "steady" thereafter)
+        """
+        device = gt_latents.device
+        dtype = gt_latents.dtype
+        B = gt_latents.shape[0]
+        npb = self.num_frame_per_block
+        NS = self.num_live_slots
+        P = self.passes_per_step
+        total_denoise = NS * P            # = 4 (the ODE student's step budget)
+
+        # --- Denoising ladder (descending, length == NS*P) -----------------
+        # Matches the semantics of ``eval_causal_AR.set_denoising_steps``:
+        # when the caller provides a ladder use it as-is; otherwise fall
+        # back to ``linspace(1000, 50, NS*P)`` so the last pass is a
+        # polish rung (t=50) rather than half-noise. The eval script passes
+        # the ODE student's ``trained`` list when its length matches
+        # ``NS*P``; this keeps the student on-distribution for the whole
+        # rollout instead of stepping through unvisited rungs.
+        if denoising_ladder is None:
+            ladder_rungs = [
+                float(x) for x in torch.linspace(1000.0, 50.0, steps=total_denoise).tolist()
+            ]
+        else:
+            ladder_rungs = [float(t) for t in denoising_ladder]
+            if len(ladder_rungs) != total_denoise:
+                raise ValueError(
+                    f"denoising_ladder must have length NS*P = {total_denoise}; "
+                    f"got {len(ladder_rungs)}"
+                )
+            # Sort descending so ladder_rungs[i] is the input t at pass-index i.
+            ladder_rungs = sorted(ladder_rungs, reverse=True)
+
+        self._initialize_kv_cache(batch_size=B, dtype=dtype, device=device)
+        self._initialize_crossattn_cache(batch_size=B, dtype=dtype, device=device)
+
+        n_primed = self.warmup_prime_kv_cache(
+            gt_latents=gt_latents,
+            gt_actions=gt_actions,
+            prompt_embeds=prompt_embeds,
+        )
+        if n_primed == 0:
+            return
+        prime_chunks = n_primed // npb
+        next_commit_chunk = prime_chunks
+        logical_frame = n_primed
+
+        C = int(gt_latents.shape[2])
+        H = int(gt_latents.shape[3])
+        W = int(gt_latents.shape[4])
+
+        total_ride_chunks = int(gt_actions.shape[1]) // npb
+
+        log.info(
+            "rollout_sequential: NS=%d P=%d total_denoise=%d ladder=%s "
+            "prime_chunks=%d first_commit_chunk=%d",
+            NS, P, total_denoise,
+            [round(float(x), 2) for x in ladder_rungs],
+            prime_chunks, next_commit_chunk,
+        )
+
+        # Live window state: each entry is (latent, ladder_idx) where
+        # ``ladder_idx`` is the slot's position in ``ladder_rungs`` (0 =
+        # freshest / highest-noise rung). Every forward pass advances every
+        # live slot's ``ladder_idx`` by 1; a slot reaches ``total_denoise``
+        # only when slot 0 has accumulated all NS*P passes and is ready to
+        # commit.
+        live_slots: List[Tuple[torch.Tensor, int]] = []
+
+        def _slot0_action_3frames() -> torch.Tensor:
+            """Return ``gt_actions[:, commit_chunk*npb : (commit_chunk+1)*npb]``
+            — the 3-frame slice for the chunk slot 0 is about to commit.
+            Matches ``eval_causal_AR.generate_ar``'s
+            ``block_fa = noisy_fa_full[:, frame_lo:frame_hi]``."""
+            f0 = int(next_commit_chunk) * npb
+            f1 = f0 + npb
+            total = int(gt_actions.shape[1])
+            if f1 <= total:
+                return gt_actions[:, f0:f1, :].contiguous()
+            # End-of-ride: clamp to last available frame.
+            avail = gt_actions[:, min(f0, total - 1):total, :]
+            pad_count = f1 - total
+            pad = gt_actions[:, -1:, :].expand(-1, pad_count, -1)
+            return torch.cat([avail, pad], dim=1).contiguous()
+
+        def _build_cond_for_width(num_slots_in_window: int) -> dict:
+            """Build the prompt + action cond dict for a live window of the
+            given width. Slot 0 carries the full 3-frame chunk-action slice
+            (decay=1.0); slots 1..num_slots-1 carry ``decay[s] * slot0_action``
+            (decayed echoes, matching the user's deployment semantics that
+            future ride actions are unavailable at inference time)."""
+            slot0_a = _slot0_action_3frames().to(device=device, dtype=dtype)
+            assert slot0_a.shape[1] == npb, slot0_a.shape
+            D = int(slot0_a.shape[-1])
+            per_frame = torch.zeros(
+                B, num_slots_in_window * npb, D, device=device, dtype=dtype,
+            )
+            for s in range(num_slots_in_window):
+                decay = float(self.action_decay_per_slot[s])
+                f0 = s * npb
+                f1 = f0 + npb
+                per_frame[:, f0:f1, :] = decay * slot0_a
+            modulation = self._compute_live_modulation(
+                per_frame, device=device, dtype=dtype,
+            )
+            action_tokens = self._compute_live_action_tokens(
+                per_frame, device=device, dtype=dtype,
+            )
+            return self._prepare_conditional(prompt_embeds, modulation, action_tokens)
+
+        def _forward_live(denoise_cond: dict) -> torch.Tensor:
+            """Run one DiT forward over the current live window with
+            skip_cache_update=True. Per-slot input timestep is read from
+            each slot's ``ladder_idx``. Returns pred_x0."""
+            k = len(live_slots)
+            assert k >= 1
+            live_cat = torch.cat([x for x, _ in live_slots], dim=1).contiguous()
+            timestep = torch.zeros(B, k * npb, device=device, dtype=torch.int64)
+            for s, (_, idx) in enumerate(live_slots):
+                timestep[:, s * npb:(s + 1) * npb] = int(round(ladder_rungs[idx]))
+            self._set_skip_cache_update(True)
+            out = self.generator(
+                noisy_image_or_video=live_cat,
+                conditional_dict=denoise_cond,
+                timestep=timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=logical_frame * self.frame_seq_length,
+            )
+            return out[1]
+
+        def _commit_and_cache_refresh(
+            slot0_clean: torch.Tensor, commit_cond: dict,
+        ) -> None:
+            """Cache-refresh forward at t=0 on ``slot0_clean`` with cache
+            update ENABLED. This writes clean K/V for slot 0's 3 frames at
+            RoPE position ``logical_frame`` into the persistent cache —
+            the same pattern eval_causal_AR uses after its denoise loop
+            (``self.wrapper(pred_x0, cond, timestep=refresh_t_block=0, ...)``).
+            """
+            self._set_skip_cache_update(False)
+            ts0 = torch.zeros(B, npb, device=device, dtype=torch.int64)
+            self.generator(
+                noisy_image_or_video=slot0_clean,
+                conditional_dict=commit_cond,
+                timestep=ts0,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=logical_frame * self.frame_seq_length,
+            )
+            self._trim_committed_kv_cache()
+
+        commits_emitted = 0
+
+        def _run_P_passes(phase_tag: str):
+            """Run ``P`` forward passes over the current live window with a
+            single reusable ``denoise_cond`` (built once for this virtual
+            step). Each pass advances every live slot's ``ladder_idx`` by 1.
+            When slot 0's next ``ladder_idx`` reaches ``total_denoise`` the
+            slot is clean — commit it via a t=0 cache-refresh forward and
+            yield the record."""
+            nonlocal logical_frame, next_commit_chunk, commits_emitted, live_slots
+            # Build cond ONCE per virtual step (chunk action is fixed for
+            # all P passes within the step AND for the commit forward). The
+            # prompt_embeds slot is a reference, not recomputed; only the
+            # action_modulation / action_tokens get re-projected, and only
+            # because the chunk-wise action changes between chunks (ride
+            # actions vary sharply — chunks 0..23 of Brighton span
+            # [-0.31, +0.99] in z2). The commit cond is just the slot-0
+            # slice of the denoise cond (slot 0 carries decay=1.0 * chunk
+            # action, which is exactly what the commit forward needs).
+            k_start = len(live_slots)
+            denoise_cond = _build_cond_for_width(k_start)
+            commit_cond = {
+                "prompt_embeds": denoise_cond["prompt_embeds"],
+                "_action_modulation": denoise_cond["_action_modulation"][:, :npb, :, :].contiguous(),
+                "_action_tokens": denoise_cond["_action_tokens"][:, :npb, :].contiguous(),
+            }
+            for _p in range(P):
+                pred_x0 = _forward_live(denoise_cond)
+                rebuilt: List[Tuple[torch.Tensor, int]] = []
+                commit_now: Optional[torch.Tensor] = None
+                for s in range(len(live_slots)):
+                    slot_pred = pred_x0[:, s * npb:(s + 1) * npb].detach()
+                    _, idx = live_slots[s]
+                    next_idx = int(idx) + 1
+                    if next_idx >= total_denoise:
+                        assert s == 0, (
+                            f"unexpected non-slot-0 reaching clean at s={s} "
+                            f"pass={_p} ladder_idx={next_idx}"
+                        )
+                        commit_now = slot_pred
+                    else:
+                        next_t = float(ladder_rungs[next_idx])
+                        rebuilt.append(
+                            (self._renoise(slot_pred, int(round(next_t))), next_idx),
+                        )
+                live_slots = rebuilt
+                if commit_now is not None:
+                    assert _p == P - 1, (
+                        f"commit must fall on the last pass; got p={_p} of P={P}"
+                    )
+                    _commit_and_cache_refresh(commit_now, commit_cond)
+                    yield {
+                        "latent": commit_now.detach().to(
+                            device="cpu", dtype=torch.float32,
+                        ).clone(),
+                        "chunk_idx": int(next_commit_chunk),
+                        "action": _slot0_action_3frames().detach()[:, 0, :].to(
+                            device="cpu", dtype=torch.float32,
+                        ).clone(),
+                        "slot_timestep": 0,
+                        "phase": phase_tag,
+                    }
+                    commits_emitted += 1
+                    logical_frame += npb
+                    next_commit_chunk += 1
+
+        # --- Additive warmup: NS virtual steps, P passes each ---
+        for vk in range(1, NS + 1):
+            new_slot = torch.randn(B, npb, C, H, W, device=device, dtype=dtype)
+            live_slots.append((new_slot, 0))   # fresh noise at ladder_idx=0
+            yield from _run_P_passes("warmup")
+
+        # --- Steady state: one commit per rolling step, P passes each ---
+        while True:
+            if max_commits is not None and commits_emitted >= max_commits:
+                break
+            if next_commit_chunk >= total_ride_chunks:
+                break
+            new_slot = torch.randn(B, npb, C, H, W, device=device, dtype=dtype)
+            live_slots.append((new_slot, 0))
+            yield from _run_P_passes("steady")
