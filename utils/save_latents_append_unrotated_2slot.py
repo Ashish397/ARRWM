@@ -61,6 +61,96 @@ from wan.modules.causal_model import (
 )
 from wan.modules.attention import attention as flash_attention_fn
 
+# Per-config freqs_i cache, keyed by (id(freqs), tuple(rel_idx), h, w, head_dim/2).
+_FREQS_I_CACHE: dict = {}
+
+
+def _build_freqs_i(freqs: torch.Tensor, rel_indices: torch.Tensor,
+                   h: int, w: int, head_dim_half: int) -> torch.Tensor:
+    """Per-position complex rotation tensor; depends only on indices and grid."""
+    rel_tup = tuple(rel_indices.tolist())
+    key = (id(freqs), rel_tup, h, w, head_dim_half)
+    cached = _FREQS_I_CACHE.get(key)
+    if cached is not None:
+        return cached
+    f = rel_indices.shape[0]
+    seq_len = f * h * w
+    c = head_dim_half
+    temp_dim = c - 2 * (c // 3)
+    h_dim = c // 3
+    w_dim = c // 3
+    f_temp = freqs[rel_indices, :temp_dim].view(f, 1, 1, -1).expand(f, h, w, -1)
+    f_h = freqs[:h, temp_dim:temp_dim + h_dim].view(1, h, 1, -1).expand(f, h, w, -1)
+    f_w = freqs[:w, temp_dim + h_dim:].view(1, 1, w, -1).expand(f, h, w, -1)
+    freqs_i = torch.cat([f_temp, f_h, f_w], dim=-1).reshape(seq_len, 1, -1).contiguous()
+    _FREQS_I_CACHE[key] = freqs_i
+    return freqs_i
+
+
+def _block_relativistic_rope_fast(
+    x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor,
+    rel_indices: torch.Tensor, action_tokens_per_frame: int,
+) -> torch.Tensor:
+    """LongLive's block-relativistic RoPE, action-token-aware, fp32 path."""
+    B, L, H, D = x.shape
+    f = rel_indices.shape[0]
+    h, w = int(grid_sizes[0, 1].item()), int(grid_sizes[0, 2].item())
+    spatial_per_frame = h * w
+    a_per_f = action_tokens_per_frame
+    expected_per_frame = spatial_per_frame + a_per_f
+
+    if a_per_f > 0:
+        x_per_frame = x.view(B, f, expected_per_frame, H, D)
+        x_sp = x_per_frame[:, :, :spatial_per_frame, :, :].contiguous().view(
+            B, f * spatial_per_frame, H, D)
+        x_act = x_per_frame[:, :, spatial_per_frame:, :, :]
+    else:
+        x_sp = x[:, : f * spatial_per_frame]
+        x_act = None
+
+    seq_len = f * spatial_per_frame
+    head_dim_half = D // 2
+    freqs_i = _build_freqs_i(freqs, rel_indices, h, w, head_dim_half)
+
+    x_sp_c = torch.view_as_complex(x_sp.float().reshape(B, seq_len, H, head_dim_half, 2))
+    rotated_c = x_sp_c * freqs_i
+    rotated = torch.view_as_real(rotated_c).reshape(B, seq_len, H, D).to(x.dtype)
+    del x_sp_c, rotated_c
+
+    if x_act is not None:
+        rotated_per_frame = rotated.view(B, f, spatial_per_frame, H, D)
+        out_per_frame = torch.cat([rotated_per_frame, x_act], dim=2)
+        return out_per_frame.contiguous().view(B, L, H, D)
+    return rotated
+
+
+def _rotate_chunked(
+    x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor,
+    rel_indices: torch.Tensor, action_tokens_per_frame: int,
+    batch_frames: int = 6,
+) -> torch.Tensor:
+    """Wrap _block_relativistic_rope_fast to rotate in batches of frames,
+    bounding peak memory for very long prefixes (the rotation upcasts
+    spatial tokens to fp32/complex64, costing 4× the bf16 footprint)."""
+    F = rel_indices.shape[0]
+    if F <= batch_frames or x.shape[1] == 0:
+        return _block_relativistic_rope_fast(
+            x, grid_sizes, freqs, rel_indices, action_tokens_per_frame,
+        )
+    h, w = int(grid_sizes[0, 1].item()), int(grid_sizes[0, 2].item())
+    fs = h * w + action_tokens_per_frame
+    out_parts = []
+    for f_start in range(0, F, batch_frames):
+        f_end = min(f_start + batch_frames, F)
+        f_count = f_end - f_start
+        sub_idx = rel_indices[f_start:f_end]
+        gs_sub = grid_sizes.clone(); gs_sub[:, 0] = f_count
+        x_sub = x[:, f_start * fs : f_end * fs]
+        out_parts.append(_block_relativistic_rope_fast(
+            x_sub, gs_sub, freqs, sub_idx, action_tokens_per_frame,
+        ))
+    return torch.cat(out_parts, dim=1)
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(name)s] %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -166,75 +256,80 @@ def patched_forward(
             "current_end": current_end, "is_recompute": is_recompute,
         }
 
-    # ---- Apply RoPE ----
-    # Cache portion (positions [0, local_start_index)) gets rotated with start_frame=0.
-    # The live portion (slot_0 + slot_1 in 2slot mode; just slot_0_clean in commit mode)
-    # gets rotated per-slot at their respective global frame indices.
+    # ---- Block-Relativistic RoPE (window-relative, LongLive Infinity-RoPE) ----
+    # Convention: cache prefix at indices [0..prefix_frames-1], live slots at
+    # [prefix_frames..num_cache_frames-1]. Q rotated at the same indices its
+    # corresponding K occupies, so Q-K relative offsets always match.
+    # Once the cache fills (rolled=True), Q and live-slot K indices anchor
+    # at the END of local_attn_size — gives the bounded "infinite" property.
 
-    def _rotate_one(t, gs, start_frame):
-        if a_per_f > 0:
-            t_sp, t_act = _separate_action_tokens(t, gs, a_per_f)
-            r_sp = causal_rope_apply(t_sp, gs, freqs, start_frame=start_frame)
-            return _merge_action_tokens(r_sp, t_act, gs, a_per_f)
-        return causal_rope_apply(t, gs, freqs, start_frame=start_frame)
+    rolled = (cache_update_info["action"] == "roll_and_insert")
+    prefix_frames = local_start_index // frame_seqlen
+    num_cache_frames = local_end_index // frame_seqlen
+    live_frames = num_cache_frames - prefix_frames  # 2*npb in 2slot mode, npb in commit
 
-    def _rotate(t, gs, start_frame, batch_frames=9):
-        """Rotate in BATCH_FRAMES-sized chunks to keep peak memory bounded
-        (causal_rope_apply casts to fp64/complex which is 4× memory of bf16)."""
-        if t.shape[1] == 0:
-            return t
-        F = int(gs[0, 0].item())
-        if F <= batch_frames:
-            return _rotate_one(t, gs, start_frame)
-        token_per_frame = t.shape[1] // F
-        out_parts = []
-        for f_start in range(0, F, batch_frames):
-            f_end = min(f_start + batch_frames, F)
-            f_count = f_end - f_start
-            t_sub = t[:, f_start * token_per_frame : f_end * token_per_frame]
-            gs_sub = gs.clone(); gs_sub[:, 0] = f_count
-            r = _rotate_one(t_sub, gs_sub, start_frame=start_frame + f_start)
-            out_parts.append(r)
-        return torch.cat(out_parts, dim=1)
+    if rolled:
+        # Bounded: live K at end of local_attn_size; cache prefix at [0..prefix_frames-1]
+        live_start_idx = self.local_attn_size - live_frames
+    else:
+        live_start_idx = prefix_frames
 
-    # ---- Rotate cache prefix every call (no caching to keep memory bounded). ----
-    if local_start_index > 0:
-        prefix_frames = local_start_index // frame_seqlen
+    # ---- Rotated prefix (cache up to [0..prefix_frames-1]). Computed every
+    # call (no per-layer cache — that would accumulate 30 × growing-prefix
+    # tensors and OOM well before the underlying kv_cache rolls).
+    if prefix_frames > 0:
         grid_prefix = grid_sizes.clone(); grid_prefix[:, 0] = prefix_frames
         prefix_k = temp_k[:, :local_start_index]
-        rotated_prefix = _rotate(prefix_k, grid_prefix, start_frame=0).type_as(v)
+        prefix_rel_indices = torch.arange(0, prefix_frames, device=k.device)
+        # Chunk the prefix rotation to bound peak memory for long caches.
+        rotated_prefix = _rotate_chunked(
+            prefix_k, grid_prefix, freqs, prefix_rel_indices, a_per_f,
+            batch_frames=6,
+        )
     else:
         rotated_prefix = temp_k[:, :0]
 
-    # ---- Rotate live K and Q ----
+    # ---- Live region rotation ----
     if state.mode == "commit":
-        # Just-committed slot_0 at G_0; slot_0 alone, npb frames.
+        # Just-committed slot 0 alone, npb frames at indices [live_start_idx..+npb-1]
         live_k_unrot = temp_k[:, local_start_index:local_end_index]
         grid_live = grid_sizes.clone(); grid_live[:, 0] = npb
-        live_k_rot = _rotate(live_k_unrot, grid_live, start_frame=state.G_0).type_as(v)
+        live_rel_idx = torch.arange(live_start_idx, live_start_idx + npb, device=k.device)
+        live_k_rot = _block_relativistic_rope_fast(
+            live_k_unrot, grid_live, freqs, live_rel_idx, a_per_f,
+        )
         rotated_temp_k = torch.cat([rotated_prefix, live_k_rot], dim=1)
-        # Q: slot_0 alone at G_0
-        roped_q = _rotate(q, grid_live, start_frame=state.G_0).type_as(v)
-        # Single attention call
+        # Q rotated at same indices
+        roped_q = _block_relativistic_rope_fast(
+            q, grid_live, freqs, live_rel_idx, a_per_f,
+        )
         v_full = temp_v[:, :local_end_index]
         attn_out = flash_attention_fn(roped_q, rotated_temp_k, v_full)
     else:
-        # 2-slot pass: live has slot_0 and slot_1, each npb frames.
-        # K layout: cache prefix + slot_0_K + slot_1_K
-        live_k_full = temp_k[:, local_start_index:local_end_index]  # 2*npb frames worth
+        # 2-slot pass: slot 0 at [live_start_idx..+npb-1], slot 1 at [live_start_idx+npb..+2*npb-1]
+        live_k_full = temp_k[:, local_start_index:local_end_index]  # 2*npb frames
         slot0_k = live_k_full[:, :npb * frame_seqlen]
         slot1_k = live_k_full[:, npb * frame_seqlen:]
         grid_one_slot = grid_sizes.clone(); grid_one_slot[:, 0] = npb
-        rotated_slot0_k = _rotate(slot0_k, grid_one_slot, start_frame=state.G_0).type_as(v)
-        rotated_slot1_k = _rotate(slot1_k, grid_one_slot, start_frame=state.G_1).type_as(v)
+        slot0_rel_idx = torch.arange(live_start_idx, live_start_idx + npb, device=k.device)
+        slot1_rel_idx = torch.arange(live_start_idx + npb, live_start_idx + 2 * npb, device=k.device)
+        rotated_slot0_k = _block_relativistic_rope_fast(
+            slot0_k, grid_one_slot, freqs, slot0_rel_idx, a_per_f,
+        )
+        rotated_slot1_k = _block_relativistic_rope_fast(
+            slot1_k, grid_one_slot, freqs, slot1_rel_idx, a_per_f,
+        )
         rotated_temp_k = torch.cat([rotated_prefix, rotated_slot0_k, rotated_slot1_k], dim=1)
-        # V (un-rotated; same layout)
         v_full = temp_v[:, :local_end_index]
-        # Q: slot_0 (npb frames) + slot_1 (npb frames)
+        # Q: slot_0 at slot0_rel_idx, slot_1 at slot1_rel_idx
         slot0_q = q[:, :npb * frame_seqlen]
         slot1_q = q[:, npb * frame_seqlen:]
-        roped_slot0_q = _rotate(slot0_q, grid_one_slot, start_frame=state.G_0).type_as(v)
-        roped_slot1_q = _rotate(slot1_q, grid_one_slot, start_frame=state.G_1).type_as(v)
+        roped_slot0_q = _block_relativistic_rope_fast(
+            slot0_q, grid_one_slot, freqs, slot0_rel_idx, a_per_f,
+        )
+        roped_slot1_q = _block_relativistic_rope_fast(
+            slot1_q, grid_one_slot, freqs, slot1_rel_idx, a_per_f,
+        )
 
         if state.mask_mode == "bidirectional":
             # Single attention call: Q = [slot0_q, slot1_q], K = full, V = full
@@ -274,6 +369,7 @@ def restore():
         del CausalWanSelfAttention._original_forward
     if hasattr(CausalWanSelfAttention, "_state"):
         del CausalWanSelfAttention._state
+    _FREQS_I_CACHE.clear()
 
 
 @torch.no_grad()
@@ -341,22 +437,51 @@ def run(
             )
         committed_frames = num_frame_per_block
 
-        # live_slots: list of (latent, ladder_idx). Slot 0 first.
-        # Initialize in steady-state pattern: slot 0 at idx P (about to finish
-        # in P passes), slot 1 at idx 0 (just started). Slot 0's first commit
-        # is technically a warmup artefact (fresh noise pseudo-denoised through
-        # only P rungs) but lets us avoid all warmup branching.
-        live_slots: List[Tuple[torch.Tensor, int]] = []
-        for ladder_idx_init in (P, 0):
-            t_init = ladder[ladder_idx_init]
-            fresh = torch.randn(
-                [B, num_frame_per_block, C, H, W],
-                dtype=torch.float32, device=device,
+        # === WARMUP: 1-slot phase, P passes ===
+        # Run slot 0 alone through ladder rungs 0..P, so it ends at idx P
+        # *with proper denoising history* before slot 1 is introduced.
+        # Without this, slot 0's first commit is mush (fresh N(0,I) tagged
+        # as t=367) and pollutes the cache for every subsequent step.
+        warmup_lat = torch.randn(
+            [B, num_frame_per_block, C, H, W],
+            dtype=torch.float32, device=device,
+        ).to(dtype)
+        warmup_idx = 0
+        first_commit_chunk = committed_frames // num_frame_per_block
+        first_commit_fa = noisy_fa_full[:,
+            first_commit_chunk * num_frame_per_block
+            : (first_commit_chunk + 1) * num_frame_per_block,
+        ]
+        first_commit_cond = pipe._build_action_cond_chunk(
+            prompt_embeds_dev, first_commit_fa, num_frames=num_frame_per_block,
+        )
+        for _ in range(P):
+            state.mode = "commit"
+            t_val = ladder[warmup_idx]
+            tt_w = torch.full(
+                [B, num_frame_per_block], t_val, device=device, dtype=torch.float32,
             )
-            # The slot's "input" at idx P is what an in-progress denoise looks
-            # like at that ladder rung. We sample from the noise distribution
-            # at that t (random N(0,I) treated as a noised image at t).
-            live_slots.append((fresh.to(dtype), ladder_idx_init))
+            with torch.amp.autocast("cuda", dtype=dtype):
+                out_w = pipe.wrapper(
+                    noisy_image_or_video=warmup_lat,
+                    conditional_dict=first_commit_cond, timestep=tt_w,
+                    kv_cache=kv_cache, crossattn_cache=crossattn_cache,
+                    current_start=committed_frames * frame_seq_length,
+                )
+            pred_x0_w = out_w[1]
+            warmup_idx += 1
+            if warmup_idx >= total_denoise:
+                break
+            next_t = ladder[warmup_idx]
+            flat = pred_x0_w.flatten(0, 1).float()
+            fn = torch.randn_like(flat)
+            ft = torch.full((flat.shape[0],), next_t, device=device, dtype=torch.float32)
+            warmup_lat = scheduler.add_noise(flat, fn, ft).view(
+                B, num_frame_per_block, C, H, W).to(dtype)
+        log.info("warmup done: slot 0 at ladder_idx=%d after %d 1-slot passes",
+                 warmup_idx, P)
+
+        live_slots: List[Tuple[torch.Tensor, int]] = [(warmup_lat, warmup_idx)]
         generated: List[torch.Tensor] = []
 
         while len(generated) < num_gen_chunks:
