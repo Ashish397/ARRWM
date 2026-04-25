@@ -2056,18 +2056,23 @@ class RollingStaircaseTrainingPipeline:
             k = len(live_slots)
             assert k >= 1
             live_cat = torch.cat([x for x, _ in live_slots], dim=1).contiguous()
-            timestep = torch.zeros(B, k * npb, device=device, dtype=torch.int64)
+            # Match eval_causal_AR: float32 timestep tensor.
+            timestep = torch.zeros(B, k * npb, device=device, dtype=torch.float32)
             for s, (_, idx) in enumerate(live_slots):
-                timestep[:, s * npb:(s + 1) * npb] = int(round(ladder_rungs[idx]))
+                timestep[:, s * npb:(s + 1) * npb] = float(ladder_rungs[idx])
             self._set_skip_cache_update(True)
-            out = self.generator(
-                noisy_image_or_video=live_cat,
-                conditional_dict=denoise_cond,
-                timestep=timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=logical_frame * self.frame_seq_length,
-            )
+            # Match eval_causal_AR's forward: bf16 autocast around the DiT
+            # call. The ODE student was trained under autocast, so inference
+            # under autocast stays on-distribution numerically.
+            with torch.amp.autocast("cuda", dtype=dtype):
+                out = self.generator(
+                    noisy_image_or_video=live_cat,
+                    conditional_dict=denoise_cond,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=logical_frame * self.frame_seq_length,
+                )
             return out[1]
 
         def _commit_and_cache_refresh(
@@ -2080,15 +2085,16 @@ class RollingStaircaseTrainingPipeline:
             (``self.wrapper(pred_x0, cond, timestep=refresh_t_block=0, ...)``).
             """
             self._set_skip_cache_update(False)
-            ts0 = torch.zeros(B, npb, device=device, dtype=torch.int64)
-            self.generator(
-                noisy_image_or_video=slot0_clean,
-                conditional_dict=commit_cond,
-                timestep=ts0,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=logical_frame * self.frame_seq_length,
-            )
+            ts0 = torch.zeros(B, npb, device=device, dtype=torch.float32)
+            with torch.amp.autocast("cuda", dtype=dtype):
+                self.generator(
+                    noisy_image_or_video=slot0_clean,
+                    conditional_dict=commit_cond,
+                    timestep=ts0,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=logical_frame * self.frame_seq_length,
+                )
             self._trim_committed_kv_cache()
 
         commits_emitted = 0
@@ -2133,9 +2139,21 @@ class RollingStaircaseTrainingPipeline:
                         commit_now = slot_pred
                     else:
                         next_t = float(ladder_rungs[next_idx])
-                        rebuilt.append(
-                            (self._renoise(slot_pred, int(round(next_t))), next_idx),
+                        # Re-noise to the next rung in fp32 (matches
+                        # eval_causal_AR: ``flat = pred_x0.flatten(0,1).float()``
+                        # -> ``add_noise`` -> cast back to self.dtype).
+                        flat = slot_pred.flatten(0, 1).float()
+                        flat_noise = torch.randn_like(flat)
+                        flat_t = torch.full(
+                            (flat.shape[0],), next_t,
+                            device=flat.device, dtype=torch.float32,
                         )
+                        renoised = (
+                            self.scheduler.add_noise(flat, flat_noise, flat_t)
+                            .view(slot_pred.shape)
+                            .to(dtype=dtype)
+                        )
+                        rebuilt.append((renoised, next_idx))
                 live_slots = rebuilt
                 if commit_now is not None:
                     assert _p == P - 1, (
