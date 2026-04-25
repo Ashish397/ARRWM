@@ -16,6 +16,7 @@ __all__ = [
     "DMD2RealMSELAM_Actions",
     "DMD2B2BLAM",
     "DMD2B2BLAM_actions",
+    "ActionForcingDMD",
     "MSE_DMD",
     "MSE_DMD_LAM",
     "MSE_DMD_LAM_ACTION",
@@ -32,6 +33,7 @@ _MODULE_MAP = {
     "DMD2RealMSELAM_Actions": ".dmd2realmselam_actions",
     "DMD2B2BLAM": ".dmd2b2blam",
     "DMD2B2BLAM_actions": ".dmd2b2blam_actions",
+    "ActionForcingDMD": ".dmd_action_forcing",
     "MSE_DMD": ".mse_dmd",
     "MSE_DMD_LAM": ".mse_dmd_lam",
     "MSE_DMD_LAM_ACTION": ".mse_dmd_lam_action",
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
     from .dmd2realmselam_actions import DMD2RealMSELAM_Actions as DMD2RealMSELAM_Actions  # pragma: no cover
     from .dmd2b2blam import DMD2B2BLAM as DMD2B2BLAM  # pragma: no cover
     from .dmd2b2blam_actions import DMD2B2BLAM_actions as DMD2B2BLAM_actions  # pragma: no cover
+    from .dmd_action_forcing import ActionForcingDMD as ActionForcingDMD  # pragma: no cover
     from .mse_dmd import MSE_DMD as MSE_DMD  # pragma: no cover
     from .mse_dmd_lam import MSE_DMD_LAM as MSE_DMD_LAM  # pragma: no cover
     from .mse_dmd_lam_action import MSE_DMD_LAM_ACTION as MSE_DMD_LAM_ACTION  # pragma: no cover

@@ -1,0 +1,261 @@
+# Phase-1 Action-Forcing DMD config (NO STAIRCASE) — AUX LOSSES ENABLED
+#
+# Identical to ``configs/action_forcing_phase1.yaml`` (CF chunkwise DMD,
+# 21-frame action-forcing rollout, infinity-RoPE, MAE extensions) PLUS
+# the auxiliary action critic + frozen-teacher z-guidance loss path.
+# Keep this YAML in lockstep with the base; only the AUX section
+# below should diverge.
+#
+# Aux-loss recipe (mirrors the ODE distill teacher trainer at
+# ``configs/action_ode_distill.yaml``):
+#   - action_teacher_mode="all": CoTracker + ss_vae teacher built and
+#     run per iter; teacher z is computed over the full 21-frame
+#     baseline rollout window.
+#   - action_critic_aux_enabled=true: instantiate + un-freeze the
+#     ActionCritic (the trainer's ``_build_model`` flips
+#     ``requires_grad_(True)`` + ``train()`` + DDP-wraps when this is
+#     true).
+#   - critic optimizer: AdamW lr=3e-4 wd=0.0 (per-step trained
+#     ``critic_updates_per_step`` times, INDEPENDENT of the generator
+#     optimizer).
+#   - generator z-guidance: gen-side path runs the FROZEN critic on
+#     the live ``pred_x0`` and adds an MSE loss between the critic's
+#     z2/z7 prediction and the commanded action z2/z7. Warmup 500
+#     steps (linear ramp from 0 to ``generator_action_z_guidance_weight``).
+#
+# Memory cost over the base config: ~2-3 GB for the cotracker+ss_vae
+# teacher (per rank, fp16 autocast on cotracker forward) + the critic
+# parameters (~few hundred MB at base_channels=128, num_blocks=4).
+# Wallclock cost: cotracker forward dominates (~150ms / iter at
+# grid=10, fp16 on H100), so expect ~30-60% throughput hit vs the
+# pure-DMD base config. The benefit is action-faithful generations
+# (the student is forced to match cotracker-recoverable motion) at
+# the cost of throughput; flip back to the base config for pure DMD
+# A/B.
+
+config_name: action-forcing-phase1-aux
+run_name: action_forcing_phase1_aux
+
+seed: 0
+mixed_precision: true
+log_interval: 10
+checkpoint_interval: 500
+max_steps: 10000
+max_grad_norm: 10.0
+auto_resume: true
+strict_resume_load: false
+strict_ode_load: false
+
+distillation: action_forcing
+
+wandb_project: longlive-phase1
+wandb_dir: ./wandb
+disable_wandb: false
+
+log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
+
+# ---------------------------------------------------------------------------
+# Data (verbatim from the base config)
+# ---------------------------------------------------------------------------
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
+caption_root: /projects/u6ex/fbots/frodobots_captions/train
+motion_root: /projects/u6ex/fbots/frodobots_motion
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+action_dims: [2, 7]
+raw_action_dim: 2
+action_dim: 2
+enable_adaln_zero: true
+action_conditioning_mode: both
+
+min_ride_frames: 21
+max_rides: null
+max_ride_frames: 105
+
+sort_rides_by_length: asc
+num_workers: 2
+
+# ---------------------------------------------------------------------------
+# Model (verbatim from the base config)
+# ---------------------------------------------------------------------------
+distribution_loss: dmd_action_forcing
+model_name: Wan2.1-T2V-1.3B
+real_model_name: Wan2.1-T2V-1.3B
+fake_model_name: Wan2.1-T2V-1.3B
+num_training_frames: 21
+num_train_timestep: 1000
+denoising_loss_type: flow
+gradient_checkpointing: true
+
+rollout_frames: null
+
+mae_extension_threshold: 0.5
+mae_extension_max_extra_chunks: 13
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 21
+  sink_size: 3
+
+i2v: false
+text_pre_encoded: true
+
+infinity_rope: true
+
+# ---------------------------------------------------------------------------
+# CF-style pipeline geometry (verbatim from base)
+# ---------------------------------------------------------------------------
+num_frame_per_block: 3
+chunks_per_rolling_step: 1
+same_step_across_blocks: true
+last_step_only: false
+context_noise: 0
+denoising_step_list: [1000, 625, 500, 312.5]
+
+action_patch_enabled: true
+action_modulation_activation: silu
+
+# ---------------------------------------------------------------------------
+# AUX HEADS — INSTANTIATED AND TRAINABLE (this is the diff vs base).
+# ---------------------------------------------------------------------------
+# Action critic head: instantiated AND un-frozen by the trainer's
+# ``_build_model``. Independent AdamW optimizer (see ``critic_lr``
+# below) trains it for ``critic_updates_per_step`` steps per
+# generator step on the teacher z target. Architecture matches the
+# ODE distill teacher exactly so the ODE checkpoint's critic
+# state_dict loads strictly into this head as a warm start.
+action_critic_aux_enabled: true
+action_critic_z_out_dim: 8
+action_critic_base_channels: 128
+action_critic_num_blocks: 4
+action_critic_dims: [2, 7]
+
+# State-probe head: STILL INSTANTIATED (for ODE checkpoint compat) but
+# NOT TRAINED. The action-forcing trainer does NOT consume state-probe
+# losses — Phase-1 Action-Forcing's contract is "DMD + action critic
+# only". Setting ``state_head_loss_weight: 0.0`` here is a
+# belt-and-suspenders no-op (the trainer never reads it), but
+# documents intent.
+state_probe_aux_enabled: true
+state_head_out_dim: 8
+state_probe_dim: 256
+state_probe_num_heads: 8
+state_probe_n_taps: 6
+state_head_loss_weight: 0.0
+state_guidance_weight: 0.0
+
+# ---------------------------------------------------------------------------
+# Action teacher — ON.
+# ---------------------------------------------------------------------------
+# CoTracker + ss_vae motion teacher built per rank (~2-3 GB extra GPU
+# memory, ~150ms / iter forward cost on H100). The trainer calls
+# ``_compute_teacher_z_per_slot(pred_x0)`` (inherited from the
+# rolling-staircase parent) every iter to produce the chunkwise
+# teacher z; ``slot0`` vs ``all`` is irrelevant here because there's
+# no staircase concept (the action-forcing rollout is one window of
+# 7 chunks, all of which feed into the critic loss). Set to "all"
+# for full coverage.
+action_teacher_mode: "all"
+
+cotracker_source_dir: /home/u6ex/as1748.u6ex/.cache/torch/hub/facebookresearch_co-tracker_main
+cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/scaled_offline.pth
+
+# ---------------------------------------------------------------------------
+# Critic optimizer + z-guidance recipe (mirrors action_ode_distill.yaml)
+# ---------------------------------------------------------------------------
+# Critic AdamW — INDEPENDENT of the generator/fake_score optimizers.
+# The trainer's ``_compute_action_critic_losses`` runs an
+# ``ac.zero_grad / ac.backward / ac.clip / ac.step`` cycle exactly
+# ``critic_updates_per_step`` times per generator step (frozen
+# motion teacher target).
+critic_lr: 3.0e-04
+critic_betas: [0.9, 0.999]
+critic_eps: 1.0e-08
+critic_weight_decay: 0.0
+critic_max_grad_norm: 10.0
+critic_updates_per_step: 2
+
+# Critic z-loss weight (multiplies the chunkwise weighted-MSE
+# between predicted z and teacher z; z2/z7 dims weighted 2x because
+# they're the action-relevant dims).
+action_critic_z_loss_weight: 0.25
+
+# Generator z-guidance — adds an MSE loss between the FROZEN
+# critic's z2/z7 prediction on ``pred_x0`` (graph-carrying) and the
+# commanded z2/z7. Warms up linearly over ``z_guidance_warmup_steps``
+# starting from ``warmup_steps`` (``warmup_steps`` is shared with
+# the broader optim warmup; default 0 here so guidance ramps in
+# immediately).
+generator_action_z_guidance_weight: 0.125
+z_guidance_warmup_steps: 500
+warmup_steps: 0
+
+# ---------------------------------------------------------------------------
+# Checkpoints (ODE-init student + v14 teacher) — verbatim from base
+# ---------------------------------------------------------------------------
+ode_generator_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/action_ode_distill_E/action_ode_step0001000.pt
+
+v14_teacher_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_balanced_weunz/causal_lora_step0006600.pt
+v14_lora:
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+
+# ---------------------------------------------------------------------------
+# DMD + critic loss config (verbatim from base)
+# ---------------------------------------------------------------------------
+dmd_loss_weight: 1.0
+real_guidance_scale: 3.0
+fake_guidance_scale: 0.0
+timestep_shift: 5.0
+ts_schedule: false
+ts_schedule_max: false
+min_score_timestep: 0
+
+gan_loss_weight: 0.0
+
+fake_score_updates_enabled: true
+dfake_gen_update_ratio: 1
+
+ema_weight: 0.99
+ema_start_step: 200
+
+# ---------------------------------------------------------------------------
+# Optimizer (CF chunkwise DMD parity, verbatim)
+# ---------------------------------------------------------------------------
+lr: 2.0e-06
+betas: [0.0, 0.999]
+eps: 1.0e-08
+weight_decay: 0.01
+train_action_projection: true
+train_action_token_projection: true
+
+fake_lr: 4.0e-07
+fake_betas: [0.0, 0.999]
+fake_eps: 1.0e-08
+fake_weight_decay: 0.01
+fake_max_grad_norm: 10.0
+
+debug_find_unused_parameters: false
+assert_grad_uniformity: false
+nccl_timeout_minutes: 60
+
+# ---------------------------------------------------------------------------
+# Visualization (verbatim from base)
+# ---------------------------------------------------------------------------
+vis_wallclock_seconds: 0
+vis_num_chunks: 0
+vis_fps: 8
+vis_to_wandb: false
+vis_save_local: false
+vis_emit_on_first_step: false
+
+# ---------------------------------------------------------------------------
+# Trainer-internal feature flags (verbatim)
+# ---------------------------------------------------------------------------
+slots_per_rank: 1
+rolling_steps_per_iter: null
+collapse_mae_threshold: null
+backward_simulation: true
+independent_first_frame: false
+warp_denoising_step: false

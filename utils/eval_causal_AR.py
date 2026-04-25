@@ -1160,6 +1160,17 @@ def main():
                              "for each FIFO entry in temporal order. The 4 "
                              "denoise passes of the current chunk share this "
                              "refreshed cache. Requires --ar_cache.")
+    parser.add_argument("--infinity_rope", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="AR mode only: install LongLive-style "
+                             "Block-Relativistic RoPE (Infinity-RoPE) on the KV "
+                             "cache path. Stores un-roped K in the cache and "
+                             "rotates Q/K with bounded window-relative indices "
+                             "at attention time, fixing the chunk-boundary "
+                             "stutter caused by stale absolute rotations on long "
+                             "rollouts. Default: read 'infinity_rope' from the "
+                             "config (true if absent). Pass --no-infinity_rope "
+                             "to force the original RoPE path for A/B testing.")
 
     # ---- Per-rank data-path overrides (config doesn't always define these) ----
     parser.add_argument("--motion_root", type=str, default=None,
@@ -1223,9 +1234,16 @@ def main():
         _cfg.get("ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt")
     )
     action_dims = list(_cfg.get("action_dims", [2, 7]))
+    # Default ``infinity_rope`` to the config value (if any) — falls back
+    # to True so the rerope fix is on for fresh runs without an explicit
+    # CLI flag. ``--no-infinity_rope`` overrides the config to False.
+    if args.infinity_rope is None:
+        infinity_rope_enabled = bool(_cfg.get("infinity_rope", True))
+    else:
+        infinity_rope_enabled = bool(args.infinity_rope)
     log.info(
-        "[config] motion_root=%s  ss_vae_ckpt=%s  action_dims=%s",
-        motion_root, ss_vae_ckpt, action_dims,
+        "[config] motion_root=%s  ss_vae_ckpt=%s  action_dims=%s  infinity_rope=%s",
+        motion_root, ss_vae_ckpt, action_dims, infinity_rope_enabled,
     )
 
     out_root = Path(args.output_dir)
@@ -1391,26 +1409,33 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         mem_before = torch.cuda.memory_allocated() / (1024 ** 2)
 
+        from utils.infinity_rope import infinity_rope_active
+        base_dit_ar = pipe.wrapper.model
+        if hasattr(base_dit_ar, "get_base_model"):
+            base_dit_ar = base_dit_ar.get_base_model()
+
         t0 = time.time()
-        full_latents = pipe.generate_ar(
-            prompt_embeds=ar_prompt_embeds,
-            noisy_fa_full=noisy_fa_ar,
-            initial_latents=prefill_lat,
-            num_gen_chunks=args.ar_gen_chunks,
-            cache_chunks=args.cache_chunks,
-            chunks_per_step=args.chunks_per_step,
-            context_noise_timestep=args.context_noise_timestep,
-            ar_cache=args.ar_cache,
-            cache_refresh=args.ar_cache_refresh,
-        )
+        with infinity_rope_active(infinity_rope_enabled, base_dit_ar):
+            full_latents = pipe.generate_ar(
+                prompt_embeds=ar_prompt_embeds,
+                noisy_fa_full=noisy_fa_ar,
+                initial_latents=prefill_lat,
+                num_gen_chunks=args.ar_gen_chunks,
+                cache_chunks=args.cache_chunks,
+                chunks_per_step=args.chunks_per_step,
+                context_noise_timestep=args.context_noise_timestep,
+                ar_cache=args.ar_cache,
+                cache_refresh=args.ar_cache_refresh,
+            )
         peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
         reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
         log.info(
             "[AR][%s] rank=%d streaming rollout done in %.1fs "
-            "(K=%d, fill=%s, refresh=%s, bootstrap=%d, main=%d, seed=%d) | "
-            "mem before=%.0f MiB  peak_alloc=%.0f MiB  peak_reserved=%.0f MiB",
+            "(K=%d, fill=%s, refresh=%s, infinity_rope=%s, bootstrap=%d, "
+            "main=%d, seed=%d) | mem before=%.0f MiB  peak_alloc=%.0f MiB  "
+            "peak_reserved=%.0f MiB",
             label, rank, time.time() - t0, args.denoising_steps,
-            cache_fill_tag, args.ar_cache_refresh,
+            cache_fill_tag, args.ar_cache_refresh, infinity_rope_enabled,
             args.ar_initial_chunks if args.ar_cache else 0,
             args.ar_gen_chunks, noise_seed,
             mem_before, peak_mb, reserved_mb,
@@ -1443,9 +1468,10 @@ def main():
         target_z_ar = chunk_dev_gen[:, :n_c].contiguous()
 
         refresh_tag = "" if args.ar_cache_refresh == "append" else f"_{args.ar_cache_refresh}"
+        rerope_tag = "_rerope" if infinity_rope_enabled else ""
         tag = (
             f"{label}_{cond_tag}_ar_c{args.cache_chunks}_cps{args.chunks_per_step}"
-            f"_{cache_fill_tag}{refresh_tag}"
+            f"_{cache_fill_tag}{refresh_tag}{rerope_tag}"
         )
         raw_path = out_dir / f"{tag}_rollout_raw.mp4"
         annot_path = out_dir / f"{tag}_rollout_annotated.mp4"

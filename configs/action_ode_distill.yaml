@@ -165,6 +165,16 @@ context_frames: 3
 streaming_chunk_size: 21
 num_training_frames: 21
 
+# Infinity-RoPE (Block-Relativistic RoPE) on the KV-cache inference path.
+# When true, the eval scripts (``utils/eval_causal_AR.py``,
+# ``utils/eval_causal_AR_chain.py``) install a monkey-patch on
+# ``CausalWanSelfAttention.forward`` that stores un-roped K in the cache
+# and rotates Q/cached-K with bounded window-relative indices at attention
+# time. Fixes the chunk-boundary stutter from the default cache-stale-
+# rotation path. No effect on training or chain-mode inference (those
+# don't use kv_cache). CLI flag: --infinity_rope / --no-infinity_rope.
+infinity_rope: true
+
 # Model / scheduler
 model_name: Wan2.1-T2V-1.3B
 num_train_timestep: 1000

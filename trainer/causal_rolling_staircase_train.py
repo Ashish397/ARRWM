@@ -145,6 +145,12 @@ class RollingStaircaseDMDTrainer:
             self.config = config_path_or_obj
             self.config_path = "<in-memory>"
 
+        # CF-parity #4: enable TF32 globally. No-op for our bf16 hot path,
+        # but matches CF's ``Trainer.__init__`` (Causal-Forcing/trainer/
+        # distillation.py:22-23) and helps any fp32 fallback paths.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
         # DDP setup.
         self._setup_distributed()
         self.device = torch.device(f"cuda:{self.local_rank}")
@@ -152,6 +158,15 @@ class RollingStaircaseDMDTrainer:
 
         self.is_main_process = self.rank == 0
         self._configure_logging()
+
+        # CF-parity #3: per-rank seeding. CF (Causal-Forcing/trainer/
+        # distillation.py:36-41) draws a single seed on rank 0, broadcasts
+        # it, then offsets by ``global_rank`` so each rank's stochastic
+        # ops are decorrelated. PyTorch's default /dev/urandom seeding
+        # already gives this in practice, but doing it explicitly makes
+        # the run reproducible from a single seed and matches CF's code
+        # path byte-for-byte.
+        self._seed_per_rank()
 
         # Mixed precision dtype.
         self.use_mixed_precision = bool(getattr(self.config, "mixed_precision", True))
@@ -211,6 +226,53 @@ class RollingStaircaseDMDTrainer:
             level=level,
             format=f"%(asctime)s [rank {self.rank}] %(levelname)s %(message)s",
         )
+
+    def _seed_per_rank(self) -> None:
+        """Set ``(seed + global_rank)`` on torch / cuda / numpy / random.
+
+        Mirrors Causal-Forcing's pattern at ``Causal-Forcing/trainer/
+        distillation.py:36-41``: when ``config.seed == 0`` rank 0 draws a
+        random uint32 and broadcasts it; otherwise the configured seed
+        is used directly. Each rank then offsets by its global rank so
+        per-rank stochastic ops (DMD timestep sampling, ``add_noise``
+        noise) are decorrelated. Lockstep ops we actually need synced
+        (``exit_flag`` selection, future ``num_generated_blocks``) are
+        explicit ``dist.broadcast``-es elsewhere.
+        """
+        import random as _py_random
+        try:
+            import numpy as _np
+            _has_numpy = True
+        except Exception:
+            _has_numpy = False
+
+        cfg_seed = int(getattr(self.config, "seed", 0) or 0)
+        if cfg_seed == 0:
+            if dist.is_initialized():
+                seed_t = torch.randint(
+                    1, 2**31 - 1, (1,), device=self.device, dtype=torch.long,
+                )
+                dist.broadcast(seed_t, src=0)
+                cfg_seed = int(seed_t.item())
+            else:
+                cfg_seed = int(torch.randint(1, 2**31 - 1, (1,)).item())
+            try:
+                OmegaConf.update(self.config, "seed", cfg_seed, merge=True)
+            except Exception:
+                pass
+
+        rank_seed = cfg_seed + int(self.rank)
+        torch.manual_seed(rank_seed)
+        torch.cuda.manual_seed_all(rank_seed)
+        _py_random.seed(rank_seed)
+        if _has_numpy:
+            _np.random.seed(rank_seed % (2**32 - 1))
+
+        if self.is_main_process:
+            logging.info(
+                "[seed] base=%d rank_seed=%d (per-rank offset by global rank)",
+                cfg_seed, rank_seed,
+            )
 
     def _build_model(self) -> None:
         # Alias a few config fields expected by the DMD model's `__init__`
