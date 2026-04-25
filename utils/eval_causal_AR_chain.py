@@ -10,16 +10,31 @@ every chunk thereafter until the cache rolls them out. Chain never has
 this problem because it re-runs the context tokens through the whole
 transformer at every denoise step, in lockstep with the noisy tokens.
 
-This script replaces AR's persistent KV cache with a **latent FIFO**:
+This script replaces AR's persistent KV cache with a **latent FIFO**.
+Two refresh modes are supported (``--refresh_mode``):
 
-  * Saves the last ``--fifo_size`` committed ``pred_x0`` latent chunks
-    (default 3 chunks = 9 frames).
-  * At each denoise step of each chunk, concatenates the FIFO latents
-    with the current 3-frame noisy chunk into a single sequence and
-    feeds the **full window** through the training forward in one
-    shot. The model recomputes K/V for the context tokens from raw
-    latents at every transformer layer, every denoise step — exactly
-    what chain does.
+  * ``per_pass`` (default, the original AR_refresh recipe):
+    concatenates the FIFO latents with the current 3-frame noisy
+    chunk into a single sequence and feeds the full window through
+    the TRAINING forward (``_forward_train``, ``clean_x=None``,
+    ``kv_cache=None``) at every denoise step. The model recomputes
+    K/V for the context tokens from raw latents at every transformer
+    layer, every denoise step — exactly what chain does. Cost: 4
+    large forwards/chunk (~4.00× a single-chunk forward).
+
+  * ``per_chunk`` (LongLive-inspired recache, "Recommendation #1"):
+    at the start of every chunk, rebuilds a real ``kv_cache`` from
+    the FIFO via N sequential 3-frame refresh forwards through the
+    INFERENCE path (``_forward_inference``, ``current_start``
+    advancing by 3 frames per refresh, ``t=context_noise_timestep``).
+    Then runs the 4 denoise passes as 3-frame ``_forward_inference``
+    calls at ``current_start = N*3*fsl``. Passes 2-4 append/overwrite
+    only the current 3 frames' K/V. Cost: N refresh + 4 denoise
+    small forwards per chunk (~1.5× a single-chunk forward for
+    N=3); much faster than ``per_pass`` but shares numerics with
+    ``eval_causal_AR.py --ar_cache_refresh full_fifo`` so it may or
+    may not retain ``per_pass`` 's visual quality. Use an A/B
+    comparison to decide.
   * Per-frame timestep: context frames at ``context_noise_timestep``
     (default 0.0, matching AR's cache-refresh t), current chunk at the
     live denoising timestep.
@@ -101,6 +116,10 @@ from utils.eval_causal_AR import (
     FRAME_SPATIAL_TOKENS,
     BASE_CHUNK_FRAMES,
     DEFAULT_DENOISING_STEPS,
+    _initialize_kv_cache,
+    _initialize_crossattn_cache,
+    _reset_kv_cache,
+    _set_attention_window,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s | %(message)s")
@@ -136,6 +155,7 @@ class ODEARRefreshPipeline(ODEChainPipeline):
         num_gen_chunks: int,
         fifo_size: int = DEFAULT_FIFO_SIZE,
         context_noise_timestep: float = 0.0,
+        refresh_mode: str = "per_pass",
     ) -> torch.Tensor:
         """AR rollout with per-step context K/V recomputation.
 
@@ -173,6 +193,11 @@ class ODEARRefreshPipeline(ODEChainPipeline):
         assert self.ode_model is not None and self.wrapper is not None
         assert self.denoising_step_list is not None, "call set_denoising_steps() first"
         assert fifo_size >= 1
+        if refresh_mode not in ("per_pass", "per_chunk"):
+            raise SystemExit(
+                f"AR_refresh: unknown refresh_mode={refresh_mode!r}; "
+                "expected 'per_pass' or 'per_chunk'."
+            )
 
         base_dit = self.wrapper.model
         if hasattr(base_dit, "get_base_model"):
@@ -183,39 +208,74 @@ class ODEARRefreshPipeline(ODEChainPipeline):
         max_window_blocks = fifo_size + 1        # e.g. 4 for fifo_size=3
         max_window_frames = max_window_blocks * num_frame_per_block  # 12
 
-        # The forward path we take is ``_forward_train`` (clean_x=None,
-        # kv_cache=None). It inspects ``base_dit.num_frame_per_block``
-        # and ``base_dit.block_mask``; we set/rebuild these each time
-        # the window size changes (only during the first few chunks
-        # while the FIFO is filling up).
+        # Both paths patch ``base_dit.num_frame_per_block``; ``per_pass``
+        # additionally rebuilds ``base_dit.block_mask`` per window-size
+        # change (driven inside ``_run_ar_refresh``). For ``per_chunk``
+        # we keep ``block_mask=None`` — ``_forward_inference`` does not
+        # consume the train-time block_mask (it relies on the kv_cache
+        # structure + causal flag in plain flash attention).
         base_dit.num_frame_per_block = num_frame_per_block
         action_tokens_per_frame = int(getattr(base_dit, "action_tokens_per_frame", 1))
         frame_seq_length = FRAME_SPATIAL_TOKENS + action_tokens_per_frame
 
         # wrapper.seq_len bounds the max sequence length the model can
-        # produce — must accommodate the full window.
-        required_tokens = max_window_frames * frame_seq_length
+        # produce — must accommodate the full window (``per_pass``) or
+        # a single 3-frame chunk (``per_chunk`` uses cache so each
+        # wrapper call only sees its own 3-frame queries).
+        if refresh_mode == "per_pass":
+            required_tokens = max_window_frames * frame_seq_length
+        else:
+            required_tokens = num_frame_per_block * frame_seq_length
         self.wrapper.seq_len = max(int(self.wrapper.seq_len), required_tokens)
 
-        # Temporarily set local_attn_size to -1 (global attention within
-        # the window). The ``_prepare_blockwise_causal_attn_mask`` honours
-        # ``local_attn_size`` to restrict how far back each block can
-        # attend — for the ``max_window_blocks``-block window we want
-        # every block to see everything allowed by the block-causal
-        # structure, so global is fine.
         prev_local_attn_size = getattr(base_dit, "local_attn_size", -1)
         prev_max_attention_size = getattr(base_dit, "max_attention_size", None)
-        base_dit.local_attn_size = -1
-        try:
-            # Propagate to every attention block.
+
+        if refresh_mode == "per_pass":
+            # Set local_attn_size to -1 (global attention within the
+            # window). ``_prepare_blockwise_causal_attn_mask`` honours
+            # ``local_attn_size``; for a ``max_window_blocks``-block
+            # window we want every block to see everything allowed by
+            # the block-causal structure, so global is fine.
+            base_dit.local_attn_size = -1
             for _, module in base_dit.named_modules():
                 if hasattr(module, "local_attn_size"):
                     try:
                         module.local_attn_size = -1
                     except Exception:
                         pass
+        else:
+            # ``per_chunk`` uses the kv_cache path. We size the cache
+            # and the attention window to exactly the steady-state
+            # window (``max_window_frames`` frames = N context + 1 cur).
+            # ``_set_attention_window`` propagates these to every
+            # attention block so ``_forward_inference``'s window-clip
+            # arithmetic does the right thing.
+            _set_attention_window(
+                base_dit,
+                local_attn_size_frames=max_window_frames,
+                max_tokens=max_window_frames * frame_seq_length,
+            )
+            # ``_forward_inference`` ignores ``block_mask`` (relies on
+            # kv_cache + causal flag), but clear it defensively so
+            # stale state from a prior ``per_pass`` call doesn't leak.
+            base_dit.block_mask = None
 
-            return self._run_ar_refresh(
+        try:
+            if refresh_mode == "per_pass":
+                return self._run_ar_refresh(
+                    prompt_embeds=prompt_embeds,
+                    noisy_fa_full=noisy_fa_full,
+                    initial_latents=initial_latents,
+                    num_gen_chunks=num_gen_chunks,
+                    fifo_size=fifo_size,
+                    context_noise_timestep=context_noise_timestep,
+                    base_dit=base_dit,
+                    num_frame_per_block=num_frame_per_block,
+                    frame_seq_length=frame_seq_length,
+                    max_window_blocks=max_window_blocks,
+                )
+            return self._run_ar_refresh_cached(
                 prompt_embeds=prompt_embeds,
                 noisy_fa_full=noisy_fa_full,
                 initial_latents=initial_latents,
@@ -225,7 +285,7 @@ class ODEARRefreshPipeline(ODEChainPipeline):
                 base_dit=base_dit,
                 num_frame_per_block=num_frame_per_block,
                 frame_seq_length=frame_seq_length,
-                max_window_blocks=max_window_blocks,
+                max_window_frames=max_window_frames,
             )
         finally:
             base_dit.local_attn_size = prev_local_attn_size
@@ -451,6 +511,227 @@ class ODEARRefreshPipeline(ODEChainPipeline):
         torch.cuda.empty_cache()
         return full
 
+    def _run_ar_refresh_cached(
+        self,
+        *,
+        prompt_embeds: torch.Tensor,
+        noisy_fa_full: torch.Tensor,
+        initial_latents: torch.Tensor,
+        num_gen_chunks: int,
+        fifo_size: int,
+        context_noise_timestep: float,
+        base_dit,
+        num_frame_per_block: int,
+        frame_seq_length: int,
+        max_window_frames: int,
+    ) -> torch.Tensor:
+        """AR_refresh with LongLive-style per-CHUNK cache rebuild.
+
+        For each to-be-generated chunk:
+          1. Zero the kv_cache (``_reset_kv_cache``).
+          2. Walk the FIFO oldest->newest and, for each 3-frame entry,
+             call the inference forward at ``t=context_noise_timestep``
+             with ``current_start`` advancing by 3 frames. After N
+             refresh forwards the cache holds fresh K/V for
+             ``cache[0 : 3N]``, block-causal across context blocks
+             (each block's K/V is computed with the prior blocks'
+             freshly-cached K/V in scope).
+          3. Run the 4 denoise passes as 3-frame inference forwards at
+             ``current_start = 3N * fsl``. Pass 1 appends the current
+             chunk's K/V into ``cache[3N : 3N+3]``; passes 2-4 trigger
+             the ``is_recompute`` branch and overwrite those 3 positions
+             with fresh K/V from the re-noised queries.
+          4. Commit ``pred_x0`` of the current chunk into the FIFO.
+
+        Per-chunk cost: ``N + 4`` forwards of 3 frames each. For the
+        default ``fifo_size=3`` steady state: 7 small forwards/chunk,
+        matching ``eval_causal_AR.py --ar_cache_refresh full_fifo``.
+        """
+        B = 1
+        scheduler = self.scheduler
+        scheduler.sigmas = scheduler.sigmas.to(self.device)
+        ts = self.denoising_step_list
+
+        seed_frames = int(initial_latents.shape[1])
+        if seed_frames != num_frame_per_block:
+            raise SystemExit(
+                f"AR_refresh (cached): expected exactly 1 GT chunk "
+                f"({num_frame_per_block} frames) as the seed, got "
+                f"{seed_frames} frames. Adjust --ar_initial_chunks if "
+                "you want more."
+            )
+
+        C = int(initial_latents.shape[2])
+        H = int(initial_latents.shape[3])
+        W = int(initial_latents.shape[4])
+
+        total_frames = seed_frames + num_gen_chunks * num_frame_per_block
+        if noisy_fa_full.shape[1] < total_frames:
+            raise SystemExit(
+                f"AR_refresh (cached): noisy_fa_full has "
+                f"{noisy_fa_full.shape[1]} frames; need {total_frames} "
+                f"(seed={seed_frames} + gen={num_gen_chunks}*"
+                f"{num_frame_per_block})."
+            )
+
+        noisy_fa_full = noisy_fa_full.to(device=self.device, dtype=self.dtype)
+        prompt_embeds_dev = prompt_embeds.to(device=self.device, dtype=self.dtype)
+        initial_latents_dev = initial_latents.to(device=self.device, dtype=self.dtype)
+
+        # Allocate kv_cache + crossattn_cache. Size: the steady-state
+        # window (``max_window_frames`` frames = fifo_size+1 blocks).
+        num_transformer_blocks = len(base_dit.blocks)
+        kv_cache_tokens = max_window_frames * frame_seq_length
+        kv_cache = _initialize_kv_cache(
+            num_transformer_blocks=num_transformer_blocks,
+            batch_size=B,
+            kv_cache_size_tokens=kv_cache_tokens,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        crossattn_cache = _initialize_crossattn_cache(
+            num_transformer_blocks=num_transformer_blocks,
+            batch_size=B,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        # FIFO of committed chunks; entries are [B, 3, C, H, W]. The
+        # seed chunk is entry 0.
+        fifo: List[torch.Tensor] = [initial_latents_dev]
+
+        refresh_t_block = torch.full(
+            [B, num_frame_per_block], float(context_noise_timestep),
+            device=self.device, dtype=torch.float32,
+        )
+
+        seed_chunks = seed_frames // num_frame_per_block
+
+        log.info(
+            "[AR_refresh][per_chunk] seed=%d frames  gen=%d chunks  "
+            "fifo=%d chunks  window=%d frames  kv_cache_tokens=%d  "
+            "t_ctx=%.3f",
+            seed_frames, num_gen_chunks, fifo_size, max_window_frames,
+            kv_cache_tokens, context_noise_timestep,
+        )
+
+        generated: List[torch.Tensor] = []
+
+        for chunk_idx in range(num_gen_chunks):
+            n_ctx_blocks = min(len(fifo), fifo_size)
+            window_blocks = n_ctx_blocks + 1
+
+            cur_global_frame_lo = (seed_chunks + chunk_idx) * num_frame_per_block
+            cur_global_frame_hi = cur_global_frame_lo + num_frame_per_block
+            ctx_global_frame_lo = cur_global_frame_lo - n_ctx_blocks * num_frame_per_block
+            assert ctx_global_frame_lo >= 0, (
+                ctx_global_frame_lo, cur_global_frame_lo, n_ctx_blocks,
+            )
+
+            # -------- 1) Rebuild the cache from the FIFO ---------
+            _reset_kv_cache(kv_cache)
+            # Rebuild crossattn too to guarantee fresh-prompt K/V (same
+            # prompt, but be defensive; LongLive does the same).
+            for entry in crossattn_cache:
+                entry["is_init"] = False
+
+            current_start_frame = 0
+            # Iterate FIFO oldest->newest. Each entry advances
+            # ``current_start_frame`` by ``num_frame_per_block``.
+            ctx_chunks = fifo[-n_ctx_blocks:] if n_ctx_blocks > 0 else []
+            for block_idx, f_lat in enumerate(ctx_chunks):
+                f_lo = ctx_global_frame_lo + block_idx * num_frame_per_block
+                f_hi = f_lo + num_frame_per_block
+                f_block_fa = noisy_fa_full[:, f_lo:f_hi]
+                f_cond = self._build_action_cond_chunk(
+                    prompt_embeds_dev, f_block_fa,
+                    num_frames=num_frame_per_block,
+                )
+                with torch.amp.autocast("cuda", dtype=self.dtype):
+                    self.wrapper(
+                        noisy_image_or_video=f_lat,
+                        conditional_dict=f_cond,
+                        timestep=refresh_t_block,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start_frame * frame_seq_length,
+                    )
+                current_start_frame += num_frame_per_block
+            # ``current_start_frame`` is now ``n_ctx_blocks*npb`` — the
+            # position where the current chunk's 3 frames will live.
+
+            # -------- 2) Denoise the current chunk ---------------
+            block_fa = noisy_fa_full[:, cur_global_frame_lo:cur_global_frame_hi]
+            cond = self._build_action_cond_chunk(
+                prompt_embeds_dev, block_fa,
+                num_frames=num_frame_per_block,
+            )
+
+            current_noise = torch.randn(
+                [B, num_frame_per_block, C, H, W],
+                dtype=torch.float32, device=self.device,
+            )
+            x = current_noise.to(self.dtype)
+
+            pred_x0: Optional[torch.Tensor] = None
+            for d_idx in range(int(ts.shape[0])):
+                t_val = float(ts[d_idx].item())
+                tt = torch.full(
+                    [B, num_frame_per_block], t_val,
+                    device=self.device, dtype=torch.float32,
+                )
+                with torch.amp.autocast("cuda", dtype=self.dtype):
+                    out = self.wrapper(
+                        noisy_image_or_video=x,
+                        conditional_dict=cond,
+                        timestep=tt,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start_frame * frame_seq_length,
+                    )
+                pred_x0 = out[1]  # [B, 3, C, H, W]
+
+                if d_idx < int(ts.shape[0]) - 1:
+                    next_t = float(ts[d_idx + 1].item())
+                    flat = pred_x0.flatten(0, 1).float()
+                    flat_noise = torch.randn_like(flat)
+                    flat_t = torch.full(
+                        (flat.shape[0],), next_t,
+                        device=self.device, dtype=torch.float32,
+                    )
+                    x = (
+                        scheduler.add_noise(flat, flat_noise, flat_t)
+                        .view(B, num_frame_per_block, C, H, W)
+                        .to(self.dtype)
+                    )
+
+            assert pred_x0 is not None
+            generated.append(pred_x0.detach().to(torch.float32))
+
+            # -------- 3) Commit to FIFO --------------------------
+            if len(fifo) >= fifo_size:
+                fifo.pop(0)
+            fifo.append(pred_x0.detach().to(self.dtype))
+
+            log.info(
+                "[AR_refresh][per_chunk] chunk %d/%d committed | "
+                "window=%d blocks (%d ctx + 1 cur) | global frames "
+                "[%d:%d] | fifo_len=%d",
+                chunk_idx + 1, num_gen_chunks, window_blocks,
+                n_ctx_blocks, cur_global_frame_lo, cur_global_frame_hi,
+                len(fifo),
+            )
+
+        # Assemble: GT seed ++ generated chunks.
+        seed_real = initial_latents_dev[:, :seed_frames].to(torch.float32)
+        full = torch.cat([seed_real] + generated, dim=1)
+        expected = seed_frames + num_gen_chunks * num_frame_per_block
+        assert int(full.shape[1]) == expected, (full.shape, expected)
+
+        del kv_cache, crossattn_cache
+        torch.cuda.empty_cache()
+        return full
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -491,6 +772,18 @@ def main():
                         help="Per-frame timestep applied to context (FIFO) frames in "
                              "the joint forward. Training uses 0. Matches AR's "
                              "cache-refresh t.")
+    parser.add_argument("--refresh_mode", choices=["per_pass", "per_chunk"],
+                        default="per_pass",
+                        help="How often context K/V are recomputed from FIFO latents. "
+                             "'per_pass' (default, the original AR_refresh recipe) "
+                             "does one 12-frame train-path forward per denoise step "
+                             "(4 per chunk). 'per_chunk' (Recommendation #1, "
+                             "LongLive-inspired) rebuilds a real kv_cache once per "
+                             "chunk via N sequential 3-frame refresh forwards, then "
+                             "runs the 4 denoise passes as 3-frame inference forwards "
+                             "that reuse the cached context K/V. Much faster but "
+                             "shares numerics with "
+                             "'eval_causal_AR.py --ar_cache_refresh full_fifo'.")
 
     # ---- Per-rank data-path overrides ----
     parser.add_argument("--motion_root", type=str, default=None,
@@ -574,6 +867,7 @@ def main():
         "ar_gen_chunks": args.ar_gen_chunks,
         "fifo_size": args.fifo_size,
         "mode": "ar_refresh",
+        "refresh_mode": args.refresh_mode,
     })
 
     meta_path = out_root / f"rank{rank}_ride.json"
@@ -587,7 +881,10 @@ def main():
     pipe.set_denoising_steps(args.denoising_steps)
 
     step_tag = str(student_step) if student_step >= 0 else "unknown"
-    label = args.label or f"ode_student_step{step_tag}_{args.denoising_steps}step_ar_refresh"
+    label = args.label or (
+        f"ode_student_step{step_tag}_{args.denoising_steps}step_ar_refresh_"
+        f"{args.refresh_mode}"
+    )
 
     if args.rank_tag:
         out_dir = out_root / f"rank{rank}_{label}_{args.rank_tag}"
@@ -597,9 +894,10 @@ def main():
 
     log.info(
         "Rank %d/%d: ar_refresh | student=%s (step=%s) | denoising_steps=%d | "
-        "fifo=%d | gen_chunks=%d | initial_chunks=%d | out=%s",
+        "refresh_mode=%s | fifo=%d | gen_chunks=%d | initial_chunks=%d | out=%s",
         rank, world, args.student_ckpt, student_step, args.denoising_steps,
-        args.fifo_size, args.ar_gen_chunks, args.ar_initial_chunks, out_dir.name,
+        args.refresh_mode, args.fifo_size, args.ar_gen_chunks,
+        args.ar_initial_chunks, out_dir.name,
     )
 
     pe_dtype = pipe.dtype
@@ -642,14 +940,16 @@ def main():
         num_gen_chunks=args.ar_gen_chunks,
         fifo_size=args.fifo_size,
         context_noise_timestep=args.context_noise_timestep,
+        refresh_mode=args.refresh_mode,
     )
     peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
     reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
     log.info(
-        "[AR_refresh][%s] rank=%d rollout done in %.1fs (K=%d, fifo=%d, seed=%d) | "
-        "mem before=%.0f MiB  peak_alloc=%.0f MiB  peak_reserved=%.0f MiB",
-        label, rank, time.time() - t0, args.denoising_steps, args.fifo_size, noise_seed,
-        mem_before, peak_mb, reserved_mb,
+        "[AR_refresh][%s] rank=%d rollout done in %.1fs (K=%d, fifo=%d, "
+        "refresh_mode=%s, seed=%d) | mem before=%.0f MiB  peak_alloc=%.0f MiB  "
+        "peak_reserved=%.0f MiB",
+        label, rank, time.time() - t0, args.denoising_steps, args.fifo_size,
+        args.refresh_mode, noise_seed, mem_before, peak_mb, reserved_mb,
     )
 
     full_latents = full_latents.detach()
@@ -671,7 +971,7 @@ def main():
     target_z_ar = chunk_dev_gen[:, :n_c].contiguous()
 
     tag = (
-        f"{label}_{cond_tag}_ar_refresh_fifo{args.fifo_size}"
+        f"{label}_{cond_tag}_ar_refresh_{args.refresh_mode}_fifo{args.fifo_size}"
         f"_init{args.ar_initial_chunks}"
     )
     raw_path = out_dir / f"{tag}_rollout_raw.mp4"

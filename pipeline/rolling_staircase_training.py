@@ -308,52 +308,75 @@ class RollingStaircaseTrainingPipeline:
         # `self.NUM_SLOTS` pick up the runtime value.
         self.NUM_SLOTS = self.num_live_slots
 
-        # Staircase ladder: ascending timesteps assigned slot 0 -> slot NS-1,
-        # interpreted as the INPUT noise level for PASS 0 of a rolling step.
-        # The user-supplied `denoising_step_list` is expected to match this
-        # slot-0..slot-(NS-1) ordering.
-        if len(denoising_step_list) != self.num_live_slots:
+        # ------------------------------------------------------------------
+        # Denoising ladder. Two accepted input shapes:
+        #
+        #   (a) ``len(denoising_step_list) == NS * P`` — full rung list.
+        #       Used as-is (sorted ascending). REQUIRED for non-uniform
+        #       schedules (e.g. the ODE student's distilled pool
+        #       ``[1000, 625, 500, 312.5]`` from
+        #       ``random_steps: [0, 36, 40, 44, 46]`` on the 48-step
+        #       FlowMatch(shift=5) grid). Trades the implicit
+        #       ``step = max_t // (NS·P)`` uniform-spacing assumption for
+        #       an explicit per-rung definition.
+        #
+        #   (b) ``len(denoising_step_list) == NS`` (legacy) — pass-0 ladder
+        #       only. The remaining (P-1) inter-pass rungs are derived by
+        #       uniform stepping from ``max_t`` down to 0. Equivalent to
+        #       the pre-refactor behaviour; kept so the 2x2 / 1x4 configs
+        #       that pass length-NS lists still work.
+        #
+        # In both cases ``self.rungs`` is the canonical ascending list of
+        # length NS·P and everything below derives from it.
+        # ------------------------------------------------------------------
+        ladder_in = [float(t) for t in denoising_step_list]
+        NS = self.num_live_slots
+        P = self.passes_per_step
+        NSP = NS * P
+        if len(ladder_in) == NSP:
+            self.rungs: List[float] = sorted(ladder_in)
+            self._rungs_src = "explicit"
+        elif len(ladder_in) == NS and NS != NSP:
+            # Legacy: derive intermediate rungs by uniform stepping. With
+            # ``max_t = pass0_ladder[-1]`` and ``step = max_t / NSP`` we
+            # recover the original ``[step, 2·step, ..., NSP·step]`` grid.
+            pass0_ladder = sorted(ladder_in)
+            max_t_float = pass0_ladder[-1]
+            step_float = max_t_float / NSP
+            self.rungs = [step_float * (k + 1) for k in range(NSP)]
+            self._rungs_src = "uniform_inferred"
+        else:
             raise ValueError(
-                f"denoising_step_list must have length {self.num_live_slots}; got "
-                f"{len(denoising_step_list)}: {denoising_step_list}"
+                f"denoising_step_list must have length {NS} (pass-0 ladder, "
+                f"legacy uniform-step path) or {NSP} (full rung list, "
+                f"explicit non-uniform path); got {len(ladder_in)}: "
+                f"{denoising_step_list}"
             )
-        ladder = sorted(int(t) for t in denoising_step_list)
-        self.ladder_timesteps: List[int] = ladder  # [t_slot0, ..., t_slot(NS-1)]
-        # Total ODE step budget per committed chunk = NS * P. Per-sub-step
-        # noise increment is `max_t // total_steps`; with max_t=1000 and
-        # NS*P=4 this is the same 250-per-step schedule the ODE student
-        # was distilled at.
+
+        # Pass-p input noise level for slot s, indexed against the canonical
+        # ascending rung list:
+        #   noise[p][s] = rungs[s * P + P - 1 - p]
+        # Verifications:
+        #   NS=4, P=1, rungs=[r0..r3] -> [[r0,r1,r2,r3]] (slot s sees rs)
+        #   NS=1, P=4, rungs=[r0..r3] -> [[r3],[r2],[r1],[r0]] (one slot, descending)
+        #   NS=2, P=2, rungs=[r0..r3] -> [[r1,r3],[r0,r2]] (pass-0 = upper rungs)
+        self.pass_input_timesteps: List[List[float]] = [
+            [self.rungs[s * P + P - 1 - p] for s in range(NS)]
+            for p in range(P)
+        ]
+        # Pass-0 ladder = ladder_timesteps (slot 0 .. slot NS-1, ascending).
+        self.ladder_timesteps: List[float] = list(self.pass_input_timesteps[0])
         max_t = self.ladder_timesteps[-1]
-        total_denoise_steps = self.num_live_slots * self.passes_per_step
-        step = max_t // total_denoise_steps
-        # Pass-p input noise level for slot s (see formula in design notes):
-        #   noise[p, s] = step * (s * P + P - p)
-        # With P=1 this reduces to noise[0, s] = step * (s + 1) = ladder[s].
-        self.pass_input_timesteps: List[List[int]] = [
-            [step * (s * self.passes_per_step + self.passes_per_step - p)
-             for s in range(self.num_live_slots)]
-            for p in range(self.passes_per_step)
+        # Warmup-pass lockstep levels: descending rungs from max_t -> 0,
+        # one rung per (NS·P) lockstep pass. The staircase gets FILLED
+        # here uniformly across slots; the per-slot offset only kicks in
+        # after ``transition_to_steady_state``.
+        self.warmup_pass_input_timesteps: List[float] = [
+            self.rungs[NSP - 1 - k] for k in range(NSP)
         ]
-        # Cross-check: the user-supplied denoising_step_list (which becomes
-        # the pass-0 input ladder) must match the derived pass_input_timesteps[0].
-        # Otherwise the ODE schedule the student was trained on is inconsistent
-        # with what the pipeline will actually run.
-        if self.pass_input_timesteps[0] != self.ladder_timesteps:
-            raise ValueError(
-                f"denoising_step_list {self.ladder_timesteps} does not match the "
-                f"pass-0 input ladder derived from (num_live_slots={self.num_live_slots}, "
-                f"passes_per_step={self.passes_per_step}, max_t={max_t}): "
-                f"{self.pass_input_timesteps[0]}. For 4x1 use [250,500,750,1000]; "
-                f"for 2x2 use [500,1000]."
-            )
-        # Warmup-pass lockstep levels go t=max_t -> 0 in `total_denoise_steps`
-        # increments, uniform across slots (the staircase gets FILLED here;
-        # the per-slot offset only kicks in after transition_to_steady_state).
-        self.warmup_pass_input_timesteps: List[int] = [
-            max_t - step * k for k in range(total_denoise_steps)
-        ]
-        self.warmup_pass_output_timesteps: List[int] = [
-            max(0, t - step) for t in self.warmup_pass_input_timesteps
+        self.warmup_pass_output_timesteps: List[float] = [
+            self.rungs[NSP - 2 - k] if k < NSP - 1 else 0.0
+            for k in range(NSP)
         ]
 
         self.scheduler = scheduler
@@ -824,22 +847,34 @@ class RollingStaircaseTrainingPipeline:
         for slot_idx, t_slot in enumerate(slot_timesteps):
             f0 = slot_idx * self.num_frame_per_block
             f1 = f0 + self.num_frame_per_block
-            ts[:, f0:f1] = int(t_slot)
+            # ``round`` (not truncation) so non-integer rungs from the
+            # ODE-distilled pool (e.g. 312.5) land on the closest int
+            # before being dispatched to the DiT's int64 timestep tensor.
+            ts[:, f0:f1] = int(round(float(t_slot)))
         return ts
 
     def _renoise(
         self,
         clean_x0: torch.Tensor,
-        target_t: int,
+        target_t,
     ) -> torch.Tensor:
         """Re-noise a clean x0 block [B, F, C, H, W] to `target_t`.
-        Returns a tensor with the same shape."""
-        if int(target_t) <= 0:
+
+        ``target_t`` is accepted as int or float (e.g. 312.5 from the ODE
+        pool). It is rounded to the nearest int before being broadcast
+        across frames so the scheduler's timestep tensor stays int64;
+        the scheduler's ``add_noise`` then uses ``argmin`` against its
+        warped-grid timesteps to pick the closest stored sigma — so
+        rounding error is at most half a grid step (negligible vs the
+        smooth time embedding).
+        """
+        t_int = int(round(float(target_t)))
+        if t_int <= 0:
             return clean_x0
         flat = clean_x0.flatten(0, 1)
         noise = torch.randn_like(flat)
         batch_frames = flat.shape[0]
-        t = int(target_t) * torch.ones([batch_frames], device=flat.device, dtype=torch.long)
+        t = t_int * torch.ones([batch_frames], device=flat.device, dtype=torch.long)
         noised = self.scheduler.add_noise(flat, noise, t)
         return noised.unflatten(0, clean_x0.shape[:2])
 
@@ -995,7 +1030,7 @@ class RollingStaircaseTrainingPipeline:
 
                 timestep = torch.full(
                     (batch_size, self.live_frames),
-                    int(input_t),
+                    int(round(float(input_t))),
                     device=device,
                     dtype=torch.int64,
                 )
@@ -1031,7 +1066,7 @@ class RollingStaircaseTrainingPipeline:
                         warmup_outputs.append(
                             RollingStepOutput(
                                 pred_x0=pred_x0[:, f0:f1],
-                                slot_timestep=int(input_t),
+                                slot_timestep=int(round(float(input_t))),
                                 slot_idx=int(slot_idx),
                                 # Global frame start follows the ACTION base
                                 # (i.e., which logical chunk this slot carries
@@ -1054,8 +1089,8 @@ class RollingStaircaseTrainingPipeline:
                         )
 
                 with torch.no_grad():
-                    if int(output_t) > 0:
-                        live = self._renoise(pred_x0.detach(), int(output_t))
+                    if float(output_t) > 0.0:
+                        live = self._renoise(pred_x0.detach(), output_t)
                     else:
                         live = pred_x0.detach()
         finally:
@@ -1179,9 +1214,9 @@ class RollingStaircaseTrainingPipeline:
         slided_noisy.append(fresh_noise)
         live = torch.cat(slided_noisy, dim=1)
         next_slot_timesteps = (
-            [0] * (NS - 1) + [int(max_t)]
+            [0] * (NS - 1) + [int(round(float(max_t)))]
             if self.disable_renoise
-            else list(self.ladder_timesteps)
+            else [int(round(float(t))) for t in self.ladder_timesteps]
         )
         state = LiveWindowState(
             noisy_latents=live.contiguous(),
@@ -1415,7 +1450,7 @@ class RollingStaircaseTrainingPipeline:
                         renoised_slots = [
                             self._renoise(
                                 pred_detached[:, s * npb : (s + 1) * npb],
-                                int(next_levels[s]),
+                                next_levels[s],
                             )
                             for s in range(self.num_live_slots)
                         ]
@@ -1648,7 +1683,7 @@ class RollingStaircaseTrainingPipeline:
                     slided.append(
                         self._renoise(
                             x0_detached[:, src_f0:src_f1],
-                            int(self.ladder_timesteps[new_slot]),
+                            self.ladder_timesteps[new_slot],
                         )
                     )
             # Fresh noise for the new final slot (noise level = ladder[-1]).
@@ -1656,9 +1691,9 @@ class RollingStaircaseTrainingPipeline:
             next_live = torch.cat(slided, dim=1)
 
         next_slot_timesteps = (
-            [0] * (self.num_live_slots - 1) + [int(max_t)]
+            [0] * (self.num_live_slots - 1) + [int(round(float(max_t)))]
             if self.disable_renoise
-            else list(self.ladder_timesteps)
+            else [int(round(float(t))) for t in self.ladder_timesteps]
         )
         next_state = LiveWindowState(
             noisy_latents=next_live.contiguous(),

@@ -319,23 +319,49 @@ class ODEChainPipeline(ChainPipeline):
     def set_denoising_steps(self, n: int) -> torch.Tensor:
         """Build a length-``n`` descending timestep tensor.
 
-        * ``n == len(trained_list)`` → use the student's trained list
-          (preserves pool membership the student was supervised on).
-        * otherwise → ``linspace(1000, 50, n)`` descending. Matches the
-          fallback in ``bin/bench_streaming_inference.py`` so numbers
-          line up between the two tools.
+        Stays inside the student's TRAINED pool whenever possible —
+        feeding the model timesteps it never saw at distillation
+        (e.g. ``linspace(1000, 50, 4)`` = ``[1000, 683, 367, 50]``)
+        produces sub-distribution outputs because the timestep
+        embedding is OOD.
+
+        Resolution order:
+          1. ``n == len(trained)``: use the trained list verbatim.
+          2. ``1 <= n < len(trained)``: pick the ``n`` LARGEST trained
+             timesteps in descending order. With the default
+             ``random_steps: [0, 36, 40, 44, 46]`` (= timesteps
+             ``[1000, 625, 500, 312.5, 178.6]``) and ``n=4`` this
+             returns ``[1000, 625, 500, 312.5]`` — the canonical
+             4-step CF chunkwise ladder mapped onto the 48-step
+             FlowMatch(shift=5) grid the student was distilled on.
+             The "polish" step (178.6) is dropped first because
+             it's the lowest-noise / smallest-quality-delta entry.
+          3. ``n > len(trained)``: fall back to
+             ``linspace(1000, 50, n)`` (matches
+             ``bin/bench_streaming_inference.py``); flag in the log
+             that we're feeding OOD timesteps to the student.
         """
         assert self.ode_model is not None
         trained = self.ode_model.denoising_step_list.detach().to(
             device=self.device, dtype=torch.float32,
         )
         trained, _ = torch.sort(trained, descending=True)
-        if int(trained.shape[0]) == n:
+        K = int(trained.shape[0])
+        if n == K:
             ts = trained
             src = "trained"
+        elif 1 <= n < K:
+            ts = trained[:n].contiguous()
+            src = f"trained_top{n}_of_{K}"
         else:
             ts = torch.linspace(1000.0, 50.0, steps=n, device=self.device)
-            src = "linspace(1000,50)"
+            src = "linspace(1000,50)__OOD"
+            log.warning(
+                "[%s] Denoising step count %d > trained pool size %d; "
+                "falling back to linspace(1000, 50, %d). The student was "
+                "NOT distilled at these timesteps; expect quality drop.",
+                self.device, n, K, n,
+            )
         self.denoising_step_list = ts
         log.info(
             "[%s] Denoising schedule (%s, %d steps): %s",

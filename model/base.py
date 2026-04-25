@@ -52,10 +52,24 @@ class BaseModel(nn.Module):
         self.args = args
         self.dtype = torch.bfloat16 if args.mixed_precision else torch.float32
         if hasattr(args, "denoising_step_list"):
-            self.denoising_step_list = torch.tensor(args.denoising_step_list, dtype=torch.long)
+            # Float storage so non-integer rungs from the ODE-distilled
+            # pool (e.g. 312.5 from ``random_steps: [..., 44, ...]`` on
+            # the 48-step FlowMatch(shift=5) grid) survive into the
+            # downstream consumer without truncation. The eval pipelines
+            # and the rolling-staircase trainer accept floats and round
+            # to int only at the DiT timestep-tensor boundary.
+            self.denoising_step_list = torch.tensor(
+                args.denoising_step_list, dtype=torch.float32,
+            )
             if args.warp_denoising_step:
-                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
-                self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
+                timesteps = torch.cat(
+                    (self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
+                )
+                # ``warp`` indexes the warped 1000-step grid; cast to long
+                # only for the index computation, then read off the float
+                # warped values.
+                indices = (1000 - self.denoising_step_list).long()
+                self.denoising_step_list = timesteps[indices]
 
     def _initialize_models(self, args, device):
         base_model_name = getattr(args, "model_name", None)

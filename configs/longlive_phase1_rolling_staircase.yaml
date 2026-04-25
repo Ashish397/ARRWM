@@ -84,12 +84,55 @@ num_workers: 2
 #                      randomly-chosen pass per rolling step (the other pass
 #                      runs under no_grad); scorer batch still up to NS=2.
 #
-# `denoising_step_list` is the pass-0 INPUT ladder (slot 0 .. slot NS-1).
-# The pipeline sorts it ascending and cross-checks against the topology.
+# `denoising_step_list` interpretation: when its length equals NS·P
+# (the total ODE step budget per committed chunk), it is treated as the
+# FULL rung list — one timestep per pass-step the student will see, in
+# any order. The pipeline sorts ascending; pass-0 ladder is then the
+# top-NS rungs (slot 0 .. slot NS-1, ascending). This is the path used
+# below: the rungs match the ODE student's distilled pool exactly so
+# the DiT is never fed a timestep it wasn't supervised on.
+#
+# When length equals NS (legacy), the list is treated as the pass-0
+# ladder only and intermediate rungs for pass>0 are derived by uniform
+# stepping (e.g. ``[500, 1000]`` for 2x2 → rungs ``[250, 500, 750, 1000]``).
+#
+# ODE alignment (THIS config — 4x1, NS·P = 4):
+#   ``configs/action_ode_distill.yaml`` distilled the student against
+#   ``random_steps: [0, 36, 40, 44, 46]`` on the 48-step
+#   FlowMatchScheduler(shift=5.0, extra_one_step=True) grid, which maps
+#   to actual timesteps ``{1000, 625, 500, 312.5, 178.6}``. We pick
+#   the top-4 (drop the polish rung 178.6) for the 4-step DMD ladder:
+#       [1000, 625, 500, 312.5]
+#   With ``warp_denoising_step: false`` these values are used VERBATIM
+#   — no further index-table indirection. They render in the trainer
+#   as ``[312.5, 500, 625, 1000]`` (ascending) → slot 0 sees 312.5,
+#   slot 3 sees 1000.
 num_live_slots: 4
 passes_per_step: 1
-denoising_step_list: [1000, 750, 500, 250]
-warp_denoising_step: true
+denoising_step_list: [1000, 625, 500, 312.5]
+warp_denoising_step: false
+
+# Whether to renoise the carryover slots after each rolling step's commit.
+#
+# The pipeline default is ``True`` (LongLive-style: each committed slot's
+# clean pred_x0 is kept as-is and slid into a lower-index live slot at
+# t=0; only the trailing slot is reseeded with fresh pure noise; the
+# steady-state ladder degenerates to ``[0, 0, 0, max_t]`` =
+# ``[0, 0, 0, 1000]``).
+#
+# Phase-1 needs the OPPOSITE: the rolling-staircase recipe assumes every
+# live-slot index ``s`` always carries a noisy chunk at the ladder rung
+# ``ladder_timesteps[s]``, so each chunk traverses
+# ``[1000, 625, 500, 312.5]`` over its 4-slot lifetime. With
+# ``disable_renoise: true`` the student would only ever see timesteps
+# {0, 1000} in steady state and the four-rung ODE-distilled supervision
+# is wasted -- the DiT would be fed timesteps it WAS supervised on
+# (1000, plus 0 via the post-commit clean pass) but in the wrong
+# combination, contradicting the four-rung ladder this config sets up.
+#
+# Set explicitly to ``false`` so a future change of the pipeline default
+# can't silently re-introduce the bug.
+disable_renoise: false
 
 # Eval-only switch for utils/eval_rolling_staircase.py: picks how the
 # sequential-commit rollout spreads its 4-step denoising budget across
@@ -198,14 +241,71 @@ aux_loss_weight: 1.0
 #   wrapped in DDP `no_sync()`, so exactly ONE all-reduce fires per
 #   optimizer step regardless of this knob.
 #
-#   Larger -> fewer all-reduces per wall-second but more wasted ride
-#   tail per refill (up to rolling_steps_per_iter-1 steps per ride).
-#   16 is a reasonable default for 100-400 step rides (<=10% waste).
+#   Pinned to 8 == one optimizer step per "near-cycle" of the live
+#   window (4 slots) plus a generous overlap, with a tight collapse-
+#   gate reaction. Pure engineering pick -- no architectural cycle
+#   maps cleanly to 8; the natural cadences are:
+#     * 1 step  -- teacher (real_score) and critic (fake_score) fire
+#                  EVERY rolling step on a 4-chunk = 12-frame batched
+#                  context window. "Bidirectional" only means the
+#                  scorer attention mask has no causal triangle inside
+#                  that 12-frame window; it does NOT mean the scorer
+#                  needs N steps of accumulated context to fire.
+#     * 3 steps -- KV committed-past region (kv_committed_max_frames=9
+#                  = 3 chunks) fully turns over: after 3 rolling steps
+#                  the 3 primed GT chunks have all been FIFO'd out and
+#                  the cache is 100% student-committed. The cache size
+#                  itself is FIXED (always 3 past + 4 live = 21 frames
+#                  during a forward); it never varies.
+#     * 4 steps -- every live-slot index (0..3) has been "the active
+#                  commit slot" exactly once.
+#   At rolling_steps_per_iter=8 we run two full 4-slot cycles per
+#   optimizer step.
+#
+#   Aligns with the collapse-MAE gate: if MAE trips inside an iter's
+#   8-step cycle, the slot finishes the cycle (DDP-safe -- single
+#   allreduce fires on the final backward) and prepare_for_iter swaps
+#   in a fresh ride. So the *next* 8-step cycle runs on a different
+#   ride. Worst-case wasted tail per ride = 7 rolling steps.
+#
+#   Trade-offs vs. the old `16`:
+#     * +allreduce traffic (~2x per wall-second). Negligible at
+#       4-GPU scale; revisit if you push slots_per_rank >> 4.
+#     * Smaller per-step gradient batch (4*8 = 32 backwards) but
+#       still well above DMD's statistical-noise floor.
 #
 # Set slots_per_rank=1 and rolling_steps_per_iter=null to fall back to
 # the original one-ride-per-iter path (bit-identical to before).
 slots_per_rank: 4
-rolling_steps_per_iter: 16
+rolling_steps_per_iter: 8
+
+# ---------------------------------------------------------------------------
+# Collapse-MAE early stop (adaptive rollout length)
+# ---------------------------------------------------------------------------
+# After every rolling step the batcher computes a single scalar per
+# committed chunk:
+#
+#     mae = (stu_c - gt_c).abs().mean()
+#
+# where ``stu_c`` is the just-committed slot-0 student chunk and
+# ``gt_c`` is the GT-aligned slice of the same ride at the slot-0 frame
+# window (shape [1, npb, C, H, W] — for LongLive: [1, 3, 16, 60, 104]).
+# If ``mae > collapse_mae_threshold`` the slot is flagged for refill at
+# the next ``prepare_for_iter``. The flag is consulted at the iter
+# BOUNDARY so every rank still completes ``rolling_steps_per_iter``
+# backwards this iter — DDP lockstep is preserved, no rush-to-exit.
+#
+# 0.65 was set after a local collapse sweep: stable chunks stay
+# comfortably below ~0.3 for the entire ride, divergent chunks blow
+# past 1.0 within a handful of rolling steps, so 0.65 sits in the
+# clean separation gap with a slightly tighter bias than 0.7 -- we
+# trade a small risk of cutting healthy rides early for crisper
+# curriculum control while the student is unstable. Raise if you
+# see healthy rides being retired; lower for an even tighter gate.
+#
+# Set to null to disable the early-stop entirely and always roll to
+# the natural end of the ride (or the ``max_ride_frames`` cap).
+collapse_mae_threshold: 0.65
 
 # ---------------------------------------------------------------------------
 # DDP correctness guards
@@ -441,7 +541,22 @@ cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/s
 # DMD + GAN loss weights (LAM/CFG/action-sep + generator-MSE removed).
 # ---------------------------------------------------------------------------
 dmd_loss_weight: 1.0
-real_guidance_scale: 1.0
+# CFG dropped (2026-04-25). Setting both guidance scales to 0.0 makes the
+# DMD scoring forwards purely conditional — no second forward through
+# real_score / fake_score with zeroed prompt+actions. The student already
+# learnt action-following via ODE distillation and we don't need prompt
+# amplification for this phase. Keeping the knobs (rather than ripping
+# the CFG plumbing out) so we can flip back to e.g. 1.0 / 0.5 in a single
+# YAML edit if a phase-2 ablation needs it.
+#
+# Speed: with `dmd_active_slots: all` (NS=4) and 4-step ladder this
+# removes 4 real_score forwards per training iter (~one full real_score
+# block-batch pass). Empirically ~10-15% step-time saving on H100.
+#
+# Both unconditional dicts (real/fake) are still constructed for code-
+# path locality but neither is consumed when guidance_scale==0.0; the
+# `if != 0.0` gates in `dmd2b2blam_staircase.py` skip the uncond forward.
+real_guidance_scale: 0.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 ts_schedule: true
@@ -461,6 +576,17 @@ concat_time_embeddings: false
 cls_on_clean_image: false
 adaptive_d_weight: false
 gan_type: relative
+
+# Generator EMA. Mirrors Causal-Forcing's chunkwise DMD recipe
+# (``configs/causal_forcing_dmd_chunkwise.yaml``). The shadow is a CPU
+# fp32 copy of the generator DiT's trainable parameters; update fires
+# on every optimizer step once ``self.step >= ema_start_step``. The
+# shadow is saved under the ``generator_ema`` key in the trainer's
+# checkpoint and is consumed by eval / inference scripts that prefer
+# the EMA weights over the live ones for stability. Set
+# ``ema_weight: 0.0`` to disable EMA entirely.
+ema_weight: 0.99
+ema_start_step: 200
 
 # Fake-score updates: ENABLED this remit, stepped 1:1 with the generator.
 # Wired via "Option A — shared forward": the fake_score runs a SINGLE

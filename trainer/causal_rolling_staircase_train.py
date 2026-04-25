@@ -325,6 +325,20 @@ class RollingStaircaseDMDTrainer:
             getattr(cfg, "action_decay_per_slot", default_decay)
         )
 
+        # ``disable_renoise``: when True the pipeline keeps slided slots at
+        # t=0 (LongLive-style sequential rollout, ladder degenerates to
+        # ``[0, 0, 0, max_t]``); when False each carryover slot is renoised
+        # to its ladder rung so the live window always carries a full
+        # rolling-staircase ladder. Phase-1 REQUIRES False so the four-rung
+        # ODE ladder ``[1000, 625, 500, 312.5]`` is actually exercised in
+        # steady state.
+        #
+        # We default to False here (Phase-1 contract). The pipeline's own
+        # constructor still defaults to True for backward compatibility
+        # with older single-rung scripts; this trainer overrides that
+        # intentionally so a missing YAML key doesn't silently downgrade
+        # the rolling staircase to LongLive sequential mode.
+        disable_renoise = bool(getattr(cfg, "disable_renoise", False))
         self.pipeline = RollingStaircaseTrainingPipeline(
             denoising_step_list=denoising_step_list,
             scheduler=self.model.scheduler,
@@ -340,7 +354,14 @@ class RollingStaircaseDMDTrainer:
             action_projection=self.model.action_projection,
             action_token_projection=self.model.action_token_projection,
             real_score_num_gt_chunks=int(getattr(cfg, "real_score_num_gt_chunks", 2)),
+            disable_renoise=disable_renoise,
         )
+        if self.is_main_process:
+            logging.info(
+                "Pipeline: disable_renoise=%s (False = full rolling staircase, "
+                "True = LongLive-style sequential)",
+                disable_renoise,
+            )
         # The DMD model's slot-loss helper needs the pipeline for optional
         # ride-aware conditioning (not currently used). We store a reference.
         setattr(self.model, "_staircase_pipeline", self.pipeline)
@@ -487,6 +508,70 @@ class RollingStaircaseDMDTrainer:
                 getattr(cfg, "fake_max_grad_norm", self.max_grad_norm)
             )
 
+        # ------------------------------------------------------------------
+        # Generator EMA (mirrors Causal-Forcing's ``EMA_FSDP`` API but uses
+        # a CPU fp32 shadow over the unwrapped DiT's trainable params, since
+        # we run DDP and don't need the FSDP summon dance).
+        #
+        # Driven by two config knobs (defaults match Causal-Forcing's
+        # ``causal_forcing_dmd_chunkwise.yaml``):
+        #   ema_weight     : 0.99   (decay; 0 disables)
+        #   ema_start_step : 200    (delay creation until step >= this)
+        #
+        # The shadow is stored at the inner-DiT parameter granularity
+        # (``self.model.generator.model.named_parameters()``); the
+        # action_projection / action_token_projection heads are NOT
+        # EMA'd — matches CF's behaviour of EMA-ing only the DiT
+        # backbone and keeps the shadow tensor list comparable.
+        # ------------------------------------------------------------------
+        self.generator_ema = None
+        self.ema_weight = float(getattr(cfg, "ema_weight", 0.0) or 0.0)
+        self.ema_start_step = int(getattr(cfg, "ema_start_step", 0) or 0)
+        if self.ema_weight > 0.0 and self.ema_start_step <= 0:
+            self._init_generator_ema()
+
+    def _init_generator_ema(self) -> None:
+        """Create the EMA shadow over the generator DiT's trainable params.
+
+        Idempotent: re-calling on a non-None ``self.generator_ema`` is a
+        no-op (the shadow is already up to date with the DiT). Runs on
+        every rank because each DDP rank holds the same parameter view
+        — the shadow is purely local and never synced across ranks.
+        """
+        if self.generator_ema is not None:
+            return
+        if self.ema_weight <= 0.0:
+            return
+        from utils.ema import GeneratorEMA
+        self.generator_ema = GeneratorEMA(
+            self.model.generator.model,
+            decay=self.ema_weight,
+        )
+        if self.is_main_process:
+            logging.info(
+                "[EMA] Initialized generator EMA (decay=%.4f, params=%d).",
+                self.ema_weight, self.generator_ema.num_params(),
+            )
+
+    def _maybe_update_generator_ema(self) -> None:
+        """Lazy-create the EMA at ``ema_start_step`` and update on every step.
+
+        Called immediately after ``self.optimizer.step()`` (from BOTH
+        the multi-slot and legacy single-ride paths). Mirrors the
+        Causal-Forcing recipe (``trainer/distillation.py`` /
+        ``trainer/gan.py``):
+          1. If past ``ema_start_step`` and EMA is None, create it from
+             the live DiT (so the shadow is initialized at the moment
+             EMA is first turned on, not at training start).
+          2. Update the shadow against the live DiT.
+        """
+        if self.ema_weight <= 0.0:
+            return
+        if self.step >= self.ema_start_step and self.generator_ema is None:
+            self._init_generator_ema()
+        if self.generator_ema is not None:
+            self.generator_ema.update(self.model.generator.model)
+
     # ------------------------------------------------------------------
     # Action teacher (CoTracker + ss_vae) for state_probe / action_critic
     # supervision. Lazy-loaded when ``action_teacher_mode != "off"``.
@@ -537,6 +622,23 @@ class RollingStaircaseDMDTrainer:
         self._frozen_cotracker = None
         self._frozen_ss_vae = None
         self._frozen_ss_vae_scale = 1.0
+        # ------------------------------------------------------------------
+        # Telemetry: silent fallback to commanded-action targets is a real
+        # failure mode — ``_compute_teacher_z_per_slot`` returns ``None``
+        # on VAE / CoTracker / ss_vae errors and the aux-loss heads then
+        # auto-fall-back to commanded targets in
+        # ``DMD2B2BLAM_Staircase._action_critic_aux_loss`` and
+        # ``_state_probe_aux_loss``. Without explicit counters / wandb
+        # series the run can drift off the CoTracker+ss_vae regime and we
+        # would not notice until eval time.
+        # ------------------------------------------------------------------
+        self._teacher_call_count: int = 0
+        self._teacher_failure_count: int = 0
+        # Component-level reasons: VAE_DECODE / COTRACKER / SS_VAE / SHAPE.
+        self._teacher_failure_reasons: Dict[str, int] = {}
+        # When set, ``_log_teacher_telemetry`` will fire next time it is
+        # called from the train loop. The actual logging is rate-limited
+        # to once per ``log_interval`` to avoid spamming.
         from utils.action_teacher import resolve_action_teacher_mode
         self.action_teacher_mode = resolve_action_teacher_mode(
             getattr(self.config, "action_teacher_mode", None),
@@ -710,20 +812,39 @@ class RollingStaircaseDMDTrainer:
         to the commanded-action branch automatically because the aux
         losses treat ``None`` that way.
         """
+        # NOTE: every entry into this function counts as a teacher call,
+        # whether it succeeds, fails fast on a sanity check, or fails
+        # mid-pipeline. Callers (the trainer's per-iter loop) interpret
+        # ``None`` as "fall back to commanded actions for this iter's
+        # aux loss"; the call/failure ratio is logged + sent to wandb so
+        # silent regressions surface quickly.
+        self._teacher_call_count += 1
+
+        def _record_failure(reason: str) -> None:
+            self._teacher_failure_count += 1
+            self._teacher_failure_reasons[reason] = (
+                self._teacher_failure_reasons.get(reason, 0) + 1
+            )
+
         if self._frozen_cotracker is None or self._frozen_ss_vae is None:
+            _record_failure("teacher_unavailable")
             return None
         if pred_x0_all_slots is None:
+            _record_failure("pred_x0_none")
             return None
         vae = getattr(self.model, "vae", None)
         if vae is None:
+            _record_failure("vae_missing")
             return None
 
         npb = int(getattr(self.config, "num_frame_per_block", 3))
         x0 = pred_x0_all_slots.detach()
         if x0.dim() != 5:
+            _record_failure("bad_pred_x0_shape")
             return None
         B, F_total = x0.shape[0], x0.shape[1]
         if F_total % npb != 0:
+            _record_failure("frame_count_misaligned")
             return None
         n_slots = F_total // npb
 
@@ -737,6 +858,7 @@ class RollingStaircaseDMDTrainer:
                 pixels = vae.decode_to_pixel(x0.float())  # [B, T_pix, 3, H, W]
         except Exception as e:
             logging.warning("action teacher: VAE decode failed: %s", e)
+            _record_failure("vae_decode")
             return None
         # Pixels are in [-1, 1]; CoTracker wants [0, 255] float, [B, T, 3, H, W].
         video = (255.0 * 0.5 * (pixels + 1.0)).clamp(0, 255).float()
@@ -749,6 +871,7 @@ class RollingStaircaseDMDTrainer:
         # pool motion vectors across each slot's pixel frames.
         T_pix = video.shape[1]
         if T_pix < 2:
+            _record_failure("too_few_pixel_frames")
             return None
         # Frames-per-slot at the pixel resolution. Typical VAE: K=4 → 45
         # pixel frames for 12 latent frames (first 3 from the first latent,
@@ -756,6 +879,7 @@ class RollingStaircaseDMDTrainer:
         # split T_pix // n_slots; remainder at the tail is discarded.
         per_slot_pix = T_pix // n_slots
         if per_slot_pix < 2:
+            _record_failure("per_slot_pix_too_small")
             return None
         used_pix = per_slot_pix * n_slots
         vid = video[:, :used_pix]  # [B, used, 3, H, W]
@@ -767,6 +891,7 @@ class RollingStaircaseDMDTrainer:
                 )
         except Exception as e:
             logging.warning("action teacher: CoTracker forward failed: %s", e)
+            _record_failure("cotracker")
             return None
         # pred_tracks: [B, used_pix, N, 2], pred_vis: [B, used_pix, N] or [..., 1]
         # Displacement per adjacent pixel-frame pair; pool across each slot.
@@ -784,6 +909,7 @@ class RollingStaircaseDMDTrainer:
         eff_len = used_pix - 1
         base = eff_len // n_slots
         if base < 1:
+            _record_failure("base_chunk_too_small")
             return None
         # Trim to base * n_slots so we can reshape cleanly.
         d = d[:, : base * n_slots]
@@ -800,6 +926,7 @@ class RollingStaircaseDMDTrainer:
             mu, _ = self._frozen_ss_vae.encoder(x_in.to(self.device))
         except Exception as e:
             logging.warning("action teacher: ss_vae encoder failed: %s", e)
+            _record_failure("ss_vae")
             return None
         # mu: [B*NS, 8, 1, 1] → [B, NS, 8]
         z = mu.squeeze(-1).squeeze(-1)
@@ -808,7 +935,70 @@ class RollingStaircaseDMDTrainer:
         z = z.reshape(B, n_slots, -1)
         return z.detach().contiguous()
 
+    def _log_teacher_telemetry(self) -> None:
+        """Emit teacher call/failure counters since training started.
+
+        Logs to stdout (always) and wandb (when enabled). Counters are
+        cumulative; downstream tooling can take per-step deltas if it
+        wants per-iter rates. Reasons are emitted as a flat
+        ``teacher/fail/<reason>`` series for easy filtering.
+
+        Cheap and idempotent — called only on the main process from
+        the multi-slot loop, gated behind ``log_interval``.
+        """
+        calls = int(self._teacher_call_count)
+        fails = int(self._teacher_failure_count)
+        if calls == 0 and fails == 0 and not self._teacher_failure_reasons:
+            return
+        rate = (fails / calls) if calls > 0 else 0.0
+        reasons_str = ", ".join(
+            f"{k}={v}" for k, v in sorted(self._teacher_failure_reasons.items())
+        ) or "(none)"
+        logging.info(
+            "action_teacher: calls=%d failures=%d (%.1f%%) reasons={%s}",
+            calls, fails, 100.0 * rate, reasons_str,
+        )
+        if rate > 0.10 and calls > 10:
+            logging.warning(
+                "action_teacher: fallback rate %.1f%% > 10%% — aux losses "
+                "are partially regressing on COMMANDED actions instead of "
+                "ss_vae teacher targets. Investigate the dominant reason "
+                "above before trusting the run as a CoTracker+ss_vae "
+                "experiment.",
+                100.0 * rate,
+            )
+        if self.wandb_enabled:
+            payload = {
+                "teacher/calls_total": float(calls),
+                "teacher/failures_total": float(fails),
+                "teacher/failure_rate": float(rate),
+            }
+            for k, v in self._teacher_failure_reasons.items():
+                payload[f"teacher/fail/{k}"] = float(v)
+            try:
+                wandb.log(payload, step=self.step)  # type: ignore
+            except Exception as e:
+                logging.debug("teacher telemetry: wandb log failed: %s", e)
+
     def _init_wandb(self) -> None:
+        """Initialize Weights & Biases on the main process.
+
+        Failure handling: ``wandb.init`` can hang or raise on compute
+        nodes without outbound network access. To make sure that a
+        flaky cluster path never wedges training (especially under DDP
+        where rank 0 stuck = all ranks stuck on the next allreduce),
+        we wrap the call:
+
+          1. honor ``WANDB_MODE`` if the user set it externally,
+          2. fall back to ``WANDB_MODE=offline`` automatically when no
+             API key is available (``WANDB_API_KEY`` empty *and* no
+             ``~/.netrc`` entry), so an offline cluster still gets a
+             local run directory it can sync later;
+          3. wrap ``wandb.init`` in try/except — on any exception we
+             disable wandb logging for the rest of the run (no retry,
+             no hang) and continue training so we don't lose hours of
+             compute on a side-channel issue.
+        """
         self.wandb_enabled = (
             self.is_main_process
             and _HAS_WANDB
@@ -818,12 +1008,47 @@ class RollingStaircaseDMDTrainer:
             return
         run_name = str(getattr(self.config, "run_name", "phase1_rolling_staircase"))
         project = str(getattr(self.config, "wandb_project", "longlive-phase1"))
-        wandb.init(  # type: ignore
-            project=project,
-            name=run_name,
-            config=OmegaConf.to_container(self.config, resolve=True),
-            dir=str(getattr(self.config, "wandb_dir", "./wandb")),
-        )
+
+        # Auto-degrade to offline mode if no creds are available — beats a
+        # silent hang on cluster nodes that have neither an API key nor
+        # the ``api.wandb.ai`` route. Only acts if the user did NOT
+        # explicitly set ``WANDB_MODE``.
+        if not os.environ.get("WANDB_MODE"):
+            has_key = bool(os.environ.get("WANDB_API_KEY"))
+            netrc_path = Path.home() / ".netrc"
+            has_netrc = False
+            if netrc_path.exists():
+                try:
+                    with open(netrc_path, "r") as fh:
+                        has_netrc = "api.wandb.ai" in fh.read()
+                except Exception:
+                    pass
+            if not has_key and not has_netrc:
+                logging.warning(
+                    "wandb: no API key (WANDB_API_KEY empty and no "
+                    "api.wandb.ai entry in ~/.netrc); forcing "
+                    "WANDB_MODE=offline. Sync afterwards with "
+                    "``wandb sync %s``.",
+                    str(getattr(self.config, "wandb_dir", "./wandb")),
+                )
+                os.environ["WANDB_MODE"] = "offline"
+
+        try:
+            wandb.init(  # type: ignore
+                project=project,
+                name=run_name,
+                config=OmegaConf.to_container(self.config, resolve=True),
+                dir=str(getattr(self.config, "wandb_dir", "./wandb")),
+            )
+        except Exception as e:
+            logging.warning(
+                "wandb.init failed: %s — disabling wandb for this run "
+                "(training continues; metrics will only be in stdout/log "
+                "files). Set WANDB_MODE=offline or disable_wandb=true in "
+                "the YAML to skip this attempt next time.", e,
+            )
+            self.wandb_enabled = False
+            return
 
     # ------------------------------------------------------------------
     # DDP grad-uniformity check (catches rank-asymmetric parameter
@@ -969,14 +1194,45 @@ class RollingStaircaseDMDTrainer:
         if not self.is_main_process:
             return
         path = self._checkpoint_path(self.step)
+        # Generator inner-DiT weights (unwrap DDP if present).
+        gen_module = (
+            self.generator_ddp.module
+            if self.generator_ddp is not None
+            else self.model.generator.model
+        )
         state = {
             "step": self.step,
-            "generator": (self.generator_ddp.module if self.generator_ddp is not None else self.model.generator.model).state_dict(),
+            "generator": gen_module.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "config_name": os.path.basename(self.config_path),
         }
         if self.model.action_projection is not None:
             state["action_projection"] = self.model.action_projection.state_dict()
+        # Stream-B action-token projection: separate head outside the DDP
+        # wrapper, trained when `train_action_token_projection: true`. We
+        # save it unconditionally if it exists so a future config flip
+        # from frozen -> trainable doesn't silently drop weights from a
+        # prior run.
+        if getattr(self.model, "action_token_projection", None) is not None:
+            state["action_token_projection"] = (
+                self.model.action_token_projection.state_dict()
+            )
+        # Fake-score: save when fake updates are enabled so
+        # auto-resume doesn't reset the critic to its init weights.
+        # Unwrap DDP if wrapped.
+        if self.fake_score_updates_enabled:
+            fake_module = (
+                self.fake_score_ddp.module
+                if self.fake_score_ddp is not None
+                else self.model.fake_score.model
+            )
+            state["fake_score"] = fake_module.state_dict()
+            if self.fake_optimizer is not None:
+                state["fake_optimizer"] = self.fake_optimizer.state_dict()
+        if self.generator_ema is not None:
+            state["generator_ema"] = self.generator_ema.state_dict()
+            state["ema_weight"] = self.ema_weight
+            state["ema_start_step"] = self.ema_start_step
         torch.save(state, path)
         logging.info("Saved checkpoint: %s", path)
 
@@ -990,17 +1246,131 @@ class RollingStaircaseDMDTrainer:
         if self.is_main_process:
             logging.info("Auto-resuming from %s", path)
         state = torch.load(path, map_location="cpu")
+        # When ``strict_resume_load`` is set, raise on any missing or
+        # unexpected key in the resumed generator / action_projection /
+        # action_token_projection / fake_score loads. Default False to
+        # preserve compatibility with checkpoints that pre-date a saved
+        # head; flip on to catch silent weight loss in production.
+        strict_resume = bool(getattr(self.config, "strict_resume_load", False))
         inner = self.generator_ddp.module if self.generator_ddp is not None else self.model.generator.model
         missing, unexpected = inner.load_state_dict(state["generator"], strict=False)
         if self.is_main_process:
             logging.info("resume: generator missing=%d unexpected=%d", len(missing), len(unexpected))
+            if missing:
+                logging.debug("resume: generator missing (first 8): %s", list(missing)[:8])
+            if unexpected:
+                logging.debug("resume: generator unexpected (first 8): %s", list(unexpected)[:8])
+        if strict_resume and (missing or unexpected):
+            raise RuntimeError(
+                f"resume: strict_resume_load=True but generator state has "
+                f"missing={len(missing)} unexpected={len(unexpected)} keys."
+            )
         if "action_projection" in state and self.model.action_projection is not None:
-            self.model.action_projection.load_state_dict(state["action_projection"], strict=False)
+            ap_missing, ap_unexpected = self.model.action_projection.load_state_dict(
+                state["action_projection"], strict=False,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "resume: action_projection missing=%d unexpected=%d",
+                    len(ap_missing), len(ap_unexpected),
+                )
+            if strict_resume and (ap_missing or ap_unexpected):
+                raise RuntimeError(
+                    "resume: strict_resume_load=True but action_projection "
+                    "has missing/unexpected keys."
+                )
+        # Stream-B action-token projection. Restored non-strictly so a
+        # checkpoint produced before this key was saved still loads cleanly
+        # (logged with a warning so the user notices).
+        atp = getattr(self.model, "action_token_projection", None)
+        if atp is not None:
+            atp_sd = state.get("action_token_projection")
+            if atp_sd is not None:
+                atp_missing, atp_unexpected = atp.load_state_dict(atp_sd, strict=False)
+                if self.is_main_process:
+                    logging.info(
+                        "resume: action_token_projection missing=%d unexpected=%d",
+                        len(atp_missing), len(atp_unexpected),
+                    )
+                if strict_resume and (atp_missing or atp_unexpected):
+                    raise RuntimeError(
+                        "resume: strict_resume_load=True but "
+                        "action_token_projection has missing/unexpected keys."
+                    )
+            elif self.is_main_process:
+                logging.warning(
+                    "resume: ckpt has no action_token_projection key; head "
+                    "will start from current (init or frozen) weights. "
+                    "If train_action_token_projection=true this means the "
+                    "Stream-B head silently resets across requeues."
+                )
+        # Fake-score critic + its optimizer. Required for correct
+        # requeue when fake_score_updates_enabled=true; without these
+        # the critic would reset to init each time SLURM bounces the
+        # job (auto_resume path only).
+        if self.fake_score_updates_enabled:
+            fake_module = (
+                self.fake_score_ddp.module
+                if self.fake_score_ddp is not None
+                else self.model.fake_score.model
+            )
+            fake_sd = state.get("fake_score")
+            if fake_sd is not None:
+                f_missing, f_unexpected = fake_module.load_state_dict(
+                    fake_sd, strict=False
+                )
+                if self.is_main_process:
+                    logging.info(
+                        "resume: fake_score missing=%d unexpected=%d",
+                        len(f_missing), len(f_unexpected),
+                    )
+                if strict_resume and (f_missing or f_unexpected):
+                    raise RuntimeError(
+                        "resume: strict_resume_load=True but fake_score "
+                        "has missing/unexpected keys."
+                    )
+            elif self.is_main_process:
+                logging.warning(
+                    "resume: fake_score_updates_enabled=true but ckpt has "
+                    "no fake_score key; critic weights will start from "
+                    "current init."
+                )
+            if self.fake_optimizer is not None:
+                fake_opt_sd = state.get("fake_optimizer")
+                if fake_opt_sd is not None:
+                    try:
+                        self.fake_optimizer.load_state_dict(fake_opt_sd)
+                    except Exception as e:
+                        logging.warning(
+                            "fake_optimizer state load failed: %s", e
+                        )
+                elif self.is_main_process:
+                    logging.warning(
+                        "resume: ckpt has no fake_optimizer key; "
+                        "fake_optimizer state (momentum etc.) will reset."
+                    )
         try:
             self.optimizer.load_state_dict(state["optimizer"])
         except Exception as e:
             logging.warning("optimizer state load failed: %s", e)
         self.step = int(state.get("step", 0))
+        # EMA: rebuild the shadow if the checkpoint carries one and EMA
+        # is enabled in the config. Must happen AFTER ``self.step`` is
+        # restored so a fresh EMA is created at the right moment if the
+        # previous run had not yet crossed ``ema_start_step``.
+        if self.ema_weight > 0.0:
+            ema_sd = state.get("generator_ema")
+            if ema_sd is not None:
+                if self.generator_ema is None:
+                    self._init_generator_ema()
+                if self.generator_ema is not None:
+                    try:
+                        self.generator_ema.load_state_dict(ema_sd)
+                    except Exception as e:
+                        logging.warning("EMA shadow load failed: %s", e)
+            elif self.step >= self.ema_start_step and self.generator_ema is None:
+                # Resuming past ema_start_step but ckpt has no shadow → init now.
+                self._init_generator_ema()
 
     # ------------------------------------------------------------------
     # Training loop
@@ -1201,13 +1571,38 @@ class RollingStaircaseDMDTrainer:
         rolling_steps_per_iter: int,
     ) -> None:
         ride_loader = self._make_ride_loader()
+        # Collapse-MAE threshold: per-chunk absolute-error between the
+        # student's committed slot-0 chunk and its GT-aligned counterpart.
+        # If > threshold the batcher flags the slot for refill at the
+        # NEXT prepare_for_iter (DDP-safe; the current iter's rolling
+        # steps still execute on every rank so allreduce pairs up). Set
+        # to null/None in YAML to disable. See PerSlotRideBatcher's
+        # docstring for the exact formula.
+        raw_thresh = getattr(self.config, "collapse_mae_threshold", None)
+        if raw_thresh in (None, "", "none", "None"):
+            collapse_mae_threshold: Optional[float] = None
+        else:
+            collapse_mae_threshold = float(raw_thresh)
+        if self.is_main_process:
+            if collapse_mae_threshold is None:
+                logging.info("Collapse-MAE early-stop: DISABLED")
+            else:
+                logging.info(
+                    "Collapse-MAE early-stop: threshold=%.3f "
+                    "(flagged slots refill at next prepare_for_iter)",
+                    collapse_mae_threshold,
+                )
         batcher = PerSlotRideBatcher(
             pipeline=self.pipeline,
             slots_per_rank=slots_per_rank,
             device=self.device,
             dtype=self.dtype,
             ride_loader=ride_loader,
+            collapse_mae_threshold=collapse_mae_threshold,
         )
+        # Running total of rides collapsed across all slots on this rank
+        # since training started. Used to emit per-iter deltas to wandb.
+        last_collapsed_total = 0
 
         while self.step < max_steps:
             t0 = time.time()
@@ -1261,12 +1656,69 @@ class RollingStaircaseDMDTrainer:
                     mem_str,
                     batcher.summary(),
                 )
+            # Collapse-MAE telemetry. We log:
+            #   - a per-slot MAE snapshot (taken at the end of the iter
+            #     from the batcher, so it reflects the freshest committed
+            #     chunk on each slot's current ride),
+            #   - a mean MAE across slots (rank-local, no allreduce),
+            #   - a rank-local delta count of rides retired this iter by
+            #     the collapse gate.
+            mae_snapshot = batcher.mae_snapshot()
+            collapsed_total = int(batcher.num_collapsed_rides)
+            collapsed_delta = max(0, collapsed_total - last_collapsed_total)
+            last_collapsed_total = collapsed_total
             if self.wandb_enabled and (self.step % log_interval == 0):
                 payload = dict(iter_stats)
                 payload["time/iter_seconds"] = iter_time
                 payload["batcher/slots_per_rank"] = float(slots_per_rank)
                 payload["batcher/rolling_steps_per_iter"] = float(rolling_steps_per_iter)
+                if mae_snapshot:
+                    payload["collapse/mae_mean"] = float(
+                        sum(mae_snapshot) / len(mae_snapshot)
+                    )
+                    payload["collapse/mae_max"] = float(max(mae_snapshot))
+                    for i, v in enumerate(mae_snapshot):
+                        payload[f"collapse/mae_slot{i}"] = float(v)
+                payload["collapse/rides_retired_delta"] = float(collapsed_delta)
+                payload["collapse/rides_retired_total"] = float(collapsed_total)
+                if collapse_mae_threshold is not None:
+                    payload["collapse/threshold"] = float(collapse_mae_threshold)
+                # MAE-compute failures: count of times the per-chunk MAE
+                # diagnostic threw inside the batcher. Non-zero means the
+                # collapse gate is silently disabled for those slots/iters
+                # — exactly the failure mode the run is meant to catch.
+                payload["collapse/mae_compute_failures"] = float(
+                    int(getattr(batcher, "mae_compute_failures", 0))
+                )
                 wandb.log(payload, step=self.step)  # type: ignore
+            if (
+                self.is_main_process
+                and collapsed_delta > 0
+                and collapse_mae_threshold is not None
+            ):
+                logging.info(
+                    "collapse: %d ride(s) retired this iter (total=%d, "
+                    "threshold=%.3f, mae={mean=%.3f, max=%.3f})",
+                    collapsed_delta,
+                    collapsed_total,
+                    collapse_mae_threshold,
+                    (sum(mae_snapshot) / len(mae_snapshot)) if mae_snapshot else 0.0,
+                    max(mae_snapshot) if mae_snapshot else 0.0,
+                )
+
+            # Action-teacher fallback telemetry. The teacher returns
+            # ``None`` on any internal failure (VAE / CoTracker / ss_vae
+            # error, or sanity checks fail) and the aux losses then
+            # silently fall back to commanded-action targets — which
+            # changes the experimental setup without changing the run
+            # status. Surface call/failure counts every log_interval to
+            # both stdout and wandb so a sustained fallback is visible.
+            if (
+                self.is_main_process
+                and self.action_teacher_enabled
+                and (self.step % log_interval == 0)
+            ):
+                self._log_teacher_telemetry()
 
             if self.step > 0 and (self.step % ckpt_interval == 0):
                 self._save_checkpoint()
@@ -1304,15 +1756,37 @@ class RollingStaircaseDMDTrainer:
     ) -> Dict[str, float]:
         """Run `rolling_steps_per_iter` rolling-step forwards on every slot.
 
-        Backward pattern: one-step look-ahead `no_sync()`. All backwards
-        except the last are wrapped in `generator_ddp.no_sync()`, so DDP
-        accumulates gradients locally across (slots_per_rank *
-        rolling_steps_per_iter) backwards and all-reduces exactly once
-        per iter on the final backward.
+        Backward pattern: forward-side ``no_sync()``. DDP's
+        ``require_backward_grad_sync`` flag is set during ``forward()``
+        (not during ``backward()``); ``DistributedDataParallel.no_sync()``
+        wrapping a backward call is a no-op (see PyTorch issue
+        github.com/pytorch/pytorch/issues, "no_sync doesn't affect
+        backward() calls, only forward() calls").
 
-        Lockstep guarantee: `prepare_for_iter` has already ensured every
-        slot on every rank has >= rolling_steps_per_iter steps remaining,
-        so every rank runs the same number of backwards — DDP pairs up.
+        Therefore we wrap each non-final FORWARD in the relevant DDP
+        wrapper's ``no_sync()`` context:
+
+          * Generator forward (``batcher.step_slot``) on iters
+            ``flat_idx < total - 1`` runs inside ``generator_ddp.no_sync()``.
+            On the final iter it runs in nullcontext, so its eventual
+            backward fires the lone allreduce for the iter.
+          * Fake-score forward (inside ``model.generator_loss_on_slots``,
+            invoked by ``_process_pending``) on the in-loop calls runs
+            inside ``fake_score_ddp.no_sync()``. The after-loop call (the
+            final fake forward) runs in nullcontext, allreducing once.
+
+        DDP's per-graph reducer state is then stamped at forward time
+        and consulted when each backward propagates through THAT
+        forward's graph; backward-side context wrappers don't matter.
+
+        Net effect: across ``slots_per_rank * rolling_steps_per_iter``
+        backwards, exactly one generator-allreduce and one
+        fake-score-allreduce fire per optimizer step.
+
+        Lockstep guarantee: ``prepare_for_iter`` has already ensured every
+        slot on every rank has >= ``rolling_steps_per_iter`` steps
+        remaining, so every rank runs the same number of forwards /
+        backwards and the allreduces pair up.
         """
         self.optimizer.zero_grad(set_to_none=True)
         if self.fake_optimizer is not None:
@@ -1336,10 +1810,20 @@ class RollingStaircaseDMDTrainer:
                 return self.fake_score_ddp.no_sync()
             return contextlib.nullcontext()
 
-        def _process_pending(pending_records, pending_ride_slot_idx, is_final):
-            """Backward one slot's records under the right sync contexts
-            for BOTH the generator and fake_score (each has its own DDP
-            wrapper + no_sync lookahead)."""
+        def _process_pending(pending_records, pending_ride_slot_idx):
+            """Forward fake_score + backward generator + backward fake.
+
+            The CALLER is responsible for wrapping this call in the right
+            ``fake_score_ddp.no_sync()`` context (or nullcontext on the
+            final iter) so the fake_score's forward is correctly stamped
+            for its eventual allreduce. Generator-side allreduce is
+            determined by whether the previous ``step_slot`` (forward)
+            ran inside ``generator_ddp.no_sync()``.
+
+            Backwards are run in plain context: backward-side no_sync
+            wrappers are a no-op in PyTorch DDP, so wrapping them here
+            would be misleading.
+            """
             teacher_z = None
             if self.action_teacher_enabled and pending_records:
                 first = pending_records[0]
@@ -1351,20 +1835,11 @@ class RollingStaircaseDMDTrainer:
                 aux_loss_weight=aux_loss_weight,
                 teacher_z_per_slot=teacher_z,
             )
-            gen_ctx = contextlib.nullcontext() if is_final else _gen_no_sync()
-            fake_ctx = contextlib.nullcontext() if is_final else _fake_no_sync()
             if step_loss.requires_grad:
-                with gen_ctx:
-                    # retain_graph when we still need the graph for fake
-                    # backward (fake_loss shares the autocast / step but
-                    # its backward is through a DIFFERENT graph — no
-                    # shared intermediates — so retain_graph is NOT
-                    # needed; the graphs are independent). Keep plain.
-                    step_loss.backward()
+                step_loss.backward()
             fake_val = 0.0
             if fake_loss is not None and fake_loss.requires_grad:
-                with fake_ctx:
-                    fake_loss.backward()
+                fake_loss.backward()
                 fake_val = float(fake_loss.detach().item())
             return (
                 float(step_loss.detach().item()),
@@ -1394,30 +1869,66 @@ class RollingStaircaseDMDTrainer:
                 slot_loss_sum[slot_idx] = slot_loss_sum.get(slot_idx, 0.0) + rec_val
                 slot_loss_count[slot_idx] = slot_loss_count.get(slot_idx, 0) + 1
 
+        # Total forward count (also = backward count) over this iter.
+        # ``prepare_for_iter`` guaranteed every slot has >=
+        # rolling_steps_per_iter steps, so every (step_idx, ride_slot_idx)
+        # pair will produce a non-empty records list.
+        total_iters = int(rolling_steps_per_iter) * int(batcher.slots_per_rank)
         with autocast(device_type="cuda", dtype=self.autocast_dtype, enabled=self.use_mixed_precision):
-            # We generate (records, ride_slot_idx) tuples and use a
-            # one-step look-ahead to backward everything except the last
-            # under `no_sync`. The last backward runs under nullcontext
-            # and fires the single all-reduce for the iter.
+            # One-step look-ahead schedule: at logical iter ``flat_idx`` we
+            # run forward(flat_idx) and (if there is one queued) backward
+            # for forward(flat_idx - 1). This lets us know, at the time we
+            # call ``step_slot``, whether THIS forward is the last one of
+            # the iter -- which determines whether to wrap it in
+            # ``generator_ddp.no_sync()``.
+            #
+            # Sync rules (see method docstring):
+            #   * generator forward(k) wrapped in gen no_sync iff k < N-1
+            #   * fake_score forward(k) (= the in-loop _process_pending
+            #     call after forward(k+1)) wrapped in fake no_sync iff
+            #     k < N-1; the after-loop _process_pending call
+            #     (= fake forward(N-1)) runs in nullcontext.
             pending_records = None
             pending_ride_slot_idx = -1
+            flat_idx = 0
 
             for step_idx in range(rolling_steps_per_iter):
                 for ride_slot_idx in range(batcher.slots_per_rank):
-                    records = batcher.step_slot(ride_slot_idx)
+                    is_last_forward = (flat_idx == total_iters - 1)
+                    flat_idx += 1
+                    # Generator forward sync state is stamped HERE,
+                    # consulted when the matching backward fires.
+                    gen_fwd_ctx = (
+                        contextlib.nullcontext()
+                        if is_last_forward
+                        else _gen_no_sync()
+                    )
+                    with gen_fwd_ctx:
+                        records = batcher.step_slot(ride_slot_idx)
                     if records is None or len(records) == 0:
+                        # prepare_for_iter should prevent this; if it
+                        # ever happens, skip and hope the lockstep
+                        # guarantee on other ranks holds. (A genuine
+                        # ride exhaustion mid-iter would deadlock DDP
+                        # regardless of where we set sync.)
                         continue
                     # Visualization: capture rank-0 ride_slot_0's slot-0
-                    # pred_x0 into the rolling buffer. `observe` no-ops
+                    # pred_x0 into the rolling buffer. ``observe`` no-ops
                     # on non-main ranks or when vis is disabled.
                     if ride_slot_idx == 0:
                         self.vis_recorder.observe(
                             records, batcher.slots[ride_slot_idx]
                         )
                     if pending_records is not None:
-                        sv, n, slog, fv = _process_pending(
-                            pending_records, pending_ride_slot_idx, is_final=False
-                        )
+                        # In-loop _process_pending: this fires the
+                        # fake-score forward for the PREVIOUS iter's
+                        # records. That forward is non-final (a later
+                        # one will follow in the after-loop block), so
+                        # wrap in fake's no_sync.
+                        with _fake_no_sync():
+                            sv, n, slog, fv = _process_pending(
+                                pending_records, pending_ride_slot_idx
+                            )
                         _record_bookkeeping(
                             pending_records, sv, n, slog, fv, pending_ride_slot_idx
                         )
@@ -1425,10 +1936,13 @@ class RollingStaircaseDMDTrainer:
                     pending_records = records
                     pending_ride_slot_idx = ride_slot_idx
 
-            # Final backward (allreduce here).
+            # Final _process_pending: this fires the LAST fake-score
+            # forward AND drives the last generator backward (which
+            # back-props through the forward we ran outside no_sync
+            # above). Both fire their respective allreduces here.
             if pending_records is not None:
                 sv, n, slog, fv = _process_pending(
-                    pending_records, pending_ride_slot_idx, is_final=True
+                    pending_records, pending_ride_slot_idx
                 )
                 _record_bookkeeping(
                     pending_records, sv, n, slog, fv, pending_ride_slot_idx
@@ -1447,6 +1961,7 @@ class RollingStaircaseDMDTrainer:
         )
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
+        self._maybe_update_generator_ema()
 
         # Clip + optimizer step (fake_score).
         fake_grad_norm_val = 0.0
@@ -1530,20 +2045,26 @@ class RollingStaircaseDMDTrainer:
             # same graph twice.
             #
             # DDP OPTIMIZATION — one-step look-ahead with `no_sync()`:
-            #   optimizer.step() fires once per ride (after the whole rollout),
-            #   but there are O(ride_length / num_frame_per_block) backwards
-            #   in between (~100s per ride). By default each backward triggers
-            #   a full all-reduce across ranks, which is ~99% wasted work:
-            #   with `no_sync()`, intermediate backwards accumulate gradients
-            #   LOCALLY into `.grad` and only the FINAL backward triggers a
-            #   single all-reduce that syncs the full accumulated gradient.
-            #   This is mathematically identical to the per-step-all-reduce
-            #   version (DDP averages across ranks; accumulation is a sum
-            #   across steps; `avg(sum) == sum(avg)`), up to float-order.
-            #   If we're not using DDP the context is a no-op.
+            #   The intent is: optimizer.step() fires once per ride; ~100s
+            #   of backwards in between. `no_sync()` should let the
+            #   intermediate backwards accumulate gradients LOCALLY and
+            #   only the FINAL backward should fire a single all-reduce.
             #
-            # The one-step look-ahead is needed because `rollout_iter` is a
-            # generator and the last step isn't known until StopIteration.
+            # WARNING (legacy path bug, not on multi-slot critical path):
+            #   PyTorch's `DistributedDataParallel.no_sync()` actually
+            #   takes effect during the FORWARD call (it gates DDP's
+            #   `prepare_for_backward` reducer hookup); wrapping ONLY the
+            #   `backward()` call as below is a no-op (each backward will
+            #   still allreduce). The forwards happen inside
+            #   `pipeline.rollout_ride()` (= `next(iterator)` below),
+            #   which is OUTSIDE these `no_sync()` contexts.
+            #   See ``_train_one_iter_multislot`` for the corrected
+            #   forward-side sync pattern. This single-ride path is
+            #   only reached when slots_per_rank<=1 AND
+            #   rolling_steps_per_iter is None — neither of which the
+            #   Phase-1 YAML uses — so we keep the (suboptimal) layout
+            #   here rather than risk a test-coverage gap. TODO: lift the
+            #   forward-side fix into this path too if it's reactivated.
             def _gen_no_sync():
                 if self.generator_ddp is not None:
                     return self.generator_ddp.no_sync()
@@ -1638,6 +2159,7 @@ class RollingStaircaseDMDTrainer:
         )
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
+        self._maybe_update_generator_ema()
 
         # Gradient clip + optimizer step (fake_score).
         fake_grad_norm_val = 0.0

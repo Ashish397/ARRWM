@@ -32,6 +32,7 @@ model copies; reduce if you're on 40 GB GPUs.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -93,6 +94,24 @@ class SlotRideState:
     rolling_steps_done: int = 0
     ride_id: str = ""
 
+    # --- Collapse detection (per-chunk MAE vs GT at slot-0 commit) ---
+    # Refreshed on every successful step_slot with the MAE of the freshly
+    # committed slot-0 chunk against its GT-aligned chunk. 0.0 before the
+    # first rolling step of the ride. See PerSlotRideBatcher docstring for
+    # the exact formula and threshold semantics.
+    last_commit_mae: float = 0.0
+    # Set True by step_slot when ``last_commit_mae`` exceeds the batcher's
+    # ``collapse_mae_threshold`` for this ride. The flag is consulted
+    # ONLY by ``prepare_for_iter`` -- the current iter's remaining
+    # rolling steps still execute to preserve DDP lockstep across ranks.
+    # Reset on ``load_slot``.
+    collapse_flag: bool = False
+    # Total number of times this slot has tripped the MAE threshold for
+    # the CURRENT ride. Usually 0 or 1 (the first trip flags the ride for
+    # refill, so subsequent steps on the same ride can only add one more
+    # trip before prepare_for_iter swaps rides). Reset on ``load_slot``.
+    collapse_trips: int = 0
+
 
 class PerSlotRideBatcher:
     """Multi-slot lockstep-friendly driver for RollingStaircaseTrainingPipeline.
@@ -118,6 +137,7 @@ class PerSlotRideBatcher:
         device: torch.device,
         dtype: torch.dtype,
         ride_loader: Callable[[], Optional[RideTensors]],
+        collapse_mae_threshold: Optional[float] = None,
     ) -> None:
         """Args:
           pipeline:         RollingStaircaseTrainingPipeline. The batcher
@@ -133,14 +153,53 @@ class PerSlotRideBatcher:
                                  "zarr_path", "n_latent_frames"}.
                             ``latents`` and ``z_actions`` must have batch
                             dim 1 (shape [1, T, ...]).
+          collapse_mae_threshold:
+                            Optional per-chunk MAE threshold for early
+                            ride termination. After every rolling step,
+                            the batcher computes the per-chunk MAE
+                            between the freshly committed slot-0 chunk
+                            ``next_kv_anchor`` (shape [1, npb, C, H, W];
+                            by default [1, 3, 16, 60, 104] for LongLive
+                            latents) and its GT-aligned counterpart
+                            ``gt_latents[:, action_base:action_base+npb]``
+                            as a single scalar
+                            ``(stu_c - gt_c).abs().mean()``.
+                            If this exceeds the threshold the slot's
+                            ``collapse_flag`` is set; the flag is
+                            consulted at the NEXT ``prepare_for_iter``
+                            to force a refill (the remainder of the
+                            current iter's rolling steps still execute
+                            so DDP lockstep is preserved across ranks).
+                            Set to None (default) to disable. Typical
+                            value: 0.7 (calibrated on a local sweep of
+                            ODE-distilled checkpoints).
         """
         self.pipeline = pipeline
         self.slots_per_rank = int(slots_per_rank)
         self.device = device
         self.dtype = dtype
         self.ride_loader = ride_loader
+        self.collapse_mae_threshold: Optional[float] = (
+            float(collapse_mae_threshold)
+            if collapse_mae_threshold is not None
+            else None
+        )
 
         self.slots: List[SlotRideState] = [SlotRideState() for _ in range(self.slots_per_rank)]
+
+        # Monotonic counter of rides retired due to collapse (summed across
+        # all slots on this rank). The trainer reads it per-iter to surface
+        # a delta in logs / wandb.
+        self.num_collapsed_rides: int = 0
+        # Diagnostic: count and surface failures of the per-chunk MAE
+        # compute. The MAE is a diagnostic, not a correctness path, so we
+        # do not raise — but we DO log the FIRST failure with full
+        # traceback (so the user can fix it) and keep a counter that the
+        # trainer can emit alongside the rest of the collapse telemetry.
+        # Without this, a quietly-broken slice would silently disable the
+        # collapse gate (the whole point of this run).
+        self.mae_compute_failures: int = 0
+        self._mae_first_failure_logged: bool = False
 
     # ------------------------------------------------------------------
     # Cache plumbing
@@ -282,6 +341,10 @@ class PerSlotRideBatcher:
         slot.live = None
         slot.kv_anchor_chunk = None
         slot.commit_history = []
+        # Fresh ride starts with a clean collapse-detector slate.
+        slot.last_commit_mae = 0.0
+        slot.collapse_flag = False
+        slot.collapse_trips = 0
 
         # Fresh caches for this slot (previous slot caches, if any, would
         # be stale — wipe by reallocating instead of zeroing the old
@@ -338,12 +401,16 @@ class PerSlotRideBatcher:
         for slot_idx in range(self.slots_per_rank):
             slot = self.slots[slot_idx]
             rem = self._remaining_rolling_steps(slot)
-            if rem >= int(required_rolling_steps):
+            needs_refill = (
+                rem < int(required_rolling_steps)
+                or bool(slot.collapse_flag)
+            )
+            if not needs_refill:
                 ready += 1
                 continue
             # Refill. If this slot was still "rolling" but short of the
-            # required count, we eat its tail. This is the cost of
-            # strict lockstep.
+            # required count (or flagged for collapse), we eat its tail.
+            # This is the cost of strict lockstep.
             ok = self.refill_one(slot_idx)
             if ok:
                 ready += 1
@@ -445,6 +512,78 @@ class PerSlotRideBatcher:
         if len(slot.commit_history) > 3:
             slot.commit_history.pop(0)
 
+        # --- Collapse detection: per-chunk MAE vs GT at the slot-0 commit.
+        #
+        # ``next_kv_anchor`` IS the just-committed slot-0 student chunk,
+        # shape [1, npb, C, H, W]. Its GT-aligned counterpart is the
+        # same slice of ``slot.gt_latents`` at the ride-frame index
+        # ``a_base`` (the value of ``slot.action_base`` captured BEFORE
+        # the advance below — i.e. slot-0's ride frame index during the
+        # forward we just ran).
+        #
+        # The metric is exactly the one calibrated locally by the user:
+        #   mae = (stu_c - gt_c).abs().mean()
+        # — a single scalar per chunk, no smoothing, no per-frame split.
+        # If it exceeds ``self.collapse_mae_threshold`` we set
+        # ``collapse_flag`` so the NEXT ``prepare_for_iter`` refills
+        # this slot. We intentionally do NOT short-circuit the remaining
+        # rolling steps of the current iter: DDP lockstep requires
+        # every rank to complete ``rolling_steps_per_iter`` backwards,
+        # and the few extra steps on a collapsed ride produce at-most
+        # noisy (not corrupt) gradients on a student that's already
+        # diverged — a cheap price for a simple, safe rule.
+        try:
+            a_base_mae = int(slot.action_base)
+            a_end_mae = a_base_mae + npb
+            total_a_mae = int(slot.gt_latents.shape[1])
+            if a_end_mae <= total_a_mae and next_kv_anchor is not None:
+                gt_chunk_mae = slot.gt_latents[:, a_base_mae:a_end_mae]
+                stu_chunk_mae = next_kv_anchor
+                if gt_chunk_mae.shape == stu_chunk_mae.shape:
+                    mae_val = (
+                        (stu_chunk_mae.detach().to(dtype=torch.float32)
+                         - gt_chunk_mae.detach().to(dtype=torch.float32))
+                        .abs()
+                        .mean()
+                        .item()
+                    )
+                    slot.last_commit_mae = float(mae_val)
+                    if (
+                        self.collapse_mae_threshold is not None
+                        and mae_val > float(self.collapse_mae_threshold)
+                    ):
+                        if not slot.collapse_flag:
+                            self.num_collapsed_rides += 1
+                        slot.collapse_flag = True
+                        slot.collapse_trips += 1
+        except Exception as e:
+            # MAE is a diagnostic, never a correctness dependency. If the
+            # slice shapes go unexpectedly weird (end-of-ride padding,
+            # dtype promotion failures, etc.) we swallow and move on, but
+            # we DO record the failure and log the first occurrence with a
+            # full traceback. Silent gating is the failure mode this
+            # phase-1 sweep is trying to prevent — re-burying it here
+            # would defeat the purpose.
+            self.mae_compute_failures += 1
+            if not self._mae_first_failure_logged:
+                self._mae_first_failure_logged = True
+                if self.collapse_mae_threshold is not None:
+                    logging.warning(
+                        "PerSlotRideBatcher: collapse-MAE compute failed "
+                        "(ride=%s, action_base=%d, threshold=%.3f) — this "
+                        "is the FIRST occurrence; subsequent failures are "
+                        "silent but counted in mae_compute_failures.",
+                        getattr(slot, "ride_id", "?"),
+                        int(getattr(slot, "action_base", -1)),
+                        float(self.collapse_mae_threshold),
+                        exc_info=e,
+                    )
+                else:
+                    logging.debug(
+                        "PerSlotRideBatcher: collapse-MAE compute failed "
+                        "(threshold not set, gate disabled): %s", e,
+                    )
+
         slot.live = state
         slot.logical_start += int(logical_adv)
         slot.action_base += int(action_adv)
@@ -481,5 +620,26 @@ class PerSlotRideBatcher:
         for i, s in enumerate(self.slots):
             rem = self._remaining_rolling_steps(s)
             ride = s.zarr_path.split("/")[-1] if s.zarr_path else "?"
-            parts.append(f"s{i}[{s.phase},done={s.rolling_steps_done},rem={rem},ride={ride}]")
-        return " | ".join(parts)
+            col = "!" if s.collapse_flag else ""
+            parts.append(
+                f"s{i}[{s.phase},done={s.rolling_steps_done},rem={rem},"
+                f"mae={s.last_commit_mae:.3f}{col},ride={ride}]"
+            )
+        line = " | ".join(parts)
+        # Append MAE-compute failure count when non-zero so the gate
+        # health is visible in every periodic log line, not just the
+        # very first warning.
+        if self.mae_compute_failures > 0:
+            line += f" [mae_fail={self.mae_compute_failures}]"
+        return line
+
+    def mae_snapshot(self) -> List[float]:
+        """Per-slot last-commit MAE in slot order. Returns 0.0 for slots
+        that have not yet completed a rolling step on their current ride.
+        """
+        return [float(s.last_commit_mae) for s in self.slots]
+
+    def collapse_flags_snapshot(self) -> List[bool]:
+        """Per-slot collapse_flag in slot order. True means the slot will
+        be refilled on the next ``prepare_for_iter``."""
+        return [bool(s.collapse_flag) for s in self.slots]

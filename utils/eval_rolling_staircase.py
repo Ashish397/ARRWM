@@ -1993,24 +1993,39 @@ def main() -> None:
     # Additive warmup + one chunk per rolling step. No xition, no chunk
     # gap — slot-0 commits land sequentially (chunks P, P+1, P+2, ...).
     #
-    # Denoising ladder mirrors eval_causal_AR.set_denoising_steps: if the
-    # total budget (NS*P) matches the length of the ODE student's trained
-    # ``denoising_step_list``, use that list (on-distribution rungs);
-    # otherwise fall back to linspace(1000, 50, total), which ends on a
-    # near-clean polish rung rather than a half-noise rung.
+    # Denoising ladder mirrors eval_causal_AR.set_denoising_steps: stay
+    # inside the ODE student's TRAINED pool whenever possible. With a
+    # 5-rung trained pool (e.g. ``random_steps: [0, 36, 40, 44, 46]`` ->
+    # timesteps ``{1000, 625, 500, 312.5, 178.6}`` on the 48-step
+    # FlowMatch(shift=5) grid) and ``total_denoise=4``, this picks the
+    # 4 LARGEST trained timesteps (= ``[1000, 625, 500, 312.5]``,
+    # dropping the polish rung first); ``total_denoise=5`` uses all
+    # 5 rungs. ``linspace(1000, 50, n)`` is reserved for budgets that
+    # exceed the trained pool — those rungs are OOD for the student.
     trained = ode_model.denoising_step_list.detach().float().cpu()
     trained_sorted, _ = torch.sort(trained, descending=True)
     NS = int(getattr(pipeline, "num_live_slots"))
     P = int(getattr(pipeline, "passes_per_step"))
     total_denoise = NS * P
-    if int(trained_sorted.shape[0]) == total_denoise:
+    K = int(trained_sorted.shape[0])
+    if total_denoise == K:
         denoising_ladder_values = [float(x) for x in trained_sorted.tolist()]
         ladder_src = "trained"
+    elif 1 <= total_denoise < K:
+        denoising_ladder_values = [
+            float(x) for x in trained_sorted[:total_denoise].tolist()
+        ]
+        ladder_src = f"trained_top{total_denoise}_of_{K}"
     else:
         denoising_ladder_values = [
             float(x) for x in torch.linspace(1000.0, 50.0, steps=total_denoise).tolist()
         ]
-        ladder_src = "linspace(1000,50)"
+        ladder_src = "linspace(1000,50)__OOD"
+        log.warning(
+            "Denoising budget %d > trained pool size %d; falling back "
+            "to linspace(1000, 50, %d). Student NOT distilled at these "
+            "rungs — expect quality drop.", total_denoise, K, total_denoise,
+        )
     log.info(
         "Denoising ladder (%s, %d rungs): %s",
         ladder_src, total_denoise,

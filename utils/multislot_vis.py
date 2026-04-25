@@ -484,20 +484,31 @@ class MultislotVisRecorder:
         Falls back to imageio → torchvision in that order if ffmpeg is
         missing; returns True if any encoder succeeded.
         """
+        # Encoder fallback chain: ffmpeg (preferred) -> imageio -> torchvision.
+        # The ffmpeg path is fastest and produces the smallest files; the
+        # other two are emergency fallbacks only. We log primary failures
+        # at WARNING level (so a missing-PATH ffmpeg is loud) so silent
+        # video loss is impossible to miss in stdout/stderr logs.
         try:
             from utils.eval_chain import frames_to_mp4
             frames_to_mp4(arr, str(out_path), fps=float(fps))
             if out_path.exists() and out_path.stat().st_size > 0:
                 return True
         except Exception as e:  # noqa: BLE001
-            logging.debug("vis: ffmpeg frames_to_mp4 failed: %s", e)
+            logging.warning(
+                "vis: ffmpeg frames_to_mp4 failed (ffmpeg missing or "
+                "broken?); falling back to imageio: %s", e,
+            )
 
         try:
             import imageio  # type: ignore
             imageio.mimwrite(str(out_path), arr, fps=int(fps), quality=7)
             return True
         except Exception as e:  # noqa: BLE001
-            logging.debug("vis: imageio mp4 write failed: %s", e)
+            logging.warning(
+                "vis: imageio mp4 write failed; falling back to "
+                "torchvision: %s", e,
+            )
 
         try:
             from torchvision.io import write_video  # type: ignore
@@ -505,7 +516,10 @@ class MultislotVisRecorder:
             write_video(str(out_path), video_tensor, fps=int(fps))
             return True
         except Exception as e:  # noqa: BLE001
-            logging.debug("vis: torchvision write_video failed: %s", e)
+            logging.warning(
+                "vis: torchvision write_video failed — VIDEO WILL NOT BE "
+                "WRITTEN this iter (training continues): %s", e,
+            )
 
         return False
 

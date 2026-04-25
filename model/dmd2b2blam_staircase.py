@@ -216,22 +216,65 @@ class DMD2B2BLAM_Staircase(SelfForcingModel):
             raise KeyError(
                 f"ODE checkpoint is missing 'generator' key: {list(ckpt.keys())}"
             )
+        # ODE generator load: ALWAYS log missing/unexpected counts (no
+        # longer gated on DEBUG). Optionally hard-fail when ``strict=True``
+        # is requested via config — useful for production runs where
+        # silently loading 0/N matching keys would be a disaster. The
+        # per-key list is still emitted at debug level for forensic use.
+        is_main = (not dist.is_initialized()) or dist.get_rank() == 0
+        strict = bool(getattr(args, "strict_ode_load", False))
         missing, unexpected = self.generator.model.load_state_dict(
             ckpt["generator"], strict=False
         )
-        if ((not dist.is_initialized()) or dist.get_rank() == 0) and DEBUG:
+        if is_main:
             logging.info(
                 "[DMD2Staircase] generator load: missing=%d unexpected=%d",
                 len(missing), len(unexpected),
             )
+            if missing:
+                logging.debug(
+                    "[DMD2Staircase] generator missing keys (first 8): %s",
+                    list(missing)[:8],
+                )
+            if unexpected:
+                logging.debug(
+                    "[DMD2Staircase] generator unexpected keys (first 8): %s",
+                    list(unexpected)[:8],
+                )
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"[DMD2Staircase] strict_ode_load=True but generator state "
+                f"has missing={len(missing)} unexpected={len(unexpected)} "
+                f"keys vs ode_generator_checkpoint. Re-run with "
+                f"strict_ode_load=false to relax (and inspect debug logs)."
+            )
 
         # Action heads (if present and we have matching modules on self).
+        # Each head is loaded non-strictly so a checkpoint that pre-dates
+        # a head's introduction still loads, but missing-key counts are
+        # surfaced loudly for action_projection (the most consequential
+        # head — it's how the v14 / ODE student conditioned on actions).
         if "action_projection" in ckpt and self.action_projection is not None:
             try:
-                self.action_projection.load_state_dict(ckpt["action_projection"], strict=False)
+                ap_missing, ap_unexpected = self.action_projection.load_state_dict(
+                    ckpt["action_projection"], strict=False,
+                )
+                if is_main:
+                    logging.info(
+                        "[DMD2Staircase] action_projection load: "
+                        "missing=%d unexpected=%d",
+                        len(ap_missing), len(ap_unexpected),
+                    )
+                if strict and (ap_missing or ap_unexpected):
+                    raise RuntimeError(
+                        "[DMD2Staircase] strict_ode_load=True but "
+                        "action_projection has missing/unexpected keys."
+                    )
             except Exception as e:
-                if (not dist.is_initialized()) or dist.get_rank() == 0:
+                if is_main:
                     logging.warning("[DMD2Staircase] action_projection load failed: %s", e)
+                if strict:
+                    raise
 
         for key, attr in (
             ("action_token_projection", "action_token_projection"),
@@ -240,10 +283,24 @@ class DMD2B2BLAM_Staircase(SelfForcingModel):
         ):
             if key in ckpt and hasattr(self, attr) and getattr(self, attr) is not None:
                 try:
-                    getattr(self, attr).load_state_dict(ckpt[key], strict=False)
+                    h_missing, h_unexpected = getattr(self, attr).load_state_dict(
+                        ckpt[key], strict=False,
+                    )
+                    if is_main:
+                        logging.info(
+                            "[DMD2Staircase] %s load: missing=%d unexpected=%d",
+                            key, len(h_missing), len(h_unexpected),
+                        )
+                    if strict and (h_missing or h_unexpected):
+                        raise RuntimeError(
+                            f"[DMD2Staircase] strict_ode_load=True but "
+                            f"{key} has missing/unexpected keys."
+                        )
                 except Exception as e:
-                    if (not dist.is_initialized()) or dist.get_rank() == 0:
+                    if is_main:
                         logging.warning("[DMD2Staircase] %s load failed: %s", key, e)
+                    if strict:
+                        raise
 
     def _load_real_score_with_v14_lora(self, args, device) -> None:
         """Wrap self.real_score.model with PEFT LoRA using the v14 config,
@@ -412,12 +469,15 @@ class DMD2B2BLAM_Staircase(SelfForcingModel):
             conditional_dict=conditional_dict,
             timestep=timestep,
         )
-        _, pred_real_uncond = self.real_score(
-            noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=unconditional_dict,
-            timestep=timestep,
-        )
-        pred_real = pred_real_cond + (pred_real_cond - pred_real_uncond) * self.real_guidance_scale
+        if self.real_guidance_scale != 0.0:
+            _, pred_real_uncond = self.real_score(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=unconditional_dict,
+                timestep=timestep,
+            )
+            pred_real = pred_real_cond + (pred_real_cond - pred_real_uncond) * self.real_guidance_scale
+        else:
+            pred_real = pred_real_cond
 
         p_real = estimated_clean_image_or_video - pred_real
         p_fake = estimated_clean_image_or_video - pred_fake
