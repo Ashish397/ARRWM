@@ -90,6 +90,16 @@ auto_resume: true
 strict_resume_load: false
 strict_ode_load: false
 
+# Periodic pred_image -> wandb.Video sampling. Every
+# ``sample_interval`` generator steps the trainer detaches the
+# generator's pred_image latents, decodes them with the WAN VAE
+# wrapper, encodes the resulting RGB clip to MP4 via ffmpeg, and
+# uploads it to W&B as ``train/pred_image_video`` (only on the
+# main rank). Set ``sample_interval: 0`` to disable.
+sample_interval: 200
+sample_fps: 5
+sample_max_frames: 0  # 0 = use all frames in pred_image
+
 # Distillation = action_forcing (CF-style); selects
 # trainer/causal_action_forcing_train.py.
 distillation: action_forcing

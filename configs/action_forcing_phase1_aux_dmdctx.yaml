@@ -1,0 +1,291 @@
+# Phase-1 Action-Forcing DMD config (NO STAIRCASE) — AUX + DMD_CONTEXT
+#
+# Identical to ``configs/action_forcing_phase1_aux.yaml`` (CF chunkwise DMD,
+# 21-frame action-forcing scoring window, infinity-RoPE, MAE extensions,
+# action critic + frozen-teacher z-guidance) PLUS:
+#   1. ``dmd_context: true``: feed the bidirectional ``real_score`` /
+#      ``fake_score`` a clean GT context block alongside the student's
+#      noisy rollout, mirroring how v14 was trained (3 clean context
+#      frames + 21 noisy target frames per forward, 18-frame overlap).
+#   2. ``dmd_context_clean_frames: 3``: number of leading GT frames to
+#      hand the scorers as ``clean_x``. Must be a multiple of
+#      ``num_frame_per_block`` (= 3) so ``context_shift = cf // npb``
+#      is integer-aligned to chunks (matching v14).
+#
+# Why this matters (and why this is "fair" — Option A1):
+#   v14's bidirectional teacher was trained with a 24-frame window
+#   spanning frames ``[0..23]`` of a ride, where:
+#     * frames ``[0..20]``  (21 frames) = clean GT context (clean_x)
+#     * frames ``[3..23]``  (21 frames) = noisy target  (x_t)
+#     * 18 frames overlap; the model attends to both halves jointly
+#       and predicts noise on the noisy half.
+#   The student here also rolls ``num_training_frames=21`` frames, but
+#   they're its own predictions, not GT. dmd_context simply provides
+#   ``real_score`` / ``fake_score`` the same clean GT context block at
+#   ride frames ``[0..20]`` while the student covers ride frames
+#   ``[3..23]``. ``context_shift = cf // npb = 1`` aligns the scorer's
+#   RoPE positions to the v14 LoRA weights. THE ROLLOUT BUDGET IS
+#   IDENTICAL TO THE AUX BASELINE (21 student frames). Only the scorer
+#   forwards see an extra 3 clean GT frames as context.
+#
+# Cost vs aux baseline:
+#   * Rollout compute: UNCHANGED. Student still rolls 21 frames per
+#     iter (= 7 chunks of ``num_frame_per_block=3``), same as aux.
+#   * Scorer FLOPs: ~+15% (24 frames vs 21 frames per scorer forward).
+#   * KV cache memory: UNCHANGED — generator's rolling cache still
+#     sized for 21-frame rollout. Scorer forwards run on bidirectional
+#     models (no KV cache) so the +3 frames just resize ``seq_len``.
+#   * Throughput hit: expect ~+10-15% per-iter wallclock vs the AUX
+#     config — much cheaper than rolling 60 frames.
+#
+# To DISABLE dmd_context (regress to scorers-on-21-frames-only), set
+# ``dmd_context: false``. The model will then skip the clean_x /
+# context_shift path entirely and behave like the AUX baseline.
+
+config_name: action-forcing-phase1-aux-dmdctx
+run_name: action_forcing_phase1_aux_dmdctx
+
+seed: 0
+mixed_precision: true
+log_interval: 10
+checkpoint_interval: 500
+max_steps: 10000
+
+# Periodic pred_image -> wandb.Video sampling. See action_forcing_phase1_aux.yaml
+# for the cost / behaviour notes. Set sample_interval: 0 to disable.
+sample_interval: 200
+sample_fps: 5
+sample_max_frames: 0
+max_grad_norm: 10.0
+auto_resume: true
+strict_resume_load: false
+strict_ode_load: false
+
+distillation: action_forcing
+
+wandb_project: longlive-phase1
+wandb_dir: ./wandb
+disable_wandb: false
+
+log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
+
+# ---------------------------------------------------------------------------
+# Data (verbatim from the AUX config, except ``min_ride_frames`` is bumped
+# from 21 → 24 because dmd_context needs ``cf=3`` extra leading GT frames
+# to feed the scorers as clean_x. ``rollout_frames=21`` (unchanged), so
+# the loader needs rides of length ``>= rollout_frames + cf = 24``.)
+# ---------------------------------------------------------------------------
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
+caption_root: /projects/u6ex/fbots/frodobots_captions/train
+motion_root: /projects/u6ex/fbots/frodobots_motion
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+action_dims: [2, 7]
+raw_action_dim: 2
+action_dim: 2
+enable_adaln_zero: true
+action_conditioning_mode: both
+
+# Bumped 21 → 24 to provide cf=3 leading GT frames for clean_x.
+# ``max_ride_frames=24`` caps the loaded ride at exactly the dmd_context
+# window (cf=3 + num_training_frames=21). Bigger values just waste I/O
+# since extensions are disabled below — only the first 24 frames are
+# ever used.
+min_ride_frames: 24
+max_rides: null
+max_ride_frames: 24
+
+sort_rides_by_length: asc
+num_workers: 2
+
+# ---------------------------------------------------------------------------
+# Model (verbatim from AUX — rollout_frames stays at num_training_frames).
+# ---------------------------------------------------------------------------
+distribution_loss: dmd_action_forcing
+model_name: Wan2.1-T2V-1.3B
+real_model_name: Wan2.1-T2V-1.3B
+fake_model_name: Wan2.1-T2V-1.3B
+num_training_frames: 21
+num_train_timestep: 1000
+denoising_loss_type: flow
+gradient_checkpointing: true
+
+# Student rollout window (= num_training_frames). dmd_context does NOT
+# extend this; it only adds ``cf=3`` clean GT context frames to the
+# scorer forwards. Set to null to default to ``num_training_frames``.
+rollout_frames: 21
+
+# MAE extensions DISABLED in dmd_context mode for v14 parity. With
+# extensions enabled, the model's scoring window slides to the LAST
+# ``num_training_frames`` of the rollout (= ride[rollout_end-21:
+# rollout_end]); clean_x = ride[0:21] would then no longer be the
+# 3-frame-shifted predecessor of the scoring window — breaks v14
+# alignment. v14 itself was trained without extensions (single
+# 24-frame window per iter). Keep this off when dmd_context=true.
+mae_extension_threshold: null
+mae_extension_max_extra_chunks: 0
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 21
+  sink_size: 3
+
+i2v: false
+text_pre_encoded: true
+
+infinity_rope: true
+
+# ---------------------------------------------------------------------------
+# CF-style pipeline geometry (verbatim from AUX)
+# ---------------------------------------------------------------------------
+num_frame_per_block: 3
+chunks_per_rolling_step: 1
+same_step_across_blocks: true
+last_step_only: false
+context_noise: 0
+denoising_step_list: [1000, 625, 500, 312.5]
+
+action_patch_enabled: true
+action_modulation_activation: silu
+
+# ---------------------------------------------------------------------------
+# AUX HEADS — INSTANTIATED AND TRAINABLE (verbatim from AUX).
+# ---------------------------------------------------------------------------
+action_critic_aux_enabled: true
+action_critic_z_out_dim: 8
+action_critic_base_channels: 128
+action_critic_num_blocks: 4
+action_critic_dims: [2, 7]
+
+state_probe_aux_enabled: true
+state_head_out_dim: 8
+state_probe_dim: 256
+state_probe_num_heads: 8
+state_probe_n_taps: 6
+state_head_loss_weight: 0.0
+state_guidance_weight: 0.0
+
+# ---------------------------------------------------------------------------
+# Action teacher — ON (verbatim from AUX).
+# ---------------------------------------------------------------------------
+action_teacher_mode: "all"
+
+cotracker_source_dir: /home/u6ex/as1748.u6ex/.cache/torch/hub/facebookresearch_co-tracker_main
+cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/scaled_offline.pth
+
+# ---------------------------------------------------------------------------
+# Critic optimizer + z-guidance recipe (verbatim from AUX)
+# ---------------------------------------------------------------------------
+critic_lr: 3.0e-04
+critic_betas: [0.9, 0.999]
+critic_eps: 1.0e-08
+critic_weight_decay: 0.0
+critic_max_grad_norm: 10.0
+critic_updates_per_step: 2
+
+action_critic_z_loss_weight: 0.25
+
+generator_action_z_guidance_weight: 0.125
+z_guidance_warmup_steps: 500
+warmup_steps: 0
+
+# ---------------------------------------------------------------------------
+# Checkpoints (verbatim from AUX)
+# ---------------------------------------------------------------------------
+ode_generator_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/action_ode_distill_E/action_ode_step0001000.pt
+
+v14_teacher_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_balanced_weunz/causal_lora_step0006600.pt
+v14_lora:
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+
+# ---------------------------------------------------------------------------
+# DMD + critic loss config (verbatim from AUX)
+# ---------------------------------------------------------------------------
+dmd_loss_weight: 1.0
+real_guidance_scale: 3.0
+fake_guidance_scale: 0.0
+timestep_shift: 5.0
+ts_schedule: false
+ts_schedule_max: false
+min_score_timestep: 0
+
+gan_loss_weight: 0.0
+
+fake_score_updates_enabled: true
+dfake_gen_update_ratio: 1
+
+ema_weight: 0.99
+ema_start_step: 200
+
+# ---------------------------------------------------------------------------
+# Optimizer (verbatim from AUX)
+# ---------------------------------------------------------------------------
+lr: 2.0e-06
+betas: [0.0, 0.999]
+eps: 1.0e-08
+weight_decay: 0.01
+train_action_projection: true
+train_action_token_projection: true
+
+fake_lr: 4.0e-07
+fake_betas: [0.0, 0.999]
+fake_eps: 1.0e-08
+fake_weight_decay: 0.01
+fake_max_grad_norm: 10.0
+
+debug_find_unused_parameters: false
+assert_grad_uniformity: false
+nccl_timeout_minutes: 60
+
+# ---------------------------------------------------------------------------
+# DMD_CONTEXT — feed real_score / fake_score a clean GT context block as
+# ``clean_x`` so they're inferenced the way v14 was TRAINED (3 clean +
+# 21 noisy frames per forward, with context_shift=1 aligning the
+# RoPE positions to the v14 LoRA weights).
+# ---------------------------------------------------------------------------
+# When ``dmd_context: true``:
+#   * Trainer loads ``ride[0..23]`` (24 frames). The student rolls
+#     ``ride[3..23]`` (21 frames). Scorers receive:
+#       - ``clean_x  = ride[0..20]``  (21 clean GT frames; aug_t=0)
+#       - ``noisy_x  = student rollout`` (21 noisy student frames)
+#     plus a clean conditional dict built from the GT context's actions.
+#   * ``model.real_score.context_shift`` and ``model.fake_score.
+#     context_shift`` are set to ``cf // num_frame_per_block = 1`` so
+#     the RoPE positions match v14's training (which was trained with
+#     ``context_shift=1`` on a 24-frame window).
+#   * ``num_training_frames`` (= 21) and ``rollout_frames`` (= 21)
+#     stay constant — this is NOT a longer rollout. It just adds 3
+#     clean GT frames to the bidirectional scorer forwards.
+#
+# Default is ``false`` for backward-compat with the AUX / AUX+GAN /
+# AUX+SC-DMD runs.
+dmd_context: true
+dmd_context_clean_frames: 3
+
+# ---------------------------------------------------------------------------
+# R3GAN + SC-DMD — OFF (this is a clean dmd_context A/B vs aux baseline).
+# ---------------------------------------------------------------------------
+gan_enabled: false
+sc_dmd_enabled: false
+
+# ---------------------------------------------------------------------------
+# Visualization (verbatim from AUX)
+# ---------------------------------------------------------------------------
+vis_wallclock_seconds: 0
+vis_num_chunks: 0
+vis_fps: 8
+vis_to_wandb: false
+vis_save_local: false
+vis_emit_on_first_step: false
+
+# ---------------------------------------------------------------------------
+# Trainer-internal feature flags (verbatim)
+# ---------------------------------------------------------------------------
+slots_per_rank: 1
+rolling_steps_per_iter: null
+collapse_mae_threshold: null
+backward_simulation: true
+independent_first_frame: false
+warp_denoising_step: false

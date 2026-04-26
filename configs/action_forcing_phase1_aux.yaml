@@ -41,6 +41,27 @@ mixed_precision: true
 log_interval: 10
 checkpoint_interval: 500
 max_steps: 10000
+
+# ---------------------------------------------------------------------------
+# Periodic pred_image -> wandb.Video sampling
+# ---------------------------------------------------------------------------
+# Every ``sample_interval`` generator steps, the trainer detaches the
+# in-graph student rollout (``aux["pred_image"]``), VAE-decodes the
+# first batch element to pixel space using the generator's already
+# loaded ``WanVAEWrapper`` (no second VAE copy), encodes mp4 bytes via
+# an ffmpeg subprocess, and uploads to W&B as ``sample/pred_image``.
+#
+# Cost per sample (~21 latent frames):
+#   - VAE decode (no_grad): ~30 ms
+#   - ffmpeg libx264 encode: ~50 ms
+#   - wandb.Video upload: <1 s
+# Negligible amortized over ``sample_interval`` steps.
+#
+# Set ``sample_interval: 0`` to disable. Only the main rank does work
+# (no NCCL collective in the sample path), so multi-GPU is unaffected.
+sample_interval: 200
+sample_fps: 5
+sample_max_frames: 0  # 0 = use all frames in pred_image
 max_grad_norm: 10.0
 auto_resume: true
 strict_resume_load: false

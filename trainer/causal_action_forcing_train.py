@@ -30,11 +30,14 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -55,8 +58,52 @@ from trainer.causal_rolling_staircase_train import (
     _load_ride_tensors,
 )
 from model.dmd_action_forcing import ActionForcingDMD
+from model.r3gan import (
+    R3GANDiscriminator3D,
+    rpgan_d_loss,
+    rpgan_g_loss,
+    r1_penalty,
+    r2_penalty,
+)
 from pipeline.action_forcing_training import ActionForcingTrainingPipeline
 from utils.infinity_rope import install as _install_infinity_rope
+
+
+def _frames_to_mp4_bytes(frames: np.ndarray, fps: float = 5.0) -> Optional[bytes]:
+    """Encode uint8ndarray ``[T, H, W, 3]`` to mp4 bytes via ffmpeg.
+
+    Mirrors the helper in ``trainer/causal_diffusion_teacher_train.py``.
+    Returns ``None`` on any subprocess / encode failure so the caller
+    can skip the wandb upload silently. Best-effort: never raises.
+    """
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        return None
+    h, w = int(frames.shape[1]), int(frames.shape[2])
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{w}x{h}", "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out_bytes, _ = proc.communicate(
+            input=frames.tobytes(), timeout=120,
+        )
+        if proc.returncode == 0 and len(out_bytes) > 0:
+            return out_bytes
+    except Exception:
+        pass
+    return None
 
 
 def _chunk_actions(per_frame: torch.Tensor, chunk_frames: int) -> torch.Tensor:
@@ -98,6 +145,48 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     Action-Forcing's contract is "DMD + action critic only". The
     state probe head is still instantiated (for ODE checkpoint
     parity) and remains frozen.
+
+    R3GAN (RpGAN + R1 + R2) is OPT-IN via ``gan_enabled: true``. When
+    enabled the trainer:
+
+      - builds ``model.r3gan.R3GANDiscriminator3D`` on the latent
+        video shape and DDP-wraps it (separate from the ``fake_score``
+        / ``action_critic`` DDPs);
+      - builds a dedicated AdamW (``gan_lr``, ``gan_betas``,
+        ``gan_weight_decay``);
+      - on every generator step computes:
+            real = ride["latents"][:, gen_window]   (GT latent video)
+            fake = aux["pred_image"]                (student rollout
+                                                     last num_training_
+                                                     frames)
+        and runs:
+            * D-update (RpGAN-D + R1 on real + R2 on fake; backward
+              into D only — fake is detached so no flow into G);
+            * G's RpGAN term added to the generator loss (graph flows
+              through ``pred_image`` -> generator);
+      - persists / resumes ``r3gan_discriminator`` +
+        ``r3gan_optimizer`` state in the checkpoint file.
+
+    See ``model/r3gan.py`` for the loss / discriminator code and
+    ``configs/action_forcing_phase1_aux_gan.yaml`` for the
+    intended hyper-parameters.
+
+    SC-DMD (Salt paper, arXiv 2604.03118v1) is OPT-IN via
+    ``sc_dmd_enabled: true``. When enabled the trainer adds the
+    semigroup defect regularizer
+        L_SC = E[||Ψ_θ^{ts→te}(x_ts) - Ψ_θ^{tm→te}(Ψ_θ^{ts→tm}(x_ts))||²]
+    to the generator loss. This penalizes the gap between the model's
+    direct one-step denoising (``t_s → t_e``) and the same denoising
+    composed through an intermediate rung ``t_m``, addressing DMD's
+    compositionality deficit in multi-step inference.
+
+    Implementation lives entirely on the model
+    (``ActionForcingDMD.sc_dmd_loss`` — single chunk, fresh KV cache,
+    2 extra DiT forwards on a 3-frame chunk per gen step ≈ 1-2%
+    extra wallclock). The trainer threads weight + warmup config and
+    adds the weighted SC loss to the unified generator backward
+    alongside DMD / aux / GAN. SC works with or without aux/GAN
+    enabled (independent loss).
     """
 
     # ------------------------------------------------------------------
@@ -212,6 +301,145 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # ``.module`` still exposes the underlying ActionCritic
                 # for state_dict save.
                 model.action_critic = self.action_critic_ddp  # type: ignore
+
+        # ------------------------------------------------------------------
+        # R3GAN — RpGAN + R1 + R2 discriminator (opt-in via ``gan_enabled``).
+        # Built in fp32 to keep the gradient-penalty (second-order)
+        # arithmetic numerically clean. The discriminator operates on
+        # the same latent video tensor the student predicts; both real
+        # (GT) and fake (``pred_image``) come from the trainer's
+        # ride / aux dict, so the disc never has to know about the
+        # RoPE-cache / scheduler state of the generator.
+        # ------------------------------------------------------------------
+        self.gan_enabled = bool(getattr(self.config, "gan_enabled", False))
+        self.r3gan_disc: Optional[torch.nn.Module] = None
+        self.r3gan_disc_ddp: Optional[DDP] = None
+        if self.gan_enabled:
+            in_channels = int(
+                getattr(self.config, "gan_disc_in_channels", 16)
+            )
+            base_channels = int(
+                getattr(self.config, "gan_disc_base_channels", 64)
+            )
+            num_blocks = int(
+                getattr(self.config, "gan_disc_num_blocks", 4)
+            )
+            disc = R3GANDiscriminator3D(
+                in_channels=in_channels,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+            )
+            disc.to(device=self.device, dtype=torch.float32)
+            disc.train()
+            self.r3gan_disc = disc
+            if self.world_size > 1:
+                self.r3gan_disc_ddp = DDP(
+                    disc,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=False,
+                    broadcast_buffers=False,
+                )
+            if self.is_main_process:
+                n_params = sum(p.numel() for p in disc.parameters())
+                logging.info(
+                    "[ActionForcing] R3GAN discriminator built: "
+                    "in_channels=%d base_channels=%d num_blocks=%d "
+                    "params=%.2fM (DDP=%s)",
+                    in_channels, base_channels, num_blocks,
+                    n_params / 1e6,
+                    self.r3gan_disc_ddp is not None,
+                )
+
+        # ------------------------------------------------------------------
+        # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
+        # No new modules / optimizers needed; the SC pass shares the
+        # existing generator's parameters via the same DDP-wrapped
+        # ``model.generator``. We only thread a config flag, weight,
+        # and warmup into the gen-loss compute path. Triplet sampling
+        # and the two extra DiT forwards live on
+        # ``ActionForcingDMD.sc_dmd_loss``; this trainer just calls it
+        # and adds the weighted loss to the unified generator backward.
+        # ------------------------------------------------------------------
+        self.sc_dmd_enabled = bool(
+            getattr(self.config, "sc_dmd_enabled", False)
+        )
+        self.sc_dmd_loss_weight = float(
+            getattr(self.config, "sc_dmd_loss_weight", 0.05)
+        )
+        self.sc_dmd_warmup_steps = int(
+            getattr(self.config, "sc_dmd_warmup_steps", 0)
+        )
+        if self.sc_dmd_enabled and self.is_main_process:
+            logging.info(
+                "[ActionForcing] SC-DMD (Salt) ENABLED: weight=%.4f "
+                "warmup_steps=%d (loss multiplier ramps linearly from "
+                "0 to ``weight`` over ``warmup_steps`` steps; SC pass "
+                "costs ~2 extra DiT forwards on a ``num_frame_per_block``-"
+                "frame chunk per gen step).",
+                self.sc_dmd_loss_weight,
+                self.sc_dmd_warmup_steps,
+            )
+
+        # ------------------------------------------------------------------
+        # dmd_context (v14 teacher-forcing parity): when True the trainer
+        # loads ``num_training_frames + dmd_context_clean_frames`` frames
+        # per ride and shifts the student rollout to start at ride frame
+        # ``cf = dmd_context_clean_frames`` (default 3, matching v14's
+        # training). The DMD scorers receive ``clean_x = ride[:, :
+        # num_training_frames]`` (= the cf-leading ride frames + their
+        # overlap with the rollout window) and ``noisy_x = student_pred``
+        # (= ride frames cf..cf+N-1). The model handles the
+        # teacher-forcing block mask via its ``context_shift`` attr,
+        # which the model sets in ``ActionForcingDMD.__init__`` when
+        # ``dmd_context=True``.
+        #
+        # When dmd_context=False (default) all of this is dead — the
+        # trainer skips the cf shift, doesn't load extra frames, and
+        # passes None for the clean-context kwargs.
+        # ------------------------------------------------------------------
+        self.dmd_context_enabled = bool(
+            getattr(self.config, "dmd_context", False)
+        )
+        self.dmd_context_clean_frames = int(
+            getattr(self.config, "dmd_context_clean_frames", 3)
+        )
+
+        self.sample_interval = int(
+            getattr(self.config, "sample_interval", 0) or 0
+        )
+        self.sample_fps = int(getattr(self.config, "sample_fps", 5) or 5)
+        self.sample_max_frames = int(
+            getattr(self.config, "sample_max_frames", 0) or 0
+        )
+        self._pending_video_latents: Optional[torch.Tensor] = None
+        self._video_logger_warned_no_vae: bool = False
+        if self.sample_interval > 0 and self.is_main_process:
+            logging.info(
+                "[ActionForcing] Video sampling ENABLED: every %d "
+                "generator steps, decode pred_image -> mp4 -> wandb "
+                "(fps=%d, max_frames=%s)",
+                self.sample_interval,
+                self.sample_fps,
+                ("all" if self.sample_max_frames <= 0
+                 else str(self.sample_max_frames)),
+            )
+        if self.dmd_context_enabled and self.is_main_process:
+            logging.info(
+                "[ActionForcing] dmd_context ENABLED: "
+                "dmd_context_clean_frames=%d (= cf). Student rolls "
+                "ride[%d..%d] (a num_training_frames-long slice "
+                "starting at ride frame cf); scorers receive "
+                "clean_x = ride[0..%d] (first num_training_frames "
+                "frames). v14 parity: 3 clean GT context frames + "
+                "21 noisy student frames with 18-frame overlap.",
+                self.dmd_context_clean_frames,
+                self.dmd_context_clean_frames,
+                self.dmd_context_clean_frames + int(getattr(
+                    self.config, "num_training_frames", 21,
+                )) - 1,
+                int(getattr(self.config, "num_training_frames", 21)) - 1,
+            )
 
     def _build_pipeline(self) -> None:
         cfg = self.config
@@ -407,6 +635,64 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.action_critic_dims,
                 )
 
+        # ------------------------------------------------------------------
+        # R3GAN discriminator optimizer + hyperparameters. Defaults
+        # follow the StyleGAN/R3GAN convention: AdamW with
+        # ``betas=(0.0, 0.9)`` (high-momentum first-order beta is
+        # *unsafe* for GAN D — keep first-moment beta near 0 so D
+        # doesn't lock into pre-G's-update statistics).
+        # ------------------------------------------------------------------
+        self.gan_loss_weight = float(getattr(cfg, "gan_loss_weight", 0.05))
+        self.gan_r1_gamma = float(getattr(cfg, "gan_r1_gamma", 1.0))
+        self.gan_r2_gamma = float(getattr(cfg, "gan_r2_gamma", 1.0))
+        # ``gan_warmup_steps``: ramp the *generator-side* RpGAN-G loss
+        # weight from 0 → ``gan_loss_weight`` over this many steps so
+        # the gen doesn't see noise from a freshly-initialised D.
+        # The D-side update runs from step 0 (it has to learn before
+        # it can give G a signal). Default 500 (== z_guidance_warmup_steps).
+        self.gan_warmup_steps = int(getattr(cfg, "gan_warmup_steps", 500))
+        self.gan_updates_per_step = int(
+            getattr(cfg, "gan_updates_per_step", 1)
+        )
+        self.gan_max_grad_norm = float(
+            getattr(cfg, "gan_max_grad_norm", self.max_grad_norm)
+        )
+        self.r3gan_optimizer: Optional[torch.optim.Optimizer] = None
+        if self.gan_enabled and self.r3gan_disc is not None:
+            disc_lr = float(getattr(cfg, "gan_lr", 2e-4))
+            disc_betas = tuple(
+                getattr(cfg, "gan_betas", [0.0, 0.9])
+            )
+            disc_eps = float(getattr(cfg, "gan_eps", 1e-8))
+            disc_wd = float(getattr(cfg, "gan_weight_decay", 0.0))
+            disc_params = [
+                p for p in self.r3gan_disc.parameters() if p.requires_grad
+            ]
+            if not disc_params:
+                raise RuntimeError(
+                    "r3gan_disc has no trainable parameters; check the "
+                    "constructor."
+                )
+            self.r3gan_optimizer = torch.optim.AdamW(
+                disc_params,
+                lr=disc_lr,
+                betas=disc_betas,
+                eps=disc_eps,
+                weight_decay=disc_wd,
+            )
+            if self.is_main_process:
+                n_params = sum(p.numel() for p in disc_params)
+                logging.info(
+                    "[ActionForcing] R3GAN optimizer built: AdamW "
+                    "lr=%.2e betas=%s wd=%.4f params=%.2fM "
+                    "(loss_weight=%.4f, R1_gamma=%.3f, R2_gamma=%.3f, "
+                    "warmup_steps=%d, gan_updates_per_step=%d)",
+                    disc_lr, disc_betas, disc_wd, n_params / 1e6,
+                    self.gan_loss_weight, self.gan_r1_gamma,
+                    self.gan_r2_gamma, self.gan_warmup_steps,
+                    self.gan_updates_per_step,
+                )
+
     def _inner_dit_for_rope(self):
         """Return the bare DiT module under the (possibly DDP / LoRA)
         generator so ``infinity_rope.install()`` can clear any
@@ -465,6 +751,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else 0
         )
         max_total_rollout_frames = rollout_frames + max_extension_frames
+
+        # dmd_context shifts the student's rollout window forward by
+        # ``cf`` frames in the ride (= ride frames [cf, cf +
+        # max_total_rollout_frames)) so the leading ``cf`` ride
+        # frames are reserved as scorer clean_x. The ride filter and
+        # ride slicing must add ``cf`` to the threshold accordingly.
+        # When dmd_context is disabled, ``cf=0`` and this is a no-op.
+        cf_dmdctx = (
+            self.dmd_context_clean_frames
+            if self.dmd_context_enabled else 0
+        )
         # CF-parity #6: periodic memory hygiene.
         # ``empty_cache_interval``: how often to release PyTorch's caching
         # allocator pool back to the driver (CF: every 20 steps).
@@ -519,6 +816,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     train_generator=True,
                     rollout_frames=rollout_frames,
                     max_total_rollout_frames=max_total_rollout_frames,
+                    cf_dmdctx=cf_dmdctx,
                 )
 
             # Always run the critic step (CF parity).
@@ -526,6 +824,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 train_generator=False,
                 rollout_frames=rollout_frames,
                 max_total_rollout_frames=max_total_rollout_frames,
+                cf_dmdctx=cf_dmdctx,
             )
 
             # Step optimizers.
@@ -610,6 +909,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         logging.warning("wandb.log failed: %s", e)
                 previous_time = time.time()
 
+            if (
+                self.is_main_process
+                and self._pending_video_latents is not None
+            ):
+                self._log_pred_image_video(
+                    self._pending_video_latents, int(self.step),
+                )
+                self._pending_video_latents = None
+
             # Checkpoint.
             if self.step > 0 and self.step % ckpt_interval == 0:
                 if self.is_main_process:
@@ -651,7 +959,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         super()._save_checkpoint()
         if not self.is_main_process:
             return
-        if not self.action_critic_loss_active:
+        # Either the action critic OR the GAN may need state appended;
+        # fast-path-skip if neither is active.
+        if not (self.action_critic_loss_active or self.gan_enabled):
             return
         path = self._checkpoint_path(self.step)
         if not os.path.exists(path):
@@ -661,24 +971,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         except Exception as exc:
             logging.warning(
                 "[ActionForcing] Could not re-open checkpoint for "
-                "action_critic append: %s. Skipping.", exc,
+                "aux/GAN append: %s. Skipping.", exc,
             )
             return
-        ac = self.model.action_critic
-        ac_module = ac.module if isinstance(ac, DDP) else ac
-        if ac_module is not None:
-            state["action_critic"] = ac_module.state_dict()
-        if self.critic_optimizer is not None:
-            state["critic_optimizer"] = self.critic_optimizer.state_dict()
+        appended = []
+        if self.action_critic_loss_active:
+            ac = self.model.action_critic
+            ac_module = ac.module if isinstance(ac, DDP) else ac
+            if ac_module is not None:
+                state["action_critic"] = ac_module.state_dict()
+                appended.append("action_critic")
+            if self.critic_optimizer is not None:
+                state["critic_optimizer"] = self.critic_optimizer.state_dict()
+                appended.append("critic_optimizer")
+        if self.gan_enabled and self.r3gan_disc is not None:
+            disc_module = (
+                self.r3gan_disc_ddp.module if self.r3gan_disc_ddp is not None
+                else self.r3gan_disc
+            )
+            state["r3gan_discriminator"] = disc_module.state_dict()
+            appended.append("r3gan_discriminator")
+            if self.r3gan_optimizer is not None:
+                state["r3gan_optimizer"] = self.r3gan_optimizer.state_dict()
+                appended.append("r3gan_optimizer")
+        if not appended:
+            return
         torch.save(state, path)
         logging.info(
-            "[ActionForcing] Appended action_critic + critic_optimizer "
-            "state to %s", path,
+            "[ActionForcing] Appended state to %s: %s",
+            path, ", ".join(appended),
         )
 
     def _maybe_resume(self) -> None:
         super()._maybe_resume()
-        if not self.action_critic_loss_active:
+        if not (self.action_critic_loss_active or self.gan_enabled):
             return
         if not bool(getattr(self.config, "auto_resume", False)):
             return
@@ -692,31 +1018,57 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if self.is_main_process:
                 logging.warning(
                     "[ActionForcing] Could not load checkpoint for "
-                    "action_critic resume: %s", exc,
+                    "aux/GAN resume: %s", exc,
                 )
             return
-        ac = self.model.action_critic
-        ac_module = ac.module if isinstance(ac, DDP) else ac
-        if ac_module is not None and "action_critic" in state:
-            ac_missing, ac_unexpected = ac_module.load_state_dict(
-                state["action_critic"], strict=False,
-            )
-            if self.is_main_process:
-                logging.info(
-                    "resume: action_critic missing=%d unexpected=%d",
-                    len(ac_missing), len(ac_unexpected),
+        if self.action_critic_loss_active:
+            ac = self.model.action_critic
+            ac_module = ac.module if isinstance(ac, DDP) else ac
+            if ac_module is not None and "action_critic" in state:
+                ac_missing, ac_unexpected = ac_module.load_state_dict(
+                    state["action_critic"], strict=False,
                 )
-        if self.critic_optimizer is not None and "critic_optimizer" in state:
-            try:
-                self.critic_optimizer.load_state_dict(state["critic_optimizer"])
                 if self.is_main_process:
-                    logging.info("resume: critic_optimizer state restored")
-            except Exception as exc:
-                if self.is_main_process:
-                    logging.warning(
-                        "resume: critic_optimizer load failed: %s. "
-                        "Starting critic optim from fresh state.", exc,
+                    logging.info(
+                        "resume: action_critic missing=%d unexpected=%d",
+                        len(ac_missing), len(ac_unexpected),
                     )
+            if self.critic_optimizer is not None and "critic_optimizer" in state:
+                try:
+                    self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+                    if self.is_main_process:
+                        logging.info("resume: critic_optimizer state restored")
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: critic_optimizer load failed: %s. "
+                            "Starting critic optim from fresh state.", exc,
+                        )
+        if self.gan_enabled and self.r3gan_disc is not None:
+            disc_module = (
+                self.r3gan_disc_ddp.module if self.r3gan_disc_ddp is not None
+                else self.r3gan_disc
+            )
+            if "r3gan_discriminator" in state:
+                d_missing, d_unexpected = disc_module.load_state_dict(
+                    state["r3gan_discriminator"], strict=False,
+                )
+                if self.is_main_process:
+                    logging.info(
+                        "resume: r3gan_discriminator missing=%d unexpected=%d",
+                        len(d_missing), len(d_unexpected),
+                    )
+            if self.r3gan_optimizer is not None and "r3gan_optimizer" in state:
+                try:
+                    self.r3gan_optimizer.load_state_dict(state["r3gan_optimizer"])
+                    if self.is_main_process:
+                        logging.info("resume: r3gan_optimizer state restored")
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: r3gan_optimizer load failed: %s. "
+                            "Starting r3gan optim from fresh state.", exc,
+                        )
 
     # ------------------------------------------------------------------
     # Auxiliary action-critic losses (ported from
@@ -732,6 +1084,45 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         for dim_idx in self.action_critic_dims:
             w[dim_idx] = 2.0
         return (w * (pred_z - target_z) ** 2).mean()
+
+    def _slice_actions_for_critic(self, actions: torch.Tensor) -> torch.Tensor:
+        """Slice the action stream's last dim down to ``action_critic_dims``.
+
+        The data loader (``_load_ride_tensors``) pre-slices ``z_actions``
+        by ``self.action_dims`` before storing them on the ride dict, so
+        ``actions[..., -1]`` may already be the critic-target slice.
+        We therefore have three valid configurations to handle:
+
+          1. ``action_dims is None`` AND ``actions.shape[-1] == 8``
+             (or whatever the SS-VAE z-dim is): no pre-slicing happened,
+             slice with ``action_critic_dims`` directly.
+          2. ``action_dims is not None`` AND ``actions.shape[-1] ==
+             len(action_dims)``: pre-slicing happened. Map
+             ``action_critic_dims`` (absolute indices into the original
+             8-dim z space) into RELATIVE indices within the
+             ``action_dims``-sliced stream, then slice. If
+             ``action_dims == action_critic_dims`` this is just
+             ``[0..len(action_critic_dims)-1]``, i.e. a no-op slice.
+          3. Anything else: fall back to the absolute-index slice and
+             let the index op surface the bug as an out-of-bounds error.
+        """
+        last = int(actions.shape[-1])
+        crit_dims = list(self.action_critic_dims)
+        if self.action_dims is None:
+            return actions[..., crit_dims]
+        if last == len(self.action_dims):
+            try:
+                rel = [int(self.action_dims.index(int(d))) for d in crit_dims]
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"action_critic_dims={crit_dims} contains an index "
+                    f"not present in action_dims={list(self.action_dims)}. "
+                    "The action critic z-target stream is pre-sliced by "
+                    "action_dims in the data loader; action_critic_dims "
+                    "must be a subset of action_dims."
+                ) from exc
+            return actions[..., rel]
+        return actions[..., crit_dims]
 
     def _compute_action_critic_losses(
         self,
@@ -811,16 +1202,43 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         pred_x0_detached = pred_x0.detach()
 
+        # The action critic is built in fp32 (its internal Conv3d /
+        # Linear blocks default to fp32 weights, see
+        # ``ActionForcingDMD._build_aux_heads``). The DMD generator
+        # produces ``pred_x0`` in bf16, so a direct call into the
+        # critic raises ``RuntimeError: mat1 and mat2 must have the
+        # same dtype``. The v14 trainer hides this by wrapping the
+        # critic call in ``autocast(bf16)``; we do the same for both
+        # the critic-update and the gen-side z-guidance path so the
+        # critic transparently picks up the same bf16 mat-mul kernels
+        # as the rest of training. Grad flow:
+        #   * critic-update path: backward stays on the critic's
+        #     fp32 params (autocast unscales + casts back); optim
+        #     step happens in fp32.
+        #   * gen-side path: grad flows through ``pred_x0`` (bf16)
+        #     into the generator's DDP backward; the critic's
+        #     params are frozen for this branch.
         # --- Multi-step critic training (independent optim loop) ---
         critic_z_loss = zero
         critic_loss_k = zero
         pred_z = None
         for _k in range(max(1, self.critic_updates_per_step)):
             self.critic_optimizer.zero_grad(set_to_none=True)
-            pred_z = critic_for_update(pred_x0_detached, chunk_t, chunk_actions)
-            pred_z = pred_z[:, :n_chunks]
-            critic_z_loss = self._weighted_z_mse(pred_z, teacher_z_8d)
-            critic_loss_k = self.action_critic_z_loss_weight * critic_z_loss
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=True,
+            ):
+                pred_z = critic_for_update(
+                    pred_x0_detached, chunk_t, chunk_actions,
+                )
+                pred_z = pred_z[:, :n_chunks]
+                critic_z_loss = self._weighted_z_mse(
+                    pred_z, teacher_z_8d.to(pred_z.dtype),
+                )
+                critic_loss_k = (
+                    self.action_critic_z_loss_weight * critic_z_loss
+                )
             critic_loss_k.backward()
             if self.critic_max_grad_norm is not None and self.critic_max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -844,12 +1262,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if guidance_scale > 0:
             critic_for_guidance.requires_grad_(False)
             try:
-                gen_pred_z = critic_for_guidance(pred_x0, chunk_t, chunk_actions)
-                gen_pred_z = gen_pred_z[:, :n_chunks]
-                gen_z2z7 = gen_pred_z[:, :, self.action_critic_dims]
-                target_z2z7 = chunk_actions
-                gen_z_loss = F.mse_loss(gen_z2z7, target_z2z7.to(gen_z2z7.dtype))
-                generator_action_loss = guidance_scale * gen_z_loss
+                with torch.amp.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16,
+                    enabled=True,
+                ):
+                    gen_pred_z = critic_for_guidance(
+                        pred_x0, chunk_t, chunk_actions,
+                    )
+                    gen_pred_z = gen_pred_z[:, :n_chunks]
+                    gen_z2z7 = gen_pred_z[:, :, self.action_critic_dims]
+                    target_z2z7 = chunk_actions
+                    gen_z_loss = F.mse_loss(
+                        gen_z2z7, target_z2z7.to(gen_z2z7.dtype),
+                    )
+                    generator_action_loss = guidance_scale * gen_z_loss
             finally:
                 critic_for_guidance.requires_grad_(True)
         else:
@@ -885,6 +1312,292 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return generator_action_loss, logs, teacher_z_8d
 
     # ------------------------------------------------------------------
+    # R3GAN — RpGAN + R1 + R2.
+    # Trains a separate 3D-conv discriminator on
+    #   real = ride["latents"][:, gen_window_start:gen_window_end]
+    #   fake = aux["pred_image"]
+    # Returns the gen-side RpGAN-G term (graph-carrying through
+    # ``pred_image`` -> generator) for the caller to add to the DMD
+    # loss before the generator backward. The D-side update +
+    # backward + optim step happens inside this method.
+    #
+    # DDP correctness:
+    #   * D-update: uses ``disc_for_update`` (DDP-wrapped). Backward
+    #     fires on D's own graph; ``fake_detached``/``real_detached``
+    #     are not part of G's graph so no grad escapes.
+    #   * G-update: uses ``disc_for_guidance`` (UNWRAPPED + frozen).
+    #     We ``requires_grad_(False)`` D's params, so the only path
+    #     for grad is through ``fake = pred_image`` -> generator's
+    #     own DDP backward, which is fired in the outer caller.
+    # ------------------------------------------------------------------
+    def _compute_r3gan_losses(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+        current_step: int,
+    ) -> tuple:
+        """Run a D-update on (real, fake) and return the G-side RpGAN
+        term (graph-carrying).
+
+        Args:
+            pred_image: ``[B, F, C, H, W]`` student rollout pred (graph
+                attached). The G-side branch uses this as ``fake``;
+                the D-side branch detaches it.
+            gt_latents_window: ``[B, F, C, H, W]`` GT latent slice
+                covering the same frame indices as ``pred_image``.
+                Detached for the D-update; never used for the
+                G-side path (G never sees real samples directly in
+                R3GAN — only D's pairwise score).
+            current_step: training step (for G-side warmup ramp).
+
+        Returns:
+            ``(generator_gan_loss, logs)`` — ``generator_gan_loss``
+            is graph-carrying; ``logs`` is a flat ``str -> float``
+            dict for wandb.
+        """
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        if not self.gan_enabled or self.r3gan_disc is None:
+            return zero, {}
+
+        disc_for_update = (
+            self.r3gan_disc_ddp if self.r3gan_disc_ddp is not None else self.r3gan_disc
+        )
+        disc_for_guidance = self.r3gan_disc
+
+        # D's own arithmetic stays in fp32 for the second-order
+        # gradient penalty. The cost is one extra cast.
+        real_detached = gt_latents_window.detach().to(torch.float32)
+        fake_detached = pred_image.detach().to(torch.float32)
+
+        # --- D-update (multi-step) -----------------------------------
+        d_loss_value = 0.0
+        d_real_value = 0.0
+        d_fake_detached_value = 0.0
+        r1_value = 0.0
+        r2_value = 0.0
+        for _k in range(max(1, self.gan_updates_per_step)):
+            self.r3gan_optimizer.zero_grad(set_to_none=True)
+            real_in = real_detached.clone().requires_grad_(True)
+            fake_in = fake_detached.clone().requires_grad_(True)
+            r1, d_real = r1_penalty(disc_for_update, real_in, gamma=self.gan_r1_gamma)
+            r2, d_fake_d = r2_penalty(disc_for_update, fake_in, gamma=self.gan_r2_gamma)
+            d_main = rpgan_d_loss(d_real, d_fake_d)
+            d_total = d_main + r1 + r2
+            d_total.backward()
+            if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in (
+                        self.r3gan_disc_ddp.parameters() if self.r3gan_disc_ddp is not None
+                        else self.r3gan_disc.parameters()
+                    ) if p.grad is not None],
+                    self.gan_max_grad_norm,
+                )
+            self.r3gan_optimizer.step()
+            d_loss_value = float(d_main.detach().item())
+            d_real_value = float(d_real.detach().mean().item())
+            d_fake_detached_value = float(d_fake_d.detach().mean().item())
+            r1_value = float(r1.detach().item())
+            r2_value = float(r2.detach().item())
+
+        # --- G-side RpGAN term (frozen D) ----------------------------
+        # Warmup: ramp G's GAN weight 0 -> gan_loss_weight over
+        # gan_warmup_steps steps. D learns from step 0 regardless.
+        if self.gan_warmup_steps > 0 and current_step < self.gan_warmup_steps:
+            ramp = current_step / max(1, self.gan_warmup_steps)
+            gen_gan_weight = ramp * self.gan_loss_weight
+        else:
+            gen_gan_weight = self.gan_loss_weight
+
+        if gen_gan_weight > 0:
+            disc_for_guidance.requires_grad_(False)
+            try:
+                d_real_for_g = disc_for_guidance(real_detached).detach()
+                d_fake_for_g = disc_for_guidance(pred_image.to(torch.float32))
+                gen_gan_main = rpgan_g_loss(d_real_for_g, d_fake_for_g)
+                generator_gan_loss = gen_gan_weight * gen_gan_main.to(pred_image.dtype)
+            finally:
+                disc_for_guidance.requires_grad_(True)
+            d_fake_for_g_value = float(d_fake_for_g.detach().mean().item())
+            gen_gan_main_value = float(gen_gan_main.detach().item())
+        else:
+            generator_gan_loss = zero
+            d_fake_for_g_value = 0.0
+            gen_gan_main_value = 0.0
+
+        logs = {
+            "train/r3gan_d_loss": d_loss_value,
+            "train/r3gan_r1": r1_value,
+            "train/r3gan_r2": r2_value,
+            "train/r3gan_d_real": d_real_value,
+            "train/r3gan_d_fake_detached": d_fake_detached_value,
+            "train/r3gan_d_fake_for_g": d_fake_for_g_value,
+            "train/r3gan_g_loss_raw": gen_gan_main_value,
+            "train/r3gan_g_loss_weighted": (
+                float(generator_gan_loss.detach().item())
+                if torch.is_tensor(generator_gan_loss)
+                and generator_gan_loss.requires_grad
+                else 0.0
+            ),
+            "train/r3gan_g_weight": float(gen_gan_weight),
+        }
+        return generator_gan_loss, logs
+
+    # ------------------------------------------------------------------
+    # SC-DMD warmup helper.
+    # ------------------------------------------------------------------
+    def _sc_dmd_current_weight(self, current_step: int) -> float:
+        """Linear-ramp the SC-DMD weight from 0 → ``sc_dmd_loss_weight``
+        over the first ``sc_dmd_warmup_steps`` training steps.
+
+        The SC defect is a SECOND-ORDER consistency regularizer (the
+        generator's velocity field appears in both the direct and
+        composed paths), so its initial gradient signal can be very
+        large at random init and destabilize early DMD training. The
+        ramp keeps SC's contribution sub-DMD until the student is
+        producing meaningful x0_hat predictions, then phases SC in
+        gradually. Mirrors the ``z_guidance_warmup_steps`` recipe used
+        for action-critic z-guidance.
+
+        With ``sc_dmd_warmup_steps == 0`` (default) the weight is
+        applied at full strength from step 0.
+        """
+        if not self.sc_dmd_enabled:
+            return 0.0
+        if self.sc_dmd_warmup_steps <= 0:
+            return self.sc_dmd_loss_weight
+        if current_step >= self.sc_dmd_warmup_steps:
+            return self.sc_dmd_loss_weight
+        ramp = float(current_step) / float(max(1, self.sc_dmd_warmup_steps))
+        return ramp * self.sc_dmd_loss_weight
+
+    # ------------------------------------------------------------------
+    # Periodic pred_image -> wandb.Video sampling.
+    # ------------------------------------------------------------------
+    def _video_sample_due(self, current_step: int) -> bool:
+        """Return True iff this step should produce a sample video.
+
+        Gated on (a) ``sample_interval > 0``, (b) main rank, (c) wandb
+        enabled, (d) step is a positive multiple of ``sample_interval``.
+        Step 0 is intentionally skipped because no rollout has happened
+        yet at iter 0 entry.
+        """
+        if not self.is_main_process:
+            return False
+        if self.sample_interval <= 0:
+            return False
+        if not (_HAS_WANDB and getattr(self, "wandb_enabled", False)):
+            return False
+        if current_step <= 0:
+            return False
+        return (current_step % self.sample_interval) == 0
+
+    @torch.no_grad()
+    def _log_pred_image_video(
+        self,
+        pred_image: torch.Tensor,
+        step: int,
+    ) -> None:
+        """Decode ``pred_image`` (a student rollout in latent space) to
+        pixel mp4 bytes and upload to wandb under ``sample/pred_image``.
+
+        Cheap: re-uses the generator's already-loaded ``WanVAEWrapper``
+        (no second VAE copy), runs under ``no_grad``, encodes mp4 in
+        memory via ffmpeg subprocess. Best-effort: any failure is
+        warned and never raises.
+
+        Only the main rank ever enters this function (the call site
+        gates on ``is_main_process``); other ranks are not synchronised
+        with this work. There is no NCCL collective inside.
+
+        Caller contract: ``pred_image`` must be a ``[B, F, C, H, W]``
+        latent tensor on the GPU. We slice to the first batch element
+        and (optionally) the trailing ``sample_max_frames`` frames.
+        """
+        if pred_image is None or pred_image.numel() == 0:
+            return
+        vae = getattr(self.model, "vae", None)
+        if vae is None:
+            if not self._video_logger_warned_no_vae:
+                logging.warning(
+                    "[ActionForcing] sample_interval set but "
+                    "self.model.vae is None; sample videos disabled."
+                )
+                self._video_logger_warned_no_vae = True
+            return
+        try:
+            latents = pred_image.detach().to(torch.float32)
+            if latents.dim() != 5:
+                return
+            if self.sample_max_frames > 0:
+                F_total = latents.shape[1]
+                if F_total > self.sample_max_frames:
+                    latents = latents[:, -self.sample_max_frames:]
+            lat = latents[0:1]
+            dummy = lat[:, 0:1]
+            lat_wd = torch.cat([dummy, lat], dim=1)
+            pixels = vae.decode_to_pixel(lat_wd)[:, 1:, ...]
+            video = (0.5 * (pixels.float() + 1.0)).clamp(0.0, 1.0)
+            vid_np = (video[0].cpu().numpy() * 255.0).astype(np.uint8)
+            if vid_np.ndim != 4:
+                return
+            if vid_np.shape[-1] != 3:
+                vid_np = vid_np.transpose(0, 2, 3, 1)
+        except Exception as exc:
+            logging.warning(
+                "[ActionForcing] sample-video VAE decode failed at "
+                "step=%d: %s", step, exc,
+            )
+            return
+
+        mp4_bytes = _frames_to_mp4_bytes(
+            vid_np, fps=float(self.sample_fps),
+        )
+        if mp4_bytes is None:
+            logging.warning(
+                "[ActionForcing] sample-video ffmpeg encode failed at "
+                "step=%d (frames=%d)", step, vid_np.shape[0],
+            )
+            return
+
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".mp4", delete=False,
+            ) as fh:
+                fh.write(mp4_bytes)
+                tmp_path = fh.name
+            wandb.log(
+                {
+                    "sample/pred_image": wandb.Video(
+                        tmp_path,
+                        fps=int(self.sample_fps),
+                        format="mp4",
+                        caption=f"step {step}",
+                    ),
+                    "sample/step": int(step),
+                    "sample/num_frames": int(vid_np.shape[0]),
+                },
+                step=step,
+            )
+            logging.info(
+                "[ActionForcing] Logged sample video at step=%d "
+                "(frames=%d, fps=%d)",
+                step, vid_np.shape[0], int(self.sample_fps),
+            )
+        except Exception as exc:
+            logging.warning(
+                "[ActionForcing] sample-video wandb upload failed at "
+                "step=%d: %s", step, exc,
+            )
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    # ------------------------------------------------------------------
     # Per-iter forward/backward.
     # ------------------------------------------------------------------
     def _fwdbwd_one_step(
@@ -892,6 +1605,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         train_generator: bool,
         rollout_frames: int,
         max_total_rollout_frames: int,
+        cf_dmdctx: int = 0,
     ) -> Optional[Dict[str, Any]]:
         # Pull next valid ride; if loader exhausted, restart. Note that
         # ``rollout_frames >= num_training_frames`` (validated in
@@ -915,30 +1629,68 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # ``rollout_frames`` (BASELINE) — the noise tensor for
         # extension chunks is sampled inline by the pipeline, not
         # from the trainer.
-        ride = self._next_ride(rollout_frames)
+        #
+        # dmd_context support (``cf_dmdctx > 0``): the student's
+        # rollout starts at ride frame ``cf_dmdctx`` (= 3 by default).
+        # We require ride length ``>= rollout_frames + cf_dmdctx`` so
+        # both the rollout (``ride[cf:cf+rollout_frames]``) and the
+        # scorer's clean_x context (``ride[0:num_training_frames]``)
+        # fit. Action streams for the rollout are sliced
+        # ``ride_actions[cf:cf+...]`` so the student's per-frame
+        # conditioning matches the cf-shifted ride window. The clean-
+        # context cond dict is built separately from
+        # ``ride_actions[0:num_training_frames]`` and threaded into
+        # the model as ``clean_conditional_dict`` /
+        # ``clean_unconditional_dict``.
+        ride = self._next_ride(rollout_frames + cf_dmdctx)
         if ride is None:
             return None
 
         ride_len = int(ride["latents"].shape[1])
-        extended_length = min(ride_len, max_total_rollout_frames)
-        # Defensive: extension streams must be at least ``rollout_frames``
+        # Total frames the rollout window spans (= rollout_frames +
+        # mae extension headroom; capped at ride_len - cf_dmdctx).
+        max_rollout_window = max_total_rollout_frames
+        rollout_end = min(ride_len, cf_dmdctx + max_rollout_window)
+        rollout_window = rollout_end - cf_dmdctx
+        # Defensive: rollout_window must cover at least ``rollout_frames``
         # (validated in ``_next_ride`` already, but this is the final
         # gate before slicing).
-        if extended_length < rollout_frames:
+        if rollout_window < rollout_frames:
             raise RuntimeError(
                 f"Ride too short for rollout: ride_len={ride_len}, "
-                f"rollout_frames={rollout_frames}. ``_next_ride`` should "
-                f"have skipped this ride."
+                f"rollout_frames={rollout_frames}, cf_dmdctx={cf_dmdctx}. "
+                f"``_next_ride`` should have skipped this ride."
             )
 
         prompt_embeds = ride["prompt_embeds"]
-        latents = ride["latents"][:, :extended_length]
-        actions = ride["z_actions"][:, :extended_length]
+        latents = ride["latents"][:, cf_dmdctx:rollout_end]
+        actions = ride["z_actions"][:, cf_dmdctx:rollout_end]
 
         conditional_dict, unconditional_dict = self.model.build_action_conditional(
             prompt_embeds=prompt_embeds,
             gt_actions=actions,
         )
+
+        # dmd_context: also build the clean-half cond dicts from the
+        # leading ``num_training_frames`` ride frames (= ride[0:N]).
+        # ``num_training_frames`` is the same length as the noisy half;
+        # they overlap by ``num_training_frames - cf_dmdctx`` frames in
+        # absolute ride coords, exactly mirroring v14 training.
+        clean_context_latents = None
+        clean_conditional_dict = None
+        clean_unconditional_dict = None
+        if cf_dmdctx > 0:
+            num_training_frames = int(getattr(
+                self.config, "num_training_frames", 21,
+            ))
+            clean_context_latents = ride["latents"][:, :num_training_frames]
+            clean_actions = ride["z_actions"][:, :num_training_frames]
+            clean_conditional_dict, clean_unconditional_dict = (
+                self.model.build_action_conditional(
+                    prompt_embeds=prompt_embeds,
+                    gt_actions=clean_actions,
+                )
+            )
 
         # ``image_or_video_shape`` is the BASELINE rollout shape — the
         # pipeline allocates noise from this and then samples extension
@@ -957,7 +1709,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 and getattr(self, "action_teacher_enabled", False)
                 and self.critic_optimizer is not None
             )
-            if aux_active:
+            gan_active = (
+                self.gan_enabled
+                and self.r3gan_disc is not None
+                and self.r3gan_optimizer is not None
+            )
+            sc_dmd_active = bool(self.sc_dmd_enabled)
+            need_aux_artifacts = aux_active or gan_active
+
+            if need_aux_artifacts:
+                # Unified path: aux losses (action critic z-guidance)
+                # and/or R3GAN both consume ``aux["pred_image"]`` so we
+                # only need ONE generator forward. Each downstream
+                # branch is gated separately on its own ``*_active``
+                # flag, and adds its term to the running generator
+                # loss before the single backward at the bottom.
                 gen_loss_dmd, gen_log_dict, aux = self.model.generator_loss(
                     image_or_video_shape=image_or_video_shape,
                     conditional_dict=conditional_dict,
@@ -965,54 +1731,89 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     clean_latent=latents,
                     initial_latent=None,
                     return_aux=True,
+                    clean_context_latents=clean_context_latents,
+                    clean_conditional_dict=clean_conditional_dict,
+                    clean_unconditional_dict=clean_unconditional_dict,
                 )
-                # ``aux["pred_image"]`` is the LAST ``num_training_frames``
-                # of the BASELINE rollout (already sliced by
-                # ``_run_generator``). Slice the per-frame action stream
-                # to that same window so the chunk-pooled targets line
-                # up frame-for-frame with the critic's per-chunk preds.
                 pred_image = aux["pred_image"]
                 scoring_frames = int(aux["scoring_frames"])
                 gen_window_end = int(aux["rollout_frames"])
                 gen_window_start = gen_window_end - scoring_frames
-                actions_for_critic = actions[
-                    :, gen_window_start:gen_window_end
-                ][..., self.action_critic_dims].to(pred_image.dtype)
-                # Per-chunk timestep tensor: rung-exit timestep
-                # broadcast across all chunks. ``denoised_timestep_from``
-                # is None when ``same_step_across_blocks=False`` (per-
-                # block exit) — fall back to 0 in that case (the
-                # ActionCritic's time conditioning is robust to the
-                # specific value; the dominant signal is the action
-                # condition + latent content).
-                ts_value = aux.get("denoised_timestep_from", None)
-                ts_int = int(ts_value) if ts_value is not None else 0
-                B = pred_image.shape[0]
-                n_chunks = pred_image.shape[1] // int(self.config.num_frame_per_block)
-                chunk_t = torch.full(
-                    (B, n_chunks), ts_int,
-                    device=pred_image.device, dtype=torch.long,
-                )
-                gen_action_loss, critic_logs, _teacher_z = (
-                    self._compute_action_critic_losses(
-                        pred_x0=pred_image,
-                        target_action_z=actions_for_critic,
-                        chunk_t=chunk_t,
-                        current_step=int(self.step),
-                    )
-                )
-                generator_loss = gen_loss_dmd + gen_action_loss
-                generator_loss.backward()
+
+                if self._video_sample_due(int(self.step) + 1):
+                    try:
+                        self._pending_video_latents = (
+                            pred_image.detach().to(torch.float32)
+                        )
+                    except Exception as _exc:
+                        logging.warning(
+                            "[ActionForcing] failed to stash "
+                            "pred_image for video at step=%d: %s",
+                            int(self.step) + 1, _exc,
+                        )
+                        self._pending_video_latents = None
+
                 merged: Dict[str, Any] = {
-                    "generator_loss": float(generator_loss.detach().item()),
                     "generator_dmd_loss": float(gen_loss_dmd.detach().item()),
                 }
                 merged.update({
-                    k: float(v.detach().mean().item()) if torch.is_tensor(v) else v
+                    k: (float(v.detach().float().mean().item())
+                        if torch.is_tensor(v) else v)
                     for k, v in gen_log_dict.items()
                     if not isinstance(v, dict)
                 })
-                merged.update(critic_logs)
+
+                generator_loss = gen_loss_dmd
+
+                if aux_active:
+                    actions_for_critic = self._slice_actions_for_critic(
+                        actions[:, gen_window_start:gen_window_end]
+                    ).to(pred_image.dtype)
+                    ts_value = aux.get("denoised_timestep_from", None)
+                    ts_int = int(ts_value) if ts_value is not None else 0
+                    B = pred_image.shape[0]
+                    n_chunks = pred_image.shape[1] // int(self.config.num_frame_per_block)
+                    chunk_t = torch.full(
+                        (B, n_chunks), ts_int,
+                        device=pred_image.device, dtype=torch.long,
+                    )
+                    gen_action_loss, critic_logs, _teacher_z = (
+                        self._compute_action_critic_losses(
+                            pred_x0=pred_image,
+                            target_action_z=actions_for_critic,
+                            chunk_t=chunk_t,
+                            current_step=int(self.step),
+                        )
+                    )
+                    generator_loss = generator_loss + gen_action_loss
+                    merged.update(critic_logs)
+
+                if gan_active:
+                    gt_window = latents[:, gen_window_start:gen_window_end]
+                    gen_gan_loss, gan_logs = self._compute_r3gan_losses(
+                        pred_image=pred_image,
+                        gt_latents_window=gt_window,
+                        current_step=int(self.step),
+                    )
+                    generator_loss = generator_loss + gen_gan_loss
+                    merged.update(gan_logs)
+
+                if sc_dmd_active:
+                    sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
+                        conditional_dict=conditional_dict,
+                        clean_latent=latents,
+                    )
+                    sc_weight = self._sc_dmd_current_weight(int(self.step))
+                    weighted_sc = sc_loss_raw * sc_weight
+                    generator_loss = generator_loss + weighted_sc
+                    merged.update(sc_logs)
+                    merged["sc_dmd_weight_effective"] = float(sc_weight)
+                    merged["sc_dmd_loss_weighted"] = float(
+                        weighted_sc.detach().item()
+                    )
+
+                merged["generator_loss"] = float(generator_loss.detach().item())
+                generator_loss.backward()
                 return merged
             else:
                 generator_loss, gen_log_dict = self.model.generator_loss(
@@ -1021,16 +1822,39 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     unconditional_dict=unconditional_dict,
                     clean_latent=latents,
                     initial_latent=None,
+                    clean_context_latents=clean_context_latents,
+                    clean_conditional_dict=clean_conditional_dict,
+                    clean_unconditional_dict=clean_unconditional_dict,
                 )
-                generator_loss.backward()
-                return {
-                    "generator_loss": float(generator_loss.detach().item()),
+                merged_plain: Dict[str, Any] = {
+                    "generator_dmd_loss": float(generator_loss.detach().item()),
                     **{
-                        k: float(v.detach().mean().item()) if torch.is_tensor(v) else v
+                        k: (float(v.detach().float().mean().item())
+                            if torch.is_tensor(v) else v)
                         for k, v in gen_log_dict.items()
                         if not isinstance(v, dict)
                     },
                 }
+
+                if sc_dmd_active:
+                    sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
+                        conditional_dict=conditional_dict,
+                        clean_latent=latents,
+                    )
+                    sc_weight = self._sc_dmd_current_weight(int(self.step))
+                    weighted_sc = sc_loss_raw * sc_weight
+                    generator_loss = generator_loss + weighted_sc
+                    merged_plain.update(sc_logs)
+                    merged_plain["sc_dmd_weight_effective"] = float(sc_weight)
+                    merged_plain["sc_dmd_loss_weighted"] = float(
+                        weighted_sc.detach().item()
+                    )
+
+                merged_plain["generator_loss"] = float(
+                    generator_loss.detach().item()
+                )
+                generator_loss.backward()
+                return merged_plain
         else:
             critic_loss, critic_log_dict = self.model.critic_loss(
                 image_or_video_shape=image_or_video_shape,
@@ -1038,12 +1862,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 unconditional_dict=unconditional_dict,
                 clean_latent=latents,
                 initial_latent=None,
+                clean_context_latents=clean_context_latents,
+                clean_conditional_dict=clean_conditional_dict,
             )
             critic_loss.backward()
             return {
                 "critic_loss": float(critic_loss.detach().item()),
                 **{
-                    k: float(v.detach().mean().item()) if torch.is_tensor(v) else v
+                    k: (float(v.detach().float().mean().item())
+                        if torch.is_tensor(v) else v)
                     for k, v in critic_log_dict.items()
                     if not isinstance(v, dict)
                 },
