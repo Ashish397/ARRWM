@@ -792,6 +792,23 @@ class RollingStaircaseDMDTrainer:
                 "ss_vae_scale=%.3f)", self._frozen_ss_vae_scale,
             )
 
+        # Plumb the action teacher into the DMD model so its
+        # ``teacher_freeze_mode='action'`` path can call
+        # ``_compute_teacher_z_per_slot`` on the real_score / student
+        # latents. ActionForcingDMD declares ``_action_teacher_fn = None``
+        # at init; we set it now that the teacher is loaded. Other
+        # model classes (no such attr) are skipped silently.
+        target_model = getattr(self, "model", None)
+        if target_model is not None and hasattr(
+            target_model, "_action_teacher_fn"
+        ):
+            target_model._action_teacher_fn = self._compute_teacher_z_per_slot
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] Attached action_teacher_fn to model "
+                    "(teacher_freeze_mode='action' is now functional)."
+                )
+
     def _load_cotracker_from_local(
         self, *, source_dir: str, checkpoint_path: str,
     ) -> torch.nn.Module:

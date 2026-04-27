@@ -372,32 +372,42 @@ denoising_step_list: [1000, 625, 312.5, 178.6]
 action_patch_enabled: true
 action_modulation_activation: silu
 
-# Auxiliary action-supervision heads — INSTANTIATED for ODE checkpoint
-# compatibility but their AUX LOSSES ARE NOT CONSUMED by
-# dmd_action_forcing. Setting *_aux_enabled to false would cause
-# non-strict load drops on the corresponding ODE-stored state_dicts;
-# leaving them on with loss_weight=0 elsewhere isn't checked since
-# dmd_action_forcing never reads
-# loss_weight values. Keep enabled for clean ODE loads.
+# Auxiliary action-supervision heads — LIVE for the freeze config.
+# When ``teacher_freeze_mode: "action"`` masks DMD gradient on a slot
+# the student loses its primary supervision there; the action critic
+# z-guidance + state-probe / state-guidance carry the gradient
+# through that slot so the student keeps learning the correct action.
+# Loss weights match the action_ode_distill (ODE-init) values so the
+# action heads pick up where they left off.
 action_critic_aux_enabled: true
 action_critic_z_out_dim: 8
 action_critic_base_channels: 128
 action_critic_num_blocks: 4
+action_critic_dims: [2, 7]
+action_critic_z_loss_weight: 0.25         # ODE init
+generator_action_z_guidance_weight: 0.125  # ODE init
+critic_updates_per_step: 2                # ODE init
+critic_lr: 3.0e-04                        # ODE init
+z_guidance_warmup_steps: 0                # full strength immediately
 
 state_probe_aux_enabled: true
 state_head_out_dim: 8
 state_probe_dim: 256
 state_probe_num_heads: 8
 state_probe_n_taps: 6
+state_head_loss_weight: 0.05              # ODE init
+state_guidance_weight: 0.025              # ODE init
 
 # ---------------------------------------------------------------------------
 # Action teacher
 # ---------------------------------------------------------------------------
-# OFF for Phase-1 Action-Forcing: the trainer pipes only DMD losses to the
-# generator/critic, so the CoTracker+ss_vae teacher would be pure
-# overhead with no consumer. Flip to "slot0" / "all" only after the
-# trainer is upgraded to consume teacher-z aux losses.
-action_teacher_mode: "off"
+# Set to "all" for the freeze config: ``teacher_freeze_mode: "action"``
+# (when set in the freeze section below) routes both the real_score's
+# pred and the student's pred through the frozen CoTracker + ss_vae,
+# so the teacher MUST be loaded. "all" also keeps the action critic
+# z-guidance loss live on every iter so the student keeps learning the
+# correct action when DMD is masked off on a slot.
+action_teacher_mode: "all"
 
 cotracker_source_dir: /home/u6ex/as1748.u6ex/.cache/torch/hub/facebookresearch_co-tracker_main
 cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/scaled_offline.pth
@@ -466,13 +476,40 @@ clean_x_aug_t: 0
 # enough to catch single-frame freezes (a hazy frame typically has
 # MAE 3-5× the median).
 #
+# ``teacher_freeze_mode``: how to detect a teacher freeze.
+#
+#   * "mae" (default, legacy): per-frame MAE between real_score's
+#     prediction and the GT video at the same time positions; flag
+#     frames where MAE > teacher_freeze_threshold * median(MAE).
+#     Calibration sweep (_diag_p1/freeze_threshold_calibration.py)
+#     showed natural max-vs-median ratios cap at ~1.4× in motion-
+#     rich middle frames, ~1.8× at the structural boundary, so 2.0×
+#     is "above natural variance" — only fires on severe MAE spikes
+#     (= washed-out / static frames).
+#
+#   * "action": run BOTH the real_score's predicted latent AND the
+#     GT video through the frozen action teacher (CoTracker → ss_vae
+#     → 8-d z) and flag SLOTS where cosine_similarity(z_real, z_gt) <
+#     teacher_freeze_action_threshold. Default cutoff 0.0 → flag only
+#     when the teacher's predicted action direction is OPPOSITE to
+#     the GT action direction. Cosine sim is magnitude-invariant — a
+#     teacher that gets the magnitude wrong but the direction right
+#     stays unmasked. We compare to GT (not to student) so we don't
+#     mask slots where the teacher is correct and the student is
+#     drifting — those are exactly the slots DMD should keep
+#     training on. Requires ``action_teacher_mode != "off"`` so the
+#     trainer's ``_build_action_teacher`` actually loads the CoTracker
+#     + ss_vae.
+#
 # Per-iter wandb metrics (in the ``gen/`` namespace):
-#   gen/teacher_freeze_count       (int, frames flagged this iter)
-#   gen/teacher_freeze_rate        (fraction of B*F frames flagged)
-#   gen/teacher_freeze_max_mae     (max per-frame MAE in this iter)
-#   gen/teacher_freeze_median_mae  (median per-frame MAE)
+#   * Always: gen/teacher_freeze_count, gen/teacher_freeze_rate
+#   * mode=mae:    gen/teacher_freeze_max_mae, gen/teacher_freeze_median_mae
+#   * mode=action: gen/teacher_freeze_action_cos_RG_min/_mean/_median
+#                  gen/teacher_freeze_action_cos_RS_mean (context only)
 teacher_freeze_detect_enabled: true
-teacher_freeze_threshold: 2.0
+teacher_freeze_mode: "action"        # "mae" | "action"  — freeze sbatch defaults to action
+teacher_freeze_threshold: 2.0        # used by mode="mae" (multiplier on median MAE)
+teacher_freeze_action_threshold: 0.0  # used by mode="action" (cos(z_real, z_GT) cutoff)
 
 # GAN dropped (parity with staircase config + CF).
 gan_loss_weight: 0.0

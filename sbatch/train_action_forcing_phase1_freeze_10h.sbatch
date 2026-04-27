@@ -11,40 +11,75 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-1 Action-Forcing DMD — DEFAULTS + TEACHER-FREEZE MASK,
-# 1 node x 4 GPUs, 10h.
+# Phase-1 Action-Forcing DMD — DEFAULTS + TEACHER-FREEZE MASK + ACTION
+# AUX STACK, 1 node x 4 GPUs, 10h.
 #
-# Same as ``train_action_forcing_phase1_10h.sbatch`` (pure DMD, no
-# aux losses, no R3GAN, no SC-DMD) PLUS per-frame teacher-freeze
-# rejection on the DMD gradient.
+# Same as ``train_action_forcing_phase1_10h.sbatch`` (locked-in DMD
+# fundamentals: +npb anchor, last-chunk DMD mask, full-bidir scorer,
+# streaming on, collapse gate avg-rollout-MAE > 0.5) PLUS:
 #
-# Why this exists. The v14 ``real_score`` (frozen LoRA-merged
+#   1. Per-slot / per-frame teacher-freeze rejection on the DMD gradient.
+#   2. The full action-aux stack live so the student keeps learning the
+#      correct action even when DMD is masked off on a slot:
+#        * action_teacher_mode = "all"   (CoTracker + ss_vae loaded)
+#        * action_critic_aux_enabled = true   (z-guidance gradient)
+#        * state_probe_aux_enabled = true   (state probe head)
+#        * generator state-token branch active (from v14 LoRA)
+#
+# Why teacher-freeze masking. The v14 real_score (frozen LoRA-merged
 # bidirectional teacher) occasionally outputs a single hazy / frozen
-# latent frame inside the 21-frame DMD scoring window. Visible as a
-# washed-out frame in ``_diag_p1/out/F_real_GT.mp4`` around the
-# 3-second mark. If we let DMD score against that frame, the
-# (fake - real) gradient pulls the student toward the bad teacher
-# pred and the student learns to reproduce the freeze.
+# latent frame inside the 21-frame DMD scoring window — visible as a
+# washed-out frame in ``_diag_p1/out/F_real_GT.mp4`` around the 3-sec
+# mark. If we let DMD score against that frame the (fake - real)
+# gradient pulls the student toward the bad teacher pred and the
+# student learns to reproduce the freeze.
 #
-# Detection. Inside ``compute_distribution_matching_loss`` we now
-# compute per-frame MAE = mean(|pred_real_image - gt_target|) where
-# ``gt_target`` is the GT video at the same time positions as the
-# noisy_x window. Per batch we take the median across frames as the
-# robust reference (the freeze frame itself is the outlier so the
-# median is unaffected). Frames whose MAE exceeds
-# ``threshold * median(MAE)`` are flagged and ANDed into the
-# existing ``gradient_mask`` so the DMD MSE skips them entirely.
+# Two detection modes, selectable via ``teacher_freeze_mode``:
+#
+#   * "mae" (legacy): per-frame MAE between real_score's pred and the
+#     GT video at the same time positions; flag frames where MAE >
+#     ``teacher_freeze_threshold`` × median(MAE). Calibration sweep
+#     (_diag_p1/freeze_threshold_calibration.py over 16 motion-rich
+#     windows) shows natural max-vs-median ratios cap at ~1.4× in the
+#     middle and ~1.8× at the structural boundary, so the default
+#     ``threshold=2.0`` only fires on severe freezes.
+#
+#   * "action" (NEW): run BOTH the real_score's pred AND the GT video
+#     through the frozen action teacher (CoTracker → ss_vae → 8-d z)
+#     and flag SLOTS where cosine_similarity(z_real, z_GT) <
+#     ``teacher_freeze_action_threshold``. Default 0.0 = "teacher
+#     direction OPPOSITE to GT direction" — a teacher that gets the
+#     action MAGNITUDE wrong but the DIRECTION right stays unmasked
+#     (cos sim is magnitude-invariant). We compare to GT (not to
+#     student) so we don't mask slots where the teacher is correct
+#     and the student is the one drifting — those slots are exactly
+#     what DMD should keep training on.
+#     Diagnostic verification: ``_diag_p1/test_freeze_action_mode.py``
+#     on ride 20240131104731.zarr (which contains a backwards-driving
+#     segment) at t=178 flagged 8/21 slots with cos(R,GT) negative —
+#     all on the strong-backwards commands (z7 ≈ -0.9). cos(R,S) was
+#     +0.99 on those slots = teacher and student both got direction
+#     wrong but agreed; the cos(R,GT) metric correctly catches that.
+#     The action critic + state probe aux losses keep the student
+#     learning the correct action through the masked slots.
+#     ``ActionForcingDMD.__init__`` asserts the action-aux stack is
+#     wired before this mode can be used.
 #
 # Knobs (configs/action_forcing_phase1_freeze.yaml):
-#   * teacher_freeze_detect_enabled: true       (opt-in flag)
-#   * teacher_freeze_threshold: 2.0             (multiplier on median;
-#                                                must be > 1.0)
+#   * teacher_freeze_detect_enabled: true
+#   * teacher_freeze_mode: "mae" | "action"
+#   * teacher_freeze_threshold: 2.0   (used in "mae" mode)
+#   * teacher_freeze_action_threshold: 0.0   (used in "action" mode;
+#                                              cosine_similarity(z_real, z_GT)
+#                                              cutoff)
 #
 # Per-iter wandb metrics (gen/ namespace):
-#   gen/teacher_freeze_count       — int, frames flagged this iter
-#   gen/teacher_freeze_rate        — fraction of B*F frames flagged
-#   gen/teacher_freeze_max_mae     — max per-frame MAE
-#   gen/teacher_freeze_median_mae  — median per-frame MAE
+#   * Always:    gen/teacher_freeze_count, gen/teacher_freeze_rate
+#   * mode=mae:  gen/teacher_freeze_max_mae, gen/teacher_freeze_median_mae
+#   * mode=action: gen/teacher_freeze_action_cos_RG_min/_mean/_median
+#                                              (decision metric, vs GT)
+#                  gen/teacher_freeze_action_cos_RS_mean
+#                                              (context only, vs student)
 #
 # Sister sbatches:
 #   sbatch/train_action_forcing_phase1_10h.sbatch        (defaults only)
