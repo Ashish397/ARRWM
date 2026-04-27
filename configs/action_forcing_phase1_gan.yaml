@@ -425,7 +425,7 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 3.0
+real_guidance_scale: 1.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)
@@ -474,7 +474,7 @@ gan_max_grad_norm: 10.0
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).
 fake_score_updates_enabled: true
-dfake_gen_update_ratio: 2
+dfake_gen_update_ratio: 1
 
 # Generator EMA (CF parity).
 ema_weight: 0.99
@@ -498,7 +498,7 @@ ema_start_step: 200
 # stability for the very small lr regime, and zero first-moment removes
 # the multi-step "stuck" behaviour Adam exhibits when the gradient sign
 # flips due to DMD's antagonistic generator/critic dynamics.
-lr: 2.0e-06
+lr: 2.0e-05
 betas: [0.0, 0.999]
 eps: 1.0e-08
 weight_decay: 0.01
@@ -506,7 +506,7 @@ train_action_projection: true
 train_action_token_projection: true
 
 # Fake-score optimizer (CF: ``lr_critic`` / ``beta1_critic`` / ``beta2_critic``).
-fake_lr: 4.0e-07
+fake_lr: 4.0e-06
 fake_betas: [0.0, 0.999]
 fake_eps: 1.0e-08
 fake_weight_decay: 0.01

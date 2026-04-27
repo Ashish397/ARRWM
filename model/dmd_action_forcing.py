@@ -1432,13 +1432,13 @@ class ActionForcingDMD(SelfForcingModel):
             ):
                 with torch.no_grad():
                     npb = int(self.num_frame_per_block)
-                    F = pred_real_image_detached.shape[1]
-                    if F % npb != 0:
+                    n_F = pred_real_image_detached.shape[1]
+                    if n_F % npb != 0:
                         raise RuntimeError(
-                            f"teacher_freeze_detect (mode=action): F={F} "
+                            f"teacher_freeze_detect (mode=action): F={n_F} "
                             f"not divisible by num_frame_per_block={npb}."
                         )
-                    n_slots = F // npb
+                    n_slots = n_F // npb
 
                     # Decision metric: cos(z_real, z_gt) per slot.
                     # ``z_real`` runs the teacher pipeline (CoTracker +
