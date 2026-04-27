@@ -149,19 +149,30 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
     silently corrupts the attention pattern the causal weights were
     trained with.
 
-    When ``action_tokens_per_frame == 0`` the patch falls through to the
-    original forward — bit-identical to upstream.
+    Teacher-forcing (``tf_rope_offset > 0``): the input is a joint
+    [clean_half, noisy_half] sequence with ``grid_sizes[0,0] = 2*F`` (per-
+    half F frames each). RoPE is applied to each half independently —
+    clean at positions [0, F), noisy at [tf_rope_offset, tf_rope_offset+F)
+    — so the v14 teacher-forcing layout (clean leading by ``cf`` frames)
+    is preserved. Mirrors ``CausalWanSelfAttention.forward`` lines 179-193.
+
+    When ``action_tokens_per_frame == 0`` and ``tf_rope_offset == 0`` the
+    patch falls through to the original forward — bit-identical to
+    upstream.
     """
     if getattr(attn, "_action_attn_patched", False):
         return
     if not hasattr(attn, "action_tokens_per_frame"):
         attn.action_tokens_per_frame = 0
+    if not hasattr(attn, "tf_rope_offset"):
+        attn.tf_rope_offset = 0
 
     orig_forward = attn.forward
 
     def forward_with_action(self_attn, x, seq_lens, grid_sizes, freqs):
         a_per_f = int(getattr(self_attn, "action_tokens_per_frame", 0))
-        if a_per_f == 0:
+        tf_off = int(getattr(self_attn, "tf_rope_offset", 0))
+        if a_per_f == 0 and tf_off == 0:
             return orig_forward(x, seq_lens, grid_sizes, freqs)
 
         b, s = x.shape[0], x.shape[1]
@@ -174,9 +185,10 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
         # Strip padding for the RoPE step: _separate_action_tokens assumes
         # seq = F * (H*W + a_per_f). `s` here may be ≥ that (padded to
         # ``seq_len`` in the outer _forward).
-        f, h, w = grid_sizes[0].tolist()
+        f_total, h, w = grid_sizes[0].tolist()
+        f_total = int(f_total)
         frame_seq = h * w + a_per_f
-        valid_len = int(f) * frame_seq
+        valid_len = f_total * frame_seq
         if valid_len > s:
             raise RuntimeError(
                 f"Bidirectional self_attn: interleaved valid_len={valid_len} "
@@ -187,14 +199,57 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
         q_valid, q_tail = q[:, :valid_len], q[:, valid_len:]
         k_valid, k_tail = k[:, :valid_len], k[:, valid_len:]
 
-        q_sp, q_act = _separate_action_tokens(q_valid, grid_sizes, a_per_f)
-        k_sp, k_act = _separate_action_tokens(k_valid, grid_sizes, a_per_f)
+        if tf_off > 0:
+            # Teacher-forcing: joint sequence is [clean_half, noisy_half],
+            # each F_half = f_total // 2 frames long. Clean gets RoPE
+            # positions [0, F_half); noisy gets [tf_off, tf_off + F_half).
+            if f_total % 2 != 0:
+                raise RuntimeError(
+                    f"Bidir self_attn TF mode requires even f_total; got {f_total}."
+                )
+            f_half = f_total // 2
+            half_valid = f_half * frame_seq
+            half_grid = grid_sizes.clone()
+            half_grid[:, 0] = f_half
+            q_clean, q_noisy = q_valid[:, :half_valid], q_valid[:, half_valid:]
+            k_clean, k_noisy = k_valid[:, :half_valid], k_valid[:, half_valid:]
+            if a_per_f > 0:
+                qc_sp, qc_act = _separate_action_tokens(q_clean, half_grid, a_per_f)
+                kc_sp, kc_act = _separate_action_tokens(k_clean, half_grid, a_per_f)
+                qn_sp, qn_act = _separate_action_tokens(q_noisy, half_grid, a_per_f)
+                kn_sp, kn_act = _separate_action_tokens(k_noisy, half_grid, a_per_f)
+                rq_clean = _merge_action_tokens(
+                    rope_apply(qc_sp, half_grid, freqs, temporal_offset=0),
+                    qc_act, half_grid, a_per_f,
+                )
+                rk_clean = _merge_action_tokens(
+                    rope_apply(kc_sp, half_grid, freqs, temporal_offset=0),
+                    kc_act, half_grid, a_per_f,
+                )
+                rq_noisy = _merge_action_tokens(
+                    rope_apply(qn_sp, half_grid, freqs, temporal_offset=tf_off),
+                    qn_act, half_grid, a_per_f,
+                )
+                rk_noisy = _merge_action_tokens(
+                    rope_apply(kn_sp, half_grid, freqs, temporal_offset=tf_off),
+                    kn_act, half_grid, a_per_f,
+                )
+            else:
+                rq_clean = rope_apply(q_clean, half_grid, freqs, temporal_offset=0)
+                rk_clean = rope_apply(k_clean, half_grid, freqs, temporal_offset=0)
+                rq_noisy = rope_apply(q_noisy, half_grid, freqs, temporal_offset=tf_off)
+                rk_noisy = rope_apply(k_noisy, half_grid, freqs, temporal_offset=tf_off)
+            rq_valid = torch.cat([rq_clean, rq_noisy], dim=1)
+            rk_valid = torch.cat([rk_clean, rk_noisy], dim=1)
+        else:
+            q_sp, q_act = _separate_action_tokens(q_valid, grid_sizes, a_per_f)
+            k_sp, k_act = _separate_action_tokens(k_valid, grid_sizes, a_per_f)
 
-        rq_sp = rope_apply(q_sp, grid_sizes, freqs)
-        rk_sp = rope_apply(k_sp, grid_sizes, freqs)
+            rq_sp = rope_apply(q_sp, grid_sizes, freqs)
+            rk_sp = rope_apply(k_sp, grid_sizes, freqs)
 
-        rq_valid = _merge_action_tokens(rq_sp, q_act, grid_sizes, a_per_f)
-        rk_valid = _merge_action_tokens(rk_sp, k_act, grid_sizes, a_per_f)
+            rq_valid = _merge_action_tokens(rq_sp, q_act, grid_sizes, a_per_f)
+            rk_valid = _merge_action_tokens(rk_sp, k_act, grid_sizes, a_per_f)
 
         if q_tail.shape[1] > 0:
             rq = torch.cat([rq_valid, q_tail], dim=1)
@@ -226,6 +281,11 @@ def _bidir_forward_with_action_tokens(
     action_tokens,
     clip_fea=None,
     y=None,
+    clean_x=None,
+    aug_t=None,
+    action_tokens_clean=None,
+    state_tokens=None,
+    state_tokens_clean=None,
 ):
     """Replacement ``_forward`` body for the bidirectional WanModel that
     interleaves Stream-B action tokens per frame before the transformer
@@ -237,6 +297,20 @@ def _bidir_forward_with_action_tokens(
     per-frame layout the causal weights were trained on and (b) return
     spatial-only x0 predictions.
 
+    Teacher-forcing (``clean_x is not None``): the clean-half latents
+    are patch-embedded, interleaved with their own action tokens
+    (``action_tokens_clean``; required when a_per_f > 0), and concatenated
+    along the seq dim BEFORE the noisy half. Time embeddings are computed
+    separately for the clean half (using ``aug_t``, defaulting to zeros)
+    and the noisy half (using ``t``), then concatenated along the F dim
+    so each block sees per-frame AdaLN-Zero modulation appropriate to
+    each half. After all blocks, the clean half is sliced off; head +
+    unpatchify run on the noisy half only. The bidirectional WanModel
+    has no causal mask, so the joint-window self-attn naturally lets
+    the noisy half attend to the clean half (and vice versa) — no
+    special block_mask machinery needed (cf. CausalWanModel which DOES
+    need the TF block_mask + rope_offset).
+
     classify_mode / regress_mode are intentionally unsupported here —
     those code paths power the GAN critic heads and Phase-1 rolling-
     staircase DMD has the GAN disabled. If re-enabled they need their
@@ -246,6 +320,12 @@ def _bidir_forward_with_action_tokens(
         assert clip_fea is not None and y is not None
 
     a_per_f = int(getattr(self, "action_tokens_per_frame", 0))
+    s_per_f = int(getattr(self, "state_tokens_per_frame", 0))
+    # ``a_per_f`` is the COMBINED count of all per-frame extras (action +
+    # state) — see ``adding_state_token_branch`` which bumps a_per_f by 1
+    # when adding state tokens. ``s_per_f`` is the state-only slice;
+    # ``a_per_f - s_per_f`` is the action-only slice.
+    n_action_only = a_per_f - s_per_f
     if a_per_f <= 0:
         raise RuntimeError(
             "_bidir_forward_with_action_tokens called with "
@@ -258,6 +338,25 @@ def _bidir_forward_with_action_tokens(
             "action_tokens=None; Stream B is advertised by "
             "action_tokens_per_frame > 0 but no tokens were provided."
         )
+    if s_per_f > 0 and state_tokens is None:
+        raise RuntimeError(
+            "_bidir_forward_with_action_tokens called with "
+            f"state_tokens_per_frame={s_per_f} but state_tokens=None; "
+            "the v14 LoRA was trained with per-frame state tokens "
+            "interleaved in the input — running without them is OOD."
+        )
+    if clean_x is not None and action_tokens_clean is None:
+        raise RuntimeError(
+            "_bidir_forward_with_action_tokens called with clean_x "
+            "but action_tokens_clean=None; the clean half needs its "
+            "own per-frame action tokens (Stream B is active)."
+        )
+    if clean_x is not None and s_per_f > 0 and state_tokens_clean is None:
+        raise RuntimeError(
+            "_bidir_forward_with_action_tokens called with clean_x "
+            "but state_tokens_clean=None; the clean half needs its "
+            "own per-frame state tokens when state-token branch is active."
+        )
 
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
@@ -266,7 +365,7 @@ def _bidir_forward_with_action_tokens(
     if y is not None:
         x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
-    # Patch embedding.
+    # Patch embedding for the noisy half.
     x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
     grid_sizes = torch.stack(
         [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
@@ -287,22 +386,72 @@ def _bidir_forward_with_action_tokens(
         u = u[:, : num_frames_local * spatial_seqlen].unflatten(
             1, (num_frames_local, spatial_seqlen)
         )
-        at = action_tokens[batch_idx : batch_idx + 1].unsqueeze(2).to(
-            dtype=u.dtype, device=u.device
-        )
-        u = torch.cat([u, at], dim=2).flatten(1, 2)
+        extras = [action_tokens[batch_idx : batch_idx + 1].unsqueeze(2).to(
+            dtype=u.dtype, device=u.device,
+        )]
+        if state_tokens is not None and s_per_f > 0:
+            st_block = state_tokens[batch_idx : batch_idx + 1].unsqueeze(2).to(
+                dtype=u.dtype, device=u.device,
+            )
+            extras.append(st_block)
+        u = torch.cat([u] + extras, dim=2).flatten(1, 2)
         x_interleaved.append(u)
-    x = x_interleaved
+    x = x_interleaved  # list of [1, F*(H*W+a_per_f), C]
+
+    # Teacher-forcing: patch-embed + interleave the clean half, then
+    # concat [clean, noisy] along seq dim. The clean half uses its own
+    # action tokens (action_tokens_clean) and shares the same grid_sizes
+    # (same H, W per frame; same num_frames in our usage — clean and
+    # noisy halves are both num_training_frames long, just at different
+    # absolute time positions in the ride).
+    if clean_x is not None:
+        clean_x_emb = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
+        clean_grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in clean_x_emb]
+        )
+        if int(clean_grid_sizes[0, 0].item()) != num_frames_local:
+            raise RuntimeError(
+                f"clean_x has {int(clean_grid_sizes[0, 0].item())} frames "
+                f"but noisy x has {num_frames_local}; both halves must have "
+                "the same number of frames in this bidirectional TF path."
+            )
+        clean_x_emb = [u.flatten(2).transpose(1, 2) for u in clean_x_emb]
+        clean_at_frames = action_tokens_clean.shape[1]
+        if clean_at_frames != num_frames_local:
+            raise RuntimeError(
+                f"action_tokens_clean has {clean_at_frames} frames but "
+                f"clean_x has {num_frames_local} frames; they must match."
+            )
+        clean_x_interleaved = []
+        for batch_idx, u in enumerate(clean_x_emb):
+            u = u[:, : num_frames_local * spatial_seqlen].unflatten(
+                1, (num_frames_local, spatial_seqlen)
+            )
+            extras_c = [action_tokens_clean[batch_idx : batch_idx + 1].unsqueeze(2).to(
+                dtype=u.dtype, device=u.device,
+            )]
+            if state_tokens_clean is not None and s_per_f > 0:
+                stc_block = state_tokens_clean[batch_idx : batch_idx + 1].unsqueeze(2).to(
+                    dtype=u.dtype, device=u.device,
+                )
+                extras_c.append(stc_block)
+            u = torch.cat([u] + extras_c, dim=2).flatten(1, 2)
+            clean_x_interleaved.append(u)
+        # Concat [clean, noisy] per batch.
+        x = [torch.cat([cu, nu], dim=1) for cu, nu in zip(clean_x_interleaved, x)]
 
     seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
     # Extend pad target to fit the interleaved sequence (caller's seq_len
-    # tracks the spatial-only capacity).
-    pad_target = seq_len + num_frames_local * a_per_f
+    # tracks the spatial-only capacity for the NOISY half only). When
+    # clean_x is present the joint sequence is twice as long.
+    half_pad = seq_len + num_frames_local * a_per_f
+    pad_target = half_pad * (2 if clean_x is not None else 1)
     if int(seq_lens.max().item()) > pad_target:
         raise RuntimeError(
             f"interleaved seq_lens.max()={int(seq_lens.max().item())} "
             f"exceeds pad_target={pad_target} (seq_len={seq_len} + "
-            f"F*a_per_f={num_frames_local * a_per_f})"
+            f"F*a_per_f={num_frames_local * a_per_f}, "
+            f"doubled for clean_x={clean_x is not None})"
         )
     x = torch.cat(
         [
@@ -314,7 +463,9 @@ def _bidir_forward_with_action_tokens(
         ]
     )
 
-    # Time embedding (identical to upstream _forward).
+    # Time embedding (identical to upstream _forward) — for the NOISY
+    # half. ``time_projection`` is patched (``_patch_time_projection``)
+    # to add ``self._action_modulation`` (Stream A) to its output.
     e = self.time_embedding(
         sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x)
     )
@@ -323,6 +474,30 @@ def _bidir_forward_with_action_tokens(
         .unflatten(1, (6, self.dim))
         .unflatten(dim=0, sizes=t.shape)
     )
+
+    # Teacher-forcing time embedding for the clean half. We swap
+    # ``self._action_modulation`` to ``self._action_modulation_clean``
+    # for the duration of the clean-half time_projection so the clean
+    # tokens get clean Stream A modulation. Restored immediately so the
+    # subsequent block forwards see the regular noisy modulation.
+    # Mirrors CausalWanModel._forward_inference lines 1505-1513.
+    if clean_x is not None:
+        if aug_t is None:
+            aug_t = torch.zeros_like(t)
+        saved_am = getattr(self, "_action_modulation", None)
+        self._action_modulation = getattr(self, "_action_modulation_clean", None)
+        try:
+            e_clean = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x)
+            )
+            e0_clean = (
+                self.time_projection(e_clean)
+                .unflatten(1, (6, self.dim))
+                .unflatten(dim=0, sizes=aug_t.shape)
+            )
+        finally:
+            self._action_modulation = saved_am
+        e0 = torch.cat([e0_clean, e0], dim=1)
 
     # Context (identical to upstream _forward).
     context_lens = None
@@ -338,16 +513,45 @@ def _bidir_forward_with_action_tokens(
         context_clip = self.img_emb(clip_fea)
         context = torch.concat([context_clip, context], dim=1)
 
-    # Propagate a_per_f to each block's self_attn (blocks were patched at
-    # model-patch time; attribute needs refresh per forward because a_per_f
-    # may change between forwards of the same model instance).
+    # Propagate a_per_f and tf_rope_offset to each block's self_attn
+    # (blocks were patched at model-patch time; attributes need a refresh
+    # per forward because they may change between forwards of the same
+    # model instance — TF vs non-TF, and the offset may vary by config).
+    # In TF mode tf_rope_offset_frames = dmd_context_clean_frames (= cf,
+    # in latent frames), so the noisy half is RoPE-positioned at
+    # [cf, cf + F) while the clean half stays at [0, F) — preserving v14's
+    # training contract. The caller (ActionForcingDMD) sets
+    # ``model.tf_rope_offset_frames`` when it sets ``context_shift``.
+    if clean_x is not None:
+        tf_rope_offset = int(getattr(self, "tf_rope_offset_frames", 0))
+        if tf_rope_offset <= 0:
+            raise RuntimeError(
+                "_bidir_forward_with_action_tokens called with clean_x "
+                "but model.tf_rope_offset_frames is 0; the caller must "
+                "set it (= dmd_context_clean_frames in latent frames) "
+                "before calling with clean_x so the noisy half gets the "
+                "correct shifted RoPE positions."
+            )
+    else:
+        tf_rope_offset = 0
     for block in self.blocks:
         block.self_attn.action_tokens_per_frame = a_per_f
+        block.self_attn.tf_rope_offset = tf_rope_offset
+
+    # The self-attn patch reads grid_sizes to compute valid_len for the
+    # interleaved layout; in TF mode the joint sequence has 2*F frames.
+    # We pass a doubled-F grid_sizes so the patch sees the full joint
+    # length (otherwise it'd treat the clean half as padding and skip
+    # RoPE on the noisy half's first F frames).
+    block_grid_sizes = grid_sizes
+    if clean_x is not None:
+        block_grid_sizes = grid_sizes.clone()
+        block_grid_sizes[:, 0] = num_frames_local * 2
 
     block_kwargs = dict(
         e=e0,
         seq_lens=seq_lens,
-        grid_sizes=grid_sizes,
+        grid_sizes=block_grid_sizes,
         freqs=self.freqs,
         context=context,
         context_lens=context_lens,
@@ -370,8 +574,14 @@ def _bidir_forward_with_action_tokens(
         else:
             x = block(x, **block_kwargs)
 
-    # Strip action tokens before head + unpatchify.
+    # Teacher-forcing: keep only the noisy half (the second half of the
+    # joint sequence). The clean half is the first F*frame_seqlen tokens.
     frame_seqlen = spatial_seqlen + a_per_f
+    if clean_x is not None:
+        clean_len = num_frames_local * frame_seqlen
+        x = x[:, clean_len:]
+
+    # Strip action tokens before head + unpatchify (noisy half only now).
     valid_len = num_frames_local * frame_seqlen
     x = x[:, :valid_len].unflatten(1, (num_frames_local, frame_seqlen))
     x = x[:, :, :spatial_seqlen].flatten(1, 2)
@@ -382,6 +592,8 @@ def _bidir_forward_with_action_tokens(
     # ``[ctx_t=0, ..., target_t]``), ``e`` comes out as ``[B*F, C]`` and
     # the default Head broadcasts a full-batch vector against a
     # per-sample x — mis-shaped. Reproduce the causal head math here.
+    # The head uses the NOISY half's e (the original ``t``-based one),
+    # not the joint e0 — same convention as CausalWanModel (line 1560).
     head_mod = getattr(self.head, "modulation")
     head_norm = getattr(self.head, "norm")
     head_lin = getattr(self.head, "head")
@@ -425,10 +637,17 @@ def patch_bidirectional_wan_model_for_action(model):
         seq_len,
         *args,
         action_modulation=None,
+        action_modulation_clean=None,
         action_tokens=None,
+        action_tokens_clean=None,
+        clean_x=None,
+        aug_t=None,
+        state_tokens=None,
+        state_tokens_clean=None,
         **kwargs,
     ):
         self._action_modulation = action_modulation
+        self._action_modulation_clean = action_modulation_clean
 
         # Stream B dispatch: when the model is configured for action tokens
         # AND a tensor was provided, route through the replacement forward
@@ -469,10 +688,16 @@ def patch_bidirectional_wan_model_for_action(model):
                     action_tokens,
                     clip_fea=kwargs.get("clip_fea"),
                     y=kwargs.get("y"),
+                    clean_x=clean_x,
+                    aug_t=aug_t,
+                    action_tokens_clean=action_tokens_clean,
+                    state_tokens=state_tokens,
+                    state_tokens_clean=state_tokens_clean,
                 )
             return orig_fwd(x, t, context, seq_len, *args, **kwargs)
         finally:
             self._action_modulation = None
+            self._action_modulation_clean = None
 
     model._forward = _forward_with_action.__get__(model, type(model))
     model._action_bidir_patched = True

@@ -103,37 +103,37 @@ def _slice_baseline_scoring_window(
     cond_dict: Dict[str, torch.Tensor],
     rollout_frames: int,
     num_training_frames: int,
+    seed_frames: int = 0,
 ) -> Dict[str, torch.Tensor]:
     """Slice ``cond_dict``'s per-frame action streams to the LAST
     ``num_training_frames`` of the BASELINE rollout window.
 
-    The "baseline rollout window" is frames ``[0, rollout_frames)`` of
-    the conditioning streams — the gradient-active region. With MAE-
-    extension enabled, ``cond_dict`` may carry additional frames past
-    ``rollout_frames`` (sized to cover possible extensions); those
-    extension frames are NEVER scored, so we must positionally slice
-    inside the baseline window rather than ``[-num_training_frames:]``
-    (which would grab extension frames when extensions extended the
-    streams). The slice is
-    ``[rollout_frames - num_training_frames : rollout_frames]``,
-    which collapses correctly across all three regimes:
+    ``seed_frames`` accounts for an optional KV-cache prefill prefix
+    on the front of ``cond_dict``. When the trainer feeds the pipeline
+    a ``conditional_dict`` covering ``seed_frames + rollout_frames``
+    frames (seed actions first, then rollout actions — the layout the
+    pipeline indexes via absolute ``current_start_frame``), the scorer
+    still wants the LAST ``num_training_frames`` of the ROLLOUT half.
+    The slice becomes
+    ``[seed_frames + rollout_frames - num_training_frames :
+       seed_frames + rollout_frames]``.
+
+    With ``seed_frames == 0`` (no prefill / pre-2026-04-26 path) the
+    slice is ``[rollout_frames - num_training_frames : rollout_frames]``,
+    which collapses correctly across all three legacy regimes:
 
       - classic           (rollout_frames == num_training_frames):
-            ``[0:num_training_frames]`` (no-op when len==num_training_frames)
-      - long-rollout      (rollout_frames >  num_training_frames, no ext):
+            ``[0:num_training_frames]``
+      - long-rollout      (rollout_frames >  num_training_frames):
             ``[rollout_frames - num_training_frames : rollout_frames]``
             = LAST num_training_frames of cond_dict
-      - extension mode    (rollout_frames <= num_training_frames OR
-                            cond_dict longer than rollout_frames):
-            ``[rollout_frames - num_training_frames : rollout_frames]``
-            = first ``num_training_frames`` (when rollout_frames ==
-            num_training_frames) regardless of how far the streams
-            extend past ``rollout_frames``.
+      - extension mode    (cond_dict longer than rollout_frames):
+            same; extension frames are never scored.
 
     Non-action keys (``prompt_embeds`` etc.) are passed through.
     """
-    start = rollout_frames - num_training_frames
-    if start < 0:
+    start = seed_frames + rollout_frames - num_training_frames
+    if start < seed_frames:
         raise ValueError(
             f"rollout_frames ({rollout_frames}) must be >= "
             f"num_training_frames ({num_training_frames}); the "
@@ -181,105 +181,99 @@ class ActionForcingDMD(SelfForcingModel):
                 f"num_training_frames frames of the rollout."
             )
 
-        # ``dmd_context``: when True, restore v14's teacher-forcing
-        # input contract on the DMD scorers — feed both ``noisy_x``
-        # (= student's ``num_training_frames`` rollout) AND
-        # ``clean_x`` (= ``num_training_frames`` GT latents from the
-        # ride, offset by ``-dmd_context_clean_frames`` from the
-        # noisy half) to ``real_score`` / ``fake_score``. The
-        # underlying causal Wan model already supports this
-        # natively via ``clean_x`` + ``aug_t`` kwargs and
-        # ``model.context_shift`` (set below to
-        # ``dmd_context_clean_frames // num_frame_per_block``).
+        # ``dmd_context``: string-valued, ALWAYS SET. Selects what real_score
+        # sees as ``clean_x`` during DMD scoring; fake_score's clean_x is
+        # always the "self" (student-rolled) view regardless of mode, so
+        # the (fake - real) gradient is computed under matched fake-side
+        # conditioning across modes.
         #
-        # This is "Option A" v14 parity: scorers see a 24-frame
-        # window (3 clean GT context frames + 21 noisy student
-        # frames, with 18-frame overlap), exactly as v14 was trained
-        # (target_latents = full[cf:], context_latents = full[:N]).
-        # ``rollout_frames`` STAYS at ``num_training_frames`` — the
-        # student's compute budget is unchanged from the AUX
-        # baseline. The scorers' ``seq_len`` also stays at
-        # ``num_training_frames`` (the wrapper's ``seq_len`` covers
-        # the noisy half; the model doubles it internally via the
-        # teacher-forcing block mask).
+        #   "self": real_score's clean_x = student-rolled view = the
+        #           21-frame window shifted back by 1 chunk (3 frames)
+        #           from the noisy half. For batch i=1: [last seed chunk
+        #           GT, sdn[:18]]. For i>=2: sdn[(i-1)*21-3 : i*21-3]
+        #           entirely from the cumulative student rollout. No
+        #           noise added — both scorers see the same view.
         #
-        # Default ``False`` keeps the pure-DMD chain-only path that
-        # AUX / GAN / SC-DMD runs use.
-        self.dmd_context = bool(getattr(args, "dmd_context", False))
-        self.dmd_context_clean_frames = int(
-            getattr(args, "dmd_context_clean_frames", 3)
-        )
-        if self.dmd_context:
-            if self.dmd_context_clean_frames <= 0:
-                raise ValueError(
-                    "dmd_context=True requires dmd_context_clean_frames > 0; "
-                    f"got {self.dmd_context_clean_frames}."
-                )
-            if self.dmd_context_clean_frames % self.num_frame_per_block != 0:
-                raise ValueError(
-                    f"dmd_context_clean_frames "
-                    f"({self.dmd_context_clean_frames}) must be a multiple "
-                    f"of num_frame_per_block ({self.num_frame_per_block}) "
-                    f"so context_shift = cf // npb is integer-aligned to "
-                    f"chunks (matching v14's training)."
-                )
-            if self.dmd_context_clean_frames >= self.num_training_frames:
-                raise ValueError(
-                    f"dmd_context_clean_frames "
-                    f"({self.dmd_context_clean_frames}) must be < "
-                    f"num_training_frames ({self.num_training_frames}) so "
-                    f"the clean and noisy halves overlap (v14 used cf=3 with "
-                    f"num_frames=21 for an 18-frame overlap)."
-                )
+        #   "GT":   real_score's clean_x = ride GT at the same shifted
+        #           positions, with a small ``clean_x_aug_t`` of noise
+        #           applied to keep the reference from being perfectly
+        #           clean (symmetry-breaking; without aug_t the gradient
+        #           is dominated by a degenerate "real is perfect"
+        #           direction). v14 teacher-forcing parity. fake_score's
+        #           clean_x stays the "self" view (no noise).
+        #
+        # Default ``"GT"`` — the v14 teacher-forcing contract that the
+        # LoRA was actually trained against gives a tight DMD signal.
+        self.dmd_context = str(getattr(args, "dmd_context", "GT")).strip().lower()
+        if self.dmd_context not in ("self", "gt"):
+            raise ValueError(
+                f"dmd_context must be 'self' or 'GT' (case-insensitive); "
+                f"got {getattr(args, 'dmd_context', None)!r}."
+            )
+        # Normalise canonical case for downstream comparisons.
+        self.dmd_context = "GT" if self.dmd_context == "gt" else "self"
 
-        # ``dmd_real_GT``: when True (and dmd_context=True), real_score's
-        # clean_x is replaced with a LIGHTLY NOISED GT view (same ride
-        # frames, same shape, same memory; just a small ``aug_t`` and
-        # matching scheduler.add_noise pass on the GT context). The
-        # rationale is symmetry-breaking: today both scorers see PURE
-        # clean GT (aug_t=0), giving the bidirectional teacher a
-        # near-perfect reference. Bumping real's aug_t to a small
-        # positive value softens that reference slightly so the score
-        # gradient isn't dominated by a degenerate "real is perfect"
-        # direction. ``fake_score`` (both inside DMD's ``_compute_kl_grad``
-        # AND inside ``critic_loss``'s independent fake-score training)
-        # stays on PURE clean GT — symmetric noise on fake would just
-        # mirror the same softening and net out, defeating the purpose.
-        #
-        # Cost: +1 ``scheduler.add_noise`` call on a 21-frame chunk per
-        # generator step. Memory: +1 tensor of clean_x's size. No mask
-        # changes, no extra forwards. "Same time and memory as
-        # dmd_context" within rounding error.
-        #
-        # Default ``False``. Requires ``dmd_context=True``.
-        self.dmd_real_GT = bool(getattr(args, "dmd_real_GT", False))
-        self.dmd_real_GT_aug_t = int(getattr(args, "dmd_real_GT_aug_t", 20))
-        if self.dmd_real_GT:
-            if not self.dmd_context:
-                raise ValueError(
-                    "dmd_real_GT=True requires dmd_context=True (the "
-                    "feature only modifies the clean_x view that "
-                    "dmd_context plumbs into the scorers; with "
-                    "dmd_context=False there is no clean_x to noise)."
-                )
-            if self.dmd_real_GT_aug_t <= 0:
-                raise ValueError(
-                    "dmd_real_GT=True requires dmd_real_GT_aug_t > 0 "
-                    f"(got {self.dmd_real_GT_aug_t}). Use a SMALL value "
-                    f"(default 20 out of num_train_timestep="
-                    f"{getattr(args, 'num_train_timestep', 1000)}; "
-                    "anything <= ~50 keeps the noise effectively "
-                    "imperceptible) — the GT context should still be "
-                    "very close to clean, just not literally aug_t=0."
-                )
-            if self.dmd_real_GT_aug_t >= int(
-                getattr(args, "num_train_timestep", 1000)
-            ):
-                raise ValueError(
-                    f"dmd_real_GT_aug_t ({self.dmd_real_GT_aug_t}) "
-                    f"must be < num_train_timestep "
-                    f"({getattr(args, 'num_train_timestep', 1000)})."
-                )
+        # Number of leading GT frames that seed the KV cache before the
+        # student's rolling rollout starts (= the model's KV-cache size,
+        # default 9 = 3 chunks of ``num_frame_per_block=3``). This is
+        # the prefill amount and ONLY the prefill amount: the
+        # clean/noisy SHIFT used by the bidirectional scorer is fixed
+        # at ``num_frame_per_block`` (= 1 chunk), independent of the
+        # seed size. Must be a multiple of ``num_frame_per_block``
+        # (seed loop runs in chunks) and at least ``num_frame_per_block``
+        # (so the batch-1 clean_x mix can pull the last 1 chunk from
+        # seed when the rollout has only N=21 frames).
+        self.dmd_context_clean_frames = int(
+            getattr(args, "dmd_context_clean_frames", 9)
+        )
+        if self.dmd_context_clean_frames < self.num_frame_per_block:
+            raise ValueError(
+                "dmd_context_clean_frames must be >= num_frame_per_block "
+                f"({self.num_frame_per_block}); got "
+                f"{self.dmd_context_clean_frames}."
+            )
+        if self.dmd_context_clean_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                f"dmd_context_clean_frames "
+                f"({self.dmd_context_clean_frames}) must be a multiple "
+                f"of num_frame_per_block ({self.num_frame_per_block}) "
+                f"so the seed prefill loop runs in whole chunks."
+            )
+        if self.dmd_context_clean_frames >= self.num_training_frames:
+            raise ValueError(
+                f"dmd_context_clean_frames "
+                f"({self.dmd_context_clean_frames}) must be < "
+                f"num_training_frames ({self.num_training_frames})."
+            )
+
+        # ``clean_x_aug_t``: small noise level applied to real_score's
+        # clean_x ONLY in ``"GT"`` mode (real_score sees lightly-noised GT
+        # context). Symmetry-breaking — without it, the gradient is
+        # dominated by the perfect-context advantage. fake_score's clean_x
+        # is never noised. In ``"self"`` mode this knob has no effect (no
+        # GT clean_x to noise).
+        self.clean_x_aug_t = int(getattr(args, "clean_x_aug_t", 20))
+        if self.clean_x_aug_t <= 0 or self.clean_x_aug_t >= int(
+            getattr(args, "num_train_timestep", 1000)
+        ):
+            raise ValueError(
+                f"clean_x_aug_t ({self.clean_x_aug_t}) must be in "
+                f"(0, num_train_timestep="
+                f"{getattr(args, 'num_train_timestep', 1000)}). Use a "
+                "SMALL value (≲ 50) to keep the GT signal dominant."
+            )
+
+        # ``heatmap_out_noise_bar``: drop the gen-step DMD gradient on
+        # the top 2 latent rows of frame 0 of the noisy_x window. The
+        # v14 LoRA produces a chromatic-fringe artifact at the bidir
+        # joint-sequence half-boundary whenever clean_x is present
+        # (heatmap from ``_diag_p1/heatmap_artifact.py`` shows rows 0-1
+        # of frame 0 at ~2.5x baseline error; rest of the frame is
+        # baseline). Masking those 2 rows costs ~0.16% of supervision
+        # tokens. Default ``True``. Set ``False`` to disable.
+        self.heatmap_out_noise_bar = bool(
+            getattr(args, "heatmap_out_noise_bar", True)
+        )
 
         if getattr(args, "gradient_checkpointing", False):
             try:
@@ -346,68 +340,37 @@ class ActionForcingDMD(SelfForcingModel):
         self._load_real_score_with_v14_lora(args, device)
         self._mirror_generator_into_fake_score()
 
-        # When dmd_context=True, set ``context_shift`` on BOTH scorer
-        # models after their final state_dicts are loaded. This must
-        # happen AFTER ``_load_real_score_with_v14_lora`` (which
-        # rebuilds ``real_score.model`` via peft.merge_and_unload —
-        # any attribute set before that call would be lost) and
-        # AFTER ``_mirror_generator_into_fake_score`` (which only
-        # touches state_dicts, but kept here for ordering clarity).
-        # Setting ``context_shift`` flips the model from the
-        # block-causal mask path (``clean_x is None``) to the
-        # teacher-forcing mask path (``clean_x is not None``) at the
-        # next forward; we also clear any cached ``block_mask`` so
-        # the new TF mask gets built fresh on first scorer call.
-        if self.dmd_context:
-            cs = self.dmd_context_clean_frames // self.num_frame_per_block
-            for scorer_name in ("real_score", "fake_score"):
-                m = getattr(self, scorer_name).model
-                m.context_shift = cs
-                # Force TF mask rebuild on next forward (new shift).
-                m.block_mask = None
-            if _is_main():
-                logging.info(
-                    "[ActionForcingDMD] dmd_context=True: set "
-                    "context_shift=%d on real_score and fake_score "
-                    "(v14 teacher-forcing parity; scorers will receive "
-                    "clean_x = ride[0:%d] alongside noisy_x = "
-                    "student_pred[0:%d])",
-                    cs,
-                    self.num_training_frames,
-                    self.num_training_frames,
-                )
-            if self.dmd_real_GT and _is_main():
-                # Probe the scheduler for the EFFECTIVE sigma at this
-                # aug_t so the log makes the noise magnitude
-                # explicit (sanity-check that it's actually small).
-                try:
-                    probe_x = torch.zeros(
-                        1, 16, 1, 1, device=device, dtype=torch.float32,
-                    )
-                    probe_n = torch.ones_like(probe_x)
-                    probe_t = torch.full(
-                        (1,), int(self.dmd_real_GT_aug_t),
-                        device=device, dtype=torch.long,
-                    )
-                    probe_out = self.scheduler.add_noise(
-                        probe_x, probe_n, probe_t,
-                    )
-                    sigma_eff = float(probe_out.abs().mean().item())
-                except Exception:
-                    sigma_eff = float("nan")
-                logging.info(
-                    "[ActionForcingDMD] dmd_real_GT=True: real_score's "
-                    "clean_x will be lightly noised at aug_t=%d (out of "
-                    "num_train_timestep=%d, effective sigma~=%.4f, "
-                    "i.e. clean_x_real ~ %.1f%% noise + %.1f%% GT). "
-                    "fake_score's clean_x stays at aug_t=0 (pure clean "
-                    "GT) for both DMD and critic_loss paths.",
-                    self.dmd_real_GT_aug_t,
-                    self.num_train_timestep,
-                    sigma_eff,
-                    100.0 * sigma_eff,
-                    100.0 * (1.0 - sigma_eff),
-                )
+        # dmd_context is always set. Configure both bidirectional
+        # scorers for teacher-forcing input (clean_x + noisy_x joint
+        # window). The clean/noisy SHIFT is fixed at one chunk
+        # (= ``num_frame_per_block`` frames), NOT the seed size:
+        #   * ``model.context_shift`` (chunks) = 1
+        #   * ``model.tf_rope_offset_frames`` (frames) = ``num_frame_per_block``
+        # The bidir self-attn patch reads ``tf_rope_offset_frames`` to
+        # offset the noisy half's RoPE positions so clean is at [0, F)
+        # and noisy is at [shift, shift+F).
+        # Must run AFTER ``_load_real_score_with_v14_lora`` (peft.merge_
+        # and_unload rebuilds real_score.model and would drop attrs set
+        # before) and AFTER ``_mirror_generator_into_fake_score``.
+        for scorer_name in ("real_score", "fake_score"):
+            m = getattr(self, scorer_name).model
+            m.context_shift = 1
+            m.tf_rope_offset_frames = self.num_frame_per_block
+            # Force any cached block_mask rebuild (causal path only;
+            # bidir doesn't use block_mask but harmless to clear).
+            m.block_mask = None
+
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] dmd_context=%r: set "
+                "context_shift=1 chunk (= tf_rope_offset_frames=%d) on "
+                "real_score and fake_score. KV-cache seed prefill = "
+                "%d frames. clean_x_aug_t=%d (only used in 'GT' mode).",
+                self.dmd_context,
+                self.num_frame_per_block,
+                self.dmd_context_clean_frames,
+                self.clean_x_aug_t,
+            )
 
         # Finalize freezes.
         for p in self.real_score.parameters():
@@ -763,6 +726,7 @@ class ActionForcingDMD(SelfForcingModel):
         clean_latent=None,
         initial_latent: Optional[torch.Tensor] = None,
         enable_mae_extension: bool = False,
+        seed_latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
         """Match CF's ``SelfForcingModel._run_generator`` behavior, plus
         CF-style long-rollout support and MAE-driven extension support:
@@ -860,6 +824,7 @@ class ActionForcingDMD(SelfForcingModel):
                 clean_image_or_video=None,
                 gt_latents=clean_latent,
                 enable_mae_extension=enable_mae_extension,
+                seed_latents=seed_latents,
                 **conditional_dict,
             )
         )
@@ -929,14 +894,15 @@ class ActionForcingDMD(SelfForcingModel):
         clean-half RoPE offset (gated by ``model.context_shift``).
 
         When ``clean_x_real`` / ``aug_t_real`` are also provided
-        (dmd_real_GT=True), real_score gets a separately noised
-        clean_x view (still the same GT frames, just at a small
-        positive ``aug_t`` instead of pure clean). When they are
-        ``None``, real_score falls back to the same ``(clean_x,
-        aug_t)`` as fake_score (legacy symmetric behaviour). The
-        ``noisy_image_or_video`` driving the score is always the
-        SAME for both scorers, so the DMD subtraction stays well
-        defined; only the conditioning ``clean_x`` differs.
+        (``dmd_context='GT'`` mode), real_score gets a separately
+        prepared view: the GT-version of the same time positions,
+        lightly noised at ``self.clean_x_aug_t``. When they are
+        ``None`` (``dmd_context='self'`` mode or critic step), real_
+        score falls back to the same ``(clean_x, aug_t)`` as fake_
+        score (matched conditioning). The ``noisy_image_or_video``
+        driving the score is always the SAME for both scorers, so
+        the DMD subtraction stays well defined; only the
+        conditioning ``clean_x`` differs.
         """
         tf_kwargs_fake: Dict[str, Any] = {}
         tf_kwargs_real: Dict[str, Any] = {}
@@ -1076,15 +1042,13 @@ class ActionForcingDMD(SelfForcingModel):
             int64, shape ``[B, num_training_frames]``). For the v14
             parity case the scorers see ``clean_x`` as PURE clean
             (``aug_t=0``), matching v14's training contract.
-          clean_x_real / aug_t_real: optional ``dmd_real_GT`` view —
-            same shape as ``clean_x`` / ``aug_t`` but with
-            ``scheduler.add_noise`` already applied at a small
-            ``aug_t`` (default 50/1000). When provided, ONLY
-            ``real_score`` sees this lightly noised view; ``fake_
-            score`` keeps using the pure-clean ``(clean_x, aug_t)``.
-            When ``None`` (the default, including all dmd_context
-            calls without dmd_real_GT), both scorers share the
-            same ``(clean_x, aug_t)``.
+          clean_x_real / aug_t_real: optional separate view for
+            real_score — used in ``dmd_context='GT'`` mode where
+            real sees lightly-noised GT latents (via
+            ``scheduler.add_noise`` at ``self.clean_x_aug_t``) while
+            fake keeps the unnoised self-view. ``None`` in
+            ``dmd_context='self'`` mode and on the critic step;
+            both scorers then share ``(clean_x, aug_t)``.
         """
         original_latent = image_or_video
         batch_size, num_frame = image_or_video.shape[:2]
@@ -1114,6 +1078,23 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t_real=aug_t_real,
             )
 
+        # ``heatmap_out_noise_bar``: drop the gen-step DMD gradient on
+        # rows 0-1 of frame 0 of the noisy_x window — the chromatic-
+        # fringe artifact region the v14 LoRA cannot represent
+        # correctly under the bidir TF joint sequence. Heatmap-precise:
+        # ~0.16% of tokens. Driven by the boolean config knob.
+        if bool(getattr(self, "heatmap_out_noise_bar", False)) and original_latent.shape[1] >= 1:
+            if gradient_mask is None:
+                gradient_mask = torch.ones(
+                    original_latent.shape, dtype=torch.bool,
+                    device=original_latent.device,
+                )
+            else:
+                gradient_mask = gradient_mask.clone()
+            # Mask top 2 latent rows of frame 0 (heatmap shows rows 0-1
+            # at ~2.5x baseline error; rest of frame is at baseline).
+            gradient_mask[:, 0, :, :2, :] = False
+
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(
                 original_latent.double()[gradient_mask],
@@ -1133,7 +1114,8 @@ class ActionForcingDMD(SelfForcingModel):
     # ------------------------------------------------------------------
     def _build_dmd_context_kwargs(
         self,
-        clean_context_latents: Optional[torch.Tensor],
+        clean_x_self: Optional[torch.Tensor],
+        clean_x_GT: Optional[torch.Tensor],
         clean_conditional_dict: Optional[dict],
         clean_unconditional_dict: Optional[dict],
         cond_for_scoring: dict,
@@ -1149,81 +1131,89 @@ class ActionForcingDMD(SelfForcingModel):
         dict,
         dict,
     ]:
-        """Prepare ``clean_x`` / ``aug_t`` (and an optional separately
-        noised real-side view) and merge clean action streams into the
-        scoring cond dicts. Returns:
-            (clean_x, aug_t, clean_x_real, aug_t_real,
+        """Prepare per-scorer ``clean_x`` / ``aug_t`` and merge the clean
+        action streams into the scoring cond dicts. Returns:
+            (clean_x_fake, aug_t_fake,
+             clean_x_real, aug_t_real,
              new_cond_for_scoring, new_uncond_for_scoring)
 
-        ``clean_x`` / ``aug_t`` are the FAKE-side view (pure clean GT,
-        ``aug_t=0``) — used for ``fake_score`` everywhere
-        (``_compute_kl_grad``'s fake forwards AND ``critic_loss``'s
-        fake-score training step). They are also the REAL-side view
-        unless ``self.dmd_real_GT`` is True AND ``build_real_view`` is
-        True, in which case ``clean_x_real`` / ``aug_t_real`` are a
-        lightly noised version of the same GT (same shape, same memory
-        — just one extra ``scheduler.add_noise`` call). When
-        ``build_real_view`` is False the real-side outputs are
-        ``None`` so the caller falls back on the fake-side view.
+        ``clean_x_fake`` / ``aug_t_fake`` are ALWAYS the "self" view
+        (= ``clean_x_self``, ``aug_t=0``) regardless of ``self.dmd_context``
+        mode. fake_score thus sees consistent conditioning across modes.
+        ``clean_x_self`` is the 21-frame view shifted back by one chunk
+        from the noisy_x window, assembled by the caller from
+        ``[seed_last_chunk, sdn[:18]]`` (batch 1) or
+        ``sdn[(i-1)*21-3 : i*21-3]`` (batch ≥ 2).
 
-        ``critic_loss`` calls this helper with
-        ``build_real_view=False`` because fake-score TRAINING never
-        uses the real-side view (it only trains fake_score, not
-        real_score), saving the noise computation.
+        ``clean_x_real`` / ``aug_t_real`` are mode-dependent:
+          * ``"self"``: same as fake (no noise; both scorers see the
+            same view; (fake-real) gradient on matched conditioning).
+          * ``"GT"``: ``scheduler.add_noise(clean_x_GT, n,
+            clean_x_aug_t)`` — real_score sees the GT version of the
+            same time positions, lightly noised at ``self.clean_x_aug_t``
+            for symmetry-breaking. ``clean_x_GT`` is required in this
+            mode; trainer assembles it from
+            ``ride[s+6+(i-1)*21 : s+6+i*21]`` per batch.
+
+        When ``build_real_view=False`` (critic step — only trains fake)
+        the real-side outputs are ``None`` so callers can skip the
+        noise pass entirely.
 
         The cond dicts are SHALLOW-COPIED (never mutate the caller's
         dict) and have ``_action_modulation_clean`` /
-        ``_action_tokens_clean`` injected from ``clean_*_dict``.
-
-        When ``self.dmd_context`` is False, returns ``(None, None,
-        None, None, cond_for_scoring, uncond_for_scoring)`` unchanged
-        — caller falls into the legacy no-context DMD path.
+        ``_action_tokens_clean`` injected from ``clean_*_dict``. The
+        action streams correspond to the time positions covered by
+        ``clean_x_self`` / ``clean_x_GT`` (which are the same — only the
+        latent values differ between self and GT views), so a SINGLE
+        clean cond dict is correct for both fake and real.
         """
-        if not self.dmd_context:
-            return (
-                None, None, None, None,
-                cond_for_scoring, uncond_for_scoring,
-            )
-
-        if clean_context_latents is None:
+        if clean_x_self is None:
             raise RuntimeError(
-                "dmd_context=True requires clean_context_latents (the "
-                "trainer must pass ride_latents[:, :num_training_frames] "
-                "as clean_context_latents)."
+                "_build_dmd_context_kwargs requires clean_x_self (the "
+                "21-frame self-view assembled by the trainer)."
             )
-        if clean_context_latents.shape[1] != self.num_training_frames:
+        if clean_x_self.shape[1] != self.num_training_frames:
             raise RuntimeError(
-                f"dmd_context=True: clean_context_latents.shape[1]="
-                f"{clean_context_latents.shape[1]} must equal "
-                f"num_training_frames={self.num_training_frames}."
+                f"clean_x_self.shape[1]={clean_x_self.shape[1]} must "
+                f"equal num_training_frames={self.num_training_frames}."
             )
+        if self.dmd_context == "GT":
+            if clean_x_GT is None:
+                raise RuntimeError(
+                    "dmd_context='GT' requires clean_x_GT (the trainer "
+                    "must assemble ride[s+6+(i-1)*21 : s+6+i*21] for "
+                    "the i-th batch and pass it here)."
+                )
+            if clean_x_GT.shape[1] != self.num_training_frames:
+                raise RuntimeError(
+                    f"clean_x_GT.shape[1]={clean_x_GT.shape[1]} must "
+                    f"equal num_training_frames={self.num_training_frames}."
+                )
 
-        sc_clean_x = clean_context_latents.to(
-            dtype=dtype, device=device,
-        )
+        sc_clean_x = clean_x_self.to(dtype=dtype, device=device)
         sc_aug_t = torch.zeros(
             (sc_clean_x.shape[0], self.num_training_frames),
             device=device, dtype=torch.long,
         )
 
-        # dmd_real_GT: build a separately noised view for real_score.
-        # Only built when the caller actually consumes it (generator
-        # step) — critic_loss skips this to save the noise pass since
-        # it only trains fake_score.
         sc_clean_x_real: Optional[torch.Tensor] = None
         sc_aug_t_real: Optional[torch.Tensor] = None
-        if self.dmd_real_GT and build_real_view:
+        if build_real_view and self.dmd_context == "GT":
             sc_aug_t_real = torch.full(
                 (sc_clean_x.shape[0], self.num_training_frames),
-                fill_value=int(self.dmd_real_GT_aug_t),
+                fill_value=int(self.clean_x_aug_t),
                 device=device, dtype=torch.long,
             )
-            real_noise = torch.randn_like(sc_clean_x)
+            gt_view = clean_x_GT.to(dtype=dtype, device=device)
+            real_noise = torch.randn_like(gt_view)
             sc_clean_x_real = self.scheduler.add_noise(
-                sc_clean_x.flatten(0, 1),
+                gt_view.flatten(0, 1),
                 real_noise.flatten(0, 1),
                 sc_aug_t_real.flatten(0, 1),
-            ).unflatten(0, sc_clean_x.shape[:2]).to(dtype=dtype)
+            ).unflatten(0, gt_view.shape[:2]).to(dtype=dtype)
+        # In "self" mode (or when build_real_view=False) we leave
+        # sc_clean_x_real/sc_aug_t_real as None; _compute_kl_grad's
+        # fallback uses (sc_clean_x, sc_aug_t) for real_score.
 
         new_cond = dict(cond_for_scoring)
         new_uncond = dict(uncond_for_scoring)
@@ -1251,7 +1241,9 @@ class ActionForcingDMD(SelfForcingModel):
         clean_latent: Optional[torch.Tensor] = None,
         initial_latent: Optional[torch.Tensor] = None,
         return_aux: bool = False,
-        clean_context_latents: Optional[torch.Tensor] = None,
+        seed_latents: Optional[torch.Tensor] = None,
+        clean_x_self: Optional[torch.Tensor] = None,
+        clean_x_GT: Optional[torch.Tensor] = None,
         clean_conditional_dict: Optional[dict] = None,
         clean_unconditional_dict: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
@@ -1275,19 +1267,16 @@ class ActionForcingDMD(SelfForcingModel):
         metrics from ``inference_pipeline._last_extension_metrics``
         into the log dict.
 
-        ``clean_context_latents`` / ``clean_conditional_dict`` /
-        ``clean_unconditional_dict`` are the v14 teacher-forcing
-        inputs used ONLY when ``self.dmd_context=True``. The
-        trainer is responsible for sourcing them from the ride
-        (``ride_latents[:, :num_training_frames]`` and the
-        action-streams cond dict built from ``ride_actions[:, :
-        num_training_frames]``); they correspond to ride frames
-        ``[0, num_training_frames)`` while the student's noisy
-        rollout corresponds to ride frames ``[cf, cf +
-        num_training_frames)`` where
-        ``cf = dmd_context_clean_frames``. The scorer attends over
-        both halves with ``context_shift = cf // npb`` to recreate
-        v14's training time-alignment.
+        ``clean_x_self`` / ``clean_x_GT`` / ``clean_conditional_dict`` /
+        ``clean_unconditional_dict`` are the teacher-forcing inputs.
+        The trainer assembles ``clean_x_self`` from the cumulative
+        student rollout (= 21 frames shifted back one chunk from the
+        noisy_x window) and, in ``dmd_context='GT'`` mode, also
+        ``clean_x_GT`` from the ride at the same shifted positions.
+        ``clean_conditional_dict`` carries action streams covering
+        the same 21-frame clean window. The scorer attends over
+        the joint [clean, noisy] sequence with the noisy half RoPE-
+        shifted by ``cf`` frames to recreate v14's time-alignment.
 
         When ``return_aux=True`` we additionally return an ``aux``
         dict carrying the rolled student prediction and the rung-
@@ -1308,24 +1297,58 @@ class ActionForcingDMD(SelfForcingModel):
                 clean_latent=clean_latent,
                 initial_latent=initial_latent,
                 enable_mae_extension=True,
+                seed_latents=seed_latents,
             )
         )
         scoring_frames = self.num_training_frames
 
-        # Legacy positional baseline-window slice. Works in classic,
-        # long-rollout, AND extension modes (cond_dict may have more
-        # than rollout_frames frames; we ignore those — only the
-        # baseline carries gradient and only the baseline is scored).
+        # Trainer feeds the pipeline a ``conditional_dict`` covering
+        # ``seed_frames + rollout_frames`` frames (seed first, then
+        # rollout) so the seed-prefill loop indexes by absolute
+        # ``current_start_frame``. The scorer wants the LAST
+        # ``num_training_frames`` of the ROLLOUT half — slice with the
+        # ``seed_frames`` offset to skip the seed actions.
+        seed_frames = int(seed_latents.shape[1]) if seed_latents is not None else 0
         cond_for_scoring = _slice_baseline_scoring_window(
             conditional_dict,
             rollout_frames=rollout_frames,
             num_training_frames=scoring_frames,
+            seed_frames=seed_frames,
         )
         uncond_for_scoring = _slice_baseline_scoring_window(
             unconditional_dict,
             rollout_frames=rollout_frames,
             num_training_frames=scoring_frames,
+            seed_frames=seed_frames,
         )
+
+        # Construct clean_x_self internally when not pre-supplied.
+        # The clean/noisy SHIFT is fixed at one chunk
+        # (= ``num_frame_per_block``); the canonical batch-1 "self"
+        # view is ``[seed[-shift:], pred_image[:N-shift]]`` = the last
+        # 1 chunk of the seed prefilled GT + the first (N-shift)
+        # student-rolled frames. Action streams for these positions
+        # are available via ``clean_conditional_dict`` (built by the
+        # trainer from ride_actions[:N]). Caller can override by
+        # passing clean_x_self explicitly (e.g., for multi-batch
+        # batches i ≥ 2 the assembly is purely from sdn and uses
+        # ``sdn[(i-1)*N - shift : i*N - shift]``).
+        if clean_x_self is None:
+            shift = self.num_frame_per_block
+            if seed_latents is None or seed_latents.shape[1] < shift:
+                raise RuntimeError(
+                    "generator_loss with dmd_context active requires "
+                    "either an explicit clean_x_self OR seed_latents "
+                    f"with >= {shift} frames (= num_frame_per_block, "
+                    "the clean/noisy shift) so the model can build "
+                    "the batch-1 self-view internally."
+                )
+            seed_last_chunk = seed_latents[:, -shift:].to(
+                dtype=pred_image.dtype, device=pred_image.device,
+            )
+            clean_x_self = torch.cat(
+                [seed_last_chunk, pred_image[:, : scoring_frames - shift]], dim=1,
+            )
 
         (
             sc_clean_x,
@@ -1335,7 +1358,8 @@ class ActionForcingDMD(SelfForcingModel):
             cond_for_scoring,
             uncond_for_scoring,
         ) = self._build_dmd_context_kwargs(
-            clean_context_latents=clean_context_latents,
+            clean_x_self=clean_x_self,
+            clean_x_GT=clean_x_GT,
             clean_conditional_dict=clean_conditional_dict,
             clean_unconditional_dict=clean_unconditional_dict,
             cond_for_scoring=cond_for_scoring,
@@ -1385,7 +1409,9 @@ class ActionForcingDMD(SelfForcingModel):
         unconditional_dict: dict,
         clean_latent: Optional[torch.Tensor] = None,
         initial_latent: Optional[torch.Tensor] = None,
-        clean_context_latents: Optional[torch.Tensor] = None,
+        seed_latents: Optional[torch.Tensor] = None,
+        clean_x_self: Optional[torch.Tensor] = None,
+        clean_x_GT: Optional[torch.Tensor] = None,
         clean_conditional_dict: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """CF-parity critic (fake_score) loss: train fake_score to denoise
@@ -1402,15 +1428,12 @@ class ActionForcingDMD(SelfForcingModel):
         running them again here would just produce the same numbers
         at extra compute cost.
 
-        ``clean_context_latents`` / ``clean_conditional_dict``: when
-        ``self.dmd_context=True`` the fake_score must be trained
-        under the SAME teacher-forcing input contract it sees during
-        the generator step (otherwise the (fake - real) gradient
-        path on the gen step would compare a TF-conditioned real
-        score against a non-TF-conditioned fake score — confound).
-        We forward them here unchanged so fake_score learns to
-        denoise the student's pred conditioned on GT clean_x just
-        like real_score does.
+        ``clean_x_self`` / ``clean_conditional_dict``: fake_score's
+        clean_x is ALWAYS the self-view (same as in the gen step),
+        so fake learns to denoise the student's pred under matched
+        teacher-forcing conditioning. ``clean_x_GT`` is unused on
+        the critic step (real_score isn't trained here); accepted
+        for signature compatibility with ``generator_loss``.
         """
         rollout_frames = int(image_or_video_shape[1])
         with torch.no_grad():
@@ -1421,25 +1444,51 @@ class ActionForcingDMD(SelfForcingModel):
                     clean_latent=clean_latent,
                     initial_latent=initial_latent,
                     enable_mae_extension=False,
+                    seed_latents=seed_latents,
                 )
             )
 
         # ``generated_image`` is sliced by ``_run_generator`` to the
         # last ``num_training_frames`` of the rollout (the gradient/
-        # scoring window).
+        # scoring window). ``conditional_dict`` covers seed+rollout
+        # when seed_latents is provided; ``seed_frames`` shifts the
+        # scoring slice past the seed prefix.
         scoring_shape = list(generated_image.shape)
+        seed_frames = int(seed_latents.shape[1]) if seed_latents is not None else 0
         cond_for_scoring = _slice_baseline_scoring_window(
             conditional_dict,
             rollout_frames=rollout_frames,
             num_training_frames=scoring_shape[1],
+            seed_frames=seed_frames,
         )
+
+        # Build clean_x_self the same way generator_loss does, so the
+        # critic step trains fake_score under matched conditioning.
+        # Shift is one chunk (= ``num_frame_per_block``); batch-1 view
+        # = ``[seed[-shift:], generated_image[:N-shift]]``.
+        if clean_x_self is None:
+            shift = self.num_frame_per_block
+            if seed_latents is None or seed_latents.shape[1] < shift:
+                raise RuntimeError(
+                    "critic_loss with dmd_context active requires "
+                    "either an explicit clean_x_self OR seed_latents "
+                    f"with >= {shift} frames (= num_frame_per_block, "
+                    "the clean/noisy shift) so the model can build "
+                    "the batch-1 self-view internally."
+                )
+            seed_last_chunk = seed_latents[:, -shift:].to(
+                dtype=generated_image.dtype, device=generated_image.device,
+            )
+            clean_x_self = torch.cat(
+                [seed_last_chunk, generated_image[:, : scoring_shape[1] - shift]], dim=1,
+            )
 
         # dmd_context: build clean_x / aug_t for fake_score and merge
         # ``_action_modulation_clean`` / ``_action_tokens_clean`` into
         # cond_for_scoring (uncond not needed here — fake_score is
         # trained without CFG on the critic step). ``build_real_view=
         # False`` because critic_loss only trains fake_score (which
-        # always sees PURE clean GT, even when dmd_real_GT=True);
+        # always sees the unnoised self-view, regardless of mode);
         # skipping the real-side noised view saves one
         # ``scheduler.add_noise`` call per critic step.
         (
@@ -1450,7 +1499,8 @@ class ActionForcingDMD(SelfForcingModel):
             cond_for_scoring,
             _unused_uncond,
         ) = self._build_dmd_context_kwargs(
-            clean_context_latents=clean_context_latents,
+            clean_x_self=clean_x_self,
+            clean_x_GT=clean_x_GT,
             clean_conditional_dict=clean_conditional_dict,
             clean_unconditional_dict=None,
             cond_for_scoring=cond_for_scoring,
@@ -1514,9 +1564,18 @@ class ActionForcingDMD(SelfForcingModel):
             flow_pred=flow_pred,
         )
 
-        return denoising_loss, {
+        # Surface the rollout's last-chunk MAE (computed by the pipeline
+        # in ``_last_extension_metrics``) so the trainer can collapse-
+        # gate the critic step the same way it does the gen step.
+        critic_log: Dict[str, Any] = {
             "critic_timestep": critic_timestep.detach(),
         }
+        ext_metrics = getattr(
+            self.inference_pipeline, "_last_extension_metrics", None,
+        ) or {}
+        for k, v in ext_metrics.items():
+            critic_log[k] = v
+        return denoising_loss, critic_log
 
     # ------------------------------------------------------------------
     # SC-DMD: Self-Consistent Distribution Matching Distillation.
@@ -1689,6 +1748,7 @@ class ActionForcingDMD(SelfForcingModel):
         self,
         conditional_dict: dict,
         clean_latent: torch.Tensor,
+        seed_frames: int = 0,
     ) -> Tuple[torch.Tensor, dict]:
         """Salt's Self-Consistent DMD regularizer (single chunk, fresh cache).
 
@@ -1765,8 +1825,14 @@ class ActionForcingDMD(SelfForcingModel):
         x0_chunk = clean_latent[:, :npb].to(
             dtype=dtype, device=device,
         ).detach()
+        # ``conditional_dict`` may include leading seed-prefill action
+        # streams (when the trainer runs with dmd_context KV-cache
+        # prefill). The first chunk of ``clean_latent`` is the first
+        # rollout chunk (not a seed chunk), so we slice the cond dict
+        # at ``seed_frames`` to skip the seed actions and pick up the
+        # first rollout chunk's conditioning.
         chunk_cond = _slice_per_frame_streams(
-            conditional_dict, frame_start=0, frame_count=npb,
+            conditional_dict, frame_start=int(seed_frames), frame_count=npb,
         )
 
         B = x0_chunk.shape[0]

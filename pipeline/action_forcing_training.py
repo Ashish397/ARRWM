@@ -323,6 +323,8 @@ class ActionForcingTrainingPipeline:
         gt_latents: Optional[torch.Tensor] = None,
         enable_mae_extension: bool = False,
         return_sim_step: bool = False,
+        seed_latents: Optional[torch.Tensor] = None,
+        prefer_cache_pred_in_output: bool = False,
         **conditional_dict,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """Run the Action-Forcing chunkwise rollout.
@@ -330,7 +332,8 @@ class ActionForcingTrainingPipeline:
         Args:
             noise: ``[B, rollout_frames, C, H, W]`` initial noise.
             clean_image_or_video: unused (kept for API compatibility).
-            initial_latent: optional i2v anchor (unused in our path).
+            initial_latent: optional i2v anchor (1-frame). Mutually
+                exclusive with ``seed_latents``.
             gt_latents: ``[B, F_gt, C, H, W]`` ground-truth latents
                 covering the BASELINE rollout AND any frames the MAE-
                 extension loop might roll into. ``F_gt`` must be at
@@ -345,12 +348,21 @@ class ActionForcingTrainingPipeline:
                 the generator step already logged.
             return_sim_step: if True, also return the exit step index
                 (legacy interface, unused by Phase-1 Action-Forcing).
+            seed_latents: ``[B, cf, C, H, W]`` clean GT latents to
+                pre-populate the KV cache before the actual rollout
+                starts. Run through the generator at ``timestep=0``
+                in chunks of ``num_frame_per_block`` frames each, with
+                a context-noise commit forward per chunk (mirrors the
+                regular rolling cache-update pattern). The seed frames
+                are NOT included in the returned ``output`` — the
+                caller's scoring window is unaffected. Mutually
+                exclusive with ``initial_latent``.
             conditional_dict: per-frame action streams + prompt embed.
-                Must cover at least ``rollout_frames`` frames; in
-                extension mode it should cover up to the maximum
-                possible final length (caller's
-                ``rollout_frames + max_extra_chunks*npb``, capped to
-                ride length).
+                When ``seed_latents`` is provided the streams must
+                cover ``cf + rollout_frames`` frames (seed first,
+                then rollout). Otherwise must cover at least
+                ``rollout_frames``; extension mode covers up to
+                ``rollout_frames + max_extra_chunks*npb``.
 
         Returns:
             ``(output, denoised_timestep_from, denoised_timestep_to)``
@@ -359,6 +371,12 @@ class ActionForcingTrainingPipeline:
             scoring path is unaffected). MAE-extension metrics live on
             ``self._last_extension_metrics`` after the call.
         """
+        if seed_latents is not None and initial_latent is not None:
+            raise ValueError(
+                "seed_latents and initial_latent are mutually exclusive; "
+                "Phase-1 Action-Forcing uses seed_latents (cf-frame KV "
+                "prefill), the i2v initial_latent path is legacy."
+            )
         # Reset per-call metrics (NaN = not computed; gets overwritten
         # in the extension path when gt_latents is available).
         nan_f = float("nan")
@@ -394,12 +412,19 @@ class ActionForcingTrainingPipeline:
             remaining_blocks -= chunks_this_step
 
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
-        num_output_frames = num_frames + num_input_frames
+        num_seed_frames = seed_latents.shape[1] if seed_latents is not None else 0
+        # Output covers seed + rollout so we can write to ``output[:,
+        # current_start_frame:...]`` using ABSOLUTE indices that match
+        # the KV-cache positions. The seed slice is sliced off before
+        # return so the caller's scoring window is unchanged.
+        num_output_frames = num_frames + num_input_frames + num_seed_frames
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
             device=noise.device,
             dtype=noise.dtype,
         )
+        if num_seed_frames > 0:
+            output[:, num_input_frames: num_input_frames + num_seed_frames] = seed_latents
 
         # Step 1: Initialize KV / crossattn caches.
         self._initialize_kv_cache(
@@ -431,6 +456,73 @@ class ActionForcingTrainingPipeline:
                 )
             current_start_frame += 1
 
+        # Step 2b: KV-cache prefill from seed_latents. The seed is the
+        # leading ``cf`` frames of the ride (= dmd_context_clean_frames),
+        # = clean GT context that the ODE student was trained to see as
+        # ``clean_x``. Without this prefill the rolling rollout starts
+        # cold and the ODE student (trained ONLY teacher-forced) produces
+        # garbage. We seed in chunks of ``npb`` frames each, with one
+        # forward at ``timestep=0`` per chunk plus the standard
+        # ``context_noise`` cache-update forward — same shape as the
+        # regular per-block path so the KV cache state ends up identical
+        # to "rolling at clean GT input" through the seed window.
+        if seed_latents is not None:
+            cf = int(seed_latents.shape[1])
+            if cf <= 0:
+                raise ValueError(f"seed_latents must have >= 1 frame; got cf={cf}")
+            if cf % npb != 0:
+                raise ValueError(
+                    f"seed_latents has {cf} frames; must be a multiple of "
+                    f"num_frame_per_block ({npb})."
+                )
+            num_seed_chunks = cf // npb
+            for sc in range(num_seed_chunks):
+                seed_start = sc * npb
+                seed_chunk = seed_latents[:, seed_start: seed_start + npb]
+                seed_t = torch.zeros(
+                    [batch_size, npb], device=noise.device, dtype=torch.int64,
+                )
+                seed_block_cond = _slice_per_frame_streams(
+                    conditional_dict,
+                    frame_start=current_start_frame,
+                    frame_count=npb,
+                )
+                with torch.no_grad():
+                    self.generator(
+                        noisy_image_or_video=seed_chunk,
+                        conditional_dict=seed_block_cond,
+                        timestep=seed_t,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+                # Context-noise commit forward, mirroring the rollout
+                # loop's unconditional commit at line ~635 so the seed
+                # window's K/V ends up at the same noise level as every
+                # rollout chunk's K/V. At ``context_noise=0`` this is a
+                # no-op repetition (``add_noise(seed, n, 0) == seed``,
+                # so the t=0 forward writes the same K/V already
+                # produced by the line-491 forward) — kept unconditional
+                # for parity with the rollout, so bumping
+                # ``context_noise > 0`` later doesn't silently leave the
+                # seed's K/V at t=0 while the rollout's is at t=context_noise.
+                ctx_t = torch.full_like(seed_t, self.context_noise)
+                seed_ctx_in = self.scheduler.add_noise(
+                    seed_chunk.flatten(0, 1),
+                    torch.randn_like(seed_chunk.flatten(0, 1)),
+                    ctx_t.flatten(0, 1),
+                ).unflatten(0, seed_chunk.shape[:2])
+                with torch.no_grad():
+                    self.generator(
+                        noisy_image_or_video=seed_ctx_in,
+                        conditional_dict=seed_block_cond,
+                        timestep=ctx_t,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+                current_start_frame += npb
+
         # Step 3: Per-rolling-step denoise loop with truncated random-exit.
         num_denoising_steps = len(self.denoising_step_list)
         exit_flags = self.generate_and_sync_list(
@@ -459,8 +551,11 @@ class ActionForcingTrainingPipeline:
         timestep = None
         for block_index, current_num_frames in enumerate(all_num_frames):
             # Slice the noisy input + per-frame conditioning for this block.
+            # ``noise`` covers ROLLOUT frames only (no seed, no i2v anchor),
+            # so we offset the absolute current_start_frame back to the
+            # noise tensor's 0-based index by subtracting both prefixes.
             block_start_in_noise = (
-                current_start_frame - num_input_frames
+                current_start_frame - num_input_frames - num_seed_frames
             )
             noisy_input = noise[
                 :,
@@ -531,21 +626,79 @@ class ActionForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length,
                         )
+                    exit_index = index
                     break
 
-            # Step 3.2: Record the model's output.
+            # Step 3.2: Finish the denoising chain past the random exit
+            # rung under ``no_grad``. ``denoised_pred`` from the exit
+            # forward is the model's x0 estimate AT the random exit
+            # timestep — used by DMD as the grad-active output. For the
+            # cache-update we want a CLEAN x0 estimate so subsequent
+            # chunks attend to clean K/V (no noise compounding across
+            # the rolling cache). Continue stepping noisiest→cleanest
+            # from the exit rung's ``next_t`` to the last rung, all
+            # under ``no_grad``. ``cache_pred`` ends up at the last
+            # rung's x0 estimate (= same as ``last_step_only=True``
+            # would have produced for the cache, but with the random-
+            # exit gradient signal preserved in ``denoised_pred``).
+            cache_pred = denoised_pred.detach()
+            num_rungs = len(self.denoising_step_list)
+            for j in range(exit_index + 1, num_rungs):
+                next_t_value = int(round(float(
+                    self.denoising_step_list[j]
+                )))
+                flat = cache_pred.flatten(0, 1)
+                cache_input = self.scheduler.add_noise(
+                    flat,
+                    torch.randn_like(flat),
+                    next_t_value
+                    * torch.ones(
+                        [batch_size * current_num_frames],
+                        device=noise.device,
+                        dtype=torch.long,
+                    ),
+                ).unflatten(0, denoised_pred.shape[:2])
+                step_t = torch.full_like(timestep, next_t_value)
+                with torch.no_grad():
+                    _, cache_pred = self.generator(
+                        noisy_image_or_video=cache_input,
+                        conditional_dict=block_cond,
+                        timestep=step_t,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+
+            # Step 3.3: Record the model's output. By default this is
+            # the grad-active ``denoised_pred`` (x0 at the random exit
+            # rung) so DMD's gradient flows through. When
+            # ``prefer_cache_pred_in_output=True`` (visualization-only
+            # mode used by the diagnostic test) we write the fully-
+            # denoised ``cache_pred`` instead, so the output video
+            # shows what the cache K/V was built from rather than the
+            # noisy exit-rung x0 estimate. This is INVALID for training
+            # (no gradient signal in cache_pred) and only intended for
+            # diagnosing the no_grad-finish-denoise behaviour.
+            output_pred = (
+                cache_pred.to(denoised_pred.dtype)
+                if prefer_cache_pred_in_output
+                else denoised_pred
+            )
             output[
                 :,
                 current_start_frame: current_start_frame + current_num_frames,
-            ] = denoised_pred
+            ] = output_pred
 
-            # Step 3.3: Cache-update forward at context_noise.
+            # Step 3.4: Cache-update forward at context_noise, using
+            # the FULLY-denoised ``cache_pred`` so the K/V committed
+            # to the rolling cache is a clean x0 estimate (no
+            # noise compounding for downstream chunks).
             context_timestep = torch.full_like(timestep, self.context_noise)
             cache_pred = self.scheduler.add_noise(
-                denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
+                cache_pred.flatten(0, 1),
+                torch.randn_like(cache_pred.flatten(0, 1)),
                 context_timestep.flatten(0, 1),
-            ).unflatten(0, denoised_pred.shape[:2])
+            ).unflatten(0, cache_pred.shape[:2])
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=cache_pred,
@@ -681,6 +834,12 @@ class ActionForcingTrainingPipeline:
             denoised_timestep_from = self._round_to_grid(
                 self.denoising_step_list[exit_flags[0]]
             )
+
+        # Slice off the seed prefix (KV prefill window) before
+        # returning. The caller's scoring window is the rollout-only
+        # region, frames [num_input_frames + num_seed_frames :].
+        if num_seed_frames > 0 or num_input_frames > 0:
+            output = output[:, num_input_frames + num_seed_frames:]
 
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1

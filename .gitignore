@@ -37,6 +37,7 @@ claude/
 noise_model/
 vis/
 eval/
+_diag_p1/
 
 # Test artefacts (outputs only — the .py test scripts *are* tracked).
 # ``testing/outputs/`` is an mp4 dumping ground; the individual ignore
@@ -50,9 +51,13 @@ testing/**/*.mp4
 # ``git add .`` creating broken gitlinks. They are not maintained as
 # submodules intentionally; re-clone from upstream if you need them.
 CausVid/
+# Causal Forcing (upstream clone / vendored) — all common path spellings
 Causal-Forcing/
+causal-forcing/
+Causal_Forcing/
+causal_forcing/
 RollingForcing/
-
+LongLive/
 # Editor / tooling scratch.
 *.bak
 papers/

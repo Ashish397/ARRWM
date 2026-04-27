@@ -76,9 +76,9 @@ action_dim: 2
 enable_adaln_zero: true
 action_conditioning_mode: both
 
-min_ride_frames: 21
+min_ride_frames: 69
 max_rides: null
-max_ride_frames: 105
+max_ride_frames: 200
 
 sort_rides_by_length: asc
 num_workers: 2
@@ -118,7 +118,7 @@ chunks_per_rolling_step: 1
 same_step_across_blocks: true
 last_step_only: false
 context_noise: 0
-denoising_step_list: [1000, 625, 500, 312.5]
+denoising_step_list: [1000, 625, 312.5, 178.6]
 
 action_patch_enabled: true
 action_modulation_activation: silu
@@ -183,6 +183,14 @@ ts_schedule: false
 ts_schedule_max: false
 min_score_timestep: 0
 
+# Teacher-forcing context for the bidirectional scorers (v14 parity).
+# See action_forcing_phase1.yaml for the full doc-block; cf=3 = one chunk
+# of GT seed prefilled into the generator's KV cache at t=0.
+dmd_context: "GT"
+dmd_context_clean_frames: 9
+clean_x_aug_t: 20
+heatmap_out_noise_bar: true
+
 # Note: in the AUX/base configs we keep a stub ``gan_loss_weight: 0.0``
 # in this section as a marker that the legacy DMD2-style fake_score
 # classifier-branch GAN is OFF. Here we use the R3GAN section (below)
@@ -191,7 +199,7 @@ min_score_timestep: 0
 # add a stub ``gan_loss_weight: 0.0`` here — YAML duplicates fail.
 
 fake_score_updates_enabled: true
-dfake_gen_update_ratio: 1
+dfake_gen_update_ratio: 2
 
 ema_weight: 0.99
 ema_start_step: 200
@@ -282,7 +290,7 @@ vis_emit_on_first_step: false
 # ---------------------------------------------------------------------------
 slots_per_rank: 1
 rolling_steps_per_iter: null
-collapse_mae_threshold: null
+collapse_mae_threshold: 0.5  # ride-extension gate (deferred multi-batch): MAE > threshold => do NOT extend on this ride next batch; MAE <= threshold => keep rolling. Current rollout always trains. Set null to disable.
 backward_simulation: true
 independent_first_frame: false
 warp_denoising_step: false

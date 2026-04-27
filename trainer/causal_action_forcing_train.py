@@ -30,6 +30,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -382,27 +383,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
 
         # ------------------------------------------------------------------
-        # dmd_context (v14 teacher-forcing parity): when True the trainer
-        # loads ``num_training_frames + dmd_context_clean_frames`` frames
-        # per ride and shifts the student rollout to start at ride frame
-        # ``cf = dmd_context_clean_frames`` (default 3, matching v14's
-        # training). The DMD scorers receive ``clean_x = ride[:, :
-        # num_training_frames]`` (= the cf-leading ride frames + their
-        # overlap with the rollout window) and ``noisy_x = student_pred``
-        # (= ride frames cf..cf+N-1). The model handles the
-        # teacher-forcing block mask via its ``context_shift`` attr,
-        # which the model sets in ``ActionForcingDMD.__init__`` when
-        # ``dmd_context=True``.
-        #
-        # When dmd_context=False (default) all of this is dead — the
-        # trainer skips the cf shift, doesn't load extra frames, and
-        # passes None for the clean-context kwargs.
+        # dmd_context (v14 teacher-forcing parity) — single source of truth
+        # is the model. ``self.model.dmd_context_clean_frames`` is the
+        # KV-cache seed prefill size (= 9 by default, configurable via
+        # the ``dmd_context_clean_frames`` knob the model reads from
+        # ``args``). The trainer just reads it back to size its ride
+        # slices. The clean/noisy shift used inside DMD scoring is fixed
+        # at ``num_frame_per_block`` (= 1 chunk) and lives entirely in
+        # the model — the trainer never sees it.
         # ------------------------------------------------------------------
-        self.dmd_context_enabled = bool(
-            getattr(self.config, "dmd_context", False)
-        )
-        self.dmd_context_clean_frames = int(
-            getattr(self.config, "dmd_context_clean_frames", 3)
+
+        # Collapse gating: the threshold is consulted when deciding
+        # whether to EXTEND a rollout (multi-batch on the same ride)
+        # vs swap to a fresh ride next iter. ``MAE > threshold`` ⇒
+        # student has collapsed on this ride, so don't extend; just
+        # train on the current rollout and let the next iter pull a
+        # new ride. ``MAE <= threshold`` ⇒ keep rolling on this ride
+        # (= future multi-batch loop). Currently single-batch is the
+        # only path wired in, so the gate has no runtime effect yet —
+        # it's parsed and stored for the deferred multi-batch hookup.
+        # ``None`` disables the gate.
+        _collapse_t = getattr(self.config, "collapse_mae_threshold", 0.5)
+        self.collapse_mae_threshold: Optional[float] = (
+            None if _collapse_t is None else float(_collapse_t)
         )
 
         self.sample_interval = int(
@@ -424,21 +427,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 ("all" if self.sample_max_frames <= 0
                  else str(self.sample_max_frames)),
             )
-        if self.dmd_context_enabled and self.is_main_process:
+        if self.is_main_process:
+            cf = int(getattr(self.model, "dmd_context_clean_frames", 0))
+            N = int(getattr(self.config, "num_training_frames", 21))
             logging.info(
-                "[ActionForcing] dmd_context ENABLED: "
-                "dmd_context_clean_frames=%d (= cf). Student rolls "
-                "ride[%d..%d] (a num_training_frames-long slice "
-                "starting at ride frame cf); scorers receive "
-                "clean_x = ride[0..%d] (first num_training_frames "
-                "frames). v14 parity: 3 clean GT context frames + "
-                "21 noisy student frames with 18-frame overlap.",
-                self.dmd_context_clean_frames,
-                self.dmd_context_clean_frames,
-                self.dmd_context_clean_frames + int(getattr(
-                    self.config, "num_training_frames", 21,
-                )) - 1,
-                int(getattr(self.config, "num_training_frames", 21)) - 1,
+                "[ActionForcing] dmd_context: KV-cache seed prefill "
+                "= %d frames (= dmd_context_clean_frames). Per iter, "
+                "trainer picks random offset s ~ U[0, ride_len/2] "
+                "(broadcast from rank 0 in DDP), then slices "
+                "seed=ride[s:s+%d] and rollout=ride[s+%d:s+%d]; "
+                "scorers see clean/noisy shift of one chunk "
+                "(= num_frame_per_block).",
+                cf, cf, cf, cf + N,
             )
 
     def _build_pipeline(self) -> None:
@@ -754,14 +754,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         # dmd_context shifts the student's rollout window forward by
         # ``cf`` frames in the ride (= ride frames [cf, cf +
-        # max_total_rollout_frames)) so the leading ``cf`` ride
-        # frames are reserved as scorer clean_x. The ride filter and
-        # ride slicing must add ``cf`` to the threshold accordingly.
-        # When dmd_context is disabled, ``cf=0`` and this is a no-op.
-        cf_dmdctx = (
-            self.dmd_context_clean_frames
-            if self.dmd_context_enabled else 0
-        )
+        # max_total_rollout_frames)) so the leading ``cf`` ride frames
+        # become the KV-cache seed prefill. ``cf`` is the model's
+        # single source of truth (= ``self.model.dmd_context_clean_frames``,
+        # default 9 = KV-cache size).
+        cf_dmdctx = int(getattr(self.model, "dmd_context_clean_frames", 0))
         # CF-parity #6: periodic memory hygiene.
         # ``empty_cache_interval``: how often to release PyTorch's caching
         # allocator pool back to the driver (CF: every 20 steps).
@@ -1630,52 +1627,98 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # extension chunks is sampled inline by the pipeline, not
         # from the trainer.
         #
-        # dmd_context support (``cf_dmdctx > 0``): the student's
-        # rollout starts at ride frame ``cf_dmdctx`` (= 3 by default).
-        # We require ride length ``>= rollout_frames + cf_dmdctx`` so
-        # both the rollout (``ride[cf:cf+rollout_frames]``) and the
-        # scorer's clean_x context (``ride[0:num_training_frames]``)
-        # fit. Action streams for the rollout are sliced
-        # ``ride_actions[cf:cf+...]`` so the student's per-frame
-        # conditioning matches the cf-shifted ride window. The clean-
-        # context cond dict is built separately from
-        # ``ride_actions[0:num_training_frames]`` and threaded into
-        # the model as ``clean_conditional_dict`` /
-        # ``clean_unconditional_dict``.
+        # dmd_context window layout (single source of truth, all lengths
+        # in latent frames; `cf` = ``self.model.dmd_context_clean_frames``
+        # = KV-cache seed prefill, default 9; `shift` = num_frame_per_block
+        # = clean/noisy shift, hardcoded to 1 chunk):
+        #
+        #   ride[s : s+cf]                  → seed_latents (KV-cache prefill at t=0)
+        #   ride[s+cf : s+cf+rollout_window] → student rollout target
+        #   ride[s+cf-shift : s+cf+N-shift] → clean_x_GT (= rollout-window
+        #                                     shifted back by 1 chunk)
+        #
+        # ``s`` is sampled uniformly from ``[0, ride_len // 2]`` per iter
+        # (clamped down so ``s + cf + rollout_window ≤ ride_len``). DDP
+        # ranks pick independent s values — DDP grad-averaging handles
+        # the resulting cross-rank diversity.
+        npb = int(getattr(self.config, "num_frame_per_block", 3))
+        shift = npb  # clean/noisy shift; always 1 chunk, never configurable
+
         ride = self._next_ride(rollout_frames + cf_dmdctx)
         if ride is None:
             return None
 
         ride_len = int(ride["latents"].shape[1])
-        # Total frames the rollout window spans (= rollout_frames +
-        # mae extension headroom; capped at ride_len - cf_dmdctx).
         max_rollout_window = max_total_rollout_frames
-        rollout_end = min(ride_len, cf_dmdctx + max_rollout_window)
-        rollout_window = rollout_end - cf_dmdctx
-        # Defensive: rollout_window must cover at least ``rollout_frames``
-        # (validated in ``_next_ride`` already, but this is the final
-        # gate before slicing).
+
+        # Random offset s ∈ [0, min(ride_len // 2, ride_len - cf - max_rollout_window)].
+        # Each rank loads a different ride with a different ride_len,
+        # so the upper bound on s is rank-local. To keep the
+        # extension-loop all_reduces (MAE / synced_available) describing
+        # the same relative offset on every rank, we MIN-reduce the
+        # local bound, sample s on rank 0 within that global bound, and
+        # broadcast it. (Single-rank code paths skip the all_reduce/
+        # broadcast and just sample locally.)
+        s_local_max = max(
+            0, min(ride_len // 2, ride_len - cf_dmdctx - max_rollout_window)
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            s_t = torch.tensor(
+                [s_local_max], device=self.device, dtype=torch.long,
+            )
+            dist.all_reduce(s_t, op=dist.ReduceOp.MIN)
+            s_global_max = int(s_t.item())
+            if dist.get_rank() == 0:
+                s_t.fill_(
+                    random.randint(0, s_global_max) if s_global_max > 0 else 0
+                )
+            dist.broadcast(s_t, src=0)
+            s = int(s_t.item())
+        else:
+            s = random.randint(0, s_local_max) if s_local_max > 0 else 0
+
+        rollout_end = s + cf_dmdctx + max_rollout_window
+        rollout_window = max_rollout_window
         if rollout_window < rollout_frames:
             raise RuntimeError(
                 f"Ride too short for rollout: ride_len={ride_len}, "
-                f"rollout_frames={rollout_frames}, cf_dmdctx={cf_dmdctx}. "
-                f"``_next_ride`` should have skipped this ride."
+                f"rollout_frames={rollout_frames}, cf_dmdctx={cf_dmdctx}, "
+                f"s={s}. ``_next_ride`` should have skipped this ride."
             )
 
         prompt_embeds = ride["prompt_embeds"]
-        latents = ride["latents"][:, cf_dmdctx:rollout_end]
-        actions = ride["z_actions"][:, cf_dmdctx:rollout_end]
+        # Rollout-only slices (= ride[s+cf : s+cf+rollout_window]) — used
+        # by aux/gan paths whose slicing predates the seed prefill design.
+        latents = ride["latents"][:, s + cf_dmdctx : rollout_end]
+        actions = ride["z_actions"][:, s + cf_dmdctx : rollout_end]
+        # ``clean_latent_full`` covers the seed+rollout window so the
+        # pipeline's MAE indexing at absolute ``current_start_frame`` works.
+        clean_latent_full = ride["latents"][:, s : rollout_end]
 
+        # Pipeline ``conditional_dict`` covers the FULL window ``ride[s :
+        # s+cf+rollout_window]`` so the seed-prefill loop reads frames
+        # ``[0, cf)`` and the rollout loop reads frames ``[cf, cf+rollout)``
+        # of these streams (pipeline indexes by absolute current_start_frame
+        # which starts at 0 for the seed and ``cf`` for the rollout). The
+        # model's scoring slicer takes a ``seed_frames=cf`` offset so the
+        # scorer still gets the rollout half.
+        full_actions = ride["z_actions"][:, s : rollout_end]
         conditional_dict, unconditional_dict = self.model.build_action_conditional(
             prompt_embeds=prompt_embeds,
-            gt_actions=actions,
+            gt_actions=full_actions,
         )
 
-        # dmd_context: also build the clean-half cond dicts from the
-        # leading ``num_training_frames`` ride frames (= ride[0:N]).
-        # ``num_training_frames`` is the same length as the noisy half;
-        # they overlap by ``num_training_frames - cf_dmdctx`` frames in
-        # absolute ride coords, exactly mirroring v14 training.
+        # KV-cache prefill seed: cf frames of GT latent fed at t=0 to
+        # populate the KV cache before the rollout starts.
+        seed_latents = None
+        if cf_dmdctx > 0:
+            seed_latents = ride["latents"][:, s : s + cf_dmdctx].contiguous()
+
+        # ``clean_x_GT`` window = the noisy_x window shifted back by
+        # ``shift`` frames (= 1 chunk). For ``cf=9, shift=3, s=0`` this is
+        # ``ride[6:27]``. For the legacy ``cf=shift`` regime this collapses
+        # to ``ride[s : s+N]`` (the historical slice). The clean cond
+        # streams cover the same time positions.
         clean_context_latents = None
         clean_conditional_dict = None
         clean_unconditional_dict = None
@@ -1683,8 +1726,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             num_training_frames = int(getattr(
                 self.config, "num_training_frames", 21,
             ))
-            clean_context_latents = ride["latents"][:, :num_training_frames]
-            clean_actions = ride["z_actions"][:, :num_training_frames]
+            clean_start = s + cf_dmdctx - shift
+            clean_end = clean_start + num_training_frames
+            clean_context_latents = ride["latents"][:, clean_start : clean_end]
+            clean_actions = ride["z_actions"][:, clean_start : clean_end]
             clean_conditional_dict, clean_unconditional_dict = (
                 self.model.build_action_conditional(
                     prompt_embeds=prompt_embeds,
@@ -1728,10 +1773,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     image_or_video_shape=image_or_video_shape,
                     conditional_dict=conditional_dict,
                     unconditional_dict=unconditional_dict,
-                    clean_latent=latents,
+                    clean_latent=clean_latent_full,
                     initial_latent=None,
                     return_aux=True,
-                    clean_context_latents=clean_context_latents,
+                    seed_latents=seed_latents,
+                    clean_x_GT=clean_context_latents,
                     clean_conditional_dict=clean_conditional_dict,
                     clean_unconditional_dict=clean_unconditional_dict,
                 )
@@ -1802,6 +1848,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
                         conditional_dict=conditional_dict,
                         clean_latent=latents,
+                        seed_frames=cf_dmdctx,
                     )
                     sc_weight = self._sc_dmd_current_weight(int(self.step))
                     weighted_sc = sc_loss_raw * sc_weight
@@ -1820,9 +1867,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     image_or_video_shape=image_or_video_shape,
                     conditional_dict=conditional_dict,
                     unconditional_dict=unconditional_dict,
-                    clean_latent=latents,
+                    clean_latent=clean_latent_full,
                     initial_latent=None,
-                    clean_context_latents=clean_context_latents,
+                    seed_latents=seed_latents,
+                    clean_x_GT=clean_context_latents,
                     clean_conditional_dict=clean_conditional_dict,
                     clean_unconditional_dict=clean_unconditional_dict,
                 )
@@ -1840,6 +1888,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
                         conditional_dict=conditional_dict,
                         clean_latent=latents,
+                        seed_frames=cf_dmdctx,
                     )
                     sc_weight = self._sc_dmd_current_weight(int(self.step))
                     weighted_sc = sc_loss_raw * sc_weight
@@ -1860,9 +1909,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
-                clean_latent=latents,
+                clean_latent=clean_latent_full,
                 initial_latent=None,
-                clean_context_latents=clean_context_latents,
+                seed_latents=seed_latents,
+                clean_x_GT=clean_context_latents,
                 clean_conditional_dict=clean_conditional_dict,
             )
             critic_loss.backward()

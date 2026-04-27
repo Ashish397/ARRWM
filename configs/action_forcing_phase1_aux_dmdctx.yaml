@@ -1,16 +1,26 @@
-# Phase-1 Action-Forcing DMD config (NO STAIRCASE) — AUX + DMD_CONTEXT
+# Phase-1 Action-Forcing DMD config (NO STAIRCASE) — AUX + DMD_CONTEXT="GT"
 #
 # Identical to ``configs/action_forcing_phase1_aux.yaml`` (CF chunkwise DMD,
 # 21-frame action-forcing scoring window, infinity-RoPE, MAE extensions,
-# action critic + frozen-teacher z-guidance) PLUS:
-#   1. ``dmd_context: true``: feed the bidirectional ``real_score`` /
-#      ``fake_score`` a clean GT context block alongside the student's
-#      noisy rollout, mirroring how v14 was trained (3 clean context
-#      frames + 21 noisy target frames per forward, 18-frame overlap).
-#   2. ``dmd_context_clean_frames: 3``: number of leading GT frames to
-#      hand the scorers as ``clean_x``. Must be a multiple of
-#      ``num_frame_per_block`` (= 3) so ``context_shift = cf // npb``
-#      is integer-aligned to chunks (matching v14).
+# action critic + frozen-teacher z-guidance) PLUS the dmd_context teacher-
+# forcing path the v14 LoRA was trained against:
+#   1. ``dmd_context: "GT"``: real_score sees the GT version of the
+#      cf-leading frames as ``clean_x`` (lightly noised at
+#      ``clean_x_aug_t`` for symmetry-breaking — without it the gradient
+#      is dominated by a perfect-context advantage). fake_score's
+#      clean_x is always the "self" (student-rolled) view regardless of
+#      mode, so (fake-real) is computed under matched fake-side
+#      conditioning. Set ``dmd_context: "self"`` for the alternative
+#      where real also sees the self-rolled view.
+#   2. ``dmd_context_clean_frames: 3``: number of leading GT frames the
+#      pipeline pre-fills into the generator's KV cache (and the scorers
+#      see as ``clean_x``). Must be a multiple of ``num_frame_per_block``
+#      (= 3) so ``context_shift = cf // npb`` is integer-aligned to
+#      chunks (matching v14).
+#   3. ``heatmap_out_noise_bar: true`` masks rows 0-1 of frame 0 of the
+#      noisy_x window from the DMD gen-step gradient (v14 LoRA produces
+#      a chromatic-fringe artifact at the bidir half-boundary that the
+#      LoRA cannot represent correctly; ~0.16% of supervision tokens).
 #
 # Why this matters (and why this is "fair" — Option A1):
 #   v14's bidirectional teacher was trained with a 24-frame window
@@ -38,9 +48,11 @@
 #   * Throughput hit: expect ~+10-15% per-iter wallclock vs the AUX
 #     config — much cheaper than rolling 60 frames.
 #
-# To DISABLE dmd_context (regress to scorers-on-21-frames-only), set
-# ``dmd_context: false``. The model will then skip the clean_x /
-# context_shift path entirely and behave like the AUX baseline.
+# Note: ``dmd_context`` is always set (string "GT" or "self"); there is
+# no "off" mode. To compare against a no-context baseline, run the AUX
+# / AUX+GAN / AUX+SC-DMD configs which were authored before the v14
+# clean_x plumbing was added (those configs still set ``dmd_context``
+# but the underlying behaviour A/Bs against the clean_x view).
 
 config_name: action-forcing-phase1-aux-dmdctx
 run_name: action_forcing_phase1_aux_dmdctx
@@ -71,9 +83,9 @@ log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
 
 # ---------------------------------------------------------------------------
 # Data (verbatim from the AUX config, except ``min_ride_frames`` is bumped
-# from 21 → 24 because dmd_context needs ``cf=3`` extra leading GT frames
-# to feed the scorers as clean_x. ``rollout_frames=21`` (unchanged), so
-# the loader needs rides of length ``>= rollout_frames + cf = 24``.)
+# to 69 so the trainer's random offset ``s`` and the cf-frame seed +
+# 21-frame rollout window always fit. ``rollout_frames=21`` (unchanged).
+# See ``dmd_context_clean_frames`` below for what cf is.)
 # ---------------------------------------------------------------------------
 encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
 caption_root: /projects/u6ex/fbots/frodobots_captions/train
@@ -86,14 +98,14 @@ action_dim: 2
 enable_adaln_zero: true
 action_conditioning_mode: both
 
-# Bumped 21 → 24 to provide cf=3 leading GT frames for clean_x.
-# ``max_ride_frames=24`` caps the loaded ride at exactly the dmd_context
-# window (cf=3 + num_training_frames=21). Bigger values just waste I/O
-# since extensions are disabled below — only the first 24 frames are
-# ever used.
-min_ride_frames: 24
+# ``min_ride_frames=69`` ensures rides are long enough for the random
+# offset ``s ~ U[0, ride_len/2]`` plus the cf=9 seed + 21-frame rollout
+# window to always fit. ``max_ride_frames=200`` caps loaded rides at
+# 200 frames so the seed + rollout + the half-ride s range have plenty
+# of room without unbounded memory.
+min_ride_frames: 69
 max_rides: null
-max_ride_frames: 24
+max_ride_frames: 200
 
 sort_rides_by_length: asc
 num_workers: 2
@@ -143,7 +155,7 @@ chunks_per_rolling_step: 1
 same_step_across_blocks: true
 last_step_only: false
 context_noise: 0
-denoising_step_list: [1000, 625, 500, 312.5]
+denoising_step_list: [1000, 625, 312.5, 178.6]
 
 action_patch_enabled: true
 action_modulation_activation: silu
@@ -214,7 +226,7 @@ min_score_timestep: 0
 gan_loss_weight: 0.0
 
 fake_score_updates_enabled: true
-dfake_gen_update_ratio: 1
+dfake_gen_update_ratio: 2
 
 ema_weight: 0.99
 ema_start_step: 200
@@ -240,29 +252,36 @@ assert_grad_uniformity: false
 nccl_timeout_minutes: 60
 
 # ---------------------------------------------------------------------------
-# DMD_CONTEXT — feed real_score / fake_score a clean GT context block as
-# ``clean_x`` so they're inferenced the way v14 was TRAINED (3 clean +
-# 21 noisy frames per forward, with context_shift=1 aligning the
-# RoPE positions to the v14 LoRA weights).
+# DMD_CONTEXT — feed real_score / fake_score a clean context block as
+# ``clean_x`` so they're inferenced the way v14 was TRAINED (clean half
+# + 21 noisy frames in a joint sequence, with the noisy half RoPE-shifted
+# by 1 chunk to align with the v14 LoRA weights).
 # ---------------------------------------------------------------------------
-# When ``dmd_context: true``:
-#   * Trainer loads ``ride[0..23]`` (24 frames). The student rolls
-#     ``ride[3..23]`` (21 frames). Scorers receive:
-#       - ``clean_x  = ride[0..20]``  (21 clean GT frames; aug_t=0)
-#       - ``noisy_x  = student rollout`` (21 noisy student frames)
-#     plus a clean conditional dict built from the GT context's actions.
-#   * ``model.real_score.context_shift`` and ``model.fake_score.
-#     context_shift`` are set to ``cf // num_frame_per_block = 1`` so
-#     the RoPE positions match v14's training (which was trained with
-#     ``context_shift=1`` on a 24-frame window).
-#   * ``num_training_frames`` (= 21) and ``rollout_frames`` (= 21)
-#     stay constant — this is NOT a longer rollout. It just adds 3
-#     clean GT frames to the bidirectional scorer forwards.
+# Mechanism:
+#   * Trainer picks a random offset ``s ~ U[0, ride_len/2]`` (broadcast
+#     from rank 0 in DDP), slices ``ride[s : s+cf+21]`` (cf=9 seed + 21
+#     rollout). The student rolls ``ride[s+cf : s+cf+21]`` after the
+#     pipeline prefills the KV cache from ``ride[s : s+cf]`` at t=0.
+#   * Scorers receive a 21-frame ``noisy_x`` (student rollout) AND a
+#     21-frame ``clean_x`` shifted back by 1 chunk (= num_frame_per_block).
+#     For batch 1 the self-view ``clean_x = [seed[-3:], sdn[:18]]``;
+#     in ``"GT"`` mode real_score sees ``ride[s+cf-3 : s+cf+18]`` lightly
+#     noised at ``clean_x_aug_t``.
+#   * ``model.real_score.tf_rope_offset_frames`` and ``fake_score``'s
+#     are set to ``num_frame_per_block`` (= 1 chunk = 3 frames), the
+#     fixed shift between clean and noisy halves in the joint sequence.
+#   * ``num_training_frames`` (= 21) and ``rollout_frames`` (= 21) stay
+#     constant — this is NOT a longer rollout. cf governs only the seed
+#     prefill size.
 #
-# Default is ``false`` for backward-compat with the AUX / AUX+GAN /
-# AUX+SC-DMD runs.
-dmd_context: true
-dmd_context_clean_frames: 3
+# ``dmd_context`` is a STRING and always set: ``"GT"`` (v14-parity,
+# real_score sees noised GT clean_x) or ``"self"`` (no GT privilege:
+# real_score sees the same self-rolled view fake does). The model
+# raises if anything else is supplied.
+dmd_context: "GT"            # "GT" | "self"
+dmd_context_clean_frames: 9  # KV-cache seed prefill size (= 3 chunks of npb=3)
+clean_x_aug_t: 20            # small noise on real_score's GT clean_x in "GT" mode (symmetry-breaking; ignored in "self")
+heatmap_out_noise_bar: true  # mask rows 0-1 of frame 0 in DMD gen step (v14 LoRA boundary artifact)
 
 # ---------------------------------------------------------------------------
 # R3GAN + SC-DMD — OFF (this is a clean dmd_context A/B vs aux baseline).
@@ -285,7 +304,7 @@ vis_emit_on_first_step: false
 # ---------------------------------------------------------------------------
 slots_per_rank: 1
 rolling_steps_per_iter: null
-collapse_mae_threshold: null
+collapse_mae_threshold: 0.5  # ride-extension gate (deferred multi-batch): MAE > threshold => do NOT extend on this ride next batch; MAE <= threshold => keep rolling. Current rollout always trains. Set null to disable.
 backward_simulation: true
 independent_first_frame: false
 warp_denoising_step: false
