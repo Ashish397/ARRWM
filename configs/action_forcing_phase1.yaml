@@ -96,7 +96,8 @@ strict_ode_load: false
 # wrapper, encodes the resulting RGB clip to MP4 via ffmpeg, and
 # uploads it to W&B as ``train/pred_image_video`` (only on the
 # main rank). Set ``sample_interval: 0`` to disable.
-sample_interval: 200
+sample_at_steps: [1, 199, 399, 999, 1999, 4999, 9999]   # all odd: stash fires at s = value-1 (even = gen step)
+sample_interval: 201   # odd: (s+1)%201==0 lands on even s = gen step (dfake_gen_update_ratio=2)
 sample_fps: 5
 sample_max_frames: 0  # 0 = use all frames in pred_image
 
@@ -517,7 +518,7 @@ vis_wallclock_seconds: 0
 vis_num_chunks: 0
 vis_fps: 8
 vis_to_wandb: false
-vis_save_local: false
+vis_save_local: true   # write mp4 to <log_dir>/samples/step_<N>.mp4 as backup if wandb offline
 vis_emit_on_first_step: false
 
 # ---------------------------------------------------------------------------
@@ -531,3 +532,8 @@ collapse_mae_threshold: 0.5  # ride-extension gate (deferred multi-batch): MAE >
 backward_simulation: true
 independent_first_frame: false
 warp_denoising_step: false
+
+# Streaming-mode (LongLive persistent KV-cache + variable-length chunks).
+# FUNDAMENTAL: ON by default for Phase-1 action-forcing DMD.
+streaming_mode: true
+streaming_max_length: 57

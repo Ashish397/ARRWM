@@ -925,12 +925,17 @@ class ActionForcingDMD(SelfForcingModel):
         full_rollout = pred_image_or_video
         clean_x_self_anchor = full_rollout[:, : self.num_training_frames].contiguous()
         pred_for_scoring = full_rollout[:, -self.num_training_frames:].contiguous()
+        # ``_dmd_score_grad_mask`` returns a freshly-allocated tensor,
+        # so we can mutate it in place safely.
         gradient_mask = self._dmd_score_grad_mask(pred_for_scoring.shape, pred_for_scoring.device)
         # Long-rollout warmup boundary (only when rollout > N): also
         # mask the FIRST ``block`` frames as the CF-parity
-        # cache-warmup → grad-active boundary.
+        # cache-warmup → grad-active boundary. Intentional asymmetry
+        # vs the critic step: the critic's bidir forward has no
+        # cache-warmup→grad-active transition, so it doesn't need
+        # this leading mask. The trailing last-chunk mask remains
+        # uniform across gen and critic.
         if self.rollout_frames > self.num_training_frames:
-            gradient_mask = gradient_mask.clone()
             gradient_mask[:, :block] = False
 
         return (
@@ -1265,18 +1270,36 @@ class ActionForcingDMD(SelfForcingModel):
                     median_mae.mean().detach()
                 )
 
-        if gradient_mask is not None:
-            dmd_loss = 0.5 * F.mse_loss(
-                original_latent.double()[gradient_mask],
-                (original_latent.double() - grad.double()).detach()[gradient_mask],
-                reduction="mean",
+        # FUNDAMENTAL: every DMD-score loss must arrive here with a
+        # non-None ``gradient_mask`` (= at least the canonical last-chunk
+        # boundary mask from ``_dmd_score_grad_mask``). The loss API
+        # doesn't silently fall back to an unmasked MSE — that path was
+        # removed deliberately so a future regression in any caller
+        # cannot bypass the boundary mask.
+        if gradient_mask is None:
+            raise RuntimeError(
+                "compute_distribution_matching_loss requires "
+                "``gradient_mask`` (every caller must build it from "
+                "``self._dmd_score_grad_mask`` so the structurally-OOD "
+                "last-chunk boundary stays masked uniformly)."
             )
-        else:
-            dmd_loss = 0.5 * F.mse_loss(
-                original_latent.double(),
-                (original_latent.double() - grad.double()).detach(),
-                reduction="mean",
-            )
+        if not gradient_mask.any():
+            # All-False mask → MSE on empty tensor is NaN. Surface a
+            # clean zero loss + telemetry so the trainer can detect /
+            # gate on it instead of silently propagating NaN through
+            # the optimizer step. The zero-loss is connected to the
+            # autograd graph through ``original_latent`` so
+            # ``.backward()`` succeeds (gradient is zero on every
+            # parameter) — critical because the trainer calls
+            # ``loss.backward()`` unconditionally.
+            dmd_log_dict["dmd_empty_mask"] = 1.0
+            zero_loss = (original_latent.double() * 0.0).sum()
+            return zero_loss, dmd_log_dict
+        dmd_loss = 0.5 * F.mse_loss(
+            original_latent.double()[gradient_mask],
+            (original_latent.double() - grad.double()).detach()[gradient_mask],
+            reduction="mean",
+        )
         return dmd_loss, dmd_log_dict
 
     # ------------------------------------------------------------------
@@ -1869,6 +1892,12 @@ class ActionForcingDMD(SelfForcingModel):
         # Stashing the dicts on state would freeze the graph, and the
         # 2nd backward in the same sequence would fail with "Trying to
         # backward through the graph a second time".
+        #
+        # NB: even with the +npb anchor (rolled below) clean_actions_window
+        # still starts at cf - shift in absolute ride coords because
+        # iter k≥2's clean_x is shifted back from its noisy_x by ``shift``
+        # frames in the cumulative-sdn coord system; the anchor consumes
+        # the leading ``shift`` frames of clean_actions_window for iter 1.
         clean_actions_window = ride_actions_window[
             :, cf - npb : cf - npb + max_length
         ]
@@ -1932,8 +1961,39 @@ class ActionForcingDMD(SelfForcingModel):
             current_start_frame += npb
         del seed_cond_dict  # release the no_grad cond dict before iter 1
 
+        # +npb leading-anchor chunk: roll a single ``shift``-frame
+        # rollout chunk under no_grad so iter 1's ``clean_x_self``
+        # window has purely-student-rolled content (no seed/student
+        # quality discontinuity that used to OOD the bidir scorer in
+        # legacy mode). Mirrors ``_run_generator``'s +npb anchor at the
+        # FRONT of the rollout (legacy single-batch contract). The
+        # anchor's KV/cross-attn caches advance to ``cf + npb``;
+        # ``current_length`` initialises to ``npb`` so iter 1's
+        # ``noisy_start_sdn = npb`` (= the absolute position right
+        # after the anchor) and the geometry of clean_lo / clean_x_GT
+        # slicing collapses to the uniform iter k≥2 formula.
+        anchor_noise = torch.randn(
+            [batch_size, npb, *seed_latents.shape[2:]],
+            device=device, dtype=dtype,
+        )
+        with torch.no_grad():
+            anchor_full_cond, _ = self.build_action_conditional(
+                prompt_embeds=prompt_embeds,
+                gt_actions=ride_actions_window,
+            )
+            anchor_chunk, _, _ = pipe.generate_chunk_with_cache(
+                noise=anchor_noise,
+                current_start_frame=cf,
+                requires_grad=False,
+                prefer_cache_pred_in_output=False,
+                gt_latents=None,  # no MAE on the anchor
+                **anchor_full_cond,
+            )
+        del anchor_full_cond
+        anchor_chunk = anchor_chunk.detach()
+
         self.streaming_state = {
-            "current_length": 0,
+            "current_length": int(npb),  # anchor counts toward the cumulative sdn
             "max_length": int(max_length),
             "chunk_size": int(self.streaming_chunk_size),
             "shift": int(npb),
@@ -1944,7 +2004,8 @@ class ActionForcingDMD(SelfForcingModel):
             "clean_actions_window": clean_actions_window,
             "prompt_embeds": prompt_embeds,
             "previous_chunk": None,  # last full_chunk (chunk_size frames)
-            "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill
+            "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill (anchor adds npb on top)
+            "anchor_chunk": anchor_chunk,  # [B, npb, C, H, W] — iter 1's clean_x_self anchor
         }
 
     def _streaming_build_cond_dicts(
@@ -2152,18 +2213,17 @@ class ActionForcingDMD(SelfForcingModel):
         shifted back by ``shift`` frames in cumulative-sdn coords.
 
         For iter 1 (no previous_chunk available before this call):
-            clean_x = [seed[-shift:], full_chunk[:N-shift]]   (special case)
+            clean_x = [anchor_chunk, full_chunk[:N-shift]]
+            (anchor_chunk = the +npb chunk rolled in setup_sequence —
+            entirely student-rolled, NOT seed-mixed. Replaces the legacy
+            ``[seed[-shift:], full_chunk[:N-shift]]`` seed-mix that put
+            GT-quality frames in the leading positions of clean_x.)
         For iter k≥2 (previous_chunk available):
             clean_x = [prev_chunk[chunk_size-overlap-shift :
                                    chunk_size-overlap],
                        full_chunk[:N-shift]]
-        which collapses to:
-          - overlap=0  : clean_x = [prev_chunk[-shift:], full_chunk[:N-shift]]
-          - overlap=npb: clean_x = [prev_chunk[chunk_size-2*npb : chunk_size-npb],
-                                    full_chunk[:N-shift]]
-        Both halves are entirely model-predicted (no GT mixing) past
-        iter 1, matching the user's "we don't need GT mixing once N >
-        21" rule.
+        Both halves are entirely model-predicted at every iter — no
+        seed/student quality discontinuity anywhere.
         """
         s = self.streaming_state
         shift = s["shift"]
@@ -2176,12 +2236,13 @@ class ActionForcingDMD(SelfForcingModel):
         prev_for_clean = info.get("prev_chunk_for_clean")
         overlap = info["overlap"]
         if prev_for_clean is None:
-            # Iter 1 special case.
-            seed_tail = s["seed_latents"][:, -shift:].to(
+            # Iter 1: anchor chunk (rolled in setup_sequence) replaces
+            # the legacy seed-tail. Anchor has length ``shift``.
+            anchor = s["anchor_chunk"].to(
                 dtype=full_chunk.dtype, device=full_chunk.device,
             )
             clean_x = torch.cat(
-                [seed_tail, full_chunk[:, : chunk_size - shift]], dim=1,
+                [anchor, full_chunk[:, : chunk_size - shift]], dim=1,
             )
         else:
             head_lo = chunk_size - overlap - shift
@@ -2282,19 +2343,26 @@ class ActionForcingDMD(SelfForcingModel):
         sequence state.
         """
         s = self.streaming_state
-        gradient_mask = info["gradient_mask"]
-        # AND-in the canonical last-chunk boundary mask. Streaming's
-        # per-iter ``gradient_mask`` is True only on the new frames
-        # within the overlap-chunk window; the last-chunk mask further
-        # zeroes out the structurally-OOD positions [N, N+shift) of the
-        # noisy half. Same mask used in the legacy gen step.
+        # ``info["gradient_mask"]`` is the per-iter overlap-chunk mask
+        # (True only on the new frames). It MUST be a tensor — if a
+        # future change makes it None, the silent fallback would
+        # quietly drop the new-frames mask and leave only the last-
+        # chunk mask, retraining the overlap region every iter. Same
+        # contract as ``compute_distribution_matching_loss``: raise
+        # rather than fall back.
+        per_iter_mask = info.get("gradient_mask")
+        if per_iter_mask is None:
+            raise RuntimeError(
+                "compute_generator_loss_streaming: info['gradient_mask'] "
+                "must be a tensor (built by ``_streaming_generate_chunk_with_grad``)."
+            )
+        # AND-in the canonical last-chunk boundary mask. Same mask
+        # used in the legacy gen step — zeroes out the structurally-
+        # OOD positions [N, N+shift) of the noisy half.
         last_chunk_mask = self._dmd_score_grad_mask(
             chunk.shape, chunk.device,
         )
-        gradient_mask_eff = (
-            (gradient_mask & last_chunk_mask) if gradient_mask is not None
-            else last_chunk_mask
-        )
+        gradient_mask_eff = per_iter_mask & last_chunk_mask
 
         clean_x_self = self._streaming_build_clean_x_self(chunk, info)
         clean_x_GT = (
@@ -2374,18 +2442,20 @@ class ActionForcingDMD(SelfForcingModel):
             chunk = chunk.detach()
 
         s = self.streaming_state
-        # AND-in the canonical last-chunk boundary mask. Streaming's
-        # per-iter ``gradient_mask`` is True only on the new frames
-        # within the overlap-chunk window; the last-chunk mask further
-        # zeroes out the structurally-OOD positions [N, N+shift).
+        # Strict contract: per-iter mask must be present. See the
+        # matching comment in compute_generator_loss_streaming — silent
+        # fallback would retrain the overlap region every iter.
+        per_iter_mask = info.get("gradient_mask")
+        if per_iter_mask is None:
+            raise RuntimeError(
+                "compute_critic_loss_streaming: info['gradient_mask'] "
+                "must be a tensor (built by ``_streaming_generate_chunk_with_grad``)."
+            )
+        # AND-in the canonical last-chunk boundary mask.
         last_chunk_mask = self._dmd_score_grad_mask(
             chunk.shape, chunk.device,
         )
-        per_iter_mask = info["gradient_mask"]
-        gradient_mask = (
-            (per_iter_mask & last_chunk_mask) if per_iter_mask is not None
-            else last_chunk_mask
-        )
+        gradient_mask = per_iter_mask & last_chunk_mask
         cond_for_scoring, _uncond = self._streaming_noisy_cond_slice(info)
 
         # Build clean_x for the fake_score's TF half — same self-view
@@ -2451,9 +2521,24 @@ class ActionForcingDMD(SelfForcingModel):
                 timestep=critic_timestep.flatten(0, 1),
             ).unflatten(0, chunk.shape[:2])
 
-        gradient_mask_flat = (
-            gradient_mask.flatten(0, 1) if gradient_mask is not None else None
-        )
+        critic_log: Dict[str, Any] = {
+            "critic_timestep": critic_timestep.detach(),
+            "streaming_new_frames": float(info["new_frames"]),
+            "streaming_current_length": float(info["current_length"]),
+        }
+        if not gradient_mask.any():
+            # End-of-sequence iter where ``new_frames`` (= npb) lands
+            # entirely inside the last-chunk-masked tail → AND is all
+            # False. Short-circuit to a zero loss + telemetry so the
+            # trainer can collapse-gate / reset on this iter instead
+            # of NaNing the optimizer. Zero-loss is connected to the
+            # autograd graph through ``pred_fake_image`` so
+            # ``.backward()`` succeeds (zero gradient on every
+            # fake_score parameter).
+            critic_log["critic_empty_mask"] = 1.0
+            zero_loss = (pred_fake_image.double() * 0.0).sum()
+            return zero_loss, critic_log
+        gradient_mask_flat = gradient_mask.flatten(0, 1)
         denoising_loss = self.denoising_loss_func(
             x=chunk.flatten(0, 1),
             x_pred=pred_fake_image.flatten(0, 1),
@@ -2464,12 +2549,6 @@ class ActionForcingDMD(SelfForcingModel):
             flow_pred=flow_pred,
             gradient_mask=gradient_mask_flat,
         )
-
-        critic_log: Dict[str, Any] = {
-            "critic_timestep": critic_timestep.detach(),
-            "streaming_new_frames": float(info["new_frames"]),
-            "streaming_current_length": float(info["current_length"]),
-        }
         for k in ("baseline_last_chunk_mae", "baseline_avg_rollout_mae", "last_chunk_mae", "mae_extension_count"):
             if k in info:
                 critic_log[k] = info[k]

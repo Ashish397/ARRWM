@@ -40,6 +40,7 @@ eval/
 _diag_p1/heatmap/
 _diag_p1/out/
 _diag_p1/out_frames/
+_diag_p1/diag_streaming_logs.zip
 
 # Test artefacts (outputs only — the .py test scripts *are* tracked).
 # ``testing/outputs/`` is an mp4 dumping ground; the individual ignore

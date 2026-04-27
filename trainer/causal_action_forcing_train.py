@@ -1720,15 +1720,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             dist.all_reduce(t, op=dist.ReduceOp.MIN)
             actual_cap = int(t.item())
-        # Reject if the ride can't fit at least one valid generate_next_chunk
-        # call. ``can_generate_more()`` requires
-        # ``current_length + min_new_frame ≤ max_length``; at
-        # current_length=0 that means ``actual_cap >= min_new_frame``.
-        # Lower than that and the trainer would call ``setup_sequence``
-        # successfully, then ``can_generate_more()`` returns False, and
-        # ``generate_next_chunk`` raises ``sequence exhausted``.
+        # Reject if the ride can't fit the +npb anchor + at least one
+        # valid ``generate_next_chunk`` call. ``setup_sequence`` rolls
+        # an anchor chunk that initialises ``current_length = npb``, so
+        # ``can_generate_more()`` requires ``npb + min_new_frame ≤ max_length``
+        # → reject if ``actual_cap < npb + min_new_frame``.
         min_new = int(getattr(self.model, "streaming_min_new_frame", npb))
-        if actual_cap < min_new:
+        anchor_frames = int(getattr(self.model, "dmd_clean_x_anchor_frames", npb))
+        if actual_cap < anchor_frames + min_new:
             return False
 
         prompt_embeds = ride["prompt_embeds"]

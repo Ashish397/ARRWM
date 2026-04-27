@@ -33,28 +33,34 @@
 #     signal, then continue under no_grad to the last rung so the
 #     KV cache K/V is committed from a fully-denoised x0 estimate
 #     (no noise compounding across rolling chunks).
-#   * heatmap_out_noise_bar: true — drops the gen-step DMD gradient
-#     on rows 0-1 of frame 0 (v14 LoRA boundary artifact).
-#   * Collapse gate (ride-extension gate): MAE > 0.5 ⇒ don't extend
-#     on this ride next iter. Currently single-batch is the only
-#     wired path so the gate is parsed-and-stored only.
+#   * +npb leading anchor chunk per ride (model.dmd_clean_x_anchor_frames
+#     = num_frame_per_block) — student rolls (rollout_frames + npb)
+#     frames; clean_x_self anchor = first N (purely student-rolled,
+#     no seed dip), noisy_x scoring window = last N. Locked-in
+#     fundamental.
+#   * Last-chunk DMD gradient mask (always on) — the last ``npb``
+#     frames of every scoring window live at RoPE [N, N+shift) with
+#     no clean-half counterpart in v14's TF joint sequence;
+#     gradient_mask zeros them out. Applied at every DMD-score loss
+#     site (gen + critic, legacy + streaming) via
+#     ``model._dmd_score_grad_mask``.
+#   * Bidirectional DMD scorers always full-bidir ``flash_attention``
+#     (NO causal block_mask). v14/causal-student TF training paths
+#     in ``wan/modules/causal_model.py`` keep their mask — only the
+#     bidir scorer joint forward is unmasked.
+#   * Collapse gate ON by default: ``baseline_avg_rollout_mae`` > 0.5
+#     closes the streaming sequence ⇒ next iter pulls a fresh ride.
+#     Threshold knob: ``collapse_mae_threshold: 0.5`` (default).
+#   * Streaming-mode ON by default (LongLive persistent KV-cache +
+#     variable-length chunks). The single rolling sequence spans many
+#     iters with random 18-21 frame advances per iter. Disable by
+#     setting ``streaming_mode: false`` in the YAML.
 #   * dfake_gen_update_ratio: 2 (one gen step per two critic steps).
 #   * denoising_step_list: [1000, 625, 312.5, 178.6] — 4-rung schedule.
-#   * Streaming-mode (LongLive persistent KV-cache + variable-length
-#     chunks, Phase-B): OFF by default in this YAML. Enable by adding
-#     ``streaming_mode=true`` to the --override line below; that
-#     activates ``setup_sequence`` / ``generate_next_chunk`` /
-#     ``compute_*_loss_streaming`` and runs DMD on rolling 18-21
-#     frame advances within a persistent sequence (= multi-batch
-#     DMD on the same ride).
 #
 # CF parity hyperparams: lr=2e-6 / 4e-7 (gen / critic), beta1=0.0,
 # weight_decay=0.01, ema_weight=0.99, ema_start_step=200,
 # infinity_rope=true. See the YAML header for the full alignment table.
-#
-# To run with streaming mode on:
-#   sbatch sbatch/train_action_forcing_phase1_10h.sbatch
-#   # then in --override below add: streaming_mode=true streaming_max_length=57
 #
 # Sister sbatches (defaults + one ablation each):
 #   sbatch/train_action_forcing_phase1_gan_10h.sbatch    (defaults + R3GAN)
