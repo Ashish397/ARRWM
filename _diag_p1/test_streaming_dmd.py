@@ -62,13 +62,13 @@ def _build_config():
     from omegaconf import OmegaConf
     cfg = OmegaConf.load(_REPO / "configs" / "action_forcing_phase1_aux_dmdctx.yaml")
     OmegaConf.set_struct(cfg, False)
-    cfg.wan_model_path = "/home/ashish/Wan2.1/"
-    cfg.encoded_root = "/home/ashish/frodobots/frodobots_encoded"
-    cfg.caption_root = "/home/ashish/frodobots/frodobots_captions/train"
-    cfg.motion_root = "/home/ashish/frodobots/frodobots_motion"
-    cfg.ss_vae_checkpoint = "/home/ashish/ARRWM/action_query/checkpoints/ss_vae_8free.pt"
-    cfg.ode_generator_checkpoint = "/home/ashish/action_ode_step0001000.pt"
-    cfg.v14_teacher_checkpoint = "/home/ashish/Downloads/causal_lora_step0006600.pt"
+    cfg.wan_model_path = os.environ.get("DIAG_WAN_MODEL_PATH", "/home/ashish/Wan2.1/")
+    cfg.encoded_root = os.environ.get("DIAG_ENCODED_ROOT", "/home/ashish/frodobots/frodobots_encoded")
+    cfg.caption_root = os.environ.get("DIAG_CAPTION_ROOT", "/home/ashish/frodobots/frodobots_captions/train")
+    cfg.motion_root = os.environ.get("DIAG_MOTION_ROOT", "/home/ashish/frodobots/frodobots_motion")
+    cfg.ss_vae_checkpoint = os.environ.get("DIAG_SSVAE_CKPT", "/home/ashish/ARRWM/action_query/checkpoints/ss_vae_8free.pt")
+    cfg.ode_generator_checkpoint = os.environ.get("DIAG_ODE_CKPT", "/home/ashish/action_ode_step0001000.pt")
+    cfg.v14_teacher_checkpoint = os.environ.get("DIAG_V14_CKPT", "/home/ashish/Downloads/causal_lora_step0006600.pt")
     cfg.cotracker_checkpoint_path = ""
     cfg.cotracker_source_dir = ""
     cfg.action_teacher_mode = "off"
@@ -90,7 +90,15 @@ def _build_config():
 def main():
     _init_dist_singlerank()
     import utils.wan_wrapper as _ww
-    _ww._default_wan_model_path = "/home/ashish/Wan2.1/"
+    _wan_root = os.environ.get("DIAG_WAN_MODEL_PATH", "/home/ashish/Wan2.1/")
+    # WanDiffusionWrapper composes path as f"{_default_wan_model_path}{model_name}/",
+    # so _default_wan_model_path must be the PARENT dir (with trailing slash) of the
+    # model_name directory. Accept either the parent dir or the model dir itself.
+    if _wan_root.rstrip("/").endswith("Wan2.1-T2V-1.3B"):
+        _wan_root = str(Path(_wan_root.rstrip("/")).parent)
+    if not _wan_root.endswith("/"):
+        _wan_root = _wan_root + "/"
+    _ww._default_wan_model_path = _wan_root
 
     cfg = _build_config()
     device = torch.device("cuda:0")

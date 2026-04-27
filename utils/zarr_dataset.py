@@ -444,6 +444,28 @@ class ZarrRideDataset(Dataset):
         return obj
 
     def _build_index(self) -> None:
+        # Smoke-test affordance: skip the per-zarr scan and load a pre-built manifest.
+        _manifest_pickle = os.environ.get("ARRWM_MANIFEST_PICKLE")
+        if _manifest_pickle:
+            try:
+                _cached = torch.load(_manifest_pickle, map_location="cpu", weights_only=False)
+                _rides = _cached.get("rides") if isinstance(_cached, dict) else None
+                if _rides:
+                    if self.max_rides is not None:
+                        _rides = _rides[: int(self.max_rides)]
+                    for r in _rides:
+                        zp = Path(r["zarr_path"])
+                        self._rides.append((zp, r["prompt_embeds"], r["attrs"], int(r["n_latent_frames"])))
+                        self._attrs_by_path[str(zp)] = r["attrs"]
+                    logging.info(
+                        "[ZarrRideDataset] ARRWM_MANIFEST_PICKLE=%s -> loaded %d rides (no scan)",
+                        _manifest_pickle, len(self._rides),
+                    )
+                    if self.sort_by_length in ("asc", "desc"):
+                        self._rides.sort(key=lambda r: r[3], reverse=(self.sort_by_length == "desc"))
+                    return
+            except Exception as exc:
+                logging.warning("[ZarrRideDataset] manifest pickle load failed (%s); falling back to scan", exc)
         zarr_paths = sorted(self.encoded_root.glob("*.zarr"))
         if zarr_paths and self.start_zarr_index:
             start = self.start_zarr_index % len(zarr_paths)

@@ -431,6 +431,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.sample_max_frames = int(
             getattr(self.config, "sample_max_frames", 0) or 0
         )
+        # Optional explicit step list (in addition to the periodic interval).
+        # Semantics: each entry fires on the FIRST eligible step at or
+        # after that value. Necessary because dfake_gen_update_ratio>1
+        # makes even-indexed steps critic-only (no rollout to emit), so
+        # asking for an emission at e.g. step 10 with ratio=2 has to be
+        # interpreted as "at the next gen-step", which is step 11.
+        _sas = getattr(self.config, "sample_at_steps", None)
+        self._sample_at_steps_pending: list = (
+            sorted({int(s) for s in _sas}) if _sas else []
+        )
+        # When true, ALSO save mp4 to <log_dir>/samples/step_<n>.mp4 — this
+        # works even when wandb is disabled, so smoke runs can inspect early
+        # rollouts.
+        self.vis_save_local = bool(
+            getattr(self.config, "vis_save_local", False)
+        )
         self._pending_video_latents: Optional[torch.Tensor] = None
         self._video_logger_warned_no_vae: bool = False
         if self.sample_interval > 0 and self.is_main_process:
@@ -1490,18 +1506,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     def _video_sample_due(self, current_step: int) -> bool:
         """Return True iff this step should produce a sample video.
 
-        Gated on (a) ``sample_interval > 0``, (b) main rank, (c) wandb
-        enabled, (d) step is a positive multiple of ``sample_interval``.
-        Step 0 is intentionally skipped because no rollout has happened
-        yet at iter 0 entry.
+        Two gates can fire it:
+          (1) explicit ``sample_at_steps`` membership, or
+          (2) ``sample_interval > 0`` and step is a positive multiple
+              thereof.
+        Both also require main rank and at least one viable sink
+        (wandb enabled OR ``vis_save_local`` true). ``current_step <= 0``
+        is skipped because no rollout has happened yet at iter 0 entry
+        (the first eligible step is ``current_step == 1``).
         """
         if not self.is_main_process:
             return False
-        if self.sample_interval <= 0:
-            return False
-        if not (_HAS_WANDB and getattr(self, "wandb_enabled", False)):
+        if not (
+            (_HAS_WANDB and getattr(self, "wandb_enabled", False))
+            or self.vis_save_local
+        ):
             return False
         if current_step <= 0:
+            return False
+        if (
+            self._sample_at_steps_pending
+            and current_step >= self._sample_at_steps_pending[0]
+        ):
+            return True
+        if self.sample_interval <= 0:
             return False
         return (current_step % self.sample_interval) == 0
 
@@ -1571,6 +1599,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "[ActionForcing] sample-video ffmpeg encode failed at "
                 "step=%d (frames=%d)", step, vid_np.shape[0],
             )
+            return
+
+        if self.vis_save_local:
+            try:
+                samples_dir = Path(self.log_dir) / "samples"
+                samples_dir.mkdir(parents=True, exist_ok=True)
+                out_path = samples_dir / f"step_{int(step):07d}.mp4"
+                with open(out_path, "wb") as fh:
+                    fh.write(mp4_bytes)
+                logging.info(
+                    "[ActionForcing] Saved sample video to %s "
+                    "(frames=%d, fps=%d)",
+                    out_path, vid_np.shape[0], int(self.sample_fps),
+                )
+            except Exception as exc:
+                logging.warning(
+                    "[ActionForcing] sample-video local save failed at "
+                    "step=%d: %s", step, exc,
+                )
+
+        if not (_HAS_WANDB and getattr(self, "wandb_enabled", False)):
             return
 
         tmp_path: Optional[str] = None
@@ -1745,6 +1794,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self._pending_video_latents = (
                         chunk.detach().to(torch.float32)
                     )
+                    _cs = int(self.step) + 1
+                    while (
+                        self._sample_at_steps_pending
+                        and self._sample_at_steps_pending[0] <= _cs
+                    ):
+                        self._sample_at_steps_pending.pop(0)
                 except Exception as _exc:
                     logging.warning(
                         "[ActionForcing] failed to stash streaming chunk "
@@ -2100,6 +2155,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         self._pending_video_latents = (
                             pred_image.detach().to(torch.float32)
                         )
+                        _cs = int(self.step) + 1
+                        while (
+                            self._sample_at_steps_pending
+                            and self._sample_at_steps_pending[0] <= _cs
+                        ):
+                            self._sample_at_steps_pending.pop(0)
                     except Exception as _exc:
                         logging.warning(
                             "[ActionForcing] failed to stash "

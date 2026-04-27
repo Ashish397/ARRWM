@@ -60,12 +60,15 @@ run_name: action_forcing_phase1_aux_dmdctx
 seed: 0
 mixed_precision: true
 log_interval: 10
-checkpoint_interval: 500
+checkpoint_interval: 100
 max_steps: 10000
 
 # Periodic pred_image -> wandb.Video sampling. See action_forcing_phase1_aux.yaml
 # for the cost / behaviour notes. Set sample_interval: 0 to disable.
-sample_interval: 200
+sample_interval: 100
+# Extra explicit emission steps (in addition to the periodic interval).
+# step 1 = first iteration's rollout; useful for an early sanity check.
+sample_at_steps: [1, 10]
 sample_fps: 5
 sample_max_frames: 0
 max_grad_norm: 10.0
@@ -296,7 +299,7 @@ vis_wallclock_seconds: 0
 vis_num_chunks: 0
 vis_fps: 8
 vis_to_wandb: false
-vis_save_local: false
+vis_save_local: true   # write mp4 to <log_dir>/samples/step_<N>.mp4 (works even with disable_wandb)
 vis_emit_on_first_step: false
 
 # ---------------------------------------------------------------------------
