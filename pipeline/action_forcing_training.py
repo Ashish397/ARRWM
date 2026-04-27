@@ -1286,6 +1286,15 @@ class ActionForcingTrainingPipeline:
                     )
                     self._last_extension_metrics["baseline_last_chunk_mae"] = val
                     self._last_extension_metrics["last_chunk_mae"] = val
+                    # Mirror to ``baseline_avg_rollout_mae`` so the
+                    # trainer's streaming collapse gate (which reads
+                    # this key) actually fires. In streaming mode the
+                    # per-iter rollout is one chunk (npb frames), so
+                    # "avg rollout" = "last chunk" by construction.
+                    # Without this mirror the gate's NaN-guard
+                    # ``mae == mae`` fails on the default NaN init at
+                    # line 1113 and the gate is silently dormant.
+                    self._last_extension_metrics["baseline_avg_rollout_mae"] = val
             except Exception:
                 pass
 
