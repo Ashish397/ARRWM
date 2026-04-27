@@ -246,34 +246,65 @@ class ActionForcingDMD(SelfForcingModel):
                 f"num_training_frames ({self.num_training_frames})."
             )
 
-        # ``clean_x_aug_t``: small noise level applied to real_score's
-        # clean_x ONLY in ``"GT"`` mode (real_score sees lightly-noised GT
-        # context). Symmetry-breaking — without it, the gradient is
-        # dominated by the perfect-context advantage. fake_score's clean_x
-        # is never noised. In ``"self"`` mode this knob has no effect (no
-        # GT clean_x to noise).
-        self.clean_x_aug_t = int(getattr(args, "clean_x_aug_t", 20))
-        if self.clean_x_aug_t <= 0 or self.clean_x_aug_t >= int(
+        # ``clean_x_aug_t``: noise level applied to real_score's clean_x
+        # in ``"GT"`` mode. Default ``0`` = no noise on the GT clean half
+        # (which the diagnostic ``_diag_p1/test_dmd_inference.py`` 3-roll
+        # mask-OFF + anchor sweep settled on). fake_score's clean_x is
+        # never noised. Ignored in ``"self"`` mode.
+        self.clean_x_aug_t = int(getattr(args, "clean_x_aug_t", 0))
+        if self.clean_x_aug_t < 0 or self.clean_x_aug_t >= int(
             getattr(args, "num_train_timestep", 1000)
         ):
             raise ValueError(
                 f"clean_x_aug_t ({self.clean_x_aug_t}) must be in "
-                f"(0, num_train_timestep="
-                f"{getattr(args, 'num_train_timestep', 1000)}). Use a "
-                "SMALL value (≲ 50) to keep the GT signal dominant."
+                f"[0, num_train_timestep="
+                f"{getattr(args, 'num_train_timestep', 1000)}). Use 0 to "
+                "disable, or a SMALL value (≲ 50) for symmetry-breaking."
             )
 
-        # ``heatmap_out_noise_bar``: drop the gen-step DMD gradient on
-        # the top 2 latent rows of frame 0 of the noisy_x window. The
-        # v14 LoRA produces a chromatic-fringe artifact at the bidir
-        # joint-sequence half-boundary whenever clean_x is present
-        # (heatmap from ``_diag_p1/heatmap_artifact.py`` shows rows 0-1
-        # of frame 0 at ~2.5x baseline error; rest of the frame is
-        # baseline). Masking those 2 rows costs ~0.16% of supervision
-        # tokens. Default ``True``. Set ``False`` to disable.
-        self.heatmap_out_noise_bar = bool(
-            getattr(args, "heatmap_out_noise_bar", True)
+        # ``dmd_clean_x_anchor_frames``: number of EXTRA frames the
+        # student rolls at the START of every ride to anchor batch-1's
+        # ``clean_x_self`` window — fixes the seed/student quality
+        # discontinuity that used to OOD the bidir scorer when
+        # ``clean_x_self`` was assembled from ``[seed_last_chunk,
+        # pred[:N-shift]]``. New geometry:
+        #   pipeline rolls (num_training_frames + anchor_frames) frames
+        #   pred_for_scoring = pred[:, anchor_frames:]   (= last N, noisy_x)
+        #   clean_x_self     = pred[:, :num_training_frames]  (= first N)
+        # Hardcoded to ``num_frame_per_block`` (= the clean/noisy shift)
+        # — the model needs exactly ``shift`` extra frames at the front
+        # to slide noisy_x forward by one chunk while keeping clean_x_self
+        # entirely in the rolled-out range. Once per ride at the FRONT,
+        # NOT once per batch.
+        self.dmd_clean_x_anchor_frames = int(self.num_frame_per_block)
+
+        # ``teacher_freeze_detect_enabled``: per-frame outlier-rejection
+        # on the teacher (real_score) prediction. Some frames in the
+        # v14 teacher's denoise output occasionally come back hazy /
+        # frozen — visible as a single washed-out latent frame in
+        # ``F_real_GT.mp4`` from ``_diag_p1/test_dmd_inference.py``. If
+        # we let DMD score against that frame, the (fake - real)
+        # gradient pulls the student toward the bad teacher pred and
+        # the student learns to reproduce the freeze. Detection: per-
+        # frame MAE between ``pred_real_image`` and the GT video at
+        # the same time positions; frames with MAE > threshold *
+        # median(MAE across frames in this iter) get added to
+        # ``gradient_mask`` so the DMD loss skips them. Default OFF
+        # (opt-in via the YAML); ``threshold=2.0`` flags only frames
+        # with MAE 2× the median (= robust to all-frames-similar
+        # cases where there's no real outlier).
+        self.teacher_freeze_detect_enabled = bool(
+            getattr(args, "teacher_freeze_detect_enabled", False)
         )
+        self.teacher_freeze_threshold = float(
+            getattr(args, "teacher_freeze_threshold", 2.0)
+        )
+        if self.teacher_freeze_threshold <= 1.0:
+            raise ValueError(
+                f"teacher_freeze_threshold ({self.teacher_freeze_threshold}) "
+                "must be > 1.0 (= multiplier on median MAE; <= 1.0 would "
+                "flag the median frame itself, masking ≥ half the chunk)."
+            )
 
         if getattr(args, "gradient_checkpointing", False):
             try:
@@ -352,13 +383,32 @@ class ActionForcingDMD(SelfForcingModel):
         # Must run AFTER ``_load_real_score_with_v14_lora`` (peft.merge_
         # and_unload rebuilds real_score.model and would drop attrs set
         # before) and AFTER ``_mirror_generator_into_fake_score``.
+        # ``tf_rope_offset_frames`` knob — overridable via env for A/B
+        # diagnostics. Default = ``num_frame_per_block`` (= 1-chunk
+        # shift). Setting ``DIAG_TF_ROPE_OFFSET=9`` (= dmd_context_clean_frames)
+        # tests v14's "clean half = cf frames, noisy half stacked
+        # after" alternative training layout.
+        _tf_rope_off = int(os.environ.get(
+            "DIAG_TF_ROPE_OFFSET",
+            str(int(self.num_frame_per_block)),
+        ))
         for scorer_name in ("real_score", "fake_score"):
             m = getattr(self, scorer_name).model
             m.context_shift = 1
-            m.tf_rope_offset_frames = self.num_frame_per_block
+            m.tf_rope_offset_frames = _tf_rope_off
+            # Pass the chunk size to the bidir TF block_mask builder
+            # (action_model_patch._prepare_tf_block_mask_cached). The v14
+            # LoRA was fine-tuned with the same chunk size as the causal
+            # student (typically 3); match here so the bidir scorer's
+            # joint self-attn uses v14's training-contract block_mask.
+            m.num_frame_per_block = int(self.num_frame_per_block)
             # Force any cached block_mask rebuild (causal path only;
             # bidir doesn't use block_mask but harmless to clear).
             m.block_mask = None
+            # Drop any stale TF block_mask cache entries from a prior
+            # config so the next forward rebuilds with the new dims.
+            if hasattr(m, "_tf_block_mask_cache"):
+                m._tf_block_mask_cache = {}
 
         if _is_main():
             logging.info(
@@ -803,18 +853,21 @@ class ActionForcingDMD(SelfForcingModel):
             )
 
         noise_shape = list(image_or_video_shape)
-        # Phase-1 Action-Forcing: rollout length must equal ``self.rollout_frames``
-        # (which is >= ``num_training_frames``). The trainer is
-        # responsible for sizing the ``image_or_video_shape`` to the
-        # baseline rollout ONLY (extensions are sampled inline by the
-        # pipeline, not from this noise tensor).
-        if noise_shape[1] != self.rollout_frames:
+        # Phase-1 Action-Forcing: total rolled length must equal
+        # ``self.rollout_frames + self.dmd_clean_x_anchor_frames``.
+        # The +``anchor_frames`` is the leading chunk that anchors
+        # batch-1's ``clean_x_self`` window — once per ride at the
+        # FRONT, NOT once per batch.
+        anchor_frames = int(self.dmd_clean_x_anchor_frames)
+        expected_rollout = self.rollout_frames + anchor_frames
+        if noise_shape[1] != expected_rollout:
             raise RuntimeError(
-                f"Phase-1 Action-Forcing expects rollout of {self.rollout_frames} "
-                f"latent frames (rollout_frames knob; defaults to "
-                f"num_training_frames={self.num_training_frames}); got "
-                f"noise_shape[1]={noise_shape[1]}. Fix the trainer to "
-                f"pin the rollout to {self.rollout_frames} frames."
+                f"Phase-1 Action-Forcing expects rollout of "
+                f"{expected_rollout} latent frames (= rollout_frames="
+                f"{self.rollout_frames} + anchor_frames={anchor_frames}); "
+                f"got noise_shape[1]={noise_shape[1]}. Trainer must size "
+                f"the noise tensor to {expected_rollout} frames so the "
+                f"first {anchor_frames} frames anchor clean_x_self."
             )
 
         if self.inference_pipeline is None:
@@ -841,40 +894,95 @@ class ActionForcingDMD(SelfForcingModel):
             )
         )
 
-        # Slice the pred to the LAST ``num_training_frames`` of the
-        # rollout. The pipeline already gated gradient to this slice
-        # via ``start_gradient_frame_index``, so the leading frames
-        # carry no grad and would only confuse the scorer (whose
-        # seq_len is sized to num_training_frames). When
-        # rollout_frames == num_training_frames this is a no-op.
-        # ``gradient_mask`` is sized to the SCORING window and
-        # masks the first ``num_frame_per_block`` frames as a
-        # boundary (long-rollout mode only).
+        # Slice the pred into:
+        #   pred_for_scoring   = pred[:, -num_training_frames:]   (last N
+        #                         frames = noisy_x scoring window)
+        #   clean_x_self_anchor = pred[:, :num_training_frames]   (first
+        #                         N frames = clean_x_self anchor;
+        #                         purely student-rolled, no seed mix)
+        # The two slices overlap by N - anchor_frames frames in absolute
+        # rolled-frame indexing but live at different RoPE positions in
+        # the bidir scorer joint sequence (clean at [0,N), noisy at
+        # [shift,N+shift)).
         #
-        # CF parity reference for the boundary mask: Causal-Forcing/
-        # long_video/model/base.py lines 169-177. We deliberately omit
-        # CF's decode→re-encode of the boundary latent: with the
-        # gradient masked off the boundary frame's content cannot
-        # affect the loss, so the extra VAE round-trip is wasted work.
+        # Gradient mask:
+        #   * ALWAYS mask the LAST ``num_frame_per_block`` frames of the
+        #     scoring window. In v14's TF joint sequence the noisy half's
+        #     last block lives at RoPE positions [N, N+shift) — these
+        #     positions have NO clean-half counterpart (clean half is at
+        #     [0, N)), so the bidir scorer cannot condition them on clean
+        #     context. Empirically (``_diag_p1/test_dmd_inference.py``
+        #     3-rollout sweep): F_real_GT shows ~2× the mid-window MAE
+        #     in the last 3 frames of every 21-frame batch — an
+        #     unavoidable end-of-window boundary the DMD gradient should
+        #     not learn from.
+        #   * In long-rollout mode (``rollout_frames > num_training_frames``)
+        #     ALSO mask the first ``num_frame_per_block`` frames as the
+        #     CF-parity boundary between cache-warmup and grad-active
+        #     frames (CF: long_video/model/base.py:169-177). We
+        #     deliberately skip CF's decode→re-encode round-trip.
         block = int(self.num_frame_per_block)
-        if pred_image_or_video.shape[1] != self.num_training_frames:
-            pred_image_or_video = pred_image_or_video[
-                :, -self.num_training_frames:
-            ].contiguous()
+        full_rollout = pred_image_or_video
+        clean_x_self_anchor = full_rollout[:, : self.num_training_frames].contiguous()
+        pred_for_scoring = full_rollout[:, -self.num_training_frames:].contiguous()
+        gradient_mask = self._dmd_score_grad_mask(pred_for_scoring.shape, pred_for_scoring.device)
+        # Long-rollout warmup boundary (only when rollout > N): also
+        # mask the FIRST ``block`` frames as the CF-parity
+        # cache-warmup → grad-active boundary.
         if self.rollout_frames > self.num_training_frames:
-            gradient_mask = torch.ones_like(
-                pred_image_or_video, dtype=torch.bool,
-            )
+            gradient_mask = gradient_mask.clone()
             gradient_mask[:, :block] = False
-        else:
-            gradient_mask = None
 
         return (
-            pred_image_or_video.to(self.dtype),
+            pred_for_scoring.to(self.dtype),
+            clean_x_self_anchor.to(self.dtype),
             gradient_mask,
             denoised_timestep_from,
             denoised_timestep_to,
         )
+
+    # ------------------------------------------------------------------
+    # Canonical "drop the last chunk" mask for every DMD-score loss.
+    # ------------------------------------------------------------------
+    def _dmd_score_grad_mask(
+        self, shape: Tuple[int, ...], device: torch.device
+    ) -> torch.Tensor:
+        """Return a ``[B, F, C, H, W]`` bool mask with the last
+        ``num_frame_per_block`` frames set to False. EVERY DMD-score
+        loss in this module routes through this helper so the last-
+        chunk boundary stays masked uniformly across:
+
+          * gen-step DMD MSE (``compute_distribution_matching_loss``)
+          * critic-step denoising MSE (``critic_loss``)
+          * streaming gen step (``compute_generator_loss_streaming``)
+          * streaming critic step (``compute_critic_loss_streaming``)
+
+        Boundary rationale: in v14's TF joint sequence the noisy half
+        lives at RoPE [shift, N+shift). The last ``shift`` noisy
+        positions [N, N+shift) have no clean-half counterpart (clean
+        half is at [0, N)) — the bidir scorer can't condition them on
+        clean context, producing structurally OOD predictions. Verified
+        empirically (``_diag_p1/test_dmd_inference.py`` 3-rollout sweep,
+        F_real_GT MAE ~2× the mid-window value at the last 3 frames of
+        every 21-frame batch). Hardcoded — NOT config-settable — because
+        the boundary is a property of the v14 LoRA's training contract,
+        not of any tunable choice.
+        """
+        block = int(self.num_frame_per_block)
+        if len(shape) < 2:
+            raise ValueError(
+                f"_dmd_score_grad_mask expects shape with B and F dims, "
+                f"got {shape}"
+            )
+        if shape[1] <= block:
+            raise ValueError(
+                f"scoring window has F={shape[1]} <= block={block}; the "
+                f"last-chunk boundary mask would zero ALL frames. Bump "
+                "num_training_frames or shrink num_frame_per_block."
+            )
+        mask = torch.ones(shape, dtype=torch.bool, device=device)
+        mask[:, -block:] = False
+        return mask
 
     # ------------------------------------------------------------------
     # CF-parity DMD core
@@ -982,10 +1090,15 @@ class ActionForcingDMD(SelfForcingModel):
             grad = grad / normalizer.clamp_min(1e-6)
         grad = torch.nan_to_num(grad)
 
-        return grad, {
+        log_dict: Dict[str, Any] = {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
             "timestep": timestep.detach(),
         }
+        # Return the detached teacher prediction alongside the
+        # gradient so the caller can run teacher-freeze detection
+        # (per-frame MAE vs GT) without duplicating the real_score
+        # forward.
+        return grad, pred_real_image.detach(), log_dict
 
     def _sample_dmd_timestep(
         self,
@@ -1036,6 +1149,7 @@ class ActionForcingDMD(SelfForcingModel):
         aug_t: Optional[torch.Tensor] = None,
         clean_x_real: Optional[torch.Tensor] = None,
         aug_t_real: Optional[torch.Tensor] = None,
+        gt_target: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """CF-parity DMD loss (eq. 7).
 
@@ -1078,7 +1192,7 @@ class ActionForcingDMD(SelfForcingModel):
                 timestep.flatten(0, 1),
             ).detach().unflatten(0, (batch_size, num_frame))
 
-            grad, dmd_log_dict = self._compute_kl_grad(
+            grad, pred_real_image_detached, dmd_log_dict = self._compute_kl_grad(
                 noisy_image_or_video=noisy_latent,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
@@ -1090,22 +1204,66 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t_real=aug_t_real,
             )
 
-        # ``heatmap_out_noise_bar``: drop the gen-step DMD gradient on
-        # rows 0-1 of frame 0 of the noisy_x window — the chromatic-
-        # fringe artifact region the v14 LoRA cannot represent
-        # correctly under the bidir TF joint sequence. Heatmap-precise:
-        # ~0.16% of tokens. Driven by the boolean config knob.
-        if bool(getattr(self, "heatmap_out_noise_bar", False)) and original_latent.shape[1] >= 1:
-            if gradient_mask is None:
-                gradient_mask = torch.ones(
-                    original_latent.shape, dtype=torch.bool,
-                    device=original_latent.device,
+        # ``teacher_freeze_detect``: per-frame outlier rejection on the
+        # teacher prediction. Compute per-frame MAE between
+        # ``pred_real_image_detached`` and ``gt_target`` (= GT video
+        # frames at the noisy_x positions). Frames whose MAE exceeds
+        # ``threshold * median(MAE)`` are flagged as teacher freezes
+        # and added to ``gradient_mask`` so DMD skips them. Robust to
+        # the all-frames-similar case (median ≈ MAE on every frame ⇒
+        # no frame trips the threshold ⇒ no false positives).
+        if (
+            bool(getattr(self, "teacher_freeze_detect_enabled", False))
+            and gt_target is not None
+        ):
+            with torch.no_grad():
+                gt_t = gt_target.to(
+                    dtype=pred_real_image_detached.dtype,
+                    device=pred_real_image_detached.device,
                 )
-            else:
-                gradient_mask = gradient_mask.clone()
-            # Mask top 2 latent rows of frame 0 (heatmap shows rows 0-1
-            # at ~2.5x baseline error; rest of frame is at baseline).
-            gradient_mask[:, 0, :, :2, :] = False
+                if gt_t.shape != pred_real_image_detached.shape:
+                    raise RuntimeError(
+                        "teacher_freeze_detect: gt_target shape "
+                        f"{tuple(gt_t.shape)} does not match "
+                        f"pred_real_image shape "
+                        f"{tuple(pred_real_image_detached.shape)}."
+                    )
+                # Per-frame MAE [B, F].
+                per_frame_mae = (
+                    pred_real_image_detached.float() - gt_t.float()
+                ).abs().mean(dim=[2, 3, 4])
+                # Median across frames (per-batch, [B, 1]) — robust to
+                # the freeze frame itself being the outlier.
+                median_mae = per_frame_mae.median(dim=1, keepdim=True).values
+                freeze_mask_bf = per_frame_mae > (
+                    self.teacher_freeze_threshold * median_mae
+                )  # [B, F]
+                # Broadcast to [B, F, C, H, W] and AND into gradient_mask.
+                if freeze_mask_bf.any():
+                    if gradient_mask is None:
+                        gradient_mask = torch.ones(
+                            original_latent.shape, dtype=torch.bool,
+                            device=original_latent.device,
+                        )
+                    else:
+                        gradient_mask = gradient_mask.clone()
+                    freeze_full = freeze_mask_bf.view(
+                        *freeze_mask_bf.shape, 1, 1, 1,
+                    ).expand_as(gradient_mask)
+                    gradient_mask[freeze_full] = False
+                # Telemetry (always logged when feature is on).
+                dmd_log_dict["teacher_freeze_count"] = (
+                    freeze_mask_bf.float().sum().detach()
+                )
+                dmd_log_dict["teacher_freeze_rate"] = (
+                    freeze_mask_bf.float().mean().detach()
+                )
+                dmd_log_dict["teacher_freeze_max_mae"] = (
+                    per_frame_mae.max().detach()
+                )
+                dmd_log_dict["teacher_freeze_median_mae"] = (
+                    median_mae.mean().detach()
+                )
 
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(
@@ -1306,16 +1464,25 @@ class ActionForcingDMD(SelfForcingModel):
         and use the live tensor only for the gen-side guidance
         loss.
         """
+        # ``image_or_video_shape[1]`` = total rolled length =
+        # ``self.rollout_frames + anchor_frames`` (= scoring window
+        # length + leading clean_x_self anchor). The scoring slicer
+        # below uses this full length and picks the LAST
+        # ``num_training_frames`` of the rollout half.
         rollout_frames = int(image_or_video_shape[1])
-        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = (
-            self._run_generator(
-                image_or_video_shape=image_or_video_shape,
-                conditional_dict=conditional_dict,
-                clean_latent=clean_latent,
-                initial_latent=initial_latent,
-                enable_mae_extension=True,
-                seed_latents=seed_latents,
-            )
+        (
+            pred_image,
+            clean_x_self_anchor,
+            gradient_mask,
+            denoised_timestep_from,
+            denoised_timestep_to,
+        ) = self._run_generator(
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            clean_latent=clean_latent,
+            initial_latent=initial_latent,
+            enable_mae_extension=True,
+            seed_latents=seed_latents,
         )
         scoring_frames = self.num_training_frames
 
@@ -1339,33 +1506,16 @@ class ActionForcingDMD(SelfForcingModel):
             seed_frames=seed_frames,
         )
 
-        # Construct clean_x_self internally when not pre-supplied.
-        # The clean/noisy SHIFT is fixed at one chunk
-        # (= ``num_frame_per_block``); the canonical batch-1 "self"
-        # view is ``[seed[-shift:], pred_image[:N-shift]]`` = the last
-        # 1 chunk of the seed prefilled GT + the first (N-shift)
-        # student-rolled frames. Action streams for these positions
-        # are available via ``clean_conditional_dict`` (built by the
-        # trainer from ride_actions[:N]). Caller can override by
-        # passing clean_x_self explicitly (e.g., for multi-batch
-        # batches i ≥ 2 the assembly is purely from sdn and uses
-        # ``sdn[(i-1)*N - shift : i*N - shift]``).
+        # ``clean_x_self`` defaults to ``clean_x_self_anchor`` returned
+        # by ``_run_generator`` — the FIRST ``num_training_frames`` of
+        # the (anchor + scoring) rollout. Purely student-rolled, no
+        # seed mix. Per-ride anchor: the +``anchor_frames`` chunk at
+        # the front of the rollout exists exclusively so this slice
+        # is well-defined for batch 1 without dipping into the seed.
+        # Caller can override (rare — only multi-batch streaming
+        # consumers might want a custom slice).
         if clean_x_self is None:
-            shift = self.num_frame_per_block
-            if seed_latents is None or seed_latents.shape[1] < shift:
-                raise RuntimeError(
-                    "generator_loss with dmd_context active requires "
-                    "either an explicit clean_x_self OR seed_latents "
-                    f"with >= {shift} frames (= num_frame_per_block, "
-                    "the clean/noisy shift) so the model can build "
-                    "the batch-1 self-view internally."
-                )
-            seed_last_chunk = seed_latents[:, -shift:].to(
-                dtype=pred_image.dtype, device=pred_image.device,
-            )
-            clean_x_self = torch.cat(
-                [seed_last_chunk, pred_image[:, : scoring_frames - shift]], dim=1,
-            )
+            clean_x_self = clean_x_self_anchor
 
         (
             sc_clean_x,
@@ -1386,6 +1536,23 @@ class ActionForcingDMD(SelfForcingModel):
             build_real_view=True,
         )
 
+        # Teacher-freeze gt_target: GT video at the noisy_x positions
+        # (= the same time positions ``pred_image`` was rolled at). In
+        # the legacy single-batch path, ``clean_latent`` covers the
+        # FULL ride window (seed + rollout); the rollout's gt is
+        # ``clean_latent[seed_frames : seed_frames + scoring_frames]``.
+        # When teacher-freeze detection is off this is an O(slice)
+        # no-op.
+        gt_target = None
+        if (
+            bool(getattr(self, "teacher_freeze_detect_enabled", False))
+            and clean_latent is not None
+            and clean_latent.shape[1] >= seed_frames + scoring_frames
+        ):
+            gt_target = clean_latent[
+                :, seed_frames : seed_frames + scoring_frames
+            ]
+
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
             conditional_dict=cond_for_scoring,
@@ -1397,6 +1564,7 @@ class ActionForcingDMD(SelfForcingModel):
             aug_t=sc_aug_t,
             clean_x_real=sc_clean_x_real,
             aug_t_real=sc_aug_t_real,
+            gt_target=gt_target,
         )
         dmd_loss = dmd_loss * self.dmd_loss_weight
 
@@ -1462,21 +1630,27 @@ class ActionForcingDMD(SelfForcingModel):
         if self.inference_pipeline is not None:
             self.inference_pipeline._clear_cache_gradients()
         with torch.no_grad():
-            generated_image, _, denoised_timestep_from, denoised_timestep_to = (
-                self._run_generator(
-                    image_or_video_shape=image_or_video_shape,
-                    conditional_dict=conditional_dict,
-                    clean_latent=clean_latent,
-                    initial_latent=initial_latent,
-                    enable_mae_extension=False,
-                    seed_latents=seed_latents,
-                    requires_grad=False,
-                )
+            (
+                generated_image,
+                clean_x_self_anchor,
+                _gradient_mask,
+                denoised_timestep_from,
+                denoised_timestep_to,
+            ) = self._run_generator(
+                image_or_video_shape=image_or_video_shape,
+                conditional_dict=conditional_dict,
+                clean_latent=clean_latent,
+                initial_latent=initial_latent,
+                enable_mae_extension=False,
+                seed_latents=seed_latents,
+                requires_grad=False,
             )
 
         # ``generated_image`` is sliced by ``_run_generator`` to the
-        # last ``num_training_frames`` of the rollout (the gradient/
-        # scoring window). ``conditional_dict`` covers seed+rollout
+        # LAST ``num_training_frames`` of the rollout (= noisy_x scoring
+        # window). ``clean_x_self_anchor`` is the FIRST
+        # ``num_training_frames`` (= clean_x_self anchor; pure student-
+        # rolled, no seed mix). ``conditional_dict`` covers seed+rollout
         # when seed_latents is provided; ``seed_frames`` shifts the
         # scoring slice past the seed prefix.
         scoring_shape = list(generated_image.shape)
@@ -1488,26 +1662,11 @@ class ActionForcingDMD(SelfForcingModel):
             seed_frames=seed_frames,
         )
 
-        # Build clean_x_self the same way generator_loss does, so the
-        # critic step trains fake_score under matched conditioning.
-        # Shift is one chunk (= ``num_frame_per_block``); batch-1 view
-        # = ``[seed[-shift:], generated_image[:N-shift]]``.
+        # ``clean_x_self`` defaults to the anchor slice — same path as
+        # generator_loss. fake_score's clean_x is the unnoised self-view
+        # so critic step matches gen step's TF conditioning.
         if clean_x_self is None:
-            shift = self.num_frame_per_block
-            if seed_latents is None or seed_latents.shape[1] < shift:
-                raise RuntimeError(
-                    "critic_loss with dmd_context active requires "
-                    "either an explicit clean_x_self OR seed_latents "
-                    f"with >= {shift} frames (= num_frame_per_block, "
-                    "the clean/noisy shift) so the model can build "
-                    "the batch-1 self-view internally."
-                )
-            seed_last_chunk = seed_latents[:, -shift:].to(
-                dtype=generated_image.dtype, device=generated_image.device,
-            )
-            clean_x_self = torch.cat(
-                [seed_last_chunk, generated_image[:, : scoring_shape[1] - shift]], dim=1,
-            )
+            clean_x_self = clean_x_self_anchor
 
         # dmd_context: build clean_x / aug_t for fake_score and merge
         # ``_action_modulation_clean`` / ``_action_tokens_clean`` into
@@ -1580,6 +1739,14 @@ class ActionForcingDMD(SelfForcingModel):
                 timestep=critic_timestep.flatten(0, 1),
             ).unflatten(0, scoring_shape[:2])
 
+        # Critic step honours the SAME last-chunk boundary mask as the
+        # gen step's DMD MSE — fake_score's prediction at noisy RoPE
+        # positions [N, N+shift) is structurally OOD (no clean-half
+        # counterpart in v14's TF joint sequence), so don't train
+        # fake_score against those frames.
+        critic_grad_mask = self._dmd_score_grad_mask(
+            generated_image.shape, generated_image.device,
+        ).flatten(0, 1)
         denoising_loss = self.denoising_loss_func(
             x=generated_image.flatten(0, 1),
             x_pred=pred_fake_image.flatten(0, 1),
@@ -1588,6 +1755,7 @@ class ActionForcingDMD(SelfForcingModel):
             alphas_cumprod=self.scheduler.alphas_cumprod,
             timestep=critic_timestep.flatten(0, 1),
             flow_pred=flow_pred,
+            gradient_mask=critic_grad_mask,
         )
 
         # Surface the rollout's last-chunk MAE (computed by the pipeline
@@ -2115,17 +2283,18 @@ class ActionForcingDMD(SelfForcingModel):
         """
         s = self.streaming_state
         gradient_mask = info["gradient_mask"]
-
-        # Apply the heatmap_out_noise_bar mask on top of streaming's
-        # per-frame mask (intersect — both must be True for grad flow).
-        if bool(getattr(self, "heatmap_out_noise_bar", False)) and chunk.shape[1] >= 1:
-            full_mask = gradient_mask.clone() if gradient_mask is not None else torch.ones(
-                chunk.shape, dtype=torch.bool, device=chunk.device,
-            )
-            full_mask[:, 0, :, :2, :] = False
-            gradient_mask_eff = full_mask
-        else:
-            gradient_mask_eff = gradient_mask
+        # AND-in the canonical last-chunk boundary mask. Streaming's
+        # per-iter ``gradient_mask`` is True only on the new frames
+        # within the overlap-chunk window; the last-chunk mask further
+        # zeroes out the structurally-OOD positions [N, N+shift) of the
+        # noisy half. Same mask used in the legacy gen step.
+        last_chunk_mask = self._dmd_score_grad_mask(
+            chunk.shape, chunk.device,
+        )
+        gradient_mask_eff = (
+            (gradient_mask & last_chunk_mask) if gradient_mask is not None
+            else last_chunk_mask
+        )
 
         clean_x_self = self._streaming_build_clean_x_self(chunk, info)
         clean_x_GT = (
@@ -2149,6 +2318,27 @@ class ActionForcingDMD(SelfForcingModel):
             build_real_view=True,
         )
 
+        # Teacher-freeze gt_target for streaming: GT video at the
+        # chunk's noisy_x positions (= ride_latents_window indices
+        # [cf + noisy_start_sdn : cf + noisy_start_sdn + chunk_size]).
+        # ``noisy_start_sdn = current_length - new_frames - overlap``
+        # already accounts for the iter's overlap region. No-op when
+        # the feature is off.
+        gt_target = None
+        if bool(getattr(self, "teacher_freeze_detect_enabled", False)):
+            cf_state = int(s["cf"])
+            chunk_size_state = int(s["chunk_size"])
+            noisy_start_sdn = int(
+                s["current_length"]
+                - info["new_frames"]
+                - info["overlap"]
+            )
+            ride_window = s["ride_latents_window"]
+            chunk_lo = cf_state + noisy_start_sdn
+            chunk_hi = chunk_lo + chunk_size_state
+            if ride_window.shape[1] >= chunk_hi:
+                gt_target = ride_window[:, chunk_lo:chunk_hi]
+
         dmd_loss, dmd_log = self.compute_distribution_matching_loss(
             image_or_video=chunk,
             conditional_dict=cond_for_scoring,
@@ -2157,11 +2347,12 @@ class ActionForcingDMD(SelfForcingModel):
             denoised_timestep_from=info.get("denoised_timestep_from"),
             denoised_timestep_to=info.get("denoised_timestep_to"),
             clean_x=sc_clean_x, aug_t=sc_aug_t,
+            gt_target=gt_target,
             clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
         )
         dmd_loss = dmd_loss * self.dmd_loss_weight
 
-        for k in ("baseline_last_chunk_mae", "last_chunk_mae", "mae_extension_count"):
+        for k in ("baseline_last_chunk_mae", "baseline_avg_rollout_mae", "last_chunk_mae", "mae_extension_count"):
             if k in info:
                 dmd_log[k] = info[k]
         dmd_log["streaming_new_frames"] = float(info["new_frames"])
@@ -2183,7 +2374,18 @@ class ActionForcingDMD(SelfForcingModel):
             chunk = chunk.detach()
 
         s = self.streaming_state
-        gradient_mask = info["gradient_mask"]
+        # AND-in the canonical last-chunk boundary mask. Streaming's
+        # per-iter ``gradient_mask`` is True only on the new frames
+        # within the overlap-chunk window; the last-chunk mask further
+        # zeroes out the structurally-OOD positions [N, N+shift).
+        last_chunk_mask = self._dmd_score_grad_mask(
+            chunk.shape, chunk.device,
+        )
+        per_iter_mask = info["gradient_mask"]
+        gradient_mask = (
+            (per_iter_mask & last_chunk_mask) if per_iter_mask is not None
+            else last_chunk_mask
+        )
         cond_for_scoring, _uncond = self._streaming_noisy_cond_slice(info)
 
         # Build clean_x for the fake_score's TF half — same self-view
@@ -2268,7 +2470,7 @@ class ActionForcingDMD(SelfForcingModel):
             "streaming_new_frames": float(info["new_frames"]),
             "streaming_current_length": float(info["current_length"]),
         }
-        for k in ("baseline_last_chunk_mae", "last_chunk_mae", "mae_extension_count"):
+        for k in ("baseline_last_chunk_mae", "baseline_avg_rollout_mae", "last_chunk_mae", "mae_extension_count"):
             if k in info:
                 critic_log[k] = info[k]
         return denoising_loss, critic_log

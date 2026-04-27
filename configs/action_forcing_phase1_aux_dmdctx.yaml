@@ -283,8 +283,7 @@ nccl_timeout_minutes: 60
 # raises if anything else is supplied.
 dmd_context: "GT"            # "GT" | "self"
 dmd_context_clean_frames: 9  # KV-cache seed prefill size (= 3 chunks of npb=3)
-clean_x_aug_t: 20            # small noise on real_score's GT clean_x in "GT" mode (symmetry-breaking; ignored in "self")
-heatmap_out_noise_bar: true  # mask rows 0-1 of frame 0 in DMD gen step (v14 LoRA boundary artifact)
+clean_x_aug_t: 0            # small noise on real_score's GT clean_x in "GT" mode (symmetry-breaking; ignored in "self")
 
 # ---------------------------------------------------------------------------
 # R3GAN + SC-DMD — OFF (this is a clean dmd_context A/B vs aux baseline).

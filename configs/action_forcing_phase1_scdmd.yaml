@@ -77,8 +77,8 @@
 # are NOT wired in by ``model/dmd_action_forcing.py`` (Phase-1
 # Action-Forcing is pure DMD).
 
-config_name: action-forcing-phase1
-run_name: action_forcing_phase1
+config_name: action-forcing-phase1-scdmd
+run_name: action_forcing_phase1_scdmd
 
 seed: 0
 mixed_precision: true
@@ -451,8 +451,17 @@ dmd_context: "GT"
 dmd_context_clean_frames: 9
 clean_x_aug_t: 0
 
-# GAN dropped (parity with staircase config + CF).
+# GAN OFF (this config is defaults + SC-DMD only).
+gan_enabled: false
 gan_loss_weight: 0.0
+
+# SC-DMD (Salt) — semigroup defect regularizer.
+# Full recipe ported verbatim from action_forcing_phase1_aux_scdmd.yaml;
+# only difference is that this config does NOT enable the action
+# critic / motion teacher — pure DMD + SC-DMD (no z-guidance).
+sc_dmd_enabled: true
+sc_dmd_loss_weight: 0.05      # ~5% of DMD's typical magnitude at steady state
+sc_dmd_warmup_steps: 500      # linear ramp 0 → sc_dmd_loss_weight
 
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).

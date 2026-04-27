@@ -77,8 +77,8 @@
 # are NOT wired in by ``model/dmd_action_forcing.py`` (Phase-1
 # Action-Forcing is pure DMD).
 
-config_name: action-forcing-phase1
-run_name: action_forcing_phase1
+config_name: action-forcing-phase1-freeze
+run_name: action_forcing_phase1_freeze
 
 seed: 0
 mixed_precision: true
@@ -450,6 +450,28 @@ min_score_timestep: 0
 dmd_context: "GT"
 dmd_context_clean_frames: 9
 clean_x_aug_t: 0
+
+# Teacher-freeze detection — defaults sbatch's only delta. The v14
+# real_score occasionally outputs a single hazy/frozen latent frame
+# (visible in ``_diag_p1/out/F_real_GT.mp4`` at ~3 s). Letting DMD
+# score against it pulls the student toward the bad teacher pred.
+# Per-frame MAE between ``pred_real_image`` and the GT video at the
+# noisy_x positions is computed; frames with MAE > threshold *
+# median(MAE) are masked out of the DMD gradient.
+#
+# threshold=2.0 ⇒ flag a frame only when its MAE is at least 2× the
+# median across the 21-frame chunk — robust to the all-frames-similar
+# case (no false positives when the teacher is uniformly OK), tight
+# enough to catch single-frame freezes (a hazy frame typically has
+# MAE 3-5× the median).
+#
+# Per-iter wandb metrics (in the ``gen/`` namespace):
+#   gen/teacher_freeze_count       (int, frames flagged this iter)
+#   gen/teacher_freeze_rate        (fraction of B*F frames flagged)
+#   gen/teacher_freeze_max_mae     (max per-frame MAE in this iter)
+#   gen/teacher_freeze_median_mae  (median per-frame MAE)
+teacher_freeze_detect_enabled: true
+teacher_freeze_threshold: 2.0
 
 # GAN dropped (parity with staircase config + CF).
 gan_loss_weight: 0.0

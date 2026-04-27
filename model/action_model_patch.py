@@ -37,9 +37,63 @@ except Exception:  # pragma: no cover
 from wan.modules.causal_model import (
     _separate_action_tokens,
     _merge_action_tokens,
+    CausalWanModel,
 )
 from wan.modules.attention import flash_attention
 from wan.modules.model import rope_apply, sinusoidal_embedding_1d
+from torch.nn.attention.flex_attention import BlockMask, flex_attention as _flex_attention_raw
+
+# Compiled flex_attention (mirrors v14's compile in causal_model.py:28).
+# Available as a utility for any code path that wants to apply a structured
+# block_mask. NOTE: the bidirectional DMD scorers (real_score / fake_score)
+# in this module DO NOT use it — they always run full-bidir
+# ``flash_attention`` (no causal mask, no TF mask). The v14 LoRA training
+# itself and the causal student's teacher-forcing training continue to use
+# ``CausalWanModel._prepare_teacher_forcing_mask`` upstream.
+_flex_attention_compiled = torch.compile(
+    _flex_attention_raw, dynamic=False, mode="max-autotune-no-cudagraphs"
+)
+
+
+def _prepare_tf_block_mask_cached(
+    model,
+    device,
+    num_frames: int,
+    frame_seqlen: int,
+    num_frame_per_block: int,
+    context_shift: int,
+) -> BlockMask:
+    """Build (or fetch from cache) the v14 teacher-forcing block_mask
+    used by the upstream causal-Wan training (``CausalWanModel._forward_train``)
+    and the v14 LoRA's training. Provided here as a thin caching wrapper
+    around ``CausalWanModel._prepare_teacher_forcing_mask`` for any caller
+    that needs it.
+
+    NOT used by the bidirectional DMD scorers in this module — those run
+    full-bidir ``flash_attention``. Kept as a utility so the v14 / causal-
+    teacher training paths can share a cached BlockMask without rebuilding
+    per forward (the BlockMask construction allocates a transient
+    ~total_length²/128² intermediate, so caching matters).
+    """
+    cache = getattr(model, "_tf_block_mask_cache", None)
+    if cache is None:
+        cache = {}
+        model._tf_block_mask_cache = cache
+    key = (int(num_frames), int(frame_seqlen), int(num_frame_per_block),
+           int(context_shift), str(device))
+    bm = cache.get(key)
+    if bm is not None:
+        return bm
+    bm = CausalWanModel._prepare_teacher_forcing_mask(
+        device,
+        num_frames=int(num_frames),
+        frame_seqlen=int(frame_seqlen),
+        num_frame_per_block=int(num_frame_per_block),
+        context_shift=int(context_shift),
+    )
+    cache[key] = bm
+    return bm
+
 
 def _patch_time_projection(model):
     if getattr(model, "_action_tp_patched", False):
@@ -166,7 +220,6 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
         attn.action_tokens_per_frame = 0
     if not hasattr(attn, "tf_rope_offset"):
         attn.tf_rope_offset = 0
-
     orig_forward = attn.forward
 
     def forward_with_action(self_attn, x, seq_lens, grid_sizes, freqs):
@@ -257,6 +310,11 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
         else:
             rq, rk = rq_valid, rk_valid
 
+        # FUNDAMENTAL: bidirectional DMD scorers always use full-bidir
+        # ``flash_attention`` — never restrict their attention. The v14
+        # TF causal block_mask path was deliberately removed (it was
+        # over-constraining clean→noisy info flow vs the actual v14
+        # training contract).
         x_out = flash_attention(
             q=rq.type_as(v),
             k=rk.type_as(v),
@@ -375,6 +433,7 @@ def _bidir_forward_with_action_tokens(
     # Interleave action tokens per frame.
     spatial_seqlen = int(math.prod(grid_sizes[0][1:]).item())
     num_frames_local = int(grid_sizes[0, 0].item())
+    frame_seqlen_local = spatial_seqlen + a_per_f
     expected_at_frames = action_tokens.shape[1]
     if expected_at_frames != num_frames_local:
         raise RuntimeError(
@@ -441,17 +500,29 @@ def _bidir_forward_with_action_tokens(
         x = [torch.cat([cu, nu], dim=1) for cu, nu in zip(clean_x_interleaved, x)]
 
     seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-    # Extend pad target to fit the interleaved sequence (caller's seq_len
-    # tracks the spatial-only capacity for the NOISY half only). When
-    # clean_x is present the joint sequence is twice as long.
-    half_pad = seq_len + num_frames_local * a_per_f
-    pad_target = half_pad * (2 if clean_x is not None else 1)
+    # Extend pad target to fit the interleaved sequence. In TF mode
+    # (clean_x present) we use EXACTLY the natural joint length
+    # ``2 * F * frame_seqlen_local`` — no outer padding past the
+    # interleaved tokens. This is essential for the v14 TF block_mask:
+    # the mask is built for Q_LEN = ceil(2*F*frame_seqlen/128)*128, so
+    # if we add more outer padding here the per-block flex_attention
+    # call will pad to a different multiple-of-128 and the mask shape
+    # will mismatch the q/k length.
+    # In non-TF mode we keep the historical padding (caller's seq_len
+    # tracks the spatial-only capacity, and we still add the per-frame
+    # action-token slots on top).
+    natural_joint = num_frames_local * frame_seqlen_local * (2 if clean_x is not None else 1)
+    if clean_x is not None:
+        pad_target = natural_joint
+    else:
+        half_pad = seq_len + num_frames_local * a_per_f
+        pad_target = half_pad
     if int(seq_lens.max().item()) > pad_target:
         raise RuntimeError(
             f"interleaved seq_lens.max()={int(seq_lens.max().item())} "
-            f"exceeds pad_target={pad_target} (seq_len={seq_len} + "
-            f"F*a_per_f={num_frames_local * a_per_f}, "
-            f"doubled for clean_x={clean_x is not None})"
+            f"exceeds pad_target={pad_target} (TF={clean_x is not None}, "
+            f"natural_joint={natural_joint}, seq_len={seq_len}, "
+            f"F*a_per_f={num_frames_local * a_per_f})"
         )
     x = torch.cat(
         [
@@ -513,15 +584,18 @@ def _bidir_forward_with_action_tokens(
         context_clip = self.img_emb(clip_fea)
         context = torch.concat([context_clip, context], dim=1)
 
-    # Propagate a_per_f and tf_rope_offset to each block's self_attn
-    # (blocks were patched at model-patch time; attributes need a refresh
-    # per forward because they may change between forwards of the same
-    # model instance — TF vs non-TF, and the offset may vary by config).
+    # Propagate a_per_f and tf_rope_offset to each block's self_attn.
     # In TF mode tf_rope_offset_frames = dmd_context_clean_frames (= cf,
     # in latent frames), so the noisy half is RoPE-positioned at
-    # [cf, cf + F) while the clean half stays at [0, F) — preserving v14's
-    # training contract. The caller (ActionForcingDMD) sets
-    # ``model.tf_rope_offset_frames`` when it sets ``context_shift``.
+    # [cf, cf + F) while the clean half stays at [0, F) — preserving
+    # v14's RoPE convention.
+    #
+    # FUNDAMENTAL: bidirectional DMD scorers ALWAYS use full-bidir
+    # ``flash_attention``. We do NOT build or apply a causal block_mask
+    # here. The causal-Wan student's TF training and the v14 LoRA's own
+    # training continue to use the upstream block_mask path
+    # (``CausalWanModel._prepare_teacher_forcing_mask``) — that's
+    # untouched. Only the DMD scorers' joint forward is unmasked.
     if clean_x is not None:
         tf_rope_offset = int(getattr(self, "tf_rope_offset_frames", 0))
         if tf_rope_offset <= 0:

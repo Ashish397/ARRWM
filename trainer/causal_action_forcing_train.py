@@ -413,8 +413,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # uses ``model.setup_sequence`` / ``generate_next_chunk`` /
         # ``compute_*_loss_streaming`` instead of the legacy single-
         # iter ``generator_loss`` / ``critic_loss`` flow.
+        # FUNDAMENTAL: defaults to True. Set ``streaming_mode: false``
+        # in the YAML to fall back to the legacy single-batch path.
         self.streaming_mode: bool = bool(
-            getattr(self.config, "streaming_mode", False)
+            getattr(self.config, "streaming_mode", True)
         )
         self.streaming_max_length: int = int(
             getattr(self.config, "streaming_max_length", 57)
@@ -1772,7 +1774,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if train_generator:
             aux_active = (
                 self.action_critic_loss_active
-                and getattr(self, "action_teacher_enabled", False)
                 and self.critic_optimizer is not None
             )
             gan_active = (
@@ -1912,7 +1913,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # student collapsed on this ride — close the sequence so
             # next iter pulls a fresh ride. Current chunk still trained
             # (gradient already accumulated via .backward()).
-            mae = float(gen_log.get("baseline_last_chunk_mae", float("nan")))
+            mae = float(gen_log.get("baseline_avg_rollout_mae", float("nan")))
             if (
                 self.collapse_mae_threshold is not None
                 and mae == mae
@@ -1936,7 +1937,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 for k, v in critic_log.items()
                 if not isinstance(v, dict)
             })
-            mae = float(critic_log.get("baseline_last_chunk_mae", float("nan")))
+            mae = float(critic_log.get("baseline_avg_rollout_mae", float("nan")))
             if (
                 self.collapse_mae_threshold is not None
                 and mae == mae
@@ -1994,12 +1995,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # dmd_context window layout (single source of truth, all lengths
         # in latent frames; `cf` = ``self.model.dmd_context_clean_frames``
         # = KV-cache seed prefill, default 9; `shift` = num_frame_per_block
-        # = clean/noisy shift, hardcoded to 1 chunk):
+        # = clean/noisy shift, hardcoded to 1 chunk; `anchor` = ``shift`` =
+        # leading clean_x_self anchor chunk, ONCE per ride at the FRONT):
         #
-        #   ride[s : s+cf]                  → seed_latents (KV-cache prefill at t=0)
-        #   ride[s+cf : s+cf+rollout_window] → student rollout target
-        #   ride[s+cf-shift : s+cf+N-shift] → clean_x_GT (= rollout-window
-        #                                     shifted back by 1 chunk)
+        #   ride[s : s+cf]                          → seed_latents (KV prefill at t=0)
+        #   ride[s+cf : s+cf+anchor]                → leading anchor chunk (rolled, scored later)
+        #   ride[s+cf+anchor : s+cf+anchor+N]       → noisy_x target window
+        #   ride[s+cf : s+cf+N]                     → clean_x_GT (= same as
+        #                                              the rollout's leading
+        #                                              N frames; pure
+        #                                              student-rolled in
+        #                                              clean_x_self mode,
+        #                                              GT in clean_x_GT mode)
         #
         # ``s`` is sampled uniformly from ``[0, ride_len // 2]`` per iter
         # (clamped down so ``s + cf + rollout_window ≤ ride_len``). DDP
@@ -2007,13 +2014,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # the resulting cross-rank diversity.
         npb = int(getattr(self.config, "num_frame_per_block", 3))
         shift = npb  # clean/noisy shift; always 1 chunk, never configurable
+        anchor = int(
+            getattr(self.model, "dmd_clean_x_anchor_frames", npb)
+        )  # leading clean_x_self anchor; hardcoded to npb (= shift)
 
         ride = self._next_ride(rollout_frames + cf_dmdctx)
         if ride is None:
             return None
 
         ride_len = int(ride["latents"].shape[1])
-        max_rollout_window = max_total_rollout_frames
+        # Total rolled length includes the leading anchor chunk
+        # (= ``anchor`` = npb frames at the front so batch-1 clean_x_self
+        # is purely student-rolled, no seed dip). Once per ride.
+        max_rollout_window = max_total_rollout_frames + anchor
 
         # Random offset s ∈ [0, min(ride_len // 2, ride_len - cf - max_rollout_window)].
         # Each rank loads a different ride with a different ride_len,
@@ -2078,11 +2091,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if cf_dmdctx > 0:
             seed_latents = ride["latents"][:, s : s + cf_dmdctx].contiguous()
 
-        # ``clean_x_GT`` window = the noisy_x window shifted back by
-        # ``shift`` frames (= 1 chunk). For ``cf=9, shift=3, s=0`` this is
-        # ``ride[6:27]``. For the legacy ``cf=shift`` regime this collapses
-        # to ``ride[s : s+N]`` (the historical slice). The clean cond
-        # streams cover the same time positions.
+        # ``clean_x_GT`` window = the leading N frames of the rollout
+        # (= ``ride[s+cf : s+cf+N]``). With the +anchor leading chunk
+        # at the FRONT of the rollout, this slice is fully inside the
+        # rolled-out range — clean leads noisy by ``shift=npb`` frames
+        # WITHIN the rollout (clean=[s+cf : s+cf+N], noisy=[s+cf+anchor :
+        # s+cf+anchor+N]) so no seed dip is needed.
         clean_context_latents = None
         clean_conditional_dict = None
         clean_unconditional_dict = None
@@ -2090,7 +2104,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             num_training_frames = int(getattr(
                 self.config, "num_training_frames", 21,
             ))
-            clean_start = s + cf_dmdctx - shift
+            clean_start = s + cf_dmdctx
             clean_end = clean_start + num_training_frames
             clean_context_latents = ride["latents"][:, clean_start : clean_end]
             clean_actions = ride["z_actions"][:, clean_start : clean_end]
@@ -2101,21 +2115,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
             )
 
-        # ``image_or_video_shape`` is the BASELINE rollout shape — the
-        # pipeline allocates noise from this and then samples extension
-        # noise inline. ``clean_latent`` covers the full extended
-        # window so the pipeline's MAE check (at frames
-        # [rollout_frames - npb : rollout_frames] for the baseline,
-        # and [rollout_frames + k*npb : rollout_frames + (k+1)*npb]
-        # for the k-th extension) has GT available.
+        # ``image_or_video_shape`` is the TOTAL rolled shape (= scoring
+        # window + leading anchor). ``_run_generator`` validates against
+        # ``self.rollout_frames + self.dmd_clean_x_anchor_frames`` and
+        # slices the pred into noisy_x (last N) and clean_x_self anchor
+        # (first N).
         image_or_video_shape = [
-            latents.shape[0], rollout_frames, *latents.shape[2:]
+            latents.shape[0], rollout_frames + anchor, *latents.shape[2:]
         ]
 
         if train_generator:
             aux_active = (
                 self.action_critic_loss_active
-                and getattr(self, "action_teacher_enabled", False)
                 and self.critic_optimizer is not None
             )
             gan_active = (

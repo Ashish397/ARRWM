@@ -1,19 +1,32 @@
-"""Phase-1 DMD diagnostic: 6-test inference matrix on a real ride.
+"""Phase-1 DMD diagnostic: multi-batch (3-rollout) inference matrix.
 
-Tests (all on the same ride, same student rollout):
-  A. Student rolls 21 frames via ActionForcingTrainingPipeline -> student.mp4
-  B. Re-noise student pred, fake_score denoises (no clean_x) -> fake.mp4
-  C. Re-noise student pred, real_score denoises (no clean_x) -> real.mp4
-  D. Re-noise student pred, fake_score denoises with student clean_x -> fake_studentctx.mp4
-  E. Re-noise student pred, real_score denoises with student clean_x -> real_studentctx.mp4
-  F. Re-noise student pred, real_score denoises with GT clean_x -> real_gtctx.mp4
+Rolls the student for ``DIAG_NUM_ROLLOUTS * N`` (= 3 * 21 = 63 by default)
+frames, sliced into ``DIAG_NUM_ROLLOUTS`` consecutive 21-frame DMD scoring
+windows. For each batch we run the standard 6-test matrix (A is the long
+student rollout; B-F are per-batch scorer denoises) and concatenate B-F
+outputs along F to produce a contiguous video of the same length as A.
 
-Goal: see which combination produces sensible video and which produces
-garbage. The DMD gradient = (fake - real) on the same noisy_input is
-what trains the generator. If fake and real agree visually on Tests B/C
-or D/E or D+F, DMD is consistent. If real with GT-context (F) looks
-correct but real with student-context (E) is junk, the dmd_context
-student-context plumbing is broken. Etc.
+Per-batch geometry (matches the trainer's multi-batch contract):
+  i = 1..NUM_ROLLOUTS
+    noisy_x_i  = sdn[(i-1)*N        : i*N        ]   (= 21 frames)
+    clean_x_i  = sdn[(i-1)*N - shift: i*N - shift]   (= shift frames behind)
+  with shift = num_frame_per_block (= 3). For i=1 the clean window dips
+  into the seed prefill (sdn[-3:0] doesn't exist), so clean_x_1's first
+  ``shift`` frames are taken from the GT seed_latents tail — same hack
+  the trainer uses for batch 1.
+
+Each batch's cond_dict re-slices ``z_actions`` so the action streams
+match the absolute ride positions of THAT batch's noisy and clean
+windows. Per-frame timestep is shared across all batches so the
+concatenated B-F videos have a consistent noise level along F.
+
+Knobs:
+  DIAG_NUM_ROLLOUTS  (int, default 3)  — number of N-frame batches.
+  DIAG_RIDE_NAME     (zarr basename)   — fast-path single-ride load.
+  DIAG_RIDE_START    (int, default 0)  — absolute ride offset s.
+  DIAG_BIDIR_TF_NO_MASK=1              — disable v14 TF mask in bidir scorer.
+  DIAG_F_AUG_T       (int, default 20) — clean_x_aug_t in GT mode.
+  DIAG_OUT_SUFFIX    (str)             — suffix appended to mp4 filenames.
 """
 from __future__ import annotations
 
@@ -123,8 +136,9 @@ def _build_config():
     # block exits at the last rung, no random-exit, eval-style).
     # Set DIAG_VIZ_CACHE_PRED=0 to suppress the cache_pred swap and
     # decode the raw exit-rung ``denoised_pred`` instead.
-    if os.environ.get("DIAG_FULL_DENOISE", "0") == "1":
-        cfg.last_step_only = True
+    # if os.environ.get("DIAG_FULL_DENOISE", "0") == "1":
+    #     cfg.last_step_only = True
+    cfg.last_step_only = False
 
     # Optional denoising-schedule override via DIAG_DENOISING_STEPS env
     # (comma-separated floats, e.g. "1000,683,367,50"). Lets us A/B the
@@ -273,172 +287,149 @@ def main():
     log.info("Selected ride: %s n_latent_frames=%d (idx=%d, override=%r)",
              zpath.name, n_lat, chosen_idx, ride_name_override)
 
-    # We need num_training_frames=21 + dmd_context_clean_frames=cf frames of GT.
+    # ---- Multi-batch geometry --------------------------------------------------
+    # Roll ONE EXTRA chunk (= npb frames) at the FRONT of the student
+    # rollout so batch 1's clean_x_i lives entirely in the rolled-out
+    # range — no seed-dip. Per-batch slicing then becomes
+    #   noisy_x_i  = sdn[(i-1)*N + npb : i*N + npb]
+    #   clean_x_i  = sdn[(i-1)*N        : i*N        ]
+    # i.e. clean leads noisy by ``npb`` frames within sdn (matching v14's
+    # context_shift=1-chunk TF contract). For i=1 this gives
+    #   noisy_x_1 = sdn[3:24]  (= ride[s+cf+npb : s+cf+npb+N])
+    #   clean_x_1 = sdn[0:21]  (= ride[s+cf     : s+cf+N    ])
+    # entirely from the student's own rollout — no GT/student quality
+    # discontinuity in the first ``shift`` frames.
     cf = int(cfg.dmd_context_clean_frames)
     N = int(cfg.num_training_frames)
     npb = int(cfg.num_frame_per_block)
-    # Optional ride-start offset (s) so we can probe what happens at
-    # high temporal positions. Default 0 = ride[0:cf+N]. With s=97 we
-    # get noisy_x at ride[100:121], stressing rope_apply's freq table
-    # at higher absolute positions.
+    shift = npb
+    num_rollouts = int(os.environ.get("DIAG_NUM_ROLLOUTS", "3"))
+    if num_rollouts < 1:
+        raise RuntimeError(f"DIAG_NUM_ROLLOUTS must be >= 1, got {num_rollouts}")
+    total_rollout_frames = num_rollouts * N + npb  # +npb extra leading chunk for clean_x_1
     s = int(os.environ.get("DIAG_RIDE_START", "0"))
-    need = s + cf + N
+    need = s + cf + total_rollout_frames
     if need > n_lat:
         raise RuntimeError(
-            f"ride {zpath.name} only has {n_lat} latent frames, need s+cf+N={need} "
-            f"(s={s} cf={cf} N={N}). Pick a longer ride or smaller s."
+            f"ride {zpath.name} only has {n_lat} latent frames, need "
+            f"s+cf+(num_rollouts*N+npb)={need} (s={s} cf={cf} N={N} "
+            f"num_rollouts={num_rollouts} npb={npb}). Pick a longer ride."
         )
 
     latents_full = ZarrRideDataset.load_latent_chunk(str(zpath), 0, need).unsqueeze(0).to(device=device, dtype=dtype)
     z_actions_full = ds.encode_z_actions_window(str(zpath), need, 0, need)
     action_dims = list(getattr(cfg, "action_dims", [2, 7]))
     z_actions_full = z_actions_full[..., action_dims].unsqueeze(0).to(device=device, dtype=dtype)
-    # Slice down to the cf+N window starting at offset s.
-    latents = latents_full[:, s:s + cf + N]
-    z_actions = z_actions_full[:, s:s + cf + N]
+    # Slice ride to [s : s + cf + total_rollout_frames].
+    latents = latents_full[:, s:s + cf + total_rollout_frames]
+    z_actions = z_actions_full[:, s:s + cf + total_rollout_frames]
     prompt_embeds = prompt_embeds.unsqueeze(0).to(device=device, dtype=dtype) if prompt_embeds.dim() == 2 else prompt_embeds.to(device=device, dtype=dtype)
 
-    log.info("ride_start s=%d (noisy_x at absolute frames [%d:%d])", s, s+cf, s+cf+N)
-    log.info("latents=%s z_actions=%s prompt_embeds=%s", tuple(latents.shape), tuple(z_actions.shape), tuple(prompt_embeds.shape))
-
-    # GT slices.
-    # Seed              = ride[s : s+cf]                          (cf GT frames, KV-cache prefill at t=0)
-    # Noisy_x window    = ride[s+cf : s+cf+N]                     (N=21 frames the student rolls)
-    # Clean context     = ride[s+cf-shift : s+cf+N-shift]         (N-frame view shifted back by 1 chunk = ``shift`` frames)
-    # ``shift`` is hardcoded to ``num_frame_per_block`` (= 1 chunk = 3 frames)
-    # to match the model — separate from ``cf`` (which is the seed prefill size).
-    shift = npb
-    seed_latents = latents[:, :cf]                                            # [1, cf, 16, h, w]
-    gt_noisy_window_latents = latents[:, cf : cf + N]                         # [1, 21, 16, h, w]
-    gt_noisy_window_actions = z_actions[:, cf : cf + N]                       # [1, 21, A]
-    gt_clean_context_latents = latents[:, cf - shift : cf + N - shift]        # [1, 21, 16, h, w]
-    gt_clean_context_actions = z_actions[:, cf - shift : cf + N - shift]      # [1, 21, A]
-
-    # Build conditional dicts for the noisy half (student rollout)
-    cond_noisy, uncond_noisy = model.build_action_conditional(
-        prompt_embeds=prompt_embeds,
-        gt_actions=gt_noisy_window_actions,
-    )
-    # Build conditional dicts for the clean half (used by dmd_context tests)
-    cond_clean, uncond_clean = model.build_action_conditional(
-        prompt_embeds=prompt_embeds,
-        gt_actions=gt_clean_context_actions,
-    )
-    # Build conditional dicts over the FULL ride window (seed + rollout =
-    # cf + N frames) — pipeline needs per-frame action streams covering
-    # both the seed prefill forwards and the rollout chunks.
-    full_actions = z_actions[:, : cf + N]
-    cond_full, uncond_full = model.build_action_conditional(
-        prompt_embeds=prompt_embeds,
-        gt_actions=full_actions,
-    )
-
-    # Reference MAE: between the SHIFTED clean GT and the noised target
-    # the scorer actually sees. Decomposes into three contributors so
-    # we can attribute scorer error to noise vs. content-shift vs. pred-
-    # error separately. Computed AFTER noisy_input is constructed (see
-    # below).
-    _gt_window_mae = float(
-        (gt_clean_context_latents.float() - gt_noisy_window_latents.float()).abs().mean().item()
-    )
     log.info(
-        "MAE(gt_clean_context [s:s+N], gt_noisy_window [s+cf:s+cf+N]) = %.4f "
-        "(scene shift over cf=%d frames at ride positions [%d:%d] vs [%d:%d])",
-        _gt_window_mae, cf, s, s+N, s+cf, s+cf+N,
+        "ride_start s=%d  num_rollouts=%d  total_rollout=%d frames "
+        "(= %d chunks of %d). seed prefill = %d frames (cf).",
+        s, num_rollouts, total_rollout_frames, total_rollout_frames // npb, npb, cf,
+    )
+    log.info("latents=%s z_actions=%s prompt_embeds=%s",
+             tuple(latents.shape), tuple(z_actions.shape), tuple(prompt_embeds.shape))
+
+    seed_latents = latents[:, :cf]  # [1, cf, 16, h, w]
+
+    # cond_dicts spanning the FULL window (seed + rollout) — pipeline
+    # needs per-frame action streams covering the seed prefill forwards
+    # AND every rollout chunk.
+    full_actions = z_actions[:, : cf + total_rollout_frames]
+    cond_full, _ = model.build_action_conditional(
+        prompt_embeds=prompt_embeds, gt_actions=full_actions,
     )
 
-    # ---- Test A: roll the student (N=21 frames = 7 chunks) with seed prefill -----
+    # ---- Test A: roll the student for total_rollout_frames frames -------------
     log.info("=" * 60)
     log.info("Test A: student rollout (%d frames, %d chunks) WITH cf=%d-frame KV-cache prefill",
-             N, N // npb, cf)
+             total_rollout_frames, total_rollout_frames // npb, cf)
     torch.manual_seed(0)
     noise = torch.randn(
-        [1, N, *latents.shape[2:]],
+        [1, total_rollout_frames, *latents.shape[2:]],
         dtype=dtype, device=device,
     )
-    # By default the pipeline writes the FULLY-DENOISED ``cache_pred``
-    # (post no-grad continuation past the random exit rung) to
-    # ``output[]`` instead of the grad-active exit-rung
-    # ``denoised_pred`` — gives a crisp diagnostic mp4 even with
-    # random-rung exit. Set ``DIAG_VIZ_CACHE_PRED=0`` to render the
-    # raw exit-rung ``denoised_pred`` (= what training sees as
-    # ``pred_image``); invalid for training (no gradient signal in
-    # cache_pred), only intended for diagnostic visualisation.
     _viz_cache_pred = os.environ.get("DIAG_VIZ_CACHE_PRED", "1") == "1"
     with torch.no_grad():
-        student_pred, denoised_t_from, denoised_t_to = pipe.inference_with_trajectory(
+        student_full, denoised_t_from, denoised_t_to = pipe.inference_with_trajectory(
             noise=noise, gt_latents=None, enable_mae_extension=False,
             seed_latents=seed_latents,
             prefer_cache_pred_in_output=_viz_cache_pred,
             **cond_full,
         )
-    log.info("student_pred shape=%s mean=%.3f std=%.3f", tuple(student_pred.shape), float(student_pred.mean()), float(student_pred.std()))
+    log.info("student_full shape=%s mean=%.3f std=%.3f",
+             tuple(student_full.shape), float(student_full.mean()), float(student_full.std()))
     log.info("denoised_t [%s, %s]", denoised_t_from, denoised_t_to)
-    log.info("GT slice    mean=%.3f std=%.3f", float(gt_noisy_window_latents.float().mean()), float(gt_noisy_window_latents.float().std()))
 
     out_dir = _REPO / "_diag_p1" / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    student_uint8 = _decode_to_uint8(student_pred, model.vae)
-    _write_mp4(out_dir / f"A_student{out_suffix}.mp4", student_uint8)
+    # A_student.mp4 = the NOISY-X span of the rollout (= student_full[npb:],
+    # same num_rollouts * N = 63 frames the scorers operate on). Skips the
+    # leading ``npb``-frame extra chunk that anchors batch 1's clean_x.
+    _write_mp4(out_dir / f"A_student{out_suffix}.mp4",
+               _decode_to_uint8(student_full[:, npb:], model.vae))
 
-    # Also save GT for visual reference
-    gt_uint8 = _decode_to_uint8(gt_noisy_window_latents, model.vae)
-    _write_mp4(out_dir / "_gt_noisy_window.mp4", gt_uint8)
-    gt_clean_uint8 = _decode_to_uint8(gt_clean_context_latents, model.vae)
-    _write_mp4(out_dir / "_gt_clean_context.mp4", gt_clean_uint8)
+    # GT reference video aligned with A's NOISY-X span
+    # (= ride[s+cf+npb : s+cf+total_rollout]).
+    _write_mp4(out_dir / f"_gt_rollout_window{out_suffix}.mp4",
+               _decode_to_uint8(latents[:, cf + npb:], model.vae))
 
-    # ---- Pick a DMD timestep and re-noise student_pred once -----
-    # Use the same noisy_input for all denoise tests so they're directly comparable.
+    # ---- Pick ONE shared DMD timestep + ONE shared noise tensor for B-F --------
+    # Shared across all batches so the concatenated B-F outputs have a
+    # consistent noise level along F (otherwise per-batch t differences
+    # cause visible discontinuities at chunk boundaries).
     log.info("=" * 60)
-    log.info("Sampling shared DMD timestep + noising student pred for Tests B-F")
+    log.info("Sampling shared DMD timestep + per-frame noise for tests B-F")
     with torch.no_grad():
-        timestep = model._sample_dmd_timestep(
-            batch_size=1, num_frame=N,
+        timestep_full = model._sample_dmd_timestep(
+            batch_size=1, num_frame=total_rollout_frames,
             denoised_timestep_from=denoised_t_from, denoised_timestep_to=denoised_t_to,
             device=device,
         )
-        log.info("DMD timestep[0,0]=%d (shape=%s)", int(timestep[0, 0]), tuple(timestep.shape))
-        noise_for_dmd = torch.randn_like(student_pred)
-        noisy_input = model.scheduler.add_noise(
-            student_pred.flatten(0, 1), noise_for_dmd.flatten(0, 1), timestep.flatten(0, 1),
-        ).unflatten(0, (1, N))
-        log.info("noisy_input mean=%.3f std=%.3f", float(noisy_input.float().mean()), float(noisy_input.float().std()))
+        # Reuse the FIRST sampled t across all frames for visual consistency.
+        t0 = int(timestep_full[0, 0].item())
+        timestep_full = torch.full(
+            (1, total_rollout_frames), fill_value=t0, dtype=torch.long, device=device,
+        )
+        log.info("DMD timestep (shared) = %d", t0)
+        noise_for_dmd_full = torch.randn(
+            [1, total_rollout_frames, *latents.shape[2:]],
+            dtype=dtype, device=device,
+        )
+        noisy_input_full = model.scheduler.add_noise(
+            student_full.flatten(0, 1),
+            noise_for_dmd_full.flatten(0, 1),
+            timestep_full.flatten(0, 1),
+        ).unflatten(0, (1, total_rollout_frames))
+        # GT clean_x (shifted-back) noise — pre-sample for all frames so
+        # batches share the noise pattern.
+        aug_t_gt_val = int(os.environ.get(
+            "DIAG_F_AUG_T",
+            str(int(getattr(cfg, "clean_x_aug_t", 20))),
+        ))
+        log.info("F clean_x aug_t = %d", aug_t_gt_val)
 
-        # MAE decomposition. Three lines — what the scorer must bridge:
-        #  1) shifted_clean → noisy_input (= total gap between real_score's
-        #     "GT" mode clean_x and the noisy target it's denoising)
-        #  2) gt_noisy_window → noisy_input (= no-shift; pure pred-error +
-        #     scheduler noise. gt_noisy_window is the CLEAN GT version
-        #     of the same time positions as noisy_input.)
-        #  3) gt_noisy_window → noised(gt_noisy_window) at the SAME t (=
-        #     pure scheduler-noise contribution, isolated)
-        gt_noisy_window_noised = model.scheduler.add_noise(
-            gt_noisy_window_latents.float().flatten(0, 1),
-            torch.randn_like(gt_noisy_window_latents.float()).flatten(0, 1),
-            timestep.flatten(0, 1),
-        ).unflatten(0, (1, N))
-        mae_shifted_vs_noisy = float(
-            (gt_clean_context_latents.float() - noisy_input.float()).abs().mean().item()
-        )
-        mae_gtwin_vs_noisy = float(
-            (gt_noisy_window_latents.float() - noisy_input.float()).abs().mean().item()
-        )
-        mae_pure_noise = float(
-            (gt_noisy_window_latents.float() - gt_noisy_window_noised.float()).abs().mean().item()
-        )
-        log.info(
-            "MAE breakdown @ t=%d:\n"
-            "  shifted_clean → noisy_input = %.4f  (= scene shift + pred-err + noise)\n"
-            "  gt_noisy_win  → noisy_input = %.4f  (= pred-err + noise; no shift)\n"
-            "  gt_noisy_win  → noised(gt_noisy_win) = %.4f  (= pure scheduler noise)\n"
-            "  scene-shift baseline (clean→noisy_window, both clean) = %.4f",
-            int(timestep[0, 0].item()),
-            mae_shifted_vs_noisy, mae_gtwin_vs_noisy, mae_pure_noise, _gt_window_mae,
-        )
+    aug_t_zero_per_batch = torch.zeros(1, N, dtype=torch.long, device=device)
+    aug_t_gt_per_batch = torch.full(
+        (1, N), fill_value=aug_t_gt_val, device=device, dtype=torch.long,
+    )
+    timestep_per_batch = torch.full(
+        (1, N), fill_value=t0, dtype=torch.long, device=device,
+    )
 
-    def _run_scorer_one_shot(scorer, cond_dict, *, clean_x=None, aug_t=None, label=""):
-        """Single-shot denoise: predict x0 with the scorer at the sampled timestep."""
+    def _merge_clean_streams(cond_noisy_dict, cond_clean_dict):
+        out = dict(cond_noisy_dict)
+        for k, v in cond_clean_dict.items():
+            if k in ("_action_modulation", "_action_tokens"):
+                out[k + "_clean"] = v
+        return out
+
+    def _run_scorer_one_shot(scorer, cond_dict, noisy_input, *, clean_x=None, aug_t=None, label=""):
+        """Single-shot denoise: predict x0 with the scorer at the shared timestep."""
         kwargs = {}
         if clean_x is not None:
             kwargs["clean_x"] = clean_x
@@ -447,137 +438,182 @@ def main():
             _, pred_x0 = scorer(
                 noisy_image_or_video=noisy_input,
                 conditional_dict=cond_dict,
-                timestep=timestep,
+                timestep=timestep_per_batch,
                 **kwargs,
             )
-        log.info("[%s] pred_x0 mean=%.3f std=%.3f abs-diff-vs-student=%.4f",
-                 label, float(pred_x0.float().mean()), float(pred_x0.float().std()),
-                 float((pred_x0.float() - student_pred.float()).abs().mean()))
+        log.info("[%s] pred_x0 mean=%.3f std=%.3f",
+                 label, float(pred_x0.float().mean()), float(pred_x0.float().std()))
         return pred_x0
 
-    # ---- Tests B & C skipped (per user) — go straight to D/E/F. -----
-    fakeB = None
-    realC = None
-
-    # ---- For Tests D-F: dmd_context style. ActionForcingDMD.__init__
-    #      already set context_shift=1 chunk and tf_rope_offset_frames=
-    #      num_frame_per_block on both scorers. No manual override needed.
+    # ---- Per-batch B/C/D/E/F loop ---------------------------------------------
     log.info("=" * 60)
-    log.info("Tests D-F: dmd_context (cs=1 chunk, tf_rope_offset_frames=%d, cf=%d)",
-             npb, cf)
+    log.info("Running %d sequential rollouts (batch i ∈ 1..%d). Per-batch "
+             "noisy_x_i = sdn[(i-1)*N + npb : i*N + npb], clean_x_i = "
+             "sdn[(i-1)*N : i*N] (clean leads noisy by npb=%d in sdn). "
+             "Extra leading +npb chunk in sdn anchors batch-1's clean_x — "
+             "no seed-dip.", num_rollouts, num_rollouts, npb)
 
-    # aug_t for clean_x:
-    #  * fake's clean_x is ALWAYS the unnoised self-view (aug_t=0).
-    #  * real's clean_x in "self" mode = same self-view (aug_t=0).
-    #  * real's clean_x in "GT" mode = scheduler.add_noise(GT, n,
-    #    clean_x_aug_t) — a small symmetry-breaking noise on the GT view.
-    aug_t_zero = torch.zeros(1, N, dtype=torch.long, device=device)
+    fakeB_list, realC_list = [], []
+    fakeD_list, realE_list, realF_list = [], [], []
 
-    # Build the "self" clean_x view for batch-1 of the rollout:
-    # [last seed chunk GT (= last ``shift`` = npb = 3 frames), sdn[:N-shift]=18 frames] = 21 frames.
-    # Same time positions as ride[s+cf-shift : s+cf+N-shift] in absolute coords,
-    # so its action streams are ``gt_clean_context_actions`` (already wired into cond_clean).
-    student_clean_x = torch.cat(
-        [seed_latents[:, -shift:], student_pred[:, : N - shift]], dim=1,
-    ).to(dtype=dtype)
-    log.info(
-        "student_clean_x (self-view, batch-1) shape=%s mean=%.3f std=%.3f",
-        tuple(student_clean_x.shape),
-        float(student_clean_x.float().mean()),
-        float(student_clean_x.float().std()),
-    )
+    for i in range(1, num_rollouts + 1):
+        # ----- per-batch slice indices in sdn (= student_full) and ride.
+        # sdn has total_rollout_frames = num_rollouts*N + npb elements:
+        # the FIRST npb-frame chunk is the "leading" chunk reserved for
+        # batch-1's clean_x; everything past index npb is the noisy_x
+        # span sliced by num_rollouts.
+        noisy_start_sdn = (i - 1) * N + npb        # 3, 24, 45 for i=1..3
+        noisy_end_sdn   = i * N       + npb        # 24, 45, 66
+        clean_start_sdn = noisy_start_sdn - shift   # 0, 21, 42
+        clean_end_sdn   = noisy_end_sdn   - shift   # 21, 42, 63
 
-    # Merge clean cond streams into the noisy cond_dict (model expects
-    # _action_modulation_clean / _action_tokens_clean). The clean
-    # action streams cover ride[0:N] = same time positions as both
-    # student_clean_x (self-view) AND gt_clean_context_latents (GT-view),
-    # so a single cond_clean serves both modes.
-    def _merge_clean_streams(cond_noisy_dict, cond_clean_dict):
-        out = dict(cond_noisy_dict)
-        for k, v in cond_clean_dict.items():
-            if k in ("_action_modulation", "_action_tokens"):
-                out[k + "_clean"] = v
-        return out
+        # absolute ride positions (for picking action streams + GT slices)
+        abs_noisy_start = cf + noisy_start_sdn   # cf+npb, cf+npb+N, cf+npb+2N
+        abs_noisy_end   = cf + noisy_end_sdn
+        abs_clean_start = cf + clean_start_sdn   # cf, cf+N, cf+2N (no seed dip)
+        abs_clean_end   = cf + clean_end_sdn
 
-    cond_for_dmdctx = _merge_clean_streams(cond_noisy, cond_clean)
+        log.info("---- Batch %d ----", i)
+        log.info("  noisy_x_i  = sdn[%d:%d]    (= ride[%d:%d])",
+                 noisy_start_sdn, noisy_end_sdn,
+                 s + abs_noisy_start, s + abs_noisy_end)
+        log.info("  clean_x_i  = sdn[%d:%d]    (= ride[%d:%d])",
+                 clean_start_sdn, clean_end_sdn,
+                 s + abs_clean_start, s + abs_clean_end)
 
-    # Detailed per-frame comparison: clean vs noisy values at the
-    # OVERLAPPING RoPE positions [shift:N] vs [0:N-shift]. Clean is
-    # shifted back by 1 chunk (= ``shift`` = npb), so clean[i] should
-    # equal noisy[i-shift] for i ≥ shift.
-    am = cond_for_dmdctx.get("_action_modulation")
-    am_c = cond_for_dmdctx.get("_action_modulation_clean")
-    at = cond_for_dmdctx.get("_action_tokens")
-    at_c = cond_for_dmdctx.get("_action_tokens_clean")
-    if am is not None and am_c is not None and at is not None and at_c is not None:
-        log.info("PER-FRAME OVERLAP CHECK (clean[i] vs noisy[i-shift], shift=%d):", shift)
-        log.info("  i  |clean_mod-noisy_mod|  |clean_tok-noisy_tok|  clean_mod_norm  clean_tok_norm")
-        for i in range(am_c.shape[1]):
-            cmod = am_c[0, i].float()
-            ctok = at_c[0, i].float()
-            if i >= shift:
-                ndi = i - shift
-                mod_diff = (cmod - am[0, ndi].float()).abs().mean().item()
-                tok_diff = (ctok - at[0, ndi].float()).abs().mean().item()
-                log.info("  %2d  %20.6f  %20.6f  %14.4f  %14.4f",
-                         i, mod_diff, tok_diff,
-                         cmod.abs().mean().item(), ctok.abs().mean().item())
-            else:
-                log.info("  %2d  %20s  %20s  %14.4f  %14.4f  (clean-only, no noisy counterpart)",
-                         i, "—", "—",
-                         cmod.abs().mean().item(), ctok.abs().mean().item())
+        # ----- noisy_x_i: re-noised student rollout slice (shared noise/t)
+        noisy_input_i = noisy_input_full[:, noisy_start_sdn:noisy_end_sdn].contiguous()
+        student_pred_i = student_full[:, noisy_start_sdn:noisy_end_sdn].contiguous()
 
-    # ---- Test D: fake_score with self-view clean_x (batch-1) -----
-    log.info("Test D: fake_score with SELF-view clean_x")
-    fakeD = _run_scorer_one_shot(
-        model.fake_score, cond_for_dmdctx,
-        clean_x=student_clean_x, aug_t=aug_t_zero, label="D/fake_self",
-    )
-    _write_mp4(out_dir / f"D_fake_self{out_suffix}.mp4", _decode_to_uint8(fakeD, model.vae))
+        # ----- clean_x_self_i: the student's own rollout, shifted back by
+        # ``shift`` frames in sdn. clean_start_sdn >= 0 for ALL batches now
+        # (= entire clean_x lives in the rolled-out range, no seed mixing).
+        student_clean_x_i = student_full[:, clean_start_sdn:clean_end_sdn].contiguous()
 
-    # ---- Test E: real_score in "self" mode = same view as fake -----
-    log.info("Test E: real_score with SELF-view clean_x ('self' mode)")
-    realE = _run_scorer_one_shot(
-        model.real_score, cond_for_dmdctx,
-        clean_x=student_clean_x, aug_t=aug_t_zero, label="E/real_self",
-    )
-    _write_mp4(out_dir / f"E_real_self{out_suffix}.mp4", _decode_to_uint8(realE, model.vae))
+        # ----- clean_x_GT_i: GT slice at the shifted absolute ride positions
+        gt_clean_i = latents[:, abs_clean_start:abs_clean_end].contiguous()
+        # Noise the GT view at clean_x_aug_t (small symmetry-breaking noise)
+        gt_noise_i = torch.randn_like(gt_clean_i)
+        gt_view_noised_i = model.scheduler.add_noise(
+            gt_clean_i.float().flatten(0, 1),
+            gt_noise_i.float().flatten(0, 1),
+            aug_t_gt_per_batch.flatten(0, 1),
+        ).unflatten(0, gt_clean_i.shape[:2]).to(dtype=dtype)
 
-    # ---- Test F: real_score in "GT" mode = noised GT clean_x -----
-    aug_t_gt_val = int(getattr(cfg, "clean_x_aug_t", 20))
-    aug_t_gt = torch.full(
-        (1, N), fill_value=aug_t_gt_val, device=device, dtype=torch.long,
-    )
-    gt_view = gt_clean_context_latents.to(dtype=dtype)
-    gt_noise = torch.randn_like(gt_view)
-    gt_view_noised = model.scheduler.add_noise(
-        gt_view.flatten(0, 1),
-        gt_noise.flatten(0, 1),
-        aug_t_gt.flatten(0, 1),
-    ).unflatten(0, gt_view.shape[:2]).to(dtype=dtype)
-    log.info("Test F: real_score with NOISED-GT clean_x ('GT' mode, aug_t=%d)", aug_t_gt_val)
-    realF = _run_scorer_one_shot(
-        model.real_score, cond_for_dmdctx,
-        clean_x=gt_view_noised, aug_t=aug_t_gt, label="F/real_GT",
-    )
-    _write_mp4(out_dir / f"F_real_GT{out_suffix}.mp4", _decode_to_uint8(realF, model.vae))
+        # ----- per-batch action streams. cond_noisy_i covers the noisy
+        # window's ride positions; cond_clean_i covers the clean window's
+        # ride positions. CRITICAL: these MUST track absolute ride
+        # positions for action conditioning to be sensible across the
+        # 3 sequential rollouts.
+        actions_noisy_i = z_actions[:, abs_noisy_start:abs_noisy_end]
+        actions_clean_i = z_actions[:, abs_clean_start:abs_clean_end]
+        cond_noisy_i, _ = model.build_action_conditional(
+            prompt_embeds=prompt_embeds, gt_actions=actions_noisy_i,
+        )
+        cond_clean_i, _ = model.build_action_conditional(
+            prompt_embeds=prompt_embeds, gt_actions=actions_clean_i,
+        )
+        cond_for_dmdctx_i = _merge_clean_streams(cond_noisy_i, cond_clean_i)
 
-    # ---- Numeric summary -----
+        # ----- Run B/C: NO clean_x (plain bidir, no TF) ------
+        fakeB_i = _run_scorer_one_shot(
+            model.fake_score, cond_noisy_i, noisy_input_i,
+            label=f"B-{i}/fake_no_ctx",
+        )
+        fakeB_list.append(fakeB_i)
+        realC_i = _run_scorer_one_shot(
+            model.real_score, cond_noisy_i, noisy_input_i,
+            label=f"C-{i}/real_no_ctx",
+        )
+        realC_list.append(realC_i)
+
+        # ----- Run D/E/F: WITH clean_x (TF mode) ------
+        fakeD_i = _run_scorer_one_shot(
+            model.fake_score, cond_for_dmdctx_i, noisy_input_i,
+            clean_x=student_clean_x_i, aug_t=aug_t_zero_per_batch,
+            label=f"D-{i}/fake_self",
+        )
+        fakeD_list.append(fakeD_i)
+        realE_i = _run_scorer_one_shot(
+            model.real_score, cond_for_dmdctx_i, noisy_input_i,
+            clean_x=student_clean_x_i, aug_t=aug_t_zero_per_batch,
+            label=f"E-{i}/real_self",
+        )
+        realE_list.append(realE_i)
+        realF_i = _run_scorer_one_shot(
+            model.real_score, cond_for_dmdctx_i, noisy_input_i,
+            clean_x=gt_view_noised_i, aug_t=aug_t_gt_per_batch,
+            label=f"F-{i}/real_GT",
+        )
+        realF_list.append(realF_i)
+
+    # ---- Concatenate per-batch outputs along F and decode ---------------------
     log.info("=" * 60)
-    log.info("Per-test x0 stats:")
+    log.info("Concatenating %d per-batch outputs and writing videos", num_rollouts)
+
+    def _cat(name, lst, fname):
+        full = torch.cat(lst, dim=1).contiguous()
+        log.info("  %s  shape=%s mean=%.3f std=%.3f",
+                 name, tuple(full.shape), float(full.float().mean()), float(full.float().std()))
+        _write_mp4(out_dir / f"{fname}{out_suffix}.mp4", _decode_to_uint8(full, model.vae))
+        return full
+
+    fakeB_full = _cat("B fake_no_ctx",  fakeB_list, "B_fake_no_ctx")
+    realC_full = _cat("C real_no_ctx",  realC_list, "C_real_no_ctx")
+    fakeD_full = _cat("D fake_self",    fakeD_list, "D_fake_self")
+    realE_full = _cat("E real_self",    realE_list, "E_real_self")
+    realF_full = _cat("F real_GT",      realF_list, "F_real_GT")
+
+    # ---- Per-frame std diagnostic (last-chunk-noise check) -------------
+    # Hypothesis: at the END of every 21-frame scorer window the last
+    # ``npb=3`` frames have systematically inflated std vs the GT.
+    # If True, every i*N - 1 .. i*N - npb position should spike. This
+    # log lets us verify before masking.
+    log.info("=" * 60)
+    log.info("PER-FRAME std (and |pred - GT|) for each tested scorer "
+             "across the %d-frame composite. Watch frames %s "
+             "(= last chunk of each rollout) for outlier inflation.",
+             num_rollouts * N,
+             ", ".join(str(i * N - 1) for i in range(1, num_rollouts + 1)))
+    gt_for_per_frame = latents[:, cf + npb : cf + total_rollout_frames].float()
     for name, t in [
-        ("student_pred (A) seeded", student_pred),
-        ("fake D (self-view)", fakeD),
-        ("real E (self mode)", realE),
-        ("real F (GT mode + aug_t)", realF),
-        ("GT noisy window", gt_noisy_window_latents),
+        ("D fake_self",   fakeD_full),
+        ("E real_self",   realE_full),
+        ("F real_GT",     realF_full),
+        ("B fake_no_ctx", fakeB_full),
+        ("C real_no_ctx", realC_full),
+    ]:
+        tf = t.float()
+        per_frame_std = tf.std(dim=(0, 2, 3, 4)).cpu().numpy()
+        per_frame_mae = (tf - gt_for_per_frame).abs().mean(dim=(0, 2, 3, 4)).cpu().numpy()
+        std_str = " ".join(f"{v:.3f}" for v in per_frame_std)
+        mae_str = " ".join(f"{v:.3f}" for v in per_frame_mae)
+        log.info("  %-14s std: %s", name, std_str)
+        log.info("  %-14s mae: %s", name, mae_str)
+
+    # ---- Numeric summary -------------------------------------------------------
+    log.info("=" * 60)
+    # Compare everything on the NOISY-X span (= num_rollouts * N = 63 frames)
+    # so all tensors share shape. student_noisy_span aligns with B/C/D/E/F.
+    student_noisy_span = student_full[:, npb:].contiguous()
+    gt_noisy_span = latents[:, cf + npb : cf + total_rollout_frames]
+    span_frames = student_noisy_span.shape[1]
+    log.info("Per-test x0 stats (over the %d-frame noisy span):", span_frames)
+    for name, t in [
+        ("student (noisy span)",      student_noisy_span),
+        ("fake B (no clean_x)",       fakeB_full),
+        ("real C (no clean_x)",       realC_full),
+        ("fake D (self-view)",        fakeD_full),
+        ("real E (self mode)",        realE_full),
+        ("real F (GT mode + aug_t)",  realF_full),
+        ("GT (ride-aligned)",         gt_noisy_span),
     ]:
         t = t.float()
         log.info(
-            "  %-22s  mean=%+.3f std=%.3f  L2-vs-GT=%.4f  L2-vs-student=%.4f",
+            "  %-26s  mean=%+.3f std=%.3f  L2-vs-GT=%.4f  L2-vs-student=%.4f",
             name, float(t.mean()), float(t.std()),
-            float((t - gt_noisy_window_latents.float()).pow(2).mean().sqrt()),
-            float((t - student_pred.float()).pow(2).mean().sqrt()),
+            float((t - gt_noisy_span.float()).pow(2).mean().sqrt()),
+            float((t - student_noisy_span.float()).pow(2).mean().sqrt()),
         )
 
     log.info("DONE. Videos in %s", out_dir)

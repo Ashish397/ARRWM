@@ -189,8 +189,7 @@ min_score_timestep: 0
 # of GT seed prefilled into the generator's KV cache at t=0.
 dmd_context: "GT"
 dmd_context_clean_frames: 9
-clean_x_aug_t: 20
-heatmap_out_noise_bar: true
+clean_x_aug_t: 0
 
 gan_loss_weight: 0.0
 

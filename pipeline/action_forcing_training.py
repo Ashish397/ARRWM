@@ -379,6 +379,7 @@ class ActionForcingTrainingPipeline:
             "mae_extension_count": 0,
             "last_chunk_mae": nan_f,
             "baseline_last_chunk_mae": nan_f,
+            "baseline_avg_rollout_mae": nan_f,
         }
 
         batch_size, num_frames, num_channels, height, width = noise.shape
@@ -744,6 +745,34 @@ class ActionForcingTrainingPipeline:
             self._last_extension_metrics["last_chunk_mae"] = (
                 baseline_last_mae_value
             )
+            # Average MAE across the FULL baseline rollout (= the
+            # gradient-active scoring window). This is the metric the
+            # collapse gate uses — averaging over the whole rollout
+            # is more robust than the last-chunk MAE which can be
+            # dominated by the structural end-of-window OOD region
+            # (RoPE [N, N+shift) with no clean-half counterpart). Same
+            # ``_compute_chunk_mae`` so all-reduce semantics match.
+            #
+            # ``rollout_start = current_start_frame - rollout_frames``
+            # (= seed_frames after seed prefill). The slice covers the
+            # entire baseline output[seed:seed+rollout_frames] vs GT
+            # at the same absolute ride positions.
+            rollout_start = current_start_frame - rollout_frames
+            if (
+                rollout_start >= 0
+                and gt_latents.shape[1] >= current_start_frame
+            ):
+                baseline_avg_rollout_mae_value = self._compute_chunk_mae(
+                    pred_chunk=output[
+                        :, rollout_start: current_start_frame
+                    ].detach(),
+                    gt_chunk=gt_latents[
+                        :, rollout_start: current_start_frame
+                    ],
+                )
+                self._last_extension_metrics["baseline_avg_rollout_mae"] = (
+                    baseline_avg_rollout_mae_value
+                )
 
         extension_active = (
             enable_mae_extension
@@ -1081,6 +1110,7 @@ class ActionForcingTrainingPipeline:
             "mae_extension_count": 0,
             "last_chunk_mae": nan_f,
             "baseline_last_chunk_mae": nan_f,
+            "baseline_avg_rollout_mae": nan_f,
         }
 
         batch_size, num_frames, _, _, _ = noise.shape

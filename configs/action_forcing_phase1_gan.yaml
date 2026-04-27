@@ -77,8 +77,8 @@
 # are NOT wired in by ``model/dmd_action_forcing.py`` (Phase-1
 # Action-Forcing is pure DMD).
 
-config_name: action-forcing-phase1
-run_name: action_forcing_phase1
+config_name: action-forcing-phase1-gan
+run_name: action_forcing_phase1_gan
 
 seed: 0
 mixed_precision: true
@@ -451,8 +451,24 @@ dmd_context: "GT"
 dmd_context_clean_frames: 9
 clean_x_aug_t: 0
 
-# GAN dropped (parity with staircase config + CF).
-gan_loss_weight: 0.0
+# R3GAN — RpGAN + R1 + R2 discriminator on GT vs student latent video.
+# Full recipe ported verbatim from action_forcing_phase1_aux_gan.yaml;
+# only difference is that this config does NOT enable the action
+# critic / motion teacher — pure DMD + R3GAN (no z-guidance).
+gan_enabled: true
+gan_disc_in_channels: 16
+gan_disc_base_channels: 64
+gan_disc_num_blocks: 4
+gan_loss_weight: 0.05         # G-side RpGAN weight (= 5% of DMD's typical magnitude)
+gan_r1_gamma: 1.0             # zero-centered grad penalty on real samples
+gan_r2_gamma: 1.0             # zero-centered grad penalty on fake samples
+gan_warmup_steps: 500         # linear ramp 0 → gan_loss_weight on the G side
+gan_updates_per_step: 1       # 1:1 D:G ratio
+gan_lr: 2.0e-04
+gan_betas: [0.0, 0.9]
+gan_eps: 1.0e-08
+gan_weight_decay: 0.0
+gan_max_grad_norm: 10.0
 
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).
