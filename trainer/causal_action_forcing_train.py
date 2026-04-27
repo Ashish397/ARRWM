@@ -2143,6 +2143,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # branch is gated separately on its own ``*_active``
                 # flag, and adds its term to the running generator
                 # loss before the single backward at the bottom.
+                # ``z_actions_for_scoring`` = per-frame z_actions
+                # (already sliced to ``action_dims`` at dataset load
+                # time) for the noisy_x scoring window. Used by the
+                # action-mode freeze block to skip a CoTracker forward
+                # on GT — the dataset's offline pipeline already
+                # encoded the same motion through the same ss_vae.
+                z_actions_scoring = actions[:, -int(self.config.num_training_frames):].contiguous()
                 gen_loss_dmd, gen_log_dict, aux = self.model.generator_loss(
                     image_or_video_shape=image_or_video_shape,
                     conditional_dict=conditional_dict,
@@ -2154,6 +2161,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     clean_x_GT=clean_context_latents,
                     clean_conditional_dict=clean_conditional_dict,
                     clean_unconditional_dict=clean_unconditional_dict,
+                    z_actions_for_scoring=z_actions_scoring,
                 )
                 pred_image = aux["pred_image"]
                 scoring_frames = int(aux["scoring_frames"])
@@ -2243,6 +2251,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 generator_loss.backward()
                 return merged
             else:
+                z_actions_scoring = actions[:, -int(self.config.num_training_frames):].contiguous()
                 generator_loss, gen_log_dict = self.model.generator_loss(
                     image_or_video_shape=image_or_video_shape,
                     conditional_dict=conditional_dict,
@@ -2253,6 +2262,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     clean_x_GT=clean_context_latents,
                     clean_conditional_dict=clean_conditional_dict,
                     clean_unconditional_dict=clean_unconditional_dict,
+                    z_actions_for_scoring=z_actions_scoring,
                 )
                 merged_plain: Dict[str, Any] = {
                     "generator_dmd_loss": float(generator_loss.detach().item()),

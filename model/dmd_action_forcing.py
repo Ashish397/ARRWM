@@ -155,6 +155,17 @@ class ActionForcingDMD(SelfForcingModel):
         if self.num_frame_per_block > 1 and hasattr(self.generator, "model"):
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+        # ``action_dims``: which ss_vae output dims feed the action
+        # conditioning streams. Stashed for the action-mode freeze
+        # block — it slices the teacher's full-8-d ``z_real`` down to
+        # the same dims as ``gt_z_per_slot`` (which the trainer
+        # pre-computes from cond_dict's per-frame z_actions, already
+        # sliced to ``action_dims`` at dataset load time).
+        action_dims_cfg = getattr(args, "action_dims", None)
+        self.action_dims: Optional[List[int]] = (
+            list(action_dims_cfg) if action_dims_cfg is not None else None
+        )
+
         self.independent_first_frame = False
         self.num_training_frames = int(getattr(args, "num_training_frames", 21))
         # ``rollout_frames`` is the actual rollout length per training
@@ -1265,6 +1276,7 @@ class ActionForcingDMD(SelfForcingModel):
         clean_x_real: Optional[torch.Tensor] = None,
         aug_t_real: Optional[torch.Tensor] = None,
         gt_target: Optional[torch.Tensor] = None,
+        gt_z_per_slot: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """CF-parity DMD loss (eq. 7).
 
@@ -1327,9 +1339,60 @@ class ActionForcingDMD(SelfForcingModel):
         # and added to ``gradient_mask`` so DMD skips them. Robust to
         # the all-frames-similar case (median ≈ MAE on every frame ⇒
         # no frame trips the threshold ⇒ no false positives).
+        # FUNDAMENTAL: gradient_mask arrives non-None at this loss
+        # API (every caller routes through ``_dmd_score_grad_mask``
+        # which always produces a tensor). Enforce the contract here
+        # rather than only at the MSE boundary below — the freeze
+        # block below mutates ``gradient_mask`` in place via
+        # ``gradient_mask.clone()``, which would AttributeError on
+        # None. Fail loud here so any caller regression that bypasses
+        # the boundary mask gets a clear error.
+        if gradient_mask is None:
+            raise RuntimeError(
+                "compute_distribution_matching_loss requires "
+                "``gradient_mask`` (every caller must build it from "
+                "``self._dmd_score_grad_mask`` so the structurally-OOD "
+                "last-chunk boundary stays masked uniformly)."
+            )
+
+        # Teacher-freeze detection. The freeze mask we build below
+        # AND-merges into ``gradient_mask`` and ONLY affects this
+        # function's DMD MSE — aux losses (action critic z-guidance,
+        # R3GAN, SC-DMD) run on the unmasked ``pred_image`` from
+        # ``_run_generator`` and keep training the student through
+        # frames where the teacher is gated off. That's the design:
+        # when DMD is wrong on a slot, the action critic should still
+        # carry the gradient there.
         if bool(getattr(self, "teacher_freeze_detect_enabled", False)):
-            mode = str(getattr(self, "teacher_freeze_mode", "mae"))
+            mode = self.teacher_freeze_mode  # already lowercased at init
             freeze_mask_bf = None  # [B, F] bool, set below
+
+            # Fail-loud on the configured-but-not-actionable case:
+            # mode=='action' but the trainer never attached the teacher
+            # callable. The init-time assert in __init__ already gates
+            # on action_teacher_mode != 'off', but a future code path
+            # that bypasses the trainer's _build_action_teacher hookup
+            # would hit this.
+            if mode == "action" and self._action_teacher_fn is None:
+                raise RuntimeError(
+                    "teacher_freeze_mode='action' but the trainer did not "
+                    "attach ``self._action_teacher_fn``. Verify that "
+                    "``_build_action_teacher`` ran (action_teacher_mode != "
+                    "'off') and that the model has the attribute."
+                )
+
+            if gt_target is None:
+                # gt_target is supplied by the caller (generator_loss /
+                # streaming gen) when teacher_freeze is enabled. BOTH
+                # modes need it: 'mae' compares pred_real against
+                # gt_target directly; 'action' runs the action teacher
+                # on gt_target to get z_gt for the cos(R,GT) decision.
+                # Currently unreachable on the locked-in geometry
+                # (min_ride_frames=69 covers cf+rollout) but worth
+                # surfacing if a future config change makes it
+                # reachable — silent fallback in either mode would
+                # silently disable the freeze gate.
+                dmd_log_dict["teacher_freeze_unavailable"] = 1.0
 
             if mode == "mae" and gt_target is not None:
                 with torch.no_grad():
@@ -1376,67 +1439,78 @@ class ActionForcingDMD(SelfForcingModel):
                             f"not divisible by num_frame_per_block={npb}."
                         )
                     n_slots = F // npb
-                    # Decision metric: cos(z_real, z_gt). The teacher is
-                    # "wrong" iff its predicted action direction is opposite
-                    # to the GT action direction. Comparing to the STUDENT
-                    # would conflate "teacher wrong" with "student wrong",
-                    # masking gradient on slots where the teacher is
-                    # actually right and the student is the one drifting —
-                    # exactly the slots we want DMD to keep training on.
-                    # Cosine sim is magnitude-invariant, so a teacher that
-                    # gets the magnitude wrong but the direction right
-                    # stays in the high-cos region and is NOT masked.
-                    # ``z_student`` is also computed for telemetry only.
+
+                    # Decision metric: cos(z_real, z_gt) per slot.
+                    # ``z_real`` runs the teacher pipeline (CoTracker +
+                    # ss_vae) on real_score's pred — necessary, no
+                    # shortcut. For ``z_gt`` we accept a pre-computed
+                    # tensor sourced from the dataset's per-frame
+                    # z_actions (which were encoded offline by the
+                    # SAME ss_vae from the SAME motion data the
+                    # teacher pipeline would re-derive via CoTracker)
+                    # — no second CoTracker forward on GT latents.
+                    # Falls back to running the teacher on gt_target
+                    # only if the trainer didn't pre-compute, so the
+                    # behaviour is preserved when callers don't yet
+                    # pass the kwarg.
                     z_real = self._action_teacher_fn(pred_real_image_detached)
-                    z_gt = self._action_teacher_fn(gt_target)
-                    z_student = self._action_teacher_fn(original_latent.detach())
-                    if z_real is None or z_gt is None:
-                        # Teacher temporarily unavailable (cotracker /
-                        # ss_vae failure). Skip — the same iter's aux
-                        # loss path also no-ops on None.
+                    if z_real is None:
                         dmd_log_dict["teacher_freeze_unavailable"] = 1.0
                     else:
-                        if z_real.shape != z_gt.shape:
-                            raise RuntimeError(
-                                f"teacher_freeze_detect (mode=action): "
-                                f"z_real shape {tuple(z_real.shape)} != "
-                                f"z_gt shape {tuple(z_gt.shape)}."
+                        # Resolve z_gt — prefer pre-computed.
+                        if gt_z_per_slot is not None:
+                            z_gt = gt_z_per_slot.to(
+                                dtype=z_real.dtype, device=z_real.device,
                             )
-                        # Per-slot cosine similarity = the freeze metric.
-                        cos_RG = torch.nn.functional.cosine_similarity(
-                            z_real.float(), z_gt.float(), dim=-1,
-                        )  # [B, n_slots]
-                        slot_freeze = cos_RG < self.teacher_freeze_action_threshold
-                        freeze_mask_bf = slot_freeze.repeat_interleave(npb, dim=1)
-                        # Telemetry — surface both cos(R,GT) (the
-                        # decision metric) and cos(R,student) (context).
-                        dmd_log_dict["teacher_freeze_action_cos_RG_min"] = (
-                            cos_RG.min().detach()
-                        )
-                        dmd_log_dict["teacher_freeze_action_cos_RG_mean"] = (
-                            cos_RG.mean().detach()
-                        )
-                        dmd_log_dict["teacher_freeze_action_cos_RG_median"] = (
-                            cos_RG.median().detach()
-                        )
-                        if z_student is not None:
-                            cos_RS = torch.nn.functional.cosine_similarity(
-                                z_real.float(), z_student.float(), dim=-1,
+                            # ``z_real`` is the teacher's full ss_vae
+                            # output (8-d). ``gt_z_per_slot`` may be
+                            # sliced to ``action_dims`` (= 2-d) at
+                            # dataset load time. Slice z_real to match
+                            # so cos sim is on the same axes.
+                            if (
+                                z_gt.shape[-1] != z_real.shape[-1]
+                                and self.action_dims is not None
+                                and len(self.action_dims) == z_gt.shape[-1]
+                            ):
+                                z_real = z_real[..., self.action_dims]
+                            dmd_log_dict["teacher_freeze_z_gt_source"] = 1.0  # = pre-computed
+                        else:
+                            # Back-compat fallback: re-derive via teacher.
+                            z_gt = self._action_teacher_fn(gt_target)
+                            if z_gt is None:
+                                dmd_log_dict["teacher_freeze_unavailable"] = 1.0
+                                z_real = None  # short-circuit below
+                            else:
+                                dmd_log_dict["teacher_freeze_z_gt_source"] = 0.0  # = cotracker
+                        if z_real is not None and z_gt is not None:
+                            if z_real.shape != z_gt.shape:
+                                raise RuntimeError(
+                                    f"teacher_freeze_detect (mode=action): "
+                                    f"z_real shape {tuple(z_real.shape)} != "
+                                    f"z_gt shape {tuple(z_gt.shape)}. "
+                                    f"action_dims={self.action_dims}."
+                                )
+                            cos_RG = torch.nn.functional.cosine_similarity(
+                                z_real.float(), z_gt.float(), dim=-1,
+                            )  # [B, n_slots]
+                            slot_freeze = cos_RG < self.teacher_freeze_action_threshold
+                            freeze_mask_bf = slot_freeze.repeat_interleave(npb, dim=1)
+                            dmd_log_dict["teacher_freeze_action_cos_RG_min"] = (
+                                cos_RG.min().detach()
                             )
-                            dmd_log_dict["teacher_freeze_action_cos_RS_mean"] = (
-                                cos_RS.mean().detach()
+                            dmd_log_dict["teacher_freeze_action_cos_RG_mean"] = (
+                                cos_RG.mean().detach()
+                            )
+                            dmd_log_dict["teacher_freeze_action_cos_RG_median"] = (
+                                cos_RG.median().detach()
                             )
 
             # AND-merge the freeze mask into the running gradient_mask.
-            # No-op when the mode-specific branch couldn't compute a mask.
+            # ``gradient_mask`` arrives non-None by contract (the loss
+            # boundary's required-arg check below; matches Fix 1) so we
+            # always have a tensor to clone-and-mutate.
             if freeze_mask_bf is not None and freeze_mask_bf.any():
-                if gradient_mask is None:
-                    gradient_mask = torch.ones(
-                        original_latent.shape, dtype=torch.bool,
-                        device=original_latent.device,
-                    )
-                else:
-                    gradient_mask = gradient_mask.clone()
+                gradient_mask = gradient_mask.clone()
                 freeze_full = freeze_mask_bf.view(
                     *freeze_mask_bf.shape, 1, 1, 1,
                 ).expand_as(gradient_mask)
@@ -1451,19 +1525,10 @@ class ActionForcingDMD(SelfForcingModel):
                     freeze_mask_bf.float().mean().detach()
                 )
 
-        # FUNDAMENTAL: every DMD-score loss must arrive here with a
-        # non-None ``gradient_mask`` (= at least the canonical last-chunk
-        # boundary mask from ``_dmd_score_grad_mask``). The loss API
-        # doesn't silently fall back to an unmasked MSE — that path was
-        # removed deliberately so a future regression in any caller
-        # cannot bypass the boundary mask.
-        if gradient_mask is None:
-            raise RuntimeError(
-                "compute_distribution_matching_loss requires "
-                "``gradient_mask`` (every caller must build it from "
-                "``self._dmd_score_grad_mask`` so the structurally-OOD "
-                "last-chunk boundary stays masked uniformly)."
-            )
+        # gradient_mask is non-None by the contract enforced at the
+        # top of this function. After the freeze AND-merge it can be
+        # all-False (= every slot flagged); short-circuit to a
+        # connected zero-loss so .backward() succeeds.
         if not gradient_mask.any():
             # All-False mask → MSE on empty tensor is NaN. Surface a
             # clean zero loss + telemetry so the trainer can detect /
@@ -1625,6 +1690,7 @@ class ActionForcingDMD(SelfForcingModel):
         clean_x_GT: Optional[torch.Tensor] = None,
         clean_conditional_dict: Optional[dict] = None,
         clean_unconditional_dict: Optional[dict] = None,
+        z_actions_for_scoring: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """CF-parity generator loss: roll the student, compute DMD.
 
@@ -1757,6 +1823,38 @@ class ActionForcingDMD(SelfForcingModel):
                 :, seed_frames : seed_frames + scoring_frames
             ]
 
+        # Pre-compute gt_z_per_slot from the dataset's per-frame
+        # z_actions for the noisy_x scoring window — saves a CoTracker
+        # forward on GT latents in the action-mode freeze block.
+        # ``z_actions_for_scoring`` is [B, scoring_frames, A] (already
+        # sliced to ``action_dims`` at dataset load time). Pool to
+        # [B, n_slots, A] by mean across each ``num_frame_per_block``
+        # slot — these per-frame z's were encoded by the SAME ss_vae
+        # the teacher pipeline uses, so the cosine sim is meaningful
+        # in the action-relevant subspace.
+        gt_z_per_slot = None
+        if (
+            self.teacher_freeze_detect_enabled
+            and self.teacher_freeze_mode == "action"
+            and z_actions_for_scoring is not None
+        ):
+            npb = int(self.num_frame_per_block)
+            B, F_act, A = z_actions_for_scoring.shape
+            if F_act != scoring_frames:
+                raise RuntimeError(
+                    f"z_actions_for_scoring has F={F_act} but "
+                    f"scoring_frames={scoring_frames}."
+                )
+            if F_act % npb != 0:
+                raise RuntimeError(
+                    f"z_actions_for_scoring frames ({F_act}) must be "
+                    f"divisible by num_frame_per_block ({npb})."
+                )
+            n_slots = F_act // npb
+            gt_z_per_slot = z_actions_for_scoring.reshape(
+                B, n_slots, npb, A,
+            ).mean(dim=2)  # [B, n_slots, A]
+
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
             conditional_dict=cond_for_scoring,
@@ -1769,6 +1867,7 @@ class ActionForcingDMD(SelfForcingModel):
             clean_x_real=sc_clean_x_real,
             aug_t_real=sc_aug_t_real,
             gt_target=gt_target,
+            gt_z_per_slot=gt_z_per_slot,
         )
         dmd_loss = dmd_loss * self.dmd_loss_weight
 
@@ -2588,6 +2687,30 @@ class ActionForcingDMD(SelfForcingModel):
             if ride_window.shape[1] >= chunk_hi:
                 gt_target = ride_window[:, chunk_lo:chunk_hi]
 
+        # Pre-compute gt_z_per_slot for the noisy_x window from the
+        # ride's per-frame z_actions (already sliced to action_dims at
+        # dataset load time, stored on streaming_state). Pool by slot.
+        gt_z_per_slot = None
+        if (
+            self.teacher_freeze_detect_enabled
+            and self.teacher_freeze_mode == "action"
+        ):
+            npb = int(self.num_frame_per_block)
+            ride_actions_window = s.get("ride_actions_window")
+            if (
+                ride_actions_window is not None
+                and ride_actions_window.shape[1] >= chunk_hi
+                and chunk_size_state % npb == 0
+            ):
+                z_acts_for_scoring = ride_actions_window[
+                    :, chunk_lo:chunk_hi
+                ]  # [B, F=chunk_size, A]
+                B, F_act, A = z_acts_for_scoring.shape
+                n_slots = F_act // npb
+                gt_z_per_slot = z_acts_for_scoring.reshape(
+                    B, n_slots, npb, A,
+                ).mean(dim=2)
+
         dmd_loss, dmd_log = self.compute_distribution_matching_loss(
             image_or_video=chunk,
             conditional_dict=cond_for_scoring,
@@ -2597,6 +2720,7 @@ class ActionForcingDMD(SelfForcingModel):
             denoised_timestep_to=info.get("denoised_timestep_to"),
             clean_x=sc_clean_x, aug_t=sc_aug_t,
             gt_target=gt_target,
+            gt_z_per_slot=gt_z_per_slot,
             clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
         )
         dmd_loss = dmd_loss * self.dmd_loss_weight
