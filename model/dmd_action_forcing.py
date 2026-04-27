@@ -2831,6 +2831,20 @@ class ActionForcingDMD(SelfForcingModel):
             "streaming_new_frames": float(info["new_frames"]),
             "streaming_current_length": float(info["current_length"]),
         }
+        # Surface MAE-extension metrics BEFORE any short-circuit so the
+        # critic-side collapse gate (which reads
+        # ``baseline_avg_rollout_mae`` off ``critic_log``) never goes
+        # blind on the empty-mask early return below — same
+        # telemetry-vs-loss-path independence Fix 1 enforced for the
+        # gen step.
+        for k in (
+            "baseline_last_chunk_mae",
+            "baseline_avg_rollout_mae",
+            "last_chunk_mae",
+            "mae_extension_count",
+        ):
+            if k in info:
+                critic_log[k] = info[k]
         if not gradient_mask.any():
             # End-of-sequence iter where ``new_frames`` (= npb) lands
             # entirely inside the last-chunk-masked tail → AND is all
@@ -2854,9 +2868,6 @@ class ActionForcingDMD(SelfForcingModel):
             flow_pred=flow_pred,
             gradient_mask=gradient_mask_flat,
         )
-        for k in ("baseline_last_chunk_mae", "baseline_avg_rollout_mae", "last_chunk_mae", "mae_extension_count"):
-            if k in info:
-                critic_log[k] = info[k]
         return denoising_loss, critic_log
 
     # ------------------------------------------------------------------
