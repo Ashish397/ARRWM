@@ -273,20 +273,14 @@ class ActionForcingTrainingPipeline:
 
     @property
     def kv_cache_size(self) -> int:
-        # KV buffer is sized to the BASELINE rollout window only —
-        # ``max(num_max_frames, rollout_frames)``. We deliberately do
-        # NOT add headroom for MAE-driven extensions: the model-side
-        # rolling cache (``utils/infinity_rope.py:213-219``,
-        # ``wan/modules/causal_model.py:302-306``) implements
-        # sink-preserving FIFO eviction, so extension chunks just
-        # commit through the rolling buffer (the first
-        # ``sink_size`` frames stay pinned, oldest non-sink frames
-        # are evicted as new ones arrive). This keeps memory cost
-        # FIXED regardless of ``mae_extension_max_extra_chunks``,
-        # makes the documented "set threshold=null to disable" path
-        # genuinely free, and matches the user's invariant: "we
-        # always do max 21 frames of cache, that's why we have the
-        # tail config".
+        # Per-iter pipeline: cache sized to the BASELINE rollout
+        # window (no headroom). LongLive's streaming pipeline sizes
+        # its cache as ``(local_attn + slice_last) * frame_seq_length``
+        # to give the rolling cache headroom for seed + in-flight
+        # rollout simultaneously, but that doubles per-layer memory
+        # which OOMs on a 32GB 5090. Defer the bigger cache to
+        # Phase B (persistent streaming state), where it can be gated
+        # on a streaming-mode flag.
         return max(self.num_max_frames, self.rollout_frames) * self.frame_seq_length
 
     # -----------------------------------------------------------------
@@ -325,6 +319,7 @@ class ActionForcingTrainingPipeline:
         return_sim_step: bool = False,
         seed_latents: Optional[torch.Tensor] = None,
         prefer_cache_pred_in_output: bool = False,
+        requires_grad: bool = True,
         **conditional_dict,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """Run the Action-Forcing chunkwise rollout.
@@ -546,6 +541,16 @@ class ActionForcingTrainingPipeline:
         # "rollouts longer than num_training_frames, train on the last
         # num_training_frames only."
         start_gradient_frame_index = num_output_frames - self.num_max_frames
+        # ``requires_grad=False`` (LongLive parity: the critic step
+        # passes False so the rollout produces no autograd graph at
+        # all). Setting the gradient-start index past the end of the
+        # rollout disables the grad-active branch in the exit-flag
+        # forward — every block stays in the ``with torch.no_grad():``
+        # path. Also redundant with the trainer wrapping the critic-
+        # path call in an outer ``no_grad`` context, but kept
+        # explicit for self-documenting behaviour.
+        if not requires_grad:
+            start_gradient_frame_index = num_output_frames + 1
 
         denoised_pred = None
         timestep = None
@@ -1010,3 +1015,292 @@ class ActionForcingTrainingPipeline:
                 "is_init": False,
             })
         self.crossattn_cache = crossattn_cache
+
+    def reset_cache_state(self) -> None:
+        """Force the next ``_initialize_kv_cache``/``_initialize_crossattn_cache``
+        call to re-allocate by setting the existing caches to None. Used
+        by the streaming flow to release GPU memory between sequences
+        (each new sequence calls ``setup_sequence`` which re-initialises).
+        """
+        self.kv_cache1 = None
+        self.crossattn_cache = None
+
+    def generate_chunk_with_cache(
+        self,
+        noise: torch.Tensor,
+        current_start_frame: int,
+        *,
+        requires_grad: bool = True,
+        prefer_cache_pred_in_output: bool = False,
+        gt_latents: Optional[torch.Tensor] = None,
+        **conditional_dict,
+    ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
+        """Streaming variant of ``inference_with_trajectory`` — rolls a
+        single chunk against the EXISTING ``kv_cache1`` /
+        ``crossattn_cache`` (caller is responsible for initialising
+        them via ``setup_sequence`` and seed-prefilling). No
+        cache re-init, no seed prefill, no MAE-extension loop. Per-block
+        rolling denoise + no-grad finish-denoise (LongLive parity for
+        clean K/V) + cache-update at ``context_noise``.
+
+        Args:
+            noise: ``[B, F, C, H, W]`` initial noise for this chunk.
+                ``F`` must be a multiple of ``num_frame_per_block``.
+            current_start_frame: absolute starting frame index in the
+                sequence (= the persistent KV cache position to write
+                into). Caller advances this between calls.
+            requires_grad: when False, force the rollout's grad-active
+                exit branch into ``no_grad`` (the trainer's critic
+                rollout already wraps in ``with torch.no_grad():``;
+                this is belt-and-suspenders LongLive parity).
+            prefer_cache_pred_in_output: visualisation only — write
+                the post-finish-denoise ``cache_pred`` to the per-chunk
+                output instead of the grad-active exit-rung pred.
+            gt_latents: ``[B, F_gt, C, H, W]`` GT covering this chunk's
+                absolute window for the per-chunk MAE metric.
+                Optional; pass ``None`` to skip MAE.
+            conditional_dict: per-frame action streams covering the
+                ``num_frame_per_block``-length slice STARTING at
+                ``current_start_frame``. Caller is responsible for
+                slicing.
+
+        Returns:
+            (output, denoised_timestep_from, denoised_timestep_to),
+            where ``output`` is shape ``[B, F, C, H, W]`` — the rolled
+            chunk only (no seed, no prior frames).
+        """
+        if self.kv_cache1 is None or self.crossattn_cache is None:
+            raise RuntimeError(
+                "generate_chunk_with_cache requires pre-allocated caches; "
+                "call ``_initialize_kv_cache`` + ``_initialize_crossattn_cache`` "
+                "(typically via ``setup_sequence``) before this method."
+            )
+
+        nan_f = float("nan")
+        self._last_extension_metrics = {
+            "mae_extension_count": 0,
+            "last_chunk_mae": nan_f,
+            "baseline_last_chunk_mae": nan_f,
+        }
+
+        batch_size, num_frames, _, _, _ = noise.shape
+        npb = self.num_frame_per_block
+        cps = self.chunks_per_rolling_step
+
+        if num_frames % npb != 0:
+            raise RuntimeError(
+                f"num_frames ({num_frames}) must be divisible by "
+                f"num_frame_per_block ({npb})."
+            )
+        num_blocks_total = num_frames // npb
+        all_num_frames: List[int] = []
+        remaining_blocks = num_blocks_total
+        while remaining_blocks > 0:
+            chunks_this_step = min(cps, remaining_blocks)
+            all_num_frames.append(chunks_this_step * npb)
+            remaining_blocks -= chunks_this_step
+
+        output = torch.zeros_like(noise)
+
+        num_denoising_steps = len(self.denoising_step_list)
+        exit_flags = self.generate_and_sync_list(
+            len(all_num_frames), num_denoising_steps, device=noise.device
+        )
+        # In streaming mode the generator's gradient gate is not the
+        # rollout-vs-warmup split — it's a single flag from the caller.
+        # ``requires_grad=False`` ⇒ no grad anywhere; True ⇒ grad on the
+        # exit-rung forward.
+        start_gradient_frame_index = 0 if requires_grad else (num_frames + 1)
+
+        denoised_pred = None
+        timestep = None
+        sequence_start = current_start_frame
+        for block_index, current_num_frames in enumerate(all_num_frames):
+            block_start_in_noise = current_start_frame - sequence_start
+            noisy_input = noise[
+                :, block_start_in_noise: block_start_in_noise + current_num_frames,
+            ]
+            block_cond = _slice_per_frame_streams(
+                conditional_dict,
+                frame_start=current_start_frame,
+                frame_count=current_num_frames,
+            )
+
+            # Rolling denoise loop with truncated random exit.
+            exit_index = num_denoising_steps - 1
+            for index, current_timestep in enumerate(self.denoising_step_list):
+                if self.same_step_across_blocks:
+                    exit_flag = (index == exit_flags[0])
+                else:
+                    exit_flag = (index == exit_flags[block_index])
+
+                ts_value = int(round(float(current_timestep)))
+                timestep = torch.full(
+                    [batch_size, current_num_frames], ts_value,
+                    device=noise.device, dtype=torch.int64,
+                )
+
+                if not exit_flag:
+                    with torch.no_grad():
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=block_cond,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
+                        next_t_value = int(round(float(
+                            self.denoising_step_list[index + 1]
+                        )))
+                        flat = denoised_pred.flatten(0, 1)
+                        noisy_input = self.scheduler.add_noise(
+                            flat,
+                            torch.randn_like(flat),
+                            next_t_value
+                            * torch.ones(
+                                [batch_size * current_num_frames],
+                                device=noise.device, dtype=torch.long,
+                            ),
+                        ).unflatten(0, denoised_pred.shape[:2])
+                else:
+                    if not requires_grad:
+                        with torch.no_grad():
+                            _, denoised_pred = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=block_cond,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length,
+                            )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=block_cond,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
+                    exit_index = index
+                    break
+
+            # No-grad finish-denoise past the exit rung so the cache
+            # K/V is committed from a fully-denoised x0 estimate.
+            cache_pred = denoised_pred.detach()
+            for j in range(exit_index + 1, num_denoising_steps):
+                next_t_value = int(round(float(
+                    self.denoising_step_list[j]
+                )))
+                flat = cache_pred.flatten(0, 1)
+                cache_input = self.scheduler.add_noise(
+                    flat,
+                    torch.randn_like(flat),
+                    next_t_value * torch.ones(
+                        [batch_size * current_num_frames],
+                        device=noise.device, dtype=torch.long,
+                    ),
+                ).unflatten(0, denoised_pred.shape[:2])
+                step_t = torch.full_like(timestep, next_t_value)
+                with torch.no_grad():
+                    _, cache_pred = self.generator(
+                        noisy_image_or_video=cache_input,
+                        conditional_dict=block_cond,
+                        timestep=step_t,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+
+            output_pred = (
+                cache_pred.to(denoised_pred.dtype)
+                if prefer_cache_pred_in_output
+                else denoised_pred
+            )
+            output[
+                :, block_start_in_noise: block_start_in_noise + current_num_frames,
+            ] = output_pred
+
+            # Cache-update commit at context_noise from the clean cache_pred.
+            context_timestep = torch.full_like(timestep, self.context_noise)
+            cache_commit = self.scheduler.add_noise(
+                cache_pred.flatten(0, 1),
+                torch.randn_like(cache_pred.flatten(0, 1)),
+                context_timestep.flatten(0, 1),
+            ).unflatten(0, cache_pred.shape[:2])
+            with torch.no_grad():
+                self.generator(
+                    noisy_image_or_video=cache_commit,
+                    conditional_dict=block_cond,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+
+            current_start_frame += current_num_frames
+
+        # Per-chunk MAE vs GT (when provided).
+        if gt_latents is not None and denoised_pred is not None:
+            try:
+                last_block_lo = current_start_frame - npb - sequence_start
+                last_block_hi = current_start_frame - sequence_start
+                if (
+                    gt_latents.shape[1] >= last_block_hi
+                    and last_block_lo >= 0
+                ):
+                    val = self._compute_chunk_mae(
+                        pred_chunk=output[:, last_block_lo:last_block_hi].detach(),
+                        gt_chunk=gt_latents[:, last_block_lo:last_block_hi],
+                    )
+                    self._last_extension_metrics["baseline_last_chunk_mae"] = val
+                    self._last_extension_metrics["last_chunk_mae"] = val
+            except Exception:
+                pass
+
+        # Compute denoised_t_from / denoised_t_to from the exit_flag.
+        denoised_t_from, denoised_t_to = None, None
+        try:
+            if self.same_step_across_blocks:
+                idx = exit_flags[0]
+                from_t = int(round(float(self.denoising_step_list[idx])))
+                to_t = (
+                    0
+                    if idx == num_denoising_steps - 1
+                    else int(round(float(self.denoising_step_list[idx + 1])))
+                )
+                denoised_t_from, denoised_t_to = from_t, to_t
+        except Exception:
+            pass
+
+        return output, denoised_t_from, denoised_t_to
+
+    def _clear_cache_gradients(self) -> None:
+        """Detach K/V tensors in the persistent caches so any autograd
+        graph held by the gen step's rollout doesn't chain back through
+        the critic's no_grad rollout. LongLive parity:
+        ``LongLive/model/streaming_training.py:601-626``. Required when
+        the cache persists across gen→critic boundaries (Phase-B
+        streaming) and cheap insurance for Phase-A's per-iter cache:
+        if any K/V tensor was written under ``torch.enable_grad`` (e.g.
+        the grad-active exit-rung forward), the autograd graph stays
+        attached until the cache slot is overwritten — detaching it
+        explicitly releases that graph deterministically.
+        """
+        if self.kv_cache1 is not None:
+            for cache_block in self.kv_cache1:
+                k = cache_block.get("k")
+                v = cache_block.get("v")
+                if k is not None and k.requires_grad:
+                    cache_block["k"] = k.detach()
+                if v is not None and v.requires_grad:
+                    cache_block["v"] = v.detach()
+        if self.crossattn_cache is not None:
+            for cache_block in self.crossattn_cache:
+                k = cache_block.get("k")
+                v = cache_block.get("v")
+                if k is not None and k.requires_grad:
+                    cache_block["k"] = k.detach()
+                if v is not None and v.requires_grad:
+                    cache_block["v"] = v.detach()

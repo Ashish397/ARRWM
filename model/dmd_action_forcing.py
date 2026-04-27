@@ -385,6 +385,16 @@ class ActionForcingDMD(SelfForcingModel):
         # Pipeline is set later by the trainer (after DDP wrap).
         self.inference_pipeline = None
 
+        # Streaming-mode persistent state. ``None`` when no sequence
+        # is open; a dict tracking sequence-level state when active.
+        # See ``setup_sequence`` + ``generate_next_chunk`` for the
+        # contract. LongLive parity:
+        # ``LongLive/model/streaming_training.py``.
+        self.streaming_state: Optional[Dict[str, Any]] = None
+        self.streaming_chunk_size: int = int(getattr(args, "streaming_chunk_size", self.num_training_frames))
+        self.streaming_min_new_frame: int = int(getattr(args, "streaming_min_new_frame", self.streaming_chunk_size - self.num_frame_per_block))
+        self.streaming_max_length: int = int(getattr(args, "streaming_max_length", 57))
+
         # SC-DMD (Salt paper, 2604.03118v1) — semigroup defect
         # regularizer L_SC = E[||Ψ_θ^{ts→te}(x_ts) - Ψ_θ^{tm→te}(Ψ_θ^{ts→tm}(x_ts))||²]
         # default DISABLED. Single-chunk (chunk-0, fresh KV cache) for
@@ -727,6 +737,7 @@ class ActionForcingDMD(SelfForcingModel):
         initial_latent: Optional[torch.Tensor] = None,
         enable_mae_extension: bool = False,
         seed_latents: Optional[torch.Tensor] = None,
+        requires_grad: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
         """Match CF's ``SelfForcingModel._run_generator`` behavior, plus
         CF-style long-rollout support and MAE-driven extension support:
@@ -825,6 +836,7 @@ class ActionForcingDMD(SelfForcingModel):
                 gt_latents=clean_latent,
                 enable_mae_extension=enable_mae_extension,
                 seed_latents=seed_latents,
+                requires_grad=requires_grad,
                 **conditional_dict,
             )
         )
@@ -1177,12 +1189,17 @@ class ActionForcingDMD(SelfForcingModel):
                 f"clean_x_self.shape[1]={clean_x_self.shape[1]} must "
                 f"equal num_training_frames={self.num_training_frames}."
             )
-        if self.dmd_context == "GT":
+        if self.dmd_context == "GT" and build_real_view:
+            # ``clean_x_GT`` is only consumed for the real_score side
+            # in "GT" mode. The critic step (``build_real_view=False``)
+            # only trains fake_score, which always uses the self-view
+            # regardless of dmd_context — clean_x_GT is irrelevant
+            # there, so we don't require it.
             if clean_x_GT is None:
                 raise RuntimeError(
                     "dmd_context='GT' requires clean_x_GT (the trainer "
-                    "must assemble ride[s+6+(i-1)*21 : s+6+i*21] for "
-                    "the i-th batch and pass it here)."
+                    "must assemble the shifted GT clean window and pass "
+                    "it here for the gen-step real_score view)."
                 )
             if clean_x_GT.shape[1] != self.num_training_frames:
                 raise RuntimeError(
@@ -1436,6 +1453,14 @@ class ActionForcingDMD(SelfForcingModel):
         for signature compatibility with ``generator_loss``.
         """
         rollout_frames = int(image_or_video_shape[1])
+        # LongLive parity: detach any K/V tensors held in the
+        # persistent caches before the critic rollout so any autograd
+        # graph from a prior gen-step rollout doesn't chain through
+        # the critic's no_grad forwards. No-op when the caches are
+        # freshly initialised (Phase-A) or when no K/V required grad
+        # to begin with.
+        if self.inference_pipeline is not None:
+            self.inference_pipeline._clear_cache_gradients()
         with torch.no_grad():
             generated_image, _, denoised_timestep_from, denoised_timestep_to = (
                 self._run_generator(
@@ -1445,6 +1470,7 @@ class ActionForcingDMD(SelfForcingModel):
                     initial_latent=initial_latent,
                     enable_mae_extension=False,
                     seed_latents=seed_latents,
+                    requires_grad=False,
                 )
             )
 
@@ -1575,6 +1601,621 @@ class ActionForcingDMD(SelfForcingModel):
         ) or {}
         for k, v in ext_metrics.items():
             critic_log[k] = v
+        return denoising_loss, critic_log
+
+    # ==================================================================
+    # STREAMING MODE — LongLive-style persistent-state DMD
+    # ==================================================================
+    # The training trainer uses these methods when ``streaming_mode=True``
+    # in the YAML. They keep one rolling sequence open across many
+    # iters, advancing by 18-21 new frames per iter (random, broadcast
+    # from rank 0) while reusing the persistent KV/crossattn caches
+    # initialised at ``setup_sequence``. Iter k's gradient flows only
+    # through the new frames (per-frame ``gradient_mask``); overlap
+    # frames carry no gradient. When the sequence is exhausted (or the
+    # collapse gate fires), the trainer calls ``setup_sequence`` again
+    # with a fresh ride.
+    #
+    # State dict layout:
+    #   current_length      : int  - frames generated so far in this sequence
+    #   max_length          : int  - cap for can_generate_more
+    #   chunk_size          : int  - DMD scoring window (=21)
+    #   shift               : int  - clean/noisy shift (= num_frame_per_block)
+    #   seed_latents        : tensor [B, cf, C, H, W]  - GT prefill
+    #   ride_latents_window : tensor [B, cf+max_length, ...]  - clean_x_GT source
+    #   ride_actions_window : tensor [B, cf+max_length, A]
+    #   prompt_embeds       : tensor [B, T, D]
+    #   conditional_dict    : full-window action streams (pipeline indexes by absolute frame)
+    #   unconditional_dict  : full-window unconditional streams
+    #   clean_conditional_dict / clean_unconditional_dict : per-frame
+    #         clean-half streams (built ONCE over the WHOLE sequence;
+    #         the per-iter ``compute_*_loss_streaming`` slices to the
+    #         shifted window before passing to the scorer).
+    #   previous_chunk      : tensor [B, chunk_size, ...]  - last full_chunk
+    #         (for clean_x assembly on iter k≥2)
+    # ------------------------------------------------------------------
+    def setup_sequence(
+        self,
+        seed_latents: torch.Tensor,
+        ride_latents_window: torch.Tensor,
+        ride_actions_window: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        max_length: int,
+    ) -> None:
+        """Open a new streaming sequence: re-initialise the persistent
+        KV/crossattn caches, prefill the seed (cf=9 GT frames at t=0
+        with the existing context-noise commit), build conditional
+        dicts over the FULL sequence window, and initialise the
+        per-iter state.
+
+        Caller (trainer) is responsible for picking the random offset
+        ``s`` and slicing the ride; this method just consumes the
+        sliced tensors.
+
+        Args:
+            seed_latents:        ``[B, cf, C, H, W]`` GT KV prefill.
+            ride_latents_window: ``[B, cf+rollout, C, H, W]`` clean_x_GT source.
+                                 ``cf`` leading frames are the seed.
+            ride_actions_window: ``[B, cf+rollout, A]`` per-frame action streams.
+            prompt_embeds:       ``[B, T, D]`` cross-attn prompt.
+            max_length:          frames generated cap (``can_generate_more``).
+        """
+        if self.inference_pipeline is None:
+            raise RuntimeError(
+                "setup_sequence requires inference_pipeline; trainer must "
+                "set ``model.inference_pipeline = ActionForcingTrainingPipeline(...)``"
+                " before opening a sequence."
+            )
+        cf = int(seed_latents.shape[1])
+        if cf != self.dmd_context_clean_frames:
+            raise ValueError(
+                f"seed_latents has {cf} frames; expected "
+                f"dmd_context_clean_frames={self.dmd_context_clean_frames}."
+            )
+        if ride_latents_window.shape[1] < cf:
+            raise ValueError(
+                f"ride_latents_window has only {ride_latents_window.shape[1]} "
+                f"frames; need >= cf={cf}."
+            )
+
+        device = seed_latents.device
+        dtype = seed_latents.dtype
+        batch_size = seed_latents.shape[0]
+        npb = self.num_frame_per_block
+        pipe = self.inference_pipeline
+
+        # Cap max_length to a multiple of npb so chunk advances stay clean.
+        if max_length % npb != 0:
+            max_length = (max_length // npb) * npb
+
+        # Build full-window action streams: sequence covers
+        # ``ride_actions_window`` = cf seed + max_length rollout frames.
+        cond_dict, uncond_dict = self.build_action_conditional(
+            prompt_embeds=prompt_embeds, gt_actions=ride_actions_window,
+        )
+        # Clean-half action streams: same time positions, used as the
+        # ``clean_conditional_dict`` for the bidir scorer's clean half.
+        # Per the dmd_context API, clean lives at ride[s+cf-shift :
+        # s+cf+rollout-shift] in absolute frames; relative to the
+        # ``ride_*_window`` (which starts at ride[s]), this is
+        # ``ride_*_window[cf-shift : cf+rollout-shift]``. Built once for
+        # the whole sequence; per-iter scoring slices to the relevant
+        # 21-frame window.
+        clean_actions_window = ride_actions_window[
+            :, cf - npb : cf - npb + max_length
+        ]
+        clean_cond_dict, clean_uncond_dict = self.build_action_conditional(
+            prompt_embeds=prompt_embeds, gt_actions=clean_actions_window,
+        )
+
+        # Reset + initialise persistent caches.
+        pipe.reset_cache_state()
+        pipe._initialize_kv_cache(
+            batch_size=batch_size, dtype=dtype, device=device,
+        )
+        pipe._initialize_crossattn_cache(
+            batch_size=batch_size, dtype=dtype, device=device,
+        )
+
+        # Seed prefill: cf GT frames at t=0 + context-noise commit
+        # (mirrors the seed-prefill block inside inference_with_trajectory).
+        # The pipeline indexes per-frame action streams by absolute
+        # current_start_frame, starting at 0 for the seed window.
+        num_seed_chunks = cf // npb
+        current_start_frame = 0
+        for sc in range(num_seed_chunks):
+            seed_chunk = seed_latents[:, sc * npb : (sc + 1) * npb]
+            seed_t = torch.zeros(
+                [batch_size, npb], device=device, dtype=torch.int64,
+            )
+            seed_block_cond = _slice_per_frame_streams(
+                cond_dict, frame_start=current_start_frame, frame_count=npb,
+            )
+            with torch.no_grad():
+                pipe.generator(
+                    noisy_image_or_video=seed_chunk,
+                    conditional_dict=seed_block_cond,
+                    timestep=seed_t,
+                    kv_cache=pipe.kv_cache1,
+                    crossattn_cache=pipe.crossattn_cache,
+                    current_start=current_start_frame * pipe.frame_seq_length,
+                )
+            # Context-noise commit (LongLive parity: keeps seed K/V at
+            # the same noise level as rollout chunks').
+            ctx_t = torch.full_like(seed_t, pipe.context_noise)
+            seed_ctx_in = self.scheduler.add_noise(
+                seed_chunk.flatten(0, 1),
+                torch.randn_like(seed_chunk.flatten(0, 1)),
+                ctx_t.flatten(0, 1),
+            ).unflatten(0, seed_chunk.shape[:2])
+            with torch.no_grad():
+                pipe.generator(
+                    noisy_image_or_video=seed_ctx_in,
+                    conditional_dict=seed_block_cond,
+                    timestep=ctx_t,
+                    kv_cache=pipe.kv_cache1,
+                    crossattn_cache=pipe.crossattn_cache,
+                    current_start=current_start_frame * pipe.frame_seq_length,
+                )
+            current_start_frame += npb
+
+        self.streaming_state = {
+            "current_length": 0,
+            "max_length": int(max_length),
+            "chunk_size": int(self.streaming_chunk_size),
+            "shift": int(npb),
+            "cf": int(cf),
+            "seed_latents": seed_latents,
+            "ride_latents_window": ride_latents_window,
+            "ride_actions_window": ride_actions_window,
+            "prompt_embeds": prompt_embeds,
+            "conditional_dict": cond_dict,
+            "unconditional_dict": uncond_dict,
+            "clean_conditional_dict": clean_cond_dict,
+            "clean_unconditional_dict": clean_uncond_dict,
+            "previous_chunk": None,  # last full_chunk (chunk_size frames)
+            "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill
+        }
+
+    def can_generate_more(self) -> bool:
+        """Returns True iff the streaming sequence is open AND has room
+        to advance by at least ``min_new_frame`` more frames within
+        ``max_length``."""
+        if self.streaming_state is None:
+            return False
+        s = self.streaming_state
+        return (s["current_length"] + self.streaming_min_new_frame) <= s["max_length"]
+
+    def reset_streaming_state(self) -> None:
+        """Tear down the open sequence (typically when collapse gate
+        fires or ``can_generate_more`` returns False)."""
+        self.streaming_state = None
+        if self.inference_pipeline is not None:
+            self.inference_pipeline.reset_cache_state()
+
+    def _streaming_pick_new_frames(
+        self, device: torch.device,
+    ) -> int:
+        """Pick the number of new frames to generate this iter, broadcast
+        from rank 0 for DDP lockstep. Always a multiple of npb in
+        ``[min_new_frame, chunk_size]``, capped to remaining sequence
+        room."""
+        s = self.streaming_state
+        npb = s["shift"]
+        chunk_size = s["chunk_size"]
+        room = s["max_length"] - s["current_length"]
+        max_new = min(room, chunk_size)
+        # Snap to multiple of npb.
+        max_new = (max_new // npb) * npb
+        min_new = (self.streaming_min_new_frame // npb) * npb
+        if max_new <= min_new:
+            return max(npb, max_new)
+        # Candidate values: min_new, min_new+npb, ..., max_new.
+        candidates = list(range(min_new, max_new + 1, npb))
+        if not candidates:
+            return max(npb, max_new)
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                import random as _py_random
+                idx = _py_random.randint(0, len(candidates) - 1)
+            else:
+                idx = 0
+            t = torch.tensor([idx], device=device, dtype=torch.long)
+            dist.broadcast(t, src=0)
+            idx = int(t.item())
+        else:
+            import random as _py_random
+            idx = _py_random.randint(0, len(candidates) - 1)
+        return int(candidates[idx])
+
+    def generate_next_chunk(
+        self, requires_grad: bool = True,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Advance the open sequence by ``new_frames`` (∈ [min_new_frame,
+        chunk_size], multiple of npb). Build a chunk_size-length
+        ``full_chunk`` for DMD scoring = ``[previous_chunk[-overlap:],
+        new_frames]`` (overlap = chunk_size - new_frames; 0 on first
+        iter or when new_frames == chunk_size). Returns
+        ``(full_chunk, info)`` where ``info`` carries the
+        ``gradient_mask`` (True only on new frames), the per-chunk MAE,
+        and the metadata DMD scoring needs.
+        """
+        if self.streaming_state is None:
+            raise RuntimeError("generate_next_chunk called with no open sequence")
+        if not self.can_generate_more():
+            raise RuntimeError("generate_next_chunk: sequence exhausted")
+
+        s = self.streaming_state
+        device = s["seed_latents"].device
+        dtype = s["seed_latents"].dtype
+        batch_size = s["seed_latents"].shape[0]
+        npb = s["shift"]
+        chunk_size = s["chunk_size"]
+        cf = s["cf"]
+        pipe = self.inference_pipeline
+
+        new_frames = self._streaming_pick_new_frames(device)
+        if s["previous_chunk"] is None:
+            # First iter of the sequence: roll a full chunk_size, no overlap.
+            new_frames = chunk_size
+            overlap = 0
+        else:
+            overlap = chunk_size - new_frames
+
+        # Absolute frame position in the pipeline cache where the new
+        # frames will be written.
+        abs_frame_start = s["abs_frame_after_seed"] + s["current_length"]
+
+        noise_chunk = torch.randn(
+            [batch_size, new_frames, *s["seed_latents"].shape[2:]],
+            device=device, dtype=dtype,
+        )
+        # GT slice (for per-chunk MAE) covering the new-frame range.
+        gt_slice_lo = cf + s["current_length"]
+        gt_slice_hi = gt_slice_lo + new_frames
+        if gt_slice_hi <= s["ride_latents_window"].shape[1]:
+            gt_chunk = s["ride_latents_window"][:, gt_slice_lo:gt_slice_hi]
+        else:
+            gt_chunk = None
+
+        new_chunk, denoised_t_from, denoised_t_to = pipe.generate_chunk_with_cache(
+            noise=noise_chunk,
+            current_start_frame=abs_frame_start,
+            requires_grad=requires_grad,
+            prefer_cache_pred_in_output=False,
+            gt_latents=gt_chunk,
+            **s["conditional_dict"],
+        )
+
+        # Snapshot OLD previous_chunk BEFORE we overwrite — clean_x_self
+        # assembly on iter k≥2 needs the iter (k-1) chunk.
+        prev_chunk_for_clean = s["previous_chunk"]
+
+        # Build chunk_size-length full_chunk via overlap.
+        if overlap > 0:
+            full_chunk = torch.cat(
+                [s["previous_chunk"][:, -overlap:], new_chunk], dim=1,
+            )
+        else:
+            full_chunk = new_chunk
+
+        # gradient_mask: True only on new frames within the full_chunk.
+        gradient_mask = torch.zeros_like(full_chunk, dtype=torch.bool)
+        gradient_mask[:, overlap : overlap + new_frames] = True
+
+        # Save full_chunk as previous_chunk (detached) for the NEXT iter.
+        s["previous_chunk"] = full_chunk.detach()
+        s["current_length"] += new_frames
+
+        info: Dict[str, Any] = {
+            "denoised_timestep_from": denoised_t_from,
+            "denoised_timestep_to": denoised_t_to,
+            "new_frames": int(new_frames),
+            "overlap": int(overlap),
+            "current_length": int(s["current_length"]),
+            "max_length": int(s["max_length"]),
+            "abs_frame_start": int(abs_frame_start),
+            "gradient_mask": gradient_mask,
+            "prev_chunk_for_clean": prev_chunk_for_clean,
+        }
+        # Surface MAE from pipeline.
+        ext = getattr(pipe, "_last_extension_metrics", None) or {}
+        for k, v in ext.items():
+            info[k] = v
+        return full_chunk, info
+
+    def _streaming_build_clean_x_self(
+        self, full_chunk: torch.Tensor, info: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Assemble the 21-frame ``clean_x_self`` view = noisy window
+        shifted back by ``shift`` frames in cumulative-sdn coords.
+
+        For iter 1 (no previous_chunk available before this call):
+            clean_x = [seed[-shift:], full_chunk[:N-shift]]   (special case)
+        For iter k≥2 (previous_chunk available):
+            clean_x = [prev_chunk[chunk_size-overlap-shift :
+                                   chunk_size-overlap],
+                       full_chunk[:N-shift]]
+        which collapses to:
+          - overlap=0  : clean_x = [prev_chunk[-shift:], full_chunk[:N-shift]]
+          - overlap=npb: clean_x = [prev_chunk[chunk_size-2*npb : chunk_size-npb],
+                                    full_chunk[:N-shift]]
+        Both halves are entirely model-predicted (no GT mixing) past
+        iter 1, matching the user's "we don't need GT mixing once N >
+        21" rule.
+        """
+        s = self.streaming_state
+        shift = s["shift"]
+        chunk_size = s["chunk_size"]
+        # Read previous_chunk BEFORE generate_next_chunk overwrote it.
+        # The caller (compute_*_loss_streaming) is invoked AFTER
+        # generate_next_chunk so previous_chunk is now full_chunk;
+        # we don't have access to the iter k-1 chunk anymore.
+        # Workaround: stash the pre-overwrite copy in info.
+        prev_for_clean = info.get("prev_chunk_for_clean")
+        overlap = info["overlap"]
+        if prev_for_clean is None:
+            # Iter 1 special case.
+            seed_tail = s["seed_latents"][:, -shift:].to(
+                dtype=full_chunk.dtype, device=full_chunk.device,
+            )
+            clean_x = torch.cat(
+                [seed_tail, full_chunk[:, : chunk_size - shift]], dim=1,
+            )
+        else:
+            head_lo = chunk_size - overlap - shift
+            head_hi = chunk_size - overlap
+            clean_head = prev_for_clean[:, head_lo:head_hi].to(
+                dtype=full_chunk.dtype, device=full_chunk.device,
+            )
+            clean_x = torch.cat(
+                [clean_head, full_chunk[:, : chunk_size - shift]], dim=1,
+            )
+        return clean_x
+
+    def _streaming_build_clean_x_GT(
+        self, info: Dict[str, Any],
+    ) -> torch.Tensor:
+        """GT clean-half slice = ``ride_latents_window[abs_start - shift :
+        abs_start - shift + chunk_size]`` where ``abs_start`` is the
+        cumulative-sdn position of the noisy half's first frame
+        (= ``cf + (current_length - new_frames - overlap)``).
+
+        Equivalently in cumulative coords with abs_frame_after_seed=cf:
+            noisy_start_in_sdn = current_length - new_frames - overlap
+            clean_start_in_ride_coords = cf + noisy_start_in_sdn - shift
+        """
+        s = self.streaming_state
+        shift = s["shift"]
+        chunk_size = s["chunk_size"]
+        cf = s["cf"]
+        # In cumulative sdn coords, the noisy half's first frame is at
+        # position ``current_length - new_frames - overlap``.
+        noisy_start_sdn = s["current_length"] - info["new_frames"] - info["overlap"]
+        clean_start_in_ride = cf + noisy_start_sdn - shift
+        clean_end_in_ride = clean_start_in_ride + chunk_size
+        return s["ride_latents_window"][:, clean_start_in_ride:clean_end_in_ride]
+
+    def _streaming_clean_cond_slice(
+        self, info: Dict[str, Any],
+    ) -> Tuple[dict, dict]:
+        """Slice ``clean_conditional_dict`` / ``clean_unconditional_dict``
+        to the per-iter 21-frame window. The clean cond dict was built
+        over ``ride_actions[cf-shift : cf-shift+max_length]``
+        (= positions cf-shift onwards in the ride). For iter k the
+        clean window corresponds to cumulative sdn positions
+        ``[noisy_start_sdn - shift, noisy_start_sdn - shift + 21)``,
+        which maps to clean_cond positions
+        ``[noisy_start_sdn, noisy_start_sdn + 21)`` (since the clean
+        dict's frame 0 = ride frame cf-shift).
+        """
+        s = self.streaming_state
+        chunk_size = s["chunk_size"]
+        noisy_start_sdn = s["current_length"] - info["new_frames"] - info["overlap"]
+        clean_lo = noisy_start_sdn  # = (cf + noisy_start_sdn - shift) - (cf - shift)
+        clean_hi = clean_lo + chunk_size
+        clean_cond = _slice_per_frame_streams(
+            s["clean_conditional_dict"],
+            frame_start=clean_lo, frame_count=chunk_size,
+        )
+        clean_uncond = _slice_per_frame_streams(
+            s["clean_unconditional_dict"],
+            frame_start=clean_lo, frame_count=chunk_size,
+        )
+        return clean_cond, clean_uncond
+
+    def _streaming_noisy_cond_slice(
+        self, info: Dict[str, Any],
+    ) -> Tuple[dict, dict]:
+        """Slice the noisy-half action streams to the per-iter 21-frame
+        window in cumulative sdn coords. The full conditional_dict
+        covers ride[s : s+cf+max_length] (sdn frame i lives at
+        conditional_dict frame ``cf + i``). Noisy half is sdn[start :
+        start+21] where start = current_length - new_frames - overlap."""
+        s = self.streaming_state
+        chunk_size = s["chunk_size"]
+        cf = s["cf"]
+        noisy_start_sdn = s["current_length"] - info["new_frames"] - info["overlap"]
+        cond = _slice_per_frame_streams(
+            s["conditional_dict"],
+            frame_start=cf + noisy_start_sdn, frame_count=chunk_size,
+        )
+        uncond = _slice_per_frame_streams(
+            s["unconditional_dict"],
+            frame_start=cf + noisy_start_sdn, frame_count=chunk_size,
+        )
+        return cond, uncond
+
+    def compute_generator_loss_streaming(
+        self,
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """DMD generator loss on the streaming chunk. Reuses
+        ``compute_distribution_matching_loss`` + ``_build_dmd_context_kwargs``
+        — same scorer math as the per-iter ``generator_loss``, just
+        with the per-frame ``gradient_mask`` from streaming and the
+        clean_x_self / clean_x_GT slices assembled from the persistent
+        sequence state.
+        """
+        s = self.streaming_state
+        gradient_mask = info["gradient_mask"]
+
+        # Apply the heatmap_out_noise_bar mask on top of streaming's
+        # per-frame mask (intersect — both must be True for grad flow).
+        if bool(getattr(self, "heatmap_out_noise_bar", False)) and chunk.shape[1] >= 1:
+            full_mask = gradient_mask.clone() if gradient_mask is not None else torch.ones(
+                chunk.shape, dtype=torch.bool, device=chunk.device,
+            )
+            full_mask[:, 0, :, :2, :] = False
+            gradient_mask_eff = full_mask
+        else:
+            gradient_mask_eff = gradient_mask
+
+        clean_x_self = self._streaming_build_clean_x_self(chunk, info)
+        clean_x_GT = (
+            self._streaming_build_clean_x_GT(info) if self.dmd_context == "GT" else None
+        )
+        cond_for_scoring, uncond_for_scoring = self._streaming_noisy_cond_slice(info)
+        clean_cond, clean_uncond = self._streaming_clean_cond_slice(info)
+
+        (
+            sc_clean_x, sc_aug_t,
+            sc_clean_x_real, sc_aug_t_real,
+            cond_for_scoring, uncond_for_scoring,
+        ) = self._build_dmd_context_kwargs(
+            clean_x_self=clean_x_self,
+            clean_x_GT=clean_x_GT,
+            clean_conditional_dict=clean_cond,
+            clean_unconditional_dict=clean_uncond,
+            cond_for_scoring=cond_for_scoring,
+            uncond_for_scoring=uncond_for_scoring,
+            device=chunk.device, dtype=chunk.dtype,
+            build_real_view=True,
+        )
+
+        dmd_loss, dmd_log = self.compute_distribution_matching_loss(
+            image_or_video=chunk,
+            conditional_dict=cond_for_scoring,
+            unconditional_dict=uncond_for_scoring,
+            gradient_mask=gradient_mask_eff,
+            denoised_timestep_from=info.get("denoised_timestep_from"),
+            denoised_timestep_to=info.get("denoised_timestep_to"),
+            clean_x=sc_clean_x, aug_t=sc_aug_t,
+            clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
+        )
+        dmd_loss = dmd_loss * self.dmd_loss_weight
+
+        for k in ("baseline_last_chunk_mae", "last_chunk_mae", "mae_extension_count"):
+            if k in info:
+                dmd_log[k] = info[k]
+        dmd_log["streaming_new_frames"] = float(info["new_frames"])
+        dmd_log["streaming_current_length"] = float(info["current_length"])
+        return dmd_loss, dmd_log
+
+    def compute_critic_loss_streaming(
+        self,
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Streaming critic step. Detaches chunk + caches before the
+        fake_score forward, masks the denoising loss with the
+        per-frame ``gradient_mask`` so only new frames train fake_score.
+        """
+        if self.inference_pipeline is not None:
+            self.inference_pipeline._clear_cache_gradients()
+        if chunk.requires_grad:
+            chunk = chunk.detach()
+
+        s = self.streaming_state
+        gradient_mask = info["gradient_mask"]
+        cond_for_scoring, _uncond = self._streaming_noisy_cond_slice(info)
+
+        # Build clean_x for the fake_score's TF half — same self-view
+        # as the gen step (fake never sees GT clean_x).
+        clean_x_self = self._streaming_build_clean_x_self(chunk, info)
+        clean_cond, _ = self._streaming_clean_cond_slice(info)
+        (
+            sc_clean_x, sc_aug_t,
+            _r1, _r2, cond_for_scoring, _u,
+        ) = self._build_dmd_context_kwargs(
+            clean_x_self=clean_x_self,
+            clean_x_GT=None,
+            clean_conditional_dict=clean_cond,
+            clean_unconditional_dict=None,
+            cond_for_scoring=cond_for_scoring,
+            uncond_for_scoring={},
+            device=chunk.device, dtype=chunk.dtype,
+            build_real_view=False,
+        )
+
+        denoised_timestep_from = info.get("denoised_timestep_from")
+        denoised_timestep_to = info.get("denoised_timestep_to")
+        critic_timestep = self._sample_dmd_timestep(
+            batch_size=chunk.shape[0], num_frame=chunk.shape[1],
+            denoised_timestep_from=denoised_timestep_from,
+            denoised_timestep_to=denoised_timestep_to,
+            device=chunk.device,
+        )
+
+        critic_noise = torch.randn_like(chunk)
+        noisy_chunk = self.scheduler.add_noise(
+            chunk.flatten(0, 1),
+            critic_noise.flatten(0, 1),
+            critic_timestep.flatten(0, 1),
+        ).unflatten(0, chunk.shape[:2])
+
+        tf_kwargs: Dict[str, Any] = {}
+        if sc_clean_x is not None:
+            tf_kwargs["clean_x"] = sc_clean_x
+            tf_kwargs["aug_t"] = sc_aug_t
+
+        _, pred_fake_image = self.fake_score(
+            noisy_image_or_video=noisy_chunk,
+            conditional_dict=cond_for_scoring,
+            timestep=critic_timestep,
+            **tf_kwargs,
+        )
+
+        if self.args.denoising_loss_type == "flow":
+            from utils.wan_wrapper import WanDiffusionWrapper
+            flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
+                scheduler=self.scheduler,
+                x0_pred=pred_fake_image.flatten(0, 1),
+                xt=noisy_chunk.flatten(0, 1),
+                timestep=critic_timestep.flatten(0, 1),
+            )
+            pred_fake_noise = None
+        else:
+            flow_pred = None
+            pred_fake_noise = self.scheduler.convert_x0_to_noise(
+                x0=pred_fake_image.flatten(0, 1),
+                xt=noisy_chunk.flatten(0, 1),
+                timestep=critic_timestep.flatten(0, 1),
+            ).unflatten(0, chunk.shape[:2])
+
+        gradient_mask_flat = (
+            gradient_mask.flatten(0, 1) if gradient_mask is not None else None
+        )
+        denoising_loss = self.denoising_loss_func(
+            x=chunk.flatten(0, 1),
+            x_pred=pred_fake_image.flatten(0, 1),
+            noise=critic_noise.flatten(0, 1),
+            noise_pred=pred_fake_noise,
+            alphas_cumprod=self.scheduler.alphas_cumprod,
+            timestep=critic_timestep.flatten(0, 1),
+            flow_pred=flow_pred,
+            gradient_mask=gradient_mask_flat,
+        )
+
+        critic_log: Dict[str, Any] = {
+            "critic_timestep": critic_timestep.detach(),
+            "streaming_new_frames": float(info["new_frames"]),
+            "streaming_current_length": float(info["current_length"]),
+        }
+        for k in ("baseline_last_chunk_mae", "last_chunk_mae", "mae_extension_count"):
+            if k in info:
+                critic_log[k] = info[k]
         return denoising_loss, critic_log
 
     # ------------------------------------------------------------------

@@ -398,14 +398,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # vs swap to a fresh ride next iter. ``MAE > threshold`` ⇒
         # student has collapsed on this ride, so don't extend; just
         # train on the current rollout and let the next iter pull a
-        # new ride. ``MAE <= threshold`` ⇒ keep rolling on this ride
-        # (= future multi-batch loop). Currently single-batch is the
-        # only path wired in, so the gate has no runtime effect yet —
-        # it's parsed and stored for the deferred multi-batch hookup.
+        # new ride. ``MAE <= threshold`` ⇒ keep rolling on this ride.
+        # In streaming mode this gates the per-iter "advance same
+        # sequence vs setup fresh sequence" decision; in legacy
+        # single-batch mode it's parsed and stored but unused.
         # ``None`` disables the gate.
         _collapse_t = getattr(self.config, "collapse_mae_threshold", 0.5)
         self.collapse_mae_threshold: Optional[float] = (
             None if _collapse_t is None else float(_collapse_t)
+        )
+
+        # Streaming-mode flag (LongLive-style persistent KV cache +
+        # rolling-sequence training). When True, ``_fwdbwd_one_step``
+        # uses ``model.setup_sequence`` / ``generate_next_chunk`` /
+        # ``compute_*_loss_streaming`` instead of the legacy single-
+        # iter ``generator_loss`` / ``critic_loss`` flow.
+        self.streaming_mode: bool = bool(
+            getattr(self.config, "streaming_mode", False)
+        )
+        self.streaming_max_length: int = int(
+            getattr(self.config, "streaming_max_length", 57)
         )
 
         self.sample_interval = int(
@@ -1595,6 +1607,150 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     pass
 
     # ------------------------------------------------------------------
+    # Streaming-mode helpers (LongLive parity).
+    # ------------------------------------------------------------------
+    def _streaming_setup_sequence_from_ride(
+        self,
+        rollout_frames: int,
+        max_total_rollout_frames: int,
+        cf_dmdctx: int,
+    ) -> bool:
+        """Pull a ride, pick a random offset s, slice the seed +
+        rollout window, and call ``model.setup_sequence`` to open a
+        new streaming sequence. Returns True on success, False if no
+        ride was available.
+        """
+        npb = int(getattr(self.config, "num_frame_per_block", 3))
+        cap = int(self.streaming_max_length)
+        if cap % npb != 0:
+            cap = (cap // npb) * npb
+
+        # Need at least cf + cap frames of ride post-offset.
+        ride = self._next_ride(rollout_frames + cf_dmdctx)
+        if ride is None:
+            return False
+        ride_len = int(ride["latents"].shape[1])
+
+        # Random s ∈ [0, min(ride_len/2, ride_len - cf - cap)] with
+        # cross-rank MIN-reduce + rank-0 broadcast (mirrors the legacy
+        # single-batch path).
+        s_local_max = max(
+            0, min(ride_len // 2, ride_len - cf_dmdctx - cap),
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            t = torch.tensor([s_local_max], device=self.device, dtype=torch.long)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            s_global_max = int(t.item())
+            if dist.get_rank() == 0:
+                t.fill_(random.randint(0, s_global_max) if s_global_max > 0 else 0)
+            dist.broadcast(t, src=0)
+            s = int(t.item())
+        else:
+            s = random.randint(0, s_local_max) if s_local_max > 0 else 0
+
+        # Cap the actual rollout length to what fits this ride (s + cf + cap ≤ ride_len).
+        actual_cap = min(cap, ride_len - cf_dmdctx - s)
+        if actual_cap % npb != 0:
+            actual_cap = (actual_cap // npb) * npb
+        if actual_cap < npb:
+            return False
+
+        prompt_embeds = ride["prompt_embeds"]
+        seed_latents = ride["latents"][:, s : s + cf_dmdctx].contiguous()
+        # Window covers seed + rollout: ride_*[s : s + cf + actual_cap].
+        ride_lat_window = ride["latents"][:, s : s + cf_dmdctx + actual_cap].contiguous()
+        ride_act_window = ride["z_actions"][:, s : s + cf_dmdctx + actual_cap].contiguous()
+
+        self.model.setup_sequence(
+            seed_latents=seed_latents,
+            ride_latents_window=ride_lat_window,
+            ride_actions_window=ride_act_window,
+            prompt_embeds=prompt_embeds,
+            max_length=int(actual_cap),
+        )
+        return True
+
+    def _fwdbwd_streaming_step(
+        self,
+        train_generator: bool,
+        rollout_frames: int,
+        max_total_rollout_frames: int,
+        cf_dmdctx: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Streaming-mode per-iter step: open a sequence if none open,
+        advance by ``new_frames``, score DMD on the chunk, backward.
+        Collapse gate at end of step decides whether to keep rolling
+        next iter.
+        """
+        # Open a sequence if needed.
+        if (
+            self.model.streaming_state is None
+            or not self.model.can_generate_more()
+        ):
+            self.model.reset_streaming_state()
+            if not self._streaming_setup_sequence_from_ride(
+                rollout_frames=rollout_frames,
+                max_total_rollout_frames=max_total_rollout_frames,
+                cf_dmdctx=cf_dmdctx,
+            ):
+                return None
+
+        if train_generator:
+            chunk, info = self.model.generate_next_chunk(requires_grad=True)
+            gen_loss, gen_log = self.model.compute_generator_loss_streaming(
+                chunk, info,
+            )
+            merged: Dict[str, Any] = {
+                "generator_dmd_loss": float(gen_loss.detach().item()),
+            }
+            merged.update({
+                k: (float(v.detach().float().mean().item())
+                    if torch.is_tensor(v) else v)
+                for k, v in gen_log.items()
+                if not isinstance(v, dict)
+            })
+            merged["generator_loss"] = float(gen_loss.detach().item())
+            gen_loss.backward()
+
+            # Collapse gate: if the last-chunk MAE > threshold, the
+            # student collapsed on this ride — close the sequence so
+            # next iter pulls a fresh ride. Current chunk still trained
+            # (gradient already accumulated via .backward()).
+            mae = float(gen_log.get("baseline_last_chunk_mae", float("nan")))
+            if (
+                self.collapse_mae_threshold is not None
+                and mae == mae
+                and mae > self.collapse_mae_threshold
+            ):
+                merged["streaming_reset_for_collapse"] = 1.0
+                self.model.reset_streaming_state()
+            return merged
+        else:
+            chunk, info = self.model.generate_next_chunk(requires_grad=False)
+            critic_loss, critic_log = self.model.compute_critic_loss_streaming(
+                chunk, info,
+            )
+            critic_loss.backward()
+            merged: Dict[str, Any] = {
+                "critic_loss": float(critic_loss.detach().item()),
+            }
+            merged.update({
+                k: (float(v.detach().float().mean().item())
+                    if torch.is_tensor(v) else v)
+                for k, v in critic_log.items()
+                if not isinstance(v, dict)
+            })
+            mae = float(critic_log.get("baseline_last_chunk_mae", float("nan")))
+            if (
+                self.collapse_mae_threshold is not None
+                and mae == mae
+                and mae > self.collapse_mae_threshold
+            ):
+                merged["streaming_reset_for_collapse"] = 1.0
+                self.model.reset_streaming_state()
+            return merged
+
+    # ------------------------------------------------------------------
     # Per-iter forward/backward.
     # ------------------------------------------------------------------
     def _fwdbwd_one_step(
@@ -1604,6 +1760,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         max_total_rollout_frames: int,
         cf_dmdctx: int = 0,
     ) -> Optional[Dict[str, Any]]:
+        # Streaming mode (LongLive parity) — single rolling sequence
+        # spans many iters, advancing by ``new_frames`` ∈ [min_new,
+        # chunk_size] frames per iter using a persistent KV cache.
+        # Falls back to the legacy single-batch path below when
+        # ``streaming_mode=False``.
+        if self.streaming_mode:
+            return self._fwdbwd_streaming_step(
+                train_generator=train_generator,
+                rollout_frames=rollout_frames,
+                max_total_rollout_frames=max_total_rollout_frames,
+                cf_dmdctx=cf_dmdctx,
+            )
         # Pull next valid ride; if loader exhausted, restart. Note that
         # ``rollout_frames >= num_training_frames`` (validated in
         # ``_build_pipeline``); for long-rollout mode we slice the ride
