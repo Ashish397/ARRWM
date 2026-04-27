@@ -419,6 +419,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.streaming_max_length: int = int(
             getattr(self.config, "streaming_max_length", 57)
         )
+        # Phase-B streaming-mode aux wiring is in
+        # ``_fwdbwd_streaming_step`` (action-critic z-guidance, R3GAN,
+        # SC-DMD all mirror the legacy gen-with-aux block; sliced to
+        # the per-iter chunk's ride window via the streaming state).
 
         self.sample_interval = int(
             getattr(self.config, "sample_interval", 0) or 0
@@ -1648,11 +1652,32 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             s = random.randint(0, s_local_max) if s_local_max > 0 else 0
 
-        # Cap the actual rollout length to what fits this ride (s + cf + cap ≤ ride_len).
+        # Cap the actual rollout length to what fits this ride
+        # (s + cf + cap ≤ ride_len). ``ride_len`` is per-rank
+        # (DistributedSampler hands different rides to different ranks),
+        # so ``actual_cap`` diverges across ranks → DDP all-reduces
+        # inside ``_streaming_pick_new_frames`` / per-chunk MAE / etc.
+        # would get out of step. MIN-reduce to the lowest-fitting cap
+        # so all ranks set up sequences of the same max_length and
+        # advance in lockstep. (Single-rank path skips the reduce.)
         actual_cap = min(cap, ride_len - cf_dmdctx - s)
         if actual_cap % npb != 0:
             actual_cap = (actual_cap // npb) * npb
-        if actual_cap < npb:
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            t = torch.tensor(
+                [actual_cap], device=self.device, dtype=torch.long,
+            )
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            actual_cap = int(t.item())
+        # Reject if the ride can't fit at least one valid generate_next_chunk
+        # call. ``can_generate_more()`` requires
+        # ``current_length + min_new_frame ≤ max_length``; at
+        # current_length=0 that means ``actual_cap >= min_new_frame``.
+        # Lower than that and the trainer would call ``setup_sequence``
+        # successfully, then ``can_generate_more()`` returns False, and
+        # ``generate_next_chunk`` raises ``sequence exhausted``.
+        min_new = int(getattr(self.model, "streaming_min_new_frame", npb))
+        if actual_cap < min_new:
             return False
 
         prompt_embeds = ride["prompt_embeds"]
@@ -1696,12 +1721,43 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 return None
 
         if train_generator:
+            aux_active = (
+                self.action_critic_loss_active
+                and getattr(self, "action_teacher_enabled", False)
+                and self.critic_optimizer is not None
+            )
+            gan_active = (
+                self.gan_enabled
+                and self.r3gan_disc is not None
+                and self.r3gan_optimizer is not None
+            )
+            sc_dmd_active = bool(self.sc_dmd_enabled)
+
             chunk, info = self.model.generate_next_chunk(requires_grad=True)
-            gen_loss, gen_log = self.model.compute_generator_loss_streaming(
+
+            # Stash the chunk for the periodic wandb sample-video logger
+            # (parity with the legacy aux/plain branches). ``chunk``
+            # includes the overlap so the rendered mp4 reflects what
+            # DMD just scored. Detach + float32 to release the
+            # autograd graph (logger never backwards through this).
+            if self._video_sample_due(int(self.step) + 1):
+                try:
+                    self._pending_video_latents = (
+                        chunk.detach().to(torch.float32)
+                    )
+                except Exception as _exc:
+                    logging.warning(
+                        "[ActionForcing] failed to stash streaming chunk "
+                        "for video at step=%d: %s",
+                        int(self.step) + 1, _exc,
+                    )
+                    self._pending_video_latents = None
+
+            gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
                 chunk, info,
             )
             merged: Dict[str, Any] = {
-                "generator_dmd_loss": float(gen_loss.detach().item()),
+                "generator_dmd_loss": float(gen_loss_dmd.detach().item()),
             }
             merged.update({
                 k: (float(v.detach().float().mean().item())
@@ -1709,8 +1765,93 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 for k, v in gen_log.items()
                 if not isinstance(v, dict)
             })
-            merged["generator_loss"] = float(gen_loss.detach().item())
-            gen_loss.backward()
+
+            generator_loss = gen_loss_dmd
+
+            # ---- Auxiliary losses (mirror the legacy aux block) ----
+            # Streaming chunk's ride window in
+            # ``state["ride_*_window"]`` indices: the noisy-half lives
+            # at cumulative-sdn positions ``[noisy_start_sdn,
+            # noisy_start_sdn + chunk_size)``, which translates to
+            # ``ride_*_window[cf + noisy_start_sdn : cf + noisy_start_sdn
+            # + chunk_size]``. ``noisy_start_sdn = current_length -
+            # new_frames - overlap`` (info-supplied).
+            state = self.model.streaming_state
+            cf = int(state["cf"])
+            chunk_size = int(state["chunk_size"])
+            noisy_start_sdn = int(
+                state["current_length"]
+                - info["new_frames"]
+                - info["overlap"]
+            )
+            chunk_lo = cf + noisy_start_sdn
+            chunk_hi = chunk_lo + chunk_size
+
+            if aux_active:
+                actions_chunk = state["ride_actions_window"][
+                    :, chunk_lo:chunk_hi,
+                ]
+                actions_for_critic = self._slice_actions_for_critic(
+                    actions_chunk
+                ).to(chunk.dtype)
+                ts_value = info.get("denoised_timestep_from", None)
+                ts_int = int(ts_value) if ts_value is not None else 0
+                B = chunk.shape[0]
+                n_chunks = chunk.shape[1] // int(self.config.num_frame_per_block)
+                chunk_t = torch.full(
+                    (B, n_chunks), ts_int,
+                    device=chunk.device, dtype=torch.long,
+                )
+                gen_action_loss, critic_logs, _teacher_z = (
+                    self._compute_action_critic_losses(
+                        pred_x0=chunk,
+                        target_action_z=actions_for_critic,
+                        chunk_t=chunk_t,
+                        current_step=int(self.step),
+                    )
+                )
+                generator_loss = generator_loss + gen_action_loss
+                merged.update(critic_logs)
+
+            if gan_active:
+                gt_window = state["ride_latents_window"][
+                    :, chunk_lo:chunk_hi,
+                ]
+                gen_gan_loss, gan_logs = self._compute_r3gan_losses(
+                    pred_image=chunk,
+                    gt_latents_window=gt_window,
+                    current_step=int(self.step),
+                )
+                generator_loss = generator_loss + gen_gan_loss
+                merged.update(gan_logs)
+
+            if sc_dmd_active:
+                # SC regularizer runs on a fresh chunk-0 KV cache, so
+                # the absolute frame position doesn't matter — pass
+                # the rollout-only ``ride_latents_window[cf:]`` as
+                # ``clean_latent`` (same role as ``latents`` in the
+                # legacy path) and the iter's fresh full-window cond
+                # dict (from ``info``, NOT from state — stashed cond
+                # dicts on state would leak the action-projection
+                # graph across iters) with ``seed_frames=cf`` so
+                # sc_dmd_loss skips the seed streams when slicing
+                # chunk-0 actions.
+                sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
+                    conditional_dict=info["conditional_dict"],
+                    clean_latent=state["ride_latents_window"][:, cf:],
+                    seed_frames=cf,
+                )
+                sc_weight = self._sc_dmd_current_weight(int(self.step))
+                weighted_sc = sc_loss_raw * sc_weight
+                generator_loss = generator_loss + weighted_sc
+                merged.update(sc_logs)
+                merged["sc_dmd_weight_effective"] = float(sc_weight)
+                merged["sc_dmd_loss_weighted"] = float(
+                    weighted_sc.detach().item()
+                )
+
+            merged["generator_loss"] = float(generator_loss.detach().item())
+            generator_loss.backward()
 
             # Collapse gate: if the last-chunk MAE > threshold, the
             # student collapsed on this ride — close the sequence so

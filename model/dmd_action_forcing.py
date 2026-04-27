@@ -1688,25 +1688,22 @@ class ActionForcingDMD(SelfForcingModel):
         if max_length % npb != 0:
             max_length = (max_length // npb) * npb
 
-        # Build full-window action streams: sequence covers
-        # ``ride_actions_window`` = cf seed + max_length rollout frames.
-        cond_dict, uncond_dict = self.build_action_conditional(
-            prompt_embeds=prompt_embeds, gt_actions=ride_actions_window,
-        )
-        # Clean-half action streams: same time positions, used as the
-        # ``clean_conditional_dict`` for the bidir scorer's clean half.
-        # Per the dmd_context API, clean lives at ride[s+cf-shift :
-        # s+cf+rollout-shift] in absolute frames; relative to the
+        # Clean-half action streams cover ride[s+cf-shift :
+        # s+cf+rollout-shift] in absolute frames; relative to
         # ``ride_*_window`` (which starts at ride[s]), this is
-        # ``ride_*_window[cf-shift : cf+rollout-shift]``. Built once for
-        # the whole sequence; per-iter scoring slices to the relevant
-        # 21-frame window.
+        # ``ride_*_window[cf-shift : cf-shift+max_length]``. We store
+        # only the RAW action tensors on state and rebuild the
+        # cond/uncond dicts (= action_projection + action_token_projection
+        # forward) per-iter inside ``_streaming_build_cond_dicts`` so the
+        # autograd graph for those projections has a single backward
+        # lifecycle per gen step (matching the legacy single-iter
+        # path's ``build_action_conditional`` per ``_fwdbwd_one_step``).
+        # Stashing the dicts on state would freeze the graph, and the
+        # 2nd backward in the same sequence would fail with "Trying to
+        # backward through the graph a second time".
         clean_actions_window = ride_actions_window[
             :, cf - npb : cf - npb + max_length
         ]
-        clean_cond_dict, clean_uncond_dict = self.build_action_conditional(
-            prompt_embeds=prompt_embeds, gt_actions=clean_actions_window,
-        )
 
         # Reset + initialise persistent caches.
         pipe.reset_cache_state()
@@ -1719,8 +1716,15 @@ class ActionForcingDMD(SelfForcingModel):
 
         # Seed prefill: cf GT frames at t=0 + context-noise commit
         # (mirrors the seed-prefill block inside inference_with_trajectory).
-        # The pipeline indexes per-frame action streams by absolute
-        # current_start_frame, starting at 0 for the seed window.
+        # All seed-prefill forwards run inside ``with torch.no_grad():``,
+        # so the temporary cond_dict's grad_fn is orphaned and GC'd
+        # once setup_sequence returns. action_projection.weight.grad
+        # is unaffected — these no_grad forwards never backward through it.
+        with torch.no_grad():
+            seed_cond_dict, _ = self.build_action_conditional(
+                prompt_embeds=prompt_embeds,
+                gt_actions=ride_actions_window,
+            )
         num_seed_chunks = cf // npb
         current_start_frame = 0
         for sc in range(num_seed_chunks):
@@ -1729,7 +1733,7 @@ class ActionForcingDMD(SelfForcingModel):
                 [batch_size, npb], device=device, dtype=torch.int64,
             )
             seed_block_cond = _slice_per_frame_streams(
-                cond_dict, frame_start=current_start_frame, frame_count=npb,
+                seed_cond_dict, frame_start=current_start_frame, frame_count=npb,
             )
             with torch.no_grad():
                 pipe.generator(
@@ -1758,6 +1762,7 @@ class ActionForcingDMD(SelfForcingModel):
                     current_start=current_start_frame * pipe.frame_seq_length,
                 )
             current_start_frame += npb
+        del seed_cond_dict  # release the no_grad cond dict before iter 1
 
         self.streaming_state = {
             "current_length": 0,
@@ -1768,14 +1773,43 @@ class ActionForcingDMD(SelfForcingModel):
             "seed_latents": seed_latents,
             "ride_latents_window": ride_latents_window,
             "ride_actions_window": ride_actions_window,
+            "clean_actions_window": clean_actions_window,
             "prompt_embeds": prompt_embeds,
-            "conditional_dict": cond_dict,
-            "unconditional_dict": uncond_dict,
-            "clean_conditional_dict": clean_cond_dict,
-            "clean_unconditional_dict": clean_uncond_dict,
             "previous_chunk": None,  # last full_chunk (chunk_size frames)
             "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill
         }
+
+    def _streaming_build_cond_dicts(
+        self,
+    ) -> Tuple[dict, dict, dict, dict]:
+        """Rebuild the noisy-half + clean-half conditional / unconditional
+        dicts FRESH per call by running ``action_projection`` /
+        ``action_token_projection`` on the persistent raw action
+        tensors stored in ``streaming_state``. The dicts must NOT be
+        cached on state across iters: ``build_action_conditional``
+        produces grad_fn-attached tensors, and reusing them across
+        backward passes raises "Trying to backward through the graph
+        a second time" (the projection's saved-tensor buffer was
+        freed by the first backward) or, after an in-place optimizer
+        step, "one of the variables needed for gradient computation
+        has been modified by an inplace operation". Rebuilding gives
+        each gen-step iter its own clean grad_fn lifecycle, matching
+        the legacy ``_fwdbwd_one_step`` semantics.
+        """
+        s = self.streaming_state
+        if s is None:
+            raise RuntimeError(
+                "_streaming_build_cond_dicts called with no open sequence"
+            )
+        cond_dict, uncond_dict = self.build_action_conditional(
+            prompt_embeds=s["prompt_embeds"],
+            gt_actions=s["ride_actions_window"],
+        )
+        clean_cond_dict, clean_uncond_dict = self.build_action_conditional(
+            prompt_embeds=s["prompt_embeds"],
+            gt_actions=s["clean_actions_window"],
+        )
+        return cond_dict, uncond_dict, clean_cond_dict, clean_uncond_dict
 
     def can_generate_more(self) -> bool:
         """Returns True iff the streaming sequence is open AND has room
@@ -1878,13 +1912,22 @@ class ActionForcingDMD(SelfForcingModel):
         else:
             gt_chunk = None
 
+        # Rebuild cond/uncond/clean_cond/clean_uncond FRESH for this
+        # iter (see ``_streaming_build_cond_dicts`` for the why) and
+        # stash on ``info`` so ``compute_*_loss_streaming`` reuses the
+        # same dicts the rollout used — single grad_fn lifecycle per
+        # iter, matching legacy ``_fwdbwd_one_step`` semantics.
+        cond_dict, uncond_dict, clean_cond_dict, clean_uncond_dict = (
+            self._streaming_build_cond_dicts()
+        )
+
         new_chunk, denoised_t_from, denoised_t_to = pipe.generate_chunk_with_cache(
             noise=noise_chunk,
             current_start_frame=abs_frame_start,
             requires_grad=requires_grad,
             prefer_cache_pred_in_output=False,
             gt_latents=gt_chunk,
-            **s["conditional_dict"],
+            **cond_dict,
         )
 
         # Snapshot OLD previous_chunk BEFORE we overwrite — clean_x_self
@@ -1917,6 +1960,16 @@ class ActionForcingDMD(SelfForcingModel):
             "abs_frame_start": int(abs_frame_start),
             "gradient_mask": gradient_mask,
             "prev_chunk_for_clean": prev_chunk_for_clean,
+            # Per-iter cond dicts (NOT cached on state — see
+            # ``_streaming_build_cond_dicts`` docstring). Pass through
+            # to ``compute_*_loss_streaming`` so the scorer's slice
+            # reuses the rollout's cond_dict and the backward graph
+            # hits action_projection / action_token_projection once
+            # per iter via a single (fresh-this-iter) grad_fn chain.
+            "conditional_dict": cond_dict,
+            "unconditional_dict": uncond_dict,
+            "clean_conditional_dict": clean_cond_dict,
+            "clean_unconditional_dict": clean_uncond_dict,
         }
         # Surface MAE from pipeline.
         ext = getattr(pipe, "_last_extension_metrics", None) or {}
@@ -1999,15 +2052,15 @@ class ActionForcingDMD(SelfForcingModel):
     def _streaming_clean_cond_slice(
         self, info: Dict[str, Any],
     ) -> Tuple[dict, dict]:
-        """Slice ``clean_conditional_dict`` / ``clean_unconditional_dict``
-        to the per-iter 21-frame window. The clean cond dict was built
-        over ``ride_actions[cf-shift : cf-shift+max_length]``
-        (= positions cf-shift onwards in the ride). For iter k the
-        clean window corresponds to cumulative sdn positions
+        """Slice the per-iter clean_conditional_dict / clean_unconditional_dict
+        (built fresh by ``generate_next_chunk`` and stashed on
+        ``info``) to the iter's 21-frame window. The clean cond dict
+        covers ``ride_actions[cf-shift : cf-shift+max_length]``;
+        iter k's clean window is at cumulative sdn positions
         ``[noisy_start_sdn - shift, noisy_start_sdn - shift + 21)``,
         which maps to clean_cond positions
-        ``[noisy_start_sdn, noisy_start_sdn + 21)`` (since the clean
-        dict's frame 0 = ride frame cf-shift).
+        ``[noisy_start_sdn, noisy_start_sdn + 21)`` (frame 0 of the
+        clean dict = ride frame cf-shift).
         """
         s = self.streaming_state
         chunk_size = s["chunk_size"]
@@ -2015,11 +2068,11 @@ class ActionForcingDMD(SelfForcingModel):
         clean_lo = noisy_start_sdn  # = (cf + noisy_start_sdn - shift) - (cf - shift)
         clean_hi = clean_lo + chunk_size
         clean_cond = _slice_per_frame_streams(
-            s["clean_conditional_dict"],
+            info["clean_conditional_dict"],
             frame_start=clean_lo, frame_count=chunk_size,
         )
         clean_uncond = _slice_per_frame_streams(
-            s["clean_unconditional_dict"],
+            info["clean_unconditional_dict"],
             frame_start=clean_lo, frame_count=chunk_size,
         )
         return clean_cond, clean_uncond
@@ -2027,21 +2080,23 @@ class ActionForcingDMD(SelfForcingModel):
     def _streaming_noisy_cond_slice(
         self, info: Dict[str, Any],
     ) -> Tuple[dict, dict]:
-        """Slice the noisy-half action streams to the per-iter 21-frame
-        window in cumulative sdn coords. The full conditional_dict
-        covers ride[s : s+cf+max_length] (sdn frame i lives at
+        """Slice the per-iter conditional_dict / unconditional_dict
+        (built fresh by ``generate_next_chunk`` and stashed on
+        ``info``) to the noisy-half 21-frame window. The full cond
+        dict covers ride[s : s+cf+max_length] (sdn frame i lives at
         conditional_dict frame ``cf + i``). Noisy half is sdn[start :
-        start+21] where start = current_length - new_frames - overlap."""
+        start+21] where start = current_length - new_frames - overlap.
+        """
         s = self.streaming_state
         chunk_size = s["chunk_size"]
         cf = s["cf"]
         noisy_start_sdn = s["current_length"] - info["new_frames"] - info["overlap"]
         cond = _slice_per_frame_streams(
-            s["conditional_dict"],
+            info["conditional_dict"],
             frame_start=cf + noisy_start_sdn, frame_count=chunk_size,
         )
         uncond = _slice_per_frame_streams(
-            s["unconditional_dict"],
+            info["unconditional_dict"],
             frame_start=cf + noisy_start_sdn, frame_count=chunk_size,
         )
         return cond, uncond
