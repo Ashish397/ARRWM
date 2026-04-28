@@ -2164,11 +2164,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Per-ride 1/(K + norm_constant) loss scaling for ``train_on=every``.
         # Larger ``norm_constant`` gives short rides (small K) less signal
         # and slightly deflates the variance contribution of long rides.
-        # Default 2 matches an empirically reasonable slope: K=1 → 1/3,
-        # K=3 → 1/5, K=10 → 1/12. ``train_on=last`` mode ignores this
-        # (K_local=1 always, full_dmd_loss × 1/(1+norm) is the chosen
-        # downscale; we keep the existing 1× behaviour by short-circuiting).
-        train_norm_constant = float(getattr(cfg, "train_norm_constant", 2.0))
+        # Default 1 matches an empirically reasonable slope: K=1 → 1/2,
+        # K=3 → 1/4, K=10 → 1/11. ``train_on=last`` mode ignores this
+        # (K_local=1 always; we keep the existing 1× behaviour by short-
+        # circuiting the scale to 1.0).
+        train_norm_constant = float(getattr(cfg, "train_norm_constant", 1.0))
 
         # Open a fresh sequence — single trained window per ride means
         # we never carry streaming state across iters.
@@ -2532,10 +2532,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # losses by the same factor — uniform 1/(K+norm) treatment
         # across all loss families.
         #
-        # Effect of ``train_norm_constant`` (default 2):
-        #   K=1  → 1/3   (short rides: less per-ride signal than 1/K=1)
-        #   K=2  → 1/4
-        #   K=10 → 1/12  (long rides: K/(K+2)=10/12 ≈ 0.83 of full)
+        # Effect of ``train_norm_constant`` (default 1):
+        #   K=1  → 1/2   (short rides: less per-ride signal than 1/K=1)
+        #   K=3  → 1/4
+        #   K=10 → 1/11  (long rides: K/(K+1)=10/11 ≈ 0.91 of full)
         # Hard rides (high K) contribute slightly deflated DMD variance
         # vs the pure 1/K average; easy rides (K=1) have signal floored.
         #
