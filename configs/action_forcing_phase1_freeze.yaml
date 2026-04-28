@@ -447,7 +447,7 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 3.0
+real_guidance_scale: 1.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)
@@ -529,7 +529,7 @@ gan_loss_weight: 0.0
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).
 fake_score_updates_enabled: true
-dfake_gen_update_ratio: 2
+dfake_gen_update_ratio: 1
 
 # Generator EMA (CF parity).
 ema_weight: 0.99
@@ -608,3 +608,12 @@ warp_denoising_step: false
 # FUNDAMENTAL: ON by default for Phase-1 action-forcing DMD.
 streaming_mode: true
 streaming_max_length: 500
+
+# Slide-and-train stride: each generate_next_chunk slide advances the
+# 21-frame window forward by num_chunks_roll_forward * num_frame_per_block
+# frames (= 6 * 3 = 18 frames). Iter 1 still advances by chunk_size
+# (= 21) because the previous_chunk=None branch in generate_next_chunk
+# overrides the picker. When unset / 0, the legacy random {18, 21}
+# stride applies. Read by ActionForcingDMD as
+# ``streaming_force_new_frame_chunks``.
+num_chunks_roll_forward: 6

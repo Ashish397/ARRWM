@@ -1980,277 +1980,265 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return int(valid_idx[random.randrange(valid_idx.size)])
 
     # ------------------------------------------------------------------
-    # Streaming-mode MAE extender — the streaming analog of the legacy
-    # ``inference_with_trajectory`` extension loop. Unlike the legacy
-    # path (where extension chunks grow a single per-iter rollout
-    # buffer), the streaming KV cache is sliding-window: each
-    # ``generate_next_chunk`` call advances the cache state, and old
-    # frames evict on the fly. So "extend in streaming" means: when
-    # the just-scored chunk's MAE is below threshold, run additional
-    # no-grad ``generate_next_chunk`` calls to push the streaming
-    # sequence further along the ride within the same trainer iter,
-    # then let the next iter pick up from the advanced position.
+    # Streaming slide-and-train (Phase-1 default). Replaces the legacy
+    # _streaming_maybe_extend "base + extensions" scheme. Per ride:
+    # slide a 21-frame window forward (one ``generate_next_chunk`` per
+    # slide; iter-1 advances chunk_size frames, subsequent iters
+    # advance by ``num_chunks_roll_forward * num_frame_per_block``
+    # frames per the model's deterministic-stride mode). Compute avg
+    # MAE on the FULL 21-frame window vs the corresponding GT slice.
+    # The FIRST window whose avg MAE crosses ``mae_extension_threshold``
+    # is the trained window — DMD pulls the student toward real_score
+    # exactly where the student is wrong. A ride that stays under the
+    # threshold across the cap / end-of-ride is "too easy": no optim
+    # signal, the next iter pulls a fresh ride.
     # ------------------------------------------------------------------
-    def _streaming_maybe_extend(self) -> Dict[str, Any]:
-        """Extend the open streaming sequence by additional no-grad
-        chunks while the per-chunk MAE stays below
-        ``mae_extension_threshold`` and a per-call cap of
-        ``mae_extension_max_extra_chunks`` calls hasn't been hit.
-
-        Reads the freshest MAE from
-        ``pipeline._last_extension_metrics["baseline_last_chunk_mae"]``,
-        which ``generate_chunk_with_cache`` re-populates on every call.
-
-        DDP-safety: ``generate_chunk_with_cache`` performs an
-        ``all_reduce`` inside ``_compute_chunk_mae``; every rank must
-        therefore enter and exit the extension loop the same number of
-        times. We MIN-reduce the per-rank "remaining-chunks-in-ride"
-        bound BEFORE the loop and use that as the only iter cap. The
-        threshold check is already lockstep (averaged MAE across ranks).
-
-        Called only on gen iters (not critic) to keep the per-trainer-
-        iter chunk budget bounded and to mirror the legacy semantic of
-        "extension follows the gradient-bearing rollout."
+    def _streaming_roll_and_train_one_window(
+        self,
+        rollout_frames: int,
+        cf_dmdctx: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Slide-and-train: roll until avg MAE > threshold, then train
+        gen+critic on that window. Returns ``None`` if the ride loader
+        is exhausted; otherwise returns a flat ``str -> float`` log
+        dict (with ``streaming_window_too_easy: 1.0`` on the no-op
+        exit). Always closes the streaming sequence on exit so the
+        next iter pulls a fresh ride.
         """
         cfg = self.config
-        threshold_raw = getattr(cfg, "mae_extension_threshold", None)
-        if threshold_raw is None:
-            return {"streaming_extension_count": 0}
-        threshold = float(threshold_raw)
-        max_extra = int(getattr(cfg, "mae_extension_max_extra_chunks", 0))
-        if threshold <= 0 or max_extra <= 0:
-            return {"streaming_extension_count": 0}
+        threshold = float(cfg.mae_extension_threshold)
+        max_slides = int(cfg.mae_extension_max_extra_chunks)
+
+        # Open a fresh sequence — single trained window per ride means
+        # we never carry streaming state across iters.
+        self.model.reset_streaming_state()
+        if not self._streaming_setup_sequence_from_ride(
+            rollout_frames=rollout_frames,
+            max_total_rollout_frames=rollout_frames,
+            cf_dmdctx=cf_dmdctx,
+        ):
+            return None
 
         pipe = self.pipeline
-        if pipe is None or not getattr(pipe, "_last_extension_metrics", None):
-            return {"streaming_extension_count": 0}
+        state = self.model.streaming_state
+        npb = int(state["shift"])
+        chunk_size = int(state["chunk_size"])
+        cf_state = int(state["cf"])
 
-        last_mae = float(
-            pipe._last_extension_metrics.get(
-                "baseline_last_chunk_mae", float("nan"),
-            )
-        )
-        # NaN guard + threshold gate: if the just-scored chunk already
-        # crossed the threshold, the model isn't "confident" — bail
-        # before doing any extension work (and before the all_reduce).
-        if not (last_mae == last_mae) or last_mae >= threshold:
-            return {
-                "streaming_extension_count": 0,
-                "streaming_extension_last_mae": last_mae,
-            }
+        chunks_rolled = 0
+        stop_reason: str = "unknown"
+        train_chunk: Optional[torch.Tensor] = None
+        train_info: Optional[Dict[str, Any]] = None
+        train_avg_mae: float = float("nan")
 
-        # MIN-reduce the per-rank remaining-chunk count so every rank
-        # walks the loop the same number of iterations. Without this,
-        # rank A might exit while rank B waits forever at the next
-        # all_reduce inside compute_chunk_mae.
-        s = getattr(self.model, "streaming_state", None)
-        if s is None:
-            return {"streaming_extension_count": 0}
-        npb = int(s["shift"])
-        local_remaining = max(
-            0, (int(s["max_length"]) - int(s["current_length"])) // npb,
-        )
-        avail_t = torch.tensor(
-            [local_remaining], device=self.device, dtype=torch.long,
-        )
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(avail_t, op=dist.ReduceOp.MIN)
-        synced_remaining = int(avail_t.item())
-        max_iters = min(max_extra, synced_remaining)
-        if max_iters <= 0:
-            return {
-                "streaming_extension_count": 0,
-                "streaming_extension_last_mae": last_mae,
-            }
-
-        # Per-extension training. Each extension chunk is a high-
-        # confidence prediction (extension only fires when MAE is
-        # below threshold) — we have no reason to throw it away when
-        # both the generator AND the critic can absorb it for the
-        # cost of one forward+backward each. Per-extension memory is
-        # bounded because each extension's autograd graph is released
-        # by its own ``.backward()`` before the next extension starts
-        # — the persistent KV cache carries no grad. Both gen and
-        # critic paths default ON; toggle via config:
-        #   extension_train_gen     (default true)
-        #   extension_train_critic  (default true)
-        train_gen_on_ext = bool(
-            getattr(cfg, "extension_train_gen", True)
-        )
-        train_critic_on_ext = bool(
-            getattr(cfg, "extension_train_critic", True)
-        )
-        # generate_next_chunk needs requires_grad=True to produce a
-        # grad-bearing chunk for gen DMD. If gen training is off, we
-        # fall back to the cheaper no-grad rollout — the chunk still
-        # commits to the KV cache either way.
-        ext_requires_grad = train_gen_on_ext
-
-        # Param lists for per-extension grad-norm snapshotting. We
-        # measure the L2 norm of the grad CONTRIBUTION from each
-        # extension by snapshotting before its backward and diffing
-        # after. Cost: clone the .grad tensors of one optimizer's
-        # param group (~size of params) per snapshot, freed after
-        # the delta is computed. Worth the memory for the visibility
-        # into how much signal each extension actually contributes.
-        gen_params = [
-            p for p in self.optimizer.param_groups[0]["params"]
-            if getattr(p, "requires_grad", True)
-        ]
-        critic_params: List[torch.nn.Parameter] = []
-        if self.fake_optimizer is not None:
-            critic_params = [
-                p for p in self.fake_optimizer.param_groups[0]["params"]
-                if getattr(p, "requires_grad", True)
-            ]
-
-        def _snap(params):
-            return [
-                (p.grad.detach().clone() if p.grad is not None else None)
-                for p in params
-            ]
-
-        def _delta_norm(params, snap):
-            sq = 0.0
-            for p, prev in zip(params, snap):
-                if p.grad is None:
-                    continue
-                if prev is None:
-                    sq += p.grad.detach().pow(2).sum().item()
-                else:
-                    sq += (p.grad.detach() - prev).pow(2).sum().item()
-            return sq ** 0.5
-
-        ext_count = 0
-        ext_gen_losses: List[float] = []
-        ext_gen_grad_norms: List[float] = []
-        ext_critic_losses: List[float] = []
-        ext_critic_grad_norms: List[float] = []
-        while (
-            ext_count < max_iters
-            and last_mae == last_mae      # NaN guard
-            and last_mae < threshold
-        ):
-            try:
-                ext_chunk, ext_info = self.model.generate_next_chunk(
-                    requires_grad=ext_requires_grad,
-                )
-            except Exception as e:
-                logging.warning(
-                    "[ActionForcing] streaming extender failed at "
-                    "ext_count=%d: %s — stopping extension.",
-                    ext_count, e,
-                )
+        while True:
+            if chunks_rolled >= max_slides:
+                stop_reason = "cap"
                 break
-            last_mae = float(
-                pipe._last_extension_metrics.get(
-                    "baseline_last_chunk_mae", float("nan"),
+            if not self.model.can_generate_more():
+                stop_reason = "end_of_ride"
+                break
+            # DDP-safety: ``_compute_chunk_mae`` does an all_reduce inside
+            # so every rank must enter it the same number of times. The
+            # stop conditions above are already lockstep (max_length is
+            # MIN-reduced at setup; chunks_rolled is incremented in unison
+            # because ``_streaming_pick_new_frames`` is deterministic),
+            # but the explicit MIN-reduce guards against future drift.
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                keep_t = torch.tensor(
+                    [1], device=self.device, dtype=torch.long,
                 )
+                dist.all_reduce(keep_t, op=dist.ReduceOp.MIN)
+                if int(keep_t.item()) == 0:
+                    stop_reason = "ddp_stop"
+                    break
+
+            chunk, info = self.model.generate_next_chunk(requires_grad=True)
+            chunks_rolled += 1
+
+            # GT slice covering the chunk's noisy half (= the full 21
+            # frames the chunk represents in cumulative-sdn coords).
+            noisy_start_sdn = int(
+                info["current_length"]
+                - info["new_frames"]
+                - info["overlap"]
             )
-            ext_count += 1
+            chunk_lo = cf_state + noisy_start_sdn
+            chunk_hi = chunk_lo + chunk_size
+            ride_window = state["ride_latents_window"]
+            if ride_window.shape[1] < chunk_hi:
+                # MIN-reduced setup should make this unreachable, but
+                # treat as end-of-ride to be safe.
+                del chunk, info
+                stop_reason = "end_of_ride"
+                break
+            gt_slice = ride_window[:, chunk_lo:chunk_hi]
+            avg_mae = pipe._compute_chunk_mae(
+                pred_chunk=chunk.detach(), gt_chunk=gt_slice,
+            )
 
-            if train_gen_on_ext:
-                try:
-                    gen_loss, _gen_log = (
-                        self.model.compute_generator_loss_streaming(
-                            ext_chunk, ext_info,
-                        )
-                    )
-                    pre = _snap(gen_params)
-                    # ``retain_graph=True`` when the critic backward
-                    # will also walk the same shared subgraph (cond_
-                    # dict / action_projection chain that compute_
-                    # generator_loss_streaming and compute_critic_
-                    # loss_streaming both consume). Without retain,
-                    # the second backward crashes with "trying to
-                    # backward through the graph a second time" —
-                    # was the v3 smoke regression.
-                    gen_loss.backward(retain_graph=train_critic_on_ext)
-                    ext_gen_losses.append(float(gen_loss.detach().item()))
-                    ext_gen_grad_norms.append(_delta_norm(gen_params, pre))
-                    del pre
-                except Exception as e:
-                    logging.warning(
-                        "[ActionForcing] gen-on-extension backward "
-                        "failed at ext_count=%d: %s — skipping this "
-                        "chunk's gen update.", ext_count, e,
-                    )
+            if avg_mae == avg_mae and avg_mae > threshold:
+                stop_reason = "mae_threshold"
+                train_chunk = chunk
+                train_info = info
+                train_avg_mae = avg_mae
+                break
 
-            if train_critic_on_ext:
-                try:
-                    critic_loss, _critic_log = (
-                        self.model.compute_critic_loss_streaming(
-                            ext_chunk, ext_info,
-                        )
-                    )
-                    pre = _snap(critic_params)
-                    critic_loss.backward()
-                    ext_critic_losses.append(float(critic_loss.detach().item()))
-                    ext_critic_grad_norms.append(
-                        _delta_norm(critic_params, pre)
-                    )
-                    del pre
-                except Exception as e:
-                    logging.warning(
-                        "[ActionForcing] critic-on-extension backward "
-                        "failed at ext_count=%d: %s — skipping this "
-                        "chunk's critic update (extension itself "
-                        "still committed to cache).",
-                        ext_count, e,
-                    )
+            # Too easy — release the autograd graph for this slide.
+            del chunk, info
 
         out: Dict[str, Any] = {
-            "streaming_extension_count": ext_count,
-            "streaming_extension_last_mae": last_mae,
+            "streaming_chunks_rolled": float(chunks_rolled),
+            f"streaming_stop_reason_{stop_reason}": 1.0,
         }
-        if ext_gen_losses:
-            out["streaming_extension_gen_loss_mean"] = (
-                sum(ext_gen_losses) / len(ext_gen_losses)
-            )
-            out["streaming_extension_gen_updates"] = len(ext_gen_losses)
-        if ext_gen_grad_norms:
-            out["streaming_extension_gen_grad_norm_mean"] = (
-                sum(ext_gen_grad_norms) / len(ext_gen_grad_norms)
-            )
-            out["streaming_extension_gen_grad_norm_min"] = min(ext_gen_grad_norms)
-            out["streaming_extension_gen_grad_norm_max"] = max(ext_gen_grad_norms)
-        if ext_critic_losses:
-            out["streaming_extension_critic_loss_mean"] = (
-                sum(ext_critic_losses) / len(ext_critic_losses)
-            )
-            out["streaming_extension_critic_updates"] = len(ext_critic_losses)
-        if ext_critic_grad_norms:
-            out["streaming_extension_critic_grad_norm_mean"] = (
-                sum(ext_critic_grad_norms) / len(ext_critic_grad_norms)
-            )
-            out["streaming_extension_critic_grad_norm_min"] = min(ext_critic_grad_norms)
-            out["streaming_extension_critic_grad_norm_max"] = max(ext_critic_grad_norms)
 
-        # Best-effort stdout summary on rank 0 — mirrors the
-        # ``[ActionForcing] step=N ...`` line so the smoke is readable
-        # in real time without needing to pull wandb.
-        if (
-            self.is_main_process
-            and ext_count > 0
-            and (ext_gen_grad_norms or ext_critic_grad_norms)
-        ):
-            parts = [f"ext_count={ext_count}"]
-            if ext_gen_grad_norms:
-                parts.append(
-                    f"gen_grad[min/mean/max]="
-                    f"{min(ext_gen_grad_norms):.4f}/"
-                    f"{sum(ext_gen_grad_norms)/len(ext_gen_grad_norms):.4f}/"
-                    f"{max(ext_gen_grad_norms):.4f}"
-                )
-            if ext_critic_grad_norms:
-                parts.append(
-                    f"critic_grad[min/mean/max]="
-                    f"{min(ext_critic_grad_norms):.4f}/"
-                    f"{sum(ext_critic_grad_norms)/len(ext_critic_grad_norms):.4f}/"
-                    f"{max(ext_critic_grad_norms):.4f}"
-                )
-            logging.info("[ActionForcing] streaming_extender " + " ".join(parts))
+        if train_chunk is None:
+            # Cap or end-of-ride before MAE crossed: skip optim signal.
+            out["streaming_window_too_easy"] = 1.0
+            self.model.reset_streaming_state()
+            return out
 
+        out["streaming_window_avg_mae"] = float(train_avg_mae)
+        out["streaming_window_start_chunk"] = float(chunks_rolled)
+
+        aux_active = (
+            self.action_critic_loss_active
+            and self.critic_optimizer is not None
+        )
+        gan_active = (
+            self.gan_enabled
+            and self.r3gan_disc is not None
+            and self.r3gan_optimizer is not None
+        )
+        sc_dmd_active = bool(self.sc_dmd_enabled)
+
+        # Stash the trained chunk for the periodic wandb sample-video
+        # logger (parity with _fwdbwd_streaming_step). DMD-eval stash
+        # arming is identical; the eval video logger reads it after
+        # compute_generator_loss_streaming populates the views.
+        _sample_due_now = self._video_sample_due(int(self.step) + 1)
+        if _sample_due_now:
+            try:
+                self._pending_video_latents = (
+                    train_chunk.detach().to(torch.float32)
+                )
+                _cs = int(self.step) + 1
+                while (
+                    self._sample_at_steps_pending
+                    and self._sample_at_steps_pending[0] <= _cs
+                ):
+                    self._sample_at_steps_pending.pop(0)
+                self._video_sample_due_bit = False
+            except Exception as _exc:
+                logging.warning(
+                    "[ActionForcing] failed to stash slide-and-train "
+                    "chunk for video at step=%d: %s",
+                    int(self.step) + 1, _exc,
+                )
+                self._pending_video_latents = None
+            self.model._dmd_eval_stash = {}
+        else:
+            self.model._dmd_eval_stash = None
+
+        gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
+            train_chunk, train_info,
+        )
+
+        if _sample_due_now:
+            eval_stash = getattr(self.model, "_dmd_eval_stash", None)
+            if isinstance(eval_stash, dict) and eval_stash:
+                self._pending_dmd_eval_latents = eval_stash
+            self.model._dmd_eval_stash = None
+
+        out["generator_dmd_loss"] = float(gen_loss_dmd.detach().item())
+        out.update({
+            k: (float(v.detach().float().mean().item())
+                if torch.is_tensor(v) else v)
+            for k, v in gen_log.items()
+            if not isinstance(v, dict)
+        })
+
+        generator_loss = gen_loss_dmd
+
+        # Aux / GAN / SC-DMD chunk geometry. ``state["current_length"]``
+        # has already advanced past train_chunk by the time we get
+        # here; the chunk's noisy half lives at
+        # ``cf + (train_info[current_length] - new_frames - overlap) :
+        #  ... + chunk_size``.
+        noisy_start_sdn = int(
+            train_info["current_length"]
+            - train_info["new_frames"]
+            - train_info["overlap"]
+        )
+        chunk_lo = cf_state + noisy_start_sdn
+        chunk_hi = chunk_lo + chunk_size
+
+        if aux_active:
+            actions_chunk = state["ride_actions_window"][:, chunk_lo:chunk_hi]
+            actions_for_critic = self._slice_actions_for_critic(
+                actions_chunk
+            ).to(train_chunk.dtype)
+            ts_value = train_info.get("denoised_timestep_from", None)
+            ts_int = int(ts_value) if ts_value is not None else 0
+            B = train_chunk.shape[0]
+            n_chunks = train_chunk.shape[1] // int(self.config.num_frame_per_block)
+            chunk_t = torch.full(
+                (B, n_chunks), ts_int,
+                device=train_chunk.device, dtype=torch.long,
+            )
+            gen_action_loss, critic_logs, _teacher_z = (
+                self._compute_action_critic_losses(
+                    pred_x0=train_chunk,
+                    target_action_z=actions_for_critic,
+                    chunk_t=chunk_t,
+                    current_step=int(self.step),
+                )
+            )
+            generator_loss = generator_loss + gen_action_loss
+            out.update(critic_logs)
+
+        if gan_active:
+            gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
+            gen_gan_loss, gan_logs = self._compute_r3gan_losses(
+                pred_image=train_chunk,
+                gt_latents_window=gt_window,
+                current_step=int(self.step),
+            )
+            generator_loss = generator_loss + gen_gan_loss
+            out.update(gan_logs)
+
+        if sc_dmd_active:
+            sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
+                conditional_dict=train_info["conditional_dict"],
+                clean_latent=state["ride_latents_window"][:, cf_state:],
+                seed_frames=cf_state,
+            )
+            sc_weight = self._sc_dmd_current_weight(int(self.step))
+            weighted_sc = sc_loss_raw * sc_weight
+            generator_loss = generator_loss + weighted_sc
+            out.update(sc_logs)
+            out["sc_dmd_weight_effective"] = float(sc_weight)
+            out["sc_dmd_loss_weighted"] = float(weighted_sc.detach().item())
+
+        out["generator_loss"] = float(generator_loss.detach().item())
+        # retain_graph=True so the critic backward can walk the shared
+        # cond_dict / action_projection subgraph that both losses use.
+        generator_loss.backward(retain_graph=True)
+
+        critic_loss, critic_log = self.model.compute_critic_loss_streaming(
+            train_chunk, train_info,
+        )
+        out["critic_loss"] = float(critic_loss.detach().item())
+        out.update({
+            k: (float(v.detach().float().mean().item())
+                if torch.is_tensor(v) else v)
+            for k, v in critic_log.items()
+            if not isinstance(v, dict)
+        })
+        critic_loss.backward()
+
+        # Close the sequence — exactly one trained window per ride.
+        self.model.reset_streaming_state()
         return out
 
     # ------------------------------------------------------------------
@@ -2350,8 +2338,37 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         advance by ``new_frames``, score DMD on the chunk, backward.
         Collapse gate at end of step decides whether to keep rolling
         next iter.
+
+        When ``mae_extension_threshold is not None and
+        mae_extension_max_extra_chunks > 0`` (the Phase-1 freeze-config
+        default), the gen-iter path routes to
+        ``_streaming_roll_and_train_one_window`` (slide-and-train) and
+        the standalone critic-iter call is a no-op (the helper already
+        ran the critic backward on the same window). The legacy
+        per-chunk-trains-immediately + ``_streaming_maybe_extend``
+        chain is unreachable in that mode.
         """
-        # Open a sequence if needed.
+        cfg = self.config
+        extension_active = (
+            getattr(cfg, "mae_extension_threshold", None) is not None
+            and int(getattr(cfg, "mae_extension_max_extra_chunks", 0)) > 0
+        )
+        if extension_active:
+            if train_generator:
+                return self._streaming_roll_and_train_one_window(
+                    rollout_frames=rollout_frames,
+                    cf_dmdctx=cf_dmdctx,
+                )
+            # Critic-iter no-op: the helper already trained the critic
+            # on the same window during the gen-iter call. Running
+            # another critic update here would either re-train on a
+            # fresh ride (= different chunk than the gen update — DMD2
+            # decoupling) or roll into a closed sequence. Either is
+            # incorrect; skip with telemetry.
+            return {"streaming_critic_skipped": 1.0}
+
+        # Legacy per-chunk path (extension_active=False). Open a
+        # sequence if needed.
         if (
             self.model.streaming_state is None
             or not self.model.can_generate_more()
@@ -2545,15 +2562,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if collapsed:
                 merged["streaming_reset_for_collapse"] = 1.0
                 self.model.reset_streaming_state()
-            else:
-                # MAE-driven extender: when the just-scored chunk's MAE
-                # is below ``mae_extension_threshold``, push the stream
-                # forward by additional no-grad chunks so the next iter
-                # starts further along the ride. No-op when extension
-                # is disabled (threshold null or cap <= 0). Only fired
-                # on gen iters — see ``_streaming_maybe_extend`` for
-                # the rationale.
-                merged.update(self._streaming_maybe_extend())
             return merged
         else:
             chunk, info = self.model.generate_next_chunk(requires_grad=False)

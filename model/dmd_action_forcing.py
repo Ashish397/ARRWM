@@ -565,6 +565,18 @@ class ActionForcingDMD(SelfForcingModel):
         self.streaming_chunk_size: int = int(getattr(args, "streaming_chunk_size", self.num_training_frames))
         self.streaming_min_new_frame: int = int(getattr(args, "streaming_min_new_frame", self.streaming_chunk_size - self.num_frame_per_block))
         self.streaming_max_length: int = int(getattr(args, "streaming_max_length", 57))
+        # Deterministic stride for slide-and-train: when > 0, every
+        # ``_streaming_pick_new_frames`` call returns exactly this many
+        # ``num_frame_per_block``-chunks (* npb frames) instead of the
+        # legacy random pick from {min_new, max_new}. Phase-1 freeze
+        # YAML sets ``num_chunks_roll_forward: 6`` (= 18 frames per
+        # slide) so the slide-and-train helper's per-iter MAE is
+        # comparable across iters. Iter 1's full chunk_size advance is
+        # unaffected (it's forced by the previous_chunk=None branch in
+        # ``generate_next_chunk``).
+        self.streaming_force_new_frame_chunks: int = int(
+            getattr(args, "num_chunks_roll_forward", 0)
+        )
 
         # SC-DMD (Salt paper, 2604.03118v1) — semigroup defect
         # regularizer L_SC = E[||Ψ_θ^{ts→te}(x_ts) - Ψ_θ^{tm→te}(Ψ_θ^{ts→tm}(x_ts))||²]
@@ -2358,6 +2370,16 @@ class ActionForcingDMD(SelfForcingModel):
         npb = s["shift"]
         chunk_size = s["chunk_size"]
         room = s["max_length"] - s["current_length"]
+        # Deterministic-stride mode (slide-and-train): when set, every
+        # call returns the same number of frames (capped to room +
+        # chunk_size). No DDP broadcast needed because the value is
+        # rank-invariant. Iter 1's chunk_size advance is still applied
+        # by ``generate_next_chunk``'s previous_chunk=None branch.
+        if self.streaming_force_new_frame_chunks > 0:
+            forced = self.streaming_force_new_frame_chunks * npb
+            capped = min(forced, room, chunk_size)
+            capped = (capped // npb) * npb
+            return max(npb, capped)
         max_new = min(room, chunk_size)
         # Snap to multiple of npb.
         max_new = (max_new // npb) * npb
