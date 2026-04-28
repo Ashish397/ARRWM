@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2154,6 +2155,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         cfg = self.config
         threshold = float(cfg.mae_extension_threshold)
         max_slides = int(cfg.mae_extension_max_extra_chunks)
+        train_on = str(getattr(cfg, "train_on", "every")).lower()
+        if train_on not in ("last", "every"):
+            raise ValueError(
+                f"config.train_on must be 'last' or 'every', got "
+                f"{train_on!r}"
+            )
+        # Per-ride 1/(K + norm_constant) loss scaling for ``train_on=every``.
+        # Larger ``norm_constant`` gives short rides (small K) less signal
+        # and slightly deflates the variance contribution of long rides.
+        # Default 2 matches an empirically reasonable slope: K=1 → 1/3,
+        # K=3 → 1/5, K=10 → 1/12. ``train_on=last`` mode ignores this
+        # (K_local=1 always, full_dmd_loss × 1/(1+norm) is the chosen
+        # downscale; we keep the existing 1× behaviour by short-circuiting).
+        train_norm_constant = float(getattr(cfg, "train_norm_constant", 2.0))
 
         # Open a fresh sequence — single trained window per ride means
         # we never carry streaming state across iters.
@@ -2196,6 +2211,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             forced_exit_step = int(torch.randint(0, n_steps, (1,)).item())
 
+        # ``out`` is initialised before the loop because in
+        # ``train_on=every`` mode the inline trainings write into it
+        # (last-write-wins semantics for per-chunk DMD loss telemetry,
+        # so the dict reflects the final/sync training).
+        out: Dict[str, Any] = {}
+
         chunks_rolled = 0
         stop_reason: str = "unknown"
         train_chunk: Optional[torch.Tensor] = None
@@ -2211,6 +2232,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # slide loop. One entry per generate_next_chunk call. Helps
         # diagnose "the helper extends too far before training" cases.
         slide_maes: List[float] = []
+
+        # ``train_on=every`` mode: USE every rolled chunk for training
+        # (not just the first above-threshold one). We still BREAK on
+        # the first crossing — same as ``train_on=last`` — so the
+        # below-threshold chunks rolled before it become extra DMD
+        # gradient signal that would otherwise be discarded.
+        #
+        # Per-rolled-chunk semantics:
+        #   * Below-threshold: trained inline with ``no_sync``,
+        #     ``include_aux_gan_scdmd=False``. Local grad accumulates
+        #     on the generator / fake_score wrappers.
+        #   * Above-threshold (the FIRST one): becomes ``train_chunk``,
+        #     trained POST-loop with ``no_sync=False`` and
+        #     ``include_aux_gan_scdmd=True`` — one DDP all-reduce flush
+        #     plus the per-window aux / GAN / SC-DMD step.
+        #
+        # One-step-behind queue (``last_pending``): the most-recently
+        # rolled below-threshold chunk's autograd graph is kept alive
+        # so the no-crossing-but-peer-crossed straggler path can
+        # backward on it. On the next iter (or on a crossing) the
+        # queued chunk is processed with no_sync and the queue
+        # advances. Memory: at most 2 chunk graphs alive at once.
+        #
+        # Per-ride 1/K normalization: every chunk's DMD contribution is
+        # scaled by 1/K_local before grads enter the optimizer, so
+        # rides with K=10 above-threshold chunks don't outweigh rides
+        # with K=1. K_local = ``every_trained_count`` (= the post-loop
+        # final sync also counts toward K). Aux/GAN/SC-DMD fire ONCE
+        # per training step on the post-loop sync chunk so they're
+        # already 1× per ride and need no scaling.
+        last_pending: Optional[
+            Tuple[torch.Tensor, Dict[str, Any], float]
+        ] = None
+        every_trained_count = 0
 
         while True:
             if chunks_rolled >= max_slides:
@@ -2288,17 +2343,73 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 del prev_chunk, prev_info
             prev_chunk, prev_info = chunk, info
 
-            if avg_mae == avg_mae and avg_mae > threshold:
+            crossed = avg_mae == avg_mae and avg_mae > threshold
+
+            if train_on == "last":
+                if crossed:
+                    stop_reason = "mae_threshold"
+                    train_chunk = chunk
+                    train_info = info
+                    train_avg_mae = avg_mae
+                    break
+                continue
+
+            # train_on == "every": train EVERY rolled chunk. Below-
+            # threshold ones get an inline ``no_sync`` training (no
+            # aux/GAN/SC-DMD); the FIRST above-threshold chunk becomes
+            # the post-loop sync target (where the cross-rank all-
+            # reduce + per-window aux fires) and we break.
+            #
+            # Use a one-step-behind queue so the most-recent below-
+            # threshold chunk's autograd graph stays alive — that lets
+            # the cross-rank straggler-fallback path (this rank exited
+            # on cap/end_of_ride without crossing but a peer crossed)
+            # backward on it post-loop. Memory: at most 2 chunk graphs
+            # alive at once.
+            if last_pending is not None:
+                # Process the previously queued below-threshold chunk
+                # (no_sync, no aux). ``loss_scale=1.0`` here; the
+                # accumulated .grad will be scaled by 1/K_local
+                # post-loop, before the final sync flush, so each
+                # chunk contributes 1/K_local of its gradient on net.
+                p_chunk, p_info, p_mae = last_pending
+                self._streaming_train_one_chunk(
+                    p_chunk, p_info, p_mae,
+                    state=state, cf_state=cf_state, chunk_size=chunk_size,
+                    out=out,
+                    no_sync=True,
+                    include_aux_gan_scdmd=False,
+                    stash_video=False,
+                    loss_scale=1.0,
+                )
+                every_trained_count += 1
+                del p_chunk, p_info
+                last_pending = None
+
+            if crossed:
+                # First above-threshold chunk: this is the trained
+                # window. Hand off to the post-loop sync flush, which
+                # fires the per-window aux/GAN/SC-DMD (also scaled by
+                # 1/K_local) along with the final DDP all-reduce.
                 stop_reason = "mae_threshold"
                 train_chunk = chunk
                 train_info = info
                 train_avg_mae = avg_mae
                 break
 
-        out: Dict[str, Any] = {
-            "streaming_chunks_rolled": float(chunks_rolled),
-            f"streaming_stop_reason_{stop_reason}": 1.0,
-        }
+            # Below-threshold: queue this chunk for the next iter (or
+            # for the post-loop straggler-fallback sync flush if we
+            # exit on cap/end_of_ride).
+            last_pending = (chunk, info, avg_mae)
+
+        out["streaming_chunks_rolled"] = float(chunks_rolled)
+        out[f"streaming_stop_reason_{stop_reason}"] = 1.0
+        # ``streaming_n_trained`` = the inline no_sync trainings done
+        # so far. The post-loop sync flush (when one fires) adds 1; we
+        # set ``streaming_K_local`` further down to reflect that final
+        # total.
+        if train_on == "every":
+            out["streaming_n_inline_trained"] = float(every_trained_count)
 
         # Per-slide MAE printout — log on EVERY rank (with rank tag) so
         # we can verify the per-rank decisions diverge as expected
@@ -2310,81 +2421,251 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         rank = dist.get_rank() if dist.is_initialized() else 0
         if slide_maes:
             mae_str = ", ".join(f"{m:.4f}" for m in slide_maes)
+            # K_local here counts the inline no_sync trainings; the
+            # post-loop sync flush adds one more (handled later in the
+            # K_local computation that drives the 1/K loss scale).
             logging.warning(
                 "[ActionForcing] slide_loop rank=%d step=%d threshold=%.3f "
-                "stop_reason=%s slide_maes=[%s]",
-                rank, int(self.step) + 1, threshold, stop_reason, mae_str,
+                "stop_reason=%s train_on=%s inline_no_sync=%d slide_maes=[%s]",
+                rank, int(self.step) + 1, threshold, stop_reason,
+                train_on, every_trained_count, mae_str,
             )
 
-        # Cross-rank coordination: did ANY rank find a hard window? If
-        # so, ranks that didn't cross threshold fall back to ``prev_chunk``
-        # (the last rolled chunk) as their training target. This keeps
-        # generator_ddp + fake_score_ddp all_reduces in lockstep AND
-        # gives stragglers a real gradient contribution instead of a
-        # zero-loss no-op (the chunks are sub-threshold but still carry
-        # signal — the slide loop's forward compute is no longer wasted).
-        local_trained = 1 if train_chunk is not None else 0
+        # Cross-rank coordination: did ANY rank's slide loop break on
+        # an above-threshold crossing? Aux/GAN/SC-DMD fires on every
+        # rank iff some rank crossed (their inner discriminator optims
+        # have their own DDP all-reduces; firing them on a per-rank
+        # basis would mismatch counts across ranks).
+        #
+        # ``train_on=last``: ``train_chunk is not None`` ⇔ this rank
+        # crossed (no inline training in that mode).
+        # ``train_on=every``: ``train_chunk is not None`` ⇔ this rank
+        # crossed (the inline trainings stash via ``last_pending``,
+        # not ``train_chunk``).
+        local_crossed = 1 if train_chunk is not None else 0
         if dist.is_initialized() and dist.get_world_size() > 1:
             flag_t = torch.tensor(
-                [local_trained], device=self.device, dtype=torch.long,
+                [local_crossed], device=self.device, dtype=torch.long,
             )
             dist.all_reduce(flag_t, op=dist.ReduceOp.MAX)
-            any_trained = int(flag_t.item()) == 1
+            any_crossed = int(flag_t.item()) == 1
         else:
-            any_trained = bool(local_trained)
+            any_crossed = bool(local_crossed)
 
-        if not any_trained:
-            # Every rank's slide loop finished without crossing the
-            # threshold. No backward fires anywhere; the trainer's
-            # outer optim.step() runs on zero grads (safe path).
+        # Decide what to backward on for the post-loop sync flush, and
+        # whether aux/GAN/SC-DMD fires.
+        #
+        # The matrix:
+        #   train_on  | local_crossed | any_crossed | flush target            | aux fires?
+        #   --------- | ------------- | ----------- | ----------------------- | ----------
+        #   last      | yes           | yes         | crossing chunk          | yes
+        #   last      | no            | yes         | prev_chunk (straggler)  | yes
+        #   last      | no            | no          | (none — return early)   | no
+        #   every     | yes           | yes         | crossing chunk          | yes
+        #   every     | no            | yes         | last_pending (straggler)| yes
+        #   every     | no            | no          | last_pending (no-cross) | no
+        include_aux_for_final: bool
+        if not any_crossed and train_on == "last":
+            # window_too_easy: no rank trained anything in "last"
+            # mode. No backward fired. The trainer's outer optim.step
+            # runs on zero grads (safe no-op).
             out["streaming_window_too_easy"] = 1.0
             if prev_chunk is not None:
                 del prev_chunk, prev_info
+            if last_pending is not None:
+                del last_pending
             self.model.reset_streaming_state()
             return out
 
         if train_chunk is None:
-            # This rank didn't cross threshold but at least one peer did.
-            # Promote ``prev_chunk`` (the last rolled chunk on this rank)
-            # to train_chunk and continue through the unified backward
-            # path. Real loss, real gradient — the rank still contributes
-            # to the DDP-averaged update, just on a sub-threshold window.
-            #
-            # ``prev_chunk is not None`` here: setup_sequence rejects
-            # rides too small for ``anchor_frames + min_new``, so the
-            # loop always rolls at least one chunk and stages it as
-            # prev_chunk before any in-body break. The geometry-guard
-            # assert above eliminates the only path that could leave
-            # the loop with prev_chunk unset.
-            assert prev_chunk is not None, (
-                "straggler-fallback invariant broken: peer rank trained "
-                "but this rank has no staged prev_chunk. The slide loop "
-                "should have rolled at least one chunk before exiting."
-            )
-            train_chunk = prev_chunk
-            train_info = prev_info
-            train_avg_mae = slide_maes[-1] if slide_maes else float("nan")
-            out["streaming_straggler_fallback"] = 1.0
+            # This rank didn't cross. We need a graph-alive chunk to
+            # backward on for the cross-rank-matched sync flush.
+            if train_on == "last":
+                # "last" mode below-threshold chunks weren't backward'd
+                # → prev_chunk's autograd graph is alive.
+                assert prev_chunk is not None, (
+                    "straggler-fallback invariant: setup_sequence "
+                    "rolls ≥1 chunk so prev_chunk must be set."
+                )
+                train_chunk = prev_chunk
+                train_info = prev_info
+                train_avg_mae = slide_maes[-1] if slide_maes else float("nan")
+            else:  # train_on == "every"
+                # "every" mode: every rolled chunk was either backward'd
+                # (no_sync) or is queued in ``last_pending``. The
+                # queued one's graph is alive — use it for the flush.
+                assert last_pending is not None, (
+                    "every-mode flush invariant: setup_sequence rolls "
+                    "≥1 chunk and the slide loop queues each below-"
+                    "threshold chunk into last_pending."
+                )
+                p_chunk, p_info, p_mae = last_pending
+                train_chunk = p_chunk
+                train_info = p_info
+                train_avg_mae = p_mae
+                last_pending = None
+            if any_crossed:
+                # Peer rank crossed → join their cross-rank aux fire.
+                out["streaming_straggler_fallback"] = 1.0
+
+        # ``include_aux_gan_scdmd``: fires only when at least one rank
+        # crossed (= there's a "window" semantically). In "every"
+        # mode + no-rank-crossed, we still flush DDP gen/critic
+        # collectives so the K local no_sync gradients get all-
+        # reduced, but aux/GAN/SC-DMD inner optims sit out this step.
+        include_aux_for_final = bool(any_crossed)
+        if not any_crossed and train_on == "every":
+            out["streaming_window_no_crossing"] = 1.0
 
         out["streaming_window_avg_mae"] = float(train_avg_mae)
         out["streaming_window_start_chunk"] = float(chunks_rolled)
 
+        # Per-ride 1/(K + norm_constant) normalization (``train_on=every``
+        # only). The K_local-1 inline trainings accumulated full-magnitude
+        # gradients on the local generator / fake_score parameters (they
+        # ran inside ``no_sync`` so no all-reduce fired). Before the
+        # post-loop sync training we scale the accumulated .grad by the
+        # final loss_scale, then run the sync training itself with the
+        # same scale, so every chunk (DMD gen + DMD critic) contributes
+        # 1/(K_local + norm_constant) of its raw gradient. The final
+        # sync training also scales the per-window aux / GAN / SC-DMD
+        # losses by the same factor — uniform 1/(K+norm) treatment
+        # across all loss families.
+        #
+        # Effect of ``train_norm_constant`` (default 2):
+        #   K=1  → 1/3   (short rides: less per-ride signal than 1/K=1)
+        #   K=2  → 1/4
+        #   K=10 → 1/12  (long rides: K/(K+2)=10/12 ≈ 0.83 of full)
+        # Hard rides (high K) contribute slightly deflated DMD variance
+        # vs the pure 1/K average; easy rides (K=1) have signal floored.
+        #
+        # ``train_on=last`` mode: keep the existing 1× behaviour
+        # (norm_constant only applies to the multi-chunk averaging mode).
+        k_local = every_trained_count + 1  # +1 for the post-loop sync flush
+        if train_on == "every":
+            final_loss_scale = 1.0 / (float(k_local) + train_norm_constant)
+            self._scale_streaming_grads_(final_loss_scale)
+        else:
+            final_loss_scale = 1.0
+        out["streaming_K_local"] = float(k_local)
+        out["streaming_train_norm_constant"] = float(train_norm_constant)
+
+        self._streaming_train_one_chunk(
+            train_chunk, train_info, train_avg_mae,
+            state=state, cf_state=cf_state, chunk_size=chunk_size,
+            out=out,
+            no_sync=False,
+            include_aux_gan_scdmd=include_aux_for_final,
+            stash_video=True,
+            loss_scale=final_loss_scale,
+        )
+
+        # Close the sequence — exactly one trained window per ride.
+        self.model.reset_streaming_state()
+        return out
+
+    # ------------------------------------------------------------------
+    # Per-ride 1/K gradient renormalization (``train_on=every``).
+    # ------------------------------------------------------------------
+    def _scale_streaming_grads_(self, scale: float) -> None:
+        """Multiply accumulated ``.grad`` tensors on the generator and
+        fake_score DDP wrappers by ``scale``, in place. Called once
+        before the post-loop sync training in ``train_on=every`` mode
+        so the K-1 inline ``no_sync`` trainings (which scaled their
+        losses by 1.0 — full magnitude — for memory simplicity) get
+        retroactively renormalized to ``1/K_local`` each. Combined
+        with the post-loop sync training itself running at
+        ``loss_scale=1/K_local``, every chunk contributes 1/K of its
+        gradient on net — DMD signal averages to 1× per ride.
+
+        Only generator / fake_score parameter grads are touched here.
+        Aux/GAN/SC-DMD inner-discriminator parameter grads are scaled
+        at the loss level inside ``_streaming_train_one_chunk`` (via
+        ``loss_scale``) on the single sync call where they fire, so
+        they don't need post-hoc gradient surgery.
+        """
+        if scale == 1.0:
+            return
+        wrappers = []
+        if self.generator_ddp is not None:
+            wrappers.append(self.generator_ddp)
+        if self.fake_score_ddp is not None:
+            wrappers.append(self.fake_score_ddp)
+        for w in wrappers:
+            for p in w.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+
+    # ------------------------------------------------------------------
+    # Per-chunk training block extracted from
+    # ``_streaming_roll_and_train_one_window`` so both the post-loop
+    # sync training and the inline ``train_on=every`` no_sync trainings
+    # share one path.
+    # ------------------------------------------------------------------
+    def _streaming_train_one_chunk(
+        self,
+        train_chunk: torch.Tensor,
+        train_info: Dict[str, Any],
+        train_avg_mae: float,
+        *,
+        state: Dict[str, Any],
+        cf_state: int,
+        chunk_size: int,
+        out: Dict[str, Any],
+        no_sync: bool,
+        include_aux_gan_scdmd: bool,
+        stash_video: bool,
+        loss_scale: float = 1.0,
+    ) -> None:
+        """Run gen DMD loss + (optional) aux/GAN/SC-DMD + gen.backward
+        + critic loss + critic.backward on a single trained chunk.
+
+        ``no_sync``: when True, wrap the gen + critic backwards in
+        ``generator_ddp.no_sync()`` / ``fake_score_ddp.no_sync()`` so
+        the per-bucket all-reduces are deferred. The K-th (final)
+        training in ``train_on=every`` mode passes False so that one
+        all-reduce flushes the accumulated gradients from the prior
+        K-1 no_sync backwards.
+
+        ``include_aux_gan_scdmd``: when False, skip the action-critic /
+        R3GAN / SC-DMD branches entirely. These each have their own
+        inner optim that fires its own DDP all-reduce per call; firing
+        them once per training step (i.e. only on the ``no_sync=False``
+        flush, or on the ``train_on=last`` single training) keeps the
+        rank-count of those collectives matched across ranks.
+
+        ``stash_video``: when True and the periodic video sample is due
+        on this step, stash ``train_chunk`` and arm the DMD-eval stash.
+        Only the final (sync) training does this in ``every`` mode so
+        the rendered mp4 reflects the chunk DDP actually flushed on.
+
+        ``loss_scale``: multiplier applied to EVERY loss in this call
+        before backward. Covers ``gen_loss_dmd``, ``critic_loss``, and
+        (when ``include_aux_gan_scdmd=True``) the aux gen-side loss,
+        the R3GAN gen-side loss, and the SC-DMD weighted loss. The
+        slide loop passes ``1/(K_local + train_norm_constant)`` so each
+        ride's total contribution is bounded uniformly across all loss
+        families regardless of how many chunks it rolled (and the
+        norm_constant softens the K-dependence — short rides don't get
+        full magnitude, long rides don't get full averaging). The inner
+        aux / R3GAN discriminator optims (which fire on the final sync
+        training only) update at full scale — they're separate optims,
+        not part of the generator's gradient ledger.
+        """
         aux_active = (
-            self.action_critic_loss_active
+            include_aux_gan_scdmd
+            and self.action_critic_loss_active
             and self.critic_optimizer is not None
         )
         gan_active = (
-            self.gan_enabled
+            include_aux_gan_scdmd
+            and self.gan_enabled
             and self.r3gan_disc is not None
             and self.r3gan_optimizer is not None
         )
-        sc_dmd_active = bool(self.sc_dmd_enabled)
+        sc_dmd_active = include_aux_gan_scdmd and bool(self.sc_dmd_enabled)
 
-        # Stash the trained chunk for the periodic wandb sample-video
-        # logger (parity with _fwdbwd_streaming_step). DMD-eval stash
-        # arming is identical; the eval video logger reads it after
-        # compute_generator_loss_streaming populates the views.
-        _sample_due_now = self._video_sample_due(int(self.step) + 1)
+        _sample_due_now = stash_video and self._video_sample_due(int(self.step) + 1)
         if _sample_due_now:
             try:
                 self._pending_video_latents = (
@@ -2408,106 +2689,130 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             self.model._dmd_eval_stash = None
 
-        gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
-            train_chunk, train_info,
-        )
+        # Build the no_sync stack for the gen + critic backwards. Aux
+        # and GAN have their OWN inner backwards that fire OUTSIDE this
+        # stack (only when include_aux_gan_scdmd=True), so they all-
+        # reduce normally; their rank-count parity is enforced by being
+        # called only on the sync (post-loop) training.
+        with ExitStack() as stack:
+            if no_sync and self.generator_ddp is not None:
+                stack.enter_context(self.generator_ddp.no_sync())
+            if no_sync and self.fake_score_ddp is not None:
+                stack.enter_context(self.fake_score_ddp.no_sync())
 
-        if _sample_due_now:
-            eval_stash = getattr(self.model, "_dmd_eval_stash", None)
-            if isinstance(eval_stash, dict) and eval_stash:
-                self._pending_dmd_eval_latents = eval_stash
-            self.model._dmd_eval_stash = None
-
-        out["generator_dmd_loss"] = float(gen_loss_dmd.detach().item())
-        out.update({
-            k: (float(v.detach().float().mean().item())
-                if torch.is_tensor(v) else v)
-            for k, v in gen_log.items()
-            if not isinstance(v, dict)
-        })
-
-        generator_loss = gen_loss_dmd
-
-        # Aux / GAN / SC-DMD chunk geometry. ``state["current_length"]``
-        # has already advanced past train_chunk by the time we get
-        # here; the chunk's noisy half lives at
-        # ``cf + (train_info[current_length] - new_frames - overlap) :
-        #  ... + chunk_size``.
-        noisy_start_sdn = int(
-            train_info["current_length"]
-            - train_info["new_frames"]
-            - train_info["overlap"]
-        )
-        chunk_lo = cf_state + noisy_start_sdn
-        chunk_hi = chunk_lo + chunk_size
-
-        if aux_active:
-            actions_chunk = state["ride_actions_window"][:, chunk_lo:chunk_hi]
-            actions_for_critic = self._slice_actions_for_critic(
-                actions_chunk
-            ).to(train_chunk.dtype)
-            ts_value = train_info.get("denoised_timestep_from", None)
-            ts_int = int(ts_value) if ts_value is not None else 0
-            B = train_chunk.shape[0]
-            n_chunks = train_chunk.shape[1] // int(self.config.num_frame_per_block)
-            chunk_t = torch.full(
-                (B, n_chunks), ts_int,
-                device=train_chunk.device, dtype=torch.long,
+            gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
+                train_chunk, train_info,
             )
-            gen_action_loss, critic_logs, _teacher_z = (
-                self._compute_action_critic_losses(
-                    pred_x0=train_chunk,
-                    target_action_z=actions_for_critic,
-                    chunk_t=chunk_t,
+
+            if _sample_due_now:
+                eval_stash = getattr(self.model, "_dmd_eval_stash", None)
+                if isinstance(eval_stash, dict) and eval_stash:
+                    self._pending_dmd_eval_latents = eval_stash
+                self.model._dmd_eval_stash = None
+
+            out["generator_dmd_loss"] = float(gen_loss_dmd.detach().item())
+            out.update({
+                k: (float(v.detach().float().mean().item())
+                    if torch.is_tensor(v) else v)
+                for k, v in gen_log.items()
+                if not isinstance(v, dict)
+            })
+
+            # Per-ride 1/K normalization for the DMD gen loss (see
+            # ``loss_scale`` kwarg docstring). Aux / GAN / SC-DMD also
+            # get scaled below as they're added to ``generator_loss``.
+            if loss_scale != 1.0:
+                gen_loss_dmd = gen_loss_dmd * loss_scale
+                out["generator_dmd_loss_scaled"] = float(gen_loss_dmd.detach().item())
+                out["streaming_loss_scale"] = float(loss_scale)
+
+            generator_loss = gen_loss_dmd
+
+            # Aux / GAN / SC-DMD chunk geometry. ``state["current_length"]``
+            # has already advanced past train_chunk by the time we get
+            # here; the chunk's noisy half lives at
+            # ``cf + (train_info[current_length] - new_frames - overlap) :
+            #  ... + chunk_size``.
+            noisy_start_sdn = int(
+                train_info["current_length"]
+                - train_info["new_frames"]
+                - train_info["overlap"]
+            )
+            chunk_lo = cf_state + noisy_start_sdn
+            chunk_hi = chunk_lo + chunk_size
+
+            if aux_active:
+                actions_chunk = state["ride_actions_window"][:, chunk_lo:chunk_hi]
+                actions_for_critic = self._slice_actions_for_critic(
+                    actions_chunk
+                ).to(train_chunk.dtype)
+                ts_value = train_info.get("denoised_timestep_from", None)
+                ts_int = int(ts_value) if ts_value is not None else 0
+                B = train_chunk.shape[0]
+                n_chunks = train_chunk.shape[1] // int(self.config.num_frame_per_block)
+                chunk_t = torch.full(
+                    (B, n_chunks), ts_int,
+                    device=train_chunk.device, dtype=torch.long,
+                )
+                gen_action_loss, critic_logs, _teacher_z = (
+                    self._compute_action_critic_losses(
+                        pred_x0=train_chunk,
+                        target_action_z=actions_for_critic,
+                        chunk_t=chunk_t,
+                        current_step=int(self.step),
+                    )
+                )
+                if loss_scale != 1.0:
+                    gen_action_loss = gen_action_loss * loss_scale
+                generator_loss = generator_loss + gen_action_loss
+                out.update(critic_logs)
+
+            if gan_active:
+                gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
+                gen_gan_loss, gan_logs = self._compute_r3gan_losses(
+                    pred_image=train_chunk,
+                    gt_latents_window=gt_window,
                     current_step=int(self.step),
                 )
+                if loss_scale != 1.0:
+                    gen_gan_loss = gen_gan_loss * loss_scale
+                generator_loss = generator_loss + gen_gan_loss
+                out.update(gan_logs)
+
+            if sc_dmd_active:
+                sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
+                    conditional_dict=train_info["conditional_dict"],
+                    clean_latent=state["ride_latents_window"][:, cf_state:],
+                    seed_frames=cf_state,
+                )
+                sc_weight = self._sc_dmd_current_weight(int(self.step))
+                weighted_sc = sc_loss_raw * sc_weight
+                if loss_scale != 1.0:
+                    weighted_sc = weighted_sc * loss_scale
+                generator_loss = generator_loss + weighted_sc
+                out.update(sc_logs)
+                out["sc_dmd_weight_effective"] = float(sc_weight)
+                out["sc_dmd_loss_weighted"] = float(weighted_sc.detach().item())
+
+            out["generator_loss"] = float(generator_loss.detach().item())
+            # retain_graph=True so the critic backward can walk the shared
+            # cond_dict / action_projection subgraph that both losses use.
+            generator_loss.backward(retain_graph=True)
+
+            critic_loss, critic_log = self.model.compute_critic_loss_streaming(
+                train_chunk, train_info,
             )
-            generator_loss = generator_loss + gen_action_loss
-            out.update(critic_logs)
-
-        if gan_active:
-            gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
-            gen_gan_loss, gan_logs = self._compute_r3gan_losses(
-                pred_image=train_chunk,
-                gt_latents_window=gt_window,
-                current_step=int(self.step),
-            )
-            generator_loss = generator_loss + gen_gan_loss
-            out.update(gan_logs)
-
-        if sc_dmd_active:
-            sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
-                conditional_dict=train_info["conditional_dict"],
-                clean_latent=state["ride_latents_window"][:, cf_state:],
-                seed_frames=cf_state,
-            )
-            sc_weight = self._sc_dmd_current_weight(int(self.step))
-            weighted_sc = sc_loss_raw * sc_weight
-            generator_loss = generator_loss + weighted_sc
-            out.update(sc_logs)
-            out["sc_dmd_weight_effective"] = float(sc_weight)
-            out["sc_dmd_loss_weighted"] = float(weighted_sc.detach().item())
-
-        out["generator_loss"] = float(generator_loss.detach().item())
-        # retain_graph=True so the critic backward can walk the shared
-        # cond_dict / action_projection subgraph that both losses use.
-        generator_loss.backward(retain_graph=True)
-
-        critic_loss, critic_log = self.model.compute_critic_loss_streaming(
-            train_chunk, train_info,
-        )
-        out["critic_loss"] = float(critic_loss.detach().item())
-        out.update({
-            k: (float(v.detach().float().mean().item())
-                if torch.is_tensor(v) else v)
-            for k, v in critic_log.items()
-            if not isinstance(v, dict)
-        })
-        critic_loss.backward()
-
-        # Close the sequence — exactly one trained window per ride.
-        self.model.reset_streaming_state()
-        return out
+            out["critic_loss"] = float(critic_loss.detach().item())
+            out.update({
+                k: (float(v.detach().float().mean().item())
+                    if torch.is_tensor(v) else v)
+                for k, v in critic_log.items()
+                if not isinstance(v, dict)
+            })
+            if loss_scale != 1.0:
+                critic_loss = critic_loss * loss_scale
+                out["critic_loss_scaled"] = float(critic_loss.detach().item())
+            critic_loss.backward()
 
     # ------------------------------------------------------------------
     # Streaming-mode helpers (LongLive parity).

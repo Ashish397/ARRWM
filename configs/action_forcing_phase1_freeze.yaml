@@ -301,6 +301,29 @@ rollout_frames: null
 mae_extension_threshold: 0.5
 mae_extension_max_extra_chunks: 13
 
+# Slide-and-train policy. Both modes break on the first above-threshold
+# chunk and run the per-window aux / GAN / SC-DMD step on it.
+#   "last":  ORIGINAL behaviour. Below-threshold chunks rolled before
+#            the crossing are DISCARDED. One DMD backward per ride.
+#   "every": Below-threshold chunks rolled before the crossing are
+#            ALSO trained on (inline ``no_sync`` DMD gen + critic
+#            backwards). Total K_local = below-threshold count + 1
+#            (the crossing chunk). Every loss in the per-ride window
+#            (DMD gen, DMD critic, aux gen, GAN gen, SC-DMD) is scaled
+#            by ``1/(K_local + train_norm_constant)`` so longer rides
+#            don't outweigh short ones in the optim ledger.
+train_on: every
+
+# Per-ride loss-scale denominator offset for ``train_on=every``. The
+# scale is ``1/(K_local + train_norm_constant)`` where K_local is the
+# per-ride trained-chunk count (= below-threshold chunks + 1 for the
+# crossing chunk). Larger constant ⇒ shorter rides get less signal,
+# longer rides get less variance. Default 2 maps:
+#   K=1  → 1/3   (short ride)
+#   K=2  → 1/4
+#   K=10 → 1/12  (long/hard ride: K/(K+2) ≈ 0.83 of full DMD signal)
+train_norm_constant: 2.0
+
 model_kwargs:
   timestep_shift: 5.0
   # ``local_attn_size: 21`` keeps the attention window equal to the full
