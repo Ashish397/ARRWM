@@ -65,12 +65,15 @@ _LATENT_TO_VIDEO = 4
 _MOTION_WINDOW_FRAMES = 12
 _LATENTS_PER_MOTION_CHUNK = _MOTION_WINDOW_FRAMES // _LATENT_TO_VIDEO  # = 3
 
-# Number of leading Wan zarr latents to drop in the loader so dataset
-# latent index 0 corresponds to a clean 4-video-frame window aligned with
-# motion entry 0. v14's pre_encode_motion drops video frame 0 (line 153);
-# ARRWM's pre_encode_local does NOT, so we drop the head latent here in
-# the loader to recover v14's discipline without re-encoding rides.
-_LATENT_HEAD_DROP = 1
+# Head-latent drop knob. v14's ``pre_encode_motion`` drops video frame
+# 0 (line 153) but ARRWM's ``pre_encode_local`` does NOT, which leaves
+# a 1-video-frame phase offset between motion entry 0 and Wan latent 0.
+# The mismatch is small (1/12 of a chunk window) and empirically does
+# not materially affect training, so we leave this disabled (= 0). All
+# ``+ _LATENT_HEAD_DROP`` shifts are no-ops at this value; flip to 1
+# if a future analysis decides the head latent ever needs to be hidden
+# from the training stream.
+_LATENT_HEAD_DROP = 0
 
 # ss_vae encoding batch size.
 _ENCODE_BATCH = 128
@@ -924,9 +927,14 @@ class ZarrSequentialDataset(Dataset):
 
         end = start + self.window_size + self.context_frames
 
-        # Load latents lazily from zarr (window + leading context)
+        # Load latents lazily from zarr (window + leading context).
+        # ``z_actions_latent`` and ``self._samples``'s ``start`` are
+        # POST-head-drop dataset latents; shift the zarr read by
+        # ``_LATENT_HEAD_DROP`` so frame i of the returned tensor
+        # corresponds to the same time position as ``z_actions_latent[i]``
+        # (= chunk i // 3's z, mapped to the post-drop video segment).
         g = zarr_lib.open_group(str(zpath), mode="r")
-        lat_np = g["latents"][start:end]  # (window_size+context_frames, 16, 60, 104)
+        lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
         latents = torch.from_numpy(lat_np.astype(np.float32))
 
         z_window = z_actions_latent[start:end]  # (window_size+context_frames, 8)

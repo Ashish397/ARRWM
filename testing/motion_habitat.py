@@ -292,6 +292,7 @@ def load_videos(config, num_videos: int, device: torch.device,
             encoded_root=config.encoded_root,
             caption_root=config.caption_root,
             min_ride_frames=min_ride_frames,
+            motion_root=config.motion_root,
         )
 
     train_start = test_start_index + test_num_rides

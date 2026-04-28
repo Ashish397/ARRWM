@@ -2715,6 +2715,30 @@ class ActionForcingDMD(SelfForcingModel):
             stash["dmd_context"] = str(self.dmd_context)
             stash["clean_x_aug_t"] = int(self.clean_x_aug_t)
             stash["chunk"] = chunk.detach()
+            # Raw clean-half z's (one z per chunk, broadcast to per-
+            # latent by the dataset's ``encode_z_actions_window``).
+            # Stashed for the video logger to overlay onto the
+            # clean_x_real eval mp4 so the visual content can be
+            # cross-checked against the actions the bidir scorer's
+            # clean half was conditioned on.
+            cf_state_eval = int(s["cf"])
+            chunk_size_eval = int(s["chunk_size"])
+            shift_eval = int(s["shift"])
+            noisy_start_sdn_eval = int(
+                s["current_length"]
+                - info["new_frames"]
+                - info["overlap"]
+            )
+            clean_lo_ride = cf_state_eval + noisy_start_sdn_eval - shift_eval
+            clean_hi_ride = clean_lo_ride + chunk_size_eval
+            ride_actions_eval = s["ride_actions_window"]
+            if (
+                clean_lo_ride >= 0
+                and ride_actions_eval.shape[1] >= clean_hi_ride
+            ):
+                stash["clean_z_actions"] = (
+                    ride_actions_eval[:, clean_lo_ride:clean_hi_ride].detach()
+                )
 
         # Teacher-freeze gt_target for streaming: GT video at the
         # chunk's noisy_x positions (= ride_latents_window indices

@@ -1082,12 +1082,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         _t_lat = eval_latents.get(_key)
                         if _t_lat is None or not torch.is_tensor(_t_lat):
                             continue
+                        # Action overlay only on clean_x_real — that's
+                        # the GT view real_score is conditioned on, so
+                        # overlaying the matching z stream lets us
+                        # cross-check alignment visually.
+                        _overlay = (
+                            eval_latents.get("clean_z_actions")
+                            if _key == "clean_x_real" else None
+                        )
                         try:
                             self._log_pred_image_video(
                                 _t_lat.to(torch.float32),
                                 int(self.step),
                                 name=_name,
                                 caption_suffix=_cap,
+                                action_overlay=_overlay,
                             )
                         except Exception as _exc:
                             logging.warning(
@@ -1698,6 +1707,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         step: int,
         name: str = "pred_image",
         caption_suffix: str = "",
+        action_overlay: Optional[torch.Tensor] = None,
     ) -> None:
         """Decode ``pred_image`` (a student rollout in latent space) to
         pixel mp4 bytes and upload to wandb under ``sample/<name>``.
@@ -1719,6 +1729,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         Caller contract: ``pred_image`` must be a ``[B, F, C, H, W]``
         latent tensor on the GPU. We slice to the first batch element
         and (optionally) the trailing ``sample_max_frames`` frames.
+
+        ``action_overlay``: optional ``[B, F_lat, A]`` (or ``[F_lat, A]``)
+        per-latent action stream. When supplied, two horizontal bars
+        are rendered along the bottom of every video frame — one per
+        action dim — magnitude proportional to ``|z|`` (red for ``z>=0``,
+        blue for ``z<0``). The dataset enforces one z per chunk
+        (``num_frame_per_block`` latents share the same z), so the
+        overlay is constant within each chunk and steps at chunk
+        boundaries. Used only for ``clean_x_real`` to cross-check the
+        bidir scorer's clean-half action conditioning against the
+        decoded pixel content.
         """
         if pred_image is None or pred_image.numel() == 0:
             return
@@ -1755,6 +1776,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "step=%d: %s", step, exc,
             )
             return
+
+        # Render the action overlay (best-effort, never raises).
+        if action_overlay is not None:
+            try:
+                npb = int(getattr(self.config, "num_frame_per_block", 3))
+                self._draw_action_overlay(
+                    vid_np, action_overlay, frames_per_latent=4, npb=npb,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "[ActionForcing] action overlay failed at step=%d "
+                    "(name=%s): %s", step, name, exc,
+                )
 
         mp4_bytes = _frames_to_mp4_bytes(
             vid_np, fps=float(self.sample_fps),
@@ -1827,6 +1861,88 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _draw_action_overlay(
+        vid_np: np.ndarray,
+        action_overlay,
+        frames_per_latent: int = 4,
+        npb: int = 3,
+    ) -> None:
+        """Draw per-chunk action bars at the bottom of every frame.
+
+        ``vid_np``: ``[T_video, H, W, 3]`` uint8, edited in place.
+        ``action_overlay``: ``[B, F_lat, A]`` or ``[F_lat, A]`` tensor /
+        ndarray of post-tanh-squash z values in roughly ``[-1, 1]``.
+
+        After Wan VAE temporal upsampling, ``T_video = F_lat *
+        frames_per_latent`` (the leading dummy frame was already
+        stripped off by the caller). One motion entry covers ``npb``
+        consecutive latents; we render one bar value per chunk so the
+        overlay is constant across the chunk's ``npb *
+        frames_per_latent`` video frames and steps at chunk
+        boundaries.
+
+        Two stacked horizontal bars: top = z[0], bottom = z[1] (or up
+        to ``A`` bars if A>2). Red bar to the right for ``z>=0``,
+        blue bar to the left for ``z<0``; length scales with ``|z|``
+        (clamped to 1.0 → half the frame width).
+        """
+        if action_overlay is None:
+            return
+        if torch.is_tensor(action_overlay):
+            arr = action_overlay.detach().float().cpu().numpy()
+        else:
+            arr = np.asarray(action_overlay, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr[0]  # batch 0 — rank-local rollout uses batch dim 0
+        if arr.ndim != 2:
+            return
+        F_lat, A = arr.shape
+        if F_lat == 0 or A == 0:
+            return
+        # Per-chunk z (one row per chunk; the dataset already
+        # broadcasts within-chunk so all 3 latents in a chunk share
+        # the same row — we just take every npb-th).
+        z_per_chunk = arr[::npb]
+        n_chunks = z_per_chunk.shape[0]
+        T, H, W, _ = vid_np.shape
+        if H < 8 or W < 16 or n_chunks == 0:
+            return
+
+        # Strip layout: 4-px top padding then A bars of equal height
+        # with 2-px gaps; total bound by ~25% of frame height.
+        max_strip = max(20, H // 4)
+        gap = 2
+        bar_h = max(3, (max_strip - 4 - gap * (A - 1)) // A)
+        strip_h = 4 + bar_h * A + gap * (A - 1)
+        cx = W // 2
+        max_bar = (W // 2) - 4
+
+        # Black underlay so the bars are readable on bright frames.
+        vid_np[:, -strip_h:, :, :] = vid_np[:, -strip_h:, :, :] // 4
+
+        frames_per_chunk = npb * frames_per_latent
+        for t in range(T):
+            chunk_idx = min(t // frames_per_chunk, n_chunks - 1)
+            z = z_per_chunk[chunk_idx]
+            for d in range(A):
+                y0 = H - strip_h + 4 + d * (bar_h + gap)
+                y1 = y0 + bar_h
+                a = float(z[d])
+                length = int(min(abs(a), 1.0) * max_bar)
+                # Center marker (gray 1-px line).
+                vid_np[t, y0:y1, cx - 1:cx + 1, :] = 128
+                if length <= 0:
+                    continue
+                if a >= 0:
+                    vid_np[t, y0:y1, cx:cx + length, 0] = 255
+                    vid_np[t, y0:y1, cx:cx + length, 1] = 0
+                    vid_np[t, y0:y1, cx:cx + length, 2] = 0
+                else:
+                    vid_np[t, y0:y1, cx - length:cx, 0] = 0
+                    vid_np[t, y0:y1, cx - length:cx, 1] = 0
+                    vid_np[t, y0:y1, cx - length:cx, 2] = 255
 
     # ------------------------------------------------------------------
     # Step-scheduled local_attn_size (KV cache window) helpers.

@@ -76,6 +76,7 @@ def main():
         encoded_root=config.encoded_root,
         caption_root=config.caption_root,
         min_ride_frames=24,
+        motion_root=config.motion_root,
     )
     # Filter to only original zarrs (timestamp >= 20240131)
     original_rides = [r for r in all_rides if os.path.basename(r["zarr_path"]) >= "20240131"]
