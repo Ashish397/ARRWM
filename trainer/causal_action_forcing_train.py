@@ -451,6 +451,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
         self._pending_video_latents: Optional[torch.Tensor] = None
         self._video_logger_warned_no_vae: bool = False
+        # Diagnostic stash populated by the DMD model when a sample
+        # video is due. Keys: ``pred_real``, ``pred_fake``,
+        # ``clean_x_fake``, ``clean_x_real`` (latent tensors), plus
+        # scalar metadata (``dmd_timestep``, ``clean_x_aug_t``,
+        # ``dmd_context``). Decoded alongside ``_pending_video_latents``
+        # at the video-logger callsite.
+        self._pending_dmd_eval_latents: Optional[Dict[str, Any]] = None
         # Sticky "due" bits — set when the cadence boundary is crossed
         # on a step that can't actually emit (critic-only iter under
         # dfake_gen_update_ratio>1). The next iter that CAN emit
@@ -1000,6 +1007,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     f"gen_grad_norm={float(gen_grad_norm.item()) if torch.is_tensor(gen_grad_norm) else float(gen_grad_norm):.4f}"
                 )
                 msg_parts.append(f"fake_grad_norm={fake_grad_norm_val:.4f}")
+                # MAE diagnostics: surface baseline_last_chunk_mae +
+                # baseline_avg_rollout_mae to stdout so we can detect
+                # student collapse from the iter trace alone (the
+                # primary "is the student degrading" signal).
+                _mae_last = generator_log_dict.get("baseline_last_chunk_mae")
+                if _mae_last is not None:
+                    msg_parts.append(f"mae_last={float(_mae_last):.4f}")
+                _mae_avg = generator_log_dict.get("baseline_avg_rollout_mae")
+                if _mae_avg is not None:
+                    msg_parts.append(f"mae_avg={float(_mae_avg):.4f}")
                 logging.info("[ActionForcing] " + " ".join(msg_parts))
                 if (
                     _HAS_WANDB
@@ -1037,6 +1054,48 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self._pending_video_latents, int(self.step),
                 )
                 self._pending_video_latents = None
+
+                # DMD scorer + clean_x diagnostic videos. ``pred_real``
+                # / ``pred_fake`` are the scorers' denoised x0 estimates
+                # on the SAME noisy student input — divergence between
+                # them is what DMD is asking the student to close;
+                # ``clean_x_fake`` / ``clean_x_real`` are what each
+                # scorer was conditioned on. Same VAE decode + ffmpeg
+                # encode path as ``pred_image``; best-effort, never
+                # raises.
+                eval_latents = getattr(self, "_pending_dmd_eval_latents", None)
+                if isinstance(eval_latents, dict) and eval_latents:
+                    _t = eval_latents.get("dmd_timestep")
+                    _aug = eval_latents.get("clean_x_aug_t")
+                    _ctx = eval_latents.get("dmd_context")
+                    _suffix_real = (
+                        f"t={_t} aug_t={_aug} ctx={_ctx}"
+                        if _t is not None
+                        else ""
+                    )
+                    for _key, _name, _cap in (
+                        ("pred_real", "pred_real", _suffix_real or ""),
+                        ("pred_fake", "pred_fake", _suffix_real or ""),
+                        ("clean_x_fake", "clean_x_fake", "fake_score conditioning"),
+                        ("clean_x_real", "clean_x_real", f"real_score conditioning ({_ctx})"),
+                    ):
+                        _t_lat = eval_latents.get(_key)
+                        if _t_lat is None or not torch.is_tensor(_t_lat):
+                            continue
+                        try:
+                            self._log_pred_image_video(
+                                _t_lat.to(torch.float32),
+                                int(self.step),
+                                name=_name,
+                                caption_suffix=_cap,
+                            )
+                        except Exception as _exc:
+                            logging.warning(
+                                "[ActionForcing] DMD eval video '%s' "
+                                "failed at step=%d: %s",
+                                _name, int(self.step), _exc,
+                            )
+                self._pending_dmd_eval_latents = None
 
             # Checkpoint.
             if self.step > 0 and self.step % ckpt_interval == 0:
@@ -1637,9 +1696,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self,
         pred_image: torch.Tensor,
         step: int,
+        name: str = "pred_image",
+        caption_suffix: str = "",
     ) -> None:
         """Decode ``pred_image`` (a student rollout in latent space) to
-        pixel mp4 bytes and upload to wandb under ``sample/pred_image``.
+        pixel mp4 bytes and upload to wandb under ``sample/<name>``.
+
+        ``name`` controls both the wandb key and the local filename
+        suffix: ``step_NNN.mp4`` for the default ``pred_image``, else
+        ``step_NNN_<name>.mp4``. ``caption_suffix`` is appended to the
+        wandb caption.
 
         Cheap: re-uses the generator's already-loaded ``WanVAEWrapper``
         (no second VAE copy), runs under ``no_grad``, encodes mp4 in
@@ -1704,7 +1770,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             try:
                 samples_dir = Path(self.log_dir) / "samples"
                 samples_dir.mkdir(parents=True, exist_ok=True)
-                out_path = samples_dir / f"step_{int(step):07d}.mp4"
+                _suffix = "" if name == "pred_image" else f"_{name}"
+                out_path = samples_dir / f"step_{int(step):07d}{_suffix}.mp4"
                 with open(out_path, "wb") as fh:
                     fh.write(mp4_bytes)
                 logging.info(
@@ -1728,23 +1795,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             ) as fh:
                 fh.write(mp4_bytes)
                 tmp_path = fh.name
+            _caption = f"step {step}"
+            if caption_suffix:
+                _caption = f"{_caption} {caption_suffix}"
             wandb.log(
                 {
-                    "sample/pred_image": wandb.Video(
+                    f"sample/{name}": wandb.Video(
                         tmp_path,
                         fps=int(self.sample_fps),
                         format="mp4",
-                        caption=f"step {step}",
+                        caption=_caption,
                     ),
                     "sample/step": int(step),
-                    "sample/num_frames": int(vid_np.shape[0]),
+                    f"sample/{name}_num_frames": int(vid_np.shape[0]),
                 },
                 step=step,
             )
             logging.info(
-                "[ActionForcing] Logged sample video at step=%d "
+                "[ActionForcing] Logged sample/%s video at step=%d "
                 "(frames=%d, fps=%d)",
-                step, vid_np.shape[0], int(self.sample_fps),
+                name, step, vid_np.shape[0], int(self.sample_fps),
             )
         except Exception as exc:
             logging.warning(
@@ -2313,7 +2383,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # includes the overlap so the rendered mp4 reflects what
             # DMD just scored. Detach + float32 to release the
             # autograd graph (logger never backwards through this).
-            if self._video_sample_due(int(self.step) + 1):
+            _sample_due_now = self._video_sample_due(int(self.step) + 1)
+            if _sample_due_now:
                 try:
                     self._pending_video_latents = (
                         chunk.detach().to(torch.float32)
@@ -2339,9 +2410,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                     self._pending_video_latents = None
 
+            # Arm the DMD-scorer eval stash: when set to a dict,
+            # ``compute_generator_loss_streaming`` (and its inner
+            # ``_compute_kl_grad``) populate the scorers' denoised x0
+            # estimates and the clean_x conditioning views so the
+            # video logger can decode them as side-by-side diagnostic
+            # videos. Cleared after harvest. No effect on training
+            # math (read-only ``.detach()`` copies into a dict).
+            if _sample_due_now:
+                self.model._dmd_eval_stash = {}
+            else:
+                self.model._dmd_eval_stash = None
+
             gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
                 chunk, info,
             )
+
+            # Harvest scorer outputs + clean_x views into a parallel
+            # ``self._pending_dmd_eval_latents`` so the video logger
+            # can decode them without the metrics path having to skip
+            # non-scalar values.
+            if _sample_due_now:
+                eval_stash = getattr(self.model, "_dmd_eval_stash", None)
+                if isinstance(eval_stash, dict) and eval_stash:
+                    self._pending_dmd_eval_latents = eval_stash
+                self.model._dmd_eval_stash = None
             merged: Dict[str, Any] = {
                 "generator_dmd_loss": float(gen_loss_dmd.detach().item()),
             }

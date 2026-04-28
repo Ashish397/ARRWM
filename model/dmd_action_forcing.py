@@ -1220,6 +1220,17 @@ class ActionForcingDMD(SelfForcingModel):
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
             "timestep": timestep.detach(),
         }
+        # Optional eval-time stash so the trainer can decode the
+        # scorers' denoised x0 estimates as sample videos. ``None``
+        # = capture disabled (default); a dict means the trainer
+        # has armed the stash for this iter. Read-only side effect
+        # on the loss math (just .detach() copies into a dict).
+        stash = getattr(self, "_dmd_eval_stash", None)
+        if isinstance(stash, dict):
+            stash["pred_real"] = pred_real_image.detach()
+            stash["pred_fake"] = pred_fake_image.detach()
+            stash["dmd_timestep"] = int(timestep.flatten()[0].item())
+            stash["noisy_input"] = noisy_image_or_video.detach()
         # Return the detached teacher prediction alongside the
         # gradient so the caller can run teacher-freeze detection
         # (per-frame MAE vs GT) without duplicating the real_score
@@ -2665,6 +2676,23 @@ class ActionForcingDMD(SelfForcingModel):
             device=chunk.device, dtype=chunk.dtype,
             build_real_view=True,
         )
+
+        # Eval-time stash for sample-video diagnostics. Mirrors the
+        # ``clean_x`` views handed to fake_score / real_score (after
+        # any ``add_noise`` round-trip in ``_build_dmd_context_kwargs``)
+        # so a side-by-side decode shows exactly what each scorer
+        # was conditioned on. No effect when not armed by the trainer.
+        stash = getattr(self, "_dmd_eval_stash", None)
+        if isinstance(stash, dict):
+            stash["clean_x_fake"] = sc_clean_x.detach()
+            stash["clean_x_real"] = (
+                sc_clean_x_real.detach()
+                if sc_clean_x_real is not None
+                else sc_clean_x.detach()
+            )
+            stash["dmd_context"] = str(self.dmd_context)
+            stash["clean_x_aug_t"] = int(self.clean_x_aug_t)
+            stash["chunk"] = chunk.detach()
 
         # Teacher-freeze gt_target for streaming: GT video at the
         # chunk's noisy_x positions (= ride_latents_window indices
