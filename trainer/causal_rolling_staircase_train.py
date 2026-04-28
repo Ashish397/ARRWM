@@ -111,12 +111,33 @@ def _load_ride_tensors(
     if prompt_embeds.dim() == 2:
         prompt_embeds = prompt_embeds.unsqueeze(0)
 
+    # Per-latent-frame motion magnitude (mean |dx,dy| over the 100-grid
+    # points, mean-pooled across the 4 video frames per latent frame).
+    # Used by the action-forcing trainer's offset picker to bias rollout
+    # starts toward windows that actually contain motion. Best-effort:
+    # if the dataset doesn't expose this method (older code paths) or
+    # the motion file is missing, we leave it as None and the trainer
+    # falls back to uniform offset sampling.
+    motion_mag: Optional[torch.Tensor] = None
+    loader = getattr(dataset, "load_motion_magnitudes", None)
+    if loader is not None:
+        try:
+            mag_np = loader(zarr_path, n_latent_frames)
+            motion_mag = torch.from_numpy(mag_np)  # CPU; trainer reads w/ numpy
+        except Exception as e:
+            logging.warning(
+                "load_motion_magnitudes failed for %s: %s — offset "
+                "picker will fall back to uniform sampling for this ride",
+                zarr_path, e,
+            )
+
     return {
         "latents": latents.unsqueeze(0).to(device=device, dtype=dtype),            # [1, T, C, H, W]
         "z_actions": z_actions.unsqueeze(0).to(device=device, dtype=dtype),        # [1, T, action_dim]
         "prompt_embeds": prompt_embeds.to(device=device, dtype=dtype),             # [1, L, C_txt]
         "zarr_path": zarr_path,
         "n_latent_frames": n_latent_frames,
+        "motion_mag": motion_mag,                                                   # [T] float32 CPU, or None
     }
 
 

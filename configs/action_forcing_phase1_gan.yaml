@@ -82,8 +82,8 @@ run_name: action_forcing_phase1_gan
 
 seed: 0
 mixed_precision: true
-log_interval: 10
-checkpoint_interval: 500
+log_interval: 15
+checkpoint_interval: 50
 max_steps: 10000
 max_grad_norm: 10.0
 auto_resume: true
@@ -96,8 +96,8 @@ strict_ode_load: false
 # wrapper, encodes the resulting RGB clip to MP4 via ffmpeg, and
 # uploads it to W&B as ``train/pred_image_video`` (only on the
 # main rank). Set ``sample_interval: 0`` to disable.
-sample_at_steps: [1, 199, 399, 999, 1999, 4999, 9999]   # all odd: stash fires at s = value-1 (even = gen step)
-sample_interval: 201   # odd: (s+1)%201==0 lands on even s = gen step (dfake_gen_update_ratio=2)
+sample_at_steps: [1, 199, 399, 999, 1999, 4999, 9999]   # explicit steps: trainer fires at first eligible gen iter at-or-after value
+sample_interval: 15   # trainer defers to next gen iter if cadence boundary lands on critic-only step
 sample_fps: 5
 sample_max_frames: 0  # 0 = use all frames in pred_image
 
@@ -115,10 +115,22 @@ log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weunz
 caption_root: /projects/u6ex/fbots/frodobots_captions/train
 motion_root: /projects/u6ex/fbots/frodobots_motion
 ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+# Motion-aware rollout-start picker — see action_forcing_phase1.yaml
+# for the full rationale. Bias the offset ``s`` so the first
+# ``rollout_frames`` at ``s + cf`` have mean motion >= threshold.
+motion_start_threshold: 0.5      # per-frame floor for offset window picker
+motion_start_prob: 1.0
+motion_skip_dead_rides: true     # skip rides with low per-ride mean motion
+motion_ride_min_mean: 3.0        # ~upper-half cutoff; see action_forcing_phase1.yaml comment for details
+
+# Step-scheduled local_attn_size — see action_forcing_phase1.yaml for
+# rationale. Default: 21 frames early, 42 from step 400.
+local_attn_size_schedule: [[0, 21], [400, 42]]
 
 action_dims: [2, 7]
 raw_action_dim: 2
@@ -161,10 +173,10 @@ action_conditioning_mode: both
 # no GT past frame 21).
 min_ride_frames: 69
 max_rides: null
-max_ride_frames: 200
+max_ride_frames: 510
 
 # Curriculum: shortest valid first.
-sort_rides_by_length: asc
+sort_rides_by_length: null
 
 num_workers: 2
 
@@ -425,7 +437,7 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 1.0
+real_guidance_scale: 3.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)
@@ -474,7 +486,7 @@ gan_max_grad_norm: 10.0
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).
 fake_score_updates_enabled: true
-dfake_gen_update_ratio: 1
+dfake_gen_update_ratio: 2
 
 # Generator EMA (CF parity).
 ema_weight: 0.99
@@ -498,7 +510,7 @@ ema_start_step: 200
 # stability for the very small lr regime, and zero first-moment removes
 # the multi-step "stuck" behaviour Adam exhibits when the gradient sign
 # flips due to DMD's antagonistic generator/critic dynamics.
-lr: 2.0e-05
+lr: 1.0e-05
 betas: [0.0, 0.999]
 eps: 1.0e-08
 weight_decay: 0.01
@@ -506,7 +518,7 @@ train_action_projection: true
 train_action_token_projection: true
 
 # Fake-score optimizer (CF: ``lr_critic`` / ``beta1_critic`` / ``beta2_critic``).
-fake_lr: 4.0e-06
+fake_lr: 2.0e-06
 fake_betas: [0.0, 0.999]
 fake_eps: 1.0e-08
 fake_weight_decay: 0.01
@@ -552,4 +564,4 @@ warp_denoising_step: false
 # Streaming-mode (LongLive persistent KV-cache + variable-length chunks).
 # FUNDAMENTAL: ON by default for Phase-1 action-forcing DMD.
 streaming_mode: true
-streaming_max_length: 57
+streaming_max_length: 500

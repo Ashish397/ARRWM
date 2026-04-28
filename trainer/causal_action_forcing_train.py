@@ -36,7 +36,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -451,6 +451,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
         self._pending_video_latents: Optional[torch.Tensor] = None
         self._video_logger_warned_no_vae: bool = False
+        # Sticky "due" bits — set when the cadence boundary is crossed
+        # on a step that can't actually emit (critic-only iter under
+        # dfake_gen_update_ratio>1). The next iter that CAN emit
+        # (gen-iter with a fresh chunk / generator_log_dict) consumes
+        # the bit. Without these, log_interval / sample_interval values
+        # whose parity collides with dfake_gen_update_ratio silently
+        # never log — what bit us at the start of phase_1_b2b.
+        self._wandb_log_due: bool = False
+        self._video_sample_due_bit: bool = False
         if self.sample_interval > 0 and self.is_main_process:
             logging.info(
                 "[ActionForcing] Video sampling ENABLED: every %d "
@@ -595,6 +604,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "infinity_rope=true so a train/inference mismatch "
                     "is expected on long-horizon rollouts."
                 )
+
+        # ------------------------------------------------------------------
+        # Step-scheduled local_attn_size (KV cache window). Lets training
+        # start cheap (small attention window = fast iters, modest cache)
+        # then grow context as the student's predictions stabilise and
+        # long-horizon coherence becomes the bottleneck. Format:
+        #
+        #   local_attn_size_schedule: [[step_threshold, frames], ...]
+        #
+        # At step S, the active window is the size for the LARGEST
+        # threshold ≤ S. Omit the key (or set null) to disable the
+        # schedule and use the static ``model_kwargs.local_attn_size``
+        # for the whole run. The schedule first waypoint should match
+        # ``model_kwargs.local_attn_size`` (the model's construction-
+        # time value) so step-0 attention behaviour is unchanged.
+        sched_raw = getattr(cfg, "local_attn_size_schedule", None)
+        self._attn_size_schedule: List[Tuple[int, int]] = []
+        if sched_raw:
+            try:
+                pairs = [(int(s), int(n)) for s, n in sched_raw]
+                pairs.sort(key=lambda p: p[0])
+                self._attn_size_schedule = pairs
+            except Exception as e:
+                if self.is_main_process:
+                    logging.warning(
+                        "[ActionForcing] Bad local_attn_size_schedule %r: %s "
+                        "— ignoring schedule.", sched_raw, e,
+                    )
+        # Last applied frames count, set to None until first apply so the
+        # first sequence open at step 0 always seeds with the right size.
+        self._current_attn_frames: Optional[int] = None
+        if self._attn_size_schedule and self.is_main_process:
+            logging.info(
+                "[ActionForcing] local_attn_size_schedule active: %s",
+                self._attn_size_schedule,
+            )
 
     # ------------------------------------------------------------------
     # Optimizer (parent builds gen + fake_score; we add the critic).
@@ -831,6 +876,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self._epoch = 0
         self._ride_iter = self._fresh_ride_iter(self._epoch)
 
+        # Apply the schedule's step-0 value before the first sequence
+        # opens (no-op when no schedule configured).
+        self._apply_attn_size_if_changed()
+
         while self.step < max_steps:
             # CF-parity #5: put the whole DMD module in eval mode at the
             # start of each iter to suppress any latent randomness
@@ -839,6 +888,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # ``self.model.eval()`` at ``Causal-Forcing/trainer/
             # distillation.py:230`` to keep the code path identical.
             self.model.eval()
+            # Cheap per-iter check for an attn-size schedule transition.
+            # Only does work on the iter that crosses a threshold (rest
+            # are dict-lookup + int-compare). On a transition this also
+            # closes the open streaming sequence so the next sequence
+            # re-allocates the KV cache at the new size.
+            self._apply_attn_size_if_changed()
             # Decide whether this iter trains the generator or the critic.
             train_generator = (self.step % dfake_gen_update_ratio == 0)
 
@@ -891,21 +946,56 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
             self.step += 1
 
-            # Logging.
-            if self.is_main_process and (self.step % log_interval == 0):
+            # Mark wandb log as DUE if the cadence boundary just
+            # crossed. With ``dfake_gen_update_ratio>1`` the boundary
+            # often lands on a critic-only iter (no fresh gen data),
+            # so we just stash a sticky bit and emit on the next iter
+            # that has both gen and critic data — meeting the spec
+            # "if it is not the right step then it needs to happen in
+            # the subsequent step." Without this, e.g. log_interval=10
+            # with dfake=2 silently skips every gen log because
+            # boundary post-step parity always lands on a critic iter.
+            if self.step % log_interval == 0:
+                self._wandb_log_due = True
+
+            # Mark video sample as DUE on the same cadence-boundary
+            # principle. The ``_video_sample_due`` callsite (inside
+            # the gen rollout) already runs only on gen iters, so the
+            # bit is consumed there; we just need to set it whenever
+            # the boundary crossed but no chunk got stashed this iter
+            # (== ``_pending_video_latents is None`` at this point,
+            # since stash happens during the gen-step BEFORE step++).
+            if (
+                self.sample_interval > 0
+                and (self.step % self.sample_interval) == 0
+                and self._pending_video_latents is None
+            ):
+                self._video_sample_due_bit = True
+
+            # Logging — emit only when we have BOTH fresh gen and
+            # critic data this iter (i.e. ``train_generator`` was True
+            # and the gen step actually produced a dict). On a
+            # critic-only iter we leave ``_wandb_log_due`` set so the
+            # next gen iter emits the deferred log.
+            gen_ready = (train_generator and generator_log_dict is not None)
+            critic_ready = (critic_log_dict is not None)
+            if (
+                self.is_main_process
+                and self._wandb_log_due
+                and gen_ready
+                and critic_ready
+            ):
                 msg_parts = [f"step={self.step}/{max_steps}"]
-                if train_generator and generator_log_dict is not None:
+                msg_parts.append(
+                    f"gen_loss={generator_log_dict.get('generator_loss', 0.0):.4f}"
+                )
+                if "dmdtrain_gradient_norm" in generator_log_dict:
                     msg_parts.append(
-                        f"gen_loss={generator_log_dict.get('generator_loss', 0.0):.4f}"
+                        f"dmd_grad={generator_log_dict['dmdtrain_gradient_norm']:.4f}"
                     )
-                    if "dmdtrain_gradient_norm" in generator_log_dict:
-                        msg_parts.append(
-                            f"dmd_grad={generator_log_dict['dmdtrain_gradient_norm']:.4f}"
-                        )
-                if critic_log_dict is not None:
-                    msg_parts.append(
-                        f"critic_loss={critic_log_dict.get('critic_loss', 0.0):.4f}"
-                    )
+                msg_parts.append(
+                    f"critic_loss={critic_log_dict.get('critic_loss', 0.0):.4f}"
+                )
                 msg_parts.append(
                     f"gen_grad_norm={float(gen_grad_norm.item()) if torch.is_tensor(gen_grad_norm) else float(gen_grad_norm):.4f}"
                 )
@@ -916,16 +1006,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     and getattr(self, "wandb_enabled", False)
                 ):
                     log_payload: Dict[str, Any] = {}
-                    if train_generator and generator_log_dict is not None:
-                        for k, v in generator_log_dict.items():
-                            if torch.is_tensor(v):
-                                v = float(v.item())
-                            log_payload[f"gen/{k}"] = v
-                    if critic_log_dict is not None:
-                        for k, v in critic_log_dict.items():
-                            if torch.is_tensor(v):
-                                v = float(v.item())
-                            log_payload[f"critic/{k}"] = v
+                    for k, v in generator_log_dict.items():
+                        if torch.is_tensor(v):
+                            v = float(v.item())
+                        log_payload[f"gen/{k}"] = v
+                    for k, v in critic_log_dict.items():
+                        if torch.is_tensor(v):
+                            v = float(v.item())
+                        log_payload[f"critic/{k}"] = v
                     log_payload["gen/grad_norm"] = (
                         float(gen_grad_norm.item())
                         if torch.is_tensor(gen_grad_norm)
@@ -939,6 +1027,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     except Exception as e:
                         logging.warning("wandb.log failed: %s", e)
                 previous_time = time.time()
+                self._wandb_log_due = False
 
             if (
                 self.is_main_process
@@ -1508,13 +1597,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     def _video_sample_due(self, current_step: int) -> bool:
         """Return True iff this step should produce a sample video.
 
-        Two gates can fire it:
-          (1) explicit ``sample_at_steps`` membership, or
-          (2) ``sample_interval > 0`` and step is a positive multiple
-              thereof.
-        Both also require main rank and at least one viable sink
-        (wandb enabled OR ``vis_save_local`` true). ``current_step <= 0``
-        is skipped because no rollout has happened yet at iter 0 entry
+        Three gates can fire it:
+          (1) explicit ``sample_at_steps`` membership (uses ``>=`` so a
+              missed gen-step rolls forward to the next eligible iter),
+          (2) ``sample_interval > 0`` and ``current_step`` is a positive
+              multiple thereof, OR
+          (3) ``self._video_sample_due_bit`` is set — meaning a previous
+              iter crossed the cadence boundary while no rollout was
+              available (critic-only iter under
+              dfake_gen_update_ratio>1) and stashed the request for the
+              next eligible gen iter to consume.
+        All require main rank and at least one viable sink (wandb
+        enabled OR ``vis_save_local`` true). ``current_step <= 0`` is
+        skipped because no rollout has happened yet at iter 0 entry
         (the first eligible step is ``current_step == 1``).
         """
         if not self.is_main_process:
@@ -1530,6 +1625,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self._sample_at_steps_pending
             and current_step >= self._sample_at_steps_pending[0]
         ):
+            return True
+        if self._video_sample_due_bit:
             return True
         if self.sample_interval <= 0:
             return False
@@ -1662,6 +1759,431 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     pass
 
     # ------------------------------------------------------------------
+    # Step-scheduled local_attn_size (KV cache window) helpers.
+    # ------------------------------------------------------------------
+    def _current_attn_size_frames(self) -> Optional[int]:
+        """Return the active ``local_attn_size`` (in frames) for
+        ``self.step`` per the configured schedule, or None if no
+        schedule is set."""
+        if not self._attn_size_schedule:
+            return None
+        active = self._attn_size_schedule[0][1]
+        for thr, frames in self._attn_size_schedule:
+            if self.step >= thr:
+                active = frames
+            else:
+                break
+        return int(active)
+
+    def _apply_attn_size_if_changed(self) -> bool:
+        """If the schedule says the active ``local_attn_size`` differs
+        from what we last applied, push the new value through the
+        model's attention layers + the pipeline's cache-sizing knob,
+        and force a streaming-state reset so the next sequence open
+        re-allocates the KV cache at the new size. Returns True iff
+        anything changed.
+
+        Why reset instead of resizing in place: ``_initialize_kv_cache``
+        allocates fixed-size ``[B, kv_cache_size, 12, 128]`` buffers per
+        layer. There's no in-place resize for those buffers, and growing
+        the attention window past the current cache size mid-sequence
+        would let the model attend to slots that don't exist yet. A
+        sequence reset is the cheapest atomic transition: closes the
+        old sequence (releases old buffers next setup), then the next
+        ``setup_sequence`` allocates at the new size.
+        """
+        target = self._current_attn_size_frames()
+        if target is None or target == self._current_attn_frames:
+            return False
+
+        # Walk the bare DiT (under DDP / wrapper) and update each
+        # CausalWanSelfAttention's local_attn_size. The infinity_rope
+        # patch reads ``self.local_attn_size`` per attention forward,
+        # so updating the attribute takes effect on the next forward
+        # without re-installing the patch.
+        dit = self._inner_dit_for_rope()
+        if hasattr(dit, "local_attn_size"):
+            dit.local_attn_size = target
+        if hasattr(dit, "blocks"):
+            for blk in dit.blocks:
+                if hasattr(blk, "local_attn_size"):
+                    blk.local_attn_size = target
+                if hasattr(blk, "self_attn") and hasattr(blk.self_attn, "local_attn_size"):
+                    blk.self_attn.local_attn_size = target
+
+        # Bump the pipeline's rollout_frames so the next
+        # ``_initialize_kv_cache`` call sizes the buffer to ``target``.
+        # ``kv_cache_size = max(num_max_frames, rollout_frames) *
+        # frame_seq_length`` (pipeline.kv_cache_size property).
+        if self.pipeline is not None:
+            self.pipeline.rollout_frames = max(
+                int(self.pipeline.num_max_frames), int(target)
+            )
+
+        # Force the NEXT _fwdbwd_streaming_step to open a new sequence
+        # (which calls setup_sequence -> _initialize_kv_cache with the
+        # new size). reset_streaming_state is a no-op when state is
+        # already None, so safe to call unconditionally.
+        if hasattr(self.model, "reset_streaming_state"):
+            self.model.reset_streaming_state()
+
+        prev = self._current_attn_frames
+        self._current_attn_frames = int(target)
+        if self.is_main_process:
+            logging.info(
+                "[ActionForcing] local_attn_size schedule transition at "
+                "step=%d: %s -> %d frames (KV cache buffers will "
+                "re-allocate on next sequence open).",
+                int(self.step), str(prev), int(target),
+            )
+        return True
+
+    # ------------------------------------------------------------------
+    # Motion-aware rollout offset picker.
+    # ------------------------------------------------------------------
+    def _pick_motion_aware_offset(
+        self,
+        ride: Dict[str, Any],
+        s_local_max: int,
+        window_lo_offset: int,
+        window_len: int,
+    ) -> int:
+        """Pick a starting offset ``s ∈ [0, s_local_max]`` that gives a
+        motion-positive rollout window when possible.
+
+        With probability ``cfg.motion_start_prob`` (default 1.0),
+        restricts the candidate set to offsets whose rollout window
+        ``ride[s + window_lo_offset : s + window_lo_offset + window_len]``
+        has mean per-frame motion magnitude ≥ ``cfg.motion_start_threshold``
+        (default 0.5 — empirically separates parked / idling windows
+        from clearly-moving ones across the dataset). With probability
+        1 - prob, samples uniformly. If motion is unavailable for this
+        ride or no candidate meets the threshold, falls back to uniform
+        sampling on ``[0, s_local_max]``.
+
+        Per-rank: each rank picks independently from its own ride's
+        motion. The legacy DDP pattern broadcast a rank-0 pick (so
+        every rank used the same ``s``) — that broke as soon as we
+        wanted motion-aware selection because rank 0's motion-positive
+        offset is meaningless on rank 1's ride. Cross-rank sync is
+        instead preserved via per-rank ``s_local_max`` ensuring
+        ``s + cf + cap <= ride_len_r`` on every rank, so ``actual_cap
+        = cap`` is invariant without any all_reduce.
+        """
+        if s_local_max <= 0:
+            return 0
+        prob = float(getattr(self.config, "motion_start_prob", 1.0))
+        threshold = float(getattr(self.config, "motion_start_threshold", 0.5))
+        motion_mag = ride.get("motion_mag")
+        use_motion = (
+            motion_mag is not None
+            and prob > 0.0
+            and (prob >= 1.0 or random.random() < prob)
+        )
+        if not use_motion:
+            return random.randint(0, s_local_max)
+        mag_np = (
+            motion_mag.cpu().numpy()
+            if torch.is_tensor(motion_mag)
+            else np.asarray(motion_mag)
+        )
+        n_lat = mag_np.shape[0]
+        win_hi_max = s_local_max + window_lo_offset + window_len
+        if win_hi_max > n_lat or window_len <= 0:
+            return random.randint(0, s_local_max)
+        # Sliding-window mean via cumulative sum.
+        # window_means[s] = mean of mag_np[s+lo : s+lo+win] for
+        # s ∈ [0, s_local_max].
+        csum = np.concatenate(
+            [[0.0], np.cumsum(mag_np, dtype=np.float64)],
+        )
+        lo = window_lo_offset
+        n_candidates = s_local_max + 1
+        sums = (
+            csum[lo + window_len : lo + window_len + n_candidates]
+            - csum[lo : lo + n_candidates]
+        )
+        means = sums / float(window_len)
+        valid_idx = np.flatnonzero(means >= threshold)
+        if valid_idx.size == 0:
+            return random.randint(0, s_local_max)
+        return int(valid_idx[random.randrange(valid_idx.size)])
+
+    # ------------------------------------------------------------------
+    # Streaming-mode MAE extender — the streaming analog of the legacy
+    # ``inference_with_trajectory`` extension loop. Unlike the legacy
+    # path (where extension chunks grow a single per-iter rollout
+    # buffer), the streaming KV cache is sliding-window: each
+    # ``generate_next_chunk`` call advances the cache state, and old
+    # frames evict on the fly. So "extend in streaming" means: when
+    # the just-scored chunk's MAE is below threshold, run additional
+    # no-grad ``generate_next_chunk`` calls to push the streaming
+    # sequence further along the ride within the same trainer iter,
+    # then let the next iter pick up from the advanced position.
+    # ------------------------------------------------------------------
+    def _streaming_maybe_extend(self) -> Dict[str, Any]:
+        """Extend the open streaming sequence by additional no-grad
+        chunks while the per-chunk MAE stays below
+        ``mae_extension_threshold`` and a per-call cap of
+        ``mae_extension_max_extra_chunks`` calls hasn't been hit.
+
+        Reads the freshest MAE from
+        ``pipeline._last_extension_metrics["baseline_last_chunk_mae"]``,
+        which ``generate_chunk_with_cache`` re-populates on every call.
+
+        DDP-safety: ``generate_chunk_with_cache`` performs an
+        ``all_reduce`` inside ``_compute_chunk_mae``; every rank must
+        therefore enter and exit the extension loop the same number of
+        times. We MIN-reduce the per-rank "remaining-chunks-in-ride"
+        bound BEFORE the loop and use that as the only iter cap. The
+        threshold check is already lockstep (averaged MAE across ranks).
+
+        Called only on gen iters (not critic) to keep the per-trainer-
+        iter chunk budget bounded and to mirror the legacy semantic of
+        "extension follows the gradient-bearing rollout."
+        """
+        cfg = self.config
+        threshold_raw = getattr(cfg, "mae_extension_threshold", None)
+        if threshold_raw is None:
+            return {"streaming_extension_count": 0}
+        threshold = float(threshold_raw)
+        max_extra = int(getattr(cfg, "mae_extension_max_extra_chunks", 0))
+        if threshold <= 0 or max_extra <= 0:
+            return {"streaming_extension_count": 0}
+
+        pipe = self.pipeline
+        if pipe is None or not getattr(pipe, "_last_extension_metrics", None):
+            return {"streaming_extension_count": 0}
+
+        last_mae = float(
+            pipe._last_extension_metrics.get(
+                "baseline_last_chunk_mae", float("nan"),
+            )
+        )
+        # NaN guard + threshold gate: if the just-scored chunk already
+        # crossed the threshold, the model isn't "confident" — bail
+        # before doing any extension work (and before the all_reduce).
+        if not (last_mae == last_mae) or last_mae >= threshold:
+            return {
+                "streaming_extension_count": 0,
+                "streaming_extension_last_mae": last_mae,
+            }
+
+        # MIN-reduce the per-rank remaining-chunk count so every rank
+        # walks the loop the same number of iterations. Without this,
+        # rank A might exit while rank B waits forever at the next
+        # all_reduce inside compute_chunk_mae.
+        s = getattr(self.model, "streaming_state", None)
+        if s is None:
+            return {"streaming_extension_count": 0}
+        npb = int(s["shift"])
+        local_remaining = max(
+            0, (int(s["max_length"]) - int(s["current_length"])) // npb,
+        )
+        avail_t = torch.tensor(
+            [local_remaining], device=self.device, dtype=torch.long,
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(avail_t, op=dist.ReduceOp.MIN)
+        synced_remaining = int(avail_t.item())
+        max_iters = min(max_extra, synced_remaining)
+        if max_iters <= 0:
+            return {
+                "streaming_extension_count": 0,
+                "streaming_extension_last_mae": last_mae,
+            }
+
+        # Per-extension training. Each extension chunk is a high-
+        # confidence prediction (extension only fires when MAE is
+        # below threshold) — we have no reason to throw it away when
+        # both the generator AND the critic can absorb it for the
+        # cost of one forward+backward each. Per-extension memory is
+        # bounded because each extension's autograd graph is released
+        # by its own ``.backward()`` before the next extension starts
+        # — the persistent KV cache carries no grad. Both gen and
+        # critic paths default ON; toggle via config:
+        #   extension_train_gen     (default true)
+        #   extension_train_critic  (default true)
+        train_gen_on_ext = bool(
+            getattr(cfg, "extension_train_gen", True)
+        )
+        train_critic_on_ext = bool(
+            getattr(cfg, "extension_train_critic", True)
+        )
+        # generate_next_chunk needs requires_grad=True to produce a
+        # grad-bearing chunk for gen DMD. If gen training is off, we
+        # fall back to the cheaper no-grad rollout — the chunk still
+        # commits to the KV cache either way.
+        ext_requires_grad = train_gen_on_ext
+
+        # Param lists for per-extension grad-norm snapshotting. We
+        # measure the L2 norm of the grad CONTRIBUTION from each
+        # extension by snapshotting before its backward and diffing
+        # after. Cost: clone the .grad tensors of one optimizer's
+        # param group (~size of params) per snapshot, freed after
+        # the delta is computed. Worth the memory for the visibility
+        # into how much signal each extension actually contributes.
+        gen_params = [
+            p for p in self.optimizer.param_groups[0]["params"]
+            if getattr(p, "requires_grad", True)
+        ]
+        critic_params: List[torch.nn.Parameter] = []
+        if self.fake_optimizer is not None:
+            critic_params = [
+                p for p in self.fake_optimizer.param_groups[0]["params"]
+                if getattr(p, "requires_grad", True)
+            ]
+
+        def _snap(params):
+            return [
+                (p.grad.detach().clone() if p.grad is not None else None)
+                for p in params
+            ]
+
+        def _delta_norm(params, snap):
+            sq = 0.0
+            for p, prev in zip(params, snap):
+                if p.grad is None:
+                    continue
+                if prev is None:
+                    sq += p.grad.detach().pow(2).sum().item()
+                else:
+                    sq += (p.grad.detach() - prev).pow(2).sum().item()
+            return sq ** 0.5
+
+        ext_count = 0
+        ext_gen_losses: List[float] = []
+        ext_gen_grad_norms: List[float] = []
+        ext_critic_losses: List[float] = []
+        ext_critic_grad_norms: List[float] = []
+        while (
+            ext_count < max_iters
+            and last_mae == last_mae      # NaN guard
+            and last_mae < threshold
+        ):
+            try:
+                ext_chunk, ext_info = self.model.generate_next_chunk(
+                    requires_grad=ext_requires_grad,
+                )
+            except Exception as e:
+                logging.warning(
+                    "[ActionForcing] streaming extender failed at "
+                    "ext_count=%d: %s — stopping extension.",
+                    ext_count, e,
+                )
+                break
+            last_mae = float(
+                pipe._last_extension_metrics.get(
+                    "baseline_last_chunk_mae", float("nan"),
+                )
+            )
+            ext_count += 1
+
+            if train_gen_on_ext:
+                try:
+                    gen_loss, _gen_log = (
+                        self.model.compute_generator_loss_streaming(
+                            ext_chunk, ext_info,
+                        )
+                    )
+                    pre = _snap(gen_params)
+                    # ``retain_graph=True`` when the critic backward
+                    # will also walk the same shared subgraph (cond_
+                    # dict / action_projection chain that compute_
+                    # generator_loss_streaming and compute_critic_
+                    # loss_streaming both consume). Without retain,
+                    # the second backward crashes with "trying to
+                    # backward through the graph a second time" —
+                    # was the v3 smoke regression.
+                    gen_loss.backward(retain_graph=train_critic_on_ext)
+                    ext_gen_losses.append(float(gen_loss.detach().item()))
+                    ext_gen_grad_norms.append(_delta_norm(gen_params, pre))
+                    del pre
+                except Exception as e:
+                    logging.warning(
+                        "[ActionForcing] gen-on-extension backward "
+                        "failed at ext_count=%d: %s — skipping this "
+                        "chunk's gen update.", ext_count, e,
+                    )
+
+            if train_critic_on_ext:
+                try:
+                    critic_loss, _critic_log = (
+                        self.model.compute_critic_loss_streaming(
+                            ext_chunk, ext_info,
+                        )
+                    )
+                    pre = _snap(critic_params)
+                    critic_loss.backward()
+                    ext_critic_losses.append(float(critic_loss.detach().item()))
+                    ext_critic_grad_norms.append(
+                        _delta_norm(critic_params, pre)
+                    )
+                    del pre
+                except Exception as e:
+                    logging.warning(
+                        "[ActionForcing] critic-on-extension backward "
+                        "failed at ext_count=%d: %s — skipping this "
+                        "chunk's critic update (extension itself "
+                        "still committed to cache).",
+                        ext_count, e,
+                    )
+
+        out: Dict[str, Any] = {
+            "streaming_extension_count": ext_count,
+            "streaming_extension_last_mae": last_mae,
+        }
+        if ext_gen_losses:
+            out["streaming_extension_gen_loss_mean"] = (
+                sum(ext_gen_losses) / len(ext_gen_losses)
+            )
+            out["streaming_extension_gen_updates"] = len(ext_gen_losses)
+        if ext_gen_grad_norms:
+            out["streaming_extension_gen_grad_norm_mean"] = (
+                sum(ext_gen_grad_norms) / len(ext_gen_grad_norms)
+            )
+            out["streaming_extension_gen_grad_norm_min"] = min(ext_gen_grad_norms)
+            out["streaming_extension_gen_grad_norm_max"] = max(ext_gen_grad_norms)
+        if ext_critic_losses:
+            out["streaming_extension_critic_loss_mean"] = (
+                sum(ext_critic_losses) / len(ext_critic_losses)
+            )
+            out["streaming_extension_critic_updates"] = len(ext_critic_losses)
+        if ext_critic_grad_norms:
+            out["streaming_extension_critic_grad_norm_mean"] = (
+                sum(ext_critic_grad_norms) / len(ext_critic_grad_norms)
+            )
+            out["streaming_extension_critic_grad_norm_min"] = min(ext_critic_grad_norms)
+            out["streaming_extension_critic_grad_norm_max"] = max(ext_critic_grad_norms)
+
+        # Best-effort stdout summary on rank 0 — mirrors the
+        # ``[ActionForcing] step=N ...`` line so the smoke is readable
+        # in real time without needing to pull wandb.
+        if (
+            self.is_main_process
+            and ext_count > 0
+            and (ext_gen_grad_norms or ext_critic_grad_norms)
+        ):
+            parts = [f"ext_count={ext_count}"]
+            if ext_gen_grad_norms:
+                parts.append(
+                    f"gen_grad[min/mean/max]="
+                    f"{min(ext_gen_grad_norms):.4f}/"
+                    f"{sum(ext_gen_grad_norms)/len(ext_gen_grad_norms):.4f}/"
+                    f"{max(ext_gen_grad_norms):.4f}"
+                )
+            if ext_critic_grad_norms:
+                parts.append(
+                    f"critic_grad[min/mean/max]="
+                    f"{min(ext_critic_grad_norms):.4f}/"
+                    f"{sum(ext_critic_grad_norms)/len(ext_critic_grad_norms):.4f}/"
+                    f"{max(ext_critic_grad_norms):.4f}"
+                )
+            logging.info("[ActionForcing] streaming_extender " + " ".join(parts))
+
+        return out
+
+    # ------------------------------------------------------------------
     # Streaming-mode helpers (LongLive parity).
     # ------------------------------------------------------------------
     def _streaming_setup_sequence_from_ride(
@@ -1686,22 +2208,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             return False
         ride_len = int(ride["latents"].shape[1])
 
-        # Random s ∈ [0, min(ride_len/2, ride_len - cf - cap)] with
-        # cross-rank MIN-reduce + rank-0 broadcast (mirrors the legacy
-        # single-batch path).
+        # Per-rank motion-aware s pick. Each rank biases toward its
+        # OWN ride's motion (the legacy MIN-reduce + rank-0 broadcast
+        # pattern would force every rank to the same offset, which is
+        # meaningless when each rank has a different ride and motion
+        # profile). Per-rank ``s_local_max`` already ensures
+        # ``s + cf + cap ≤ ride_len_r`` so ``actual_cap = cap`` on every
+        # rank without coordination. ``rollout_frames`` is the window
+        # we want motion in (= the first valid scoring window of the
+        # streaming sequence).
         s_local_max = max(
             0, min(ride_len // 2, ride_len - cf_dmdctx - cap),
         )
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            t = torch.tensor([s_local_max], device=self.device, dtype=torch.long)
-            dist.all_reduce(t, op=dist.ReduceOp.MIN)
-            s_global_max = int(t.item())
-            if dist.get_rank() == 0:
-                t.fill_(random.randint(0, s_global_max) if s_global_max > 0 else 0)
-            dist.broadcast(t, src=0)
-            s = int(t.item())
-        else:
-            s = random.randint(0, s_local_max) if s_local_max > 0 else 0
+        s = self._pick_motion_aware_offset(
+            ride,
+            s_local_max=s_local_max,
+            window_lo_offset=cf_dmdctx,
+            window_len=int(rollout_frames),
+        )
 
         # Cap the actual rollout length to what fits this ride
         # (s + cf + cap ≤ ride_len). ``ride_len`` is per-rank
@@ -1800,6 +2324,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         and self._sample_at_steps_pending[0] <= _cs
                     ):
                         self._sample_at_steps_pending.pop(0)
+                    # Consume the sticky deferral bit (set when a
+                    # previous critic-only iter crossed the cadence
+                    # boundary). Safe to clear unconditionally — if it
+                    # was already False the periodic ``%==0`` gate or
+                    # ``sample_at_steps`` triggered us, and clearing has
+                    # no effect.
+                    self._video_sample_due_bit = False
                 except Exception as _exc:
                     logging.warning(
                         "[ActionForcing] failed to stash streaming chunk "
@@ -1913,13 +2444,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # next iter pulls a fresh ride. Current chunk still trained
             # (gradient already accumulated via .backward()).
             mae = float(gen_log.get("baseline_avg_rollout_mae", float("nan")))
-            if (
+            collapsed = (
                 self.collapse_mae_threshold is not None
                 and mae == mae
                 and mae > self.collapse_mae_threshold
-            ):
+            )
+            if collapsed:
                 merged["streaming_reset_for_collapse"] = 1.0
                 self.model.reset_streaming_state()
+            else:
+                # MAE-driven extender: when the just-scored chunk's MAE
+                # is below ``mae_extension_threshold``, push the stream
+                # forward by additional no-grad chunks so the next iter
+                # starts further along the ride. No-op when extension
+                # is disabled (threshold null or cap <= 0). Only fired
+                # on gen iters — see ``_streaming_maybe_extend`` for
+                # the rationale.
+                merged.update(self._streaming_maybe_extend())
             return merged
         else:
             chunk, info = self.model.generate_next_chunk(requires_grad=False)
@@ -2027,31 +2568,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # is purely student-rolled, no seed dip). Once per ride.
         max_rollout_window = max_total_rollout_frames + anchor
 
-        # Random offset s ∈ [0, min(ride_len // 2, ride_len - cf - max_rollout_window)].
-        # Each rank loads a different ride with a different ride_len,
-        # so the upper bound on s is rank-local. To keep the
-        # extension-loop all_reduces (MAE / synced_available) describing
-        # the same relative offset on every rank, we MIN-reduce the
-        # local bound, sample s on rank 0 within that global bound, and
-        # broadcast it. (Single-rank code paths skip the all_reduce/
-        # broadcast and just sample locally.)
+        # Per-rank motion-aware s pick. Each rank biases toward its
+        # OWN ride's motion. The MAE-extension all_reduce inside the
+        # pipeline operates on a SCALAR (averaged MAE) so rank-local
+        # absolute frame positions don't break the reduce — what used
+        # to need broadcasting was only the rank-0 sampled ``s``,
+        # which is meaningless when each rank has a different ride.
+        # ``window_len = rollout_frames`` (= num_training_frames):
+        # the gradient-bearing scoring window of the iter, which is
+        # what we want loaded with motion.
         s_local_max = max(
             0, min(ride_len // 2, ride_len - cf_dmdctx - max_rollout_window)
         )
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            s_t = torch.tensor(
-                [s_local_max], device=self.device, dtype=torch.long,
-            )
-            dist.all_reduce(s_t, op=dist.ReduceOp.MIN)
-            s_global_max = int(s_t.item())
-            if dist.get_rank() == 0:
-                s_t.fill_(
-                    random.randint(0, s_global_max) if s_global_max > 0 else 0
-                )
-            dist.broadcast(s_t, src=0)
-            s = int(s_t.item())
-        else:
-            s = random.randint(0, s_local_max) if s_local_max > 0 else 0
+        s = self._pick_motion_aware_offset(
+            ride,
+            s_local_max=s_local_max,
+            window_lo_offset=cf_dmdctx,
+            window_len=int(rollout_frames),
+        )
 
         rollout_end = s + cf_dmdctx + max_rollout_window
         rollout_window = max_rollout_window
@@ -2179,6 +2713,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             and self._sample_at_steps_pending[0] <= _cs
                         ):
                             self._sample_at_steps_pending.pop(0)
+                        # Consume the sticky deferral bit (see
+                        # streaming-path twin for rationale).
+                        self._video_sample_due_bit = False
                     except Exception as _exc:
                         logging.warning(
                             "[ActionForcing] failed to stash "
@@ -2341,8 +2878,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         belt-and-suspenders check in case the YAML's
         ``min_ride_frames`` is out of sync with ``rollout_frames``.
         """
+        # Ride-level motion filter. The frodobots dataset is bimodal:
+        # ~25% of rides are parked the entire time, and the per-ride
+        # mean motion magnitude has median ~3.3 across the 857
+        # available rides. Filtering by per-ride MEAN at the median
+        # keeps only the upper-half — the consistently-moving rides
+        # that actually carry the action-conditioning signal. Skip
+        # happens BEFORE the expensive ``_load_ride_tensors`` call
+        # (which runs an ss_vae forward on every frame to encode
+        # z_actions); the pre-check is ~3 ms (npy load + mean).
+        # ``motion_ride_min_mean`` is the threshold on per-ride mean
+        # magnitude; default 3.0 keeps roughly the upper half.
+        skip_dead = bool(getattr(self.config, "motion_skip_dead_rides", True))
+        ride_min_mean = float(
+            getattr(self.config, "motion_ride_min_mean", 3.0)
+        )
         attempts = 0
         max_attempts = 200
+        skipped_dead = 0
         while attempts < max_attempts:
             try:
                 batch = next(self._ride_iter)
@@ -2358,6 +2911,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if n_latent_frames < rollout_frames:
                 attempts += 1
                 continue
+            # Pre-check motion BEFORE the expensive ride load. Best-
+            # effort: if the dataset doesn't expose load_motion_
+            # magnitudes (older dataset class) we fall through and
+            # accept the ride.
+            if skip_dead:
+                loader = getattr(
+                    self.dataset, "load_motion_magnitudes", None,
+                )
+                if loader is not None:
+                    try:
+                        mag = loader(meta["zarr_path"], n_latent_frames)
+                        if float(mag.mean()) < ride_min_mean:
+                            skipped_dead += 1
+                            attempts += 1
+                            continue
+                    except Exception as e:
+                        logging.warning(
+                            "_next_ride motion pre-check failed for %s: %s — "
+                            "accepting ride without filter",
+                            meta.get("zarr_path", "?"), e,
+                        )
             # Cap the loaded ride at ``cfg.max_ride_frames`` (saved on
             # ``self.max_ride_frames`` by the parent trainer). This
             # bounds memory/compute when the dataset has very long
@@ -2373,14 +2947,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if ride is None or ride["latents"].shape[1] < rollout_frames:
                 attempts += 1
                 continue
+            if skipped_dead > 0 and self.is_main_process:
+                logging.debug(
+                    "[ActionForcing] _next_ride: skipped %d low-motion "
+                    "ride(s) before finding one with mean motion >= %.3f.",
+                    skipped_dead, ride_min_mean,
+                )
             return ride
         if self.is_main_process:
             logging.warning(
-                "[ActionForcing] _next_ride: gave up after %d attempts; the dataset "
-                "may have no rides with >=%d latent frames. Consider "
-                "lowering rollout_frames or raising the dataset's "
-                "min_ride_frames filter.",
-                max_attempts, rollout_frames,
+                "[ActionForcing] _next_ride: gave up after %d attempts "
+                "(skipped %d rides with mean motion < %.3f); the dataset "
+                "may have no rides with >=%d latent frames AND non-trivial "
+                "motion. Consider lowering rollout_frames, raising the "
+                "dataset's min_ride_frames filter, lowering "
+                "motion_ride_min_mean, or setting motion_skip_dead_rides=false.",
+                max_attempts, skipped_dead, ride_min_mean, rollout_frames,
             )
         return None
 

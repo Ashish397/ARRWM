@@ -578,6 +578,47 @@ class ZarrRideDataset(Dataset):
         )
         return z_squashed
 
+    def load_motion_magnitudes(
+        self,
+        zarr_path: str,
+        n_latent_frames: int,
+    ) -> np.ndarray:
+        """Per-latent-frame motion magnitude for a ride.
+
+        For each latent frame, we average ``|dx, dy|`` across the 100
+        grid points of the corresponding video frame, then mean-pool
+        over the ``_LATENT_TO_VIDEO`` video frames that map to that
+        latent frame. The result is the trainer's "is anything moving
+        here?" signal — used to bias rollout starting offsets toward
+        windows with non-trivial motion (vs. the many parked / idling
+        windows in the dataset).
+
+        Cheap: shares the cached ``motion.npy`` load with
+        ``encode_z_actions_window`` (~3 ms / ride). Returns
+        ``(n_latent_frames,)`` float32 — units are the raw motion
+        scale, NOT normalised. Empirically across the dataset
+        well-moving windows have mean magnitude > 0.5; sub-0.05 is
+        effectively parked.
+        """
+        zarr_attrs = self._attrs_by_path[zarr_path]
+        n_video_frames = 1 + _LATENT_TO_VIDEO * (n_latent_frames - 1)
+        motion = _load_aligned_motion_for_zarr(
+            zarr_attrs, n_video_frames, self.motion_root,
+        )  # (n_video_frames, 100, 3)
+        if motion.shape[0] == 0:
+            return np.zeros(n_latent_frames, dtype=np.float32)
+        per_video_frame = np.linalg.norm(
+            motion[:, :, :2], axis=-1,
+        ).mean(axis=-1).astype(np.float32)  # (n_video_frames,)
+
+        out = np.zeros(n_latent_frames, dtype=np.float32)
+        for i in range(n_latent_frames):
+            lo = i * _LATENT_TO_VIDEO
+            hi = min(lo + _LATENT_TO_VIDEO, per_video_frame.shape[0])
+            if hi > lo:
+                out[i] = per_video_frame[lo:hi].mean()
+        return out
+
     def __len__(self) -> int:
         return len(self._rides)
 
