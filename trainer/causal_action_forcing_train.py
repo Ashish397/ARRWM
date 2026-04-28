@@ -2194,7 +2194,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 stop_reason = "end_of_ride"
                 break
 
-            chunk, info = self.model.generate_next_chunk(requires_grad=True)
+            # ``compute_baseline_mae=False`` skips the pipeline's
+            # ``_compute_chunk_mae`` (and its DDP ``all_reduce``). The
+            # slide loop is per-rank-divergent — each rank rolls a
+            # different number of chunks based on its own ride's MAE.
+            # Firing a per-slide collective from inside
+            # ``generate_chunk_with_cache`` would deadlock NCCL because
+            # the slide counts diverge across ranks. The local MAE
+            # below is what drives the slide-and-train decision; the
+            # pipeline's baseline_last_chunk_mae telemetry isn't read
+            # on this path.
+            chunk, info = self.model.generate_next_chunk(
+                requires_grad=True, compute_baseline_mae=False,
+            )
             chunks_rolled += 1
 
             # GT slice covering the chunk's noisy half (= the full 21

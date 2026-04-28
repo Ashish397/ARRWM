@@ -2406,6 +2406,7 @@ class ActionForcingDMD(SelfForcingModel):
 
     def generate_next_chunk(
         self, requires_grad: bool = True,
+        compute_baseline_mae: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Advance the open sequence by ``new_frames`` (∈ [min_new_frame,
         chunk_size], multiple of npb). Build a chunk_size-length
@@ -2415,6 +2416,17 @@ class ActionForcingDMD(SelfForcingModel):
         ``(full_chunk, info)`` where ``info`` carries the
         ``gradient_mask`` (True only on new frames), the per-chunk MAE,
         and the metadata DMD scoring needs.
+
+        ``compute_baseline_mae`` (default True): when True, the pipeline
+        computes ``baseline_last_chunk_mae`` via ``_compute_chunk_mae``,
+        which fires a ``dist.all_reduce`` across DDP ranks. Set to False
+        from per-rank-divergent call sites (= the slide-and-train
+        helper, where each rank rolls a different number of chunks
+        based on its own ride's MAE). With this False, no ``gt_chunk``
+        is passed to ``generate_chunk_with_cache`` so ``_compute_chunk_mae``
+        is not called and no DDP collective fires per slide. The slide
+        helper computes its own per-rank MAE locally; the baseline
+        telemetry is irrelevant on that path.
         """
         if self.streaming_state is None:
             raise RuntimeError("generate_next_chunk called with no open sequence")
@@ -2447,12 +2459,15 @@ class ActionForcingDMD(SelfForcingModel):
             device=device, dtype=dtype,
         )
         # GT slice (for per-chunk MAE) covering the new-frame range.
-        gt_slice_lo = cf + s["current_length"]
-        gt_slice_hi = gt_slice_lo + new_frames
-        if gt_slice_hi <= s["ride_latents_window"].shape[1]:
-            gt_chunk = s["ride_latents_window"][:, gt_slice_lo:gt_slice_hi]
-        else:
-            gt_chunk = None
+        # Built only when the caller wants baseline_last_chunk_mae
+        # populated; passing ``gt_chunk=None`` to the pipeline below
+        # short-circuits ``_compute_chunk_mae`` (and its DDP all_reduce).
+        gt_chunk = None
+        if compute_baseline_mae:
+            gt_slice_lo = cf + s["current_length"]
+            gt_slice_hi = gt_slice_lo + new_frames
+            if gt_slice_hi <= s["ride_latents_window"].shape[1]:
+                gt_chunk = s["ride_latents_window"][:, gt_slice_lo:gt_slice_hi]
 
         # Rebuild cond/uncond/clean_cond/clean_uncond FRESH for this
         # iter (see ``_streaming_build_cond_dicts`` for the why) and
