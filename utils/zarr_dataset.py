@@ -509,7 +509,26 @@ class ZarrRideDataset(Dataset):
         if _manifest_pickle:
             try:
                 _cached = torch.load(_manifest_pickle, map_location="cpu", weights_only=False)
-                _rides = _cached.get("rides") if isinstance(_cached, dict) else None
+                # Mirror the version guard ``build_ride_manifest`` does
+                # for ``cache_path`` — pre-v3 pickles have uncapped
+                # ``n_latent_frames`` and would crash inside
+                # ``encode_z_actions_window`` on first call. Reject
+                # silently and fall through to a fresh scan.
+                _cached_version = (
+                    _cached.get("version") if isinstance(_cached, dict) else None
+                )
+                if _cached_version != _MANIFEST_VERSION:
+                    logging.warning(
+                        "[ZarrRideDataset] ARRWM_MANIFEST_PICKLE=%s has "
+                        "version=%s but current=%d — ignoring cache, "
+                        "rebuilding from scratch.",
+                        _manifest_pickle, _cached_version, _MANIFEST_VERSION,
+                    )
+                    _cached = None
+                _rides = (
+                    _cached.get("rides")
+                    if isinstance(_cached, dict) else None
+                )
                 if _rides:
                     if self.max_rides is not None:
                         _rides = _rides[: int(self.max_rides)]

@@ -1939,9 +1939,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         instead preserved via per-rank ``s_local_max`` ensuring
         ``s + cf + cap <= ride_len_r`` on every rank, so ``actual_cap
         = cap`` is invariant without any all_reduce.
+
+        Chunk-boundary snap: the dataset enforces per-chunk identity on
+        ``z_actions`` (one z per ``num_frame_per_block``-frame chunk;
+        see utils/zarr_dataset.py:_LATENTS_PER_MOTION_CHUNK). Slicing
+        the ride at an ``s`` that isn't a multiple of npb would put a
+        chunk boundary mid-window in the model's view, producing a
+        mid-chunk action transition that's OOD for v14's training
+        contract (constant action within each chunk). We snap every
+        return value to a multiple of npb here so all downstream
+        slices are chunk-aligned by construction.
         """
+        npb = int(getattr(self.config, "num_frame_per_block", 3))
+        # Cap s_local_max to a multiple of npb so the snap below never
+        # produces a value that exceeds the per-rank max.
+        s_local_max = (max(0, int(s_local_max)) // npb) * npb
         if s_local_max <= 0:
             return 0
+
+        def _snap(val: int) -> int:
+            return (max(0, int(val)) // npb) * npb
+
+        # ``random.randint(a, b)`` is INCLUSIVE on b; with b = s_local_max
+        # already npb-aligned, snapping is idempotent on b. Other values
+        # in (0, b) snap DOWN, which is fine — uniform-on-multiples-of-npb
+        # is what we want.
         prob = float(getattr(self.config, "motion_start_prob", 1.0))
         threshold = float(getattr(self.config, "motion_start_threshold", 0.5))
         motion_mag = ride.get("motion_mag")
@@ -1951,7 +1973,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             and (prob >= 1.0 or random.random() < prob)
         )
         if not use_motion:
-            return random.randint(0, s_local_max)
+            return _snap(random.randint(0, s_local_max))
         mag_np = (
             motion_mag.cpu().numpy()
             if torch.is_tensor(motion_mag)
@@ -1960,7 +1982,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         n_lat = mag_np.shape[0]
         win_hi_max = s_local_max + window_lo_offset + window_len
         if win_hi_max > n_lat or window_len <= 0:
-            return random.randint(0, s_local_max)
+            return _snap(random.randint(0, s_local_max))
         # Sliding-window mean via cumulative sum.
         # window_means[s] = mean of mag_np[s+lo : s+lo+win] for
         # s ∈ [0, s_local_max].
@@ -1976,8 +1998,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         means = sums / float(window_len)
         valid_idx = np.flatnonzero(means >= threshold)
         if valid_idx.size == 0:
-            return random.randint(0, s_local_max)
-        return int(valid_idx[random.randrange(valid_idx.size)])
+            return _snap(random.randint(0, s_local_max))
+        # Restrict to npb-aligned candidates among valid_idx so we
+        # don't bias toward pseudo-aligned offsets via post-hoc snap.
+        # ``valid_idx`` is sorted (np.flatnonzero output), so the
+        # filter just keeps the multiples-of-npb entries; if none are
+        # valid, fall back to snapping a random valid offset.
+        aligned_valid = valid_idx[valid_idx % npb == 0]
+        if aligned_valid.size > 0:
+            return int(aligned_valid[random.randrange(aligned_valid.size)])
+        return _snap(int(valid_idx[random.randrange(valid_idx.size)]))
 
     # ------------------------------------------------------------------
     # Streaming slide-and-train (Phase-1 default). Replaces the legacy
