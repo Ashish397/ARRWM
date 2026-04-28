@@ -287,10 +287,54 @@ class ActionForcingTrainingPipeline:
     # Lockstep exit-flag selection (rank 0 rolls, broadcast to all)
     # -----------------------------------------------------------------
     def generate_and_sync_list(
-        self, num_blocks: int, num_denoising_steps: int, device: torch.device
+        self, num_blocks: int, num_denoising_steps: int, device: torch.device,
+        sync: bool = True, force_exit_step: Optional[int] = None,
     ) -> List[int]:
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0:
+        """Pick a random exit step per rolling block.
+
+        ``force_exit_step`` (highest priority): when not None, return
+        ``[force_exit_step] * num_blocks`` — no NCCL traffic, no random
+        sampling. Used by per-rank-divergent call sites (the slide-and
+        -train helper) that pre-broadcast a single index ONCE before
+        the loop and reuse it across slides; this keeps cross-rank
+        lockstep on the exit rung while collapsing N per-slide
+        broadcasts into 1 per training step.
+
+        ``sync=True`` (default): rank 0 samples and broadcasts so all
+        ranks pick the same exit rung. Required when the call count is
+        matched across ranks (e.g. the warmup rollout, the per-iter
+        generator step).
+
+        ``sync=False``: each rank samples independently, no NCCL
+        traffic. Per-rank-different exit flags add gradient variance
+        but the per-rank backward + DDP all-reduce still converges.
+        """
+        if force_exit_step is not None:
+            idx = int(force_exit_step)
+            if not (0 <= idx < num_denoising_steps):
+                raise ValueError(
+                    f"force_exit_step={idx} out of range [0, "
+                    f"{num_denoising_steps})"
+                )
+            return [idx] * num_blocks
+
+        if sync:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                indices = torch.randint(
+                    low=0,
+                    high=num_denoising_steps,
+                    size=(num_blocks,),
+                    device=device,
+                )
+                if self.last_step_only:
+                    indices = torch.ones_like(indices) * (num_denoising_steps - 1)
+            else:
+                indices = torch.empty(num_blocks, dtype=torch.long, device=device)
+
+            if dist.is_initialized():
+                dist.broadcast(indices, src=0)
+        else:
             indices = torch.randint(
                 low=0,
                 high=num_denoising_steps,
@@ -299,11 +343,6 @@ class ActionForcingTrainingPipeline:
             )
             if self.last_step_only:
                 indices = torch.ones_like(indices) * (num_denoising_steps - 1)
-        else:
-            indices = torch.empty(num_blocks, dtype=torch.long, device=device)
-
-        if dist.is_initialized():
-            dist.broadcast(indices, src=0)
         return indices.tolist()
 
     # -----------------------------------------------------------------
@@ -1062,6 +1101,8 @@ class ActionForcingTrainingPipeline:
         requires_grad: bool = True,
         prefer_cache_pred_in_output: bool = False,
         gt_latents: Optional[torch.Tensor] = None,
+        sync_exit_flags: bool = True,
+        force_exit_step: Optional[int] = None,
         **conditional_dict,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """Streaming variant of ``inference_with_trajectory`` — rolls a
@@ -1134,7 +1175,8 @@ class ActionForcingTrainingPipeline:
 
         num_denoising_steps = len(self.denoising_step_list)
         exit_flags = self.generate_and_sync_list(
-            len(all_num_frames), num_denoising_steps, device=noise.device
+            len(all_num_frames), num_denoising_steps, device=noise.device,
+            sync=sync_exit_flags, force_exit_step=force_exit_step,
         )
         # In streaming mode the generator's gradient gate is not the
         # rollout-vs-warmup split — it's a single flag from the caller.

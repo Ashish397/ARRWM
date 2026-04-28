@@ -2407,6 +2407,8 @@ class ActionForcingDMD(SelfForcingModel):
     def generate_next_chunk(
         self, requires_grad: bool = True,
         compute_baseline_mae: bool = True,
+        sync_exit_flags: bool = True,
+        force_exit_step: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Advance the open sequence by ``new_frames`` (∈ [min_new_frame,
         chunk_size], multiple of npb). Build a chunk_size-length
@@ -2427,6 +2429,21 @@ class ActionForcingDMD(SelfForcingModel):
         is not called and no DDP collective fires per slide. The slide
         helper computes its own per-rank MAE locally; the baseline
         telemetry is irrelevant on that path.
+
+        ``force_exit_step`` (optional): when set, every rolling block
+        in this call uses this exit-rung index. Skips
+        ``generate_and_sync_list``'s per-call broadcast entirely. Used
+        by the slide-and-train helper, which pre-broadcasts ONE index
+        before the slide loop and reuses it across all slides — keeps
+        cross-rank exit-rung lockstep while collapsing N per-slide
+        broadcasts into 1 per training step.
+
+        ``sync_exit_flags`` (default True): forwarded to
+        ``generate_chunk_with_cache``. Only consulted when
+        ``force_exit_step`` is None. With sync=True rank 0 samples and
+        broadcasts the per-block exit indices; with sync=False each
+        rank samples independently (per-rank gradient variance, but no
+        DDP collective).
         """
         if self.streaming_state is None:
             raise RuntimeError("generate_next_chunk called with no open sequence")
@@ -2484,6 +2501,8 @@ class ActionForcingDMD(SelfForcingModel):
             requires_grad=requires_grad,
             prefer_cache_pred_in_output=False,
             gt_latents=gt_chunk,
+            sync_exit_flags=sync_exit_flags,
+            force_exit_step=force_exit_step,
             **cond_dict,
         )
 

@@ -2170,6 +2170,32 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         chunk_size = int(state["chunk_size"])
         cf_state = int(state["cf"])
 
+        # Pre-pick an exit-rung index ONCE per training step and
+        # broadcast from rank 0. Every slide reuses this same index
+        # (passed as ``force_exit_step`` to ``generate_next_chunk``),
+        # so all ranks denoise to the same exit step on every slide
+        # without firing a per-slide ``dist.broadcast``. This collapses
+        # the original per-call collective (which deadlocked on per-
+        # rank-divergent slide counts) into 1 collective per training
+        # step. ``last_step_only=True`` is honoured by the same shortcut
+        # the per-call sampler uses.
+        pipe = self.model.inference_pipeline
+        n_steps = len(pipe.denoising_step_list)
+        if pipe.last_step_only:
+            forced_exit_step: int = n_steps - 1
+        elif dist.is_initialized() and dist.get_world_size() > 1:
+            if dist.get_rank() == 0:
+                idx_t = torch.randint(
+                    0, n_steps, (1,),
+                    device=self.device, dtype=torch.long,
+                )
+            else:
+                idx_t = torch.empty(1, dtype=torch.long, device=self.device)
+            dist.broadcast(idx_t, src=0)
+            forced_exit_step = int(idx_t.item())
+        else:
+            forced_exit_step = int(torch.randint(0, n_steps, (1,)).item())
+
         chunks_rolled = 0
         stop_reason: str = "unknown"
         train_chunk: Optional[torch.Tensor] = None
@@ -2194,18 +2220,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 stop_reason = "end_of_ride"
                 break
 
-            # ``compute_baseline_mae=False`` skips the pipeline's
-            # ``_compute_chunk_mae`` (and its DDP ``all_reduce``). The
-            # slide loop is per-rank-divergent — each rank rolls a
-            # different number of chunks based on its own ride's MAE.
-            # Firing a per-slide collective from inside
-            # ``generate_chunk_with_cache`` would deadlock NCCL because
-            # the slide counts diverge across ranks. The local MAE
-            # below is what drives the slide-and-train decision; the
-            # pipeline's baseline_last_chunk_mae telemetry isn't read
-            # on this path.
+            # Per-rank-divergent slide loop — each rank rolls a
+            # different number of chunks based on its own ride's MAE,
+            # so EVERY DDP collective inside ``generate_next_chunk``
+            # must be bypassed or the slide counts mismatch and NCCL
+            # deadlocks at the divergence point. Two collectives reach
+            # this hot path:
+            #   * ``_compute_chunk_mae`` ⇒ gated by
+            #     ``compute_baseline_mae=False`` (no gt_chunk → no
+            #     all_reduce). The local MAE we compute below is what
+            #     drives slide-and-train; baseline telemetry isn't
+            #     read on this path.
+            #   * ``generate_and_sync_list`` ⇒ gated by
+            #     ``force_exit_step=forced_exit_step`` (the index was
+            #     broadcast ONCE before the loop; every slide reuses it
+            #     so no per-call collective fires). All ranks still
+            #     denoise to the same exit rung — lockstep preserved.
             chunk, info = self.model.generate_next_chunk(
-                requires_grad=True, compute_baseline_mae=False,
+                requires_grad=True,
+                compute_baseline_mae=False,
+                force_exit_step=forced_exit_step,
             )
             chunks_rolled += 1
 
@@ -2219,12 +2253,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             chunk_lo = cf_state + noisy_start_sdn
             chunk_hi = chunk_lo + chunk_size
             ride_window = state["ride_latents_window"]
-            if ride_window.shape[1] < chunk_hi:
-                # MIN-reduced setup should make this unreachable, but
-                # treat as end-of-ride to be safe.
-                del chunk, info
-                stop_reason = "end_of_ride"
-                break
+            # Geometry invariant (proof): ``_streaming_setup_sequence_
+            # from_ride`` MIN-reduces ``actual_cap`` across ranks, then
+            # builds ``ride_latents_window`` of length cf + actual_cap
+            # (= cf_state + max_length). ``can_generate_more()`` keeps
+            # ``current_length ≤ max_length``. With chunk_size =
+            # new_frames + overlap and noisy_start_sdn = current_length
+            # - new_frames - overlap, chunk_hi simplifies to cf_state +
+            # current_length ≤ cf_state + max_length =
+            # ride_window.shape[1]. Symmetric across ranks because every
+            # term is rank-invariant under the MIN-reduce + the
+            # streaming_force_new_frame_chunks deterministic-stride. If
+            # this ever fires it's a real bug, not a corner case —
+            # surface with a hard error on every rank simultaneously.
+            assert ride_window.shape[1] >= chunk_hi, (
+                f"slide-loop geometry violation: ride_window.shape[1]="
+                f"{ride_window.shape[1]} < chunk_hi={chunk_hi}. "
+                f"setup_sequence MIN-reduces actual_cap and "
+                f"can_generate_more() keeps current_length ≤ max_length."
+            )
             gt_slice = ride_window[:, chunk_lo:chunk_hi]
             # Per-rank MAE on the full 21-frame window. No all_reduce —
             # each rank decides locally based on its own ride. The
@@ -2302,19 +2349,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # to train_chunk and continue through the unified backward
             # path. Real loss, real gradient — the rank still contributes
             # to the DDP-averaged update, just on a sub-threshold window.
-            if prev_chunk is None:
-                # Defensive: should be unreachable. setup_sequence
-                # guarantees can_generate_more() on entry, so the loop
-                # always rolls at least once before hitting cap /
-                # end_of_ride. Mark and bail (DDP will hang; surface it
-                # rather than silently blocking forever).
-                out["streaming_straggler_fallback_unavailable"] = 1.0
-                self.model.reset_streaming_state()
-                raise RuntimeError(
-                    "streaming slide-and-train: peer rank trained but "
-                    "this rank has no rolled chunk for the straggler "
-                    "fallback — DDP all_reduce will deadlock."
-                )
+            #
+            # ``prev_chunk is not None`` here: setup_sequence rejects
+            # rides too small for ``anchor_frames + min_new``, so the
+            # loop always rolls at least one chunk and stages it as
+            # prev_chunk before any in-body break. The geometry-guard
+            # assert above eliminates the only path that could leave
+            # the loop with prev_chunk unset.
+            assert prev_chunk is not None, (
+                "straggler-fallback invariant broken: peer rank trained "
+                "but this rank has no staged prev_chunk. The slide loop "
+                "should have rolled at least one chunk before exiting."
+            )
             train_chunk = prev_chunk
             train_info = prev_info
             train_avg_mae = slide_maes[-1] if slide_maes else float("nan")
