@@ -497,6 +497,7 @@ class CausalLoRADiffusionTrainer:
                 caption_root=self.config.caption_root,
                 min_ride_frames=min_ride_frames,
                 cache_path=manifest_cache,
+                motion_root=self.config.motion_root,
             )
             if max_rides is not None:
                 all_rides = all_rides[:max_rides]

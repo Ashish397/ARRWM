@@ -47,11 +47,30 @@ def _extract_ride_rel(ride_dir_2k: str) -> Path:
             f"and is not under {_DATA_ROOT}"
         )
 
-# Latent temporal compression: 1 latent frame corresponds to 4 video frames.
+# Latent temporal compression: 1 latent frame corresponds to 4 video frames
+# in the Wan VAE — except for the SPECIAL HEAD LATENT (zarr index 0) which
+# encodes a single video frame. We drop that head latent in the loader so
+# every reported latent index maps to a clean 4-video-frame window. After
+# the drop: dataset latent index k <-> Wan zarr latent index k+1 <-> video
+# frames [4k+1, 4k+5) (in the original / pre-encode-motion coordinate
+# system; see ``_load_aligned_motion_for_zarr`` for the alignment with
+# motion.npy's "first video frame dropped" convention).
 _LATENT_TO_VIDEO = 4
 
-# Motion window size in video frames (12-frame CoTracker windows).
+# Motion window size in video frames (CoTracker emits one motion entry per
+# 12-frame disjoint window; see utils/pre_encode_motion.py:212-213
+# (``output_chunk_size=12``)). With ``_LATENT_TO_VIDEO=4``, that's exactly
+# ``_LATENTS_PER_MOTION_CHUNK = 3`` post-drop dataset latents per motion
+# entry — i.e. one motion entry encodes one 3-latent training chunk.
 _MOTION_WINDOW_FRAMES = 12
+_LATENTS_PER_MOTION_CHUNK = _MOTION_WINDOW_FRAMES // _LATENT_TO_VIDEO  # = 3
+
+# Number of leading Wan zarr latents to drop in the loader so dataset
+# latent index 0 corresponds to a clean 4-video-frame window aligned with
+# motion entry 0. v14's pre_encode_motion drops video frame 0 (line 153);
+# ARRWM's pre_encode_local does NOT, so we drop the head latent here in
+# the loader to recover v14's discipline without re-encoding rides.
+_LATENT_HEAD_DROP = 1
 
 # ss_vae encoding batch size.
 _ENCODE_BATCH = 128
@@ -123,59 +142,70 @@ def _build_memory_log_message() -> str:
 # Motion helpers (ported from utils/test_zarr_chunks.py)
 # ---------------------------------------------------------------------------
 
-def _load_aligned_motion_for_zarr(
-    attrs: dict,
-    n_video_frames: int,
-    motion_root: Path,
-) -> np.ndarray:
-    """Upsample motion.npy to per-video-frame resolution.
-
-    Preserves the hardcoded 0.8s action delay and 12-frame motion window alignment
-    from test_zarr_chunks.py lines 85-135.
-
-    Returns float32 array of shape (n_video_frames, 100, 3).
-    """
+def _resolve_motion_path(attrs: dict, motion_root: Path) -> Path:
     ride_dir_2k = attrs.get("ride_dir_2k", "")
     if not ride_dir_2k:
         raise RuntimeError("ride_dir_2k not present in zarr attrs")
-
     rel = _extract_ride_rel(ride_dir_2k)
-
     motion_path = motion_root / rel / "motion.npy"
     if not motion_path.exists():
         raise FileNotFoundError(f"motion.npy not found at {motion_path}")
+    return motion_path
 
-    motion = np.load(motion_path)  # [M, N, 3]
+
+def _peek_motion_chunks(attrs: dict, motion_root: Path) -> int:
+    """Return motion.npy's chunk count (= shape[0]) without loading the body.
+    Used at manifest-build time to cap n_latent_frames at min(zarr-1,
+    n_motion_chunks * 3) so the trainer never sees stale-padded motion.
+    """
+    motion_path = _resolve_motion_path(attrs, motion_root)
+    motion = np.load(motion_path, mmap_mode="r")
+    if motion.ndim != 3 or motion.shape[2] != 3:
+        raise RuntimeError(f"Unexpected motion shape {motion.shape} at {motion_path}")
+    return int(motion.shape[0])
+
+
+def _load_aligned_motion_for_zarr(
+    attrs: dict,
+    n_latent_frames: int,
+    motion_root: Path,
+) -> np.ndarray:
+    """Return per-DATASET-LATENT motion mapped from chunk-grain motion.npy.
+
+    v14 discipline (see utils/pre_encode_motion.py:153 for the dropped
+    first video frame, and the spec at the top of this module for the
+    head-latent drop): each motion entry covers exactly
+    ``_LATENTS_PER_MOTION_CHUNK`` (= 3) consecutive dataset latents, so
+    dataset latent index ``k`` reads from ``motion[k // 3]``. No
+    upsampling, no ``action_start_sec - 0.8`` offset, no stale-padding —
+    if the caller asks for more latents than the motion file supports
+    we raise: the caller must cap ``n_latent_frames`` at
+    ``min(zarr_latents - _LATENT_HEAD_DROP, n_motion_chunks * 3)`` (the
+    manifest indexer does this; ``_load_ride_tensors`` inherits the cap
+    via ``meta["n_latent_frames"]``).
+
+    Returns float32 array of shape ``(n_latent_frames, 100, 3)``. Within
+    each chunk the 3 entries are identical (= the chunk's motion.npy
+    row); across chunks they advance with the ride.
+    """
+    motion_path = _resolve_motion_path(attrs, motion_root)
+    motion = np.load(motion_path)  # [n_motion_chunks, N, 3]
     if motion.ndim != 3 or motion.shape[2] != 3:
         raise RuntimeError(f"Unexpected motion shape {motion.shape}")
 
-    action_start_sec = float(attrs.get("action_start_sec", 0.0))
-    fps = float(attrs.get("fps", 20.0))
-
-    # 0.8s delay preserved from test_zarr_chunks.py line 117
-    offset_frames_prelim = int((action_start_sec - 0.8) * fps)
-    offset_windows = offset_frames_prelim // _MOTION_WINDOW_FRAMES
-    partial_first = _MOTION_WINDOW_FRAMES - (offset_frames_prelim % _MOTION_WINDOW_FRAMES)
-    n_rest_windows = (n_video_frames - partial_first + _MOTION_WINDOW_FRAMES - 1) // _MOTION_WINDOW_FRAMES
-
-    first_motion = np.repeat(
-        motion[offset_windows: offset_windows + 1], partial_first, axis=0
-    )
-    rest_motion = np.repeat(
-        motion[offset_windows + 1: offset_windows + 1 + n_rest_windows],
-        _MOTION_WINDOW_FRAMES,
-        axis=0,
-    )
-    per_frame = np.concatenate([first_motion, rest_motion], axis=0)[:n_video_frames]
-
-    # Pad if motion data is shorter than required
-    if per_frame.shape[0] < n_video_frames:
-        reps = n_video_frames - per_frame.shape[0]
-        per_frame = np.concatenate(
-            [per_frame, np.repeat(per_frame[-1:], reps, axis=0)], axis=0
+    n_motion_chunks = int(motion.shape[0])
+    n_avail_latents = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
+    if n_latent_frames > n_avail_latents:
+        raise ValueError(
+            f"motion file has only {n_motion_chunks} chunks "
+            f"(= {n_avail_latents} usable latents) but caller requested "
+            f"{n_latent_frames}; cap n_latent_frames at min(zarr_latents "
+            f"- {_LATENT_HEAD_DROP}, n_motion_chunks * "
+            f"{_LATENTS_PER_MOTION_CHUNK}) before calling."
         )
 
-    return per_frame.astype(np.float32)  # (n_video_frames, 100, 3)
+    chunk_indices = np.arange(n_latent_frames) // _LATENTS_PER_MOTION_CHUNK
+    return motion[chunk_indices].astype(np.float32)
 
 
 def _encode_motion_ss_vae(
@@ -244,17 +274,28 @@ def _load_prompt_embeds(encoded_json: Path) -> torch.Tensor:
 # Dataset
 # ---------------------------------------------------------------------------
 
-_MANIFEST_VERSION = 2
+_MANIFEST_VERSION = 3  # bumped: head-latent drop + motion-chunk cap
 
 
 def _index_single_zarr(
     zpath: Path,
     caption_root: Path,
+    motion_root: Optional[Path] = None,
 ) -> Tuple[torch.Tensor, dict, int]:
-    """Read metadata and captions for one zarr — no motion encoding."""
+    """Read metadata and captions for one zarr — no motion encoding.
+
+    Returns ``n_latent_frames`` as the EFFECTIVE post-drop, motion-capped
+    count: ``min(zarr_latents - _LATENT_HEAD_DROP, n_motion_chunks *
+    _LATENTS_PER_MOTION_CHUNK)``. All downstream slicing in this module
+    + ``_load_ride_tensors`` inherits this cap, so:
+      * the head latent (Wan VAE's special 1-frame leading latent) is
+        never visible to the trainer;
+      * stale-padded motion past ``n_motion_chunks * 3`` latents is
+        excluded so cmd_actions always reflect real motion.
+    """
     g = zarr_lib.open_group(str(zpath), mode="r")
     attrs = dict(g.attrs)
-    n_latent_frames = g["latents"].shape[0]
+    zarr_n_latents = int(g["latents"].shape[0])
 
     ride_dir_2k = attrs.get("ride_dir_2k", "")
     if not ride_dir_2k:
@@ -266,6 +307,19 @@ def _index_single_zarr(
         raise FileNotFoundError(f"No encoded caption for {rel}")
     prompt_embeds = _load_prompt_embeds(caption_file)
 
+    n_after_head_drop = max(0, zarr_n_latents - _LATENT_HEAD_DROP)
+    if motion_root is None:
+        # Caller didn't pass motion_root — return uncapped (legacy
+        # callers e.g. test scripts). Trainer paths always pass it.
+        n_latent_frames = n_after_head_drop
+    else:
+        try:
+            n_motion_chunks = _peek_motion_chunks(attrs, motion_root)
+        except FileNotFoundError:
+            raise
+        motion_capped = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
+        n_latent_frames = min(n_after_head_drop, motion_capped)
+
     return prompt_embeds, attrs, n_latent_frames
 
 
@@ -274,11 +328,14 @@ def build_ride_manifest(
     caption_root: str,
     min_ride_frames: int = 21,
     cache_path: Optional[str] = None,
+    motion_root: Optional[str] = None,
 ) -> List[dict]:
     """Scan all zarr rides and return a manifest list, with optional disk caching.
 
     Each entry is ``{"zarr_path": str, "prompt_embeds": Tensor, "attrs": dict,
     "n_latent_frames": int}``.  The list is sorted by zarr filename.
+    ``n_latent_frames`` is the EFFECTIVE post-head-drop, motion-capped
+    count (see ``_index_single_zarr``).
 
     If *cache_path* points to a valid manifest whose *encoded_root* and zarr
     file count match the current directory, it is loaded directly (typically
@@ -307,13 +364,16 @@ def build_ride_manifest(
             logging.info("No usable manifest cache at %s, building from scratch.", cache_path)
 
     cap_root = Path(caption_root)
+    mot_root = Path(motion_root) if motion_root is not None else None
     logging.info("Scanning %d zarr files in %s (ride-level)", n_zarr, enc)
     t0 = time.perf_counter()
     rides: List[dict] = []
     skipped = 0
     for zpath in zarr_paths:
         try:
-            prompt_embeds, zarr_attrs, n_lat = _index_single_zarr(zpath, cap_root)
+            prompt_embeds, zarr_attrs, n_lat = _index_single_zarr(
+                zpath, cap_root, mot_root,
+            )
         except Exception as exc:
             logging.warning("Skipping %s: %s", zpath.name, exc)
             skipped += 1
@@ -479,7 +539,9 @@ class ZarrRideDataset(Dataset):
                 logging.info("Reached ride cap (%d); stopping index build.", self.max_rides)
                 break
             try:
-                prompt_embeds, zarr_attrs, n_latent_frames = _index_single_zarr(zpath, self.caption_root)
+                prompt_embeds, zarr_attrs, n_latent_frames = _index_single_zarr(
+                    zpath, self.caption_root, self.motion_root,
+                )
             except Exception as exc:
                 logging.warning("Skipping %s: %s", zpath.name, exc)
                 skipped += 1
@@ -532,48 +594,68 @@ class ZarrRideDataset(Dataset):
         latent_start: int,
         latent_end: int,
     ) -> torch.Tensor:
-        """Encode motion only for the latent frames in ``[latent_start, latent_end)``.
+        """Encode motion for the latent frames in ``[latent_start, latent_end)``.
 
-        Loads the full motion.npy (cheap, ~3 ms), then subsamples to the
-        video-frame indices that correspond to the requested latent window
-        before pushing through the ss_vae.  For a 21-frame window this
-        encodes ~21 frames instead of the full ride (often 10 000+).
+        v14-aligned (chunk-grain): each ``_LATENTS_PER_MOTION_CHUNK`` (= 3)
+        consecutive dataset latents are encoded from the SAME motion entry,
+        so the returned z stream is constant within each chunk. We
+        encode at chunk-grain (one ss_vae forward per unique chunk in
+        the window, NOT per latent), then ``np.repeat`` to per-latent
+        for the trainer's per-frame action stream contract. The output
+        values are identical to the per-latent path; only the
+        encoding cost is reduced (3x fewer ss_vae forwards).
+
+        ``n_latent_frames`` is the EFFECTIVE post-head-drop, motion-capped
+        ride length (= ``meta["n_latent_frames"]`` from the manifest);
+        the underlying motion file always has at least
+        ``n_latent_frames / _LATENTS_PER_MOTION_CHUNK`` chunks, so no
+        stale-padding can sneak in.
 
         Returns ``[latent_end - latent_start, z_dim]`` float32 tensor.
         """
         zarr_attrs = self._attrs_by_path[zarr_path]
-        n_video_frames = 1 + _LATENT_TO_VIDEO * (n_latent_frames - 1)
 
         t0 = time.perf_counter()
-        motion_all = _load_aligned_motion_for_zarr(
-            zarr_attrs, n_video_frames, self.motion_root,
+        # Per-latent motion view (chunk-grain values, repeated within
+        # each chunk). Cap to n_latent_frames so we never read past
+        # the motion file's coverage.
+        motion_per_latent = _load_aligned_motion_for_zarr(
+            zarr_attrs, n_latent_frames, self.motion_root,
         )
         t_loaded = time.perf_counter()
 
-        n_out = latent_end - latent_start
-        if motion_all.shape[0] == 0:
-            logging.warning(
-                "  z_actions [%d:%d]: empty motion for %s, returning zeros",
-                latent_start, latent_end, zarr_path,
-            )
-            return torch.zeros(n_out, 8, dtype=torch.float32)
+        # Encode at chunk-grain to avoid 3x redundant ss_vae forwards.
+        # Window touches chunks [chunk_lo, chunk_hi) — one motion row
+        # per chunk; the per-latent stream then repeats each chunk's z
+        # ``_LATENTS_PER_MOTION_CHUNK`` times.
+        chunk_lo = latent_start // _LATENTS_PER_MOTION_CHUNK
+        chunk_hi = (latent_end + _LATENTS_PER_MOTION_CHUNK - 1) // _LATENTS_PER_MOTION_CHUNK
+        chunk_motion = motion_per_latent[
+            chunk_lo * _LATENTS_PER_MOTION_CHUNK : chunk_hi * _LATENTS_PER_MOTION_CHUNK
+            : _LATENTS_PER_MOTION_CHUNK
+        ]  # one motion entry per chunk in [chunk_lo, chunk_hi)
 
-        vid_indices = np.arange(latent_start, latent_end) * _LATENT_TO_VIDEO
-        vid_indices = np.clip(vid_indices, 0, max(motion_all.shape[0] - 1, 0))
-        motion_window = motion_all[vid_indices]
-
-        z_window = _encode_motion_ss_vae(
-            motion_window, self._ss_vae, self._ss_scale, self._ss_dev,
-        )
+        z_chunks = _encode_motion_ss_vae(
+            chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
+        )  # [n_chunks_window, 8]
         t_encoded = time.perf_counter()
+
+        # Per-latent broadcast of chunk-grain z, then slice to the
+        # requested latent window (relative to chunk_lo's absolute
+        # latent start = chunk_lo * _LATENTS_PER_MOTION_CHUNK).
+        z_per_latent_full = np.repeat(z_chunks, _LATENTS_PER_MOTION_CHUNK, axis=0)
+        rel_start = latent_start - chunk_lo * _LATENTS_PER_MOTION_CHUNK
+        rel_end = rel_start + (latent_end - latent_start)
+        z_window = z_per_latent_full[rel_start:rel_end]
 
         z_tensor = torch.from_numpy(z_window)
         z_squashed = _tanh_squash(z_tensor)
 
         logging.info(
-            "  z_actions [%d:%d]: encode %d frames | "
+            "  z_actions [%d:%d]: encode %d chunks (%d latents) | "
             "motion_load=%.3fs  ss_vae=%.3fs  total=%.3fs",
-            latent_start, latent_end, len(vid_indices),
+            latent_start, latent_end, chunk_hi - chunk_lo,
+            latent_end - latent_start,
             t_loaded - t0, t_encoded - t_loaded, time.perf_counter() - t0,
         )
         return z_squashed
@@ -585,39 +667,25 @@ class ZarrRideDataset(Dataset):
     ) -> np.ndarray:
         """Per-latent-frame motion magnitude for a ride.
 
-        For each latent frame, we average ``|dx, dy|`` across the 100
-        grid points of the corresponding video frame, then mean-pool
-        over the ``_LATENT_TO_VIDEO`` video frames that map to that
-        latent frame. The result is the trainer's "is anything moving
-        here?" signal — used to bias rollout starting offsets toward
-        windows with non-trivial motion (vs. the many parked / idling
-        windows in the dataset).
+        v14-aligned (chunk-grain): each motion entry encodes the mean
+        per-frame |dx,dy| over its 12-video-frame window (= 3 latent
+        frames). We compute one magnitude per chunk and broadcast to
+        per-latent so all 3 latents in a chunk share the same
+        magnitude. Used by the action-forcing trainer's offset picker
+        to bias rollout starts toward windows with non-trivial motion.
 
-        Cheap: shares the cached ``motion.npy`` load with
-        ``encode_z_actions_window`` (~3 ms / ride). Returns
-        ``(n_latent_frames,)`` float32 — units are the raw motion
-        scale, NOT normalised. Empirically across the dataset
+        Returns ``(n_latent_frames,)`` float32 — units are the raw
+        motion scale, NOT normalised. Empirically across the dataset
         well-moving windows have mean magnitude > 0.5; sub-0.05 is
         effectively parked.
         """
         zarr_attrs = self._attrs_by_path[zarr_path]
-        n_video_frames = 1 + _LATENT_TO_VIDEO * (n_latent_frames - 1)
-        motion = _load_aligned_motion_for_zarr(
-            zarr_attrs, n_video_frames, self.motion_root,
-        )  # (n_video_frames, 100, 3)
-        if motion.shape[0] == 0:
-            return np.zeros(n_latent_frames, dtype=np.float32)
-        per_video_frame = np.linalg.norm(
-            motion[:, :, :2], axis=-1,
-        ).mean(axis=-1).astype(np.float32)  # (n_video_frames,)
-
-        out = np.zeros(n_latent_frames, dtype=np.float32)
-        for i in range(n_latent_frames):
-            lo = i * _LATENT_TO_VIDEO
-            hi = min(lo + _LATENT_TO_VIDEO, per_video_frame.shape[0])
-            if hi > lo:
-                out[i] = per_video_frame[lo:hi].mean()
-        return out
+        motion_per_latent = _load_aligned_motion_for_zarr(
+            zarr_attrs, n_latent_frames, self.motion_root,
+        )  # (n_latent_frames, 100, 3) — chunk-grain values, repeated within chunk
+        return np.linalg.norm(
+            motion_per_latent[:, :, :2], axis=-1,
+        ).mean(axis=-1).astype(np.float32)
 
     def __len__(self) -> int:
         return len(self._rides)
@@ -632,9 +700,17 @@ class ZarrRideDataset(Dataset):
 
     @staticmethod
     def load_latent_chunk(zarr_path: str, start: int, end: int) -> torch.Tensor:
-        """Lazy-load a latent slice ``[start:end]`` from a zarr ride file."""
+        """Lazy-load a latent slice ``[start:end]`` from a zarr ride file.
+
+        Indices are POST-head-drop dataset latents (not raw zarr
+        indices). Internally we shift by ``_LATENT_HEAD_DROP`` so
+        dataset latent index 0 reads from zarr index 1 — skipping the
+        Wan VAE's special 1-frame head latent so that motion.npy's
+        "first video frame dropped" convention aligns with our latent
+        indexing 1:1. See module-level _LATENT_HEAD_DROP comment.
+        """
         g = zarr_lib.open_group(zarr_path, mode="r")
-        lat_np = g["latents"][start:end]
+        lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
         return torch.from_numpy(lat_np.astype(np.float32))
 
 
@@ -777,7 +853,7 @@ class ZarrSequentialDataset(Dataset):
         g = zarr_lib.open_group(str(zpath), mode="r")
         attrs = dict(g.attrs)
         lat_ds = g["latents"]
-        n_latent_frames = lat_ds.shape[0]  # (T, 16, 60, 104)
+        zarr_n_latents = int(lat_ds.shape[0])  # raw (T, 16, 60, 104)
 
         # Derive relative ride path for caption/motion lookup
         ride_dir_2k = attrs.get("ride_dir_2k", "")
@@ -791,26 +867,28 @@ class ZarrSequentialDataset(Dataset):
             raise FileNotFoundError(f"No encoded caption for {rel}")
         prompt_embeds = _load_prompt_embeds(caption_file)
 
-        # Video frame count corresponding to all latent frames:
-        # n_video = 1 + 4*(n_lat - 1)  (from test_zarr_chunks.py lines 393-398)
-        n_video_frames = 1 + _LATENT_TO_VIDEO * (n_latent_frames - 1)
+        # v14-aligned dataset latent count: drop the head latent + cap
+        # at min(zarr - 1, n_motion_chunks * 3). See _index_single_zarr.
+        n_after_head_drop = max(0, zarr_n_latents - _LATENT_HEAD_DROP)
+        n_motion_chunks = _peek_motion_chunks(attrs, self.motion_root)
+        motion_capped = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
+        n_latent_frames = min(n_after_head_drop, motion_capped)
 
-        # Motion -> per-video-frame -> encode -> per-latent-frame
-        motion_per_video = _load_aligned_motion_for_zarr(
-            attrs, n_video_frames, self.motion_root
-        )  # (n_video_frames, 100, 3)
+        # Per-latent motion view (chunk-grain values, repeated within
+        # each chunk). Encode at chunk-grain to avoid 3x redundant
+        # ss_vae forwards, then repeat back to per-latent.
+        motion_per_latent = _load_aligned_motion_for_zarr(
+            attrs, n_latent_frames, self.motion_root,
+        )
+        chunk_motion = motion_per_latent[::_LATENTS_PER_MOTION_CHUNK]
+        z_chunks = _encode_motion_ss_vae(
+            chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
+        )  # (n_chunks, 8)
+        z_per_latent = np.repeat(
+            z_chunks, _LATENTS_PER_MOTION_CHUNK, axis=0,
+        )[:n_latent_frames]
 
-        z_per_video = _encode_motion_ss_vae(
-            motion_per_video, self._ss_vae, self._ss_scale, self._ss_dev
-        )  # (n_video_frames, 8) float32
-
-        # Subsample to latent frame rate: take frame indices 0, 4, 8, ...
-        latent_indices = np.arange(n_latent_frames) * _LATENT_TO_VIDEO
-        latent_indices = np.clip(latent_indices, 0, n_video_frames - 1)
-        z_per_latent = z_per_video[latent_indices]  # (n_latent_frames, 8)
-
-        # Tanh squash
-        z_tensor = torch.from_numpy(z_per_latent)  # (n_latent_frames, 8)
+        z_tensor = torch.from_numpy(z_per_latent)
         z_squashed = _tanh_squash(z_tensor)
 
         return prompt_embeds, z_squashed, n_latent_frames

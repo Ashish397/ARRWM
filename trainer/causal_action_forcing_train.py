@@ -2099,11 +2099,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # we can verify the per-rank decisions diverge as expected
         # (each rank slides on its own ride and decides locally based
         # on its own MAE). Helps diagnose "is the helper extending too
-        # far before training" + cross-rank divergence.
+        # far before training" + cross-rank divergence. Uses WARNING
+        # level because the parent trainer sets non-main ranks to
+        # logging.WARNING; INFO would be silently dropped on rank>0.
         rank = dist.get_rank() if dist.is_initialized() else 0
         if slide_maes:
             mae_str = ", ".join(f"{m:.4f}" for m in slide_maes)
-            logging.info(
+            logging.warning(
                 "[ActionForcing] slide_loop rank=%d step=%d threshold=%.3f "
                 "stop_reason=%s slide_maes=[%s]",
                 rank, int(self.step) + 1, threshold, stop_reason, mae_str,
