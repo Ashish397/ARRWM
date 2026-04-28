@@ -1082,14 +1082,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         _t_lat = eval_latents.get(_key)
                         if _t_lat is None or not torch.is_tensor(_t_lat):
                             continue
-                        # Action overlay only on clean_x_real — that's
-                        # the GT view real_score is conditioned on, so
-                        # overlaying the matching z stream lets us
-                        # cross-check alignment visually.
-                        _overlay = (
-                            eval_latents.get("clean_z_actions")
-                            if _key == "clean_x_real" else None
-                        )
+                        # Action overlay disabled — see commit notes;
+                        # the per-frame numpy bar render was suspected
+                        # of stalling the gen-loss tail. Leave the
+                        # ``clean_z_actions`` stash in the model so we
+                        # can re-enable here once the slowdown is
+                        # diagnosed (the stash itself is just a tensor
+                        # detach, sub-millisecond).
+                        _overlay = None
                         try:
                             self._log_pred_image_video(
                                 _t_lat.to(torch.float32),
@@ -2258,9 +2258,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
 
         # Cross-rank coordination: did ANY rank find a hard window? If
-        # so, ranks that didn't train must still drive a backward pass
-        # through generator_ddp + fake_score_ddp (with zeroed loss) so
-        # those modules' all_reduces don't deadlock waiting for a peer.
+        # so, ranks that didn't cross threshold fall back to ``prev_chunk``
+        # (the last rolled chunk) as their training target. This keeps
+        # generator_ddp + fake_score_ddp all_reduces in lockstep AND
+        # gives stragglers a real gradient contribution instead of a
+        # zero-loss no-op (the chunks are sub-threshold but still carry
+        # signal — the slide loop's forward compute is no longer wasted).
         local_trained = 1 if train_chunk is not None else 0
         if dist.is_initialized() and dist.get_world_size() > 1:
             flag_t = torch.tensor(
@@ -2282,37 +2285,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             return out
 
         if train_chunk is None:
-            # This rank didn't train, but at least one peer did. Run a
-            # synthetic gen + critic backward on ``prev_chunk`` so
-            # generator_ddp and fake_score_ddp's all_reduce hooks fire
-            # in lockstep with the trained ranks. Loss is multiplied by
-            # 0 so gradients are exactly zero — the optimizer step is a
-            # no-op for this rank's params.
+            # This rank didn't cross threshold but at least one peer did.
+            # Promote ``prev_chunk`` (the last rolled chunk on this rank)
+            # to train_chunk and continue through the unified backward
+            # path. Real loss, real gradient — the rank still contributes
+            # to the DDP-averaged update, just on a sub-threshold window.
             if prev_chunk is None:
                 # Defensive: should be unreachable. setup_sequence
                 # guarantees can_generate_more() on entry, so the loop
                 # always rolls at least once before hitting cap /
                 # end_of_ride. Mark and bail (DDP will hang; surface it
                 # rather than silently blocking forever).
-                out["streaming_synthetic_backward_unavailable"] = 1.0
+                out["streaming_straggler_fallback_unavailable"] = 1.0
                 self.model.reset_streaming_state()
                 raise RuntimeError(
                     "streaming slide-and-train: peer rank trained but "
-                    "this rank has no rolled chunk for the synthetic "
-                    "backward — DDP all_reduce will deadlock."
+                    "this rank has no rolled chunk for the straggler "
+                    "fallback — DDP all_reduce will deadlock."
                 )
-            (prev_chunk.double() * 0.0).sum().backward(retain_graph=True)
-            synth_critic_loss, _synth_critic_log = (
-                self.model.compute_critic_loss_streaming(
-                    prev_chunk, prev_info,
-                )
-            )
-            (synth_critic_loss * 0.0).backward()
-            out["streaming_synthetic_backward"] = 1.0
-            out["streaming_window_too_easy"] = 1.0
-            del prev_chunk, prev_info
-            self.model.reset_streaming_state()
-            return out
+            train_chunk = prev_chunk
+            train_info = prev_info
+            train_avg_mae = slide_maes[-1] if slide_maes else float("nan")
+            out["streaming_straggler_fallback"] = 1.0
 
         out["streaming_window_avg_mae"] = float(train_avg_mae)
         out["streaming_window_start_chunk"] = float(chunks_rolled)

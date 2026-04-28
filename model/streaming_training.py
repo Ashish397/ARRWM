@@ -438,24 +438,18 @@ class StreamingTrainingModel:
         # Check if previous_frames can be used for overlap and auto-compute overlap frame count
         previous_frames = self.state.get("previous_frames")
         if previous_frames is not None:
-            # Randomly select number of new frames (min=min_new_frame, max=chunk_size, step=3)
+            # Per-rank random pick. Each rank already has its own ride
+            # from DistributedSampler and the resulting chunk is always
+            # ``chunk_size`` frames regardless of the index, so the
+            # selection has no cross-rank contract to honour. The
+            # slide-and-train loop additionally relies on ranks being
+            # free to call this method a different number of times — a
+            # per-call ``dist.broadcast`` here would deadlock DDP when
+            # collective counts diverge.
             max_new_frames = min(self.state["temp_max_length"] - current_length + 1, self.chunk_size)
             possible_new_frames = list(range(self.min_new_frame, max_new_frames, 3))
-            
-            # Ensure all processes choose the same random value
-            if dist.is_initialized():
-                if dist.get_rank() == 0:
-                    import random
-                    selected_idx = random.randint(0, len(possible_new_frames) - 1)
-                else:
-                    selected_idx = 0
-                selected_idx_tensor = torch.tensor(selected_idx, device=self.device, dtype=torch.int32)
-                dist.broadcast(selected_idx_tensor, src=0)
-                selected_idx = selected_idx_tensor.item()
-            else:
-                import random
-                selected_idx = random.randint(0, len(possible_new_frames) - 1)
-            
+            import random
+            selected_idx = random.randint(0, len(possible_new_frames) - 1)
             new_frames_to_generate = possible_new_frames[selected_idx]
 
             # Auto-compute required overlap frames to ensure the final chunk has 21 frames
