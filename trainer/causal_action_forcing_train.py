@@ -2019,7 +2019,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         ):
             return None
 
-        pipe = self.pipeline
         state = self.model.streaming_state
         npb = int(state["shift"])
         chunk_size = int(state["chunk_size"])
@@ -2030,6 +2029,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         train_chunk: Optional[torch.Tensor] = None
         train_info: Optional[Dict[str, Any]] = None
         train_avg_mae: float = float("nan")
+        # Hold onto the most recently rolled chunk. Used (a) as the
+        # synthetic-backward chunk on ranks whose own slide loop ended
+        # without a trained window but at least one peer did train, and
+        # (b) discarded outright when no rank trained.
+        prev_chunk: Optional[torch.Tensor] = None
+        prev_info: Optional[Dict[str, Any]] = None
+        # Per-slide MAE history for stdout reporting at the end of the
+        # slide loop. One entry per generate_next_chunk call. Helps
+        # diagnose "the helper extends too far before training" cases.
+        slide_maes: List[float] = []
 
         while True:
             if chunks_rolled >= max_slides:
@@ -2038,20 +2047,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if not self.model.can_generate_more():
                 stop_reason = "end_of_ride"
                 break
-            # DDP-safety: ``_compute_chunk_mae`` does an all_reduce inside
-            # so every rank must enter it the same number of times. The
-            # stop conditions above are already lockstep (max_length is
-            # MIN-reduced at setup; chunks_rolled is incremented in unison
-            # because ``_streaming_pick_new_frames`` is deterministic),
-            # but the explicit MIN-reduce guards against future drift.
-            if dist.is_initialized() and dist.get_world_size() > 1:
-                keep_t = torch.tensor(
-                    [1], device=self.device, dtype=torch.long,
-                )
-                dist.all_reduce(keep_t, op=dist.ReduceOp.MIN)
-                if int(keep_t.item()) == 0:
-                    stop_reason = "ddp_stop"
-                    break
 
             chunk, info = self.model.generate_next_chunk(requires_grad=True)
             chunks_rolled += 1
@@ -2073,9 +2068,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 stop_reason = "end_of_ride"
                 break
             gt_slice = ride_window[:, chunk_lo:chunk_hi]
-            avg_mae = pipe._compute_chunk_mae(
-                pred_chunk=chunk.detach(), gt_chunk=gt_slice,
+            # Per-rank MAE on the full 21-frame window. No all_reduce —
+            # each rank decides locally based on its own ride. The
+            # post-loop MAX-reduce on local_trained handles cross-rank
+            # DDP coordination.
+            avg_mae = float(
+                (chunk.detach().float() - gt_slice.float())
+                .abs().mean().item()
             )
+            slide_maes.append(avg_mae)
+
+            # Stage as the most-recent leftover, releasing the previous.
+            if prev_chunk is not None:
+                del prev_chunk, prev_info
+            prev_chunk, prev_info = chunk, info
 
             if avg_mae == avg_mae and avg_mae > threshold:
                 stop_reason = "mae_threshold"
@@ -2084,17 +2090,79 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 train_avg_mae = avg_mae
                 break
 
-            # Too easy — release the autograd graph for this slide.
-            del chunk, info
-
         out: Dict[str, Any] = {
             "streaming_chunks_rolled": float(chunks_rolled),
             f"streaming_stop_reason_{stop_reason}": 1.0,
         }
 
-        if train_chunk is None:
-            # Cap or end-of-ride before MAE crossed: skip optim signal.
+        # Per-slide MAE printout — log on EVERY rank (with rank tag) so
+        # we can verify the per-rank decisions diverge as expected
+        # (each rank slides on its own ride and decides locally based
+        # on its own MAE). Helps diagnose "is the helper extending too
+        # far before training" + cross-rank divergence.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if slide_maes:
+            mae_str = ", ".join(f"{m:.4f}" for m in slide_maes)
+            logging.info(
+                "[ActionForcing] slide_loop rank=%d step=%d threshold=%.3f "
+                "stop_reason=%s slide_maes=[%s]",
+                rank, int(self.step) + 1, threshold, stop_reason, mae_str,
+            )
+
+        # Cross-rank coordination: did ANY rank find a hard window? If
+        # so, ranks that didn't train must still drive a backward pass
+        # through generator_ddp + fake_score_ddp (with zeroed loss) so
+        # those modules' all_reduces don't deadlock waiting for a peer.
+        local_trained = 1 if train_chunk is not None else 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            flag_t = torch.tensor(
+                [local_trained], device=self.device, dtype=torch.long,
+            )
+            dist.all_reduce(flag_t, op=dist.ReduceOp.MAX)
+            any_trained = int(flag_t.item()) == 1
+        else:
+            any_trained = bool(local_trained)
+
+        if not any_trained:
+            # Every rank's slide loop finished without crossing the
+            # threshold. No backward fires anywhere; the trainer's
+            # outer optim.step() runs on zero grads (safe path).
             out["streaming_window_too_easy"] = 1.0
+            if prev_chunk is not None:
+                del prev_chunk, prev_info
+            self.model.reset_streaming_state()
+            return out
+
+        if train_chunk is None:
+            # This rank didn't train, but at least one peer did. Run a
+            # synthetic gen + critic backward on ``prev_chunk`` so
+            # generator_ddp and fake_score_ddp's all_reduce hooks fire
+            # in lockstep with the trained ranks. Loss is multiplied by
+            # 0 so gradients are exactly zero — the optimizer step is a
+            # no-op for this rank's params.
+            if prev_chunk is None:
+                # Defensive: should be unreachable. setup_sequence
+                # guarantees can_generate_more() on entry, so the loop
+                # always rolls at least once before hitting cap /
+                # end_of_ride. Mark and bail (DDP will hang; surface it
+                # rather than silently blocking forever).
+                out["streaming_synthetic_backward_unavailable"] = 1.0
+                self.model.reset_streaming_state()
+                raise RuntimeError(
+                    "streaming slide-and-train: peer rank trained but "
+                    "this rank has no rolled chunk for the synthetic "
+                    "backward — DDP all_reduce will deadlock."
+                )
+            (prev_chunk.double() * 0.0).sum().backward(retain_graph=True)
+            synth_critic_loss, _synth_critic_log = (
+                self.model.compute_critic_loss_streaming(
+                    prev_chunk, prev_info,
+                )
+            )
+            (synth_critic_loss * 0.0).backward()
+            out["streaming_synthetic_backward"] = 1.0
+            out["streaming_window_too_easy"] = 1.0
+            del prev_chunk, prev_info
             self.model.reset_streaming_state()
             return out
 
