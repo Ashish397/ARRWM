@@ -75,6 +75,11 @@ _LATENTS_PER_MOTION_CHUNK = _MOTION_WINDOW_FRAMES // _LATENT_TO_VIDEO  # = 3
 # from the training stream.
 _LATENT_HEAD_DROP = 0
 
+# Action-vs-visual causal lag in seconds. Joystick command at time T
+# becomes visible in the camera ~``_ACTION_CAUSAL_LAG_SEC`` seconds later.
+# See utils/test_zarr_chunks.py:117 for v14's matching convention.
+_ACTION_CAUSAL_LAG_SEC = 0.8
+
 # ss_vae encoding batch size.
 _ENCODE_BATCH = 128
 
@@ -158,14 +163,44 @@ def _resolve_motion_path(attrs: dict, motion_root: Path) -> Path:
 
 def _peek_motion_chunks(attrs: dict, motion_root: Path) -> int:
     """Return motion.npy's chunk count (= shape[0]) without loading the body.
-    Used at manifest-build time to cap n_latent_frames at min(zarr-1,
-    n_motion_chunks * 3) so the trainer never sees stale-padded motion.
+    The usable count after the v14 alignment offset is
+    ``max(0, n_motion_chunks - _motion_chunk_offset(attrs))`` — see
+    ``_motion_capped_latents``.
     """
     motion_path = _resolve_motion_path(attrs, motion_root)
     motion = np.load(motion_path, mmap_mode="r")
     if motion.ndim != 3 or motion.shape[2] != 3:
         raise RuntimeError(f"Unexpected motion shape {motion.shape} at {motion_path}")
     return int(motion.shape[0])
+
+
+def _motion_chunk_offset(attrs: dict) -> int:
+    """v14-aligned chunk offset between motion.npy and dataset latents.
+
+    motion.npy is encoded from source-video frame 0 (pre_encode_motion.py
+    drops only the first frame), but latents are encoded starting at
+    ``action_start_sec`` of the source video, with a fixed causal lag of
+    ``_ACTION_CAUSAL_LAG_SEC`` seconds between joystick command and
+    visible response. v14's ``load_aligned_motion``
+    (utils/test_zarr_chunks.py:117) shifts motion by
+    ``(action_start_sec - 0.8) * fps`` source-video frames; chunk-grain
+    rounds to whole motion windows. Result is non-negative (clamped at 0).
+    """
+    action_start_sec = float(attrs.get("action_start_sec", 0.0))
+    fps = float(attrs.get("fps", 20.0))
+    offset_frames = (action_start_sec - _ACTION_CAUSAL_LAG_SEC) * fps
+    chunk_offset = int(round(offset_frames / _MOTION_WINDOW_FRAMES))
+    return max(0, chunk_offset)
+
+
+def _motion_capped_latents(attrs: dict, motion_root: Path) -> int:
+    """How many dataset latents are spanned by the usable motion window
+    after applying ``_motion_chunk_offset``. Returns 0 if the offset
+    consumes more than the available motion."""
+    n_motion_chunks = _peek_motion_chunks(attrs, motion_root)
+    chunk_offset = _motion_chunk_offset(attrs)
+    usable_chunks = max(0, n_motion_chunks - chunk_offset)
+    return usable_chunks * _LATENTS_PER_MOTION_CHUNK
 
 
 def _load_aligned_motion_for_zarr(
@@ -176,16 +211,18 @@ def _load_aligned_motion_for_zarr(
     """Return per-DATASET-LATENT motion mapped from chunk-grain motion.npy.
 
     v14 discipline (see utils/pre_encode_motion.py:153 for the dropped
-    first video frame, and the spec at the top of this module for the
-    head-latent drop): each motion entry covers exactly
-    ``_LATENTS_PER_MOTION_CHUNK`` (= 3) consecutive dataset latents, so
-    dataset latent index ``k`` reads from ``motion[k // 3]``. No
-    upsampling, no ``action_start_sec - 0.8`` offset, no stale-padding —
+    first video frame, the head-latent spec at the top of this module,
+    and ``_motion_chunk_offset`` for the
+    ``(action_start_sec - 0.8) * fps`` shift between motion.npy and the
+    encoded latents). After applying the per-ride chunk offset, each
+    motion entry covers exactly ``_LATENTS_PER_MOTION_CHUNK`` (= 3)
+    consecutive dataset latents: dataset latent index ``k`` reads from
+    ``motion[chunk_offset + k // 3]``. No upsampling, no stale-padding —
     if the caller asks for more latents than the motion file supports
     we raise: the caller must cap ``n_latent_frames`` at
-    ``min(zarr_latents - _LATENT_HEAD_DROP, n_motion_chunks * 3)`` (the
-    manifest indexer does this; ``_load_ride_tensors`` inherits the cap
-    via ``meta["n_latent_frames"]``).
+    ``_motion_capped_latents(attrs, motion_root)`` (the manifest indexer
+    does this; ``_load_ride_tensors`` inherits the cap via
+    ``meta["n_latent_frames"]``).
 
     Returns float32 array of shape ``(n_latent_frames, 100, 3)``. Within
     each chunk the 3 entries are identical (= the chunk's motion.npy
@@ -197,17 +234,19 @@ def _load_aligned_motion_for_zarr(
         raise RuntimeError(f"Unexpected motion shape {motion.shape}")
 
     n_motion_chunks = int(motion.shape[0])
-    n_avail_latents = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
+    chunk_offset = _motion_chunk_offset(attrs)
+    usable_chunks = max(0, n_motion_chunks - chunk_offset)
+    n_avail_latents = usable_chunks * _LATENTS_PER_MOTION_CHUNK
     if n_latent_frames > n_avail_latents:
         raise ValueError(
-            f"motion file has only {n_motion_chunks} chunks "
-            f"(= {n_avail_latents} usable latents) but caller requested "
-            f"{n_latent_frames}; cap n_latent_frames at min(zarr_latents "
-            f"- {_LATENT_HEAD_DROP}, n_motion_chunks * "
-            f"{_LATENTS_PER_MOTION_CHUNK}) before calling."
+            f"motion file has {n_motion_chunks} chunks; after chunk_offset="
+            f"{chunk_offset} only {usable_chunks} usable (= {n_avail_latents} "
+            f"latents) but caller requested {n_latent_frames}. Cap "
+            f"n_latent_frames at _motion_capped_latents(attrs, motion_root) "
+            f"before calling."
         )
 
-    chunk_indices = np.arange(n_latent_frames) // _LATENTS_PER_MOTION_CHUNK
+    chunk_indices = chunk_offset + np.arange(n_latent_frames) // _LATENTS_PER_MOTION_CHUNK
     return motion[chunk_indices].astype(np.float32)
 
 
@@ -277,7 +316,7 @@ def _load_prompt_embeds(encoded_json: Path) -> torch.Tensor:
 # Dataset
 # ---------------------------------------------------------------------------
 
-_MANIFEST_VERSION = 3  # bumped: head-latent drop + motion-chunk cap
+_MANIFEST_VERSION = 4  # bumped: v14 (action_start_sec - 0.8) chunk offset
 
 
 def _index_single_zarr(
@@ -288,13 +327,15 @@ def _index_single_zarr(
     """Read metadata and captions for one zarr — no motion encoding.
 
     Returns ``n_latent_frames`` as the EFFECTIVE post-drop, motion-capped
-    count: ``min(zarr_latents - _LATENT_HEAD_DROP, n_motion_chunks *
-    _LATENTS_PER_MOTION_CHUNK)``. All downstream slicing in this module
-    + ``_load_ride_tensors`` inherits this cap, so:
+    count: ``min(zarr_latents - _LATENT_HEAD_DROP,
+    _motion_capped_latents(attrs, motion_root))``. All downstream slicing
+    in this module + ``_load_ride_tensors`` inherits this cap, so:
       * the head latent (Wan VAE's special 1-frame leading latent) is
         never visible to the trainer;
-      * stale-padded motion past ``n_motion_chunks * 3`` latents is
-        excluded so cmd_actions always reflect real motion.
+      * the v14 chunk offset (``_motion_chunk_offset``) is consumed at
+        the start of motion.npy, and stale-padded motion past
+        ``(n_motion_chunks - chunk_offset) * 3`` latents is excluded so
+        cmd_actions always reflect real, properly-aligned motion.
     """
     g = zarr_lib.open_group(str(zpath), mode="r")
     attrs = dict(g.attrs)
@@ -317,10 +358,9 @@ def _index_single_zarr(
         n_latent_frames = n_after_head_drop
     else:
         try:
-            n_motion_chunks = _peek_motion_chunks(attrs, motion_root)
+            motion_capped = _motion_capped_latents(attrs, motion_root)
         except FileNotFoundError:
             raise
-        motion_capped = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
         n_latent_frames = min(n_after_head_drop, motion_capped)
 
     return prompt_embeds, attrs, n_latent_frames
@@ -890,10 +930,11 @@ class ZarrSequentialDataset(Dataset):
         prompt_embeds = _load_prompt_embeds(caption_file)
 
         # v14-aligned dataset latent count: drop the head latent + cap
-        # at min(zarr - 1, n_motion_chunks * 3). See _index_single_zarr.
+        # at min(zarr - 1, _motion_capped_latents). The motion cap
+        # accounts for the per-ride (action_start_sec - 0.8) chunk
+        # offset between motion.npy and the encoded latents.
         n_after_head_drop = max(0, zarr_n_latents - _LATENT_HEAD_DROP)
-        n_motion_chunks = _peek_motion_chunks(attrs, self.motion_root)
-        motion_capped = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
+        motion_capped = _motion_capped_latents(attrs, self.motion_root)
         n_latent_frames = min(n_after_head_drop, motion_capped)
 
         # Per-latent motion view (chunk-grain values, repeated within

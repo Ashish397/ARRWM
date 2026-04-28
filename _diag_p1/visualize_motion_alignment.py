@@ -1,35 +1,35 @@
-"""Visualise motion ↔ latent alignment by decoding a ride window with
-the Wan VAE and overlaying the per-chunk z_actions as horizontal bars
-on every frame.
+"""Visualise motion ↔ latent alignment using the v14 overlay style:
+per-pixel-frame CoTracker grid arrows (raw motion.npy) plus an
+ss_vae latent dial in the corner.
 
-Standalone — no DDP, no training, no trainer dependencies. Run on the
-local 5090 to visually verify that the dataset's chunk-grain motion
-loader (post-2d897aa, post-774456b) produces actions that semantically
-match the GT video at the same ride positions.
+Standalone — no DDP, no training. Run on the local 5090 to visually
+verify that the dataset's chunk-grain motion loader produces motion
+fields that semantically match the GT video at the same ride positions.
 
 What it does:
   1. Loads one ride from /home/ashish/frodobots/frodobots_encoded.
   2. Pulls the head-dropped, motion-capped latent slice
-     [start : start + n_frames_latent] from the zarr.
-  3. Encodes z_actions for the same slice via the dataset's
-     ``encode_z_actions_window`` (chunk-grain, broadcast within chunks).
-  4. Slices z_actions to ``action_dims=[2, 7]`` (linear / angular).
+     [start : start + n_latents] from the zarr.
+  3. Loads the raw motion.npy and slices the chunks that cover the
+     same window. Each chunk = mean displacement for one 12-pixel-frame
+     window = one [N=100, 3] tensor of (dx, dy, visibility) values.
+  4. Encodes z_actions for the same slice via the dataset's chunk-grain
+     ``encode_z_actions_window`` (broadcast within chunks) and slices
+     to ``action_dims=[2, 7]`` for the latent dial.
   5. VAE-decodes the latents to pixel video (Wan VAE).
-  6. Overlays the per-chunk action bars at the bottom of every pixel
-     frame: top bar = z[0], bottom bar = z[1]; red right for >= 0,
-     blue left for < 0; length proportional to |z| (clamped at 1.0
-     → half frame width).
-  7. Encodes mp4 via ffmpeg subprocess. Writes to
-     ``_diag_p1/out/motion_overlay_<ride>_s<start>.mp4``.
+  6. Overlays the v14 motion grid (10×10 green arrows showing per-pixel
+     displacement; one arrow per grid point, length ∝ |dx, dy|) AND a
+     small bottom-right dial (`z[2]` left/right, `z[7]` up/down).
+  7. Encodes mp4. Writes to ``_diag_p1/out/<...>.mp4``.
 
 Usage:
   cd /home/ashish/ARRWM
   python _diag_p1/visualize_motion_alignment.py --start 0 --n-latents 60
 
-The bars step at chunk boundaries (every 3 latents = every 12 video
-frames at fps=20 = 0.6s of video). You should see the bar values
-correlate with what the GT video is doing — left/right turns visible
-as angular deflection, forward speed visible as linear bar length.
+The arrows are constant for 12 consecutive video frames (= one chunk),
+then jump. They should track the visible motion in the GT pixels —
+forward translation shows arrows pointing radially outward (= scene
+flowing past the camera), turns show arrows tilting left or right.
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import zarr as zarr_lib
@@ -78,69 +79,120 @@ SS_VAE_CKPT = "/home/ashish/ARRWM/action_query/checkpoints/ss_vae_8free.pt"
 ACTION_DIMS = [2, 7]   # matches configs/action_forcing_phase1_freeze.yaml
 
 
-def _draw_action_overlay(
-    vid_np: np.ndarray,
-    z_per_chunk: np.ndarray,
-    frames_per_latent: int,
-    npb: int,
-    label_action_dims: list[int],
-) -> None:
-    """In-place overlay. Mirrors ActionForcingDMDTrainer._draw_action_overlay
-    but without the trainer dependency.
+def draw_motion_overlay(frame: np.ndarray, motion_vecs: np.ndarray, mag_scale: float = 30.0) -> np.ndarray:
+    """v14-style motion grid arrows. Ported from utils/test_zarr_chunks.py.
 
-    ``vid_np``: ``[T_video, H, W, 3]`` uint8.
-    ``z_per_chunk``: ``[n_chunks, A]`` post-tanh-squash z values.
+    motion_vecs: ``[N, 3]`` where N = grid_size**2, columns = (dx, dy, vis).
+    Draws one arrow per grid point on top of ``frame`` (modified in place
+    via cv2.arrowedLine). Color: green for vis>=0.5, orange for
+    0.2 <= vis < 0.5, skipped if vis < 0.2.
     """
-    if z_per_chunk.size == 0:
-        return
-    n_chunks, A = z_per_chunk.shape
-    T, H, W, _ = vid_np.shape
-    if H < 8 or W < 16 or n_chunks == 0:
-        return
+    h, w = frame.shape[:2]
+    if motion_vecs.ndim != 2 or motion_vecs.shape[1] != 3:
+        return frame
+    N = motion_vecs.shape[0]
+    grid_size = int(round(np.sqrt(N)))
+    if grid_size * grid_size != N or grid_size <= 0:
+        return frame
 
-    max_strip = max(36, H // 4)
-    gap = 3
-    label_w = 60
-    bar_h = max(6, (max_strip - 6 - gap * (A - 1)) // A)
-    strip_h = 6 + bar_h * A + gap * (A - 1)
-    cx = W // 2
-    max_bar = (W // 2) - 6 - label_w
+    for gy in range(grid_size):
+        for gx in range(grid_size):
+            idx = gy * grid_size + gx
+            dx, dy, vis = motion_vecs[idx]
+            if vis < 0.2:
+                continue
+            cx = int((gx + 0.5) * w / grid_size)
+            cy = int((gy + 0.5) * h / grid_size)
+            # Negate to point toward where pixels are FROM
+            # (matches v14's "flow toward camera" convention; the
+            # CoTracker delta is forward-frame displacement, so negating
+            # gives the visual flow direction).
+            end_x = int(cx - dx * mag_scale)
+            end_y = int(cy - dy * mag_scale)
+            color = (0, 255, 0) if vis >= 0.5 else (0, 200, 255)
+            cv2.arrowedLine(frame, (cx, cy), (end_x, end_y), color, 1, tipLength=0.3)
+    return frame
 
-    # Black underlay (75% darken) so bars are readable on bright frames.
-    vid_np[:, -strip_h:, :, :] = vid_np[:, -strip_h:, :, :] // 4
 
-    frames_per_chunk = npb * frames_per_latent
-    for t in range(T):
-        chunk_idx = min(t // frames_per_chunk, n_chunks - 1)
-        z = z_per_chunk[chunk_idx]
-        for d in range(A):
-            y0 = H - strip_h + 4 + d * (bar_h + gap)
-            y1 = y0 + bar_h
-            a = float(z[d])
-            length = int(min(abs(a), 1.0) * max_bar)
-            # Center marker (gray 1-px line).
-            vid_np[t, y0:y1, cx - 1:cx + 1, :] = 200
-            if length > 0:
-                if a >= 0:
-                    vid_np[t, y0:y1, cx:cx + length, 0] = 240
-                    vid_np[t, y0:y1, cx:cx + length, 1] = 80
-                    vid_np[t, y0:y1, cx:cx + length, 2] = 80
-                else:
-                    vid_np[t, y0:y1, cx - length:cx, 0] = 80
-                    vid_np[t, y0:y1, cx - length:cx, 1] = 80
-                    vid_np[t, y0:y1, cx - length:cx, 2] = 240
+def draw_latent_dial(
+    frame: np.ndarray, z_action: np.ndarray,
+    label: str = "z[2,7]",
+) -> np.ndarray:
+    """v14-style dial for the ss_vae action latent: a circle in the
+    bottom-right corner with a single arrow whose horizontal component
+    encodes z[0] (turn) and vertical component encodes z[1] (forward).
+
+    z_action: ``[2,]`` already sliced to action_dims.
+    """
+    h, w = frame.shape[:2]
+    bar_h = 60
+    cx, cy = w - 50, h - bar_h + 30
+    cv2.circle(frame, (cx, cy), 22, (60, 60, 80), -1)
+    cv2.circle(frame, (cx, cy), 22, (180, 180, 255), 1)
+
+    z_turn = float(z_action[0])
+    z_fwd = float(z_action[1])
+
+    # z is post-tanh-squash, so values are roughly in [-1, 1]. Scale
+    # arrow length to the dial radius.
+    arrow_len = 18
+    dx = int(np.clip(z_turn * arrow_len * 2.0, -arrow_len, arrow_len))
+    dy = int(np.clip(-z_fwd * arrow_len * 2.0, -arrow_len, arrow_len))
+    color = (255, 200, 100) if z_fwd >= 0 else (100, 150, 255)
+    cv2.arrowedLine(frame, (cx, cy), (cx + dx, cy + dy), color, 2, tipLength=0.35)
+    cv2.putText(
+        frame, label, (cx - 22, cy - 26),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 255), 1, cv2.LINE_AA,
+    )
+    return frame
+
+
+def draw_chunk_label(
+    frame: np.ndarray, chunk_idx: int, ride_frame_lo: int, ride_frame_hi: int,
+    z_action: np.ndarray,
+) -> np.ndarray:
+    """Bottom-left text overlay: chunk index, ride video-frame range,
+    and the ss_vae z values for the active chunk.
+    """
+    h, w = frame.shape[:2]
+    bar_h = 40
+    overlay = frame[h - bar_h:h, :, :].astype(np.float32)
+    frame[h - bar_h:h, :, :] = (overlay * 0.5).astype(np.uint8)
+    y0 = h - bar_h + 16
+    cv2.putText(
+        frame,
+        f"chunk {chunk_idx}  vid_frames [{ride_frame_lo}:{ride_frame_hi})",
+        (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"z[2]={z_action[0]:+.3f}   z[7]={z_action[1]:+.3f}",
+        (10, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1, cv2.LINE_AA,
+    )
+    return frame
 
 
 def _frames_to_mp4(frames: np.ndarray, out_path: Path, fps: float) -> None:
-    """Encode [T, H, W, 3] uint8 to mp4 via ffmpeg pipe."""
+    """Encode [T, H, W, 3] uint8 RGB to mp4 via ffmpeg pipe.
+
+    NOTE: cv2 returns BGR for its drawing primitives; we keep the array
+    in BGR throughout the overlay path and let ffmpeg interpret it as
+    rgb24 — the resulting mp4 has R/B swapped vs source. To get correct
+    colors, we swap R↔B BEFORE the ffmpeg pipe.
+    """
     T, H, W, C = frames.shape
     assert C == 3, f"expected 3-channel frames, got C={C}"
+    # cv2 drew on a BGR-interpreted array (since cv2's arrowedLine draws
+    # color tuples as B,G,R). Our source from VAE is RGB. We choose to
+    # keep the cv2 calls' visual intent — reds/greens/blues — by writing
+    # the array as-is (= treating it as BGR for ffmpeg too). To do that:
+    # tell ffmpeg the input is bgr24.
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{W}x{H}", "-r", f"{fps}",
             "-i", "-",
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -165,17 +217,18 @@ def main() -> None:
     parser.add_argument("--ride-name", type=str, default=None,
                         help="zarr basename without .zarr; default = first indexed ride")
     parser.add_argument("--start", type=int, default=0,
-                        help="dataset latent index to start at (must be a multiple of npb=3)")
+                        help="dataset latent index to start at (snapped to multiple of npb=3)")
     parser.add_argument("--n-latents", type=int, default=60,
-                        help="number of latents to decode (multiple of npb=3)")
+                        help="number of latents to decode (snapped to multiple of npb=3)")
     parser.add_argument("--max-rides", type=int, default=4)
     parser.add_argument("--fps", type=float, default=20.0,
                         help="output video fps (frodobots native = 20)")
+    parser.add_argument("--mag-scale", type=float, default=30.0,
+                        help="motion arrow magnitude scale (v14 default = 30)")
     parser.add_argument("--out-dir", type=str,
                         default=str(_REPO / "_diag_p1" / "out"))
     args = parser.parse_args()
 
-    # Snap start + n_latents to npb=3.
     npb = _LATENTS_PER_MOTION_CHUNK
     if args.start % npb != 0:
         new_start = (args.start // npb) * npb
@@ -226,72 +279,109 @@ def main() -> None:
                     args.n_latents, new_n)
         args.n_latents = new_n
 
-    # ----- Load latents (head-dropped already by ZarrRideDataset.load_latent_chunk) -----
-    log.info("Loading latents [%d : %d) from zarr (head-drop=%d already applied) ...",
-             args.start, args.start + args.n_latents, _LATENT_HEAD_DROP)
-    latents = ZarrRideDataset.load_latent_chunk(
-        str(zpath), args.start, args.start + args.n_latents,
-    )   # [F, 16, h, w], fp32
-    log.info("latents shape=%s dtype=%s", tuple(latents.shape), latents.dtype)
+    # ----- Load raw motion.npy chunks for this window -----
+    motion_path = (
+        Path(MOTION_ROOT)
+        / Path(attrs["ride_dir_2k"]).relative_to("/home/ashish/frodobots/frodobots_data")
+        / "motion.npy"
+    )
+    if not motion_path.exists():
+        log.error("motion.npy missing at %s", motion_path)
+        sys.exit(1)
+    raw_motion = np.load(motion_path)   # [n_motion_chunks, N=100, 3]
+    log.info("raw motion.npy shape=%s", raw_motion.shape)
 
-    # ----- Encode z_actions for the same window -----
-    z_window = ds.encode_z_actions_window(
-        str(zpath), n_latent_frames, args.start, args.start + args.n_latents,
-    )   # [n_latents, 8]
-    z_window = z_window.cpu().numpy()
-    log.info("z_actions shape=%s; slicing to action_dims=%s for visualisation",
-             z_window.shape, ACTION_DIMS)
-    z_window = z_window[..., ACTION_DIMS]   # [n_latents, 2]
+    # v14 alignment (utils/test_zarr_chunks.py:117): motion.npy is
+    # encoded from SOURCE VIDEO frame 0 (pre_encode_motion.py drops only
+    # the first frame), but latents are encoded starting at
+    # ``action_start_sec`` of the source video, with a 0.8s causal lag.
+    # offset_frames = (action_start_sec - 0.8) * fps. Chunk-grain rounds
+    # to the nearest whole motion window.
+    action_start_sec = float(attrs.get("action_start_sec", 0.0))
+    fps_attr = float(attrs.get("fps", 20.0))
+    motion_offset_chunks = int(round((action_start_sec - 0.8) * fps_attr / 12.0))
+    log.info(
+        "alignment offset: action_start_sec=%.2f fps=%.1f -> motion_offset=%d chunks (%.2fs)",
+        action_start_sec, fps_attr, motion_offset_chunks,
+        motion_offset_chunks * 12.0 / fps_attr,
+    )
 
-    # Reduce to per-chunk (within-chunk identity verified by Test 2 of the loader diag).
-    z_per_chunk = z_window[::npb]
-    n_chunks = z_per_chunk.shape[0]
-    log.info("per-chunk z: shape=%s ; min=%.3f max=%.3f",
-             z_per_chunk.shape, float(z_per_chunk.min()), float(z_per_chunk.max()))
-    log.info("per-chunk z (linear, angular):")
+    chunk_lo = motion_offset_chunks + args.start // npb
+    chunk_hi = motion_offset_chunks + (args.start + args.n_latents) // npb
+    if chunk_hi > raw_motion.shape[0]:
+        log.error("motion offset (%d) + window exceeds available chunks (%d)",
+                  chunk_hi, raw_motion.shape[0])
+        sys.exit(1)
+    motion_chunks = raw_motion[chunk_lo:chunk_hi]   # [n_chunks, 100, 3]
+    n_chunks = motion_chunks.shape[0]
+    log.info("motion chunks for this window: [%d:%d) -> shape=%s",
+             chunk_lo, chunk_hi, motion_chunks.shape)
+    log.info("per-chunk |dx,dy| mean (raw motion magnitude):")
+    raw_mag = np.linalg.norm(motion_chunks[:, :, :2], axis=-1).mean(axis=-1)
     for c in range(min(n_chunks, 30)):
-        log.info("  chunk %3d  z=[% .3f, % .3f]",
-                 c, float(z_per_chunk[c, 0]), float(z_per_chunk[c, 1]))
+        log.info("  chunk %3d  |motion|=%.3f", c, float(raw_mag[c]))
     if n_chunks > 30:
         log.info("  ... (%d more)", n_chunks - 30)
 
-    # ----- Build & load Wan VAE -----
+    # ----- Load latents (head-dropped already by load_latent_chunk) -----
+    log.info("Loading latents [%d : %d) ...", args.start, args.start + args.n_latents)
+    latents = ZarrRideDataset.load_latent_chunk(
+        str(zpath), args.start, args.start + args.n_latents,
+    )
+
+    # ----- Encode z_actions for the dial -----
+    z_window = ds.encode_z_actions_window(
+        str(zpath), n_latent_frames, args.start, args.start + args.n_latents,
+    ).cpu().numpy()
+    z_window = z_window[..., ACTION_DIMS]   # [n_latents, 2]
+    z_per_chunk = z_window[::npb]   # [n_chunks, 2]
+
+    # ----- Build & run Wan VAE -----
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     log.info("Loading Wan VAE on %s (dtype=%s)...", device, dtype)
-    vae = WanVAEWrapper().to(device=device, dtype=dtype)
-    vae.eval()
+    vae = WanVAEWrapper().to(device=device, dtype=dtype).eval()
 
-    # ----- Decode -----
-    # Wan VAE wants [batch_size, num_frames, num_channels, height, width]
-    # and decode_to_pixel returns the same layout. Add a leading dummy
-    # frame so the temporal-conv padding doesn't eat our first frame.
-    lat_b = latents.unsqueeze(0).to(device=device, dtype=dtype)   # [1, F, 16, h, w]
+    lat_b = latents.unsqueeze(0).to(device=device, dtype=dtype)
     dummy = lat_b[:, 0:1]
     lat_wd = torch.cat([dummy, lat_b], dim=1)
     log.info("VAE decode input shape=%s", tuple(lat_wd.shape))
     with torch.no_grad():
         pixels = vae.decode_to_pixel(lat_wd)   # [1, F+1, 3, H, W] in [-1, 1]
-    pixels = pixels[:, 1:, ...]   # drop dummy
+    pixels = pixels[:, 1:, ...]
     log.info("decoded pixels shape=%s", tuple(pixels.shape))
 
-    # To uint8 [T, H, W, 3]
     video = (0.5 * (pixels[0].float() + 1.0)).clamp(0.0, 1.0)
     vid_np = (video.permute(0, 2, 3, 1).cpu().numpy() * 255.0).astype(np.uint8)
+    # Convert RGB -> BGR for cv2 drawing primitives (cv2 uses BGR by convention).
+    # We'll feed the BGR array to ffmpeg as bgr24.
+    vid_np = vid_np[..., ::-1].copy()   # RGB → BGR, write-safe
+
     T, H, W, _ = vid_np.shape
-    log.info("video frames %d   resolution %dx%d   chunks %d   frames/chunk %d",
-             T, W, H, n_chunks, npb * 4)
+    log.info("video frames %d   resolution %dx%d   chunks %d   frames/chunk %d (npb=%d × _LATENT_TO_VIDEO=4)",
+             T, W, H, n_chunks, npb * 4, npb)
 
-    # ----- Overlay -----
-    log.info("rendering action overlay (red right = +z, blue left = -z, length ∝ |z|)...")
-    _draw_action_overlay(
-        vid_np, z_per_chunk, frames_per_latent=4, npb=npb,
-        label_action_dims=ACTION_DIMS,
-    )
+    # ----- Overlay arrows + dial + label per frame -----
+    frames_per_chunk = npb * 4
+    log.info("rendering v14 motion overlay (grid arrows + dial)...")
+    for t in range(T):
+        chunk_idx = min(t // frames_per_chunk, n_chunks - 1)
+        ride_lo = (chunk_lo + chunk_idx) * npb * 4
+        ride_hi = ride_lo + frames_per_chunk
+        draw_motion_overlay(
+            vid_np[t], motion_chunks[chunk_idx], mag_scale=args.mag_scale,
+        )
+        draw_latent_dial(vid_np[t], z_per_chunk[chunk_idx])
+        draw_chunk_label(
+            vid_np[t], chunk_idx + chunk_lo,
+            ride_lo, ride_hi, z_per_chunk[chunk_idx],
+        )
 
-    # ----- Save mp4 -----
     out_dir = Path(args.out_dir)
-    out_path = out_dir / f"motion_overlay_{zpath.stem}_s{args.start:05d}_n{args.n_latents:04d}.mp4"
+    out_path = (
+        out_dir
+        / f"motion_overlay_v14_{zpath.stem}_s{args.start:05d}_n{args.n_latents:04d}.mp4"
+    )
     log.info("encoding mp4 -> %s", out_path)
     _frames_to_mp4(vid_np, out_path, fps=args.fps)
     log.info("DONE. open %s", out_path)

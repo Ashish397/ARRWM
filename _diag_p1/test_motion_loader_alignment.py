@@ -131,7 +131,10 @@ def main() -> None:
         _fail(f"motion.npy missing at {motion_path}")
     motion = np.load(motion_path, mmap_mode="r")
     n_motion_chunks = int(motion.shape[0])
-    motion_capped = n_motion_chunks * _LATENTS_PER_MOTION_CHUNK
+    fps = float(attrs.get("fps", 20.0))
+    action_start_sec = float(attrs.get("action_start_sec", 0.0))
+    chunk_offset = max(0, int(round((action_start_sec - 0.8) * fps / 12.0)))
+    motion_capped = max(0, n_motion_chunks - chunk_offset) * _LATENTS_PER_MOTION_CHUNK
     n_after_head_drop = max(0, zarr_n_latents - _LATENT_HEAD_DROP)
     expected_n_lat = min(n_after_head_drop, motion_capped)
 
