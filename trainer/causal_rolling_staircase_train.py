@@ -70,6 +70,109 @@ def _ride_metadata_collate(batch: List[dict]) -> List[dict]:
     return batch
 
 
+def _load_ride_tensors_cpu_part(
+    dataset: ZarrRideDataset,
+    meta: dict,
+    *,
+    max_frames: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """CPU-side ride load: zarr disk read of latents + motion .npy +
+    prompt_embeds tensor. Skips the ss_vae forward (GPU work) and the
+    .to(device) H2D transfers — those go in ``_finalize_ride_to_gpu``.
+
+    Safe to call from a worker thread (no CUDA work, no GIL hot-spots
+    inside the dataset's ss_vae path). Used by the action-forcing
+    trainer's prefetch executor to overlap disk I/O of the next ride
+    with the current step's compute.
+    """
+    zarr_path = meta["zarr_path"]
+    n_latent_frames = int(meta["n_latent_frames"])
+    if max_frames is not None:
+        n_latent_frames = min(n_latent_frames, int(max_frames))
+    if n_latent_frames <= 0:
+        return None
+
+    try:
+        latents_cpu = ZarrRideDataset.load_latent_chunk(
+            zarr_path, 0, n_latent_frames,
+        )
+    except Exception as e:
+        logging.warning("load_latent_chunk failed for %s: %s", zarr_path, e)
+        return None
+
+    prompt_embeds = meta["prompt_embeds"]
+    if not isinstance(prompt_embeds, torch.Tensor):
+        prompt_embeds = torch.tensor(prompt_embeds)
+    if prompt_embeds.dim() == 2:
+        prompt_embeds = prompt_embeds.unsqueeze(0)
+
+    # Per-latent-frame motion magnitude (CPU numpy → CPU tensor).
+    motion_mag: Optional[torch.Tensor] = None
+    mag_loader = getattr(dataset, "load_motion_magnitudes", None)
+    if mag_loader is not None:
+        try:
+            mag_np = mag_loader(zarr_path, n_latent_frames)
+            motion_mag = torch.from_numpy(mag_np)
+        except Exception as e:
+            logging.warning(
+                "load_motion_magnitudes failed for %s: %s — offset "
+                "picker will fall back to uniform sampling for this ride",
+                zarr_path, e,
+            )
+
+    return {
+        "zarr_path": zarr_path,
+        "n_latent_frames": n_latent_frames,
+        "latents_cpu": latents_cpu,                # [T, C, H, W] CPU
+        "prompt_embeds_cpu": prompt_embeds,        # [1, L, C_txt] CPU
+        "motion_mag": motion_mag,                  # [T] float32 CPU or None
+    }
+
+
+def _finalize_ride_to_gpu(
+    cpu_part: Dict[str, Any],
+    dataset: ZarrRideDataset,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    action_dims: Optional[List[int]] = None,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Main-thread GPU-finishing of a CPU-prefetched ride: ss_vae encode
+    of z_actions on the dataset's ss_vae device + H2D copy of
+    latents/z_actions/prompt_embeds onto the trainer device.
+
+    Must be called from the main thread (default CUDA stream) so the
+    ss_vae forward doesn't contend with the trainer's own forward.
+    """
+    zarr_path = cpu_part["zarr_path"]
+    n_latent_frames = cpu_part["n_latent_frames"]
+
+    try:
+        resolved = zarr_path
+        if resolved not in dataset._attrs_by_path:  # pylint: disable=protected-access
+            resolved = str(Path(zarr_path).resolve())
+        z_actions = dataset.encode_z_actions_window(
+            resolved, n_latent_frames, 0, n_latent_frames,
+        )
+    except Exception as e:
+        logging.warning("encode_z_actions_window failed for %s: %s", zarr_path, e)
+        return None
+
+    if action_dims is not None:
+        z_actions = z_actions[..., action_dims]
+
+    latents_cpu: torch.Tensor = cpu_part["latents_cpu"]
+    prompt_embeds_cpu: torch.Tensor = cpu_part["prompt_embeds_cpu"]
+    return {
+        "latents": latents_cpu.unsqueeze(0).to(device=device, dtype=dtype),         # [1, T, C, H, W]
+        "z_actions": z_actions.unsqueeze(0).to(device=device, dtype=dtype),         # [1, T, action_dim]
+        "prompt_embeds": prompt_embeds_cpu.to(device=device, dtype=dtype),          # [1, L, C_txt]
+        "zarr_path": zarr_path,
+        "n_latent_frames": n_latent_frames,
+        "motion_mag": cpu_part["motion_mag"],                                       # [T] float32 CPU, or None
+    }
+
+
 def _load_ride_tensors(
     dataset: ZarrRideDataset,
     meta: dict,
@@ -79,66 +182,18 @@ def _load_ride_tensors(
     action_dims: Optional[List[int]] = None,
     max_frames: Optional[int] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """Load (latents, z_actions, prompt_embeds) for one ride."""
-    zarr_path = meta["zarr_path"]
-    n_latent_frames = int(meta["n_latent_frames"])
-    if max_frames is not None:
-        n_latent_frames = min(n_latent_frames, int(max_frames))
-    if n_latent_frames <= 0:
+    """Synchronous full ride load: CPU disk read + GPU finalize. Kept
+    as the single-call entry point used by the existing rolling
+    staircase trainer; the action-forcing trainer overrides this with
+    a prefetched two-phase pipeline (see
+    ``_load_ride_tensors_cpu_part`` + ``_finalize_ride_to_gpu``).
+    """
+    cpu_part = _load_ride_tensors_cpu_part(dataset, meta, max_frames=max_frames)
+    if cpu_part is None:
         return None
-
-    try:
-        latents = ZarrRideDataset.load_latent_chunk(zarr_path, 0, n_latent_frames)
-    except Exception as e:
-        logging.warning("load_latent_chunk failed for %s: %s", zarr_path, e)
-        return None
-
-    try:
-        resolved = zarr_path
-        if resolved not in dataset._attrs_by_path:  # pylint: disable=protected-access
-            resolved = str(Path(zarr_path).resolve())
-        z_actions = dataset.encode_z_actions_window(resolved, n_latent_frames, 0, n_latent_frames)
-    except Exception as e:
-        logging.warning("encode_z_actions_window failed for %s: %s", zarr_path, e)
-        return None
-
-    if action_dims is not None:
-        z_actions = z_actions[..., action_dims]
-
-    prompt_embeds = meta["prompt_embeds"]
-    if not isinstance(prompt_embeds, torch.Tensor):
-        prompt_embeds = torch.tensor(prompt_embeds)
-    if prompt_embeds.dim() == 2:
-        prompt_embeds = prompt_embeds.unsqueeze(0)
-
-    # Per-latent-frame motion magnitude (mean |dx,dy| over the 100-grid
-    # points, mean-pooled across the 4 video frames per latent frame).
-    # Used by the action-forcing trainer's offset picker to bias rollout
-    # starts toward windows that actually contain motion. Best-effort:
-    # if the dataset doesn't expose this method (older code paths) or
-    # the motion file is missing, we leave it as None and the trainer
-    # falls back to uniform offset sampling.
-    motion_mag: Optional[torch.Tensor] = None
-    loader = getattr(dataset, "load_motion_magnitudes", None)
-    if loader is not None:
-        try:
-            mag_np = loader(zarr_path, n_latent_frames)
-            motion_mag = torch.from_numpy(mag_np)  # CPU; trainer reads w/ numpy
-        except Exception as e:
-            logging.warning(
-                "load_motion_magnitudes failed for %s: %s — offset "
-                "picker will fall back to uniform sampling for this ride",
-                zarr_path, e,
-            )
-
-    return {
-        "latents": latents.unsqueeze(0).to(device=device, dtype=dtype),            # [1, T, C, H, W]
-        "z_actions": z_actions.unsqueeze(0).to(device=device, dtype=dtype),        # [1, T, action_dim]
-        "prompt_embeds": prompt_embeds.to(device=device, dtype=dtype),             # [1, L, C_txt]
-        "zarr_path": zarr_path,
-        "n_latent_frames": n_latent_frames,
-        "motion_mag": motion_mag,                                                   # [T] float32 CPU, or None
-    }
+    return _finalize_ride_to_gpu(
+        cpu_part, dataset, device, dtype, action_dims=action_dims,
+    )
 
 
 # ---------------------------------------------------------------------------

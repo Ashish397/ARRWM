@@ -173,7 +173,11 @@ action_conditioning_mode: both
 # no GT past frame 21).
 min_ride_frames: 69
 max_rides: null
-max_ride_frames: 510
+# Sized to fit ``cf_dmdctx + streaming_max_length`` + slack for the
+# motion-aware offset ``s``. Under K=1-per-step the prefetch executor
+# holds one ride's CPU tensors ahead of the active ride, so this also
+# bounds the prefetch RAM footprint (~250 MB / ride at fp16 latents).
+max_ride_frames: 1200
 
 # Curriculum: shortest valid first.
 sort_rides_by_length: null
@@ -295,35 +299,28 @@ rollout_frames: null
 # Set ``mae_extension_threshold: null`` to disable the extension loop
 # entirely; ``baseline_last_chunk_mae`` / ``last_chunk_mae`` will
 # still be logged (extensions just don't fire). Set
-# ``mae_extension_max_extra_chunks: 0`` for the same effect with
-# threshold left set (e.g. for an A/B that toggles only the loop
-# while keeping the baseline metric on).
+# MAE-reset gate: if the per-rank avg MAE on the just-trained 21-frame
+# window crosses this threshold, mark the ride for reset on the NEXT
+# step. Set to ``null`` to disable extension entirely (use the legacy
+# per-chunk path).
 mae_extension_threshold: 0.5
-mae_extension_max_extra_chunks: 13
 
-# Slide-and-train policy. Both modes break on the first above-threshold
-# chunk and run the per-window aux / GAN / SC-DMD step on it.
-#   "last":  ORIGINAL behaviour. Below-threshold chunks rolled before
-#            the crossing are DISCARDED. One DMD backward per ride.
-#   "every": Below-threshold chunks rolled before the crossing are
-#            ALSO trained on (inline ``no_sync`` DMD gen + critic
-#            backwards). Total K_local = below-threshold count + 1
-#            (the crossing chunk). Every loss in the per-ride window
-#            (DMD gen, DMD critic, aux gen, GAN gen, SC-DMD) is scaled
-#            by ``1/(K_local + train_norm_constant)`` so longer rides
-#            don't outweigh short ones in the optim ledger.
-train_on: every
+# Per-rank cap on chunks rolled before forced ride reset (= a hard
+# upper bound on max_total_rollout_frames per ride). At
+# streaming_force_new_frame_chunks=6 + npb=3 + chunk_size=21:
+# max reachable per ride = 21 + 59 × 18 = 1083 latent frames.
+# Renamed from the legacy ``mae_extension_max_extra_chunks``.
+max_rolls_per_ride: 60
 
-# Per-ride loss-scale denominator offset for ``train_on=every``. The
-# scale is ``1/(K_local + train_norm_constant)`` where K_local is the
-# per-ride trained-chunk count (= below-threshold chunks + 1 for the
-# crossing chunk). Larger constant ⇒ shorter rides get less signal,
-# longer rides get less variance. With train_norm_constant=1:
-#   K=1  → 1/2   (short ride: 0.50 × full)
-#   K=2  → 1/3
-#   K=3  → 1/4
-#   K=10 → 1/11  (long/hard ride: K/(K+1) ≈ 0.91 × full DMD signal)
-train_norm_constant: 1.0
+# When True, ``_streaming_step`` does a per-step rank-0 broadcast of
+# a single exit-rung index and pins every rank to it via
+# ``generate_next_chunk(force_exit_step=...)``. Use this for variance-
+# reduction experiments that want all ranks to denoise at the same
+# rung. Default False — under K=1-per-step the inner pipeline's
+# ``generate_and_sync_list(sync=True)`` already broadcasts once per
+# call on every rank (matched count → safe), so the outer broadcast
+# is redundant.
+force_exit_step_enabled: false
 
 model_kwargs:
   timestep_shift: 5.0
@@ -631,7 +628,12 @@ warp_denoising_step: false
 # Streaming-mode (LongLive persistent KV-cache + variable-length chunks).
 # FUNDAMENTAL: ON by default for Phase-1 action-forcing DMD.
 streaming_mode: true
-streaming_max_length: 500
+# Per-rank rolling-window cap. Must be >= max reachable per ride
+# (= chunk_size + (max_rolls_per_ride - 1) * num_chunks_roll_forward * npb
+# = 21 + 59 * 18 = 1083) so the rolling-window cap doesn't kick in
+# before ``max_rolls_per_ride``. Snapped to a multiple of npb=3 by
+# the trainer.
+streaming_max_length: 1100
 
 # Slide-and-train stride: each generate_next_chunk slide advances the
 # 21-frame window forward by num_chunks_roll_forward * num_frame_per_block
