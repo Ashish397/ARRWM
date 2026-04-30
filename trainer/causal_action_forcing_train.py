@@ -1845,35 +1845,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             return
 
-        # Render the action overlay (best-effort, never raises).
+        # Render the action overlay (best-effort, never raises). The
+        # ``index_overlay`` indices (when supplied) are drawn in the
+        # same pass — top-left "zarr_lat=N motion=M" text per frame so
+        # we don't iterate the video twice.
         if action_overlay is not None:
             try:
                 npb = int(getattr(self.config, "num_frame_per_block", 3))
+                _zarr_lo = None
+                _mco = None
+                if index_overlay is not None:
+                    _zarr_lo, _mco, _ = index_overlay
                 self._draw_action_overlay(
                     vid_np, action_overlay, frames_per_latent=4, npb=npb,
+                    zarr_lat_lo=_zarr_lo, motion_chunk_offset=_mco,
                 )
             except Exception as exc:
                 logging.warning(
                     "[ActionForcing] action overlay failed at step=%d "
-                    "(name=%s): %s", step, name, exc,
-                )
-
-        # Per-frame zarr-latent + motion.npy chunk annotations
-        # (best-effort, never raises). Top-left text overlay so it
-        # doesn't collide with the action-bar strip at the bottom.
-        if index_overlay is not None:
-            try:
-                zarr_lat_lo, motion_chunk_offset, idx_npb = index_overlay
-                self._draw_index_overlay(
-                    vid_np,
-                    zarr_lat_lo=zarr_lat_lo,
-                    motion_chunk_offset=motion_chunk_offset,
-                    npb=idx_npb,
-                    frames_per_latent=4,
-                )
-            except Exception as exc:
-                logging.warning(
-                    "[ActionForcing] index overlay failed at step=%d "
                     "(name=%s): %s", step, name, exc,
                 )
 
@@ -1955,6 +1944,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         action_overlay,
         frames_per_latent: int = 4,
         npb: int = 3,
+        zarr_lat_lo: Optional[int] = None,
+        motion_chunk_offset: Optional[int] = None,
     ) -> None:
         """Draw per-chunk action bars at the bottom of every frame.
 
@@ -2010,6 +2001,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         vid_np[:, -strip_h:, :, :] = vid_np[:, -strip_h:, :, :] // 4
 
         frames_per_chunk = npb * frames_per_latent
+        # cv2 needs a contiguous frame buffer; if the caller passed in
+        # a transposed (= non-contiguous) ``vid_np`` we use a per-frame
+        # contiguous copy and write it back.
+        cv2 = None
+        do_index = (
+            zarr_lat_lo is not None and motion_chunk_offset is not None
+        )
+        if do_index:
+            try:
+                import cv2 as _cv2
+                cv2 = _cv2
+            except Exception:
+                cv2 = None
         for t in range(T):
             chunk_idx = min(t // frames_per_chunk, n_chunks - 1)
             z = z_per_chunk[chunk_idx]
@@ -2031,55 +2035,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     vid_np[t, y0:y1, cx - length:cx, 1] = 0
                     vid_np[t, y0:y1, cx - length:cx, 2] = 255
 
-    @staticmethod
-    def _draw_index_overlay(
-        vid_np: np.ndarray,
-        zarr_lat_lo: int,
-        motion_chunk_offset: int,
-        npb: int = 3,
-        frames_per_latent: int = 4,
-    ) -> None:
-        """Draw per-frame "zarr_lat=N motion=M" text in the top-left
-        corner. Maps:
-          * video frame t  -> dataset latent  zarr_lat_lo + (t // 4)
-          * dataset latent k -> motion.npy chunk
-              motion_chunk_offset + (k // npb)
-        See utils/zarr_dataset.py:_motion_chunk_offset for the offset
-        definition (= round((action_start_sec - 0.8) * fps / 12)).
+            # Per-frame zarr-latent + motion.npy chunk annotation
+            # (top-left). Mapping: video frame t -> dataset latent
+            # zarr_lat_lo + (t // frames_per_latent); dataset latent k
+            # -> motion.npy chunk motion_chunk_offset + (k // npb).
+            if cv2 is not None:
+                zarr_lat = int(zarr_lat_lo) + (t // frames_per_latent)
+                motion_chunk = int(motion_chunk_offset) + (zarr_lat // npb)
+                # Dim a 20-px top strip for readability.
+                vid_np[t, :20, :, :] = vid_np[t, :20, :, :] // 4
+                frame = np.ascontiguousarray(vid_np[t])
+                cv2.putText(
+                    frame,
+                    f"zarr_lat={zarr_lat} motion={motion_chunk}",
+                    (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                vid_np[t] = frame
 
-        ``vid_np``: ``[T_video, H, W, 3]`` uint8, edited in place.
-        Sub-millisecond per video — uses cv2.putText, single small
-        rectangle of pixels touched per frame.
-        """
-        if vid_np.ndim != 4:
-            return
-        try:
-            import cv2
-        except Exception:
-            return
-        T, H, W, _ = vid_np.shape
-        if T == 0 or H < 24 or W < 64:
-            return
-        npb = max(1, int(npb))
-        frames_per_latent = max(1, int(frames_per_latent))
-        # Background strip behind the text for readability across
-        # bright frames. 4-px top pad + ~16-px text strip = 20-px.
-        strip_h = 20
-        for t in range(T):
-            zarr_lat = int(zarr_lat_lo) + (t // frames_per_latent)
-            motion_chunk = int(motion_chunk_offset) + (zarr_lat // npb)
-            # Dim the strip first.
-            vid_np[t, :strip_h, :, :] = vid_np[t, :strip_h, :, :] // 4
-            cv2.putText(
-                vid_np[t],
-                f"zarr_lat={zarr_lat} motion={motion_chunk}",
-                (4, 14),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
 
     # ------------------------------------------------------------------
     # Step-scheduled local_attn_size (KV cache window) helpers.
@@ -2581,20 +2558,49 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
         t_train_ms = (time.monotonic() - t_train_start) * 1000.0
 
-        # ---- Stage 5: per-rank reset decision for NEXT step ----------
-        crossed_mae = avg_mae == avg_mae and avg_mae > threshold
-        hit_cap = self._chunks_in_current_ride >= max_rolls
-        exhausted = not self.model.can_generate_more()
-        should_reset = crossed_mae or hit_cap or exhausted
+        # ---- Stage 5: reset decision for NEXT step ------------------
+        # The reset decision MUST be lockstep across ranks. If even one
+        # rank resets, that rank's NEXT step opens a fresh sequence —
+        # which fires an anchor forward inside ``setup_sequence``
+        # (= one extra ``generate_chunk_with_cache`` call → one extra
+        # ``generate_and_sync_list`` broadcast). Other ranks that DIDN'T
+        # reset would skip the anchor's broadcast, leaving NCCL
+        # collectives mismatched in op-count → user-code-paired
+        # broadcasts cross-pair the wrong calls → hang on the next
+        # mismatched-size collective. We MAX-reduce the per-rank
+        # ``should_reset`` flag so ANY-rank-reset triggers ALL-ranks-
+        # reset; the cost is a few resets that some ranks didn't
+        # individually need (their ride state still gets thrown away),
+        # but that's strictly better than a hang.
+        local_crossed_mae = bool(avg_mae == avg_mae and avg_mae > threshold)
+        local_hit_cap = self._chunks_in_current_ride >= max_rolls
+        local_exhausted = not self.model.can_generate_more()
+        local_should_reset = (
+            local_crossed_mae or local_hit_cap or local_exhausted
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            flag_t = torch.tensor(
+                [1 if local_should_reset else 0],
+                device=self.device, dtype=torch.long,
+            )
+            dist.all_reduce(flag_t, op=dist.ReduceOp.MAX)
+            should_reset = bool(int(flag_t.item()))
+        else:
+            should_reset = local_should_reset
 
+        # Telemetry: log the LOCAL reason so we can tell apart "this
+        # rank actually wanted to reset" from "peer triggered the
+        # reset". Both ranks always agree on the boolean now.
         if should_reset:
             out["streaming_did_reset"] = 1.0
-            if crossed_mae:
+            if local_crossed_mae:
                 out["streaming_reset_reason_mae"] = 1.0
-            elif hit_cap:
+            elif local_hit_cap:
                 out["streaming_reset_reason_cap"] = 1.0
-            else:
+            elif local_exhausted:
                 out["streaming_reset_reason_end_of_ride"] = 1.0
+            else:
+                out["streaming_reset_reason_peer_triggered"] = 1.0
             self.model.reset_streaming_state()
         else:
             out["streaming_did_reset"] = 0.0
