@@ -379,8 +379,8 @@ model_kwargs:
   #           timescales into the same N-frame budget.
   #           To enable: set ``sink_size: N``, ``sink_type: ema``, and
   #           list exactly N alphas in ``sink_ema_alphas``.
-  sink_type: sink
-  sink_ema_alphas: null
+  # sink_type: sink
+  # sink_ema_alphas: null
 
 i2v: false
 text_pre_encoded: true
