@@ -1107,6 +1107,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         # diagnosed (the stash itself is just a tensor
                         # detach, sub-millisecond).
                         _overlay = None
+                        # Per-frame zarr-latent + motion.npy chunk
+                        # annotations on clean_x_real ONLY (other views
+                        # are pred_*/clean_x_fake which don't trace back
+                        # to a specific ride window). The model stashes
+                        # the absolute zarr-latent index of clean_x_real's
+                        # first frame plus the ride's motion-chunk offset
+                        # in ``compute_generator_loss_streaming``.
+                        _index_overlay = None
+                        if _key == "clean_x_real":
+                            _zarr_lo = eval_latents.get("clean_x_real_zarr_lat_lo")
+                            _mco = eval_latents.get("clean_x_real_motion_chunk_offset")
+                            _ovl_npb = eval_latents.get("clean_x_real_npb")
+                            if (
+                                _zarr_lo is not None
+                                and _mco is not None
+                                and _ovl_npb is not None
+                            ):
+                                _index_overlay = (
+                                    int(_zarr_lo),
+                                    int(_mco),
+                                    int(_ovl_npb),
+                                )
                         try:
                             self._log_pred_image_video(
                                 _t_lat.to(torch.float32),
@@ -1114,6 +1136,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                 name=_name,
                                 caption_suffix=_cap,
                                 action_overlay=_overlay,
+                                index_overlay=_index_overlay,
                             )
                         except Exception as _exc:
                             logging.warning(
@@ -1384,10 +1407,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         zero = torch.tensor(0.0, device=pred_x0.device, dtype=pred_x0.dtype)
 
         teacher_z_8d = self._compute_teacher_z_per_slot(pred_x0.detach())
-        if teacher_z_8d is None:
-            # Teacher unavailable (cotracker / VAE / ss_vae failure) —
-            # silently skip aux loss this iter; the failure was already
-            # counted by the parent ``_compute_teacher_z_per_slot``.
+        # Cross-rank coordination: if ANY rank's teacher failed
+        # (cotracker / VAE / ss_vae error on this rank's pred_x0), ALL
+        # ranks must skip aux training together. Otherwise the failing
+        # ranks early-return without firing the action_critic_ddp
+        # forward (a DDP-wrapped collective) while the succeeding ranks
+        # do — NCCL collective op count mismatches across ranks → hang.
+        # This is the action-critic analog of the slide-loop's
+        # any_crossed MAX-reduce.
+        local_unavailable = 1 if teacher_z_8d is None else 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            flag_t = torch.tensor(
+                [local_unavailable], device=pred_x0.device, dtype=torch.long,
+            )
+            dist.all_reduce(flag_t, op=dist.ReduceOp.MAX)
+            any_unavailable = bool(int(flag_t.item()))
+        else:
+            any_unavailable = bool(local_unavailable)
+        if any_unavailable:
+            # Skip aux loss on every rank this iter; teacher_unavailable
+            # log fires only on the rank(s) that actually failed.
             logs = {
                 "train/critic_z_loss": 0.0,
                 "train/critic_loss": 0.0,
@@ -1398,7 +1437,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/teacher_z2_mean": 0.0,
                 "train/teacher_z7_mean": 0.0,
                 "train/z_guidance_scale": 0.0,
-                "train/teacher_unavailable": 1.0,
+                "train/teacher_unavailable": float(local_unavailable),
             }
             return zero, logs, None
         teacher_z_8d = teacher_z_8d[:, :n_chunks]
@@ -1725,6 +1764,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         name: str = "pred_image",
         caption_suffix: str = "",
         action_overlay: Optional[torch.Tensor] = None,
+        index_overlay: Optional[Tuple[int, int, int]] = None,
     ) -> None:
         """Decode ``pred_image`` (a student rollout in latent space) to
         pixel mp4 bytes and upload to wandb under ``sample/<name>``.
@@ -1757,6 +1797,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         boundaries. Used only for ``clean_x_real`` to cross-check the
         bidir scorer's clean-half action conditioning against the
         decoded pixel content.
+
+        ``index_overlay``: optional
+        ``(zarr_lat_lo, motion_chunk_offset, npb)`` tuple. When supplied,
+        per-frame text "zarr_lat=N motion=M" is rendered top-left of
+        each video frame so the displayed content can be cross-checked
+        against the dataset (which exact zarr latent index this frame
+        corresponds to, and which motion.npy chunk encodes its motion).
+        Used only for ``clean_x_real`` (the only view that traces back
+        to a specific ride window). For video frame ``t`` (after VAE
+        4× temporal upsampling): zarr_lat = zarr_lat_lo + (t // 4),
+        motion_chunk = motion_chunk_offset + (zarr_lat // npb).
         """
         if pred_image is None or pred_image.numel() == 0:
             return
@@ -1804,6 +1855,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             except Exception as exc:
                 logging.warning(
                     "[ActionForcing] action overlay failed at step=%d "
+                    "(name=%s): %s", step, name, exc,
+                )
+
+        # Per-frame zarr-latent + motion.npy chunk annotations
+        # (best-effort, never raises). Top-left text overlay so it
+        # doesn't collide with the action-bar strip at the bottom.
+        if index_overlay is not None:
+            try:
+                zarr_lat_lo, motion_chunk_offset, idx_npb = index_overlay
+                self._draw_index_overlay(
+                    vid_np,
+                    zarr_lat_lo=zarr_lat_lo,
+                    motion_chunk_offset=motion_chunk_offset,
+                    npb=idx_npb,
+                    frames_per_latent=4,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "[ActionForcing] index overlay failed at step=%d "
                     "(name=%s): %s", step, name, exc,
                 )
 
@@ -1960,6 +2030,56 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     vid_np[t, y0:y1, cx - length:cx, 0] = 0
                     vid_np[t, y0:y1, cx - length:cx, 1] = 0
                     vid_np[t, y0:y1, cx - length:cx, 2] = 255
+
+    @staticmethod
+    def _draw_index_overlay(
+        vid_np: np.ndarray,
+        zarr_lat_lo: int,
+        motion_chunk_offset: int,
+        npb: int = 3,
+        frames_per_latent: int = 4,
+    ) -> None:
+        """Draw per-frame "zarr_lat=N motion=M" text in the top-left
+        corner. Maps:
+          * video frame t  -> dataset latent  zarr_lat_lo + (t // 4)
+          * dataset latent k -> motion.npy chunk
+              motion_chunk_offset + (k // npb)
+        See utils/zarr_dataset.py:_motion_chunk_offset for the offset
+        definition (= round((action_start_sec - 0.8) * fps / 12)).
+
+        ``vid_np``: ``[T_video, H, W, 3]`` uint8, edited in place.
+        Sub-millisecond per video — uses cv2.putText, single small
+        rectangle of pixels touched per frame.
+        """
+        if vid_np.ndim != 4:
+            return
+        try:
+            import cv2
+        except Exception:
+            return
+        T, H, W, _ = vid_np.shape
+        if T == 0 or H < 24 or W < 64:
+            return
+        npb = max(1, int(npb))
+        frames_per_latent = max(1, int(frames_per_latent))
+        # Background strip behind the text for readability across
+        # bright frames. 4-px top pad + ~16-px text strip = 20-px.
+        strip_h = 20
+        for t in range(T):
+            zarr_lat = int(zarr_lat_lo) + (t // frames_per_latent)
+            motion_chunk = int(motion_chunk_offset) + (zarr_lat // npb)
+            # Dim the strip first.
+            vid_np[t, :strip_h, :, :] = vid_np[t, :strip_h, :, :] // 4
+            cv2.putText(
+                vid_np[t],
+                f"zarr_lat={zarr_lat} motion={motion_chunk}",
+                (4, 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     # ------------------------------------------------------------------
     # Step-scheduled local_attn_size (KV cache window) helpers.
@@ -2760,6 +2880,32 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             prompt_embeds=prompt_embeds,
             max_length=int(actual_cap),
         )
+
+        # Telemetry: stash the ride's absolute zarr-latent offset ``s``
+        # and its motion.npy chunk offset on streaming_state so the
+        # clean_x_real video logger can render frame-level "zarr_lat=N
+        # motion_chunk=M" annotations alongside the action-bar overlay.
+        # Read motion offset from the dataset's per-ride attrs cache so
+        # we don't re-open the zarr (zero disk I/O).
+        zarr_path = ride.get("zarr_path", "")
+        motion_chunk_offset = 0
+        attrs_by_path = getattr(self.dataset, "_attrs_by_path", None)
+        if attrs_by_path is not None and zarr_path in attrs_by_path:
+            try:
+                from utils.zarr_dataset import _motion_chunk_offset
+                motion_chunk_offset = int(
+                    _motion_chunk_offset(attrs_by_path[zarr_path])
+                )
+            except Exception as _exc:  # pragma: no cover
+                logging.warning(
+                    "[ActionForcing] motion-chunk offset lookup failed "
+                    "for %s: %s — falling back to 0",
+                    zarr_path, _exc,
+                )
+        if self.model.streaming_state is not None:
+            self.model.streaming_state["ride_offset_s"] = int(s)
+            self.model.streaming_state["zarr_path"] = zarr_path
+            self.model.streaming_state["motion_chunk_offset"] = motion_chunk_offset
         return True
 
     def _fwdbwd_streaming_step(

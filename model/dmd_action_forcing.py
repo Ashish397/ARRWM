@@ -2773,6 +2773,22 @@ class ActionForcingDMD(SelfForcingModel):
                 stash["clean_z_actions"] = (
                     ride_actions_eval[:, clean_lo_ride:clean_hi_ride].detach()
                 )
+                # Per-frame index annotations for the clean_x_real video
+                # logger. ``ride_offset_s`` and ``motion_chunk_offset``
+                # were stashed by the trainer at setup time. The clean
+                # window's first dataset latent has zarr-absolute index
+                #     ride_offset_s + clean_lo_ride
+                # and lives in motion.npy at chunk
+                #     motion_chunk_offset + (zarr_lat_idx // npb)
+                # See utils/zarr_dataset.py:_motion_chunk_offset for the
+                # offset definition.
+                ride_offset_s = int(s.get("ride_offset_s", 0))
+                motion_chunk_offset = int(s.get("motion_chunk_offset", 0))
+                stash["clean_x_real_zarr_lat_lo"] = (
+                    ride_offset_s + clean_lo_ride
+                )
+                stash["clean_x_real_motion_chunk_offset"] = motion_chunk_offset
+                stash["clean_x_real_npb"] = shift_eval
 
         # Teacher-freeze gt_target for streaming: GT video at the
         # chunk's noisy_x positions (= ride_latents_window indices
