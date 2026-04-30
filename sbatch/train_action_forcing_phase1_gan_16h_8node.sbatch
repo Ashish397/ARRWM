@@ -1,19 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-gan-10h-8node
+#SBATCH --job-name=action-forcing-phase1-gan-16h-8node
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=10:00:00
+#SBATCH --time=16:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-1 Action-Forcing DMD — DEFAULTS + R3GAN, 1 node x 4 GPUs, 10h.
+# Phase-1 Action-Forcing DMD — DEFAULTS + R3GAN, 1 node x 4 GPUs, 16h.
 #
-# Same as ``train_action_forcing_phase1_10h.sbatch`` (pure DMD, no
+# Same as ``train_action_forcing_phase1_16h.sbatch`` (pure DMD, no
 # aux losses, no SC-DMD) PLUS the R3GAN discriminator (RpGAN + R1 +
 # R2 zero-centered grad penalty) trained on GT vs student latent
 # video. Recipe ported verbatim from action_forcing_phase1_aux_gan.yaml,
@@ -36,8 +36,8 @@
 # gan_disc_base_channels=64 on H100.
 #
 # Sister sbatches:
-#   sbatch/train_action_forcing_phase1_10h.sbatch        (defaults only)
-#   sbatch/train_action_forcing_phase1_scdmd_10h.sbatch  (defaults + SC-DMD)
+#   sbatch/train_action_forcing_phase1_16h.sbatch        (defaults only)
+#   sbatch/train_action_forcing_phase1_scdmd_16h.sbatch  (defaults + SC-DMD)
 # =====================================================================
 
 set -e -o pipefail
@@ -45,7 +45,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_10h
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_16h
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -73,7 +73,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-1 Action-Forcing DMD + R3GAN (1 node x 4 GPUs, 10h) on $(date)"
+echo "Starting Phase-1 Action-Forcing DMD + R3GAN (1 node x 4 GPUs, 16h) on $(date)"
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \

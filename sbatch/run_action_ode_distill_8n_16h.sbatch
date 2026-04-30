@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=action_ode_distill_10h
+#SBATCH --job-name=action_ode_distill_16h
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --gpus-per-node=4
-#SBATCH --time=10:00:00
+#SBATCH --time=16:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err

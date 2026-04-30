@@ -1,37 +1,50 @@
 #!/bin/bash
-#SBATCH --job-name=phase1-collapse-2x2-10h
-#SBATCH --nodes=1
+#SBATCH --job-name=action-forcing-phase1-scdmd-16h-8node
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=10:00:00
+#SBATCH --time=16:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-1 Rolling-Staircase DMD, 1 node x 4 GPUs, 10h.
+# Phase-1 Action-Forcing DMD — DEFAULTS + SC-DMD, 1 node x 4 GPUs, 16h.
 #
-# Same as train_phase1_collapse_gate_10h.sbatch, but 2x2 live geometry:
-#   num_live_slots=2, passes_per_step=2  (NS*P=4, same ODE budget as 4x1).
-#   action_decay_per_slot=[1.0, 0.5]    (length must match num_live_slots).
-# Base YAML is unchanged: denoising_step_list [1000, 625, 500, 312.5] is
-# already length 4 = NSP; collapse gate, curriculum, and other knobs match
-# configs/longlive_phase1_rolling_staircase.yaml.
+# Same as ``train_action_forcing_phase1_16h.sbatch`` (pure DMD, no
+# aux losses, no R3GAN) PLUS the Salt SC-DMD semigroup defect
+# regularizer:
 #
-# This sbatch sets paths (log_dir, wandb_dir), wandb run_name (distinct
-# from train_phase1_collapse_gate_10h.sbatch), plus the slot overrides
-# above; everything else stays in the YAML.
+#     L_SC = E[ || Ψ_θ^{ts→te}(x_ts) - Ψ_θ^{tm→te}(Ψ_θ^{ts→tm}(x_ts)) ||² ]
 #
+# enforcing local consistency of the student's velocity field across
+# composed denoising paths. Recipe ported verbatim from
+# action_forcing_phase1_aux_scdmd.yaml, minus the action critic /
+# motion teacher (this config is "defaults + SC-DMD only", clean A/B
+# vs the defaults sbatch).
+#
+# SC-DMD knobs (configs/action_forcing_phase1_scdmd.yaml):
+#   * sc_dmd_loss_weight: 0.05      (~5% of DMD's typical magnitude)
+#   * sc_dmd_warmup_steps: 500      (linear ramp 0 → sc_dmd_loss_weight)
+#
+# Implementation: ``ActionForcingDMD.sc_dmd_loss`` — one chunk-0
+# forward with a fresh ``num_frame_per_block``-frame KV cache, two
+# extra DiT forwards on a 3-frame chunk per gen step. Cost: ~1-2%
+# extra wallclock end-to-end vs the defaults sbatch.
+#
+# Sister sbatches:
+#   sbatch/train_action_forcing_phase1_16h.sbatch      (defaults only)
+#   sbatch/train_action_forcing_phase1_gan_16h.sbatch  (defaults + R3GAN)
 # =====================================================================
 
 set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-CONFIG=configs/longlive_phase1_rolling_staircase.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/phase1_collapse_gate_10h_2x2
+CONFIG=configs/action_forcing_phase1_scdmd.yaml
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_scdmd_16h
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -59,8 +72,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Geometry: 2x2 (num_live_slots=2, passes_per_step=2)"
-echo "Starting phase-1 collapse-gate + curriculum DMD 2x2 (1 node, 4 GPUs, 10h) on $(date)"
+echo "Starting Phase-1 Action-Forcing DMD + SC-DMD (1 node x 4 GPUs, 16h) on $(date)"
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -77,14 +89,11 @@ srun torchrun \
   --rdzv_id=$SLURM_JOB_ID \
   --rdzv_backend=c10d \
   --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-  trainer/causal_rolling_staircase_train.py \
+  trainer/causal_action_forcing_train.py \
   --config $CONFIG \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    run_name=phase1_collapse_2x2_j${SLURM_JOB_ID} \
-    num_live_slots=2 \
-    passes_per_step=2 \
-    'action_decay_per_slot=[1.0,0.5]'
+    run_name=action_forcing_phase1_scdmd_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

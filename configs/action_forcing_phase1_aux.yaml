@@ -116,7 +116,7 @@ mae_extension_max_extra_chunks: 13
 model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 21
-  sink_size: 3
+  sink_size: 0
 
 i2v: false
 text_pre_encoded: true

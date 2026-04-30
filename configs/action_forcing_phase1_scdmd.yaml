@@ -336,7 +336,7 @@ model_kwargs:
   # ``sink_size: 3`` becomes LIVE during the trailing gradient-active
   # forwards — the algebra above flips because local_end exceeds
   # max_attention_size and the windowing actually slices.
-  sink_size: 3
+  sink_size: 0
 
 i2v: false
 text_pre_encoded: true

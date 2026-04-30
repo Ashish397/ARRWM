@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=phase1-collapse-gate-10h
+#SBATCH --job-name=phase1-collapse-gate-16h
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=10:00:00
+#SBATCH --time=16:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-1 Rolling-Staircase DMD, 1 node x 4 GPUs, 10h.
+# Phase-1 Rolling-Staircase DMD, 1 node x 4 GPUs, 16h.
 #
 # COLLAPSE-GATE + CURRICULUM variant. The student gets adaptively-
 # truncated rollouts: every rolling step the batcher computes a
@@ -58,7 +58,7 @@ CONFIG=configs/longlive_phase1_rolling_staircase.yaml
 #   we pass in here. So checkpoints, vis, and the auto-resume scan land
 #   under ``${LOGDIR}/phase1_rolling_staircase/`` -- NOT directly in
 #   ``${LOGDIR}``. Set up to match because some tooling globs there.
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/phase1_collapse_gate_10h
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/phase1_collapse_gate_16h
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -91,7 +91,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting phase-1 collapse-gate + curriculum DMD (1 node, 4 GPUs, 10h) on $(date)"
+echo "Starting phase-1 collapse-gate + curriculum DMD (1 node, 4 GPUs, 16h) on $(date)"
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -104,7 +104,7 @@ echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
 # Minimal overrides: paths + wandb run name. Everything else experiment-
 # shaped stays in the YAML. run_name is phase1_4x1_* vs train_phase1_
-# collapse_gate_2x2_10h.sbatch (phase1_2x2_*).
+# collapse_gate_2x2_16h.sbatch (phase1_2x2_*).
 srun torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \

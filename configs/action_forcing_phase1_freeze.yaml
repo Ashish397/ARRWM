@@ -130,7 +130,7 @@ motion_ride_min_mean: 3.0        # ~upper-half cutoff; see action_forcing_phase1
 
 # Step-scheduled local_attn_size — see action_forcing_phase1.yaml for
 # rationale. Default: 21 frames early, 42 from step 400.
-local_attn_size_schedule: [[0, 21], [400, 42]]
+local_attn_size_schedule: [[0, 21], [1000, 42]]
 
 action_dims: [2, 7]
 raw_action_dim: 2
@@ -357,7 +357,30 @@ model_kwargs:
   # ``sink_size: 3`` becomes LIVE during the trailing gradient-active
   # forwards — the algebra above flips because local_end exceeds
   # max_attention_size and the windowing actually slices.
-  sink_size: 3
+  sink_size: 0
+
+  # Sink update mechanism. Two modes:
+  #   "sink"  (DEFAULT): the first ``sink_size`` frames are pinned in the
+  #           rolling KV cache as a frozen attention anchor (LongLive
+  #           convention). With ``sink_size: 0`` (current default) this
+  #           is a no-op and the sink machinery is dormant.
+  #   "ema":  FRAME-LEVEL parallel EMA. Each of the ``sink_size`` sink
+  #           frames is a parallel summary slot at its own decay rate.
+  #           When the rolling cache evicts a chunk we mean-pool the
+  #           eviction across the temporal axis (npb evicted frames →
+  #           1 frame of pooled K/V), then update every sink frame i:
+  #               sink_frame_i ← α_i · sink_frame_i + (1 − α_i) · pooled
+  #           in PARALLEL. Higher α ⇒ longer-memory; lower α ⇒ shorter.
+  #           Frame-level (vs chunk-level) avoids the within-chunk
+  #           redundancy of the LongLive/Reward-Forcing convention:
+  #           with ``num_frame_per_block: 3``, three frames in a chunk
+  #           are highly correlated, so storing the same EMA in three
+  #           positions wastes slots. Frame-level packs N distinct
+  #           timescales into the same N-frame budget.
+  #           To enable: set ``sink_size: N``, ``sink_type: ema``, and
+  #           list exactly N alphas in ``sink_ema_alphas``.
+  sink_type: sink
+  sink_ema_alphas: null
 
 i2v: false
 text_pre_encoded: true

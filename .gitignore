@@ -61,6 +61,7 @@ Causal_Forcing/
 causal_forcing/
 RollingForcing/
 LongLive/
+Reward-Forcing/
 # Editor / tooling scratch.
 *.bak
 papers/
