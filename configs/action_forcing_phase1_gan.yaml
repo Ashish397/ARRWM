@@ -298,7 +298,7 @@ rollout_frames: null
 # ``mae_extension_max_extra_chunks: 0`` for the same effect with
 # threshold left set (e.g. for an A/B that toggles only the loop
 # while keeping the baseline metric on).
-mae_extension_threshold: 0.5
+mae_extension_threshold: 0.4
 mae_extension_max_extra_chunks: 13
 
 model_kwargs:
@@ -437,7 +437,7 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 3.0
+real_guidance_scale: 0.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)

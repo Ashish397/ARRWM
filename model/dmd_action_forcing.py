@@ -398,6 +398,37 @@ class ActionForcingDMD(SelfForcingModel):
         self.ts_schedule = bool(getattr(args, "ts_schedule", True))
         self.ts_schedule_max = bool(getattr(args, "ts_schedule_max", False))
         self.min_score_timestep = int(getattr(args, "min_score_timestep", 0))
+        # ``cfg_uncond_keep_actions``: when True, ``build_action_conditional``
+        # zeros only ``prompt_embeds`` in the unconditional dict and
+        # keeps the action streams (``_action_modulation`` /
+        # ``_action_tokens``) identical to the conditional. This makes
+        # the uncond forward IN-DISTRIBUTION for v14 LoRA scorers (which
+        # were trained with non-zero action conditioning everywhere)
+        # while still letting CFG sharpen the prompt direction. Default
+        # False = legacy zero-everything CF/Wan convention.
+        self.cfg_uncond_keep_actions = bool(
+            getattr(args, "cfg_uncond_keep_actions", False)
+        )
+        # ``dmd_debug_step``: when set, the eval-stash branch of
+        # ``_compute_kl_grad`` runs an EXTRA pair of real_score /
+        # fake_score forwards at this fixed timestep and overwrites
+        # the stash's pred_real / pred_fake / dmd_timestep / noisy_input
+        # entries with the debug-t versions. Diagnostic only — does NOT
+        # affect the training-time DMD gradient (random t still used
+        # for ``grad = pred_fake - pred_real``).
+        # Accepted values:
+        #   * int → fixed timestep in [0, num_train_timestep)
+        #   * "last_rung" → last entry of ``denoising_step_list`` (= the
+        #     rollout's last-rung exit timestep)
+        #   * None / unset → no override, eval stash uses random t
+        _dbg = getattr(args, "dmd_debug_step", None)
+        if _dbg is None or (isinstance(_dbg, str) and _dbg.lower() in {"none", "off", ""}):
+            self.dmd_debug_step = None
+        elif isinstance(_dbg, str) and _dbg.lower() in {"last_rung", "last", "last_step"}:
+            _dsl = list(getattr(args, "denoising_step_list", []) or [])
+            self.dmd_debug_step = int(round(float(_dsl[-1]))) if _dsl else None
+        else:
+            self.dmd_debug_step = int(_dbg)
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
@@ -901,11 +932,26 @@ class ActionForcingDMD(SelfForcingModel):
             "_action_modulation": modulation,
             "_action_tokens": action_tokens,
         }
-        unconditional = {
-            "prompt_embeds": torch.zeros_like(prompt_embeds),
-            "_action_modulation": torch.zeros_like(modulation),
-            "_action_tokens": torch.zeros_like(action_tokens),
-        }
+        # ``cfg_uncond_keep_actions``: if True, the unconditional dict
+        # ZEROS ONLY the prompt embeds and KEEPS the action streams
+        # identical to the conditional. This avoids feeding the v14
+        # LoRA-merged real_score an OOD all-zero action input (the LoRA
+        # was trained with non-zero action conditioning everywhere; an
+        # all-zero uncond pushes pred_real toward an OOD direction when
+        # CFG extrapolates ``cond + scale*(cond - uncond)``). Default
+        # False = legacy zero-everything CF/Wan convention.
+        if getattr(self, "cfg_uncond_keep_actions", False):
+            unconditional = {
+                "prompt_embeds": torch.zeros_like(prompt_embeds),
+                "_action_modulation": modulation,
+                "_action_tokens": action_tokens,
+            }
+        else:
+            unconditional = {
+                "prompt_embeds": torch.zeros_like(prompt_embeds),
+                "_action_modulation": torch.zeros_like(modulation),
+                "_action_tokens": torch.zeros_like(action_tokens),
+            }
         return conditional, unconditional
 
     # ------------------------------------------------------------------
@@ -1243,6 +1289,67 @@ class ActionForcingDMD(SelfForcingModel):
             stash["pred_fake"] = pred_fake_image.detach()
             stash["dmd_timestep"] = int(timestep.flatten()[0].item())
             stash["noisy_input"] = noisy_image_or_video.detach()
+
+            # ``dmd_debug_step`` override: re-noise the student's x0 at
+            # a FIXED timestep (e.g. the last denoising rung) and re-run
+            # the scorers, overwriting the stash entries with the
+            # debug-t versions. Lets the eval video render pred_real /
+            # pred_fake at a low, comparable noise level instead of the
+            # randomly-sampled training-time ``timestep`` which is
+            # often very high. Training-time DMD gradient above is
+            # untouched.
+            if self.dmd_debug_step is not None:
+                with torch.no_grad():
+                    debug_t_int = int(self.dmd_debug_step)
+                    debug_t = torch.full_like(timestep, debug_t_int)
+                    debug_noise = torch.randn_like(estimated_clean_image_or_video)
+                    _b, _f = estimated_clean_image_or_video.shape[:2]
+                    noisy_debug = self.scheduler.add_noise(
+                        estimated_clean_image_or_video.flatten(0, 1),
+                        debug_noise.flatten(0, 1),
+                        debug_t.flatten(0, 1),
+                    ).unflatten(0, (_b, _f))
+
+                    _, dbg_pred_fake_cond = self.fake_score(
+                        noisy_image_or_video=noisy_debug,
+                        conditional_dict=conditional_dict,
+                        timestep=debug_t,
+                        **tf_kwargs_fake,
+                    )
+                    if self.fake_guidance_scale != 0.0:
+                        _, dbg_pred_fake_uncond = self.fake_score(
+                            noisy_image_or_video=noisy_debug,
+                            conditional_dict=unconditional_dict,
+                            timestep=debug_t,
+                            **tf_kwargs_fake,
+                        )
+                        dbg_pred_fake = dbg_pred_fake_cond + (
+                            dbg_pred_fake_cond - dbg_pred_fake_uncond
+                        ) * self.fake_guidance_scale
+                    else:
+                        dbg_pred_fake = dbg_pred_fake_cond
+
+                    _, dbg_pred_real_cond = self.real_score(
+                        noisy_image_or_video=noisy_debug,
+                        conditional_dict=conditional_dict,
+                        timestep=debug_t,
+                        **tf_kwargs_real,
+                    )
+                    _, dbg_pred_real_uncond = self.real_score(
+                        noisy_image_or_video=noisy_debug,
+                        conditional_dict=unconditional_dict,
+                        timestep=debug_t,
+                        **tf_kwargs_real,
+                    )
+                    dbg_pred_real = dbg_pred_real_cond + (
+                        dbg_pred_real_cond - dbg_pred_real_uncond
+                    ) * self.real_guidance_scale
+
+                    stash["pred_real"] = dbg_pred_real.detach()
+                    stash["pred_fake"] = dbg_pred_fake.detach()
+                    stash["dmd_timestep"] = debug_t_int
+                    stash["noisy_input"] = noisy_debug.detach()
+                    stash["dmd_debug_step_active"] = 1.0
         # Return the detached teacher prediction alongside the
         # gradient so the caller can run teacher-freeze detection
         # (per-frame MAE vs GT) without duplicating the real_score
@@ -2789,6 +2896,16 @@ class ActionForcingDMD(SelfForcingModel):
                 )
                 stash["clean_x_real_motion_chunk_offset"] = motion_chunk_offset
                 stash["clean_x_real_npb"] = shift_eval
+                # Ride identifier (zarr file stem) so the overlay can
+                # show which underlying recording the clean_x_real
+                # window came from. Stem only — full paths are too long
+                # to fit on a video frame.
+                _zarr_path = s.get("zarr_path", "")
+                if _zarr_path:
+                    from pathlib import Path as _Path
+                    stash["clean_x_real_zarr_name"] = _Path(_zarr_path).stem
+                else:
+                    stash["clean_x_real_zarr_name"] = ""
 
         # Teacher-freeze gt_target for streaming: GT video at the
         # chunk's noisy_x positions (= ride_latents_window indices

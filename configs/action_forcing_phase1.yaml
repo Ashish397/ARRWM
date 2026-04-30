@@ -82,8 +82,8 @@ run_name: action_forcing_phase1
 
 seed: 0
 mixed_precision: true
-log_interval: 15
-checkpoint_interval: 50
+log_interval: 10
+checkpoint_interval: 30
 max_steps: 10000
 max_grad_norm: 10.0
 auto_resume: true
@@ -163,7 +163,7 @@ motion_ride_min_mean: 3.0
 # memory at 8 fps) for the first ~400 iters, then 42 frames (~5 s) for
 # the rest. With ~35 s/iter early and ~50-55 s late, a 10 h run lands
 # around 1.8-2.0 epochs over the 905-ride motion-filtered pool.
-local_attn_size_schedule: [[0, 21], [400, 42]]
+local_attn_size_schedule: [[0, 21], [250, 30], [500, 42], [750, 54], [1000, 66]]
 
 action_dims: [2, 7]
 raw_action_dim: 2
@@ -331,7 +331,7 @@ rollout_frames: null
 # ``mae_extension_max_extra_chunks: 0`` for the same effect with
 # threshold left set (e.g. for an A/B that toggles only the loop
 # while keeping the baseline metric on).
-mae_extension_threshold: 0.5
+mae_extension_threshold: 0.4
 mae_extension_max_extra_chunks: 13
 
 model_kwargs:
@@ -470,7 +470,7 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 3.0
+real_guidance_scale: 0.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)

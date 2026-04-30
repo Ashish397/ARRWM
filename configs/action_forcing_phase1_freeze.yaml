@@ -303,7 +303,7 @@ rollout_frames: null
 # window crosses this threshold, mark the ride for reset on the NEXT
 # step. Set to ``null`` to disable extension entirely (use the legacy
 # per-chunk path).
-mae_extension_threshold: 0.5
+mae_extension_threshold: 0.4
 
 # Per-rank cap on chunks rolled before forced ride reset (= a hard
 # upper bound on max_total_rollout_frames per ride). At
@@ -491,7 +491,7 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 1.0
+real_guidance_scale: 0.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)

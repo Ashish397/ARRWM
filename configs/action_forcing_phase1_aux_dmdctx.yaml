@@ -219,7 +219,7 @@ v14_lora:
 # DMD + critic loss config (verbatim from AUX)
 # ---------------------------------------------------------------------------
 dmd_loss_weight: 1.0
-real_guidance_scale: 3.0
+real_guidance_scale: 0.0
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 ts_schedule: false

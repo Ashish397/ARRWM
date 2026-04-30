@@ -1099,14 +1099,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         _t_lat = eval_latents.get(_key)
                         if _t_lat is None or not torch.is_tensor(_t_lat):
                             continue
-                        # Action overlay disabled — see commit notes;
-                        # the per-frame numpy bar render was suspected
-                        # of stalling the gen-loss tail. Leave the
-                        # ``clean_z_actions`` stash in the model so we
-                        # can re-enable here once the slowdown is
-                        # diagnosed (the stash itself is just a tensor
-                        # detach, sub-millisecond).
-                        _overlay = None
+                        # Overlay enabled on ``clean_x_real`` only. The
+                        # consolidated ``_draw_action_overlay`` draws
+                        # both the action z-value bars (from
+                        # ``clean_z_actions``) and the per-frame
+                        # zarr_lat / motion-chunk text (from
+                        # ``index_overlay``) in a single pass; both
+                        # are gated on action_overlay being non-None,
+                        # so passing the clean_z tensor turns the
+                        # whole overlay on.
+                        _clean_z_overlay = eval_latents.get(
+                            "clean_z_actions"
+                        )
+                        _overlay = (
+                            _clean_z_overlay
+                            if _key == "clean_x_real"
+                            and torch.is_tensor(_clean_z_overlay)
+                            else None
+                        )
                         # Per-frame zarr-latent + motion.npy chunk
                         # annotations on clean_x_real ONLY (other views
                         # are pred_*/clean_x_fake which don't trace back
@@ -1119,6 +1129,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             _zarr_lo = eval_latents.get("clean_x_real_zarr_lat_lo")
                             _mco = eval_latents.get("clean_x_real_motion_chunk_offset")
                             _ovl_npb = eval_latents.get("clean_x_real_npb")
+                            _zarr_name = eval_latents.get(
+                                "clean_x_real_zarr_name", ""
+                            )
                             if (
                                 _zarr_lo is not None
                                 and _mco is not None
@@ -1128,6 +1141,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                     int(_zarr_lo),
                                     int(_mco),
                                     int(_ovl_npb),
+                                    str(_zarr_name),
                                 )
                         try:
                             self._log_pred_image_video(
@@ -1854,11 +1868,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 npb = int(getattr(self.config, "num_frame_per_block", 3))
                 _zarr_lo = None
                 _mco = None
+                _zarr_name = ""
                 if index_overlay is not None:
-                    _zarr_lo, _mco, _ = index_overlay
+                    # 4-tuple from the trainer call site:
+                    # (zarr_lat_lo, motion_chunk_offset, npb, zarr_name).
+                    # Tolerate the legacy 3-tuple shape too.
+                    if len(index_overlay) == 4:
+                        _zarr_lo, _mco, _, _zarr_name = index_overlay
+                    else:
+                        _zarr_lo, _mco, _ = index_overlay
                 self._draw_action_overlay(
                     vid_np, action_overlay, frames_per_latent=4, npb=npb,
                     zarr_lat_lo=_zarr_lo, motion_chunk_offset=_mco,
+                    zarr_name=_zarr_name,
                 )
             except Exception as exc:
                 logging.warning(
@@ -1946,6 +1968,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         npb: int = 3,
         zarr_lat_lo: Optional[int] = None,
         motion_chunk_offset: Optional[int] = None,
+        zarr_name: str = "",
     ) -> None:
         """Draw per-chunk action bars at the bottom of every frame.
 
@@ -2039,16 +2062,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # (top-left). Mapping: video frame t -> dataset latent
             # zarr_lat_lo + (t // frames_per_latent); dataset latent k
             # -> motion.npy chunk motion_chunk_offset + (k // npb).
+            # Two stacked lines:
+            #   line 1 (y=14): zarr file stem (which recording)
+            #   line 2 (y=28): per-frame indices into that recording
             if cv2 is not None:
                 zarr_lat = int(zarr_lat_lo) + (t // frames_per_latent)
                 motion_chunk = int(motion_chunk_offset) + (zarr_lat // npb)
-                # Dim a 20-px top strip for readability.
-                vid_np[t, :20, :, :] = vid_np[t, :20, :, :] // 4
+                strip_top_h = 34 if zarr_name else 20
+                vid_np[t, :strip_top_h, :, :] = vid_np[t, :strip_top_h, :, :] // 4
                 frame = np.ascontiguousarray(vid_np[t])
+                if zarr_name:
+                    cv2.putText(
+                        frame,
+                        f"zarr={zarr_name}",
+                        (4, 14),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                _idx_y = 28 if zarr_name else 14
                 cv2.putText(
                     frame,
-                    f"zarr_lat={zarr_lat} motion={motion_chunk}",
-                    (4, 14),
+                    f"lat={zarr_lat} motion={motion_chunk}",
+                    (4, _idx_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.42,
                     (255, 255, 255),
