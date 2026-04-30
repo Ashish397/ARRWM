@@ -1009,8 +1009,29 @@ class RollingStaircaseDMDTrainer:
             # cast convs' inputs back to bf16 and clash with the VAE's
             # fp32 bias tensors ("Input type BFloat16 and bias type Float
             # should be the same").
+            #
+            # Dummy-prepend trick: Wan VAE temporal-decodes the FIRST
+            # input latent as the head (= 1 pixel frame), and every
+            # subsequent latent as 4 pixel frames. Without compensation
+            # we'd get T_pix = 1 + 4*(F-1) and per-slot pixel frames
+            # would be NON-uniform (slot 0 has 9, others have 12 with
+            # npb=3). The downstream slot pooling assumes uniform
+            # ``T_pix // n_slots`` per slot — without the trick, slots
+            # progressively leak motion from adjacent slots and the
+            # last slot becomes mostly the previous slot's content.
+            #
+            # Fix (mirrors ``utils/eval_sanity_chain.py:402-403``,
+            # ``utils/evaluate_models.py``, ``utils/multislot_vis.py``,
+            # and the in-tree video logger at
+            # ``causal_action_forcing_train.py:1832-1834``): prepend a
+            # dummy latent so the head-expansion lands on the dummy,
+            # decode F+1 latents to 1 + 4*F pixel frames, then drop
+            # the dummy's pixel frame. Result: T_pix = 4 * F, exactly
+            # 4 pixel frames per latent → 4*npb = 12 per slot, uniform.
             with torch.amp.autocast(device_type="cuda", enabled=False):
-                pixels = vae.decode_to_pixel(x0.float())  # [B, T_pix, 3, H, W]
+                dummy = x0[:, 0:1].float()
+                lat_wd = torch.cat([dummy, x0.float()], dim=1)
+                pixels = vae.decode_to_pixel(lat_wd)[:, 1:, ...]  # [B, 4*F, 3, H, W]
         except Exception as e:
             logging.warning("action teacher: VAE decode failed: %s", e)
             _record_failure("vae_decode")
@@ -1021,17 +1042,14 @@ class RollingStaircaseDMDTrainer:
         grid_size = 10
         N = grid_size ** 2
 
-        # We want 1 motion vector PER SLOT (== npb pixel frames per slot).
-        # Decode gives T_pix = K * F_lat for some VAE upsample ratio K. We
-        # pool motion vectors across each slot's pixel frames.
+        # 1 motion vector PER SLOT. With the dummy-prepend trick above,
+        # ``T_pix == 4 * F_total`` exactly, so each slot gets a clean
+        # ``4 * npb`` pixel frames (= 12 with npb=3). No head-latent
+        # asymmetry, no motion leak across slot boundaries.
         T_pix = video.shape[1]
         if T_pix < 2:
             _record_failure("too_few_pixel_frames")
             return None
-        # Frames-per-slot at the pixel resolution. Typical VAE: K=4 → 45
-        # pixel frames for 12 latent frames (first 3 from the first latent,
-        # then 4 per subsequent latent). We approximate with a uniform
-        # split T_pix // n_slots; remainder at the tail is discarded.
         per_slot_pix = T_pix // n_slots
         if per_slot_pix < 2:
             _record_failure("per_slot_pix_too_small")
