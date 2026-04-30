@@ -228,6 +228,76 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     inner_vae.to(device=self.device)
         self.model = model
 
+        # ------------------------------------------------------------------
+        # torch.compile (optional, config-gated). Wraps the inner DiT
+        # modules BEFORE DDP wrap so the compiled graph is what DDP all-
+        # reduces over. Real_score is frozen but still benefits from
+        # compile on its inference forward (3 forwards per gen step).
+        #
+        # Knobs:
+        #   ``compile_dit`` (bool, default False): turn it on.
+        #   ``compile_dit_mode`` (str, default "default"): forwarded to
+        #       ``torch.compile(mode=...)``. ``"default"`` is safe with
+        #       in-place KV cache mutation; ``"reduce-overhead"`` enables
+        #       CUDA graphs which conflict with our cache writes — avoid.
+        #   ``compile_dit_dynamic`` (bool|None, default None = auto):
+        #       ``True`` = single shape-polymorphic graph (faster compile,
+        #       slightly slower runtime); ``False`` = recompile per shape
+        #       (slower compile, fastest runtime). ``None`` lets dynamo
+        #       decide. Our forward shapes vary (rolling 3-frame chunks
+        #       vs scoring 21-frame chunks vs local_attn_size_schedule
+        #       transitions), so the dynamo cache holds multiple graphs.
+        #   ``compile_dynamo_cache_size`` (int, default 64): bump
+        #       dynamo's cache_size_limit so shape-polymorphic recompiles
+        #       don't fall back to eager.
+        #
+        # First-step wallclock spikes during compilation (~minutes for
+        # a 1.3B DiT). Steady-state speedup is typically 1.5-3x on the
+        # forward path. If compile fails (dynamic-shape edge case, DDP
+        # interaction), we log + fall back to eager — training continues.
+        # ------------------------------------------------------------------
+        compile_dit = bool(getattr(self.config, "compile_dit", False))
+        if compile_dit:
+            compile_mode = str(getattr(self.config, "compile_dit_mode", "default"))
+            compile_dynamic = getattr(self.config, "compile_dit_dynamic", None)
+            cache_size_limit = int(getattr(self.config, "compile_dynamo_cache_size", 64))
+            try:
+                import torch._dynamo as _dynamo
+                _dynamo.config.cache_size_limit = max(
+                    int(_dynamo.config.cache_size_limit), cache_size_limit,
+                )
+            except Exception as _exc:
+                logging.warning(
+                    "[ActionForcing] torch._dynamo cache_size_limit bump failed: %s",
+                    _exc,
+                )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] torch.compile DiT modules (mode=%s, "
+                    "dynamic=%s, dynamo_cache=%d). First-step wallclock will "
+                    "spike during compilation; steady-state should be ~1.5-3x "
+                    "faster on forward.",
+                    compile_mode, compile_dynamic, cache_size_limit,
+                )
+            try:
+                model.generator.model = torch.compile(
+                    model.generator.model,
+                    mode=compile_mode, dynamic=compile_dynamic,
+                )
+                model.fake_score.model = torch.compile(
+                    model.fake_score.model,
+                    mode=compile_mode, dynamic=compile_dynamic,
+                )
+                model.real_score.model = torch.compile(
+                    model.real_score.model,
+                    mode=compile_mode, dynamic=compile_dynamic,
+                )
+            except Exception as _exc:
+                logging.warning(
+                    "[ActionForcing] torch.compile failed (%s) — falling "
+                    "back to eager.", _exc,
+                )
+
         debug_fup = bool(getattr(self.config, "debug_find_unused_parameters", False))
         self.generator_ddp: Optional[DDP] = None
         self.fake_score_ddp: Optional[DDP] = None
@@ -2401,6 +2471,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             return cpu_part
         return None
 
+    @staticmethod
+    def _is_dataloader_worker_death(exc: BaseException) -> bool:
+        """Heuristic: did this exception come from a PyTorch DataLoader
+        fork-worker dying mid-fetch? PyTorch's signal_handling raises a
+        plain ``RuntimeError`` whose message starts with "DataLoader
+        worker (pid …) exited unexpectedly". The traceback may surface
+        the error wherever the SIGCHLD handler fires (often deep inside
+        a flash-attention forward), so we match on the message rather
+        than on the call stack.
+        """
+        if not isinstance(exc, RuntimeError):
+            return False
+        msg = str(exc)
+        return (
+            "DataLoader worker" in msg
+            and "exited unexpectedly" in msg
+        )
+
     def _consume_or_load_ride(
         self, rollout_frames: int,
     ) -> Tuple[Optional[Dict[str, torch.Tensor]], float]:
@@ -2418,10 +2506,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         a clear ``TimeoutError`` instead of letting the trainer hang
         silently until NCCL collectives time out 30 min later.
 
+        Defensive single-retry on PyTorch DataLoader fork-worker death.
+        With ``num_workers > 0`` the dataloader fork-spawns CPU helpers
+        that occasionally die from transient OS signals (page-cache
+        eviction race during zarr open, NFS hiccup, OOM-killer drive-by,
+        ...). PyTorch surfaces those deaths as
+        ``RuntimeError("DataLoader worker (pid N) exited unexpectedly")``
+        from the next ``next(self._ride_iter)`` call. We catch that
+        once, recreate ``self._ride_iter`` (which tears down the dead
+        worker pool and forks fresh), kick a new prefetch, and retry.
+        Cap at one retry so a persistent fault still surfaces.
+
         ``self._ride_iter`` is touched ONLY by the executor's worker
         thread, never from the main thread directly — even on cold
         start (we ``submit`` and immediately await rather than calling
         ``next()`` ourselves) to preserve the single-writer invariant.
+        On retry, the iterator-reset itself runs on the main thread but
+        only AFTER the executor's task has already returned (raised),
+        so single-writer is preserved.
         """
         self._ensure_prefetch_executor()
         if self._prefetched_ride_future is None:
@@ -2438,6 +2540,46 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 f"deadlocked worker, or dataset code. Surfacing before "
                 f"NCCL collective timeouts produce a confusing error."
             ) from exc
+        except RuntimeError as exc:
+            if not self._is_dataloader_worker_death(exc):
+                raise
+            logging.warning(
+                "[ActionForcing] DataLoader worker died (transient "
+                "subprocess fault): %s. Recreating ride iterator and "
+                "retrying once.",
+                exc,
+            )
+            try:
+                self._ride_iter = self._fresh_ride_iter(self._epoch)
+            except Exception as reset_exc:  # pragma: no cover
+                logging.error(
+                    "[ActionForcing] Failed to recreate ride iterator "
+                    "after worker death: %s", reset_exc,
+                )
+                raise
+            self._kick_ride_prefetch_if_idle(rollout_frames)
+            retry_fut = self._prefetched_ride_future
+            self._prefetched_ride_future = None
+            try:
+                cpu_part = retry_fut.result(
+                    timeout=self._PREFETCH_FUTURE_TIMEOUT_S,
+                )
+            except FuturesTimeoutError as exc2:
+                raise TimeoutError(
+                    f"ride prefetch retry stalled for >"
+                    f"{self._PREFETCH_FUTURE_TIMEOUT_S:.0f}s after "
+                    f"DataLoader-worker recovery."
+                ) from exc2
+            except RuntimeError as exc2:
+                if self._is_dataloader_worker_death(exc2):
+                    raise RuntimeError(
+                        "DataLoader worker died TWICE in a row "
+                        "(after iterator recreation). This is no "
+                        "longer a transient fault — investigate "
+                        "dmesg, CPU RAM pressure, or a corrupted "
+                        "ride file."
+                    ) from exc2
+                raise
         wait_ms = (time.monotonic() - t0) * 1000.0
         if cpu_part is None:
             return None, wait_ms
