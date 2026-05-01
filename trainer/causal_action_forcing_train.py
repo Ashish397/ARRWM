@@ -321,6 +321,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
                 model.fake_score.model = self.fake_score_ddp  # type: ignore
 
+            # Online real_teacher: peft adapter is alive on
+            # model.real_score.model. Wrap with DDP using
+            # find_unused_parameters=True (peft only touches LoRA-target
+            # modules — non-LoRA layers see no gradient per step).
+            self.real_score_ddp: Optional[DDP] = None
+            if bool(getattr(self.config, "real_teacher_train_online", False)):
+                self.real_score_ddp = DDP(
+                    model.real_score.model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=True,
+                    broadcast_buffers=False,
+                )
+                model.real_score.model = self.real_score_ddp  # type: ignore
+        else:
+            self.real_score_ddp = None
+
         # ------------------------------------------------------------------
         # Auxiliary action critic (CF-parity ActionCritic, frozen teacher
         # supervised). The model's ``_build_action_aux_heads_compat``
@@ -861,6 +878,70 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.gan_updates_per_step,
                 )
 
+        # ------------------------------------------------------------------
+        # Online real_teacher (v14-LoRA flow training vs GT).
+        # ------------------------------------------------------------------
+        # Builds an AdamW over the LoRA params kept alive on
+        # ``model.real_score.model`` by ``_load_real_score_with_v14_lora``
+        # (which skipped ``merge_and_unload`` because the YAML flag
+        # ``real_teacher_train_online`` was True). Stays None when the
+        # flag is False.
+        self.real_teacher_optimizer: Optional[torch.optim.Optimizer] = None
+        self.real_teacher_train_online = bool(
+            getattr(cfg, "real_teacher_train_online", False)
+        )
+        if self.real_teacher_train_online:
+            rt_params = list(
+                getattr(self.model, "_real_teacher_trainable_params", []) or []
+            )
+            if not rt_params:
+                # Fallback: discover by `requires_grad`. Should never
+                # trigger if the model-side load went well, but a
+                # missing stash here means the LoRA wrap broke silently
+                # — fail loud.
+                rt_params = [
+                    p for p in self.model.real_score.model.parameters()
+                    if p.requires_grad
+                ]
+            if not rt_params:
+                raise RuntimeError(
+                    "real_teacher_train_online=True but real_score has "
+                    "no trainable params; check "
+                    "_load_real_score_with_v14_lora's online path."
+                )
+            rt_lr = float(getattr(cfg, "real_teacher_lr", 5.0e-05))
+            rt_betas = tuple(getattr(cfg, "real_teacher_betas", [0.9, 0.999]))
+            rt_eps = float(getattr(cfg, "real_teacher_eps", 1.0e-08))
+            rt_wd = float(getattr(cfg, "real_teacher_weight_decay", 0.01))
+            self.real_teacher_optimizer = torch.optim.AdamW(
+                rt_params,
+                lr=rt_lr,
+                betas=rt_betas,
+                eps=rt_eps,
+                weight_decay=rt_wd,
+            )
+            self.real_teacher_max_grad_norm = float(
+                getattr(cfg, "real_teacher_max_grad_norm", 1.0)
+            )
+            self.real_teacher_warmup_steps = int(
+                getattr(cfg, "real_teacher_warmup_steps", 200)
+            )
+            self._real_teacher_base_lr = rt_lr
+            if self.is_main_process:
+                n_params = sum(p.numel() for p in rt_params)
+                logging.info(
+                    "[ActionForcing] real_teacher optimizer built: "
+                    "AdamW lr=%.2e betas=%s wd=%.4f params=%.2fM "
+                    "(warmup_steps=%d, max_grad_norm=%.2f)",
+                    rt_lr, rt_betas, rt_wd, n_params / 1e6,
+                    self.real_teacher_warmup_steps,
+                    self.real_teacher_max_grad_norm,
+                )
+        else:
+            self.real_teacher_max_grad_norm = 1.0
+            self.real_teacher_warmup_steps = 0
+            self._real_teacher_base_lr = 0.0
+
     def _inner_dit_for_rope(self):
         """Return the bare DiT module under the (possibly DDP / LoRA)
         generator so ``infinity_rope.install()`` can clear any
@@ -1038,6 +1119,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.fake_optimizer.step()
                 self.fake_optimizer.zero_grad(set_to_none=True)
 
+            # ----- Online real_teacher: clip + step + zero -----
+            real_teacher_grad_norm_val = 0.0
+            if self.real_teacher_optimizer is not None:
+                rt_params_with_grad = [
+                    p for p in self.real_teacher_optimizer.param_groups[0]["params"]
+                    if p.grad is not None
+                ]
+                if rt_params_with_grad:
+                    # Linear LR warmup over the first
+                    # ``real_teacher_warmup_steps`` steps.
+                    if (
+                        self.real_teacher_warmup_steps > 0
+                        and self.step < self.real_teacher_warmup_steps
+                    ):
+                        warm_factor = (
+                            (self.step + 1) / self.real_teacher_warmup_steps
+                        )
+                        for pg in self.real_teacher_optimizer.param_groups:
+                            pg["lr"] = self._real_teacher_base_lr * warm_factor
+                    elif self.real_teacher_warmup_steps > 0:
+                        # Restore base LR once warmup completes (no-op
+                        # after first post-warmup step but harmless).
+                        for pg in self.real_teacher_optimizer.param_groups:
+                            pg["lr"] = self._real_teacher_base_lr
+                    rtgn = torch.nn.utils.clip_grad_norm_(
+                        rt_params_with_grad,
+                        max_norm=self.real_teacher_max_grad_norm,
+                    )
+                    real_teacher_grad_norm_val = (
+                        float(rtgn.item()) if torch.is_tensor(rtgn) else float(rtgn)
+                    )
+                    self.real_teacher_optimizer.step()
+                self.real_teacher_optimizer.zero_grad(set_to_none=True)
+
             self.step += 1
 
             # Mark wandb log as DUE if the cadence boundary just
@@ -1124,6 +1239,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         else float(gen_grad_norm)
                     )
                     log_payload["critic/grad_norm"] = fake_grad_norm_val
+                    # Online real_teacher (LoRA) gets the same treatment
+                    # as the gen/critic optimizers: log the post-clip
+                    # grad_norm and the warmup-aware effective LR. Both
+                    # are always-defined locals (init'd to 0.0 / read
+                    # off param_groups[0]["lr"] above) so the keys
+                    # appear every step regardless of whether the
+                    # optimizer fired this iter.
+                    log_payload["critic/real_teacher_grad_norm"] = real_teacher_grad_norm_val
+                    if self.real_teacher_optimizer is not None:
+                        log_payload["critic/real_teacher_lr"] = float(
+                            self.real_teacher_optimizer.param_groups[0]["lr"]
+                        )
                     if previous_time is not None:
                         log_payload["per_iter_time"] = time.time() - previous_time
                     try:
@@ -1160,8 +1287,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         if _t is not None
                         else ""
                     )
+                    # ``pred_real`` is the DMD-path teacher's x0 (frozen
+                    # merged-v14 in dual-teacher mode; the LoRA in
+                    # single-teacher mode). ``pred_real_lora`` is the
+                    # aux-pass LoRA teacher's x0 — only present when
+                    # dual-teacher is on (frozen pass + aux pass both
+                    # populate the stash). Operators get a side-by-
+                    # side comparison: the frozen oracle (DMD's
+                    # gradient source) vs the moving-target online
+                    # LoRA (aux pass's training target).
+                    _aux_t = eval_latents.get("aux_teacher_timestep")
+                    _aux_was_gt = eval_latents.get("aux_teacher_input_was_gt")
+                    _suffix_aux = (
+                        f"t={_aux_t} input={'GT' if _aux_was_gt else 'student'}"
+                        if _aux_t is not None
+                        else ""
+                    )
                     for _key, _name, _cap in (
                         ("pred_real", "pred_real", _suffix_real or ""),
+                        ("pred_real_lora", "pred_real_lora", _suffix_aux or ""),
                         ("pred_fake", "pred_fake", _suffix_real or ""),
                         ("clean_x_fake", "clean_x_fake", "fake_score conditioning"),
                         ("clean_x_real", "clean_x_real", f"real_score conditioning ({_ctx})"),
@@ -1273,7 +1417,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             return
         # Either the action critic OR the GAN may need state appended;
         # fast-path-skip if neither is active.
-        if not (self.action_critic_loss_active or self.gan_enabled):
+        if not (
+            self.action_critic_loss_active
+            or self.gan_enabled
+            or self.real_teacher_train_online
+        ):
             return
         path = self._checkpoint_path(self.step)
         if not os.path.exists(path):
@@ -1306,6 +1454,38 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if self.r3gan_optimizer is not None:
                 state["r3gan_optimizer"] = self.r3gan_optimizer.state_dict()
                 appended.append("r3gan_optimizer")
+        if self.real_teacher_train_online:
+            # FAIL-LOUD on save: silently dropping the LoRA state from
+            # the checkpoint pairs with the resume path's silent
+            # restart-from-warm-init to erase hours of online teacher
+            # training without operator notice. Better to crash the
+            # save and require investigation than to leave a
+            # checkpoint that quietly discards progress on the next
+            # resume. (action_critic / r3gan retain fail-soft because
+            # they are bootstrapped from fixed checkpoints; only the
+            # online-trained LoRA has this asymmetric risk profile.)
+            try:
+                from peft import get_peft_model_state_dict
+                rs_inner = self.model.real_score.model
+                if isinstance(rs_inner, DDP):
+                    rs_inner = rs_inner.module
+                state["real_teacher_lora"] = get_peft_model_state_dict(rs_inner)
+                appended.append("real_teacher_lora")
+            except Exception as exc:
+                raise RuntimeError(
+                    "[ActionForcing] real_teacher LoRA save failed: "
+                    f"{exc!r}. Refusing to silently drop trained LoRA "
+                    "state from the checkpoint — the next auto-resume "
+                    "would rewind the teacher to v14 warm-start without "
+                    "any operator-visible signal. Investigate the save "
+                    "failure (most likely a peft version mismatch or a "
+                    "DDP-wrap-shape issue on real_score.model) and rerun."
+                ) from exc
+            if self.real_teacher_optimizer is not None:
+                state["real_teacher_optimizer"] = (
+                    self.real_teacher_optimizer.state_dict()
+                )
+                appended.append("real_teacher_optimizer")
         if not appended:
             return
         torch.save(state, path)
@@ -1316,7 +1496,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
     def _maybe_resume(self) -> None:
         super()._maybe_resume()
-        if not (self.action_critic_loss_active or self.gan_enabled):
+        if not (
+            self.action_critic_loss_active
+            or self.gan_enabled
+            or self.real_teacher_train_online
+        ):
             return
         if not bool(getattr(self.config, "auto_resume", False)):
             return
@@ -1381,6 +1565,68 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             "resume: r3gan_optimizer load failed: %s. "
                             "Starting r3gan optim from fresh state.", exc,
                         )
+        if self.real_teacher_train_online:
+            # FAIL-LOUD on resume: silently rolling the LoRA back to
+            # v14 warm-start because the load errored — or because the
+            # checkpoint just doesn't contain it — would erase every
+            # step of online teacher training while the student
+            # KEPT its optimizer state. That asymmetric rewind is
+            # almost never what the operator wants. To force a fresh
+            # teacher start, delete the checkpoint or set
+            # auto_resume=False (which short-circuits this whole
+            # block above).
+            if "real_teacher_lora" not in state:
+                raise RuntimeError(
+                    "[ActionForcing] real_teacher_train_online=True but "
+                    f"the resume checkpoint at {path} does not contain "
+                    "'real_teacher_lora' state. This means either the "
+                    "previous run wasn't training the teacher (expected: "
+                    "the checkpoint predates this feature), or a save "
+                    "failed silently in an earlier step. To proceed from "
+                    "v14 warm-start instead of resuming, delete the "
+                    "checkpoint or set auto_resume=False."
+                )
+            try:
+                from peft import set_peft_model_state_dict
+                rs_inner = self.model.real_score.model
+                if isinstance(rs_inner, DDP):
+                    rs_inner = rs_inner.module
+                set_peft_model_state_dict(rs_inner, state["real_teacher_lora"])
+                if self.is_main_process:
+                    logging.info("resume: real_teacher LoRA state restored")
+            except Exception as exc:
+                raise RuntimeError(
+                    "[ActionForcing] real_teacher LoRA load failed: "
+                    f"{exc!r}. Refusing to silently restart from v14 "
+                    "warm-start — would discard every step of online "
+                    "teacher training. Investigate the checkpoint "
+                    "(likely a peft / config mismatch with the "
+                    "current LoRA setup) and rerun."
+                ) from exc
+            if self.real_teacher_optimizer is not None:
+                if "real_teacher_optimizer" not in state:
+                    raise RuntimeError(
+                        "[ActionForcing] real_teacher_optimizer is built "
+                        "but resume checkpoint lacks 'real_teacher_optimizer' "
+                        "state. Same reasoning as the LoRA-state check above: "
+                        "silently re-warming-up Adam moments + the LR "
+                        "schedule on a checkpoint past the warmup phase "
+                        "is almost never wanted."
+                    )
+                try:
+                    self.real_teacher_optimizer.load_state_dict(
+                        state["real_teacher_optimizer"]
+                    )
+                    if self.is_main_process:
+                        logging.info(
+                            "resume: real_teacher_optimizer state restored"
+                        )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "[ActionForcing] real_teacher_optimizer load "
+                        f"failed: {exc!r}. Refusing to silently start "
+                        "from fresh optimizer state."
+                    ) from exc
 
     # ------------------------------------------------------------------
     # Auxiliary action-critic losses (ported from
@@ -3344,6 +3590,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 for k, v in critic_log.items()
                 if not isinstance(v, dict)
             })
+
+            # ----- Online real_teacher step (riding shotgun with critic) -----
+            # Reuse the SAME chunk + info from the critic step so the
+            # streaming KV cache state is not advanced again. Backward
+            # is fully independent (gradient flows only through real_score
+            # LoRA params; chunk is detached inside
+            # compute_real_teacher_loss_streaming).
+            if (
+                self.real_teacher_train_online
+                and self.real_teacher_optimizer is not None
+            ):
+                rt_loss, rt_log = self.model.compute_real_teacher_loss_streaming(
+                    chunk, info,
+                )
+                # End-of-ride DDP-synced skip: when ANY rank can't
+                # build a gt_target this iter, ALL ranks skip the
+                # backward (otherwise the rank-local skip would hang
+                # DDP's AllReduce on the peer ranks). The model's
+                # ``compute_real_teacher_loss_streaming`` does the
+                # all_reduce internally and returns a no-grad zero
+                # plus the flag below. ``.backward()`` on a no-grad
+                # tensor would also raise — both reasons to gate.
+                if not rt_log.get(
+                    type(self.model).REAL_TEACHER_SKIP_KEY, 0.0,
+                ):
+                    rt_loss.backward()
+                merged["real_teacher_loss"] = float(rt_loss.detach().item())
+                merged.update({
+                    k: (float(v.detach().float().mean().item())
+                        if torch.is_tensor(v) else v)
+                    for k, v in rt_log.items()
+                    if not isinstance(v, dict)
+                })
+
             mae = float(critic_log.get("baseline_avg_rollout_mae", float("nan")))
             if (
                 self.collapse_mae_threshold is not None
@@ -3796,6 +4076,58 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # ------------------------------------------------------------------
 
 
+def _load_config_with_extends(path: str) -> "OmegaConf":
+    """Load a yaml config, recursively resolving a top-level
+    ``_extends: <path>`` directive.
+
+    Behavior:
+      * If the yaml has ``_extends: <other.yaml>`` at top level, the
+        extended file is loaded first (recursively) and the current
+        file's keys merge ON TOP via ``OmegaConf.merge``. This lets a
+        variant config carry only the deltas from a base.
+      * ``_extends`` is stripped from the final config so consumers
+        never see it.
+      * The path is resolved relative to the directory of the file
+        containing the directive (Hydra-style).
+      * Cycles are detected and raise.
+
+    Used by the action_forcing config family to collapse
+    near-identical 600-line yamls into a single base + thin overlays.
+    """
+    # ``stack`` tracks the active recursion path (push on entry, pop on
+    # exit). Catches actual cycles A->B->...->A without false-positive-
+    # ing on a future diamond pattern (A->B and A->C both extending D
+    # — D is touched twice along non-cyclic branches).
+    stack: list = []
+
+    def _load(p: str) -> "OmegaConf":
+        ap = os.path.abspath(p)
+        if ap in stack:
+            raise RuntimeError(
+                f"Circular _extends in config chain: "
+                f"{' -> '.join(stack + [ap])}"
+            )
+        stack.append(ap)
+        try:
+            cfg = OmegaConf.load(ap)
+            # ``_extends`` is optional and consumed here.
+            ext = None
+            if isinstance(cfg, type(OmegaConf.create({}))) and "_extends" in cfg:
+                ext = cfg["_extends"]
+                del cfg["_extends"]
+            if ext is None:
+                return cfg
+            ext_path = os.path.normpath(
+                os.path.join(os.path.dirname(ap), str(ext))
+            )
+            base = _load(ext_path)
+            return OmegaConf.merge(base, cfg)
+        finally:
+            stack.pop()
+
+    return _load(path)
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(
@@ -3805,12 +4137,12 @@ def main() -> None:
     parser.add_argument("--override", type=str, nargs="*", default=[])
     args = parser.parse_args()
 
+    base = _load_config_with_extends(args.config)
     if args.override:
-        base = OmegaConf.load(args.config)
         override = OmegaConf.from_dotlist(list(args.override))
         cfg = OmegaConf.merge(base, override)
     else:
-        cfg = OmegaConf.load(args.config)
+        cfg = base
 
     trainer = ActionForcingDMDTrainer(cfg)
     trainer.train()

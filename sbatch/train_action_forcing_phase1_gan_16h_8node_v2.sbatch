@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-gan-16h-v2
-#SBATCH --nodes=1
+#SBATCH --job-name=action-forcing-phase1-gan-16h-8node-v2
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
@@ -45,7 +45,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_16h_v5_online_teacher
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_16h_v6_online_teacher_caustron
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -95,16 +95,23 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    action_teacher_mode=all \
+    action_teacher_mode=off \
+    action_critic_aux_enabled=false \
+    state_probe_aux_enabled=false \
     max_rolls_per_ride=300 \
-    dfake_gen_update_ratio=1 \
+    dfake_gen_update_ratio=5 \
+    collapse_mae_threshold=0.2 \
+    mae_extension_threshold=0.2 \
+    model_kwargs.local_attn_size=42 \
+    local_attn_size_schedule=[[0,42]] \
     dmd_context=mix \
-    dmd_context_mix_p=0.25 \
+    dmd_context_mix_p=0.5 \
     dmd_context_yinyang=true \
     real_teacher_train_online=true \
-    real_teacher_causal_mask=false \
+    real_teacher_causal_mask=true \
     real_guidance_scale=1.0 \
+    real_teacher_lr=5e-5 \
     num_workers=0 \
-    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v5_online_teacher
+    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v6_online_teacher_caustron
 
 echo "Training completed on $(date)"

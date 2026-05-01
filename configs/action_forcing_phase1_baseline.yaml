@@ -163,7 +163,7 @@ motion_ride_min_mean: 3.0
 # memory at 8 fps) for the first ~400 iters, then 42 frames (~5 s) for
 # the rest. With ~35 s/iter early and ~50-55 s late, a 10 h run lands
 # around 1.8-2.0 epochs over the 905-ride motion-filtered pool.
-local_attn_size_schedule: [[0, 21], [250, 30], [500, 42], [750, 54], [1000, 66]]
+local_attn_size_schedule: [[0, 42]]
 
 action_dims: [2, 7]
 raw_action_dim: 2
@@ -204,7 +204,7 @@ action_conditioning_mode: both
 # extensions (and so short rides — say, 21 frames exactly — are
 # accepted; they just won't trigger any extensions because there's
 # no GT past frame 21).
-min_ride_frames: 69
+min_ride_frames: 30
 max_rides: null
 max_ride_frames: 510
 
@@ -331,7 +331,7 @@ rollout_frames: null
 # ``mae_extension_max_extra_chunks: 0`` for the same effect with
 # threshold left set (e.g. for an A/B that toggles only the loop
 # while keeping the baseline metric on).
-mae_extension_threshold: 0.4
+mae_extension_threshold: 0.2
 mae_extension_max_extra_chunks: 13
 
 model_kwargs:
@@ -344,7 +344,7 @@ model_kwargs:
   # num_training_frames < buffer; we pin to 21 explicitly so AR-eval
   # (and long-rollout training) can dial it down (e.g. to 12 for
   # LongLive-style rolling) without retraining.
-  local_attn_size: 21
+  local_attn_size: 42
   # ``sink_size: 3`` (= one 3-frame chunk) is a LongLive-style addition
   # on top of CF's recipe (CF leaves sink_size unset → defaults to 0).
   # During CLASSIC training (rollout_frames=21) this is a NO-OP for
@@ -424,12 +424,12 @@ action_modulation_activation: silu
 # leaving them on with loss_weight=0 elsewhere isn't checked since
 # dmd_action_forcing never reads
 # loss_weight values. Keep enabled for clean ODE loads.
-action_critic_aux_enabled: true
+action_critic_aux_enabled: false
 action_critic_z_out_dim: 8
 action_critic_base_channels: 128
 action_critic_num_blocks: 4
 
-state_probe_aux_enabled: true
+state_probe_aux_enabled: false
 state_head_out_dim: 8
 state_probe_dim: 256
 state_probe_num_heads: 8
@@ -516,7 +516,7 @@ real_teacher_input_mix_gt_p: 0.5
 # extra Wan-1.3B copy on each rank (deepcopy of base before LoRA
 # load + merge). When False, single-teacher mode: DMD and aux both
 # go through the LoRA-active ``self.real_score`` (legacy behavior).
-dmd_frozen_teacher_pass_enabled: true
+dmd_frozen_teacher_pass_enabled: false
 
 # ``aux_teacher_loss_weight`` — Weight on the auxiliary teacher pass
 # loss (FlowPredLoss against GT, via the LoRA real_score) in the
@@ -526,7 +526,7 @@ dmd_frozen_teacher_pass_enabled: true
 # teacher step is detached from the student; this knob controls
 # only the gen-step student-gradient channel + the additional LoRA
 # gradient at gen cadence.
-aux_teacher_loss_weight: 1.0
+aux_teacher_loss_weight: 0.0
 
 # ---------------------------------------------------------------------------
 # DMD + critic loss config (CF parity, DMD2 retained)
@@ -580,8 +580,8 @@ min_score_timestep: 0
 # showed up as disjoint artefacts in the student's reconstruction).
 # The mix knob (``dmd_context_mix_p``) alone fully determines the
 # blend.
-dmd_context: "mix"
-dmd_context_mix_p: 0.25
+dmd_context: "self"
+dmd_context_mix_p: 0.0
 dmd_context_clean_frames: 9
 clean_x_aug_t: 0
 
@@ -591,7 +591,7 @@ gan_loss_weight: 0.0
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).
 fake_score_updates_enabled: true
-dfake_gen_update_ratio: 2
+dfake_gen_update_ratio: 5
 
 # Generator EMA (CF parity).
 ema_weight: 0.99

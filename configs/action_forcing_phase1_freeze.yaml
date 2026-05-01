@@ -1,684 +1,88 @@
-# Phase-1 Action-Forcing DMD config (NO STAIRCASE).
+# Phase-1 Action-Forcing DMD with FREEZE-mode aux losses + teacher-
+# freeze detection. Thin overlay on top of action_forcing_phase1.yaml.
 #
-# CF-style self-forcing DMD on a fixed 21-frame window with action
-# awareness. Key differences from longlive_phase1_rolling_staircase.yaml:
-#   - NO staircase: the 21-frame student rollout uses CF-style truncated
-#     random-exit denoising with a persistent KV cache (one timestep per
-#     block per rolling step, gradient on the final exit-flag forward only).
-#   - 7 chunks of 3 frames; pipeline runs 7 rolling steps with
-#     ``chunks_per_rolling_step=1`` (uniform sizes [3, 3, 3, 3, 3, 3, 3])
-#     so each rolling step denoises exactly one 3-frame chunk — byte-for-
-#     byte CF chunkwise behavior. All in-flight frames receive their real
-#     GT actions — no per-slot decay.
-#   - Real and fake scorers are SYMMETRIC on the student's noisy 21-frame
-#     output (no GT context, no asymmetric KV-cache for real_score). The
-#     DMD subtraction is a pure (fake - real) on identical noisy inputs.
-#   - Generator EMA, timestep_shift=5.0, denoising_step_list = ODE rungs.
-#   - Fake-score critic loss is the CF-parity denoise MSE on the student
-#     pred (DMD2 retained: fake_score updates 1:1 with generator).
+# This config used to be a full ~700-line duplicate of phase1.yaml.
+# Consolidated to an overlay; only the freeze-specific deltas live
+# here. Edit shared knobs in action_forcing_phase1.yaml.
 #
-# Hyperparameter alignment vs Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml
-# (+ Causal-Forcing/configs/default_config.yaml):
-#   ALIGNED → lr=2e-6, lr_critic=4e-7, beta1=beta1_critic=0.0,
-#             beta2=beta2_critic=0.999, weight_decay=0.01, ts_schedule=false,
-#             ema_weight=0.99, ema_start_step=200, max_grad_norm=10.0,
-#             same_step_across_blocks=true, last_step_only=false,
-#             context_noise=0, num_frame_per_block=3, timestep_shift=5.0,
-#             real_guidance_scale=3.0 (= CF's guidance_scale), fake_guidance_scale=0.0
-#             (= CF's default when only `guidance_scale` is set; see
-#             Causal-Forcing/model/dmd.py:38-43).
-#   KEPT-AS-UPGRADE → dfake_gen_update_ratio=1 (DMD2; CF DMD uses 5),
-#             fake_score_updates_enabled=true (DMD2).
-#   PROJECT-SPECIFIC (NOT aligned to CF, intentionally):
-#     - denoising_step_list=[1000, 625, 500, 312.5] — our ODE student was
-#       distilled on these rungs; CF's [1000, 750, 500, 250] would feed
-#       the student timesteps it was never supervised on.
-#     - warp_denoising_step=false — pair with the verbatim float ladder
-#       above (see longlive_phase1_rolling_staircase.yaml + .claude/
-#       phase_1_creation/README.md §2.5 for the rationale).
-#     - num_training_frames=21 — CF parity (7 chunks * 3 frames each).
-#     - chunks_per_rolling_step=1 — CF parity (one chunk per rolling
-#       step → 7 rolling steps, exactly one denoise sample per chunk).
-#     - model_kwargs.local_attn_size=21, sink_size=3 — local_attn_size
-#       is pinned to num_training_frames so the cache buffer never
-#       evicts during a single training iter (matches CF's
-#       unbounded ``-1`` default in the classic-rollout regime).
-#       sink_size=3 is a LongLive-style addition (CF: sink_size=0); see
-#       model_kwargs block for why it's a no-op during training but
-#       arms the architecture for sink-aware AR inference.
-#     - infinity_rope=true — Block-Relativistic RoPE patch on the cache
-#       path; train/inference parity with utils/eval_causal_AR.py.
-#     - rollout_frames (default null = num_training_frames): CF-style
-#       knob to decouple rollout length from the gradient/scoring
-#       window. When > num_training_frames, the leading (rollout_frames
-#       - num_training_frames) frames warm the KV cache under no_grad
-#       and only the trailing num_training_frames carry gradient.
-#       Mirrors CF's ``start_gradient_frame_index`` gate.
-#     - mae_extension_threshold (default 0.5) +
-#       mae_extension_max_extra_chunks (default 13) — MAE-driven
-#       dynamic rollout extension. After the baseline 21-frame
-#       rollout, the pipeline checks the latent-space MAE between
-#       the LAST 3 generated frames and GT. If MAE < threshold AND
-#       the ride has more GT AND we're under the cap, it rolls one
-#       more 3-frame chunk under no_grad (full denoise, KV-cache-
-#       committed). Repeats until: MAE crosses threshold, ride GT
-#       exhausted, or cap hit. Extensions are NEVER scored — they're
-#       pure forward passes that produce ``mae_extension_count`` and
-#       ``last_chunk_mae`` metrics for wandb. Set
-#       ``mae_extension_threshold: null`` to disable extensions while
-#       still logging the baseline last-chunk MAE.
-#
-# All staircase-specific knobs (num_live_slots, passes_per_step,
-# action_decay_per_slot, kv_committed_max_frames, real_score_num_gt_chunks,
-# dmd_active_slot_policy, slots_per_rank, rolling_steps_per_iter,
-# collapse_mae_threshold, aux_loss_weight, aux_loss_slot_policy, etc.)
-# have been REMOVED. Auxiliary action heads (action_critic / state_probe)
-# are instantiated for ODE checkpoint compatibility only — their losses
-# are NOT wired in by ``model/dmd_action_forcing.py`` (Phase-1
-# Action-Forcing is pure DMD).
+# Behaviour preserved exactly relative to the pre-refactor (HEAD)
+# version: dmd_context stays "GT" (pre-yinyang), real_guidance_scale
+# stays 0.0, dataset stays weunz, streaming_max_length stays 1100,
+# boundary_vae_roundtrip stays off, action_critic / state_probe aux
+# losses are wired in at v14-ODE init values, action teacher (mode=
+# all) feeds the cotracker+ss_vae teacher-freeze detection on the
+# action cosine cutoff. To migrate to the modern (yinyang) regime,
+# delete the explicit dmd_context / real_guidance_scale / encoded_root
+# / streaming_max_length / boundary_vae_roundtrip overrides below
+# (they'll then inherit phase1's modern values).
+
+_extends: action_forcing_phase1.yaml
 
 config_name: action-forcing-phase1-freeze
 run_name: action_forcing_phase1_freeze
 
-seed: 0
-mixed_precision: true
+# Logging / checkpoint cadence — slightly slower than phase1 since
+# freeze runs are typically longer per step (action critic + state
+# probe forwards add wallclock).
 log_interval: 15
 checkpoint_interval: 50
-max_steps: 10000
-max_grad_norm: 10.0
-auto_resume: true
-strict_resume_load: false
-strict_ode_load: false
 
-# Periodic pred_image -> wandb.Video sampling. Every
-# ``sample_interval`` generator steps the trainer detaches the
-# generator's pred_image latents, decodes them with the WAN VAE
-# wrapper, encodes the resulting RGB clip to MP4 via ffmpeg, and
-# uploads it to W&B as ``train/pred_image_video`` (only on the
-# main rank). Set ``sample_interval: 0`` to disable.
-sample_at_steps: [1, 199, 399, 999, 1999, 4999, 9999]   # explicit steps: trainer fires at first eligible gen iter at-or-after value
-sample_interval: 15   # trainer defers to next gen iter if cadence boundary lands on critic-only step
-sample_fps: 5
-sample_max_frames: 0  # 0 = use all frames in pred_image
-
-# Distillation = action_forcing (CF-style); selects
-# trainer/causal_action_forcing_train.py.
-distillation: action_forcing
-
-# W&B
-wandb_project: longlive-phase1
-wandb_dir: ./wandb
-disable_wandb: false
-
-log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
+# Dataset: full weunz pool (vs phase1's weu MRS subset).
 encoded_root: /projects/u6ex/fbots/frodobots_encoded_weunz
-caption_root: /projects/u6ex/fbots/frodobots_captions/train
-motion_root: /projects/u6ex/fbots/frodobots_motion
-ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
 
-# Motion-aware rollout-start picker — see action_forcing_phase1.yaml
-# for the full rationale. Bias the offset ``s`` so the first
-# ``rollout_frames`` at ``s + cf`` have mean motion >= threshold.
-motion_start_threshold: 0.5      # per-frame floor for offset window picker
-motion_start_prob: 1.0
-motion_skip_dead_rides: true     # skip rides with low per-ride mean motion
-motion_ride_min_mean: 3.0        # ~upper-half cutoff; see action_forcing_phase1.yaml comment for details
-
-# Step-scheduled local_attn_size — see action_forcing_phase1.yaml for
-# rationale. Default: 21 frames early, 42 from step 400.
+# Local-attention schedule: 21 → 42 at step 1000 (single transition
+# vs phase1's multi-step ramp).
 local_attn_size_schedule: [[0, 21], [1000, 42]]
 
-action_dims: [2, 7]
-raw_action_dim: 2
-action_dim: 2
-enable_adaln_zero: true
-action_conditioning_mode: both
-
-# Need at least ``rollout_frames`` (or ``num_training_frames`` in
-# classic mode) latent frames per ride. Rides shorter than this are
-# skipped by the loader. ``max_ride_frames`` is the upper bound on
-# how many latent frames the loader returns per ride: longer rides
-# are truncated to this many frames at load time (memory/compute
-# safety), shorter rides are returned as-is and the trainer's
-# downstream ``[:extended_length]`` slice trims to the actual per-iter
-# window. Bump in lockstep with ``rollout_frames`` if you turn
-# long-rollout mode on (e.g. min=42, max=42 when rollout_frames=42).
-#
-# MAE-extension note: with ``mae_extension_max_extra_chunks > 0`` AND
-# ``mae_extension_threshold`` set, the trainer slices each ride to
-# ``min(ride_len, rollout_frames + max_extra_chunks*num_frame_per_block)``
-# for GT-comparison purposes. With either disabled, the slice
-# collapses to ``rollout_frames`` (no extra ride frames loaded, no
-# extra action streams built). The KV cache buffer is ALWAYS sized to
-# ``max(num_max_frames, rollout_frames)`` and extension chunks commit
-# through the model's rolling cache (sink + FIFO), so enabling
-# extensions never grows the cache.
-#
-# Default 105 = 21 baseline + 84 (= 28 chunks of 3) extension headroom,
-# more than enough for the default cap of 13 extras (= 39 extra frames
-# = 60 total). With ``mae_extension_max_extra_chunks=13``, only the
-# first 60 frames of each 105-frame ride get used per iter; the rest
-# is discarded by the slicer. Bump ``mae_extension_max_extra_chunks``
-# to 28 to actually use all 105 frames when the student is good
-# enough for MAE to stay under threshold for that long.
-#
-# Keep ``min_ride_frames`` at ``rollout_frames`` so the loader's
-# filter does NOT exclude rides that could still benefit from
-# extensions (and so short rides — say, 21 frames exactly — are
-# accepted; they just won't trigger any extensions because there's
-# no GT past frame 21).
-min_ride_frames: 69
-max_rides: null
-# Sized to fit ``cf_dmdctx + streaming_max_length`` + slack for the
-# motion-aware offset ``s``. Under K=1-per-step the prefetch executor
-# holds one ride's CPU tensors ahead of the active ride, so this also
-# bounds the prefetch RAM footprint (~250 MB / ride at fp16 latents).
+# Longer rides (1200 vs phase1's 510) so the streaming sequence has
+# enough GT for the dynamic 60-roll cap below.
 max_ride_frames: 1200
+max_rolls_per_ride: 60
+force_exit_step_enabled: false
+num_chunks_roll_forward: 6
 
-# Curriculum: shortest valid first.
-sort_rides_by_length: null
-
-num_workers: 0
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-distribution_loss: dmd_action_forcing
-model_name: Wan2.1-T2V-1.3B
-real_model_name: Wan2.1-T2V-1.3B
-fake_model_name: Wan2.1-T2V-1.3B
-# CF chunkwise parity: 21 latent frames = 7 chunks of 3.
-num_training_frames: 21
-num_train_timestep: 1000
-denoising_loss_type: flow
-gradient_checkpointing: true
-
-# torch.compile on the three DiT modules (generator, fake_score,
-# real_score). First step's wallclock spikes during compilation
-# (~minutes for the 1.3B model); steady-state forward path should be
-# ~1.5-3x faster. ``mode="default"`` is safe with our in-place KV
-# cache mutation; ``"reduce-overhead"`` enables CUDA graphs which
-# conflict with the cache writes — keep at default.
-# ``compile_dit_dynamic: null`` lets dynamo auto-detect shape
-# variance; the rolling forward (3-frame chunks) and DMD scoring
-# (21-frame chunks) live in the same module so dynamo will cache
-# both shapes — keep ``compile_dynamo_cache_size`` ≥ 32.
+# torch.compile knobs (off by default; freeze runs sometimes use
+# this to amortise the larger fwd cost).
 compile_dit: false
 compile_dit_mode: default
 compile_dit_dynamic: null
 compile_dynamo_cache_size: 64
 
-# CF-style long rollout (``Causal-Forcing/pipeline/self_forcing_training.py:120``):
-# ``rollout_frames`` is the number of latent frames the student rolls
-# out per training iter. The pipeline gates gradient to the LAST
-# ``num_training_frames`` of the rollout
-# (``start_gradient_frame_index = num_output_frames - num_max_frames``):
-#
-#   rollout_frames == num_training_frames (default; 21/21)
-#     ├── Classic CF chunkwise DMD: every rolled frame is in the
-#     │   gradient window, the warmup region is empty, sink_size=3
-#     │   is a no-op for attention output (algebra in the
-#     │   model_kwargs.sink_size comment above). 7 rolling steps of
-#     │   3 frames each (one chunk per rolling step).
-#     └── No change to data plumbing — min_ride_frames=21 suffices.
-#
-#   rollout_frames > num_training_frames (e.g. 42/21)
-#     ├── The student rolls 42 frames (14 chunks → 14 rolling
-#     │   steps at chunks_per_rolling_step=1); the LEADING 21
-#     │   frames warm the KV cache via no_grad exit-flag forwards,
-#     │   only the TRAILING 21 frames carry gradient.
-#     ├── Bidirectional scorer (real_score / fake_score) is fed
-#     │   exactly ``num_training_frames`` frames (the trailing
-#     │   slice) — its seq_len was sized to that window.
-#     ├── ``local_attn_size=21, sink_size=3`` becomes LIVE during
-#     │   the gradient-active forwards (frames 21..41 attend over
-#     │   sink ∪ last 18 frames), exercising the LongLive-style
-#     │   sink mechanism the architecture was already built for.
-#     ├── CF-style first-chunk BOUNDARY mask kicks in automatically
-#     │   (``model/dmd_action_forcing.py::_run_generator``): the first
-#     │   ``num_frame_per_block`` (=3) frames of the scoring window
-#     │   carry NO gradient because their attention context is
-#     │   warmup-cache content the student produced under no_grad.
-#     │   Effective gradient-active frame count drops to
-#     │   ``num_training_frames - num_frame_per_block`` (= 18 here).
-#     │   We follow CF
-#     │   (``Causal-Forcing/long_video/model/base.py:169-177``) but
-#     │   SKIP CF's decode→re-encode round-trip on the boundary
-#     │   latent: with the gradient masked off, the boundary frame's
-#     │   contents cannot affect the loss, so the VAE round-trip is
-#     │   wasted compute.
-#     └── Bump ``min_ride_frames`` and ``max_ride_frames`` to
-#         ``rollout_frames`` so the loader skips too-short rides.
-#
-# Set to ``null`` (or omit) for classic CF behavior. Override at the
-# CLI with ``--override rollout_frames=42`` for a long-rollout study.
-rollout_frames: null
-
-# ---------------------------------------------------------------------------
-# MAE-driven dynamic rollout extension
-# ---------------------------------------------------------------------------
-# After the baseline 21-frame rollout (``rollout_frames`` frames in
-# long-rollout mode), the pipeline checks the latent-space mean-
-# absolute-error between the LAST ``num_frame_per_block`` (=3)
-# generated latent frames and the GT for those same frames. If
-# MAE < ``mae_extension_threshold`` AND there's more GT in the ride AND
-# we haven't already rolled ``mae_extension_max_extra_chunks`` extras,
-# the pipeline rolls one more 3-frame chunk under ``no_grad`` (full
-# denoise — every rung in ``denoising_step_list`` runs, no random exit;
-# the chunk is committed to the KV cache via the standard t=context_noise
-# forward). The extension keeps firing until the MAE crosses
-# ``mae_extension_threshold``, the ride's GT runs out, or the cap is
-# hit.
-#
-# Extensions are NOT included in the scoring window — the DMD loss
-# operates exclusively on the BASELINE rollout (last
-# ``num_training_frames`` of ``rollout_frames``), so the gradient flow
-# is unchanged. Extensions exist purely to (a) measure how far the
-# student can sustain quality on a given ride and (b) bump
-# ``last_chunk_mae`` to a more meaningful value (the MAE at the
-# point the student finally degrades, or ride end). Per-iter metrics
-# the trainer logs to wandb under the ``gen/`` namespace:
-#
-#   gen/baseline_last_chunk_mae  — MAE of the last 3 baseline frames
-#                                  vs GT (always; even when
-#                                  extensions are disabled, as long
-#                                  as gt_latents was passed).
-#   gen/last_chunk_mae           — MAE of the FINAL evaluated chunk
-#                                  (= baseline last chunk if no
-#                                  extensions, else the extension
-#                                  chunk where MAE crossed threshold
-#                                  / where GT ran out / where cap
-#                                  was hit).
-#   gen/mae_extension_count      — number of extension chunks rolled
-#                                  this iter (0 if disabled or no
-#                                  extension fired).
-#
-# Memory note: extensions DO NOT grow the KV cache buffer. The cache
-# is fixed at ``max(num_max_frames, rollout_frames)`` frames (= 21 in
-# classic mode); extension chunks commit through the model's rolling
-# cache, which sink-pins the first ``model_kwargs.sink_size`` (=3)
-# frames and FIFO-evicts the oldest non-sink frames. So
-# ``mae_extension_max_extra_chunks`` is a COMPUTE cap (each extension
-# is a full-denoise + cache-commit forward pass under no_grad), not
-# a memory cap. Enable freely.
-#
-# DDP note: extensions perform an in-loop ``all_reduce`` on the MAE.
-# The pipeline pre-syncs (``ReduceOp.MIN``) the per-rank "GT chunks
-# left" count BEFORE the loop, so ranks always loop the same number
-# of times even if their rides have different lengths.
-#
-# Set ``mae_extension_threshold: null`` to disable the extension loop
-# entirely; ``baseline_last_chunk_mae`` / ``last_chunk_mae`` will
-# still be logged (extensions just don't fire). Set
-# MAE-reset gate: if the per-rank avg MAE on the just-trained 21-frame
-# window crosses this threshold, mark the ride for reset on the NEXT
-# step. Set to ``null`` to disable extension entirely (use the legacy
-# per-chunk path).
-mae_extension_threshold: 0.4
-
-# Per-rank cap on chunks rolled before forced ride reset (= a hard
-# upper bound on max_total_rollout_frames per ride). At
-# streaming_force_new_frame_chunks=6 + npb=3 + chunk_size=21:
-# max reachable per ride = 21 + 59 × 18 = 1083 latent frames.
-# Renamed from the legacy ``mae_extension_max_extra_chunks``.
-max_rolls_per_ride: 60
-
-# When True, ``_streaming_step`` does a per-step rank-0 broadcast of
-# a single exit-rung index and pins every rank to it via
-# ``generate_next_chunk(force_exit_step=...)``. Use this for variance-
-# reduction experiments that want all ranks to denoise at the same
-# rung. Default False — under K=1-per-step the inner pipeline's
-# ``generate_and_sync_list(sync=True)`` already broadcasts once per
-# call on every rank (matched count → safe), so the outer broadcast
-# is redundant.
-force_exit_step_enabled: false
-
-model_kwargs:
-  timestep_shift: 5.0
-  # ``local_attn_size: 21`` keeps the attention window equal to the full
-  # Action-Forcing training horizon (num_training_frames = 21) so the cache buffer
-  # never has to evict during a classic-rollout (rollout_frames=21)
-  # training iter. CF chunkwise DMD leaves ``local_attn_size`` unset
-  # (defaults to -1 = unbounded), which is functionally identical when
-  # num_training_frames < buffer; we pin to 21 explicitly so AR-eval
-  # (and long-rollout training) can dial it down (e.g. to 12 for
-  # LongLive-style rolling) without retraining.
-  local_attn_size: 21
-  # ``sink_size: 3`` (= one 3-frame chunk) is a LongLive-style addition
-  # on top of CF's recipe (CF leaves sink_size unset → defaults to 0).
-  # During CLASSIC training (rollout_frames=21) this is a NO-OP for
-  # attention output:
-  #   max_attention_size  = local_attn_size * 1560 = 21*1560
-  #   local_budget        = max_attention_size - sink_tokens
-  #                       = (21-3)*1560 = 18*1560
-  #   local_start_for_win = max(sink_tokens, local_end - local_budget)
-  # which on every rolling step inside a 21-frame iter resolves to
-  # exactly ``sink_tokens`` (since local_end <= 21*1560 = sink_tokens
-  # + local_budget), so ``[k_sink] ++ [k_local]`` reconstructs the
-  # full 0..local_end slice — bit-identical to ``sink_size = 0``.
-  # We carry the flag at training time for ARCHITECTURAL parity with
-  # sink-aware AR inference (LongLive-style ``local_attn_size = 12,
-  # sink_size = 3``): the model is constructed with the sink machinery
-  # plumbed, so reloading the checkpoint with a smaller
-  # ``local_attn_size`` at AR rollout time gives a properly-pinned
-  # 3-frame anchor without any code changes. Together with
-  # ``infinity_rope: true`` below this gives full train/inference parity
-  # on the K-storage + RoPE-rotation conventions used at long horizons.
-  # When ``rollout_frames`` > num_training_frames (long-rollout mode),
-  # ``sink_size: 3`` becomes LIVE during the trailing gradient-active
-  # forwards — the algebra above flips because local_end exceeds
-  # max_attention_size and the windowing actually slices.
-  sink_size: 0
-
-  # Sink update mechanism. Two modes:
-  #   "sink"  (DEFAULT): the first ``sink_size`` frames are pinned in the
-  #           rolling KV cache as a frozen attention anchor (LongLive
-  #           convention). With ``sink_size: 0`` (current default) this
-  #           is a no-op and the sink machinery is dormant.
-  #   "ema":  FRAME-LEVEL parallel EMA. Each of the ``sink_size`` sink
-  #           frames is a parallel summary slot at its own decay rate.
-  #           When the rolling cache evicts a chunk we mean-pool the
-  #           eviction across the temporal axis (npb evicted frames →
-  #           1 frame of pooled K/V), then update every sink frame i:
-  #               sink_frame_i ← α_i · sink_frame_i + (1 − α_i) · pooled
-  #           in PARALLEL. Higher α ⇒ longer-memory; lower α ⇒ shorter.
-  #           Frame-level (vs chunk-level) avoids the within-chunk
-  #           redundancy of the LongLive/Reward-Forcing convention:
-  #           with ``num_frame_per_block: 3``, three frames in a chunk
-  #           are highly correlated, so storing the same EMA in three
-  #           positions wastes slots. Frame-level packs N distinct
-  #           timescales into the same N-frame budget.
-  #           To enable: set ``sink_size: N``, ``sink_type: ema``, and
-  #           list exactly N alphas in ``sink_ema_alphas``.
-  # sink_type: sink
-  # sink_ema_alphas: null
-
-i2v: false
-text_pre_encoded: true
-
-# Infinity-RoPE (Block-Relativistic RoPE) on the KV-cache training path.
-# When true, ``trainer/causal_action_forcing_train.py`` calls
-# ``utils.infinity_rope.install()`` on the generator's DiT before the
-# training loop starts, monkey-patching
-# ``CausalWanSelfAttention.forward`` to store un-roped K in the cache
-# and rotate Q / cached-K with bounded window-relative indices at
-# attention time. Within a CLASSIC (rollout_frames=21) iter the
-# Action-Forcing cache never rolls (num_training_frames=21 == local_attn_size=21;
-# sink_size=3 is a no-op for attention with this geometry — see the
-# model_kwargs comment above for the algebra), so the patch is
-# mathematically equivalent to the original RoPE path during training.
-# The point of having it on is train/inference parity:
-# ``utils/eval_causal_AR.py`` runs with ``infinity_rope=true`` by
-# default, so the student should be trained with the same K-storage
-# convention it will see at long-horizon AR rollout time (where the
-# rolling cache *does* fire and sinks become live). It also makes
-# long-rollout training (rollout_frames>21) numerically equivalent to
-# AR rollout. Override to ``false`` only for A/B parity studies
-# against the original-RoPE training path.
-infinity_rope: true
-
-# ---------------------------------------------------------------------------
-# CF-style pipeline geometry (CF chunkwise parity)
-# ---------------------------------------------------------------------------
-# 7 blocks of 3 frames = 21 frames. chunks_per_rolling_step=1 means
-# each rolling step denoises EXACTLY ONE 3-frame chunk → 7 rolling
-# steps of uniform size [3, 3, 3, 3, 3, 3, 3] — byte-for-byte
-# Causal-Forcing's chunkwise self-forcing pipeline. denoising_step_list
-# is the 4 ODE rungs (descending [1000, 625, 500, 312.5]); per CF,
-# each rolling step samples one timestep per block
-# (same_step_across_blocks=true → one shared exit_flag across all 7
-# blocks) and lets a random exit-flag forward carry the gradient for
-# that block's chain.
-num_frame_per_block: 3
-chunks_per_rolling_step: 1
-same_step_across_blocks: true
-last_step_only: false
-context_noise: 0
-denoising_step_list: [1000, 625, 312.5, 178.6]
-
-action_patch_enabled: true
-action_modulation_activation: silu
-
-# Auxiliary action-supervision heads — LIVE for the freeze config.
-# When ``teacher_freeze_mode: "action"`` masks DMD gradient on a slot
-# the student loses its primary supervision there; the action critic
-# z-guidance + state-probe / state-guidance carry the gradient
-# through that slot so the student keeps learning the correct action.
-# Loss weights match the action_ode_distill (ODE-init) values so the
-# action heads pick up where they left off.
-action_critic_aux_enabled: true
-action_critic_z_out_dim: 8
-action_critic_base_channels: 128
-action_critic_num_blocks: 4
+# Auxiliary losses turned ON: action critic + state probe at the
+# v14-ODE distill init values. These were instantiated frozen by the
+# parent's compat shim; here we activate them and supply hyperparams.
 action_critic_dims: [2, 7]
-action_critic_z_loss_weight: 0.25         # ODE init
-generator_action_z_guidance_weight: 0.125  # ODE init
-critic_updates_per_step: 2                # ODE init
-critic_lr: 3.0e-04                        # ODE init
-z_guidance_warmup_steps: 0                # full strength immediately
+action_critic_z_loss_weight: 0.25            # v14 ODE init
+generator_action_z_guidance_weight: 0.125     # v14 ODE init
+critic_updates_per_step: 2
+critic_lr: 3.0e-04
+z_guidance_warmup_steps: 0                    # full strength immediately
+state_head_loss_weight: 0.05                  # v14 ODE init
+state_guidance_weight: 0.025                  # v14 ODE init
+action_teacher_mode: "all"                    # cotracker+ss_vae teacher live
 
-state_probe_aux_enabled: true
-state_head_out_dim: 8
-state_probe_dim: 256
-state_probe_num_heads: 8
-state_probe_n_taps: 6
-state_head_loss_weight: 0.05              # ODE init
-state_guidance_weight: 0.025              # ODE init
-
-# ---------------------------------------------------------------------------
-# Action teacher
-# ---------------------------------------------------------------------------
-# Set to "all" for the freeze config: ``teacher_freeze_mode: "action"``
-# (when set in the freeze section below) routes both the real_score's
-# pred and the student's pred through the frozen CoTracker + ss_vae,
-# so the teacher MUST be loaded. "all" also keeps the action critic
-# z-guidance loss live on every iter so the student keeps learning the
-# correct action when DMD is masked off on a slot.
-action_teacher_mode: "all"
-
-cotracker_source_dir: /home/u6ex/as1748.u6ex/.cache/torch/hub/facebookresearch_co-tracker_main
-cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/scaled_offline.pth
-
-# ---------------------------------------------------------------------------
-# Checkpoints (ODE-init student + v14 teacher)
-# ---------------------------------------------------------------------------
-ode_generator_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/action_ode_distill_E/action_ode_step0001000.pt
-
-v14_teacher_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_balanced_weunz/causal_lora_step0006600.pt
-v14_lora:
-  rank: 256
-  alpha: 256
-  dropout: 0.0
-
-# ---------------------------------------------------------------------------
-# DMD + critic loss config (CF parity, DMD2 retained)
-# ---------------------------------------------------------------------------
-# CFG: CF parity. real_guidance_scale=3.0 means the real_score is
-# ``cond + 3*(cond - uncond)`` on every step (model/dmd_action_forcing.py always
-# runs the uncond forward; no scale-zero gate). fake_guidance_scale=0.0
-# matches CF's default (the fake_score uncond forward is gated, and
-# stays off so the critic learns from the cond branch only).
-# Unconditional dict := zeroed prompt embeds + zero action streams
-# (we keep our own zero-prompt convention rather than CF's Chinese
-# negative prompt; only the CFG mechanism is aligned).
-dmd_loss_weight: 1.0
-real_guidance_scale: 0.0
-cfg_uncond_keep_actions: true   # CFG uncond keeps action streams identical to cond; only prompt_embeds zeroed (in-distribution for v14 LoRA)
-fake_guidance_scale: 0.0
-timestep_shift: 5.0
-# CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)
-# explicitly sets ``ts_schedule: false`` to disable the descending-bias
-# DMD timestep clamp (model/dmd_action_forcing.py: ``self.ts_schedule_max`` /
-# denoised_timestep_to gating). With it off, ``_sample_dmd_timestep``
-# samples uniformly in [min_score_timestep, num_train_timestep) before
-# applying the timestep_shift, which is what CF's chunkwise student
-# learnt against. Our previous default was ``true``; we flip it for
-# CF parity. ``ts_schedule_max: false`` and ``min_score_timestep: 0``
-# already match CF's defaults.
-ts_schedule: false
-ts_schedule_max: false
-min_score_timestep: 0
-
-# Teacher-forcing context for the bidirectional scorers (v14 parity).
-# ``dmd_context: "GT"`` — real_score sees the GT clean-half of the same
-# 21-frame window the student rolls (lightly noised at ``clean_x_aug_t``);
-# fake_score sees the student's own self-rolled clean-half. ``"self"``
-# is the alternative where real and fake share the self view (no GT
-# privilege). cf=3 = one chunk of seed prefilled into the generator's
-# KV cache at t=0 before the rollout starts.
-dmd_context: "GT"
-dmd_context_clean_frames: 9
-clean_x_aug_t: 0
-
-# Teacher-freeze detection — defaults sbatch's only delta. The v14
-# real_score occasionally outputs a single hazy/frozen latent frame
-# (visible in ``_diag_p1/out/F_real_GT.mp4`` at ~3 s). Letting DMD
-# score against it pulls the student toward the bad teacher pred.
-# Per-frame MAE between ``pred_real_image`` and the GT video at the
-# noisy_x positions is computed; frames with MAE > threshold *
-# median(MAE) are masked out of the DMD gradient.
-#
-# threshold=2.0 ⇒ flag a frame only when its MAE is at least 2× the
-# median across the 21-frame chunk — robust to the all-frames-similar
-# case (no false positives when the teacher is uniformly OK), tight
-# enough to catch single-frame freezes (a hazy frame typically has
-# MAE 3-5× the median).
-#
-# ``teacher_freeze_mode``: how to detect a teacher freeze.
-#
-#   * "mae" (default, legacy): per-frame MAE between real_score's
-#     prediction and the GT video at the same time positions; flag
-#     frames where MAE > teacher_freeze_threshold * median(MAE).
-#     Calibration sweep (_diag_p1/freeze_threshold_calibration.py)
-#     showed natural max-vs-median ratios cap at ~1.4× in motion-
-#     rich middle frames, ~1.8× at the structural boundary, so 2.0×
-#     is "above natural variance" — only fires on severe MAE spikes
-#     (= washed-out / static frames).
-#
-#   * "action": run BOTH the real_score's predicted latent AND the
-#     GT video through the frozen action teacher (CoTracker → ss_vae
-#     → 8-d z) and flag SLOTS where cosine_similarity(z_real, z_gt) <
-#     teacher_freeze_action_threshold. Default cutoff 0.0 → flag only
-#     when the teacher's predicted action direction is OPPOSITE to
-#     the GT action direction. Cosine sim is magnitude-invariant — a
-#     teacher that gets the magnitude wrong but the direction right
-#     stays unmasked. We compare to GT (not to student) so we don't
-#     mask slots where the teacher is correct and the student is
-#     drifting — those are exactly the slots DMD should keep
-#     training on. Requires ``action_teacher_mode != "off"`` so the
-#     trainer's ``_build_action_teacher`` actually loads the CoTracker
-#     + ss_vae.
-#
-# Per-iter wandb metrics (in the ``gen/`` namespace):
-#   * Always: gen/teacher_freeze_count, gen/teacher_freeze_rate
-#   * mode=mae:    gen/teacher_freeze_max_mae, gen/teacher_freeze_median_mae
-#   * mode=action: gen/teacher_freeze_action_cos_RG_min/_mean/_median
-#                  gen/teacher_freeze_action_cos_RS_mean (context only)
+# Teacher-freeze detection (mode=action: cosine on z_real vs z_GT).
 teacher_freeze_detect_enabled: true
-teacher_freeze_mode: "action"        # "mae" | "action"  — freeze sbatch defaults to action
-teacher_freeze_threshold: 2.0        # used by mode="mae" (multiplier on median MAE)
-teacher_freeze_action_threshold: 0.0  # used by mode="action" (cos(z_real, z_GT) cutoff)
+teacher_freeze_mode: "action"
+teacher_freeze_threshold: 2.0                 # used by mode="mae" only
+teacher_freeze_action_threshold: 0.0          # cos(z_real, z_GT) cutoff
 
-# GAN dropped (parity with staircase config + CF).
-gan_loss_weight: 0.0
+# DMD knobs — pre-yinyang regime. Real_score is a frozen v14 oracle
+# at CFG=0 (no sharpening); pure DMD with all-GT clean_x context.
+dmd_context: "GT"
+real_guidance_scale: 0.0
 
-# DMD2: fake_score updates 1:1 with generator (one critic step per
-# generator step in the CF-parity loop).
-fake_score_updates_enabled: true
+# DMD2 cadence: 1:1 critic/gen ratio (vs phase1's 1:2).
 dfake_gen_update_ratio: 1
 
-# Generator EMA (CF parity).
-ema_weight: 0.99
-ema_start_step: 200
-
-# ---------------------------------------------------------------------------
-# Optimizer (CF chunkwise DMD parity).
-# ---------------------------------------------------------------------------
-# Hyperparameters mirror Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml
-# and Causal-Forcing/configs/default_config.yaml verbatim, with the SOLE
-# exception that we keep the DMD2 update cadence (dfake_gen_update_ratio=1,
-# fake_score_updates_enabled=true) below — DMD2 is a strict upgrade over
-# CF's ratio=5 DMD critic step, so we don't roll that back.
-#
-# Generator AdamW:
-#   lr=2e-6, betas=(0.0, 0.999), weight_decay=0.01, eps=1e-8 (PyTorch default)
-# Critic (fake_score) AdamW:
-#   lr=4e-7, betas=(0.0, 0.999), weight_decay=0.01, eps=1e-8 (PyTorch default)
-# beta1=0.0 — CF's recipe disables Adam's first-moment momentum (matches
-# Self-Forcing / DMD2 papers); the second moment alone gives enough
-# stability for the very small lr regime, and zero first-moment removes
-# the multi-step "stuck" behaviour Adam exhibits when the gradient sign
-# flips due to DMD's antagonistic generator/critic dynamics.
-lr: 1.0e-05
-betas: [0.0, 0.999]
-eps: 1.0e-08
-weight_decay: 0.01
-train_action_projection: true
-train_action_token_projection: true
-
-# Fake-score optimizer (CF: ``lr_critic`` / ``beta1_critic`` / ``beta2_critic``).
-fake_lr: 2.0e-06
-fake_betas: [0.0, 0.999]
-fake_eps: 1.0e-08
-fake_weight_decay: 0.01
-fake_max_grad_norm: 10.0
-
-# DDP correctness guards.
-debug_find_unused_parameters: false
-assert_grad_uniformity: false  # CF-style train branches per iter
-# (train_generator vs train_critic alternation, exit-flag carries grad
-# only on one rung), which legitimately leaves some params un-touched
-# on a given backward. The static uniformity check fires false
-# positives in this regime; re-enable after a warm-up burn-in if
-# needed.
-
-nccl_timeout_minutes: 60
-
-# ---------------------------------------------------------------------------
-# Visualization (rank 0).
-# ---------------------------------------------------------------------------
-# Phase-1 Action-Forcing doesn't have a slot-0-committed-chunk
-# concept; the legacy MultiSlotVisRecorder still works because we
-# never call vis_recorder.add(...) from the Action-Forcing trainer.
-# Disable explicitly so the recorder doesn't even spin up on rank 0.
-vis_wallclock_seconds: 0
-vis_num_chunks: 0
-vis_fps: 8
-vis_to_wandb: false
-vis_save_local: true   # write mp4 to <log_dir>/samples/step_<N>.mp4 as backup if wandb offline
-vis_emit_on_first_step: false
-
-# ---------------------------------------------------------------------------
-# Trainer-internal feature flags carried through from staircase YAML.
-# Most are no-ops for the Action-Forcing trainer (it doesn't read them) but kept
-# at default values to avoid AttributeError on dotted overrides.
-# ---------------------------------------------------------------------------
-slots_per_rank: 1
-rolling_steps_per_iter: null
-collapse_mae_threshold: 0.5  # ride-extension gate (deferred multi-batch): MAE > threshold => do NOT extend on this ride next batch; MAE <= threshold => keep rolling. Current rollout always trains. Set null to disable.
-backward_simulation: true
-independent_first_frame: false
-warp_denoising_step: false
-
-# Streaming-mode (LongLive persistent KV-cache + variable-length chunks).
-# FUNDAMENTAL: ON by default for Phase-1 action-forcing DMD.
-streaming_mode: true
-# Per-rank rolling-window cap. Must be >= max reachable per ride
-# (= chunk_size + (max_rolls_per_ride - 1) * num_chunks_roll_forward * npb
-# = 21 + 59 * 18 = 1083) so the rolling-window cap doesn't kick in
-# before ``max_rolls_per_ride``. Snapped to a multiple of npb=3 by
-# the trainer.
+# Streaming: long sequences (1100-frame max).
 streaming_max_length: 1100
 
-# Slide-and-train stride: each generate_next_chunk slide advances the
-# 21-frame window forward by num_chunks_roll_forward * num_frame_per_block
-# frames (= 6 * 3 = 18 frames). Iter 1 still advances by chunk_size
-# (= 21) because the previous_chunk=None branch in generate_next_chunk
-# overrides the picker. When unset / 0, the legacy random {18, 21}
-# stride applies. Read by ActionForcingDMD as
-# ``streaming_force_new_frame_chunks``.
-num_chunks_roll_forward: 6
+# Variant-specific overrides on flags PHASE1 added post-HEAD that
+# this config explicitly does NOT want inherited:
+#   * boundary_vae_roundtrip: off (HEAD freeze never had this; the
+#     long streaming + AR sink mechanism handles boundaries).
+#   * mae_extension_max_extra_chunks: 0 (HEAD freeze used trainer
+#     default; phase1 sets 13 — explicit 0 here overrides).
+boundary_vae_roundtrip: false
+mae_extension_max_extra_chunks: 0

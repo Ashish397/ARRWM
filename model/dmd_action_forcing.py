@@ -148,6 +148,14 @@ def _slice_baseline_scoring_window(
 class ActionForcingDMD(SelfForcingModel):
     """DMD2 trainer module for the Action-Forcing (no-staircase) Phase-1 recipe."""
 
+    # Sentinel log key the trainer reads to decide whether to skip the
+    # post-critic teacher backward (end-of-ride: no gt_target available
+    # on at least one rank → all ranks return a non-grad zero loss via
+    # the all_reduce(MAX) skip path). Hoisted to a class-level constant
+    # so a rename doesn't silently break the trainer's skip gate. The
+    # trainer references this attribute, not the literal string.
+    REAL_TEACHER_SKIP_KEY = "real_teacher_skipped_short_ride"
+
     def __init__(self, args, device):
         super().__init__(args, device)
 
@@ -245,29 +253,123 @@ class ActionForcingDMD(SelfForcingModel):
                 f"dmd_context_mix_p must be in [0, 1]; got "
                 f"{self.dmd_context_mix_p!r}."
             )
-        # ``dmd_context_yinyang``: when True (default), each chunk is a
-        # LINEAR COMBINATION of GT and self views with weights derived
-        # from ``dmd_context_mix_p``:
-        #   GT-dominant chunks  : (1 - mix_p) * GT + mix_p * self
-        #   self-dominant chunks: (1 - mix_p) * self + mix_p * GT
-        # i.e., the dominant view contributes (1 - mix_p), the minority
-        # view splashes in at mix_p. Each chunk's IDENTITY (dominant
-        # source) is decided by the same per-chunk Bernoulli coin
-        # described above. At mix_p=0.5 the two chunk types collapse
-        # to an identical 50/50 average (intentional: there is no
-        # "dominant" view at that point). When False, chunks hard-swap
-        # between pure-GT and pure-self with no minority splash. Only
-        # consulted when ``dmd_context == "mix"``.
-        self.dmd_context_yinyang = bool(
-            getattr(args, "dmd_context_yinyang", True)
+        # ``"mix"`` mode is now a uniform linear blend across ALL
+        # frames:
+        #   clean_x_real = (1 - mix_p) * clean_x_self + mix_p * noised_GT
+        # No per-chunk Bernoulli, no chunk-level dominance — the
+        # previous yinyang_random shuffling was removed because the
+        # chunk-level dice introduced step-discontinuities along the
+        # time axis of the clean_x context (visible as disjoint
+        # artefacts in the student's reconstruction). The mix knob
+        # (``dmd_context_mix_p``) alone now fully determines the
+        # blend.
+
+        # ---------------------------------------------------------------
+        # Online real_teacher (v14-LoRA trained online vs GT video).
+        # ---------------------------------------------------------------
+        # When ``real_teacher_train_online`` is True, the v14 LoRA load
+        # path (``_load_real_score_with_v14_lora``) skips
+        # ``merge_and_unload``, the rank-256 adapter stays alive on top
+        # of base Wan, only the LoRA params receive gradient, and the
+        # trainer wires a separate optimizer + DDP wrap + per-iter
+        # teacher step (``compute_real_teacher_loss_streaming``). When
+        # False (default), real_score remains the frozen merged oracle
+        # — legacy behavior preserved.
+        self.real_teacher_train_online = bool(
+            getattr(args, "real_teacher_train_online", False)
         )
-        # Last per-chunk mask resolved by ``_build_dmd_context_kwargs``
-        # (bool tensor, shape ``[num_training_frames //
-        # num_frame_per_block]``; True = GT-dominant chunk). Stashed
-        # for telemetry — ``compute_generator_loss_streaming`` reads
-        # this to surface the realised GT-chunk fraction per iter.
-        # ``None`` until the first call.
-        self._last_dmd_context_mask: Optional[torch.Tensor] = None
+        # Causal mask flag on the joint [clean | noisy] TF sequence
+        # (v14 parity = True). When False, the inner CausalWanModel's
+        # ``_prepare_teacher_forcing_mask`` returns a full-bidirectional
+        # block mask. Plumbed onto ``self.real_score.model
+        # .tf_use_causal_mask`` immediately after the LoRA load.
+        self.real_teacher_causal_mask = bool(
+            getattr(args, "real_teacher_causal_mask", True)
+        )
+        # List of trainable LoRA params, populated by
+        # ``_load_real_score_with_v14_lora`` after the peft wrap.
+        # The trainer reads this to build the teacher optimizer.
+        self._real_teacher_trainable_params: List[torch.nn.Parameter] = []
+
+        # ``dmd_frozen_teacher_pass_enabled``: when True (default when
+        # online teacher is on), the model holds TWO real-score
+        # modules:
+        #   * ``self.real_score``       — base Wan + ACTIVE v14 LoRA
+        #     (trainable). Used for the auxiliary teacher pass that
+        #     trains the LoRA AND, optionally, flows gradient back to
+        #     the student (option 3 from the dual-teacher design).
+        #   * ``self.real_score_frozen`` — base Wan with v14 LoRA
+        #     MERGED into the base weights (frozen, no_grad). Used in
+        #     the DMD scoring path so the (fake - real) gradient is
+        #     against a clean ``p_real`` model, not the moving-target
+        #     online LoRA. Preserves the DMD theoretical guarantee.
+        # When False, the legacy single-teacher behavior holds:
+        # ``self.real_score`` is used in BOTH the DMD path and the
+        # auxiliary training pass.
+        self.dmd_frozen_teacher_pass_enabled = bool(
+            getattr(args, "dmd_frozen_teacher_pass_enabled", True)
+        )
+        # Holds the frozen merged-v14 teacher when the dual-teacher
+        # path is enabled. None otherwise. Loaded by
+        # ``_load_real_score_with_v14_lora``.
+        self.real_score_frozen: Optional[nn.Module] = None
+
+        # ``aux_teacher_loss_weight``: weight on the auxiliary
+        # online-teacher flow loss in the gen-step total loss. When
+        # ``real_teacher_train_online`` is True, the auxiliary pass
+        # forwards ``self.real_score`` (LoRA-active, with grad on the
+        # LoRA params AND on the student's chunk via the noise base)
+        # and computes ``(flow_pred - (ε - GT))²``. The loss
+        # contributes:
+        #   * Always: gradient to the LoRA → trains the online teacher.
+        #   * When the noise base is the student chunk (input_source
+        #     "student" / coin lands student): gradient also to the
+        #     student via the noise base.
+        # Set to 0.0 to keep the LoRA-training pass alive but not fold
+        # the loss into the gen-step total (legacy behavior with the
+        # post-critic separate teacher step).
+        self.aux_teacher_loss_weight = float(
+            getattr(args, "aux_teacher_loss_weight", 1.0)
+        )
+
+        # ``real_teacher_input_source`` ∈ {"student", "gt", "mix"}
+        # controls how ``compute_real_teacher_loss_streaming`` builds
+        # ``noisy_input``:
+        #   "student" : add_noise(student_chunk_detached, ε, t)
+        #               — current default; an amortized refinement
+        #               target. Strictly speaking NOT score matching
+        #               for ``p_real(x_t)`` because the input is
+        #               drawn from a noised-student joint, not the
+        #               noised-data marginal. As ``student → GT`` the
+        #               bias decays and it converges back to a true
+        #               score.
+        #   "gt"      : add_noise(gt_target, ε, t) — proper DMD score
+        #               matching: the teacher learns
+        #               ``∇ log p_real(x_t)`` exactly, no curriculum
+        #               bias.
+        #   "mix"     : per-iter Bernoulli(``real_teacher_input_mix_gt_p``);
+        #               True = GT, False = student. DDP-synced from
+        #               rank 0 so all ranks pick the same source per
+        #               iter.
+        # Whatever source is chosen, the LOSS TARGET is always GT —
+        # the source only changes what the noise is added to.
+        self.real_teacher_input_source = str(
+            getattr(args, "real_teacher_input_source", "student")
+        )
+        if self.real_teacher_input_source not in ("student", "gt", "mix"):
+            raise ValueError(
+                f"real_teacher_input_source must be one of "
+                f"'student' / 'gt' / 'mix'; got "
+                f"{self.real_teacher_input_source!r}."
+            )
+        self.real_teacher_input_mix_gt_p = float(
+            getattr(args, "real_teacher_input_mix_gt_p", 0.5)
+        )
+        if not (0.0 <= self.real_teacher_input_mix_gt_p <= 1.0):
+            raise ValueError(
+                f"real_teacher_input_mix_gt_p must be in [0, 1]; got "
+                f"{self.real_teacher_input_mix_gt_p!r}."
+            )
 
         # Number of leading GT frames that seed the KV cache before the
         # student's rolling rollout starts (= the model's KV-cache size,
@@ -518,8 +620,18 @@ class ActionForcingDMD(SelfForcingModel):
             "DIAG_TF_ROPE_OFFSET",
             str(int(self.num_frame_per_block)),
         ))
-        for scorer_name in ("real_score", "fake_score"):
-            m = getattr(self, scorer_name).model
+        # Apply the TF context attrs to every scorer DiT — including
+        # ``real_score_frozen`` if the dual-teacher path built it. peft
+        # does not forward attribute SETs to the base model, so we
+        # unwrap before assigning.
+        scorer_wrappers = [self.real_score.model, self.fake_score.model]
+        if self.real_score_frozen is not None:
+            scorer_wrappers.append(self.real_score_frozen.model)
+        for wrapper in scorer_wrappers:
+            m = (
+                wrapper.get_base_model()
+                if hasattr(wrapper, "get_base_model") else wrapper
+            )
             m.context_shift = 1
             m.tf_rope_offset_frames = _tf_rope_off
             # Pass the chunk size to the bidir TF block_mask builder
@@ -548,9 +660,15 @@ class ActionForcingDMD(SelfForcingModel):
                 self.clean_x_aug_t,
             )
 
-        # Finalize freezes.
-        for p in self.real_score.parameters():
-            p.requires_grad_(False)
+        # Finalize freezes. When real_teacher_train_online=True, the
+        # v14 LoRA load (_load_real_score_with_v14_lora) deliberately
+        # leaves the LoRA params with requires_grad=True so the trainer
+        # can build an optimizer + DDP-wrap real_score. Don't clobber
+        # that here — only freeze if the teacher is the offline merged
+        # oracle.
+        if not self.real_teacher_train_online:
+            for p in self.real_score.parameters():
+                p.requires_grad_(False)
         if not self.fake_score_updates_enabled:
             for p in self.fake_score.parameters():
                 p.requires_grad_(False)
@@ -860,56 +978,163 @@ class ActionForcingDMD(SelfForcingModel):
             else getattr(lora_cfg, "dropout", 0.0)
         )
 
-        target_modules = self._collect_target_modules(self.real_score.model)
-        if not target_modules:
-            target_modules = ["q", "k", "v", "o"]
+        # Load v14 LoRA state dict ONCE, off disk, here. The dual-
+        # teacher path calls ``_apply_v14_lora`` twice (frozen + LoRA);
+        # without this cache the same checkpoint would be re-read from
+        # /scratch on each call.
+        _v14_ckpt_blob = torch.load(v14_ckpt_path, map_location="cpu")
+        v14_lora_sd = _v14_ckpt_blob.get("lora")
+        if v14_lora_sd is None:
+            raise KeyError(
+                f"v14 checkpoint missing 'lora' key: "
+                f"have {list(_v14_ckpt_blob.keys())}"
+            )
+        del _v14_ckpt_blob
 
-        lora_config = LoraConfig(
-            r=rank,
-            lora_alpha=alpha,
-            lora_dropout=dropout,
-            target_modules=target_modules,
-            bias="none",
-        )
+        # Helper: apply v14 LoRA to a wrapper's ``.model`` field.
+        # ``merge=True`` returns the merged base (LoRA folded in,
+        # peft removed); ``merge=False`` returns the peft-wrapped
+        # model with the LoRA params marked trainable. Mutates
+        # ``wrapper.model`` in place.
+        def _apply_v14_lora(wrapper, *, merge: bool) -> List[nn.Parameter]:
+            target_modules = self._collect_target_modules(wrapper.model)
+            if not target_modules:
+                target_modules = ["q", "k", "v", "o"]
+            lora_config = LoraConfig(
+                r=rank,
+                lora_alpha=alpha,
+                lora_dropout=dropout,
+                target_modules=target_modules,
+                bias="none",
+            )
+            peft_model = peft.get_peft_model(wrapper.model, lora_config)
+            lora_sd = v14_lora_sd
+            try:
+                set_peft_model_state_dict(peft_model, lora_sd)
+            except Exception:
+                from peft import get_peft_model_state_dict
+                current_sd = get_peft_model_state_dict(peft_model)
+                matched = 0
+                for key in current_sd:
+                    if (
+                        key in lora_sd
+                        and current_sd[key].shape == lora_sd[key].shape
+                    ):
+                        current_sd[key] = lora_sd[key]
+                        matched += 1
+                set_peft_model_state_dict(peft_model, current_sd)
+                if _is_main():
+                    logging.info(
+                        "[ActionForcingDMD] real_score LoRA cross-load "
+                        "matched %d/%d", matched, len(current_sd),
+                    )
+            if merge:
+                merged = peft_model.merge_and_unload()
+                try:
+                    from peft.tuners.lora import LoraLayer
+                    for _, m in merged.named_modules():
+                        if isinstance(m, LoraLayer):
+                            raise RuntimeError(
+                                "LoRA layers remain after merge_and_unload."
+                            )
+                except Exception:
+                    pass
+                wrapper.model = merged.to(device=device, dtype=self.dtype)
+                return []
+            wrapper.model = peft_model.to(device=device, dtype=self.dtype)
+            trainable: List[nn.Parameter] = []
+            for n, p in wrapper.model.named_parameters():
+                if "lora_" in n:
+                    p.requires_grad = True
+                    trainable.append(p)
+                else:
+                    p.requires_grad = False
+            return trainable
+
         if _is_main():
             logging.info(
-                "[ActionForcingDMD] Applying v14 LoRA (rank=%d alpha=%s drop=%s) to "
-                "real_score over %d linear modules",
-                rank, alpha, dropout, len(target_modules),
+                "[ActionForcingDMD] Applying v14 LoRA (rank=%d alpha=%s drop=%s) "
+                "to real_score (online=%s, frozen_pass=%s).",
+                rank, alpha, dropout,
+                self.real_teacher_train_online,
+                self.dmd_frozen_teacher_pass_enabled
+                and self.real_teacher_train_online,
             )
-        peft_model = peft.get_peft_model(self.real_score.model, lora_config)
-        ckpt = torch.load(v14_ckpt_path, map_location="cpu")
-        lora_sd = ckpt.get("lora")
-        if lora_sd is None:
-            raise KeyError(
-                f"v14 checkpoint missing 'lora' key: have {list(ckpt.keys())}"
-            )
-        try:
-            set_peft_model_state_dict(peft_model, lora_sd)
-        except Exception:
-            from peft import get_peft_model_state_dict
-            current_sd = get_peft_model_state_dict(peft_model)
-            matched = 0
-            for key in current_sd:
-                if key in lora_sd and current_sd[key].shape == lora_sd[key].shape:
-                    current_sd[key] = lora_sd[key]
-                    matched += 1
-            set_peft_model_state_dict(peft_model, current_sd)
+
+        # ---------------------------------------------------------------
+        # Dual-teacher path: build the FROZEN merged-v14 copy FIRST
+        # (deepcopy of the base wrapper before mutating the live one).
+        # The live ``self.real_score`` then becomes the LoRA-online
+        # teacher in the second branch below.
+        # ---------------------------------------------------------------
+        if (
+            self.real_teacher_train_online
+            and self.dmd_frozen_teacher_pass_enabled
+        ):
+            import copy as _copy
+            frozen_wrapper = _copy.deepcopy(self.real_score)
+            _apply_v14_lora(frozen_wrapper, merge=True)
+            for p in frozen_wrapper.parameters():
+                p.requires_grad = False
+            frozen_wrapper.model.eval()
+            inner_frozen = frozen_wrapper.model
+            inner_frozen.tf_use_causal_mask = bool(self.real_teacher_causal_mask)
+            self.real_score_frozen = frozen_wrapper
             if _is_main():
                 logging.info(
-                    "[ActionForcingDMD] real_score LoRA cross-load matched %d/%d",
-                    matched, len(current_sd),
+                    "[ActionForcingDMD] dual-teacher: built frozen merged-v14 "
+                    "real_score_frozen (eval, no_grad, dtype=%s).",
+                    self.dtype,
                 )
 
-        merged = peft_model.merge_and_unload()
-        try:
-            from peft.tuners.lora import LoraLayer
-            for _, m in merged.named_modules():
-                if isinstance(m, LoraLayer):
-                    raise RuntimeError("LoRA layers remain after merge_and_unload on real_score.")
-        except Exception:
-            pass
-        self.real_score.model = merged.to(device=device, dtype=self.dtype)
+        if self.real_teacher_train_online:
+            # Online teacher: apply v14 LoRA to ``self.real_score``
+            # WITHOUT merging — the peft adapter stays alive, base is
+            # frozen, LoRA params are trainable. Trainer builds an
+            # optimizer over ``_real_teacher_trainable_params`` below;
+            # DDP-wraps ``real_score.model`` separately.
+            trainable_lora = _apply_v14_lora(self.real_score, merge=False)
+            self._real_teacher_trainable_params = trainable_lora
+            if not trainable_lora:
+                raise RuntimeError(
+                    "[ActionForcingDMD] real_teacher_train_online=True but "
+                    "no LoRA params were marked trainable after the peft "
+                    "wrap — check peft naming convention or LoRA config."
+                )
+            # Causal mask flag — consumed by
+            # ``CausalWanModel._prepare_teacher_forcing_mask`` (see
+            # ``wan/modules/causal_model.py``). Default True (v14 parity).
+            inner = self.real_score.model
+            base_for_flag = (
+                inner.get_base_model()
+                if hasattr(inner, "get_base_model") else inner
+            )
+            base_for_flag.tf_use_causal_mask = bool(self.real_teacher_causal_mask)
+
+            # Activation checkpointing on real_score's WanBlocks (memory
+            # — see prior comment block; trade is ~10 GB saved for ~10%
+            # wallclock from re-forward on backward).
+            gc_on = bool(getattr(args, "gradient_checkpointing", True))
+            if gc_on:
+                base_for_flag.gradient_checkpointing = True
+
+            if _is_main():
+                logging.info(
+                    "[ActionForcingDMD] real_teacher_train_online=True: "
+                    "v14 LoRA adapter kept (no merge), %d LoRA params "
+                    "trainable, tf_use_causal_mask=%s, "
+                    "gradient_checkpointing=%s.",
+                    len(trainable_lora),
+                    self.real_teacher_causal_mask,
+                    gc_on,
+                )
+            return
+
+        # Legacy single-teacher path: merge LoRA into ``self.real_score``
+        # and freeze. The merged model is the v14 oracle that DMD scoring
+        # forwards through.
+        _apply_v14_lora(self.real_score, merge=True)
+        self.real_score.model.tf_use_causal_mask = bool(self.real_teacher_causal_mask)
 
     @staticmethod
     def _collect_target_modules(model) -> list:
@@ -1224,49 +1449,6 @@ class ActionForcingDMD(SelfForcingModel):
         mask = torch.ones(shape, dtype=torch.bool, device=device)
         mask[:, -block:] = False
         return mask
-
-    # ------------------------------------------------------------------
-    # dmd_context per-chunk mask resolver.
-    # ------------------------------------------------------------------
-    def _resolve_dmd_context_mask(self, device: torch.device) -> torch.Tensor:
-        """Resolve the per-chunk GT/self assignment for real_score's
-        clean_x window. Returns a bool tensor of shape
-        ``[num_chunks] = [num_training_frames // num_frame_per_block]``,
-        where ``True`` = GT-dominant chunk, ``False`` = self-dominant.
-
-        Behavior by mode:
-          * ``"GT"``   : all-True (every chunk is GT-dominant; reduces
-                         to today's pure-GT path).
-          * ``"self"`` : all-False (every chunk is self-dominant; real
-                         falls back to fake's view in ``_compute_kl_grad``).
-          * ``"mix"``  : per-chunk Bernoulli(``dmd_context_mix_p``).
-                         Rank 0 samples the full ``[num_chunks]`` vector
-                         and broadcasts; every DDP rank ends up with the
-                         same mask (matched conditioning is required for
-                         the (fake - real) subtraction).
-
-        The DDP collective is a single ``broadcast`` of a small float
-        tensor (= ``num_chunks``, typically 7) per gen step — same
-        collective count as the previous per-iter coin.
-        """
-        npb = int(self.num_frame_per_block)
-        num_chunks = int(self.num_training_frames // npb)
-        if self.dmd_context == "GT":
-            return torch.ones(num_chunks, device=device, dtype=torch.bool)
-        if self.dmd_context == "self":
-            return torch.zeros(num_chunks, device=device, dtype=torch.bool)
-        # mix mode
-        p = float(self.dmd_context_mix_p)
-        if dist.is_available() and dist.is_initialized():
-            if dist.get_rank() == 0:
-                rolls = (torch.rand(num_chunks) < p).to(torch.float32)
-                t = rolls.to(device=device)
-            else:
-                t = torch.zeros(num_chunks, device=device, dtype=torch.float32)
-            dist.broadcast(t, src=0)
-            return t > 0.5
-        rolls = torch.rand(num_chunks, device=device) < p
-        return rolls
 
     # ------------------------------------------------------------------
     # CF-parity DMD core
@@ -1815,14 +1997,16 @@ class ActionForcingDMD(SelfForcingModel):
         ``sdn[(i-1)*21-3 : i*21-3]`` (batch ≥ 2).
 
         ``clean_x_real`` / ``aug_t_real`` are mode-dependent:
-          * ``"self"``: same as fake (no noise; both scorers see the
-            same view; (fake-real) gradient on matched conditioning).
+          * ``"self"``: ``None`` (same as fake; ``_compute_kl_grad``
+            falls back to ``sc_clean_x``).
           * ``"GT"``: ``scheduler.add_noise(clean_x_GT, n,
             clean_x_aug_t)`` — real_score sees the GT version of the
             same time positions, lightly noised at ``self.clean_x_aug_t``
-            for symmetry-breaking. ``clean_x_GT`` is required in this
-            mode; trainer assembles it from
-            ``ride[s+6+(i-1)*21 : s+6+i*21]`` per batch.
+            for symmetry-breaking. ``clean_x_GT`` is required.
+          * ``"mix"``: ``(1 - mix_p) * sc_clean_x + mix_p * noised_gt``
+            uniformly across all frames. No per-chunk shuffle. The
+            mix knob alone determines the blend; aug_t stays at 0
+            (matches the dominant ``self`` contribution).
 
         When ``build_real_view=False`` (critic step — only trains fake)
         the real-side outputs are ``None`` so callers can skip the
@@ -1846,40 +2030,6 @@ class ActionForcingDMD(SelfForcingModel):
                 f"clean_x_self.shape[1]={clean_x_self.shape[1]} must "
                 f"equal num_training_frames={self.num_training_frames}."
             )
-        # Resolve the per-CHUNK GT/self assignment. ``mask`` is a
-        # ``[num_chunks]`` bool tensor; True = GT-dominant chunk, False
-        # = self-dominant. Pure modes give all-True / all-False; mix
-        # mode gives a Bernoulli(``mix_p``) vector (DDP-synced).
-        #
-        # The critic step (``build_real_view=False``) only trains
-        # fake_score, which always uses the self-view regardless of
-        # dmd_context, so we short-circuit the mask to all-False there
-        # — falling through to the existing None-fallback below.
-        npb = int(self.num_frame_per_block)
-        num_chunks = int(self.num_training_frames // npb)
-        if build_real_view:
-            mask = self._resolve_dmd_context_mask(device=device)
-        else:
-            mask = torch.zeros(num_chunks, device=device, dtype=torch.bool)
-        # Stash for telemetry surface in compute_generator_loss_streaming.
-        self._last_dmd_context_mask = mask
-
-        # Validate clean_x_GT only when at least one chunk needs it.
-        if build_real_view and bool(mask.any()):
-            if clean_x_GT is None:
-                raise RuntimeError(
-                    "dmd_context resolved to at least one GT-dominant "
-                    "chunk this iter but clean_x_GT was not provided. "
-                    "In mix mode (default), callers must build "
-                    "clean_x_GT for every gen-step iter regardless of "
-                    "which way the per-chunk coin lands, since the "
-                    "resolution happens inside this function."
-                )
-            if clean_x_GT.shape[1] != self.num_training_frames:
-                raise RuntimeError(
-                    f"clean_x_GT.shape[1]={clean_x_GT.shape[1]} must "
-                    f"equal num_training_frames={self.num_training_frames}."
-                )
 
         sc_clean_x = clean_x_self.to(dtype=dtype, device=device)
         sc_aug_t = torch.zeros(
@@ -1887,11 +2037,32 @@ class ActionForcingDMD(SelfForcingModel):
             device=device, dtype=torch.long,
         )
 
+        # Decide whether the real-side clean_x mixes in any GT this
+        # iter. "self" and the critic-step short-circuit both produce
+        # None (caller falls back to sc_clean_x).
         sc_clean_x_real: Optional[torch.Tensor] = None
         sc_aug_t_real: Optional[torch.Tensor] = None
-        if build_real_view and bool(mask.any()):
-            # Build the noised GT view (uniform clean_x_aug_t across
-            # all 21 frames before mixing — same as the prior code).
+        needs_gt = build_real_view and self.dmd_context in ("GT", "mix")
+        if needs_gt and self.dmd_context == "mix":
+            # mix_p == 0 collapses to pure self; skip the GT branch
+            # entirely (cheaper, identical result).
+            if float(self.dmd_context_mix_p) <= 0.0:
+                needs_gt = False
+        if needs_gt:
+            if clean_x_GT is None:
+                raise RuntimeError(
+                    f"dmd_context={self.dmd_context!r} requires "
+                    "clean_x_GT this iter but the caller did not "
+                    "provide it. Trainer must assemble clean_x_GT for "
+                    "every gen-step iter when dmd_context is 'GT' or "
+                    "'mix' (mix_p > 0)."
+                )
+            if clean_x_GT.shape[1] != self.num_training_frames:
+                raise RuntimeError(
+                    f"clean_x_GT.shape[1]={clean_x_GT.shape[1]} must "
+                    f"equal num_training_frames={self.num_training_frames}."
+                )
+
             aug_t_full_gt = torch.full(
                 (sc_clean_x.shape[0], self.num_training_frames),
                 fill_value=int(self.clean_x_aug_t),
@@ -1905,69 +2076,19 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t_full_gt.flatten(0, 1),
             ).unflatten(0, gt_view.shape[:2]).to(dtype=dtype)
 
-            # Lift the per-chunk mask to a per-frame bool ([21] when
-            # num_chunks=7, npb=3) by repeating each chunk decision npb
-            # times.
-            per_frame_gt = mask.repeat_interleave(npb)
-            # Belt-and-braces: ensure the per-frame mask matches the
-            # full clean_x window length. Will trip only if num_chunks *
-            # npb != num_training_frames (impossible by construction
-            # given the divisibility check on dmd_context_clean_frames,
-            # but cheap to assert).
-            if per_frame_gt.shape[0] != self.num_training_frames:
-                raise RuntimeError(
-                    f"per-frame GT mask length {per_frame_gt.shape[0]} "
-                    f"does not match num_training_frames="
-                    f"{self.num_training_frames}; check that "
-                    f"num_training_frames is divisible by "
-                    f"num_frame_per_block={npb}."
-                )
-
-            # Yin-yang mixing (default): each chunk is a linear
-            # combination of GT and self views with mix_p / (1-mix_p)
-            # weights, where the dominant view is determined by the
-            # chunk's mask bit. When ``dmd_context_yinyang=False`` we
-            # hard-swap (no minority splash) — equivalent to today's
-            # all-or-nothing per-chunk behavior.
-            if (
-                self.dmd_context == "mix"
-                and self.dmd_context_yinyang
-            ):
-                p = float(self.dmd_context_mix_p)
-                # Per-frame GT contribution weight:
-                #   GT-dominant frames get (1 - p) on GT, p on self
-                #   self-dominant frames get p on GT, (1 - p) on self
-                gt_weight = torch.empty(
-                    self.num_training_frames, device=device, dtype=dtype,
-                )
-                gt_weight[per_frame_gt] = 1.0 - p
-                gt_weight[~per_frame_gt] = p
-                self_weight = 1.0 - gt_weight
-                # Broadcast over [B, F, C, H, W] for the latent tensor.
-                gt_w_lat = gt_weight.view(1, -1, 1, 1, 1)
-                self_w_lat = self_weight.view(1, -1, 1, 1, 1)
-                sc_clean_x_real = (
-                    gt_w_lat * noised_gt + self_w_lat * sc_clean_x
-                )
+            if self.dmd_context == "GT":
+                # Pure GT: real_score sees noised_gt with full aug_t.
+                sc_clean_x_real = noised_gt
+                sc_aug_t_real = aug_t_full_gt
             else:
-                # Hard per-chunk swap (no yinyang): GT-dominant chunks
-                # = pure noised GT; self-dominant chunks = pure self.
-                bcast_lat = per_frame_gt.view(1, -1, 1, 1, 1)
-                sc_clean_x_real = torch.where(
-                    bcast_lat, noised_gt, sc_clean_x,
-                )
-
-            # aug_t per-chunk dominance: GT-dominant frames get
-            # clean_x_aug_t, self-dominant frames get 0. With the
-            # default clean_x_aug_t=0 this is uniform 0 anyway; the
-            # branch only matters once aug_t > 0.
-            bcast_aug = per_frame_gt.view(1, -1)
-            sc_aug_t_real = torch.where(
-                bcast_aug, aug_t_full_gt, sc_aug_t,
-            )
-        # When the mask is all-False (or build_real_view=False), we
-        # leave sc_clean_x_real/sc_aug_t_real as None; _compute_kl_grad's
-        # fallback uses (sc_clean_x, sc_aug_t) for real_score.
+                # mix: uniform linear blend across all frames. Lower
+                # variance than the per-chunk Bernoulli yinyang and
+                # without the chunk-level step-discontinuities along
+                # the time axis. aug_t stays 0 because the blended
+                # frame is dominated by sc_clean_x (which is clean).
+                p = float(self.dmd_context_mix_p)
+                sc_clean_x_real = (1.0 - p) * sc_clean_x + p * noised_gt
+                sc_aug_t_real = sc_aug_t
 
         new_cond = dict(cond_for_scoring)
         new_uncond = dict(uncond_for_scoring)
@@ -3173,39 +3294,101 @@ class ActionForcingDMD(SelfForcingModel):
                     B, n_slots, npb, A,
                 ).mean(dim=2)
 
-        dmd_loss, dmd_log = self.compute_distribution_matching_loss(
-            image_or_video=chunk,
-            conditional_dict=cond_for_scoring,
-            unconditional_dict=uncond_for_scoring,
-            gradient_mask=gradient_mask_eff,
-            denoised_timestep_from=info.get("denoised_timestep_from"),
-            denoised_timestep_to=info.get("denoised_timestep_to"),
-            clean_x=sc_clean_x, aug_t=sc_aug_t,
-            gt_target=gt_target,
-            gt_z_per_slot=gt_z_per_slot,
-            clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
-        )
+        # Dual-teacher routing: when a frozen merged-v14 teacher is
+        # held, the DMD scoring forwards through THAT module (a clean
+        # ``p_real`` model — no GT contamination, no moving target),
+        # not through the LoRA-active ``self.real_score``. We swap
+        # ``self.real_score`` ↔ ``self.real_score_frozen`` for the
+        # duration of the DMD call and pass clean_x_real=None so the
+        # frozen teacher sees only the self-view clean_x (proper DMD,
+        # no GT in the conditioning either). The aux pass below uses
+        # the LoRA teacher with the GT-mixed clean_x_real, gradient
+        # to BOTH the LoRA AND the student.
+        dual_teacher_active = self.real_score_frozen is not None
+        if dual_teacher_active:
+            _saved_real_score = self.real_score
+            self.real_score = self.real_score_frozen
+            try:
+                dmd_loss, dmd_log = self.compute_distribution_matching_loss(
+                    image_or_video=chunk,
+                    conditional_dict=cond_for_scoring,
+                    unconditional_dict=uncond_for_scoring,
+                    gradient_mask=gradient_mask_eff,
+                    denoised_timestep_from=info.get("denoised_timestep_from"),
+                    denoised_timestep_to=info.get("denoised_timestep_to"),
+                    clean_x=sc_clean_x, aug_t=sc_aug_t,
+                    gt_target=gt_target,
+                    gt_z_per_slot=gt_z_per_slot,
+                    clean_x_real=None, aug_t_real=None,
+                )
+            finally:
+                self.real_score = _saved_real_score
+        else:
+            dmd_loss, dmd_log = self.compute_distribution_matching_loss(
+                image_or_video=chunk,
+                conditional_dict=cond_for_scoring,
+                unconditional_dict=uncond_for_scoring,
+                gradient_mask=gradient_mask_eff,
+                denoised_timestep_from=info.get("denoised_timestep_from"),
+                denoised_timestep_to=info.get("denoised_timestep_to"),
+                clean_x=sc_clean_x, aug_t=sc_aug_t,
+                gt_target=gt_target,
+                gt_z_per_slot=gt_z_per_slot,
+                clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
+            )
         dmd_loss = dmd_loss * self.dmd_loss_weight
+
+        # Auxiliary online-teacher pass (option 3 of the dual-teacher
+        # design). When ``real_teacher_train_online`` is True we run a
+        # SECOND real-side forward — through ``self.real_score`` (the
+        # LoRA teacher, possibly the same module as DMD's when dual-
+        # teacher is off) — with the GT-mixed clean_x context and a
+        # noisy_input built from the student chunk (or GT, or a coin).
+        # The flow loss ``(flow_pred - (ε - GT))²`` produces gradient:
+        #   * To the LoRA params (trains the online teacher).
+        #   * To the student chunk via the noise base, when the noise
+        #     base is the chunk (input_source 'student' or coin lands
+        #     student).
+        # Folded into the gen-step total so a single backward
+        # populates both. ``aux_teacher_loss_weight=0`` short-circuits
+        # the pass entirely.
+        aux_log: Dict[str, Any] = {}
+        total_loss = dmd_loss
+        if (
+            self.real_teacher_train_online
+            and self.aux_teacher_loss_weight > 0.0
+        ):
+            aux_loss, aux_log = self._compute_aux_teacher_loss_streaming(
+                chunk=chunk,
+                gradient_mask_eff=gradient_mask_eff,
+                cond_for_scoring=cond_for_scoring,
+                sc_clean_x_real=sc_clean_x_real,
+                sc_aug_t_real=sc_aug_t_real,
+                info=info,
+            )
+            if aux_loss is not None:
+                total_loss = total_loss + self.aux_teacher_loss_weight * aux_loss
 
         for k in ("baseline_last_chunk_mae", "baseline_avg_rollout_mae", "last_chunk_mae", "mae_extension_count"):
             if k in info:
                 dmd_log[k] = info[k]
         dmd_log["streaming_new_frames"] = float(info["new_frames"])
         dmd_log["streaming_current_length"] = float(info["current_length"])
-        # Per-iter realised GT-chunk fraction. Static "GT" / "self"
-        # modes give constant 1.0 / 0.0; mix mode gives a value in
-        # ``{0, 1/num_chunks, ..., 1}`` (= 7-bucketed at the default
-        # geometry). Long-run mean tracks ``dmd_context_mix_p``.
-        mask = getattr(self, "_last_dmd_context_mask", None)
-        if mask is not None:
-            dmd_log["dmd_context_branch_gt"] = float(
-                mask.float().mean().item()
-            )
-        else:
-            dmd_log["dmd_context_branch_gt"] = (
+        # Replacement for the (removed) ``dmd_context_branch_gt`` key.
+        # Under the uniform-mix regime the GT contribution is constant
+        # = ``dmd_context_mix_p`` on every chunk (no per-chunk dice),
+        # so this surfaces the actual blend weight in wandb for any
+        # dashboard/alert that previously tracked the per-iter
+        # realized GT-chunk fraction.
+        dmd_log["dmd_context_mix_p"] = (
+            float(self.dmd_context_mix_p)
+            if self.dmd_context == "mix" else (
                 1.0 if self.dmd_context == "GT" else 0.0
             )
-        return dmd_loss, dmd_log
+        )
+        for k, v in aux_log.items():
+            dmd_log[k] = v
+        return total_loss, dmd_log
 
     def compute_critic_loss_streaming(
         self,
@@ -3344,6 +3527,428 @@ class ActionForcingDMD(SelfForcingModel):
             gradient_mask=gradient_mask_flat,
         )
         return denoising_loss, critic_log
+
+    # ------------------------------------------------------------------
+    # Auxiliary online-teacher pass at the gen step. Forwards the
+    # LoRA-active ``self.real_score`` with grad on both the LoRA params
+    # (trains the online teacher) AND the student chunk (when the
+    # noise base is the chunk). Folded into ``compute_generator_loss_
+    # streaming``'s total loss so a single gen.backward() populates
+    # both gradients. The post-critic ``compute_real_teacher_loss_
+    # streaming`` (below) stays alive — it provides the every-iter
+    # LoRA training cadence; this function provides the every-gen-iter
+    # student-gradient channel.
+    # ------------------------------------------------------------------
+    def _compute_aux_teacher_loss_streaming(
+        self,
+        *,
+        chunk: torch.Tensor,
+        gradient_mask_eff: torch.Tensor,
+        cond_for_scoring: dict,
+        sc_clean_x_real: Optional[torch.Tensor],
+        sc_aug_t_real: Optional[torch.Tensor],
+        info: Dict[str, Any],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Aux pass: forward ``self.real_score`` (LoRA) on
+        ``add_noise(<chunk or GT>, ε, t)`` with the GT-mixed clean_x
+        context, return the FlowPredLoss against GT.
+
+        ``chunk`` is the GENERATOR'S undetached output — the loss
+        gradient flows to the student via the noise base (when
+        ``real_teacher_input_source`` selects the student) AND to the
+        LoRA params via the real_score forward.
+
+        Returns ``(None, log)`` when the ride is too short for a
+        gt_target slice (DDP-synced skip across all ranks).
+        """
+        s = self.streaming_state
+        if sc_clean_x_real is None:
+            # No GT in clean_x this iter (mix_p=0 or "self" mode).
+            # Aux pass has no GT-pull contract — skip.
+            return None, {}
+
+        # GT target slice at the noisy_x positions (= 3 frames forward
+        # of clean_x). Same indexing the teacher_freeze_detect block
+        # uses; reused unchanged so the lag math is locked.
+        chunk_size = s["chunk_size"]
+        cf = s["cf"]
+        noisy_start_sdn = (
+            s["current_length"] - info["new_frames"] - info["overlap"]
+        )
+        ride_window = s.get("ride_latents_window")
+        if ride_window is None:
+            raise RuntimeError(
+                "_compute_aux_teacher_loss_streaming: streaming_state "
+                "missing ride_latents_window — cannot build gt_target."
+            )
+        chunk_lo = cf + noisy_start_sdn
+        chunk_hi = chunk_lo + chunk_size
+        # End-of-ride DDP-sync: same all_reduce(MAX) pattern as the
+        # post-critic teacher step (model/dmd_action_forcing.py:
+        # compute_real_teacher_loss_streaming). Without this, a rank
+        # whose ride is too short would skip the LoRA forward while
+        # peer ranks proceed → DDP AllReduce hang on the LoRA's
+        # gradient sync. With dual-teacher mode the LoRA is also
+        # DDP-wrapped (trainer real_score_ddp), so the hang is real.
+        local_skip_int = 1 if ride_window.shape[1] < chunk_hi else 0
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor(
+                [float(local_skip_int)],
+                device=chunk.device, dtype=torch.float32,
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            skip_all_ranks = bool(flag.item() > 0.5)
+        else:
+            skip_all_ranks = bool(local_skip_int)
+        if skip_all_ranks:
+            return None, {"aux_teacher_skipped_short_ride": 1.0}
+        gt_target = ride_window[:, chunk_lo:chunk_hi].to(
+            dtype=chunk.dtype, device=chunk.device,
+        )
+
+        # Sample fresh ε and t at the DMD timestep distribution.
+        t = self._sample_dmd_timestep(
+            batch_size=chunk.shape[0],
+            num_frame=chunk.shape[1],
+            denoised_timestep_from=info.get("denoised_timestep_from"),
+            denoised_timestep_to=info.get("denoised_timestep_to"),
+            device=chunk.device,
+        )
+        eps = torch.randn_like(chunk)
+
+        # Decide noise base per ``real_teacher_input_source``. "mix"
+        # picks a Bernoulli coin on rank 0 and broadcasts so every
+        # rank uses the same source per iter.
+        if self.real_teacher_input_source == "gt":
+            use_gt = True
+        elif self.real_teacher_input_source == "student":
+            use_gt = False
+        else:
+            p_gt = float(self.real_teacher_input_mix_gt_p)
+            if p_gt <= 0.0:
+                use_gt = False
+            elif p_gt >= 1.0:
+                use_gt = True
+            elif dist.is_available() and dist.is_initialized():
+                if dist.get_rank() == 0:
+                    coin = torch.tensor(
+                        [1.0 if torch.rand(1).item() < p_gt else 0.0],
+                        device=chunk.device, dtype=torch.float32,
+                    )
+                else:
+                    coin = torch.zeros(
+                        1, device=chunk.device, dtype=torch.float32,
+                    )
+                dist.broadcast(coin, src=0)
+                use_gt = bool(coin.item() > 0.5)
+            else:
+                use_gt = bool(torch.rand(1).item() < p_gt)
+        # IMPLICIT GRADIENT CHANNEL: the loss flows back to the
+        # student generator THROUGH ``noise_base`` when it equals
+        # ``chunk`` (which carries autograd from the rollout). When
+        # ``noise_base = gt_target`` (sourced from the dataset's
+        # ride_window) the path is dead-ended — gradient lands only
+        # on the LoRA params. This is the documented mechanism by
+        # which the aux pass "feeds gradient back to the student"
+        # WITHOUT a direct ``MSE(student, GT)`` term. The
+        # student-bound gradient comes from
+        #   ∂loss/∂chunk = (∂loss/∂flow_pred) · (∂flow_pred/∂noisy_input) · α_t
+        # with α_t the scheduler's add_noise scaling — i.e. a
+        # learned-distillation gradient through the LoRA's flow
+        # function, NOT a mean-seeking L2 to GT.
+        noise_base = gt_target if use_gt else chunk
+        if not use_gt:
+            assert chunk.requires_grad, (
+                "_compute_aux_teacher_loss_streaming: noise_base=chunk "
+                "but chunk has no grad — student-gradient channel is "
+                "broken. Caller must pass an undetached chunk from "
+                "compute_generator_loss_streaming."
+            )
+        noisy_input = self.scheduler.add_noise(
+            noise_base.flatten(0, 1),
+            eps.flatten(0, 1),
+            t.flatten(0, 1),
+        ).unflatten(0, chunk.shape[:2])
+
+        # Teacher forward — full grad on LoRA params (and on chunk
+        # via noisy_input when use_gt=False).
+        flow_pred, _x0 = self.real_score(
+            noisy_image_or_video=noisy_input,
+            conditional_dict=cond_for_scoring,
+            timestep=t,
+            clean_x=sc_clean_x_real,
+            aug_t=sc_aug_t_real,
+        )
+
+        # Eval-time stash: surface the LoRA aux teacher's denoised x0
+        # estimate for the sample-video logger. The DMD pass already
+        # stashes ``pred_real`` (= the FROZEN teacher's CFG-extrapolated
+        # x0); this adds ``pred_real_lora`` (= the LoRA aux teacher's
+        # raw x0, no CFG since the aux pass runs cond-only). The
+        # trainer's video logger iteration list includes both keys so
+        # they decode side-by-side per sample step.
+        stash = getattr(self, "_dmd_eval_stash", None)
+        if isinstance(stash, dict):
+            stash["pred_real_lora"] = _x0.detach()
+            stash["aux_teacher_timestep"] = int(t.flatten()[0].item())
+            stash["aux_teacher_input_was_gt"] = 1.0 if use_gt else 0.0
+
+        gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
+        loss = self.denoising_loss_func(
+            x=gt_target.flatten(0, 1),
+            x_pred=None,
+            noise=eps.flatten(0, 1),
+            noise_pred=None,
+            alphas_cumprod=self.scheduler.alphas_cumprod,
+            timestep=t.flatten(0, 1),
+            flow_pred=flow_pred.flatten(0, 1),
+            gradient_mask=gradient_mask_flat,
+        )
+
+        log: Dict[str, Any] = {
+            "aux_teacher_loss": loss.detach(),
+            "aux_teacher_input_was_gt": 1.0 if use_gt else 0.0,
+        }
+        return loss, log
+
+    # ------------------------------------------------------------------
+    # Online real_teacher: flow-loss training of the v14 LoRA against
+    # GT video.
+    # ------------------------------------------------------------------
+    def compute_real_teacher_loss_streaming(
+        self,
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Train the v14 LoRA online: given a noisy input + the same
+        clean_x mix the DMD scoring uses, predict a flow that points
+        to GT.
+
+        Math (v14-parity FlowPredLoss):
+            noisy_input = scheduler.add_noise(<source>, ε, t)
+            flow_pred   = real_score(noisy_input, cond, t,
+                                     clean_x = mix(clean_x_GT,
+                                                   clean_x_self),
+                                     aug_t   = ...)
+            loss        = (flow_pred - (ε - GT))²
+
+        ``<source>`` is selected by ``self.real_teacher_input_source``:
+          * "student": ``chunk_detached`` — amortized refinement
+            target. Default; the bias decays as student → GT.
+          * "gt": ``gt_target`` — proper DMD score matching for
+            ``p_real(x_t)``. No curriculum bias.
+          * "mix": per-iter Bernoulli(``real_teacher_input_mix_gt_p``);
+            DDP-synced from rank 0. True → GT, False → student.
+
+        The LOSS TARGET is always GT regardless of source — the source
+        only decides what the noise is added to.
+
+        Both halves of the clean_x context are CLEAN latents
+        (clean_x_aug_t=0). The only place noise enters is the
+        noisy_input half. v14's training contract preserved.
+
+        Reuses the chunk + info from the critic step — the streaming KV
+        cache state is NOT advanced again. ``chunk`` is detached so the
+        teacher's backward never reaches the student.
+        """
+        s = self.streaming_state
+        # Strict contract — same as gen / critic streaming methods.
+        per_iter_mask = info.get("gradient_mask")
+        if per_iter_mask is None:
+            raise RuntimeError(
+                "compute_real_teacher_loss_streaming: info['gradient_mask'] "
+                "must be a tensor (built by ``_streaming_generate_chunk_with_grad``)."
+            )
+        last_chunk_mask = self._dmd_score_grad_mask(
+            chunk.shape, chunk.device,
+        )
+        # ``per_iter_mask`` is True only on new frames; we apply that
+        # here so the teacher only learns on the same frames the
+        # scorer scores. AND with last-chunk boundary mask.
+        gradient_mask_eff = per_iter_mask & last_chunk_mask
+
+        chunk_detached = chunk.detach()
+
+        clean_x_self = self._streaming_build_clean_x_self(chunk_detached, info)
+        clean_x_GT = self._streaming_build_clean_x_GT(info)
+        clean_cond, clean_uncond = self._streaming_clean_cond_slice(info)
+        cond_for_scoring, uncond_for_scoring = self._streaming_noisy_cond_slice(info)
+
+        # Detach all conditional dicts. ``info["conditional_dict"]`` /
+        # ``info["unconditional_dict"]`` carry autograd state from the
+        # per-iter action-embedding projection inside generate_next_chunk
+        # (action MLP outputs etc.). The trainer just called
+        # ``critic_loss.backward()`` on the line before this one, which
+        # already consumed those saved tensors — reusing them here
+        # raises "Trying to backward through the graph a second time".
+        # The teacher only learns its own LoRA params; cond is a pure
+        # input — no grad needs to flow back through it.
+        def _detach_dict(d):
+            if d is None:
+                return None
+            return {
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in d.items()
+            }
+        clean_cond = _detach_dict(clean_cond)
+        clean_uncond = _detach_dict(clean_uncond)
+        cond_for_scoring = _detach_dict(cond_for_scoring)
+        uncond_for_scoring = _detach_dict(uncond_for_scoring)
+        (
+            _sc_clean_x_fake,         # = clean_x_self; unused on real side
+            _sc_aug_t_fake,           # = zeros; unused on real side
+            sc_clean_x_real,          # = uniform GT/self blend
+            sc_aug_t_real,            # = aug_t (uniform 0 in mix mode)
+            cond_for_scoring,         # action streams at noisy positions
+            _uncond_for_scoring,      # unused (no CFG on training step)
+        ) = self._build_dmd_context_kwargs(
+            clean_x_self=clean_x_self,
+            clean_x_GT=clean_x_GT,
+            clean_conditional_dict=clean_cond,
+            clean_unconditional_dict=clean_uncond,
+            cond_for_scoring=cond_for_scoring,
+            uncond_for_scoring=uncond_for_scoring,
+            device=chunk.device, dtype=chunk.dtype,
+            build_real_view=True,
+        )
+
+        # GT target slice at the noisy_x positions (= 3 frames forward
+        # of clean_x; v14's target geometry). Same indexing the
+        # teacher_freeze_detect block in compute_distribution_matching_loss
+        # uses for `gt_target` — reused unchanged so the lag math is
+        # locked.
+        chunk_size = s["chunk_size"]
+        cf = s["cf"]
+        noisy_start_sdn = (
+            s["current_length"] - info["new_frames"] - info["overlap"]
+        )
+        ride_window = s.get("ride_latents_window")
+        if ride_window is None:
+            # Streaming contract should always provide this; surface
+            # loud rather than silently zero out.
+            raise RuntimeError(
+                "compute_real_teacher_loss_streaming: streaming_state "
+                "missing ride_latents_window — cannot build gt_target."
+            )
+        chunk_lo = cf + noisy_start_sdn
+        chunk_hi = chunk_lo + chunk_size
+        # End-of-ride detection. The check is rank-local — different
+        # ranks pull different rides — so we MUST DDP-sync before
+        # acting on it. Two failure modes if we don't:
+        #   1. The previous return path was ``(chunk_detached * 0.0)``
+        #      which has no ``grad_fn`` (chunk came from generate_next_
+        #      chunk(requires_grad=False)), so .backward() raises.
+        #   2. Even with a grad-bearing zero, a RANK-LOCAL skip means
+        #      the skipping rank never forwards through the DDP-wrapped
+        #      real_score, while peer ranks do — peer backward fires
+        #      AllReduce that hangs forever waiting for the skipper.
+        # Fix: all_reduce(MAX) the skip flag so EVERY rank skips
+        # together when ANY rank can't build a gt_target this iter.
+        # Trainer must then ALSO skip the .backward() call (the
+        # returned zero is a leaf with no grad — a defensive no-op,
+        # not a backward-able loss).
+        local_skip_int = 1 if ride_window.shape[1] < chunk_hi else 0
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor(
+                [float(local_skip_int)],
+                device=chunk.device, dtype=torch.float32,
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            skip_all_ranks = bool(flag.item() > 0.5)
+        else:
+            skip_all_ranks = bool(local_skip_int)
+        if skip_all_ranks:
+            # Non-grad zero. Trainer reads ``REAL_TEACHER_SKIP_KEY``
+            # from the model class to decide whether to call
+            # ``.backward()``; the constant lives on the class
+            # (``ActionForcingDMD.REAL_TEACHER_SKIP_KEY``) so a rename
+            # propagates to both sides without a string-match break.
+            zero = torch.zeros(
+                (), device=chunk.device, dtype=chunk.dtype,
+            )
+            return zero, {self.REAL_TEACHER_SKIP_KEY: 1.0}
+        gt_target = ride_window[:, chunk_lo:chunk_hi].to(
+            dtype=chunk.dtype, device=chunk.device,
+        )
+
+        # Sample fresh ε and t at the DMD timestep distribution.
+        # ``denoised_timestep_from/to`` come from info if the pipeline
+        # populated them (they gate the timestep range when ts_schedule
+        # is on); we use the same hooks the critic step does.
+        t = self._sample_dmd_timestep(
+            batch_size=chunk.shape[0],
+            num_frame=chunk.shape[1],
+            denoised_timestep_from=info.get("denoised_timestep_from"),
+            denoised_timestep_to=info.get("denoised_timestep_to"),
+            device=chunk.device,
+        )
+        eps = torch.randn_like(chunk_detached)
+
+        # Decide the noise base for THIS iter based on the input-
+        # source knob. "mix" picks a Bernoulli coin on rank 0 and
+        # broadcasts so every rank uses the same source per iter
+        # (DDP grads need matched conditioning).
+        if self.real_teacher_input_source == "gt":
+            use_gt = True
+        elif self.real_teacher_input_source == "student":
+            use_gt = False
+        else:
+            p_gt = float(self.real_teacher_input_mix_gt_p)
+            if p_gt <= 0.0:
+                use_gt = False
+            elif p_gt >= 1.0:
+                use_gt = True
+            elif dist.is_available() and dist.is_initialized():
+                if dist.get_rank() == 0:
+                    coin = torch.tensor(
+                        [1.0 if torch.rand(1).item() < p_gt else 0.0],
+                        device=chunk.device, dtype=torch.float32,
+                    )
+                else:
+                    coin = torch.zeros(
+                        1, device=chunk.device, dtype=torch.float32,
+                    )
+                dist.broadcast(coin, src=0)
+                use_gt = bool(coin.item() > 0.5)
+            else:
+                use_gt = bool(torch.rand(1).item() < p_gt)
+        noise_base = gt_target if use_gt else chunk_detached
+        noisy_input = self.scheduler.add_noise(
+            noise_base.flatten(0, 1),
+            eps.flatten(0, 1),
+            t.flatten(0, 1),
+        ).unflatten(0, chunk.shape[:2])
+
+        # Teacher forward — full grad on the LoRA params.
+        flow_pred, _x0 = self.real_score(
+            noisy_image_or_video=noisy_input,
+            conditional_dict=cond_for_scoring,
+            timestep=t,
+            clean_x=sc_clean_x_real,
+            aug_t=sc_aug_t_real,
+        )
+
+        # FlowPredLoss(x=GT, noise=ε, flow_pred=teacher_out).
+        # err = (flow_pred - (ε - GT))²; gradient_mask zeroes the
+        # overlap region + last-chunk boundary.
+        gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
+        loss = self.denoising_loss_func(
+            x=gt_target.flatten(0, 1),
+            x_pred=None,                       # unused by FlowPredLoss
+            noise=eps.flatten(0, 1),
+            noise_pred=None,
+            alphas_cumprod=self.scheduler.alphas_cumprod,
+            timestep=t.flatten(0, 1),
+            flow_pred=flow_pred.flatten(0, 1),
+            gradient_mask=gradient_mask_flat,
+        )
+
+        log: Dict[str, Any] = {
+            "real_teacher_loss": loss.detach(),
+            "real_teacher_timestep": t.detach(),
+            "real_teacher_input_was_gt": 1.0 if use_gt else 0.0,
+        }
+        return loss, log
 
     # ------------------------------------------------------------------
     # SC-DMD: Self-Consistent Distribution Matching Distillation.

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-gan-16h-8node
+#SBATCH --job-name=action-forcing-phase1-baseline-16h-8node
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,41 +11,25 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-1 Action-Forcing DMD — DEFAULTS + R3GAN, 1 node x 4 GPUs, 16h.
+# Phase-1 Action-Forcing DMD — BASELINE, 8 nodes x 4 GPUs.
 #
-# Same as ``train_action_forcing_phase1_16h.sbatch`` (pure DMD, no
-# aux losses, no SC-DMD) PLUS the R3GAN discriminator (RpGAN + R1 +
-# R2 zero-centered grad penalty) trained on GT vs student latent
-# video. Recipe ported verbatim from action_forcing_phase1_aux_gan.yaml,
-# minus the action critic / motion teacher (this config is "defaults +
-# R3GAN only", clean A/B vs the defaults sbatch).
-#
-# R3GAN knobs (configs/action_forcing_phase1_gan.yaml):
-#   * gan_loss_weight: 0.05         (G-side RpGAN, ~5% of DMD magnitude)
-#   * gan_r1_gamma: 1.0
-#   * gan_r2_gamma: 1.0             (R3GAN paper requires both R1 + R2)
-#   * gan_warmup_steps: 500         (linear ramp on the G side; D
-#                                    updates from step 0 regardless)
-#   * gan_updates_per_step: 1       (1:1 D:G ratio)
-#   * gan_lr: 2e-4, betas=[0.0, 0.9] (StyleGAN/R3GAN convention)
-#
-# Memory cost over the defaults sbatch: ~1-2 GB for the discriminator
-# parameters + activations + the R1/R2 second-order graph. Wallclock
-# cost: 1 D forward + 1 D backward (with create_graph for R1/R2) + 1
-# frozen-D forward for G's term — typically ~50-80 ms/iter at
-# gan_disc_base_channels=64 on H100.
+# Pure DMD baseline: aux losses OFF (action_critic / state_probe heads
+# instantiated for ODE-checkpoint compatibility but their losses are
+# not consumed), no R3GAN, no SC-DMD. Bound to
+# configs/action_forcing_phase1_baseline.yaml — see that file for the
+# full hyperparameter table.
 #
 # Sister sbatches:
-#   sbatch/train_action_forcing_phase1_16h.sbatch        (defaults only)
-#   sbatch/train_action_forcing_phase1_scdmd_16h.sbatch  (defaults + SC-DMD)
+#   sbatch/train_action_forcing_phase1_gan_16h_8node.sbatch    (baseline + R3GAN)
+#   sbatch/train_action_forcing_phase1_scdmd_16h_8node.sbatch  (baseline + SC-DMD)
 # =====================================================================
 
 set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_16h_v5_online_teacher
+CONFIG=configs/action_forcing_phase1_baseline.yaml
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_baseline_8node
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -73,7 +57,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-1 Action-Forcing DMD + R3GAN (1 node x 4 GPUs, 16h) on $(date)"
+echo "Starting Phase-1 Action-Forcing DMD baseline (8 nodes x 4 GPUs) on $(date)"
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -100,17 +84,15 @@ srun torchrun \
     state_probe_aux_enabled=false \
     max_rolls_per_ride=300 \
     dfake_gen_update_ratio=5 \
-    collapse_mae_threshold=0.2 \
-    mae_extension_threshold=0.2 \
+    collapse_mae_threshold=0.1 \
+    mae_extension_threshold=0.1 \
     model_kwargs.local_attn_size=42 \
     local_attn_size_schedule=[[0,42]] \
-    dmd_context=mix \
-    dmd_context_mix_p=0.25 \
-    dmd_context_yinyang=true \
-    real_teacher_train_online=true \
-    real_teacher_causal_mask=false \
-    real_guidance_scale=1.0 \
+    dmd_context=self \
+    real_teacher_train_online=false \
+    real_teacher_causal_mask=true \
+    real_guidance_scale=3.0 \
     num_workers=0 \
-    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v5_online_teacher
+    run_name=action_forcing_phase1_baseline_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

@@ -481,6 +481,7 @@ class ZarrRideDataset(Dataset):
         start_zarr_index: int = 0,
         max_rides: Optional[int] = None,
         sort_by_length: Optional[str] = None,
+        cache_path: Optional[str] = None,
     ):
         self.encoded_root = Path(encoded_root)
         self.caption_root = Path(caption_root)
@@ -489,6 +490,11 @@ class ZarrRideDataset(Dataset):
         self.start_zarr_index = start_zarr_index
         self.max_rides = max_rides
         self.sort_by_length = sort_by_length
+        # Optional on-disk cache for the ride scan. ``_build_index`` reads
+        # from it on entry (skipping the 30-min zarr scan) and writes
+        # back to it after a fresh scan. The version + encoded_root are
+        # validated on load — mismatches force a re-scan.
+        self.cache_path = cache_path
 
         ss_dev = ss_vae_device or device
         logging.info("Loading ss_vae from %s on %s", ss_vae_checkpoint, ss_dev)
@@ -547,6 +553,56 @@ class ZarrRideDataset(Dataset):
         return obj
 
     def _build_index(self) -> None:
+        # Trainer-supplied cache (constructor kwarg). When provided AND
+        # the file exists with a matching version + encoded_root, this
+        # short-circuits the 30-min zarr scan. After a fresh scan the
+        # cache is written back so the next run starts instantly.
+        # Mirrors the shape of ``build_ride_manifest``'s on-disk cache
+        # (rides, version, encoded_root keys).
+        if self.cache_path and os.path.exists(self.cache_path):
+            try:
+                _cached = torch.load(
+                    self.cache_path, map_location="cpu", weights_only=False,
+                )
+                _ver = (
+                    _cached.get("version") if isinstance(_cached, dict) else None
+                )
+                _enc = (
+                    _cached.get("encoded_root") if isinstance(_cached, dict) else None
+                )
+                _rides = (
+                    _cached.get("rides") if isinstance(_cached, dict) else None
+                )
+                if (
+                    _ver == _MANIFEST_VERSION
+                    and _enc == str(self.encoded_root)
+                    and _rides
+                ):
+                    if self.max_rides is not None:
+                        _rides = _rides[: int(self.max_rides)]
+                    for r in _rides:
+                        zp = Path(r["zarr_path"])
+                        self._rides.append((zp, r["prompt_embeds"], r["attrs"], int(r["n_latent_frames"])))
+                        self._attrs_by_path[str(zp)] = r["attrs"]
+                    logging.info(
+                        "[ZarrRideDataset] cache_path=%s -> loaded %d rides (no scan)",
+                        self.cache_path, len(self._rides),
+                    )
+                    if self.sort_by_length in ("asc", "desc"):
+                        self._rides.sort(key=lambda r: r[3], reverse=(self.sort_by_length == "desc"))
+                    return
+                else:
+                    logging.info(
+                        "[ZarrRideDataset] cache at %s rejected (version=%s "
+                        "expected=%d, encoded_root=%s expected=%s) — rescanning.",
+                        self.cache_path, _ver, _MANIFEST_VERSION,
+                        _enc, str(self.encoded_root),
+                    )
+            except Exception as exc:
+                logging.warning(
+                    "[ZarrRideDataset] cache load failed (%s); rescanning.", exc,
+                )
+
         # Smoke-test affordance: skip the per-zarr scan and load a pre-built manifest.
         _manifest_pickle = os.environ.get("ARRWM_MANIFEST_PICKLE")
         if _manifest_pickle:
@@ -627,6 +683,52 @@ class ZarrRideDataset(Dataset):
         )
         if not self._rides:
             raise RuntimeError("No valid rides found. Check encoded_root, caption_root, motion_root.")
+
+        # Persist the freshly-scanned manifest if the caller supplied
+        # ``cache_path``. RANK-0 ONLY: 32 ranks racing torch.save on the
+        # same Lustre path would corrupt the pickle. Other ranks just
+        # log + continue (they paid the scan cost in parallel anyway,
+        # which is fine since the scan is read-only on the encoded
+        # zarrs). Future runs (same encoded_root, same version) short-
+        # circuit the scan via the load path above.
+        _is_rank0 = True
+        try:
+            import torch.distributed as _dist
+            if _dist.is_available() and _dist.is_initialized():
+                _is_rank0 = _dist.get_rank() == 0
+        except Exception:
+            pass
+        if self.cache_path and _is_rank0:
+            try:
+                # Atomic write via tempfile + rename so a partial write
+                # (process killed mid-save) doesn't poison the cache.
+                _tmp = f"{self.cache_path}.tmp.{os.getpid()}"
+                Path(self.cache_path).parent.mkdir(parents=True, exist_ok=True)
+                _payload = {
+                    "version": _MANIFEST_VERSION,
+                    "encoded_root": str(self.encoded_root),
+                    "rides": [
+                        {
+                            "zarr_path": str(zp),
+                            "prompt_embeds": pe,
+                            "attrs": at,
+                            "n_latent_frames": nl,
+                        }
+                        for (zp, pe, at, nl) in self._rides
+                    ],
+                }
+                torch.save(_payload, _tmp)
+                os.replace(_tmp, self.cache_path)
+                logging.info(
+                    "[ZarrRideDataset rank0] manifest cache written to %s "
+                    "(%d rides; reuse on next run skips the %.1fs scan)",
+                    self.cache_path, len(self._rides), elapsed,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "[ZarrRideDataset] manifest cache write failed (%s); "
+                    "next run will re-scan.", exc,
+                )
 
         # Optional ride ordering by latent frame count. Driven by
         # ``self.sort_by_length`` (set by the trainer via __init__

@@ -1,237 +1,16 @@
-# Phase-1 Action-Forcing DMD config (NO STAIRCASE) — AUX + R3GAN + SC-DMD
+# Phase-1 Action-Forcing DMD — AUX + R3GAN + SC-DMD smoke variant.
+# Thin overlay on top of action_forcing_phase1_aux.yaml.
 #
-# Identical to ``configs/action_forcing_phase1_aux_gan.yaml`` PLUS the
-# SC-DMD (Salt paper, arXiv 2604.03118v1) semigroup defect regularizer.
-#
-# Salt / SC-DMD intuition:
-#   DMD is trained to match the teacher's score field at each
-#   timestep INDEPENDENTLY, but at inference the student composes
-#   multi-step denoising trajectories. This composition is where
-#   DMD students drift — the per-timestep distribution match is
-#   correct but the COMPOSITION of two consecutive matches isn't.
-#   Salt fixes this by adding a regularizer that explicitly enforces
-#   semigroup consistency:
-#
-#       L_SC = E[ || Ψ_θ^{ts→te}(x_ts)
-#                  - Ψ_θ^{tm→te}(Ψ_θ^{ts→tm}(x_ts)) ||² ]
-#
-#   where Ψ_θ^{a→b}(·) is one Euler step of the student's velocity
-#   field from noise level ``a`` down to ``b``. The defect term
-#   penalises the gap between the direct one-step path
-#   (``t_s → t_e``) and the composed two-step path
-#   (``t_s → t_m → t_e``). Both paths share the same start point
-#   x_ts and target endpoint t_e; perfect consistency means they
-#   land on the same x_te. The Salt paper proves this is a local
-#   convergence regularizer (Theorem 1) and shows ~0.5-1.0 dB FID
-#   gains on FastVideo with negligible compute cost.
-#
-# Cost model (this config):
-#   * Implementation lives in ``ActionForcingDMD.sc_dmd_loss`` —
-#     single chunk (chunk-0, fresh ``num_frame_per_block``-frame KV
-#     cache), 2 extra DiT forwards on a 3-frame chunk per gen step.
-#   * Compared to the 7-chunk × 21-frame full rollout already
-#     running per gen step, SC adds ~2/(7*7) ≈ 4% extra DiT compute
-#     per gen step, or ~1-2% extra wallclock end-to-end.
-#   * Memory: ~10 MB for the small fresh KV cache (sized to one
-#     chunk, not 21 frames). Activation memory for the 2 forwards
-#     is bounded by 2 × chunk-0 activations ≈ 100-200 MB at
-#     gradient_checkpointing=true. Fits comfortably alongside the
-#     existing rollout/aux/GAN memory.
-#
-# Why "single chunk" only:
-#   The SC pass needs a CONTROLLED denoising trajectory at known
-#   noise levels (t_s, t_m, t_e from ``denoising_step_list``). The
-#   main rollout's exit-flag pattern only commits one grad-enabled
-#   forward per chunk at a randomly-chosen rung, so it doesn't
-#   expose the t_s/t_m/t_e triple we need. Running SC on a fresh
-#   chunk-0 forward (empty KV cache, no prior context) gives a
-#   clean isolated test of the velocity field's local consistency,
-#   which is the paper's plain-SC variant (Section 3.2). We
-#   deliberately skip the paper's mixed-step training and
-#   cache-conditioned feature alignment extensions for simplicity.
-#
-# To DISABLE SC-DMD (and revert to AUX+GAN-only), set
-# ``sc_dmd_enabled: false`` (the trainer skips the SC pass entirely).
+# Used by sbatch/smoke_action_forcing_phase1_aux_gan_scdmd.sbatch.
+# Stacks the R3GAN discriminator AND the SC-DMD self-consistency
+# regularizer on the aux pipeline.
+
+_extends: action_forcing_phase1_aux.yaml
 
 config_name: action-forcing-phase1-aux-gan-scdmd
 run_name: action_forcing_phase1_aux_gan_scdmd
 
-seed: 0
-mixed_precision: true
-log_interval: 10
-checkpoint_interval: 500
-max_steps: 10000
-max_grad_norm: 10.0
-auto_resume: true
-strict_resume_load: false
-strict_ode_load: false
-
-distillation: action_forcing
-
-wandb_project: longlive-phase1
-wandb_dir: ./wandb
-disable_wandb: false
-
-log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
-
-# ---------------------------------------------------------------------------
-# Data (verbatim from the AUX+GAN config)
-# ---------------------------------------------------------------------------
-encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
-caption_root: /projects/u6ex/fbots/frodobots_captions/train
-motion_root: /projects/u6ex/fbots/frodobots_motion
-ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
-
-action_dims: [2, 7]
-raw_action_dim: 2
-action_dim: 2
-enable_adaln_zero: true
-action_conditioning_mode: both
-
-min_ride_frames: 69
-max_rides: null
-max_ride_frames: 200
-
-sort_rides_by_length: asc
-num_workers: 0
-
-# ---------------------------------------------------------------------------
-# Model (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-distribution_loss: dmd_action_forcing
-model_name: Wan2.1-T2V-1.3B
-real_model_name: Wan2.1-T2V-1.3B
-fake_model_name: Wan2.1-T2V-1.3B
-num_training_frames: 21
-num_train_timestep: 1000
-denoising_loss_type: flow
-gradient_checkpointing: true
-
-rollout_frames: null
-
-mae_extension_threshold: 0.4
-mae_extension_max_extra_chunks: 13
-
-model_kwargs:
-  timestep_shift: 5.0
-  local_attn_size: 21
-  sink_size: 0
-
-i2v: false
-text_pre_encoded: true
-
-infinity_rope: true
-
-# ---------------------------------------------------------------------------
-# CF-style pipeline geometry (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-num_frame_per_block: 3
-chunks_per_rolling_step: 1
-same_step_across_blocks: true
-last_step_only: false
-context_noise: 0
-denoising_step_list: [1000, 625, 312.5, 178.6]
-
-action_patch_enabled: true
-action_modulation_activation: silu
-
-# ---------------------------------------------------------------------------
-# AUX HEADS (verbatim from AUX+GAN — action critic + teacher ON)
-# ---------------------------------------------------------------------------
-action_critic_aux_enabled: true
-action_critic_z_out_dim: 8
-action_critic_base_channels: 128
-action_critic_num_blocks: 4
-action_critic_dims: [2, 7]
-
-state_probe_aux_enabled: true
-state_head_out_dim: 8
-state_probe_dim: 256
-state_probe_num_heads: 8
-state_probe_n_taps: 6
-state_head_loss_weight: 0.0
-state_guidance_weight: 0.0
-
-# ---------------------------------------------------------------------------
-# Action teacher (verbatim from AUX+GAN — ON)
-# ---------------------------------------------------------------------------
-action_teacher_mode: "all"
-cotracker_source_dir: /home/u6ex/as1748.u6ex/.cache/torch/hub/facebookresearch_co-tracker_main
-cotracker_checkpoint_path: /home/u6ex/as1748.u6ex/.cache/torch/hub/checkpoints/scaled_offline.pth
-
-# ---------------------------------------------------------------------------
-# Critic optimizer + z-guidance recipe (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-critic_lr: 3.0e-04
-critic_betas: [0.9, 0.999]
-critic_eps: 1.0e-08
-critic_weight_decay: 0.0
-critic_max_grad_norm: 10.0
-critic_updates_per_step: 2
-
-action_critic_z_loss_weight: 0.25
-generator_action_z_guidance_weight: 0.125
-z_guidance_warmup_steps: 500
-warmup_steps: 0
-
-# ---------------------------------------------------------------------------
-# Checkpoints (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-ode_generator_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/action_ode_distill_E/action_ode_step0001000.pt
-v14_teacher_checkpoint: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_balanced_weunz/causal_lora_step0006600.pt
-v14_lora:
-  rank: 256
-  alpha: 256
-  dropout: 0.0
-
-# ---------------------------------------------------------------------------
-# DMD + critic loss config (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-dmd_loss_weight: 1.0
-real_guidance_scale: 0.0
-cfg_uncond_keep_actions: true   # CFG uncond keeps action streams identical to cond; only prompt_embeds zeroed (in-distribution for v14 LoRA)
-fake_guidance_scale: 0.0
-timestep_shift: 5.0
-ts_schedule: false
-ts_schedule_max: false
-min_score_timestep: 0
-
-# Teacher-forcing context for the bidirectional scorers (v14 parity).
-# See action_forcing_phase1.yaml for the full doc-block; cf=3 = one chunk
-# of GT seed prefilled into the generator's KV cache at t=0.
-dmd_context: "GT"
-dmd_context_clean_frames: 9
-clean_x_aug_t: 0
-
-fake_score_updates_enabled: true
-dfake_gen_update_ratio: 2
-
-ema_weight: 0.99
-ema_start_step: 200
-
-# ---------------------------------------------------------------------------
-# Optimizer (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-lr: 2.0e-06
-betas: [0.0, 0.999]
-eps: 1.0e-08
-weight_decay: 0.01
-train_action_projection: true
-train_action_token_projection: true
-
-fake_lr: 4.0e-07
-fake_betas: [0.0, 0.999]
-fake_eps: 1.0e-08
-fake_weight_decay: 0.01
-fake_max_grad_norm: 10.0
-
-debug_find_unused_parameters: false
-assert_grad_uniformity: false
-nccl_timeout_minutes: 60
-
-# ---------------------------------------------------------------------------
-# R3GAN — RpGAN + R1 + R2 discriminator (verbatim from AUX+GAN — ON)
-# ---------------------------------------------------------------------------
+# R3GAN — RpGAN + R1 + R2 discriminator.
 gan_enabled: true
 gan_disc_in_channels: 16
 gan_disc_base_channels: 64
@@ -247,45 +26,15 @@ gan_eps: 1.0e-08
 gan_weight_decay: 0.0
 gan_max_grad_norm: 10.0
 
-# ---------------------------------------------------------------------------
-# SC-DMD (Salt) — semigroup defect regularizer. THIS IS THE DIFF VS THE
-# AUX+GAN CONFIG.
-# ---------------------------------------------------------------------------
+# SC-DMD — single-chunk Salt regularizer at 5% of DMD magnitude.
 sc_dmd_enabled: true
-
-# ``sc_dmd_loss_weight``: how much weight to put on the SC defect.
-# DMD's gen loss is typically O(1.0) at steady state; SC defect is
-# O(0.01-0.1) (similar magnitudes to the model's per-frame x0 MAE).
-# A weight of 0.05 puts SC at ~5% of DMD's contribution once
-# warmed up. If SC ends up dominating (gen DMD loss flatlines), drop
-# to 0.02; if SC has no effect (composed-vs-direct gap stays high),
-# bump to 0.1. Paper recipe is closer to 0.1; we start conservative.
 sc_dmd_loss_weight: 0.05
-
-# ``sc_dmd_warmup_steps``: linearly ramp SC weight from 0 →
-# ``sc_dmd_loss_weight`` over this many steps. SC needs the student
-# to produce non-trivial x0 predictions before its defect signal
-# becomes meaningful — early in training x0_hat is essentially
-# noise so SC just penalises arbitrary drift. Mirror the
-# z-guidance and GAN warmups (500 steps).
 sc_dmd_warmup_steps: 500
 
-# ---------------------------------------------------------------------------
-# Visualization (verbatim from AUX+GAN)
-# ---------------------------------------------------------------------------
-vis_wallclock_seconds: 0
-vis_num_chunks: 0
-vis_fps: 8
-vis_to_wandb: false
-vis_save_local: false
-vis_emit_on_first_step: false
-
-# ---------------------------------------------------------------------------
-# Trainer-internal feature flags (verbatim)
-# ---------------------------------------------------------------------------
-slots_per_rank: 1
-rolling_steps_per_iter: null
-collapse_mae_threshold: 0.5  # ride-extension gate (deferred multi-batch): MAE > threshold => do NOT extend on this ride next batch; MAE <= threshold => keep rolling. Current rollout always trains. Set null to disable.
-backward_simulation: true
-independent_first_frame: false
-warp_denoising_step: false
+# Preserve HEAD behaviour: HEAD aux_gan_scdmd had no sample_* keys
+# (trainer default sample_interval=0 → no sampling). Without this,
+# the overlay would inherit aux base's sample_interval=200 and add a
+# per-200-step VAE decode + video write that wasn't there before —
+# enough to throw off any tight wallclock measurement on this smoke
+# variant. Set explicit 0 to match HEAD.
+sample_interval: 0

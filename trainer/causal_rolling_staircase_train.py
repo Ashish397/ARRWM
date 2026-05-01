@@ -531,6 +531,17 @@ class RollingStaircaseDMDTrainer:
                 f"{{None, 'none', 'asc', 'desc'}}; got {sort_mode!r}"
             )
 
+        # Manifest cache: rank-0 writes after a fresh scan; every rank
+        # reads on subsequent runs and skips the ~30-min scan when the
+        # cache version + encoded_root match. Lives under the run's
+        # log_dir so distinct configs (different encoded_roots) get
+        # distinct caches automatically. ``log_dir`` may be a string;
+        # let pathlib handle the join.
+        _log_dir = getattr(cfg, "log_dir", None)
+        _manifest_cache = (
+            str(Path(_log_dir) / ".ride_manifest.pt")
+            if _log_dir else None
+        )
         self.dataset = ZarrRideDataset(
             encoded_root=encoded_root,
             caption_root=caption_root,
@@ -540,6 +551,7 @@ class RollingStaircaseDMDTrainer:
             device="cpu",
             max_rides=int(max_rides) if max_rides is not None else None,
             sort_by_length=sort_mode,
+            cache_path=_manifest_cache,
         )
 
         shuffle_rides = (sort_mode is None)

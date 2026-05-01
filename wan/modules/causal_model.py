@@ -879,11 +879,25 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         device: torch.device | str, num_frames: int = 21,
         frame_seqlen: int = 1560, num_frame_per_block=1,
         context_shift: int = 0,
+        causal: bool = True,
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
         [1 latent frame] [1 latent frame] ... [1 latent frame]
         We use flexattention to construct the attention mask
+
+        When ``causal=True`` (default; v14 parity) the mask is
+        block-causal on the joint [clean | noisy] sequence: clean
+        attends to preceding clean; noisy attends to its own block
+        plus preceding (block_index + context_shift) clean blocks.
+
+        When ``causal=False`` the mask is FULLY BIDIRECTIONAL — every
+        position attends to every other position across the joint
+        sequence. Padding is still respected via ``total_length``.
+        Used by the online real_teacher feature when its yaml flag
+        ``real_teacher_causal_mask: false`` (rare; v14 was trained with
+        the mask, so warm-starting without it produces a step-1
+        distribution mismatch).
         """
         # # debug
         # DEBUG = False
@@ -938,17 +952,26 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             # noise_context_starts[start:end] = 0
             noise_context_ends[start:end] = (block_index + context_shift) * attention_block_size
 
-        def attention_mask(b, h, q_idx, kv_idx):
-            # first design the mask for clean frames
-            clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
-            # then design the mask for noisy frames
-            # noisy frames will attend to all clean preceeding clean frames + itself
-            C1 = (kv_idx < noise_noise_ends[q_idx]) & (kv_idx >= noise_noise_starts[q_idx])
-            C2 = (kv_idx < noise_context_ends[q_idx]) & (kv_idx >= noise_context_starts[q_idx])
-            noise_mask = (q_idx >= clean_ends) & (C1 | C2)
+        if causal:
+            def attention_mask(b, h, q_idx, kv_idx):
+                # first design the mask for clean frames
+                clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
+                # then design the mask for noisy frames
+                # noisy frames will attend to all clean preceeding clean frames + itself
+                C1 = (kv_idx < noise_noise_ends[q_idx]) & (kv_idx >= noise_noise_starts[q_idx])
+                C2 = (kv_idx < noise_context_ends[q_idx]) & (kv_idx >= noise_context_starts[q_idx])
+                noise_mask = (q_idx >= clean_ends) & (C1 | C2)
 
-            eye_mask = q_idx == kv_idx
-            return eye_mask | clean_mask | noise_mask
+                eye_mask = q_idx == kv_idx
+                return eye_mask | clean_mask | noise_mask
+        else:
+            # Full-bidirectional joint sequence (real_teacher_causal_mask=false).
+            # Every position attends to every other position; padding is
+            # still respected because the BlockMask is built only over
+            # ``total_length + padded_length`` and downstream attention
+            # implementations honour the padding extents.
+            def attention_mask(b, h, q_idx, kv_idx):
+                return q_idx >= 0  # always-True mask (q_idx is non-negative by construction)
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
                                        KV_LEN=total_length + padded_length, _compile=True, device=device)
@@ -1404,6 +1427,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block,
                         context_shift=self.context_shift,
+                        causal=bool(getattr(self, "tf_use_causal_mask", True)),
                     )
             else:
                 if self.independent_first_frame:
