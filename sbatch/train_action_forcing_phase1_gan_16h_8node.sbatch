@@ -45,7 +45,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_16h
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_16h_v4
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -95,12 +95,19 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    real_guidance_scale=0.0 \
-    action_teacher_mode=all \
+    action_teacher_mode=off \
+    action_critic_aux_enabled=false \
+    state_probe_aux_enabled=false \
     max_rolls_per_ride=300 \
-    dfake_gen_update_ratio=1 \
-    streaming_max_length=1500 \
-    max_ride_frames=1490 \
-    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}
+    dfake_gen_update_ratio=5 \
+    collapse_mae_threshold=0.2 \
+    mae_extension_threshold=0.2 \
+    model_kwargs.local_attn_size=42 \
+    local_attn_size_schedule=[[0,42]] \
+    dmd_context=mix \
+    dmd_context_mix_p=0.25 \
+    dmd_context_yinyang=true \
+    num_workers=0 \
+    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v4
 
 echo "Training completed on $(date)"

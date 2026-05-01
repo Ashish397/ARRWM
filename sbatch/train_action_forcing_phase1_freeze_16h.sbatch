@@ -142,12 +142,12 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    real_guidance_scale=0.0 \
     action_teacher_mode=all \
     max_rolls_per_ride=300 \
     dfake_gen_update_ratio=1 \
     streaming_max_length=1500 \
     max_ride_frames=1490 \
+    num_workers=0 \
     run_name=action_forcing_phase1_freeze_j${SLURM_JOB_ID}_v2
 
 echo "Training completed on $(date)"

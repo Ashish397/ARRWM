@@ -182,7 +182,7 @@ max_ride_frames: 1200
 # Curriculum: shortest valid first.
 sort_rides_by_length: null
 
-num_workers: 2
+num_workers: 0
 
 # ---------------------------------------------------------------------------
 # Model
@@ -507,6 +507,7 @@ v14_lora:
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
 real_guidance_scale: 0.0
+cfg_uncond_keep_actions: true   # CFG uncond keeps action streams identical to cond; only prompt_embeds zeroed (in-distribution for v14 LoRA)
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)

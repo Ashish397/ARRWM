@@ -216,13 +216,58 @@ class ActionForcingDMD(SelfForcingModel):
         # Default ``"GT"`` — the v14 teacher-forcing contract that the
         # LoRA was actually trained against gives a tight DMD signal.
         self.dmd_context = str(getattr(args, "dmd_context", "GT")).strip().lower()
-        if self.dmd_context not in ("self", "gt"):
+        if self.dmd_context not in ("self", "gt", "mix"):
             raise ValueError(
-                f"dmd_context must be 'self' or 'GT' (case-insensitive); "
-                f"got {getattr(args, 'dmd_context', None)!r}."
+                f"dmd_context must be 'self', 'GT', or 'mix' "
+                f"(case-insensitive); got "
+                f"{getattr(args, 'dmd_context', None)!r}."
             )
         # Normalise canonical case for downstream comparisons.
-        self.dmd_context = "GT" if self.dmd_context == "gt" else "self"
+        if self.dmd_context == "gt":
+            self.dmd_context = "GT"
+        # ``dmd_context_mix_p``: per-CHUNK probability of routing
+        # real_score's clean_x through the GT view (vs the self view).
+        # Only consulted when ``dmd_context == "mix"``. The 21-frame
+        # clean_x window is divided into ``num_training_frames /
+        # num_frame_per_block`` chunks; each chunk independently flips
+        # a Bernoulli(``dmd_context_mix_p``) coin to decide if it's a
+        # "GT-dominant" or "self-dominant" chunk. 0.5 = balanced;
+        # 0.0 collapses to pure self; 1.0 collapses to pure GT. The
+        # per-chunk vector is sampled on rank 0 and broadcast across
+        # DDP so every rank takes the same per-chunk decision (DMD's
+        # (fake-real) subtraction needs matched conditioning across
+        # ranks; otherwise the gradient sum is malformed).
+        self.dmd_context_mix_p = float(
+            getattr(args, "dmd_context_mix_p", 0.5)
+        )
+        if not (0.0 <= self.dmd_context_mix_p <= 1.0):
+            raise ValueError(
+                f"dmd_context_mix_p must be in [0, 1]; got "
+                f"{self.dmd_context_mix_p!r}."
+            )
+        # ``dmd_context_yinyang``: when True (default), each chunk is a
+        # LINEAR COMBINATION of GT and self views with weights derived
+        # from ``dmd_context_mix_p``:
+        #   GT-dominant chunks  : (1 - mix_p) * GT + mix_p * self
+        #   self-dominant chunks: (1 - mix_p) * self + mix_p * GT
+        # i.e., the dominant view contributes (1 - mix_p), the minority
+        # view splashes in at mix_p. Each chunk's IDENTITY (dominant
+        # source) is decided by the same per-chunk Bernoulli coin
+        # described above. At mix_p=0.5 the two chunk types collapse
+        # to an identical 50/50 average (intentional: there is no
+        # "dominant" view at that point). When False, chunks hard-swap
+        # between pure-GT and pure-self with no minority splash. Only
+        # consulted when ``dmd_context == "mix"``.
+        self.dmd_context_yinyang = bool(
+            getattr(args, "dmd_context_yinyang", True)
+        )
+        # Last per-chunk mask resolved by ``_build_dmd_context_kwargs``
+        # (bool tensor, shape ``[num_training_frames //
+        # num_frame_per_block]``; True = GT-dominant chunk). Stashed
+        # for telemetry — ``compute_generator_loss_streaming`` reads
+        # this to surface the realised GT-chunk fraction per iter.
+        # ``None`` until the first call.
+        self._last_dmd_context_mask: Optional[torch.Tensor] = None
 
         # Number of leading GT frames that seed the KV cache before the
         # student's rolling rollout starts (= the model's KV-cache size,
@@ -596,6 +641,18 @@ class ActionForcingDMD(SelfForcingModel):
         self.streaming_chunk_size: int = int(getattr(args, "streaming_chunk_size", self.num_training_frames))
         self.streaming_min_new_frame: int = int(getattr(args, "streaming_min_new_frame", self.streaming_chunk_size - self.num_frame_per_block))
         self.streaming_max_length: int = int(getattr(args, "streaming_max_length", 57))
+        # ``boundary_vae_roundtrip``: Causal-Forcing/long_video parity
+        # for the rolling-cache boundary (CF: long_video/model/base.py:
+        # 155-167). When True and the streaming chunk has overlap (iter
+        # k>=2), the first frame of the chunk is replaced by a VAE
+        # decode->encode round-trip — temporal context is the prior
+        # iter's full chunk, and the re-encoded LAST pixel frame
+        # becomes the fresh image-manifold latent at the seam. Default
+        # False (legacy behavior); flip via config when long-horizon
+        # AR drift starts compounding into blur.
+        self.boundary_vae_roundtrip: bool = bool(
+            getattr(args, "boundary_vae_roundtrip", False)
+        )
         # Deterministic stride for slide-and-train: when > 0, every
         # ``_streaming_pick_new_frames`` call returns exactly this many
         # ``num_frame_per_block``-chunks (* npb frames) instead of the
@@ -1167,6 +1224,49 @@ class ActionForcingDMD(SelfForcingModel):
         mask = torch.ones(shape, dtype=torch.bool, device=device)
         mask[:, -block:] = False
         return mask
+
+    # ------------------------------------------------------------------
+    # dmd_context per-chunk mask resolver.
+    # ------------------------------------------------------------------
+    def _resolve_dmd_context_mask(self, device: torch.device) -> torch.Tensor:
+        """Resolve the per-chunk GT/self assignment for real_score's
+        clean_x window. Returns a bool tensor of shape
+        ``[num_chunks] = [num_training_frames // num_frame_per_block]``,
+        where ``True`` = GT-dominant chunk, ``False`` = self-dominant.
+
+        Behavior by mode:
+          * ``"GT"``   : all-True (every chunk is GT-dominant; reduces
+                         to today's pure-GT path).
+          * ``"self"`` : all-False (every chunk is self-dominant; real
+                         falls back to fake's view in ``_compute_kl_grad``).
+          * ``"mix"``  : per-chunk Bernoulli(``dmd_context_mix_p``).
+                         Rank 0 samples the full ``[num_chunks]`` vector
+                         and broadcasts; every DDP rank ends up with the
+                         same mask (matched conditioning is required for
+                         the (fake - real) subtraction).
+
+        The DDP collective is a single ``broadcast`` of a small float
+        tensor (= ``num_chunks``, typically 7) per gen step — same
+        collective count as the previous per-iter coin.
+        """
+        npb = int(self.num_frame_per_block)
+        num_chunks = int(self.num_training_frames // npb)
+        if self.dmd_context == "GT":
+            return torch.ones(num_chunks, device=device, dtype=torch.bool)
+        if self.dmd_context == "self":
+            return torch.zeros(num_chunks, device=device, dtype=torch.bool)
+        # mix mode
+        p = float(self.dmd_context_mix_p)
+        if dist.is_available() and dist.is_initialized():
+            if dist.get_rank() == 0:
+                rolls = (torch.rand(num_chunks) < p).to(torch.float32)
+                t = rolls.to(device=device)
+            else:
+                t = torch.zeros(num_chunks, device=device, dtype=torch.float32)
+            dist.broadcast(t, src=0)
+            return t > 0.5
+        rolls = torch.rand(num_chunks, device=device) < p
+        return rolls
 
     # ------------------------------------------------------------------
     # CF-parity DMD core
@@ -1746,17 +1846,34 @@ class ActionForcingDMD(SelfForcingModel):
                 f"clean_x_self.shape[1]={clean_x_self.shape[1]} must "
                 f"equal num_training_frames={self.num_training_frames}."
             )
-        if self.dmd_context == "GT" and build_real_view:
-            # ``clean_x_GT`` is only consumed for the real_score side
-            # in "GT" mode. The critic step (``build_real_view=False``)
-            # only trains fake_score, which always uses the self-view
-            # regardless of dmd_context — clean_x_GT is irrelevant
-            # there, so we don't require it.
+        # Resolve the per-CHUNK GT/self assignment. ``mask`` is a
+        # ``[num_chunks]`` bool tensor; True = GT-dominant chunk, False
+        # = self-dominant. Pure modes give all-True / all-False; mix
+        # mode gives a Bernoulli(``mix_p``) vector (DDP-synced).
+        #
+        # The critic step (``build_real_view=False``) only trains
+        # fake_score, which always uses the self-view regardless of
+        # dmd_context, so we short-circuit the mask to all-False there
+        # — falling through to the existing None-fallback below.
+        npb = int(self.num_frame_per_block)
+        num_chunks = int(self.num_training_frames // npb)
+        if build_real_view:
+            mask = self._resolve_dmd_context_mask(device=device)
+        else:
+            mask = torch.zeros(num_chunks, device=device, dtype=torch.bool)
+        # Stash for telemetry surface in compute_generator_loss_streaming.
+        self._last_dmd_context_mask = mask
+
+        # Validate clean_x_GT only when at least one chunk needs it.
+        if build_real_view and bool(mask.any()):
             if clean_x_GT is None:
                 raise RuntimeError(
-                    "dmd_context='GT' requires clean_x_GT (the trainer "
-                    "must assemble the shifted GT clean window and pass "
-                    "it here for the gen-step real_score view)."
+                    "dmd_context resolved to at least one GT-dominant "
+                    "chunk this iter but clean_x_GT was not provided. "
+                    "In mix mode (default), callers must build "
+                    "clean_x_GT for every gen-step iter regardless of "
+                    "which way the per-chunk coin lands, since the "
+                    "resolution happens inside this function."
                 )
             if clean_x_GT.shape[1] != self.num_training_frames:
                 raise RuntimeError(
@@ -1772,21 +1889,84 @@ class ActionForcingDMD(SelfForcingModel):
 
         sc_clean_x_real: Optional[torch.Tensor] = None
         sc_aug_t_real: Optional[torch.Tensor] = None
-        if build_real_view and self.dmd_context == "GT":
-            sc_aug_t_real = torch.full(
+        if build_real_view and bool(mask.any()):
+            # Build the noised GT view (uniform clean_x_aug_t across
+            # all 21 frames before mixing — same as the prior code).
+            aug_t_full_gt = torch.full(
                 (sc_clean_x.shape[0], self.num_training_frames),
                 fill_value=int(self.clean_x_aug_t),
                 device=device, dtype=torch.long,
             )
             gt_view = clean_x_GT.to(dtype=dtype, device=device)
             real_noise = torch.randn_like(gt_view)
-            sc_clean_x_real = self.scheduler.add_noise(
+            noised_gt = self.scheduler.add_noise(
                 gt_view.flatten(0, 1),
                 real_noise.flatten(0, 1),
-                sc_aug_t_real.flatten(0, 1),
+                aug_t_full_gt.flatten(0, 1),
             ).unflatten(0, gt_view.shape[:2]).to(dtype=dtype)
-        # In "self" mode (or when build_real_view=False) we leave
-        # sc_clean_x_real/sc_aug_t_real as None; _compute_kl_grad's
+
+            # Lift the per-chunk mask to a per-frame bool ([21] when
+            # num_chunks=7, npb=3) by repeating each chunk decision npb
+            # times.
+            per_frame_gt = mask.repeat_interleave(npb)
+            # Belt-and-braces: ensure the per-frame mask matches the
+            # full clean_x window length. Will trip only if num_chunks *
+            # npb != num_training_frames (impossible by construction
+            # given the divisibility check on dmd_context_clean_frames,
+            # but cheap to assert).
+            if per_frame_gt.shape[0] != self.num_training_frames:
+                raise RuntimeError(
+                    f"per-frame GT mask length {per_frame_gt.shape[0]} "
+                    f"does not match num_training_frames="
+                    f"{self.num_training_frames}; check that "
+                    f"num_training_frames is divisible by "
+                    f"num_frame_per_block={npb}."
+                )
+
+            # Yin-yang mixing (default): each chunk is a linear
+            # combination of GT and self views with mix_p / (1-mix_p)
+            # weights, where the dominant view is determined by the
+            # chunk's mask bit. When ``dmd_context_yinyang=False`` we
+            # hard-swap (no minority splash) — equivalent to today's
+            # all-or-nothing per-chunk behavior.
+            if (
+                self.dmd_context == "mix"
+                and self.dmd_context_yinyang
+            ):
+                p = float(self.dmd_context_mix_p)
+                # Per-frame GT contribution weight:
+                #   GT-dominant frames get (1 - p) on GT, p on self
+                #   self-dominant frames get p on GT, (1 - p) on self
+                gt_weight = torch.empty(
+                    self.num_training_frames, device=device, dtype=dtype,
+                )
+                gt_weight[per_frame_gt] = 1.0 - p
+                gt_weight[~per_frame_gt] = p
+                self_weight = 1.0 - gt_weight
+                # Broadcast over [B, F, C, H, W] for the latent tensor.
+                gt_w_lat = gt_weight.view(1, -1, 1, 1, 1)
+                self_w_lat = self_weight.view(1, -1, 1, 1, 1)
+                sc_clean_x_real = (
+                    gt_w_lat * noised_gt + self_w_lat * sc_clean_x
+                )
+            else:
+                # Hard per-chunk swap (no yinyang): GT-dominant chunks
+                # = pure noised GT; self-dominant chunks = pure self.
+                bcast_lat = per_frame_gt.view(1, -1, 1, 1, 1)
+                sc_clean_x_real = torch.where(
+                    bcast_lat, noised_gt, sc_clean_x,
+                )
+
+            # aug_t per-chunk dominance: GT-dominant frames get
+            # clean_x_aug_t, self-dominant frames get 0. With the
+            # default clean_x_aug_t=0 this is uniform 0 anyway; the
+            # branch only matters once aug_t > 0.
+            bcast_aug = per_frame_gt.view(1, -1)
+            sc_aug_t_real = torch.where(
+                bcast_aug, aug_t_full_gt, sc_aug_t,
+            )
+        # When the mask is all-False (or build_real_view=False), we
+        # leave sc_clean_x_real/sc_aug_t_real as None; _compute_kl_grad's
         # fallback uses (sc_clean_x, sc_aug_t) for real_score.
 
         new_cond = dict(cond_for_scoring)
@@ -2629,6 +2809,41 @@ class ActionForcingDMD(SelfForcingModel):
         gradient_mask = torch.zeros_like(full_chunk, dtype=torch.bool)
         gradient_mask[:, overlap : overlap + new_frames] = True
 
+        # Boundary VAE round-trip (Causal-Forcing/long_video parity, see
+        # Causal-Forcing/long_video/model/base.py:155-167). When the iter
+        # has overlap, ``full_chunk[:, 0:1]`` is the seam between the
+        # previously-committed cache and the current scoring window —
+        # analog of CF's "first frame of the trailing-21". Decode the
+        # prior chunk + that boundary latent for VAE temporal context,
+        # take the last pixel frame, and re-encode it to a fresh
+        # single-frame latent on the image manifold. The replacement is
+        # no_grad; the boundary lives at gradient_mask[:, 0] = False
+        # already (overlap region) so this does NOT break gradient flow
+        # on the new frames. Saved into ``s["previous_chunk"]`` below
+        # so next iter's clean_x_self / overlap inherits the on-manifold
+        # boundary instead of needing to re-anchor.
+        if (
+            self.boundary_vae_roundtrip
+            and overlap > 0
+            and prev_chunk_for_clean is not None
+        ):
+            with torch.no_grad():
+                from einops import rearrange as _rearrange
+                ctx_latents = torch.cat(
+                    [prev_chunk_for_clean, full_chunk[:, 0:1]], dim=1,
+                ).to(dtype)
+                pixels = self.vae.decode_to_pixel(ctx_latents)
+                last_frame_btchw = pixels[:, -1:, ...].to(dtype)
+                last_frame_bcthw = _rearrange(
+                    last_frame_btchw, "b t c h w -> b c t h w",
+                )
+                image_latent = self.vae.encode_to_latent(
+                    last_frame_bcthw,
+                ).to(dtype)
+                full_chunk = torch.cat(
+                    [image_latent, full_chunk[:, 1:]], dim=1,
+                )
+
         # Save full_chunk as previous_chunk (detached) for the NEXT iter.
         s["previous_chunk"] = full_chunk.detach()
         s["current_length"] += new_frames
@@ -2819,8 +3034,14 @@ class ActionForcingDMD(SelfForcingModel):
         gradient_mask_eff = per_iter_mask & last_chunk_mask
 
         clean_x_self = self._streaming_build_clean_x_self(chunk, info)
+        # In "mix" mode the per-iter coin (sampled inside
+        # ``_build_dmd_context_kwargs``) may resolve to GT, so we MUST
+        # build clean_x_GT for every gen-step iter regardless of which
+        # branch this iter ends up on. Building is cheap (slice +
+        # add_noise on existing tensors).
         clean_x_GT = (
-            self._streaming_build_clean_x_GT(info) if self.dmd_context == "GT" else None
+            self._streaming_build_clean_x_GT(info)
+            if self.dmd_context in ("GT", "mix") else None
         )
         cond_for_scoring, uncond_for_scoring = self._streaming_noisy_cond_slice(info)
         clean_cond, clean_uncond = self._streaming_clean_cond_slice(info)
@@ -2971,6 +3192,19 @@ class ActionForcingDMD(SelfForcingModel):
                 dmd_log[k] = info[k]
         dmd_log["streaming_new_frames"] = float(info["new_frames"])
         dmd_log["streaming_current_length"] = float(info["current_length"])
+        # Per-iter realised GT-chunk fraction. Static "GT" / "self"
+        # modes give constant 1.0 / 0.0; mix mode gives a value in
+        # ``{0, 1/num_chunks, ..., 1}`` (= 7-bucketed at the default
+        # geometry). Long-run mean tracks ``dmd_context_mix_p``.
+        mask = getattr(self, "_last_dmd_context_mask", None)
+        if mask is not None:
+            dmd_log["dmd_context_branch_gt"] = float(
+                mask.float().mean().item()
+            )
+        else:
+            dmd_log["dmd_context_branch_gt"] = (
+                1.0 if self.dmd_context == "GT" else 0.0
+            )
         return dmd_loss, dmd_log
 
     def compute_critic_loss_streaming(

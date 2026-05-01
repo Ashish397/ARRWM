@@ -79,7 +79,7 @@ max_rides: null
 max_ride_frames: 200
 
 sort_rides_by_length: asc
-num_workers: 2
+num_workers: 0
 
 # ---------------------------------------------------------------------------
 # Model (verbatim from the AUX config)
@@ -178,6 +178,7 @@ v14_lora:
 # ---------------------------------------------------------------------------
 dmd_loss_weight: 1.0
 real_guidance_scale: 0.0
+cfg_uncond_keep_actions: true   # CFG uncond keeps action streams identical to cond; only prompt_embeds zeroed (in-distribution for v14 LoRA)
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 ts_schedule: false

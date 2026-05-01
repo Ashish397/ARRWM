@@ -82,8 +82,8 @@ run_name: action_forcing_phase1_gan
 
 seed: 0
 mixed_precision: true
-log_interval: 15
-checkpoint_interval: 50
+log_interval: 10
+checkpoint_interval: 30
 max_steps: 10000
 max_grad_norm: 10.0
 auto_resume: true
@@ -115,22 +115,40 @@ log_dir: /scratch/u6ex/as1748.u6ex/ARRWM/logs
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-encoded_root: /projects/u6ex/fbots/frodobots_encoded_weunz
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
 caption_root: /projects/u6ex/fbots/frodobots_captions/train
 motion_root: /projects/u6ex/fbots/frodobots_motion
 ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
 
-# Motion-aware rollout-start picker — see action_forcing_phase1.yaml
-# for the full rationale. Bias the offset ``s`` so the first
-# ``rollout_frames`` at ``s + cf`` have mean motion >= threshold.
-motion_start_threshold: 0.5      # per-frame floor for offset window picker
+# Motion-aware rollout-start picker. The dataset is heavy on parked /
+# idling windows (zero motion); these matter for distribution coverage
+# but starting EVERY rollout there starves the student of motion-
+# conditioned learning signal. With these knobs the trainer biases the
+# offset ``s`` so the first ``rollout_frames`` frames at ``s + cf`` have
+# mean per-frame motion magnitude >= ``motion_start_threshold``.
+# Empirical scan across the dataset (0.5 = roughly the median, 1.0 =
+# clearly moving). ``motion_start_prob`` is the per-iter probability
+# of using motion-biased sampling vs. uniform — set < 1.0 to keep some
+# zero-motion exposure. Per-rank: each rank picks independently from
+# its own ride.
+motion_start_threshold: 0.5      # per-frame magnitude floor for the offset window picker (within a ride)
 motion_start_prob: 1.0
-motion_skip_dead_rides: true     # skip rides with low per-ride mean motion
-motion_ride_min_mean: 3.0        # ~upper-half cutoff; see action_forcing_phase1.yaml comment for details
+# Ride-level rejection. Skip rides whose PER-RIDE MEAN motion is
+# below ``motion_ride_min_mean`` — the empirical median of per-ride
+# means across the 857-ride frodobots set is 3.285, so 3.0 keeps
+# roughly the upper half (~430 rides / ~57% of latent frames). This
+# is intentionally aggressive: the lower half is dominated by parked
+# / barely-moving rides that swallow training compute without giving
+# the action-conditioned student useful gradient. Tune down toward
+# 0.5 for a softer filter (88% frame retention) or up to 4.0 for
+# only-clearly-moving (~38% retention). Set
+# motion_skip_dead_rides=false to disable.
+motion_skip_dead_rides: true
+motion_ride_min_mean: 3.0
 
 # Step-scheduled local_attn_size — see action_forcing_phase1.yaml for
 # rationale. Default: 21 frames early, 42 from step 400.
-local_attn_size_schedule: [[0, 21], [400, 42]]
+local_attn_size_schedule: [[0, 42]]
 
 action_dims: [2, 7]
 raw_action_dim: 2
@@ -178,7 +196,7 @@ max_ride_frames: 510
 # Curriculum: shortest valid first.
 sort_rides_by_length: null
 
-num_workers: 2
+num_workers: 0
 
 # ---------------------------------------------------------------------------
 # Model
@@ -298,7 +316,7 @@ rollout_frames: null
 # ``mae_extension_max_extra_chunks: 0`` for the same effect with
 # threshold left set (e.g. for an A/B that toggles only the loop
 # while keeping the baseline metric on).
-mae_extension_threshold: 0.4
+mae_extension_threshold: 0.2
 mae_extension_max_extra_chunks: 13
 
 model_kwargs:
@@ -437,7 +455,15 @@ v14_lora:
 # (we keep our own zero-prompt convention rather than CF's Chinese
 # negative prompt; only the CFG mechanism is aligned).
 dmd_loss_weight: 1.0
-real_guidance_scale: 0.0
+# CFG=3 on real_score (CF chunkwise / LongLive rolling parity). Sharpens
+# the teacher's predicted x0 via ``cond + 3*(cond - uncond)`` so the
+# DMD gradient (fake - real) pulls the student toward the sharp
+# conditional manifold instead of the smooth conditional baseline.
+# Previously 0.0 (a silent regression vs the comment block at the top
+# of this file claiming CF parity); flipped to 3.0 to actually realise
+# that parity and stop the student from collapsing to blur.
+real_guidance_scale: 3.0
+cfg_uncond_keep_actions: true   # CFG uncond keeps action streams identical to cond; only prompt_embeds zeroed (in-distribution for v14 LoRA)
 fake_guidance_scale: 0.0
 timestep_shift: 5.0
 # CF chunkwise DMD recipe (Causal-Forcing/configs/causal_forcing_dmd_chunkwise.yaml:13)
@@ -460,7 +486,25 @@ min_score_timestep: 0
 # is the alternative where real and fake share the self view (no GT
 # privilege). cf=3 = one chunk of seed prefilled into the generator's
 # KV cache at t=0 before the rollout starts.
-dmd_context: "GT"
+# "mix" = per-iter coin between GT and self (DDP-synced from rank
+# 0). With dmd_context_mix_p=0.25 every gen step independently
+# routes real_score's clean_x through the GT view (lightly noised
+# at clean_x_aug_t, v14 LoRA's training contract) 25% of iters and
+# the matched-self view (no GT privilege) 75% of iters. Realised
+# branch logged on wandb as ``dmd/dmd_context_branch_gt`` per
+# step; long-run mean should track this probability.
+dmd_context: "mix"
+dmd_context_mix_p: 0.25
+# Yin-yang per-chunk mixing (default true). When true, each of the
+# 7 npb-frame chunks of clean_x_real is a LINEAR COMBINATION of GT
+# and self views with weights derived from dmd_context_mix_p:
+#   GT-dominant chunks  : (1 - mix_p) * GT + mix_p * self
+#   self-dominant chunks: (1 - mix_p) * self + mix_p * GT
+# At mix_p=0.25 this gives 0.75/0.25 splits in both directions.
+# Each chunk's identity (dominant view) is decided by the same
+# per-chunk Bernoulli coin that drives dmd_context_mix_p. Set
+# false to hard-swap (no minority splash).
+dmd_context_yinyang: true
 dmd_context_clean_frames: 9
 clean_x_aug_t: 0
 
@@ -556,7 +600,7 @@ vis_emit_on_first_step: false
 # ---------------------------------------------------------------------------
 slots_per_rank: 1
 rolling_steps_per_iter: null
-collapse_mae_threshold: 0.5  # ride-extension gate (deferred multi-batch): MAE > threshold => do NOT extend on this ride next batch; MAE <= threshold => keep rolling. Current rollout always trains. Set null to disable.
+collapse_mae_threshold: 0.2  # ride-extension gate (deferred multi-batch): MAE > threshold => do NOT extend on this ride next batch; MAE <= threshold => keep rolling. Current rollout always trains. Set null to disable.
 backward_simulation: true
 independent_first_frame: false
 warp_denoising_step: false
@@ -564,4 +608,22 @@ warp_denoising_step: false
 # Streaming-mode (LongLive persistent KV-cache + variable-length chunks).
 # FUNDAMENTAL: ON by default for Phase-1 action-forcing DMD.
 streaming_mode: true
-streaming_max_length: 500
+# 42 latents = 2x the 21-frame scoring window — exercises the streaming
+# overlap path for one round-trip-eligible iter (iter 2 carries an
+# overlap region from iter 1) without committing to the long
+# error-accumulation regime that 1500 caused. CF chunkwise DMD trains
+# on 21 frames per iter; this is the tightest streaming setup that
+# still verifies the boundary-handling logic.
+streaming_max_length: 42
+
+# Boundary VAE round-trip (Causal-Forcing/long_video parity, see
+# Causal-Forcing/long_video/model/base.py:155-167). When the streaming
+# chunk has overlap (iter k>=2), the first frame is the seam between
+# previously-cached frames and the current scoring window. Decode the
+# prior context + that boundary latent through the VAE, take the last
+# pixel frame, and re-encode to a fresh single-frame latent on the
+# image manifold. Resets distribution drift at every iter's boundary
+# so errors don't accumulate into latent-space blur. No-grad: the
+# boundary frame lives in the masked overlap region anyway, so this
+# does not break gradient flow.
+boundary_vae_roundtrip: true

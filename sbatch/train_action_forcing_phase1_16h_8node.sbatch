@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-16h-8node
+#SBATCH --job-name=action-forcing-phase1-16h-8node_0cfg
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -72,7 +72,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_16h
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_16h_v4
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -111,6 +111,9 @@ echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
+# collapse_mae_threshold: 0.2 here (YAML / header doc default is 0.5).
+# KV cache attention window: 42 latent frames (model_kwargs.local_attn_size
+# + local_attn_size_schedule first waypoint; YAML default 21 + ramp).
 srun torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
@@ -122,12 +125,16 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    real_guidance_scale=0.0 \
-    action_teacher_mode=all \
+    action_teacher_mode=off \
+    action_critic_aux_enabled=false \
+    state_probe_aux_enabled=false \
     max_rolls_per_ride=300 \
-    dfake_gen_update_ratio=1 \
-    streaming_max_length=1500 \
-    max_ride_frames=1490 \
-    run_name=action_forcing_phase1_j${SLURM_JOB_ID}
+    dfake_gen_update_ratio=5 \
+    collapse_mae_threshold=0.2 \
+    mae_extension_threshold=0.2 \
+    model_kwargs.local_attn_size=42 \
+    local_attn_size_schedule=[[0,42]] \
+    num_workers=0 \
+    run_name=action_forcing_phase1_j${SLURM_JOB_ID}_v4
 
 echo "Training completed on $(date)"
