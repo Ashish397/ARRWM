@@ -49,6 +49,27 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = args.model_kwargs.local_attn_size
 
+        # Warm-start init: subsequent chunks denoise from the prior
+        # chunk's clean pred re-noised at
+        # ``denoising_step_list[warm_start_rung_idx]`` via the
+        # shortened ladder ``denoising_step_list[warm_start_rung_idx:]``.
+        # The very first chunk uses the standard cold init (pure noise
+        # + full ladder). Default off; flip via config knob to A/B.
+        # ``warm_start_rung_idx`` defaults to 1 (= second-noisiest rung
+        # in the standard 4-step ladder = 625). Move it later in the
+        # ladder for less-aggressive warm-start (preserves more prior
+        # structure) or earlier for more-aggressive (more re-randomized).
+        self.warm_start_init = bool(getattr(args, "warm_start_init", False))
+        self.warm_start_rung_idx = int(getattr(args, "warm_start_rung_idx", 1))
+        if self.warm_start_init:
+            n = len(self.denoising_step_list)
+            if not (0 <= self.warm_start_rung_idx < n - 1):
+                raise ValueError(
+                    f"warm_start_rung_idx={self.warm_start_rung_idx} out of "
+                    f"valid range [0, {n - 1}) for denoising_step_list of "
+                    f"length {n}."
+                )
+
         # Normalize to list if sequence-like (e.g., OmegaConf ListConfig)
 
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -167,16 +188,44 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 2: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
+        # Warm-start carry: track the previous block's clean pred so
+        # subsequent blocks can warm-start from it. The first block
+        # always cold-starts (pure noise + full ladder, even when
+        # ``warm_start_init=True``) per the user's "first chunk
+        # unchanged" invariant.
+        prev_block_clean = None
+        num_denoising_steps = len(self.denoising_step_list)
         for current_num_frames in all_num_frames:
             if profile:
                 block_start.record()
 
-            noisy_input = noise[
-                :, current_start_frame:current_start_frame + current_num_frames]
+            is_warm = self.warm_start_init and prev_block_clean is not None
+            rung_start = self.warm_start_rung_idx if is_warm else 0
+            if is_warm:
+                # Re-noise the prior block's clean pred at the
+                # configured warm-start rung's t.
+                warm_t_value = self.denoising_step_list[self.warm_start_rung_idx]
+                warm_seed_slab = prev_block_clean[
+                    :, -current_num_frames:
+                ]
+                warm_eps = torch.randn_like(warm_seed_slab)
+                warm_t_long = torch.full(
+                    [batch_size * current_num_frames],
+                    int(warm_t_value), device=noise.device, dtype=torch.long,
+                )
+                noisy_input = self.scheduler.add_noise(
+                    warm_seed_slab.flatten(0, 1),
+                    warm_eps.flatten(0, 1),
+                    warm_t_long,
+                ).unflatten(0, warm_seed_slab.shape[:2])
+            else:
+                noisy_input = noise[
+                    :, current_start_frame:current_start_frame + current_num_frames]
 
-            # Step 2.1: Spatial denoising loop
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                # print(f"current_timestep: {current_timestep}")
+            # Step 2.1: Spatial denoising loop. ``rung_start`` skips
+            # the noisiest rung for warm-start blocks.
+            for index in range(rung_start, num_denoising_steps):
+                current_timestep = self.denoising_step_list[index]
 
                 # set current timestep
                 timestep = torch.ones(
@@ -184,7 +233,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
 
-                if index < len(self.denoising_step_list) - 1:
+                if index < num_denoising_steps - 1:
                     model_out = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
@@ -214,6 +263,8 @@ class CausalInferencePipeline(torch.nn.Module):
                     denoised_pred = model_out[1]
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
+            # Capture clean pred for next block's warm-start carry.
+            prev_block_clean = denoised_pred.detach()
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(

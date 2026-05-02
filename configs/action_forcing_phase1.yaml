@@ -414,6 +414,22 @@ last_step_only: false
 context_noise: 0
 denoising_step_list: [1000, 625, 312.5, 178.6]
 
+# Warm-start init: subsequent rolling chunks denoise from the prior
+# chunk's clean pred re-noised at
+# ``denoising_step_list[warm_start_rung_idx]`` via the shortened ladder
+# ``denoising_step_list[warm_start_rung_idx:]``. The first chunk in
+# the rollout (anchor in streaming mode; block 0 in non-streaming)
+# keeps the standard cold init: pure noise + full ladder. Default off;
+# set true for v9 A/B against v8. ``warm_start_rung_idx`` defaults to 1
+# (= second-noisiest rung, t≈625 in the standard 4-step ladder); move
+# it later in the ladder for less-aggressive warm-start (preserves
+# more prior-chunk structure) or earlier for more re-randomization.
+# Validation against the actual denoising_step_list length lives in
+# the pipeline (must satisfy 0 <= idx < len(denoising_step_list) - 1
+# so at least one denoising step actually runs).
+warm_start_init: false
+warm_start_rung_idx: 1
+
 action_patch_enabled: true
 action_modulation_activation: silu
 
@@ -587,6 +603,105 @@ clean_x_aug_t: 0
 
 # GAN dropped (parity with staircase config + CF).
 gan_loss_weight: 0.0
+
+# ---------------------------------------------------------------------------
+# GAN backbone selector (Flash-DMD §3.3 + paper-aligned video variant).
+# ---------------------------------------------------------------------------
+# ``latent_3d_conv`` (default) — the legacy R3GANDiscriminator3D
+# operating on the student's 16-channel latent video. Cheapest path,
+# no VAE decode required. Captures latent-space distribution but
+# misses pixel-space structure (edges, texture).
+#
+# ``sam2_pixel`` — Flash-DMD-style frozen SAM2 image encoder
+# (Hiera) + multiple trainable heads on the FPN, applied per frame
+# to VAE-decoded pixel video. Catches structural failure modes (road
+# edges, vehicle outlines, lane markings) the latent disc can't see.
+# Requires ``sam2`` package + a downloaded SAM2 checkpoint; set
+# ``gan_sam2_checkpoint_path`` and ``gan_sam2_config_path``.
+#
+# Memory cost when ``sam2_pixel`` is on: +~2 GB transient per rank
+# (VAE decode activations + Hiera-B+ at 512 forward); fits within
+# the current ~21 GB headroom from v8 smoke #8.
+gan_backbone: "latent_3d_conv"
+# ``sam2_pixel`` paths — only consulted when gan_backbone="sam2_pixel".
+# The checkpoint is the .pt file from Meta's SAM2 release; the
+# config is the matching architecture yaml (e.g.
+# ``sam2.1_hiera_b_plus.yaml``). Both must be downloaded ahead of
+# time; the discriminator init fails loudly if either is missing.
+gan_sam2_checkpoint_path: null
+gan_sam2_config_path: null
+# Square input edge for the SAM2 image encoder. 512 is a memory-
+# friendly default; raise to 1024 for full SAM2-native resolution
+# at ~4× the per-frame compute.
+gan_sam2_resolution: 512
+# Note: the ADM 2D head's hidden dim is fixed at 256 in the head class
+# (matches arXiv:2507.18569 §B.1) — no ``gan_sam2_head_hidden`` knob.
+# When true (default), resize so the longer edge of the decoded
+# pixel video equals ``gan_sam2_resolution``; let Hiera process the
+# resulting non-square input. Preserves aspect ratio (driving frames
+# are typically ~1.7:1 — squashing crushes road-edge geometry which
+# is exactly the signal SAM2's segmentation pretraining captures).
+# When false, resize to ``(R, R)`` square (cheaper, distorts).
+gan_sam2_preserve_aspect: true
+# Per-iter frame aggregation strategy on the per-frame logits the
+# disc heads emit. The paper is image-only and has no opinion here;
+# for video, "mean" damps the gradient on the worst frame (exactly
+# the artifact we want amplified), so two stronger options are
+# exposed:
+#   * "mean" (default, paper-faithful when treating the video as F
+#     independent images) — equal-weighted average across frames.
+#   * "max" — gradient flows through the single frame with the
+#     highest-magnitude logit (strongest signal; can be unstable
+#     when one frame is far OOD).
+#   * "topk_mean" — mean of the top-k highest-magnitude logits
+#     (compromise; less brittle than max, sharper than mean).
+# ``gan_sam2_frame_pool_topk`` is consulted only when frame_pool=
+# "topk_mean" (default 4 of 21 frames).
+gan_sam2_frame_pool: "mean"
+gan_sam2_frame_pool_topk: 4
+
+# ADM 2D heads (Lu et al. 2025 "Adversarial Diffusion Postprocessing",
+# arXiv:2507.18569 §B.1, Fig. 6). Each head is a small SDXL-Lightning-
+# style ConvNet: 3× [Conv4×4-stride2 → GN(32) → SiLU] + 1× [Conv3×3 →
+# GN(32) → SiLU] + GAP + Linear(256, 1). All convs project to a fixed
+# 256-channel hidden dim (hardcoded in the head class — no config
+# knob); GroupNorm uses 32 groups (always divides 256 cleanly).
+
+# SAM2-distilled latent critic (Sobolev-style value+gradient
+# distillation). When on, the pixel-space SAM2 disc is no longer in
+# the generator's autograd graph — instead a small latent-space
+# surrogate critic (LatentSAM2Critic) is trained to match BOTH the
+# pixel disc's logit values AND its gradient field w.r.t. the input
+# latent. The generator gets its GAN gradient from the critic, never
+# from the pixel disc. Architectural fix for the OOM in
+# ``_compute_r3gan_losses`` where the G-side V+SAM2 forward + R1/R2
+# graph blows the 95 GB GPU budget.
+gan_sam2_distilled_critic: false
+# Critic warmup: until step >= warmup, gen GAN loss = 0 (critic
+# trains but doesn't propagate to gen). After warmup, ramp gen GAN
+# weight 0 → ``gan_loss_weight`` over ``gan_warmup_steps`` (existing).
+gan_critic_warmup_steps: 500
+# Critic optimizer.
+gan_critic_lr: 2.0e-04
+gan_critic_betas: [0.0, 0.9]
+# Critic architecture (3D conv stem + transformer body).
+gan_critic_hidden: 512
+gan_critic_num_blocks: 6
+# Gradient-distillation budget. Frame subsampling: each iter, build
+# a graph-on V+SAM2+disc forward on this many frames out of the
+# rollout's chunk_size — ~7× cheaper than full-frame graph-on. The
+# critic still sees the full 21-frame clip; only the gradient TARGET
+# is computed on the subset (rest of frames have zero target this
+# iter — over many iters all frames are covered).
+gan_critic_grad_frames: 3
+# Periodic full-grad anchor: every N iters, compute the gradient
+# target on ALL frames with a checkpointed V+SAM2 forward. Corrects
+# systematic drift from the frame-subsample noise. Set to 0 to
+# disable (subsample only).
+gan_critic_grad_full_every: 50
+# λ_grad — weight on the gradient-distillation MSE term (vs the
+# value-distillation MSE term). 1.0 weighs them equally.
+gan_critic_grad_loss_weight: 1.0
 
 # DMD2: fake_score updates 1:1 with generator (one critic step per
 # generator step in the CF-parity loop).

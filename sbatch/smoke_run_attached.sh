@@ -62,7 +62,6 @@ torchrun \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
     max_rolls_per_ride=300 \
-    dfake_gen_update_ratio=5 \
     collapse_mae_threshold=0.2 \
     mae_extension_threshold=0.2 \
     num_workers=0 \
@@ -72,8 +71,14 @@ torchrun \
     real_teacher_warmup_steps=200 \
     real_teacher_input_source=mix \
     real_teacher_input_mix_gt_p=0.5 \
-    dmd_frozen_teacher_pass_enabled=true \
+    dmd_frozen_teacher_pass_enabled=false \
     aux_teacher_loss_weight=1.0 \
+    flash_dmd_split_timestep=500 \
+    fake_score_ema_weight=0.95 \
+    dfake_gen_update_ratio=1 \
+    gan_loss_weight=1.0 \
+    gan_disc_base_channels=128 \
+    gan_warmup_steps=1000 \
     log_dir=$T2_LOG \
     wandb_dir=wandb \
     wandb_project=$SMOKE_WANDB_PROJECT \

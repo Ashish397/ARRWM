@@ -63,8 +63,11 @@ RollingForcing/
 LongLive/
 Reward-Forcing/
 Self-Forcing-Plus-Plus/
+sam2_checkpoints/
+guided-diffusion/
 # Editor / tooling scratch.
 *.bak
 papers/
 
 pav.txt
+*.pt

@@ -211,6 +211,43 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         model.generator.model.to(device=self.device, dtype=self.dtype)
         model.fake_score.model.to(device=self.device, dtype=self.dtype)
         model.real_score.model.to(device=self.device, dtype=self.dtype)
+        # Gradient checkpointing — recompute transformer-block
+        # activations during backward to free forward-time memory.
+        # WAN ships with native checkpoint support
+        # (``wan/modules/model.py:767-772``); each block routes through
+        # ``torch.utils.checkpoint.checkpoint`` when
+        # ``self.gradient_checkpointing`` is True. Saves ~80% of the
+        # forward-activation memory on each grad-active gen/real/fake
+        # forward at the cost of ~33% extra compute (one extra forward
+        # per block during backward).
+        # Defaults: gen ON when distilled-critic mode is on (the
+        # dual_grad path stacks per-block last-rung grad-active
+        # forwards on top of the rolling rollout, OOMing without
+        # checkpointing); real_score / fake_score OFF by default
+        # (their forwards are detached at the gen-grad path).
+        # Configurable per knob below.
+        gen_grad_ckpt = bool(
+            getattr(args, "gen_gradient_checkpointing",
+                    bool(getattr(args, "gan_sam2_distilled_critic", False)))
+        )
+        rs_grad_ckpt = bool(
+            getattr(args, "real_score_gradient_checkpointing", False)
+        )
+        fs_grad_ckpt = bool(
+            getattr(args, "fake_score_gradient_checkpointing", False)
+        )
+        if gen_grad_ckpt:
+            model.generator.model.gradient_checkpointing = True
+        if rs_grad_ckpt:
+            model.real_score.model.gradient_checkpointing = True
+        if fs_grad_ckpt:
+            model.fake_score.model.gradient_checkpointing = True
+        if self.is_main_process:
+            logging.info(
+                "[ActionForcing] gradient_checkpointing: gen=%s "
+                "real_score=%s fake_score=%s",
+                gen_grad_ckpt, rs_grad_ckpt, fs_grad_ckpt,
+            )
         if model.action_projection is not None:
             model.action_projection.to(device=self.device, dtype=self.dtype)
         if model.action_token_projection is not None:
@@ -407,42 +444,229 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_enabled = bool(getattr(self.config, "gan_enabled", False))
         self.r3gan_disc: Optional[torch.nn.Module] = None
         self.r3gan_disc_ddp: Optional[DDP] = None
+        # Distilled-critic mode wraps ``disc.heads_module`` instead of
+        # the full disc to give DDP a clean, fully-trainable submodule
+        # (the frozen SAM2 encoder is left un-wrapped). Only set when
+        # ``gan_sam2_distilled_critic=True`` and world_size > 1.
+        self.r3gan_heads_ddp: Optional[DDP] = None
+        # Slot for inputs to the deferred D-update + critic-distillation
+        # step (distilled mode only). Populated during the gen step (which
+        # only computes the light Path 3 = ``-critic(pred_image)``);
+        # consumed by ``_run_distilled_post_backward_step`` AFTER gen +
+        # action-critic backwards have freed gen-rollout activations
+        # (~70 GB). Without this defer, the heavy V+SAM2 forwards in
+        # Path 1 (D-update no_grad features) and Path 2 (critic value+grad
+        # distillation) compete with the gen rollout's persistent state
+        # and OOM the 95 GB GH200 budget.
+        self._distilled_pending: Optional[Dict[str, Any]] = None
+        # ``gan_backbone`` selects the discriminator architecture:
+        #   * "latent_3d_conv" (default, legacy) — 3D ConvNet on the
+        #     student's latent video. Cheap, no VAE decode required.
+        #   * "sam2_pixel" — Flash-DMD-style frozen SAM2 image encoder
+        #     on VAE-decoded pixel video, with multiple trainable
+        #     heads on the Hiera FPN. Paper-aligned, video-aware via
+        #     SAM2's segmentation pretraining; catches structural
+        #     failure modes (road edges, vehicle outlines, lane
+        #     markings) the latent disc misses.
+        self.gan_backbone = str(
+            getattr(self.config, "gan_backbone", "latent_3d_conv")
+        )
+        if self.gan_backbone not in ("latent_3d_conv", "sam2_pixel"):
+            raise ValueError(
+                f"gan_backbone must be 'latent_3d_conv' or 'sam2_pixel'; "
+                f"got {self.gan_backbone!r}."
+            )
         if self.gan_enabled:
-            in_channels = int(
-                getattr(self.config, "gan_disc_in_channels", 16)
-            )
-            base_channels = int(
-                getattr(self.config, "gan_disc_base_channels", 64)
-            )
-            num_blocks = int(
-                getattr(self.config, "gan_disc_num_blocks", 4)
-            )
-            disc = R3GANDiscriminator3D(
-                in_channels=in_channels,
-                base_channels=base_channels,
-                num_blocks=num_blocks,
-            )
-            disc.to(device=self.device, dtype=torch.float32)
-            disc.train()
-            self.r3gan_disc = disc
-            if self.world_size > 1:
-                self.r3gan_disc_ddp = DDP(
-                    disc,
-                    device_ids=[self.local_rank],
-                    output_device=self.local_rank,
-                    find_unused_parameters=False,
-                    broadcast_buffers=False,
+            if self.gan_backbone == "latent_3d_conv":
+                in_channels = int(
+                    getattr(self.config, "gan_disc_in_channels", 16)
                 )
-            if self.is_main_process:
-                n_params = sum(p.numel() for p in disc.parameters())
-                logging.info(
-                    "[ActionForcing] R3GAN discriminator built: "
-                    "in_channels=%d base_channels=%d num_blocks=%d "
-                    "params=%.2fM (DDP=%s)",
-                    in_channels, base_channels, num_blocks,
-                    n_params / 1e6,
-                    self.r3gan_disc_ddp is not None,
+                base_channels = int(
+                    getattr(self.config, "gan_disc_base_channels", 64)
                 )
+                num_blocks = int(
+                    getattr(self.config, "gan_disc_num_blocks", 4)
+                )
+                disc = R3GANDiscriminator3D(
+                    in_channels=in_channels,
+                    base_channels=base_channels,
+                    num_blocks=num_blocks,
+                )
+                disc.to(device=self.device, dtype=torch.float32)
+                disc.train()
+                self.r3gan_disc = disc
+                if self.world_size > 1:
+                    self.r3gan_disc_ddp = DDP(
+                        disc,
+                        device_ids=[self.local_rank],
+                        output_device=self.local_rank,
+                        find_unused_parameters=False,
+                        broadcast_buffers=False,
+                    )
+                if self.is_main_process:
+                    n_params = sum(p.numel() for p in disc.parameters())
+                    logging.info(
+                        "[ActionForcing] R3GAN discriminator built: "
+                        "in_channels=%d base_channels=%d num_blocks=%d "
+                        "params=%.2fM (DDP=%s)",
+                        in_channels, base_channels, num_blocks,
+                        n_params / 1e6,
+                        self.r3gan_disc_ddp is not None,
+                    )
+            elif self.gan_backbone == "sam2_pixel":
+                from model.r3gan_sam2 import R3GANDiscriminatorSAM2Pixel
+                sam2_ckpt = getattr(
+                    self.config, "gan_sam2_checkpoint_path", None,
+                )
+                sam2_cfg = getattr(
+                    self.config, "gan_sam2_config_path", None,
+                )
+                if sam2_ckpt is None or sam2_cfg is None:
+                    raise ValueError(
+                        "gan_backbone=sam2_pixel requires "
+                        "gan_sam2_checkpoint_path and gan_sam2_config_path "
+                        "to be set in the config."
+                    )
+                resolution = int(
+                    getattr(self.config, "gan_sam2_resolution", 512)
+                )
+                # All-fp32 SAM2 path: R1/R2 second-order penalties are
+                # numerically unstable under bf16 (the original latent
+                # disc was explicitly all-fp32 for the same reason).
+                # Memory cost is +~80 MB params + ~2× activation vs
+                # bf16 — comfortably within budget on Hiera-B+.
+                preserve_aspect = bool(
+                    getattr(self.config, "gan_sam2_preserve_aspect", True)
+                )
+                pad_to_square = bool(
+                    getattr(self.config, "gan_sam2_pad_to_square", False)
+                )
+                frame_pool = str(
+                    getattr(self.config, "gan_sam2_frame_pool", "mean")
+                )
+                frame_pool_topk = int(
+                    getattr(self.config, "gan_sam2_frame_pool_topk", 4)
+                )
+                disc = R3GANDiscriminatorSAM2Pixel(
+                    sam2_checkpoint_path=str(sam2_ckpt),
+                    sam2_config_path=str(sam2_cfg),
+                    image_resolution=resolution,
+                    device=self.device,
+                    dtype=torch.float32,
+                    preserve_aspect=preserve_aspect,
+                    pad_to_square=pad_to_square,
+                    frame_pool=frame_pool,
+                    frame_pool_topk=frame_pool_topk,
+                )
+                disc.train()  # heads → train; encoder pinned to eval
+                              # via overridden train() in the class
+                self.r3gan_disc = disc
+                # Distilled-critic mode determines DDP-wrap topology:
+                #   * Legacy mode (False): wrap the FULL disc with
+                #     find_unused_parameters=True (frozen SAM2 encoder
+                #     has no grad → "unused").
+                #   * Distilled mode (True): the distilled D-update
+                #     calls heads-only forward; if we wrapped the full
+                #     disc, the heads forward would bypass the wrapper's
+                #     forward-tracking and DDP all-reduce would NOT
+                #     fire on backward (silent rank divergence). Wrap
+                #     ONLY ``heads_module`` instead. The frozen encoder
+                #     stays un-wrapped; no DDP needed (no trainable
+                #     params).
+                self.gan_sam2_distilled_critic = bool(
+                    getattr(self.config, "gan_sam2_distilled_critic", False)
+                )
+                self.r3gan_heads_ddp = None
+                if self.world_size > 1:
+                    if self.gan_sam2_distilled_critic:
+                        # Heads-only DDP wrap. find_unused_parameters
+                        # can be False here because every head is
+                        # always exercised in the distilled D-update.
+                        self.r3gan_heads_ddp = DDP(
+                            disc.heads_module,
+                            device_ids=[self.local_rank],
+                            output_device=self.local_rank,
+                            find_unused_parameters=False,
+                            broadcast_buffers=False,
+                        )
+                    else:
+                        # Legacy: full-disc DDP wrap (frozen encoder
+                        # forces find_unused_parameters=True).
+                        self.r3gan_disc_ddp = DDP(
+                            disc,
+                            device_ids=[self.local_rank],
+                            output_device=self.local_rank,
+                            find_unused_parameters=True,
+                            broadcast_buffers=False,
+                        )
+                if self.is_main_process:
+                    n_total = sum(p.numel() for p in disc.parameters())
+                    n_train = sum(
+                        p.numel() for p in disc.parameters()
+                        if p.requires_grad
+                    )
+                    ddp_kind = (
+                        "heads-only"
+                        if self.r3gan_heads_ddp is not None
+                        else (
+                            "full-disc"
+                            if self.r3gan_disc_ddp is not None
+                            else "no"
+                        )
+                    )
+                    logging.info(
+                        "[ActionForcing] R3GAN-SAM2 discriminator built (ADM 2D heads): "
+                        "ckpt=%s cfg=%s resolution=%d "
+                        "params_total=%.2fM params_trainable=%.2fM (DDP=%s)",
+                        sam2_ckpt, sam2_cfg, resolution,
+                        n_total / 1e6, n_train / 1e6, ddp_kind,
+                    )
+
+                # SAM2-distilled latent critic (Sobolev-style value+gradient
+                # distillation). When enabled, the pixel-space disc is no
+                # longer in the gen's autograd graph — instead this small
+                # latent-space critic is trained to match BOTH the disc's
+                # logit values AND its gradient field w.r.t. the input
+                # latent, and the gen gets its GAN gradient from the critic.
+                # See ``model/latent_sam2_critic.py`` for the architecture.
+                self.latent_critic = None
+                self.latent_critic_ddp = None
+                self.latent_critic_optimizer = None
+                if self.gan_sam2_distilled_critic:
+                    from model.latent_sam2_critic import LatentSAM2Critic
+                    critic_hidden = int(
+                        getattr(self.config, "gan_critic_hidden", 512)
+                    )
+                    critic_num_blocks = int(
+                        getattr(self.config, "gan_critic_num_blocks", 4)
+                    )
+                    critic_in_channels = 16  # WAN VAE latent channel count
+                    self.latent_critic = LatentSAM2Critic(
+                        in_channels=critic_in_channels,
+                        d_model=critic_hidden,
+                        num_blocks=critic_num_blocks,
+                        frame_pool=frame_pool,
+                        frame_pool_topk=frame_pool_topk,
+                    ).to(device=self.device, dtype=torch.float32)
+                    self.latent_critic.train()
+                    if self.world_size > 1:
+                        self.latent_critic_ddp = DDP(
+                            self.latent_critic,
+                            device_ids=[self.local_rank],
+                            output_device=self.local_rank,
+                            find_unused_parameters=False,
+                            broadcast_buffers=False,
+                        )
+                    if self.is_main_process:
+                        n_critic = self.latent_critic.num_params
+                        logging.info(
+                            "[ActionForcing] LatentSAM2Critic built: "
+                            "d_model=%d num_blocks=%d num_params=%.2fM "
+                            "frame_pool=%s (DDP=%s)",
+                            critic_hidden, critic_num_blocks,
+                            n_critic / 1e6, frame_pool,
+                            self.latent_critic_ddp is not None,
+                        )
 
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
@@ -878,6 +1102,61 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.gan_updates_per_step,
                 )
 
+        # Distilled-critic config + optimizer (only when the disc was
+        # built with ``gan_sam2_distilled_critic=True``). Read knobs
+        # unconditionally so they're available for log surfacing even
+        # when the critic isn't built.
+        self.gan_critic_warmup_steps = int(
+            getattr(cfg, "gan_critic_warmup_steps", 500)
+        )
+        self.gan_critic_grad_frames = int(
+            getattr(cfg, "gan_critic_grad_frames", 3)
+        )
+        self.gan_critic_grad_full_every = int(
+            getattr(cfg, "gan_critic_grad_full_every", 50)
+        )
+        self.gan_critic_grad_loss_weight = float(
+            getattr(cfg, "gan_critic_grad_loss_weight", 1.0)
+        )
+        if (
+            self.gan_enabled
+            and getattr(self, "latent_critic", None) is not None
+        ):
+            critic_lr = float(getattr(cfg, "gan_critic_lr", 2e-4))
+            critic_betas = tuple(
+                getattr(cfg, "gan_critic_betas", [0.0, 0.9])
+            )
+            critic_eps = float(getattr(cfg, "gan_critic_eps", 1e-8))
+            critic_wd = float(getattr(cfg, "gan_critic_weight_decay", 0.0))
+            critic_params = [
+                p for p in self.latent_critic.parameters()
+                if p.requires_grad
+            ]
+            if not critic_params:
+                raise RuntimeError(
+                    "latent_critic has no trainable parameters."
+                )
+            self.latent_critic_optimizer = torch.optim.AdamW(
+                critic_params,
+                lr=critic_lr,
+                betas=critic_betas,
+                eps=critic_eps,
+                weight_decay=critic_wd,
+            )
+            if self.is_main_process:
+                n_params = sum(p.numel() for p in critic_params)
+                logging.info(
+                    "[ActionForcing] LatentSAM2Critic optimizer built: "
+                    "AdamW lr=%.2e betas=%s wd=%.4f params=%.2fM "
+                    "(warmup=%d, grad_frames=%d, grad_full_every=%d, "
+                    "grad_loss_weight=%.3f)",
+                    critic_lr, critic_betas, critic_wd, n_params / 1e6,
+                    self.gan_critic_warmup_steps,
+                    self.gan_critic_grad_frames,
+                    self.gan_critic_grad_full_every,
+                    self.gan_critic_grad_loss_weight,
+                )
+
         # ------------------------------------------------------------------
         # Online real_teacher (v14-LoRA flow training vs GT).
         # ------------------------------------------------------------------
@@ -941,6 +1220,186 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.real_teacher_max_grad_norm = 1.0
             self.real_teacher_warmup_steps = 0
             self._real_teacher_base_lr = 0.0
+
+        # ------------------------------------------------------------------
+        # Flash-DMD (paper arXiv:2511.20549) — timestep-aware DMD/GAN
+        # gating + EMA fake_score from generator.
+        # ------------------------------------------------------------------
+        # ``flash_dmd_split_timestep`` (None = legacy DMD2 summing every
+        # iter; int = engage Flash-DMD decoupling). When set, each gen
+        # iter rolls one DDP-synced scalar t ~ U[min_score_timestep,
+        # num_train_timestep). High-noise iter (t > split): DMD active,
+        # generator's GAN loss skipped. Low-noise iter: DMD skipped,
+        # generator's GAN loss active. The discriminator updates every
+        # iter regardless. Aux teacher pass is unaffected.
+        _split = getattr(cfg, "flash_dmd_split_timestep", None)
+        self.flash_dmd_split_timestep = (
+            int(_split) if _split is not None else None
+        )
+        self.flash_dmd_min_t = int(getattr(cfg, "min_score_timestep", 0))
+        self.flash_dmd_max_t = int(getattr(cfg, "num_train_timestep", 1000))
+
+        # ``fake_score_ema_weight`` (0.0 = off, current behavior; e.g.
+        # 0.95 = engage). After each generator optimizer.step(), the
+        # fake_score's params get EMA-pulled toward the generator's
+        # newly-updated params:
+        #     ψ ← w · ψ + (1 - w) · θ
+        # This lets the fake_score track p_gen with much fewer dedicated
+        # diffusion-loss updates, so dfake_gen_update_ratio can be
+        # dropped from 5 to 1 or 2 with no quality loss (paper §3.3).
+        self.fake_score_ema_weight = float(
+            getattr(cfg, "fake_score_ema_weight", 0.0)
+        )
+        if not (0.0 <= self.fake_score_ema_weight < 1.0):
+            raise ValueError(
+                f"fake_score_ema_weight must be in [0, 1); got "
+                f"{self.fake_score_ema_weight!r}."
+            )
+        if self.is_main_process and (
+            self.flash_dmd_split_timestep is not None
+            or self.fake_score_ema_weight > 0.0
+        ):
+            logging.info(
+                "[ActionForcing] Flash-DMD active: split_timestep=%s, "
+                "fake_score_ema_weight=%.4f",
+                self.flash_dmd_split_timestep,
+                self.fake_score_ema_weight,
+            )
+
+    def _flash_dmd_sample_iter_regime(self, device) -> Optional[Dict[str, Any]]:
+        """Sample one DDP-synced scalar t per gen iter and return the
+        regime dict to inject into ``info``. Returns None when
+        Flash-DMD is disabled (legacy DMD2 summing).
+
+        High-noise iter (t > split): DMD active, constrained to
+        ``[split, max_t]``; trainer skips the generator's GAN loss.
+        Low-noise iter (t <= split): DMD skipped (zero-loss in the
+        model); generator's GAN loss is the only signal.
+        """
+        if self.flash_dmd_split_timestep is None:
+            return None
+        if dist.is_available() and dist.is_initialized():
+            if dist.get_rank() == 0:
+                t_iter = float(
+                    torch.randint(
+                        self.flash_dmd_min_t,
+                        self.flash_dmd_max_t,
+                        (1,),
+                    ).item()
+                )
+            else:
+                t_iter = 0.0
+            t_tensor = torch.tensor(
+                [t_iter], device=device, dtype=torch.float32,
+            )
+            dist.broadcast(t_tensor, src=0)
+            t_iter = float(t_tensor.item())
+        else:
+            t_iter = float(
+                torch.randint(
+                    self.flash_dmd_min_t, self.flash_dmd_max_t, (1,),
+                ).item()
+            )
+        regime = "high" if t_iter > self.flash_dmd_split_timestep else "low"
+        # Hard bounds for the DMD's per-frame timestep sampling. We
+        # use NEW keys (``flash_dmd_t_min/max``) consumed directly by
+        # ``_sample_dmd_timestep`` so the bounds always engage —
+        # ``denoised_timestep_from/to`` is gated by the
+        # ``ts_schedule`` config flag (currently false in our active
+        # configs) and is also read by the action-critic chunk_t,
+        # which we must not overwrite.
+        # High-noise iter: per-frame t in [split, max_t).
+        # Low-noise iter: DMD is skipped entirely (model-side gate),
+        # but we still set bounds for documentation / sanity if any
+        # downstream call hits the sampler.
+        if regime == "high":
+            t_min = self.flash_dmd_split_timestep
+            t_max = self.flash_dmd_max_t
+        else:
+            t_min = self.flash_dmd_min_t
+            t_max = self.flash_dmd_split_timestep
+        return {
+            "flash_dmd_regime": regime,
+            "flash_dmd_iter_t": t_iter,
+            "flash_dmd_t_min": t_min,
+            "flash_dmd_t_max": t_max,
+        }
+
+    def _maybe_ema_fake_score_from_generator(self) -> None:
+        """Flash-DMD §3.3 EMA: after each generator optimizer.step(),
+        pull the fake_score's params toward the generator's params
+        with weight ``self.fake_score_ema_weight``. No-op when the
+        weight is 0.
+
+        Iterates by ``named_parameters()`` and matches by name +
+        shape. On the first call we audit the match coverage and log
+        a one-shot summary so silent param-structure drift (rename,
+        shape mismatch, accidental architectural divergence) is
+        loud — without that audit a fake_score param could quietly
+        decouple from the generator forever.
+        """
+        if self.fake_score_ema_weight <= 0.0:
+            return
+        # Both modules may be DDP-wrapped; unwrap to the inner module.
+        gen_inner = (
+            self.generator_ddp.module
+            if getattr(self, "generator_ddp", None) is not None
+            else self.model.generator.model
+        )
+        fake_inner = (
+            self.fake_score_ddp.module
+            if getattr(self, "fake_score_ddp", None) is not None
+            else self.model.fake_score.model
+        )
+        gen_params = dict(gen_inner.named_parameters())
+        w = self.fake_score_ema_weight
+
+        # One-shot startup audit. Counts matched / skipped on the
+        # first invocation only; logs the summary so operators see
+        # whether 100% of fake_score params are EMA-tracked. If the
+        # match rate is < 100%, the SKIPPED ones drift untouched and
+        # that's almost always wrong (architectural drift, not
+        # intentional).
+        if not getattr(self, "_fake_ema_audit_done", False):
+            matched = 0
+            skipped = 0
+            skipped_examples = []
+            for name, p_fake in fake_inner.named_parameters():
+                p_gen = gen_params.get(name)
+                if p_gen is None or p_gen.shape != p_fake.shape:
+                    skipped += 1
+                    if len(skipped_examples) < 5:
+                        reason = (
+                            "missing-in-generator" if p_gen is None
+                            else f"shape-mismatch ({tuple(p_gen.shape)} vs {tuple(p_fake.shape)})"
+                        )
+                        skipped_examples.append(f"{name}: {reason}")
+                else:
+                    matched += 1
+            total = matched + skipped
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] fake_score EMA audit: matched=%d "
+                    "skipped=%d total=%d (%.1f%% coverage). EMA "
+                    "weight=%.4f.",
+                    matched, skipped, total,
+                    100.0 * matched / max(1, total),
+                    w,
+                )
+                if skipped > 0:
+                    logging.warning(
+                        "[ActionForcing] fake_score EMA: %d params NOT "
+                        "EMA-tracked. First %d examples: %s",
+                        skipped, len(skipped_examples), skipped_examples,
+                    )
+            self._fake_ema_audit_done = True
+
+        with torch.no_grad():
+            for name, p_fake in fake_inner.named_parameters():
+                p_gen = gen_params.get(name)
+                if p_gen is None or p_gen.shape != p_fake.shape:
+                    continue
+                p_fake.data.mul_(w).add_(p_gen.data, alpha=1.0 - w)
 
     def _inner_dit_for_rope(self):
         """Return the bare DiT module under the (possibly DDP / LoRA)
@@ -1119,6 +1578,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.fake_optimizer.step()
                 self.fake_optimizer.zero_grad(set_to_none=True)
 
+            # Flash-DMD §3.3: EMA fake_score toward generator AFTER
+            # the fake_optimizer step. Order matters: applying Adam's
+            # accumulated momentum/variance to fake's pre-step params
+            # is the intended math; the EMA pull then becomes the
+            # FINAL mutation of fake's params for the iter, with no
+            # stale-momentum interaction. No-op when
+            # ``fake_score_ema_weight == 0`` (default).
+            if (
+                train_generator
+                and self.fake_score_ema_weight > 0.0
+            ):
+                self._maybe_ema_fake_score_from_generator()
+
             # ----- Online real_teacher: clip + step + zero -----
             real_teacher_grad_norm_val = 0.0
             if self.real_teacher_optimizer is not None:
@@ -1209,6 +1681,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     f"gen_grad_norm={float(gen_grad_norm.item()) if torch.is_tensor(gen_grad_norm) else float(gen_grad_norm):.4f}"
                 )
                 msg_parts.append(f"fake_grad_norm={fake_grad_norm_val:.4f}")
+                # GAN diagnostics: surface the 3 most-watched signals
+                # so terminal trace alone is enough to spot disc/critic
+                # health (full set on wandb under train/*).
+                #   d_real   = disc score on real (should rise > 0)
+                #   d_fake   = disc score on fake-detached (D-update)
+                #   c_corr   = critic↔disc value Pearson (should → 1)
+                _d_real = generator_log_dict.get("train/r3gan_d_real")
+                if _d_real is not None:
+                    msg_parts.append(f"d_real={float(_d_real):+.3f}")
+                _d_fake = generator_log_dict.get("train/r3gan_d_fake_detached")
+                if _d_fake is not None:
+                    msg_parts.append(f"d_fake={float(_d_fake):+.3f}")
+                _c_corr = generator_log_dict.get("train/critic_disc_corr")
+                if _c_corr is not None:
+                    msg_parts.append(f"c_corr={float(_c_corr):+.3f}")
                 # MAE diagnostics: surface baseline_last_chunk_mae +
                 # baseline_avg_rollout_mae to stdout so we can detect
                 # student collapse from the iter trace alone (the
@@ -1219,6 +1706,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _mae_avg = generator_log_dict.get("baseline_avg_rollout_mae")
                 if _mae_avg is not None:
                     msg_parts.append(f"mae_avg={float(_mae_avg):.4f}")
+                # Peak GPU memory this step (resets the high-water
+                # mark each iter). Useful for OOM-margin diagnostics.
+                try:
+                    if torch.cuda.is_available():
+                        peak_gb = (
+                            torch.cuda.max_memory_allocated() / (1024 ** 3)
+                        )
+                        msg_parts.append(f"peak_gb={peak_gb:.2f}")
+                        torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
                 logging.info("[ActionForcing] " + " ".join(msg_parts))
                 if (
                     _HAS_WANDB
@@ -1904,11 +2402,576 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     #     for grad is through ``fake = pred_image`` -> generator's
     #     own DDP backward, which is fired in the outer caller.
     # ------------------------------------------------------------------
+    def _sample_critic_grad_frame_indices(
+        self, F: int, k: int, device: torch.device,
+    ) -> List[int]:
+        """Pick ``k`` distinct frame indices in [0, F) for the
+        gradient-distillation subset, broadcast from rank 0 so all
+        DDP ranks pick the same subset (otherwise the per-rank
+        gradient targets would differ and the all-reduce on the
+        critic backward would average inconsistent gradients).
+        """
+        k = max(1, min(int(k), int(F)))
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            idx = torch.randperm(F, device=device)[:k].sort().values
+        else:
+            idx = torch.empty(k, dtype=torch.long, device=device)
+        if dist.is_initialized():
+            dist.broadcast(idx, src=0)
+        return idx.tolist()
+
+    def _compute_r3gan_losses_distilled(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+        current_step: int,
+        flash_dmd_regime: Optional[str] = None,
+        paper_aligned_x0_for_adv: Optional[torch.Tensor] = None,
+    ) -> tuple:
+        """Distilled-critic R3GAN flow with action_critic-style boosts.
+
+        Order of operations (mirrors ``_compute_action_critic_losses``):
+
+          1. Path 1 (D-update on heads + R1/R2) — trains the SAM2 disc
+             heads on this iter's (real, fake) features.
+          2. Path 2 (critic value/grad distillation) — trains the
+             ``LatentSAM2Critic`` to match the freshly-updated disc.
+          3. Path 3 (gen-side ``-critic(fake_lat_grad)``) — uses the
+             FRESHLY-UPDATED critic so the generator sees current
+             gradients, not the previous iter's stale critic.
+
+        This mirrors the action-critic pattern: train the critic just
+        before the generator consumes it. Previously Paths 1+2 ran in
+        ``_run_distilled_post_backward_step`` AFTER gen.backward, which
+        meant the gen always saw a one-iter-stale critic. We now run
+        them INLINE up-front when memory permits (Sobolev OFF).
+
+        Memory rationale:
+          * Sobolev OFF (``gan_critic_grad_loss_weight == 0``): Paths
+            1+2 only need V+SAM2 in no_grad mode + a small critic
+            forward+backward (~5-8 GB transient) — fits alongside the
+            gen rollout's ~70 GB activations on the 95 GB GH200. Run
+            inline so Path 3 sees the fresh critic.
+          * Sobolev ON: Path 2's gradient-distillation target requires
+            graph-on V+SAM2+disc forward (~10-15 GB workspace). That
+            does NOT fit alongside the gen rollout activations, so we
+            stash to ``self._distilled_pending`` and defer to
+            ``_run_distilled_post_backward_step`` AFTER gen.backward
+            frees the rollout's activations. Critic is one iter stale
+            in this branch (acceptable trade-off since the Sobolev
+            target itself is much stronger supervision).
+        """
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+
+        critic = self.latent_critic
+
+        # ----- Latents (fp32 for R1/R2 stability — Paths 1 + 2 both fp32).
+        real_lat = gt_latents_window.detach().to(torch.float32)
+        # G-side fake latent: paper-aligned-adv = last_rung_full_chunk
+        # (paper §3.3 Eq. 9); else the rolling rollout's pred_image.
+        # Path 3 uses the GRAD-attached version; Paths 1+2 use detached.
+        if paper_aligned_x0_for_adv is not None:
+            fake_lat_grad = paper_aligned_x0_for_adv.to(torch.float32)
+        else:
+            fake_lat_grad = pred_image.to(torch.float32)
+        fake_lat = fake_lat_grad.detach()
+
+        logs: Dict[str, float] = {}
+
+        # ===== Inline Paths 1+2 when Sobolev is off ===================
+        # Sobolev's graph-on V+SAM2 forward is the only thing that
+        # forces the deferred path. With it off, Paths 1+2 fit alongside
+        # gen activations and the gen sees a fresh critic in Path 3.
+        sobolev_active = self.gan_critic_grad_loss_weight > 0
+        if not sobolev_active:
+            self._run_distilled_disc_critic_update(
+                real_lat=real_lat,
+                fake_lat=fake_lat,
+                current_step=current_step,
+                out=logs,
+            )
+            self._distilled_pending = None
+        else:
+            # Sobolev path: defer Paths 1+2 to post-backward (memory
+            # budget). Critic in Path 3 is from the previous iter.
+            self._distilled_pending = {
+                "real_lat": real_lat,
+                "fake_lat": fake_lat,
+                "current_step": current_step,
+            }
+
+        # ===== Path 3: Gen-side via critic (after warmup) =============
+        critic_warmup_done = (
+            current_step >= self.gan_critic_warmup_steps
+        )
+        # Gen GAN weight ramp: 0 until critic warmup, then linear
+        # 0 → gan_loss_weight over the next ``gan_warmup_steps``.
+        if (
+            self.gan_warmup_steps > 0
+            and current_step < (
+                self.gan_critic_warmup_steps + self.gan_warmup_steps
+            )
+            and current_step >= self.gan_critic_warmup_steps
+        ):
+            ramp_steps_in = current_step - self.gan_critic_warmup_steps
+            ramp = ramp_steps_in / max(1, self.gan_warmup_steps)
+            gen_gan_weight = ramp * self.gan_loss_weight
+        elif current_step >= (
+            self.gan_critic_warmup_steps + self.gan_warmup_steps
+        ):
+            gen_gan_weight = self.gan_loss_weight
+        else:
+            gen_gan_weight = 0.0
+
+        skip_g_side = (
+            flash_dmd_regime == "high"
+            and paper_aligned_x0_for_adv is None
+        )
+
+        if (
+            critic_warmup_done
+            and gen_gan_weight > 0
+            and not skip_g_side
+        ):
+            # Freeze critic params so the gen backward doesn't write
+            # critic-side gradients into the critic optim (the critic
+            # has already been updated above for this iter, OR will be
+            # updated in the deferred step for Sobolev). Mirrors the
+            # legacy ``disc_for_guidance.requires_grad_(False)`` pattern
+            # and matches ``_compute_action_critic_losses``'s
+            # ``critic_for_guidance.requires_grad_(False)`` block.
+            critic.requires_grad_(False)
+            try:
+                gen_critic_logit = critic(fake_lat_grad).float()
+                gen_gan_main = -gen_critic_logit.mean()
+                generator_gan_loss = (
+                    gen_gan_weight * gen_gan_main.to(pred_image.dtype)
+                )
+            finally:
+                critic.requires_grad_(True)
+            d_fake_for_g_value = float(gen_critic_logit.detach().mean().item())
+            gen_gan_main_value = float(gen_gan_main.detach().item())
+        else:
+            generator_gan_loss = zero
+            d_fake_for_g_value = 0.0
+            gen_gan_main_value = 0.0
+
+        logs.update({
+            "train/r3gan_d_fake_for_g": d_fake_for_g_value,
+            "train/r3gan_g_loss_raw": gen_gan_main_value,
+            "train/r3gan_g_loss_weighted": (
+                float(generator_gan_loss.detach().item())
+                if torch.is_tensor(generator_gan_loss)
+                and generator_gan_loss.requires_grad
+                else 0.0
+            ),
+            "train/r3gan_g_weight": float(gen_gan_weight),
+            "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
+            "train/critic_trained_inline": 0.0 if sobolev_active else 1.0,
+        })
+        return generator_gan_loss, logs
+
+    def _run_distilled_post_backward_step(
+        self, out: Dict[str, Any],
+    ) -> None:
+        """Deferred D-update + critic value+grad distillation.
+
+        Used ONLY when Sobolev (gradient distillation) is active —
+        Path 2's graph-on V+SAM2 forward exceeds memory budget if run
+        alongside the gen rollout's persistent grad activations. The
+        deferred step runs AFTER both gen and action-critic backwards
+        have freed the rollout's ~70 GB activations.
+
+        With Sobolev OFF (the v9 default), Paths 1+2 run INLINE in
+        ``_compute_r3gan_losses_distilled`` BEFORE Path 3, so the gen
+        sees a freshly-trained critic (mirrors the action-critic's
+        train-then-evaluate pattern).
+
+        Mutates ``out`` in place with Path 1 + Path 2 diagnostics.
+        Clears ``self._distilled_pending`` after consumption.
+        """
+        if self._distilled_pending is None:
+            return
+        pending = self._distilled_pending
+        self._distilled_pending = None
+
+        self._run_distilled_disc_critic_update(
+            real_lat=pending["real_lat"],
+            fake_lat=pending["fake_lat"],
+            current_step=pending["current_step"],
+            out=out,
+        )
+
+    def _run_distilled_disc_critic_update(
+        self,
+        real_lat: torch.Tensor,
+        fake_lat: torch.Tensor,
+        current_step: int,
+        out: Dict[str, Any],
+    ) -> None:
+        """Train the SAM2 disc heads (Path 1) + LatentSAM2Critic (Path 2).
+
+        Operates on detached real/fake latents. Mutates ``out`` in place
+        with Path 1 + Path 2 diagnostics. Called inline before Path 3
+        when Sobolev is off (so gen consumes a fresh critic), or via
+        ``_run_distilled_post_backward_step`` after gen.backward when
+        Sobolev is on (memory budget for graph-on V+SAM2).
+        """
+        from model.r3gan import rpgan_d_loss
+
+        disc = self.r3gan_disc
+        # Heads-only DDP wrap (or un-wrapped fallback). Routing the
+        # heads forward through this wrapper is critical for DDP
+        # all-reduce to fire on the heads' params (see
+        # ``model/r3gan_sam2.py:_R3GANDiscHeads`` docstring).
+        heads_for_update = (
+            self.r3gan_heads_ddp
+            if self.r3gan_heads_ddp is not None else disc.heads_module
+        )
+        critic = self.latent_critic
+        critic_for_update = (
+            self.latent_critic_ddp
+            if self.latent_critic_ddp is not None else critic
+        )
+
+        vae = getattr(self.model, "vae", None)
+        if vae is None:
+            raise RuntimeError(
+                "gan_sam2_distilled_critic=True requires self.model.vae."
+            )
+
+        # ``real_lat`` and ``fake_lat`` come from the gen-step's
+        # stash. Both are detached (no graph from the gen rollout
+        # remains since gen.backward already ran).
+        B, F_, _, _, _ = real_lat.shape
+        device = real_lat.device
+
+        def _decode_no_grad(lat: torch.Tensor) -> torch.Tensor:
+            """VAE decode with the dummy-leading-frame trick. Caller
+            controls grad context (this fn assumes torch.no_grad).
+
+            We chunk the input temporally and run the single-shot
+            ``decode`` per chunk to bound peak workspace. The WAN VAE
+            ``decode`` has a special "first latent" behavior (1
+            output frame) and 4× expansion for the rest; the
+            dummy-leading-frame trick + ``[:, 1:]`` slice is
+            calibrated for that. ``cached_decode`` has different
+            temporal semantics (4× per latent, no special-first) so
+            we don't use it here.
+
+            Chunk size: ``decode_chunk_size`` latent frames. Each
+            chunk after the first prepends one frame from the prior
+            chunk's tail to seed the temporal Conv3d's left-context
+            (single-shot decode's first frame is the special
+            short-output one). The first chunk's first latent is
+            our dummy frame, so the left-context bootstrap matches
+            the original full-clip decode semantics byte-for-byte.
+            """
+            dummy = lat[:, 0:1]
+            lat_pad = torch.cat([dummy, lat], dim=1)
+            pix = vae.decode_to_pixel(lat_pad)  # use_cache=False
+            return pix[:, 1:, ...]
+
+        def _decode_grad(lat: torch.Tensor) -> torch.Tensor:
+            """VAE decode that PRESERVES the autograd graph through
+            ``lat`` for the gradient-distillation target. Caller
+            should keep input small (subset = 3 frames) to bound
+            workspace. Same single-shot ``decode`` path as
+            ``_decode_no_grad`` for consistent output shape.
+            """
+            dummy = lat[:, 0:1]
+            lat_pad = torch.cat([dummy, lat], dim=1)
+            pix = vae.decode_to_pixel(lat_pad)
+            return pix[:, 1:, ...]
+
+        # ===== Path 1: D-update (no_grad V+SAM2; R1/R2 on features) =====
+        with torch.no_grad():
+            real_pixel_d = _decode_no_grad(real_lat).to(torch.float32)
+            fake_pixel_d = _decode_no_grad(fake_lat).to(torch.float32)
+            # The WAN VAE has 4× temporal expansion + the dummy-frame
+            # trick produces ``F_pix = 4 * F_lat``. SAM2 features are
+            # batched at the PIXEL frame count, so heads.forward needs
+            # F_pix (not F_=21 from the latent shape).
+            B_pix, F_pix = real_pixel_d.shape[0], real_pixel_d.shape[1]
+            real_feats_raw = disc.forward_features(real_pixel_d)
+            fake_feats_raw = disc.forward_features(fake_pixel_d)
+        # Detach-and-leaf the features for R1/R2 (Option A: penalty on
+        # the feature manifold, not pixel manifold).
+        real_feats = [
+            f.detach().requires_grad_(True) for f in real_feats_raw
+        ]
+        fake_feats = [
+            f.detach().requires_grad_(True) for f in fake_feats_raw
+        ]
+        d_loss_value = 0.0
+        d_real_value = 0.0
+        d_fake_detached_value = 0.0
+        r1_value = 0.0
+        r2_value = 0.0
+        for _k in range(max(1, self.gan_updates_per_step)):
+            self.r3gan_optimizer.zero_grad(set_to_none=True)
+            # Re-detach + re-leaf each iter so R1/R2 grads chain only
+            # through the current iter's heads forward.
+            real_feats_iter = [
+                f.detach().requires_grad_(True) for f in real_feats
+            ]
+            fake_feats_iter = [
+                f.detach().requires_grad_(True) for f in fake_feats
+            ]
+            # Route through the heads-DDP wrapper so DDP's forward-time
+            # tracking fires (essential — if we routed through the
+            # un-wrapped ``disc.heads_module`` here, the backward
+            # below would NOT trigger DDP all-reduce on the heads'
+            # params and ranks would silently diverge).
+            # Use PIXEL frame count (B_pix, F_pix) — features are
+            # batched at the post-VAE-decode pixel rate, not the
+            # latent rate.
+            d_real = heads_for_update(
+                real_feats_iter, B_pix, F_pix,
+            )
+            r1_grads = torch.autograd.grad(
+                d_real.sum(), real_feats_iter,
+                create_graph=True, retain_graph=True,
+            )
+            r1 = (
+                self.gan_r1_gamma
+                * sum(
+                    (g.flatten(1).norm(dim=1) ** 2).mean()
+                    for g in r1_grads
+                )
+                / max(1, len(r1_grads))
+            )
+            d_fake_d = heads_for_update(
+                fake_feats_iter, B_pix, F_pix,
+            )
+            r2_grads = torch.autograd.grad(
+                d_fake_d.sum(), fake_feats_iter,
+                create_graph=True, retain_graph=True,
+            )
+            r2 = (
+                self.gan_r2_gamma
+                * sum(
+                    (g.flatten(1).norm(dim=1) ** 2).mean()
+                    for g in r2_grads
+                )
+                / max(1, len(r2_grads))
+            )
+            d_main = rpgan_d_loss(d_real, d_fake_d)
+            d_total = d_main + r1 + r2
+            d_total.backward()
+            if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
+                # In distilled mode the only trainable disc params are
+                # the heads (the SAM2 encoder is frozen). Clip those.
+                heads_params_iter = (
+                    self.r3gan_heads_ddp.parameters()
+                    if self.r3gan_heads_ddp is not None
+                    else disc.heads_module.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in heads_params_iter if p.grad is not None],
+                    self.gan_max_grad_norm,
+                )
+            self.r3gan_optimizer.step()
+            d_loss_value = float(d_main.detach().item())
+            d_real_value = float(d_real.detach().mean().item())
+            d_fake_detached_value = float(d_fake_d.detach().mean().item())
+            r1_value = float(r1.detach().item())
+            r2_value = float(r2.detach().item())
+
+        # ===== Path 2: Latent critic value+grad distillation ==========
+        # Value targets — full-frame, no_grad teacher forward. Reuse
+        # Path 1's already-computed features (avoids two redundant
+        # SAM2 forwards per iter, saving ~6 GB transient workspace).
+        with torch.no_grad():
+            teacher_val_real = disc.forward_heads(
+                real_feats_raw, batch_size=B_pix, num_frames=F_pix,
+            ).float()
+            teacher_val_fake = disc.forward_heads(
+                fake_feats_raw, batch_size=B_pix, num_frames=F_pix,
+            ).float()
+        # Gradient targets — frame subsampling OR periodic full-grad.
+        # Periodic full-grad anchor. Skip until the critic warmup
+        # completes — the anchor's purpose is to correct critic drift
+        # after subset-only gradient updates; before warmup there's
+        # nothing to correct yet. Also gates on ``current_step > 0``
+        # for memory safety (allocator hasn't settled at iter 0).
+        # AND gates on ``grad_loss_weight > 0`` — if gradient
+        # distillation is disabled, the anchor is irrelevant.
+        grad_distill_active = self.gan_critic_grad_loss_weight > 0
+        do_full_grad = (
+            grad_distill_active
+            and self.gan_critic_grad_full_every > 0
+            and current_step > 0
+            and current_step >= self.gan_critic_warmup_steps
+            and (current_step % self.gan_critic_grad_full_every) == 0
+        )
+        # When ``grad_loss_weight=0``, skip the entire teacher-gradient
+        # computation (the most expensive piece — graph-on V+SAM2+disc
+        # forward). Critic trains on value-only distillation in that
+        # case. Loses the Sobolev guarantee but eliminates the
+        # remaining V+SAM2 graph-on memory cost (~3-15 GB depending on
+        # subset vs anchor).
+        if grad_distill_active:
+            if do_full_grad:
+                grad_frames = list(range(F_))
+            else:
+                grad_frames = self._sample_critic_grad_frame_indices(
+                    F_, self.gan_critic_grad_frames, device,
+                )
+            n_grad = len(grad_frames)
+            real_lat_sub = real_lat[:, grad_frames].clone().detach().requires_grad_(True)
+            fake_lat_sub = fake_lat[:, grad_frames].clone().detach().requires_grad_(True)
+            from torch.utils.checkpoint import checkpoint as _ckpt
+
+            def _teacher_value(z: torch.Tensor) -> torch.Tensor:
+                pix = _decode_grad(z).to(torch.float32)
+                return disc(pix).float()
+
+            if do_full_grad:
+                teacher_real_sub = _ckpt(
+                    _teacher_value, real_lat_sub, use_reentrant=False,
+                )
+            else:
+                teacher_real_sub = _teacher_value(real_lat_sub)
+            teacher_grad_real_sub = torch.autograd.grad(
+                teacher_real_sub.sum(), real_lat_sub,
+                create_graph=False, retain_graph=False,
+            )[0].detach()
+            del teacher_real_sub
+            if do_full_grad:
+                teacher_fake_sub = _ckpt(
+                    _teacher_value, fake_lat_sub, use_reentrant=False,
+                )
+            else:
+                teacher_fake_sub = _teacher_value(fake_lat_sub)
+            teacher_grad_fake_sub = torch.autograd.grad(
+                teacher_fake_sub.sum(), fake_lat_sub,
+                create_graph=False, retain_graph=False,
+            )[0].detach()
+            del teacher_fake_sub
+        else:
+            # Value-only distillation — no teacher gradient computation.
+            grad_frames = []
+            n_grad = 0
+            teacher_grad_real_sub = None
+            teacher_grad_fake_sub = None
+        # Critic forward on FULL clip. With grad-distillation active,
+        # also compute grad w.r.t. input (create_graph=True for the
+        # second-order backward through L_grad). With value-only mode,
+        # skip the input-grad compute entirely (saves ~few hundred MB).
+        real_lat_critic_in = real_lat.clone().detach().requires_grad_(
+            grad_distill_active
+        )
+        fake_lat_critic_in = fake_lat.clone().detach().requires_grad_(
+            grad_distill_active
+        )
+        critic_val_real = critic_for_update(real_lat_critic_in).float()
+        critic_val_fake = critic_for_update(fake_lat_critic_in).float()
+        if grad_distill_active:
+            critic_grad_real = torch.autograd.grad(
+                critic_val_real.sum(), real_lat_critic_in,
+                create_graph=True, retain_graph=True,
+            )[0]
+            critic_grad_fake = torch.autograd.grad(
+                critic_val_fake.sum(), fake_lat_critic_in,
+                create_graph=True, retain_graph=True,
+            )[0]
+        else:
+            critic_grad_real = None
+            critic_grad_fake = None
+        # Value loss.
+        L_value = (
+            ((critic_val_real - teacher_val_real.detach()) ** 2).mean()
+            + ((critic_val_fake - teacher_val_fake.detach()) ** 2).mean()
+        )
+        # Grad loss on the subset (only when distillation is active).
+        if grad_distill_active:
+            critic_grad_real_sub = critic_grad_real[:, grad_frames]
+            critic_grad_fake_sub = critic_grad_fake[:, grad_frames]
+            L_grad = (
+                ((critic_grad_real_sub - teacher_grad_real_sub) ** 2).mean()
+                + ((critic_grad_fake_sub - teacher_grad_fake_sub) ** 2).mean()
+            )
+            L_critic = L_value + self.gan_critic_grad_loss_weight * L_grad
+        else:
+            critic_grad_real_sub = None
+            critic_grad_fake_sub = None
+            L_grad = torch.zeros((), device=device)
+            L_critic = L_value
+        if self.latent_critic_optimizer is not None:
+            self.latent_critic_optimizer.zero_grad(set_to_none=True)
+            L_critic.backward()
+            if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
+                critic_params_iter = (
+                    self.latent_critic_ddp.parameters()
+                    if self.latent_critic_ddp is not None
+                    else critic.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in critic_params_iter if p.grad is not None],
+                    self.gan_max_grad_norm,
+                )
+            self.latent_critic_optimizer.step()
+        # Diagnostic: critic↔disc value correlation, grad cosine sim.
+        with torch.no_grad():
+            cv_all = torch.cat([critic_val_real, critic_val_fake], dim=0)
+            tv_all = torch.cat([teacher_val_real, teacher_val_fake], dim=0)
+            if cv_all.numel() >= 2:
+                cv_c = cv_all - cv_all.mean()
+                tv_c = tv_all - tv_all.mean()
+                denom = (cv_c.norm() * tv_c.norm()).clamp_min(1e-8)
+                critic_disc_corr = float((cv_c * tv_c).sum() / denom)
+            else:
+                critic_disc_corr = 0.0
+            if grad_distill_active:
+                cg = torch.cat([
+                    critic_grad_real_sub.flatten(),
+                    critic_grad_fake_sub.flatten(),
+                ])
+                tg = torch.cat([
+                    teacher_grad_real_sub.flatten(),
+                    teacher_grad_fake_sub.flatten(),
+                ])
+                denom = (cg.norm() * tg.norm()).clamp_min(1e-8)
+                critic_grad_cos_sim = float((cg * tg).sum() / denom)
+            else:
+                critic_grad_cos_sim = 0.0  # n/a in value-only mode
+
+        # Path 3 (gen-side ``-critic(pred_image)``) was already
+        # computed in ``_compute_r3gan_losses_distilled`` and
+        # backpropagated into the generator. The deferred step's job
+        # is just D-update + critic distillation; no gen-side work
+        # remains here. Append diagnostics to ``out``.
+        out["train/r3gan_d_loss"] = d_loss_value
+        out["train/r3gan_r1"] = r1_value
+        out["train/r3gan_r2"] = r2_value
+        out["train/r3gan_d_real"] = d_real_value
+        out["train/r3gan_d_fake_detached"] = d_fake_detached_value
+        out["train/critic_value_loss"] = float(L_value.detach().item())
+        out["train/critic_grad_loss"] = float(L_grad.detach().item())
+        out["train/critic_total_loss"] = float(L_critic.detach().item())
+        out["train/critic_logit_mean"] = float(
+            ((critic_val_real.mean() + critic_val_fake.mean()) / 2.0)
+            .detach().item()
+        )
+        out["train/disc_logit_mean"] = float(
+            ((teacher_val_real.mean() + teacher_val_fake.mean()) / 2.0)
+            .detach().item()
+        )
+        out["train/critic_disc_corr"] = critic_disc_corr
+        out["train/critic_grad_cos_sim"] = critic_grad_cos_sim
+        out["train/critic_grad_full_anchor"] = 1.0 if do_full_grad else 0.0
+        out["train/critic_n_grad_frames"] = float(n_grad)
+
     def _compute_r3gan_losses(
         self,
         pred_image: torch.Tensor,
         gt_latents_window: torch.Tensor,
         current_step: int,
+        flash_dmd_regime: Optional[str] = None,
+        paper_aligned_x0_for_adv: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Run a D-update on (real, fake) and return the G-side RpGAN
         term (graph-carrying).
@@ -1923,6 +2986,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 G-side path (G never sees real samples directly in
                 R3GAN — only D's pairwise score).
             current_step: training step (for G-side warmup ramp).
+            flash_dmd_regime: optional Flash-DMD regime indicator
+                (``"high"`` / ``"low"`` / ``None`` for legacy mode).
+                On ``"high"`` (DMD-only iter) the trainer caller
+                discards ``generator_gan_loss``; this method skips
+                the G-side decode + discriminator forward to save
+                wallclock — the D-update still fires every iter.
 
         Returns:
             ``(generator_gan_loss, logs)`` — ``generator_gan_loss``
@@ -1934,6 +3003,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if not self.gan_enabled or self.r3gan_disc is None:
             return zero, {}
 
+        # Dispatch to the distilled-critic flow when enabled. Keeps
+        # the legacy pixel-disc-in-gen-graph path as the fallback.
+        if (
+            getattr(self, "gan_sam2_distilled_critic", False)
+            and self.latent_critic is not None
+            and self.gan_backbone == "sam2_pixel"
+        ):
+            return self._compute_r3gan_losses_distilled(
+                pred_image=pred_image,
+                gt_latents_window=gt_latents_window,
+                current_step=current_step,
+                flash_dmd_regime=flash_dmd_regime,
+                paper_aligned_x0_for_adv=paper_aligned_x0_for_adv,
+            )
+
         disc_for_update = (
             self.r3gan_disc_ddp if self.r3gan_disc_ddp is not None else self.r3gan_disc
         )
@@ -1941,8 +3025,82 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         # D's own arithmetic stays in fp32 for the second-order
         # gradient penalty. The cost is one extra cast.
-        real_detached = gt_latents_window.detach().to(torch.float32)
-        fake_detached = pred_image.detach().to(torch.float32)
+        # ``pred_image_for_g`` is the graph-carrying version used in
+        # the G-side branch; ``*_detached`` versions feed the D-update.
+        real_detached_lat = gt_latents_window.detach().to(torch.float32)
+        fake_detached_lat = pred_image.detach().to(torch.float32)
+        # Paper-aligned adv (Flash-DMD §3.3 Eq. 8-9): the G-side fake
+        # is NOT the rolling rollout's pred_image — it's an EXTRA
+        # gen forward at low-noise ˆt on re-noised pred_x0. The
+        # model stashes the result on ``info["paper_aligned_x0_for_adv"]``
+        # and the caller passes it here. Grad through this latent
+        # flows back to the gen via the extra forward only, never
+        # through the rolling rollout's high-noise denoising steps.
+        if paper_aligned_x0_for_adv is not None:
+            pred_image_for_g_lat = paper_aligned_x0_for_adv.to(torch.float32)
+        else:
+            pred_image_for_g_lat = pred_image.to(torch.float32)
+        # Flash-DMD high-noise iter: the trainer caller will discard
+        # ``generator_gan_loss``; skip the G-side decode + SAM2 forward
+        # to save wallclock. The D-side decode + update still runs
+        # every iter so the discriminator keeps learning. Paper-aligned
+        # mode bypasses the regime gate (both losses fire every iter)
+        # so skip_g_side is False there regardless of regime.
+        skip_g_side = (
+            flash_dmd_regime == "high"
+            and paper_aligned_x0_for_adv is None
+        )
+
+        if self.gan_backbone == "sam2_pixel":
+            # Pixel-space discriminator: decode the latent video to
+            # pixels via the WAN VAE. The decode runs in fp32 (the
+            # VAE's internal Conv3d kernels require fp32) and mirrors
+            # the dummy-frame trick from ``_log_pred_image_video`` to
+            # avoid the WAN VAE's first-frame artifact. Two D-side
+            # decodes per iter (real + fake) ALWAYS fire; the third
+            # G-side decode is skipped on Flash-DMD high-noise iters
+            # (where the gen GAN loss would be discarded anyway).
+            #
+            # Deviation from paper §4.1 (auditor's #11): the paper
+            # feeds RAW pixel reals directly (x_real ∼ D_real) and
+            # only fakes go through V (V(z_fake)). Our dataset is
+            # preprocessed to latent — no raw pixel videos on disk —
+            # so real = V(encode(real_pixel)) goes through the same
+            # VAE roundtrip as fake. Both real and fake live on the
+            # V-decode manifold (no V-roundtrip artifacts to detect,
+            # which is good), but the disc learns distinguishing on
+            # the V-decode manifold rather than natural images (mild
+            # distribution shift). Acceptable trade-off given data
+            # constraints; would require a parallel pixel-video data
+            # path to fix paper-faithfully.
+            vae = getattr(self.model, "vae", None)
+            if vae is None:
+                raise RuntimeError(
+                    "gan_backbone=sam2_pixel requires self.model.vae "
+                    "to be set; the WAN VAE wrapper is built by the "
+                    "parent SelfForcingModel init. Check the model "
+                    "construction path."
+                )
+
+            def _decode(lat: torch.Tensor) -> torch.Tensor:
+                # ``lat`` is [B, F, C, H, W] in fp32. Apply the
+                # dummy-leading-frame trick (matches video logger).
+                dummy = lat[:, 0:1]
+                lat_pad = torch.cat([dummy, lat], dim=1)
+                pix = vae.decode_to_pixel(lat_pad)
+                return pix[:, 1:, ...]
+
+            real_detached = _decode(real_detached_lat)
+            fake_detached = _decode(fake_detached_lat)
+            pred_image_for_g = (
+                None if skip_g_side else _decode(pred_image_for_g_lat)
+            )
+        else:
+            real_detached = real_detached_lat
+            fake_detached = fake_detached_lat
+            pred_image_for_g = (
+                None if skip_g_side else pred_image_for_g_lat
+            )
 
         # --- D-update (multi-step) -----------------------------------
         d_loss_value = 0.0
@@ -1983,15 +3141,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             gen_gan_weight = self.gan_loss_weight
 
-        if gen_gan_weight > 0:
+        if gen_gan_weight > 0 and not skip_g_side:
+            # Freeze the disc for the G-side path. On the SAM2
+            # backbone the encoder stays frozen at all times — we
+            # restore ``requires_grad=True`` only on the trainable
+            # heads after the G-update.
             disc_for_guidance.requires_grad_(False)
             try:
                 d_real_for_g = disc_for_guidance(real_detached).detach()
-                d_fake_for_g = disc_for_guidance(pred_image.to(torch.float32))
+                d_fake_for_g = disc_for_guidance(pred_image_for_g)
                 gen_gan_main = rpgan_g_loss(d_real_for_g, d_fake_for_g)
                 generator_gan_loss = gen_gan_weight * gen_gan_main.to(pred_image.dtype)
             finally:
+                # Restore trainability on the trainable params only.
+                # For SAM2 backbone, the frozen encoder must stay
+                # frozen — flip ALL params back to True then re-freeze
+                # the encoder. For latent backbone, all params are
+                # trainable so True everywhere is correct.
                 disc_for_guidance.requires_grad_(True)
+                if self.gan_backbone == "sam2_pixel":
+                    enc = getattr(disc_for_guidance, "image_encoder", None)
+                    if enc is not None:
+                        for p in enc.parameters():
+                            p.requires_grad_(False)
             d_fake_for_g_value = float(d_fake_for_g.detach().mean().item())
             gen_gan_main_value = float(gen_gan_main.detach().item())
         else:
@@ -3132,6 +4304,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             self.model._dmd_eval_stash = None
 
+        # Flash-DMD: roll the iter's regime once, inject into info so
+        # the model gates the DMD compute and the GAN gate below
+        # consults the same flag. None-return (legacy mode) leaves
+        # info untouched.
+        flash_regime = self._flash_dmd_sample_iter_regime(train_chunk.device)
+        if flash_regime is not None:
+            train_info.update(flash_regime)
+
         gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
             train_chunk, train_info,
         )
@@ -3149,6 +4329,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             for k, v in gen_log.items()
             if not isinstance(v, dict)
         })
+        if flash_regime is not None:
+            out["flash_dmd_iter_t"] = float(flash_regime["flash_dmd_iter_t"])
+            out["flash_dmd_regime_high"] = (
+                1.0 if flash_regime["flash_dmd_regime"] == "high" else 0.0
+            )
 
         generator_loss = gen_loss_dmd
 
@@ -3191,12 +4376,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         if gan_active:
             gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
+            _flash_regime_str = (
+                flash_regime["flash_dmd_regime"]
+                if flash_regime is not None else None
+            )
+            # Paper-aligned adv: the model stashes the extra low-noise
+            # gen forward output on ``info["paper_aligned_x0_for_adv"]``;
+            # pass it through so the disc sees x0_for_adv as fake.
+            _paper_aligned_x0 = train_info.get("paper_aligned_x0_for_adv")
             gen_gan_loss, gan_logs = self._compute_r3gan_losses(
                 pred_image=train_chunk,
                 gt_latents_window=gt_window,
                 current_step=int(self.step),
+                flash_dmd_regime=_flash_regime_str,
+                paper_aligned_x0_for_adv=_paper_aligned_x0,
             )
-            generator_loss = generator_loss + gen_gan_loss
+            # Flash-DMD: skip the generator's GAN gradient on
+            # high-noise iters when running per-iter alternation.
+            # Paper-aligned mode (``paper_aligned_x0_for_adv``)
+            # bypasses the gate — both DMD and adv fire every iter
+            # per Flash-DMD §3.3 Eq. 8-9.
+            if (
+                _paper_aligned_x0 is None
+                and flash_regime is not None
+                and flash_regime["flash_dmd_regime"] == "high"
+            ):
+                gan_logs["gan_gen_loss_skipped_high_noise"] = 1.0
+            else:
+                generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
 
         if sc_dmd_active:
@@ -3228,6 +4435,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if not isinstance(v, dict)
         })
         critic_loss.backward()
+
+        # Distilled-critic deferred step. Path 1 (D-update) + Path 2
+        # (critic value+grad distillation) were stashed by the gen
+        # step's ``_compute_r3gan_losses_distilled``. Run them here
+        # AFTER both gen and action-critic backwards. Note: the gen
+        # backward uses ``retain_graph=True`` (so the action-critic
+        # backward can walk the shared cond_dict / action_projection
+        # subgraph) which keeps gen activations alive even after the
+        # action-critic backward completes. Explicitly empty the
+        # CUDA allocator cache before launching the heavy V+SAM2
+        # forwards in Paths 1+2 to release any fragmented free
+        # blocks back to CUDA — without this, the allocator may
+        # have ~5-10 GB of small unusable holes that block a
+        # contiguous ~1 GB workspace allocation.
+        if self._distilled_pending is not None:
+            torch.cuda.empty_cache()
+            self._run_distilled_post_backward_step(out)
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Streaming-mode helpers (LongLive parity).
@@ -3451,6 +4676,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 self.model._dmd_eval_stash = None
 
+            # Flash-DMD: roll the iter's regime once, inject into info
+            # so the model gates the DMD compute and the GAN gate
+            # below consults the same flag.
+            flash_regime = self._flash_dmd_sample_iter_regime(chunk.device)
+            if flash_regime is not None:
+                info.update(flash_regime)
+
             gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
                 chunk, info,
             )
@@ -3473,6 +4705,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 for k, v in gen_log.items()
                 if not isinstance(v, dict)
             })
+            if flash_regime is not None:
+                merged["flash_dmd_iter_t"] = float(flash_regime["flash_dmd_iter_t"])
+                merged["flash_dmd_regime_high"] = (
+                    1.0 if flash_regime["flash_dmd_regime"] == "high" else 0.0
+                )
 
             generator_loss = gen_loss_dmd
 
@@ -3525,12 +4762,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 gt_window = state["ride_latents_window"][
                     :, chunk_lo:chunk_hi,
                 ]
+                _flash_regime_str = (
+                    flash_regime["flash_dmd_regime"]
+                    if flash_regime is not None else None
+                )
+                # Paper-aligned adv: model stashes the extra
+                # low-noise gen forward output on
+                # ``info["paper_aligned_x0_for_adv"]``.
+                _paper_aligned_x0 = info.get("paper_aligned_x0_for_adv")
                 gen_gan_loss, gan_logs = self._compute_r3gan_losses(
                     pred_image=chunk,
                     gt_latents_window=gt_window,
                     current_step=int(self.step),
+                    flash_dmd_regime=_flash_regime_str,
+                    paper_aligned_x0_for_adv=_paper_aligned_x0,
                 )
-                generator_loss = generator_loss + gen_gan_loss
+                # Flash-DMD: skip the generator's GAN gradient on
+                # high-noise iters in per-iter-alternation mode.
+                # Paper-aligned mode bypasses the gate — both losses
+                # fire every iter per Flash-DMD §3.3 Eq. 8-9.
+                if (
+                    _paper_aligned_x0 is None
+                    and flash_regime is not None
+                    and flash_regime["flash_dmd_regime"] == "high"
+                ):
+                    gan_logs["gan_gen_loss_skipped_high_noise"] = 1.0
+                else:
+                    generator_loss = generator_loss + gen_gan_loss
                 merged.update(gan_logs)
 
             if sc_dmd_active:
