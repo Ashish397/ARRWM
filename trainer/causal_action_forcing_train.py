@@ -668,6 +668,101 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             self.latent_critic_ddp is not None,
                         )
 
+                # ----- Dense perceptual approximators (mse / lpips /
+                # gan_d_approx) — all share the PerceptualApprox 3D-CNN
+                # architecture. Each takes (gen_lat, gt_lat) and outputs
+                # a dense per-frame-per-spatial-token field; the three
+                # differ only in their training target (per-token MSE,
+                # per-token LPIPS, per-token disc logit map).
+                # When ``gan_d_approx_loss_weight > 0``, gan_d_approx
+                # REPLACES LatentSAM2Critic in the gen-side path.
+                self.mse_approx = None
+                self.mse_approx_ddp = None
+                self.mse_approx_optimizer = None
+                self.lpips_approx = None
+                self.lpips_approx_ddp = None
+                self.lpips_approx_optimizer = None
+                self.msssim_approx = None
+                self.msssim_approx_ddp = None
+                self.msssim_approx_optimizer = None
+                self.gan_d_approx = None
+                self.gan_d_approx_ddp = None
+                self.gan_d_approx_optimizer = None
+                self._lpips_target_model = None  # lazy-built no_grad LPIPS
+                # Read directly from cfg here so we avoid the order-of-
+                # init issue (the knob assignments to self happen later
+                # in this same __init__, after the disc/critic build).
+                _approx_d_model = int(
+                    getattr(self.config, "perceptual_approx_d_model", 256)
+                )
+                _approx_num_blocks = int(
+                    getattr(self.config, "perceptual_approx_num_blocks", 4)
+                )
+                _need_mse_approx = float(
+                    getattr(self.config, "mse_approx_loss_weight", 0.0)
+                ) > 0
+                _need_lpips_approx = float(
+                    getattr(self.config, "lpips_approx_loss_weight", 0.0)
+                ) > 0
+                _need_msssim_approx = float(
+                    getattr(self.config, "msssim_approx_loss_weight", 0.0)
+                ) > 0
+                _need_gan_d_approx = float(
+                    getattr(self.config, "gan_d_approx_loss_weight", 0.0)
+                ) > 0
+                if (
+                    _need_mse_approx or _need_lpips_approx
+                    or _need_msssim_approx or _need_gan_d_approx
+                ):
+                    from model.perceptual_approx import PerceptualApprox
+
+                    def _build_approx(name: str):
+                        m = PerceptualApprox(
+                            in_channels=16,
+                            d_model=_approx_d_model,
+                            num_blocks=_approx_num_blocks,
+                        ).to(device=self.device, dtype=torch.float32)
+                        m.train()
+                        ddp = None
+                        if self.world_size > 1:
+                            ddp = DDP(
+                                m, device_ids=[self.local_rank],
+                                output_device=self.local_rank,
+                                find_unused_parameters=False,
+                                broadcast_buffers=False,
+                            )
+                        if self.is_main_process:
+                            logging.info(
+                                "[ActionForcing] %s built: d_model=%d "
+                                "num_blocks=%d num_params=%.2fM "
+                                "(DDP=%s)",
+                                name,
+                                _approx_d_model,
+                                _approx_num_blocks,
+                                m.num_params / 1e6,
+                                ddp is not None,
+                            )
+                        return m, ddp
+
+                    if _need_mse_approx:
+                        self.mse_approx, self.mse_approx_ddp = _build_approx(
+                            "MSEApprox"
+                        )
+                    if _need_lpips_approx:
+                        self.lpips_approx, self.lpips_approx_ddp = (
+                            _build_approx("LPIPSApprox")
+                        )
+                    if _need_msssim_approx:
+                        (
+                            self.msssim_approx,
+                            self.msssim_approx_ddp,
+                        ) = _build_approx("MSSSIMApprox")
+                    if _need_gan_d_approx:
+                        (
+                            self.gan_d_approx,
+                            self.gan_d_approx_ddp,
+                        ) = _build_approx("GANDApprox")
+
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
         # No new modules / optimizers needed; the SC pass shares the
@@ -1118,6 +1213,145 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_critic_grad_loss_weight = float(
             getattr(cfg, "gan_critic_grad_loss_weight", 1.0)
         )
+        # Multi-step critic training (mirrors action_critic's
+        # ``critic_updates_per_step``): step the critic optimizer K_c
+        # times per gen step. Default 1 = legacy single-step behavior.
+        self.gan_critic_updates_per_step = int(
+            getattr(cfg, "gan_critic_updates_per_step", 1)
+        )
+        # Multi-noise (WGAN-GP-style) Path 2 expansion: K interpolation
+        # points between (real_lat, fake_lat) for value-distillation.
+        # Densifies the critic's value-field constraints so its gradient
+        # becomes meaningful by Lipschitz interpolation. Default 0 =
+        # legacy 2-point (real, fake) only.
+        self.gan_critic_n_interp_samples = int(
+            getattr(cfg, "gan_critic_n_interp_samples", 0)
+        )
+        # Finite-difference Sobolev: train the critic's input-gradient
+        # to match the disc's input-gradient via (no_grad) finite
+        # differences. Cheap alternative to true Sobolev (no graph-on
+        # V+SAM2 backward). When ``gan_critic_fd_loss_weight > 0``,
+        # perturb fake_lat by ε~N(0, σ²) on a random subset of frames,
+        # match (critic(z+ε)-critic(z))/ε to (disc(decode(z+ε))
+        # -disc(decode(z)))/ε. Default 0 = disabled.
+        self.gan_critic_fd_loss_weight = float(
+            getattr(cfg, "gan_critic_fd_loss_weight", 0.0)
+        )
+        self.gan_critic_fd_sigma = float(
+            getattr(cfg, "gan_critic_fd_sigma", 0.01)
+        )
+        self.gan_critic_fd_frames = int(
+            getattr(cfg, "gan_critic_fd_frames", 1)
+        )
+        self.gan_critic_fd_n_directions = int(
+            getattr(cfg, "gan_critic_fd_n_directions", 1)
+        )
+        # ---------- Pixel-space perceptual losses (v13) ----------
+        # LPIPS (Zhang et al., CVPR 2018) — VGG-based perceptual
+        # distance between gen pixels and GT pixels. Direct anti-blur
+        # signal that doesn't go through the GAN distillation chain.
+        # Operates on a small frame subset per iter (memory budget).
+        # ``lpips_loss_weight=0`` disables. Lazy-loaded on first use.
+        self.lpips_loss_weight = float(
+            getattr(cfg, "lpips_loss_weight", 0.0)
+        )
+        self.lpips_n_frames = int(
+            getattr(cfg, "lpips_n_frames", 2)
+        )
+        # Pixel-space L1/MSE (the "(3)" term). Anti-streaming-drift
+        # signal — direct pixel supervision that DMD doesn't provide.
+        # Low weight (0.01-0.1) is the standard.
+        self.pixel_recon_loss_weight = float(
+            getattr(cfg, "pixel_recon_loss_weight", 0.0)
+        )
+        # ``mse | l1`` — L1 is more outlier-robust, MSE is smoother.
+        self.pixel_recon_loss_type = str(
+            getattr(cfg, "pixel_recon_loss_type", "l1")
+        )
+        # Optional random crop for LPIPS / pixel-recon — keeps memory
+        # bounded when full-resolution decode (480×832) is too large.
+        # 0 disables cropping (use full decoded resolution).
+        self.lpips_crop_size = int(
+            getattr(cfg, "lpips_crop_size", 0)
+        )
+
+        # ---------- Dense perceptual approximators (v13 redesign) ---------
+        # Train cheap latent-space approximators that predict the
+        # per-token MSE / LPIPS distance between gen and GT pixels —
+        # gen-side loss flows gradient through these (no VAE backprop)
+        # so we get pixel-level supervision without OOM. The approxes
+        # are trained on dense per-token targets computed via no_grad
+        # VAE decode (which the disc training path already does), so
+        # the only extra cost per iter is the LPIPS forward + per-token
+        # mean-pool. See ``model/perceptual_approx.py`` for design.
+        self.mse_approx_loss_weight = float(
+            getattr(cfg, "mse_approx_loss_weight", 0.0)
+        )
+        # The "MSE" approx actually predicts a per-token combined
+        # ``l2_w * (gen-gt)² + l1_w * |gen-gt|`` field. Both terms are
+        # GRANULAR (per-pixel reduced to per-latent-token by mean-pool),
+        # not just per-frame scalars. Setting ``l1_w=0`` recovers the
+        # legacy pure-MSE target.
+        self.mse_approx_l2_weight = float(
+            getattr(cfg, "mse_approx_l2_weight", 1.0)
+        )
+        self.mse_approx_l1_weight = float(
+            getattr(cfg, "mse_approx_l1_weight", 0.0)
+        )
+        self.lpips_approx_loss_weight = float(
+            getattr(cfg, "lpips_approx_loss_weight", 0.0)
+        )
+        # MS-SSIM approx — per-frame MS-SSIM scalar broadcast across
+        # the latent token grid. Gen-side loss is sign-flipped (gen
+        # wants MS-SSIM HIGH = "looks similar to GT in structure").
+        # Less blur-prone than MSE because MS-SSIM preserves local
+        # structure / edges instead of penalizing pixel-wise diffs.
+        self.msssim_approx_loss_weight = float(
+            getattr(cfg, "msssim_approx_loss_weight", 0.0)
+        )
+        # gan_d_approx replaces LatentSAM2Critic when > 0. Same arch
+        # (PerceptualApprox), takes (gen_lat, gt_lat), trained against
+        # the pixel-disc's DENSE per-token output map for the gen
+        # latent. Gen-side loss = -gan_d_approx(gen, gt).mean() (same
+        # sign convention as the legacy ``-critic(fake).mean()``).
+        self.gan_d_approx_loss_weight = float(
+            getattr(cfg, "gan_d_approx_loss_weight", 0.0)
+        )
+        # Dense target supervision (the "(2)" in user's spec): the
+        # approxes are trained on per-token MSE/LPIPS targets PLUS
+        # a scalar mean-alignment term. ``mean_align_weight`` weights
+        # the second term in the approx training loss; default 0.1
+        # (mean is a soft constraint relative to the dense target).
+        self.perceptual_approx_mean_align_weight = float(
+            getattr(cfg, "perceptual_approx_mean_align_weight", 0.1)
+        )
+        # Approx model architecture knobs.
+        self.perceptual_approx_d_model = int(
+            getattr(cfg, "perceptual_approx_d_model", 256)
+        )
+        self.perceptual_approx_num_blocks = int(
+            getattr(cfg, "perceptual_approx_num_blocks", 4)
+        )
+        self.perceptual_approx_lr = float(
+            getattr(cfg, "perceptual_approx_lr", 2e-4)
+        )
+        self.perceptual_approx_warmup_steps = int(
+            getattr(cfg, "perceptual_approx_warmup_steps", 25)
+        )
+        # ----- v11-style multi-noise (Lipschitz-by-density) -----
+        # When > 0, sample K interpolation points between
+        # ``fake_lat`` and ``real_lat`` each iter, compute the dense
+        # per-token target metrics on each, and add their MSE to each
+        # approx's training loss. The denser supervision constrains
+        # the approx's value field across the (fake → real) line so
+        # its gradient (what the gen consumes via ``.mean()``) is
+        # meaningful by Lipschitz interpolation.
+        # Each interpolation costs: 1 no_grad VAE decode + (optionally)
+        # 1 SAM2 forward + 1 LPIPS forward + K small approx forwards.
+        # Sequential per-alpha processing bounds peak memory.
+        self.perceptual_approx_n_interp_samples = int(
+            getattr(cfg, "perceptual_approx_n_interp_samples", 0)
+        )
         if (
             self.gan_enabled
             and getattr(self, "latent_critic", None) is not None
@@ -1149,12 +1383,103 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "[ActionForcing] LatentSAM2Critic optimizer built: "
                     "AdamW lr=%.2e betas=%s wd=%.4f params=%.2fM "
                     "(warmup=%d, grad_frames=%d, grad_full_every=%d, "
-                    "grad_loss_weight=%.3f)",
+                    "grad_loss_weight=%.3f, updates_per_step=%d, "
+                    "n_interp=%d, fd_loss_weight=%.3f, fd_sigma=%.4f, "
+                    "fd_frames=%d, fd_n_directions=%d)",
                     critic_lr, critic_betas, critic_wd, n_params / 1e6,
                     self.gan_critic_warmup_steps,
                     self.gan_critic_grad_frames,
                     self.gan_critic_grad_full_every,
                     self.gan_critic_grad_loss_weight,
+                    self.gan_critic_updates_per_step,
+                    self.gan_critic_n_interp_samples,
+                    self.gan_critic_fd_loss_weight,
+                    self.gan_critic_fd_sigma,
+                    self.gan_critic_fd_frames,
+                    self.gan_critic_fd_n_directions,
+                )
+
+        # ----- Perceptual approx optimizers (mse / lpips) -----
+        if getattr(self, "mse_approx", None) is not None:
+            self.mse_approx_optimizer = torch.optim.AdamW(
+                [p for p in self.mse_approx.parameters() if p.requires_grad],
+                lr=self.perceptual_approx_lr,
+                betas=(0.0, 0.9),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] MSEApprox optimizer built: "
+                    "AdamW lr=%.2e weight=%.3f warmup=%d "
+                    "mean_align_w=%.3f",
+                    self.perceptual_approx_lr,
+                    self.mse_approx_loss_weight,
+                    self.perceptual_approx_warmup_steps,
+                    self.perceptual_approx_mean_align_weight,
+                )
+        if getattr(self, "lpips_approx", None) is not None:
+            self.lpips_approx_optimizer = torch.optim.AdamW(
+                [
+                    p for p in self.lpips_approx.parameters()
+                    if p.requires_grad
+                ],
+                lr=self.perceptual_approx_lr,
+                betas=(0.0, 0.9),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] LPIPSApprox optimizer built: "
+                    "AdamW lr=%.2e weight=%.3f warmup=%d "
+                    "mean_align_w=%.3f",
+                    self.perceptual_approx_lr,
+                    self.lpips_approx_loss_weight,
+                    self.perceptual_approx_warmup_steps,
+                    self.perceptual_approx_mean_align_weight,
+                )
+        if getattr(self, "msssim_approx", None) is not None:
+            self.msssim_approx_optimizer = torch.optim.AdamW(
+                [
+                    p for p in self.msssim_approx.parameters()
+                    if p.requires_grad
+                ],
+                lr=self.perceptual_approx_lr,
+                betas=(0.0, 0.9),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] MSSSIMApprox optimizer built: "
+                    "AdamW lr=%.2e weight=%.3f warmup=%d "
+                    "(gen-side sign FLIPPED — gen wants MS-SSIM HIGH)",
+                    self.perceptual_approx_lr,
+                    self.msssim_approx_loss_weight,
+                    self.perceptual_approx_warmup_steps,
+                )
+        if getattr(self, "gan_d_approx", None) is not None:
+            self.gan_d_approx_optimizer = torch.optim.AdamW(
+                [
+                    p for p in self.gan_d_approx.parameters()
+                    if p.requires_grad
+                ],
+                lr=self.perceptual_approx_lr,
+                betas=(0.0, 0.9),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] GANDApprox optimizer built: "
+                    "AdamW lr=%.2e weight=%.3f warmup=%d "
+                    "mean_align_w=%.3f (REPLACES LatentSAM2Critic in "
+                    "gen-side path)",
+                    self.perceptual_approx_lr,
+                    self.gan_d_approx_loss_weight,
+                    self.perceptual_approx_warmup_steps,
+                    self.perceptual_approx_mean_align_weight,
                 )
 
         # ------------------------------------------------------------------
@@ -2421,6 +2746,686 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             dist.broadcast(idx, src=0)
         return idx.tolist()
 
+    def _get_lpips_target_model(self) -> Optional["torch.nn.Module"]:
+        """Lazy-build the LPIPS model used to compute DENSE TARGETS for
+        the LPIPS approx (no_grad, never trained). Spatial=True returns
+        per-position distance maps so we can mean-pool to a per-token
+        target grid for the approx.
+
+        Separate from ``_get_lpips_model`` (which would have been used
+        for direct LPIPS-as-loss; that path was abandoned due to OOM
+        from VAE backprop). This one always sets ``spatial=True``.
+        """
+        cached = getattr(self, "_lpips_target_model", None)
+        if cached is not None:
+            return cached
+        try:
+            import lpips as _lpips
+        except ImportError as e:
+            raise RuntimeError(
+                "lpips_approx_loss_weight>0 requires the 'lpips' "
+                f"package: pip install lpips. Original error: {e}"
+            )
+        model = _lpips.LPIPS(
+            net="vgg", verbose=False, spatial=True,
+        )
+        model = model.to(device=self.device, dtype=torch.float32)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self._lpips_target_model = model
+        if self.is_main_process:
+            n_params = sum(p.numel() for p in model.parameters())
+            logging.info(
+                "[ActionForcing] LPIPS-target(vgg, spatial) lazy-built: "
+                "params=%.2fM (used for no_grad target only)",
+                n_params / 1e6,
+            )
+        return model
+
+    def _compute_dense_perceptual_targets(
+        self,
+        gen_pix: torch.Tensor,
+        gt_pix: torch.Tensor,
+        F_lat: int,
+        target_h: int,
+        target_w: int,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        """Build per-token MSE-or-MSE+MAE / LPIPS / MS-SSIM dense
+        targets from VAE-decoded pixel pairs.
+
+        Args:
+            gen_pix / gt_pix: ``[B, F_pix, 3, H_pix, W_pix]`` in [-1, 1].
+                F_pix = 4 * F_lat (WAN VAE temporal expansion).
+            F_lat: latent temporal length (target frame axis).
+            target_h, target_w: token grid spatial dims (=8 by default,
+                matching the approx's post-stem output).
+
+        Returns:
+            ``(target_mse, target_lpips, target_msssim)`` each
+            ``[B, F_lat, target_h, target_w]``. Any may be None when
+            its weight is 0 (skip compute).
+
+        ``target_mse`` is actually a combined ``l2_w * (gen-gt)² +
+        l1_w * |gen-gt|`` per-token field — both terms are per-pixel
+        and granular (mean-pooled to the latent token grid). Set
+        ``mse_approx_l1_weight=0`` for legacy pure-MSE.
+
+        ``target_msssim`` is per-frame MS-SSIM (computed on each
+        pixel frame, then averaged across the 4 pixel-frames-per-
+        latent) BROADCAST across all (target_h * target_w) tokens.
+        Per-frame scalar supervision but dense approx output, so
+        the approx learns its own spatial pattern.
+        """
+        B, F_pix, C, H_pix, W_pix = gen_pix.shape
+        if F_pix % F_lat != 0:
+            raise RuntimeError(
+                f"_compute_dense_perceptual_targets: F_pix={F_pix} "
+                f"not divisible by F_lat={F_lat}."
+            )
+        pix_per_lat = F_pix // F_lat
+        target_mse: Optional[torch.Tensor] = None
+        target_lpips: Optional[torch.Tensor] = None
+        target_msssim: Optional[torch.Tensor] = None
+
+        with torch.no_grad():
+            if self.mse_approx_loss_weight > 0:
+                # Combined L2 + L1 per-token target.
+                # Per-pixel l2 = (gen - gt)², l1 = |gen - gt|.
+                diff = gen_pix - gt_pix  # [B, F_pix, 3, H, W]
+                l2_w = float(self.mse_approx_l2_weight)
+                l1_w = float(self.mse_approx_l1_weight)
+                combined = l2_w * (diff ** 2)
+                if l1_w > 0:
+                    combined = combined + l1_w * diff.abs()
+                del diff
+                # Reshape to [B, F_lat, pix_per_lat, 3, H, W] then mean
+                # over (pix_per_lat, 3) → [B, F_lat, H_pix, W_pix].
+                combined = combined.view(
+                    B, F_lat, pix_per_lat, C, H_pix, W_pix,
+                )
+                combined = combined.mean(dim=(2, 3))
+                # Spatial mean-pool to token grid.
+                combined = combined.reshape(
+                    B * F_lat, 1, H_pix, W_pix,
+                )
+                target_mse = torch.nn.functional.adaptive_avg_pool2d(
+                    combined, (target_h, target_w),
+                ).reshape(B, F_lat, target_h, target_w).float()
+                del combined
+            if self.lpips_approx_loss_weight > 0:
+                lpips_model = self._get_lpips_target_model()
+                # LPIPS expects [N, 3, H, W] in [-1, 1]. Forward on
+                # all 84 frames at 480×832 blows ~8 GB activation
+                # workspace. Process in small chunks (4 frames each)
+                # and accumulate the spatial-pooled distance.
+                gen_flat = gen_pix.reshape(B * F_pix, C, H_pix, W_pix)
+                gt_flat = gt_pix.reshape(B * F_pix, C, H_pix, W_pix)
+                chunk = 4
+                pooled_chunks = []
+                for s in range(0, gen_flat.shape[0], chunk):
+                    e = min(s + chunk, gen_flat.shape[0])
+                    d_chunk = lpips_model(
+                        gen_flat[s:e], gt_flat[s:e],
+                    ).float()  # [chunk, 1, h_d, w_d]
+                    d_chunk = torch.nn.functional.adaptive_avg_pool2d(
+                        d_chunk, (target_h, target_w),
+                    )
+                    pooled_chunks.append(d_chunk)
+                dist = torch.cat(pooled_chunks, dim=0)
+                dist = dist.reshape(
+                    B, F_lat, pix_per_lat, target_h, target_w,
+                )
+                target_lpips = dist.mean(dim=2).float()
+            if self.msssim_approx_loss_weight > 0:
+                # MS-SSIM expects [N, C, H, W] in non-negative range
+                # (default data_range=1.0). Our pixels are in
+                # [-1, 1] so shift to [0, 1] and use data_range=1.
+                # Per-frame scalar (size_average=False), then average
+                # over the 4 pixel-frames per latent → [B, F_lat].
+                from pytorch_msssim import ms_ssim as _ms_ssim_fn
+                gen_norm = (
+                    gen_pix.reshape(
+                        B * F_pix, C, H_pix, W_pix,
+                    ).float().clamp(-1, 1) + 1.0
+                ) * 0.5
+                gt_norm = (
+                    gt_pix.reshape(
+                        B * F_pix, C, H_pix, W_pix,
+                    ).float().clamp(-1, 1) + 1.0
+                ) * 0.5
+                # Chunk to bound memory (MS-SSIM does multi-scale
+                # Gaussian filtering — ~1-2 GB transient per 4-frame
+                # batch at 480x832).
+                chunk = 4
+                msssim_chunks = []
+                for s in range(0, gen_norm.shape[0], chunk):
+                    e = min(s + chunk, gen_norm.shape[0])
+                    msssim_chunks.append(
+                        _ms_ssim_fn(
+                            gen_norm[s:e],
+                            gt_norm[s:e],
+                            data_range=1.0,
+                            size_average=False,
+                        ).float()
+                    )
+                msssim_per_pix_frame = torch.cat(msssim_chunks, dim=0)
+                # [B*F_pix] → [B, F_lat] (mean over pix_per_lat).
+                msssim_per_lat = msssim_per_pix_frame.view(
+                    B, F_lat, pix_per_lat,
+                ).mean(dim=2)
+                # Broadcast to dense token grid.
+                target_msssim = (
+                    msssim_per_lat
+                    .unsqueeze(-1).unsqueeze(-1)
+                    .expand(B, F_lat, target_h, target_w)
+                    .contiguous()
+                    .float()
+                )
+                del gen_norm, gt_norm, msssim_per_pix_frame
+        return target_mse, target_lpips, target_msssim
+
+    def _run_perceptual_approx_update(
+        self,
+        gen_lat: torch.Tensor,
+        gt_lat: torch.Tensor,
+        target_mse: Optional[torch.Tensor],
+        target_lpips: Optional[torch.Tensor],
+        target_msssim: Optional[torch.Tensor] = None,
+        target_disc_fake: Optional[torch.Tensor] = None,
+        target_disc_real: Optional[torch.Tensor] = None,
+        target_mse_real: Optional[torch.Tensor] = None,
+        target_lpips_real: Optional[torch.Tensor] = None,
+        target_msssim_real: Optional[torch.Tensor] = None,
+        interp_data: Optional[List[Dict[str, torch.Tensor]]] = None,
+        out: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Train all dense per-token approxes against their targets.
+
+        All approxes operate on ``(input_lat, gt_lat)`` (detached) and
+        produce ``[B, F_lat, target_h, target_w]`` predictions. Loss is
+        per-token MSE + scalar mean-alignment. Mutates ``out`` in place.
+
+        ``gan_d_approx`` is trained on TWO forward passes per iter:
+        ``(gen_lat, gt_lat) → target_disc_fake`` and
+        ``(gt_lat, gt_lat) → target_disc_real``. The two-sided training
+        forces the approx to USE its gt_lat input (otherwise the same
+        input gives two different targets, contradicting). This
+        anchors the gt-conditioning so the approx learns "how the disc
+        would score this CANDIDATE given this REFERENCE", which is
+        what the gen actually wants in Path 3.
+        """
+        if out is None:
+            out = {}
+        gen_lat_d = gen_lat.detach()
+        gt_lat_d = gt_lat.detach()
+
+        # Standard single-input approxes (mse / lpips / msssim) use
+        # ``gen_lat`` as the candidate; gan_d_approx is special-cased
+        # below. All three additionally train on a GT-pair anchor
+        # (``approx(gt_lat, gt_lat) → target_real``) so the approx
+        # USES the gt_lat input meaningfully (otherwise it could
+        # learn to ignore it).
+        for (
+            name, model_ddp, model, optim, target, target_real,
+            interp_key, weight,
+        ) in [
+            (
+                "mse_approx",
+                self.mse_approx_ddp,
+                self.mse_approx,
+                self.mse_approx_optimizer,
+                target_mse,
+                target_mse_real,
+                "mse",
+                self.mse_approx_loss_weight,
+            ),
+            (
+                "lpips_approx",
+                self.lpips_approx_ddp,
+                self.lpips_approx,
+                self.lpips_approx_optimizer,
+                target_lpips,
+                target_lpips_real,
+                "lpips",
+                self.lpips_approx_loss_weight,
+            ),
+            (
+                "msssim_approx",
+                self.msssim_approx_ddp,
+                self.msssim_approx,
+                self.msssim_approx_optimizer,
+                target_msssim,
+                target_msssim_real,
+                "msssim",
+                self.msssim_approx_loss_weight,
+            ),
+        ]:
+            if model is None or optim is None or target is None or weight <= 0:
+                continue
+            optim.zero_grad(set_to_none=True)
+            model_for_update = model_ddp if model_ddp is not None else model
+            pred = model_for_update(gen_lat_d, gt_lat_d).float()
+            # Dense per-token loss on the original (gen, gt) anchor.
+            L_dense = ((pred - target) ** 2).mean()
+            L_mean_align = (pred.mean() - target.mean()) ** 2
+            L_total = (
+                L_dense
+                + self.perceptual_approx_mean_align_weight * L_mean_align
+            )
+            # GT-pair anchor: approx(gt, gt) → target_real. For mse it's
+            # ~0, for lpips ~0, for msssim ~1.0. Forces the approx to
+            # use gt_lat input (anchors gt-conditioning).
+            L_real_pair_value = 0.0
+            if target_real is not None:
+                pred_real_pair = model_for_update(gt_lat_d, gt_lat_d).float()
+                L_real_pair = ((pred_real_pair - target_real) ** 2).mean()
+                L_total = L_total + L_real_pair
+                L_real_pair_value = float(L_real_pair.detach().item())
+            # v11-style multi-noise: extra anchor points along the
+            # (fake → real) line. Each contributes a per-token MSE
+            # term to the same training loss. Densifies the value
+            # field so the approx's gradient (what gen consumes) is
+            # meaningful by Lipschitz interpolation across anchors.
+            L_interp_value = 0.0
+            if interp_data is not None and len(interp_data) > 0:
+                interp_terms = []
+                for d in interp_data:
+                    interp_target = d.get(interp_key)
+                    if interp_target is None:
+                        continue
+                    interp_pred = model_for_update(
+                        d["lat"], gt_lat_d,
+                    ).float()
+                    interp_terms.append(
+                        ((interp_pred - interp_target) ** 2).mean()
+                    )
+                if interp_terms:
+                    L_interp = sum(interp_terms) / len(interp_terms)
+                    L_total = L_total + L_interp
+                    L_interp_value = float(L_interp.detach().item())
+            L_total.backward()
+            if (
+                self.gan_max_grad_norm is not None
+                and self.gan_max_grad_norm > 0
+            ):
+                params_iter = (
+                    model_ddp.parameters() if model_ddp is not None
+                    else model.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in params_iter if p.grad is not None],
+                    self.gan_max_grad_norm,
+                )
+            optim.step()
+            out[f"train/{name}_dense_loss"] = float(L_dense.detach().item())
+            out[f"train/{name}_mean_align_loss"] = float(
+                L_mean_align.detach().item()
+            )
+            out[f"train/{name}_pred_mean"] = float(pred.detach().mean().item())
+            out[f"train/{name}_target_mean"] = float(target.mean().item())
+            out[f"train/{name}_interp_loss"] = L_interp_value
+            out[f"train/{name}_real_pair_loss"] = L_real_pair_value
+
+        # ----- gan_d_approx training -----
+        # When ``target_disc_real`` is provided, train the paired
+        # forward: (gen, gt)→target_fake AND (gt, gt)→target_real.
+        # Otherwise fall back to fake-only (gen, gt)→target_fake.
+        if (
+            self.gan_d_approx is not None
+            and self.gan_d_approx_optimizer is not None
+            and self.gan_d_approx_loss_weight > 0
+            and target_disc_fake is not None
+        ):
+            self.gan_d_approx_optimizer.zero_grad(set_to_none=True)
+            model = self.gan_d_approx
+            model_for_update = (
+                self.gan_d_approx_ddp if self.gan_d_approx_ddp is not None
+                else model
+            )
+            # Pass 1: fake side — disc score on gen_pixels.
+            pred_fake = model_for_update(gen_lat_d, gt_lat_d).float()
+            L_dense_fake = ((pred_fake - target_disc_fake) ** 2).mean()
+            L_mean_fake = (pred_fake.mean() - target_disc_fake.mean()) ** 2
+            # Pass 2 (optional): real side — disc score on gt_pixels.
+            pred_real = None
+            if target_disc_real is not None:
+                pred_real = model_for_update(gt_lat_d, gt_lat_d).float()
+                L_dense_real = ((pred_real - target_disc_real) ** 2).mean()
+                L_mean_real = (pred_real.mean() - target_disc_real.mean()) ** 2
+                L_total = (
+                    (L_dense_fake + L_dense_real)
+                    + self.perceptual_approx_mean_align_weight
+                    * (L_mean_fake + L_mean_real)
+                )
+            else:
+                L_dense_real = torch.zeros((), device=gen_lat_d.device)
+                L_mean_real = torch.zeros((), device=gen_lat_d.device)
+                L_total = (
+                    L_dense_fake
+                    + self.perceptual_approx_mean_align_weight * L_mean_fake
+                )
+            # v11-style multi-noise interp anchors for gan_d_approx.
+            # Adds extra (interp_lat, gt_lat) → target_disc_interp
+            # constraints so the approx's value field is densely
+            # supervised across the (fake → real) line.
+            gan_d_interp_value = 0.0
+            if interp_data is not None and len(interp_data) > 0:
+                interp_terms = []
+                for d in interp_data:
+                    interp_target = d.get("disc")
+                    if interp_target is None:
+                        continue
+                    interp_pred = model_for_update(
+                        d["lat"], gt_lat_d,
+                    ).float()
+                    interp_terms.append(
+                        ((interp_pred - interp_target) ** 2).mean()
+                    )
+                if interp_terms:
+                    L_interp = sum(interp_terms) / len(interp_terms)
+                    L_total = L_total + L_interp
+                    gan_d_interp_value = float(L_interp.detach().item())
+            L_total.backward()
+            if (
+                self.gan_max_grad_norm is not None
+                and self.gan_max_grad_norm > 0
+            ):
+                params_iter = (
+                    self.gan_d_approx_ddp.parameters()
+                    if self.gan_d_approx_ddp is not None
+                    else model.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in params_iter if p.grad is not None],
+                    self.gan_max_grad_norm,
+                )
+            self.gan_d_approx_optimizer.step()
+            out["train/gan_d_approx_dense_loss_fake"] = float(
+                L_dense_fake.detach().item()
+            )
+            out["train/gan_d_approx_dense_loss_real"] = float(
+                L_dense_real.detach().item()
+            )
+            out["train/gan_d_approx_pred_fake_mean"] = float(
+                pred_fake.detach().mean().item()
+            )
+            if pred_real is not None:
+                out["train/gan_d_approx_pred_real_mean"] = float(
+                    pred_real.detach().mean().item()
+                )
+            out["train/gan_d_approx_target_fake_mean"] = float(
+                target_disc_fake.mean().item()
+            )
+            if target_disc_real is not None:
+                out["train/gan_d_approx_target_real_mean"] = float(
+                    target_disc_real.mean().item()
+                )
+                # Sanity: real should consistently score HIGHER than fake.
+                out["train/gan_d_approx_target_real_minus_fake"] = float(
+                    (target_disc_real.mean() - target_disc_fake.mean()).item()
+                )
+            out["train/gan_d_approx_interp_loss"] = gan_d_interp_value
+
+    def _compute_gen_side_perceptual_loss(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+        current_step: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Gen-side perceptual loss via the trained approxes.
+
+        ``pred_image``: graph-on gen latent ``[B, F, C, H, W]``.
+        ``gt_latents_window``: GT latent (detached).
+
+        Returns ``(loss, logs)`` where ``loss`` is a graph-attached
+        scalar to add to gen_loss; backward flows through the small
+        approxes (no VAE) into the gen.
+
+        Gated by warmup and per-approx weights. Returns zero scalar
+        + empty logs when nothing fires.
+        """
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        if current_step < self.perceptual_approx_warmup_steps:
+            return zero, {}
+        loss = zero
+        logs: Dict[str, float] = {}
+        gt_lat_det = gt_latents_window.detach().to(pred_image.dtype)
+        # ``sign``: +1 for distance approxes (gen wants pred LOW); -1
+        # for similarity / GAN approxes (gen wants pred HIGH).
+        # MS-SSIM is in [0, 1] with 1 = identical → sign = -1 so the
+        # gen MAXIMIZES it.
+        for name, model, weight, sign in [
+            ("mse_approx", self.mse_approx, self.mse_approx_loss_weight, +1.0),
+            (
+                "lpips_approx",
+                self.lpips_approx,
+                self.lpips_approx_loss_weight,
+                +1.0,
+            ),
+            (
+                "msssim_approx",
+                self.msssim_approx,
+                self.msssim_approx_loss_weight,
+                -1.0,
+            ),
+            (
+                "gan_d_approx",
+                self.gan_d_approx,
+                self.gan_d_approx_loss_weight,
+                -1.0,
+            ),
+        ]:
+            if model is None or weight <= 0:
+                continue
+            # Freeze approx params for this forward — gen-side
+            # backward only flows into pred_image, not the approx.
+            model.requires_grad_(False)
+            try:
+                pred = model(
+                    pred_image.to(pred_image.dtype), gt_lat_det,
+                ).float()
+                pred_mean = pred.mean()
+                loss = loss + sign * weight * pred_mean.to(pred_image.dtype)
+            finally:
+                model.requires_grad_(True)
+            logs[f"train/{name}_gen_pred_mean"] = float(
+                pred_mean.detach().item()
+            )
+            logs[f"train/{name}_gen_loss_weighted"] = float(
+                (sign * weight * pred_mean).detach().item()
+            )
+        return loss, logs
+
+    def _get_lpips_model(self) -> Optional["torch.nn.Module"]:
+        """Lazy-build (and cache) the LPIPS-VGG perceptual distance
+        model. Returns None when ``lpips_loss_weight == 0``.
+
+        VGG16 backbone is downloaded once into ``~/.cache/torch/hub`` —
+        all ranks already have it after the first run. Model is
+        ``eval()`` + ``requires_grad_(False)`` so its parameters are
+        not trained — only its forward gradient flows back into the
+        gen via the decoded pixels.
+        """
+        if self.lpips_loss_weight <= 0:
+            return None
+        cached = getattr(self, "_lpips_model", None)
+        if cached is not None:
+            return cached
+        try:
+            import lpips as _lpips
+        except ImportError as e:
+            raise RuntimeError(
+                "lpips_loss_weight>0 requires the 'lpips' python "
+                f"package: pip install lpips. Original error: {e}"
+            )
+        model = _lpips.LPIPS(net="vgg", verbose=False)
+        model = model.to(device=self.device, dtype=torch.float32)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self._lpips_model = model
+        if self.is_main_process:
+            n_params = sum(p.numel() for p in model.parameters())
+            logging.info(
+                "[ActionForcing] LPIPS(vgg) lazy-built: params=%.2fM "
+                "(weight=%.3f, n_frames=%d, crop_size=%d)",
+                n_params / 1e6, self.lpips_loss_weight,
+                self.lpips_n_frames, self.lpips_crop_size,
+            )
+        return model
+
+    def _vae_decode_grad(
+        self,
+        latent: torch.Tensor,
+        use_checkpoint: bool = True,
+    ) -> torch.Tensor:
+        """Graph-on VAE decode using the dummy-leading-frame trick.
+
+        ``latent``: ``[B, F_lat, C, H_lat, W_lat]`` (with grad).
+        Returns: ``[B, F_pix, 3, H_pix, W_pix]`` in ``[-1, 1]``.
+
+        The WAN VAE single-shot decode produces a "special first
+        latent" output (1 pixel frame) and 4× temporal expansion for
+        the rest. We prepend a dummy frame and slice ``[:, 1:]`` so
+        the dummy absorbs the special-first behavior and our actual
+        latents get the full 4× expansion. Caller controls grad
+        context — used here for graph-on decode that flows gradient
+        back to the gen.
+
+        ``use_checkpoint=True`` wraps the VAE forward in
+        ``torch.utils.checkpoint`` so activations are recomputed
+        during backward instead of cached. ~30% extra compute but
+        ~5-10 GB activation savings — required to fit graph-on decode
+        alongside the gen rollout's persistent activations.
+        """
+        vae = getattr(self.model, "vae", None)
+        if vae is None:
+            raise RuntimeError(
+                "_vae_decode_grad requires self.model.vae."
+            )
+        dummy = latent[:, 0:1]
+        lat_pad = torch.cat([dummy, latent], dim=1)
+        if use_checkpoint:
+            from torch.utils.checkpoint import checkpoint as _ckpt
+
+            def _decode(z):
+                return vae.decode_to_pixel(z)
+
+            pix = _ckpt(_decode, lat_pad, use_reentrant=False)
+        else:
+            pix = vae.decode_to_pixel(lat_pad)
+        return pix[:, 1:, ...]
+
+    def _compute_pixel_perceptual_losses(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+        current_step: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """LPIPS + pixel reconstruction losses on a graph-on subset.
+
+        Decodes a small (``lpips_n_frames``) random subset of the gen
+        prediction through the VAE WITH GRAD, decodes the matching
+        GT latents WITHOUT GRAD (target), optionally crops to a
+        smaller resolution, and computes:
+
+          * LPIPS-VGG distance per frame (anti-blur, perceptual)
+          * Pixel L1 / MSE per frame (anti-drift, direct supervision)
+
+        Returns ``(perceptual_loss, logs)`` where ``perceptual_loss``
+        is graph-attached scalar (to be added to generator_loss);
+        ``logs`` is a flat ``str -> float`` dict.
+
+        Gated by ``self.lpips_loss_weight > 0`` AND/OR
+        ``self.pixel_recon_loss_weight > 0``. Returns zero scalar +
+        empty logs when both are zero.
+        """
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        lpips_active = self.lpips_loss_weight > 0
+        recon_active = self.pixel_recon_loss_weight > 0
+        if not (lpips_active or recon_active):
+            return zero, {}
+
+        # Pick a small random frame subset (DDP-synced).
+        F_lat = pred_image.shape[1]
+        n_pick = max(1, min(int(self.lpips_n_frames), int(F_lat)))
+        frame_idx = self._sample_critic_grad_frame_indices(
+            F_lat, n_pick, device,
+        )
+
+        # Slice latents to the subset and decode.
+        pred_lat_sub = pred_image[:, frame_idx].to(torch.float32)
+        gt_lat_sub = (
+            gt_latents_window[:, frame_idx].detach().to(torch.float32)
+        )
+        # Graph-on for gen, no_grad for GT.
+        pred_pix = self._vae_decode_grad(pred_lat_sub).to(torch.float32)
+        with torch.no_grad():
+            gt_pix = self._vae_decode_grad(gt_lat_sub).to(torch.float32)
+
+        # ``pred_pix`` / ``gt_pix`` are ``[B, F_pix, 3, H, W]`` in
+        # ``[-1, 1]``. The WAN VAE decode produces 4× temporal
+        # expansion; both sides have the same F_pix so they're
+        # frame-aligned for per-pixel loss computation.
+        B, F_pix, C, H, W = pred_pix.shape
+
+        # Optional random spatial crop. Single crop per iter (DDP-
+        # synced) so all ranks compute the loss on the same region.
+        crop = int(self.lpips_crop_size)
+        if 0 < crop < min(H, W):
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                h_off = torch.randint(0, H - crop + 1, (1,), device=device)
+                w_off = torch.randint(0, W - crop + 1, (1,), device=device)
+                offsets = torch.cat([h_off, w_off]).long()
+            else:
+                offsets = torch.empty(2, dtype=torch.long, device=device)
+            if dist.is_initialized():
+                dist.broadcast(offsets, src=0)
+            h_o = int(offsets[0].item())
+            w_o = int(offsets[1].item())
+            pred_pix = pred_pix[..., h_o:h_o + crop, w_o:w_o + crop]
+            gt_pix = gt_pix[..., h_o:h_o + crop, w_o:w_o + crop]
+
+        # Flatten frames into batch for both losses (frame-independent).
+        pred_flat = pred_pix.reshape(B * F_pix, C, pred_pix.shape[-2], pred_pix.shape[-1])
+        gt_flat = gt_pix.reshape(B * F_pix, C, gt_pix.shape[-2], gt_pix.shape[-1])
+
+        loss = zero
+        logs: Dict[str, float] = {}
+        if lpips_active:
+            lpips_model = self._get_lpips_model()
+            # LPIPS expects ``[N, 3, H, W]`` in ``[-1, 1]`` — already
+            # in that range from the WAN VAE clamp.
+            lpips_dist = lpips_model(pred_flat, gt_flat)
+            lpips_loss = lpips_dist.mean()
+            loss = loss + self.lpips_loss_weight * lpips_loss
+            logs["train/lpips_loss_raw"] = float(lpips_loss.detach().item())
+            logs["train/lpips_loss_weighted"] = float(
+                (self.lpips_loss_weight * lpips_loss).detach().item()
+            )
+        if recon_active:
+            if self.pixel_recon_loss_type == "mse":
+                recon_loss = ((pred_flat - gt_flat) ** 2).mean()
+            else:  # default l1
+                recon_loss = (pred_flat - gt_flat).abs().mean()
+            loss = loss + self.pixel_recon_loss_weight * recon_loss
+            logs["train/pixel_recon_loss_raw"] = float(
+                recon_loss.detach().item()
+            )
+            logs["train/pixel_recon_loss_weighted"] = float(
+                (self.pixel_recon_loss_weight * recon_loss).detach().item()
+            )
+        logs["train/lpips_n_frames"] = float(n_pick)
+        return loss.to(pred_image.dtype), logs
+
     def _compute_r3gan_losses_distilled(
         self,
         pred_image: torch.Tensor,
@@ -2530,10 +3535,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             and paper_aligned_x0_for_adv is None
         )
 
+        # When gan_d_approx is active, it REPLACES the LatentSAM2Critic
+        # gen-side call. The gen-side adversarial signal flows through
+        # gan_d_approx via ``_compute_gen_side_perceptual_loss`` below
+        # (with sign=-1 for "gen wants disc-approx HIGH = looks real").
+        gan_d_approx_active = (
+            self.gan_d_approx is not None
+            and self.gan_d_approx_loss_weight > 0
+        )
         if (
             critic_warmup_done
             and gen_gan_weight > 0
             and not skip_g_side
+            and not gan_d_approx_active
         ):
             # Freeze critic params so the gen backward doesn't write
             # critic-side gradients into the critic optim (the critic
@@ -2557,6 +3571,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             generator_gan_loss = zero
             d_fake_for_g_value = 0.0
             gen_gan_main_value = 0.0
+
+        # Gen-side perceptual loss via the trained approxes. Adds to
+        # generator_gan_loss so the same downstream summing path works.
+        # Backward flows through the (small) approxes into pred_image
+        # — no VAE in autograd graph.
+        if (
+            self.mse_approx is not None
+            or self.lpips_approx is not None
+        ):
+            perc_loss, perc_logs = self._compute_gen_side_perceptual_loss(
+                pred_image=fake_lat_grad,
+                gt_latents_window=real_lat,
+                current_step=current_step,
+            )
+            generator_gan_loss = generator_gan_loss + perc_loss
+            logs.update(perc_logs)
 
         logs.update({
             "train/r3gan_d_fake_for_g": d_fake_for_g_value,
@@ -2620,6 +3650,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         Sobolev is on (memory budget for graph-on V+SAM2).
         """
         from model.r3gan import rpgan_d_loss
+
+        # R1/R2 gradient penalty on the SAM2-feature manifold (Option A).
+        # The ADM 2D heads end with ``GAP → Linear(C → 1)`` so the
+        # gradient at each input feature element is shrunk by the head's
+        # spatial averaging factor: ``∂D / ∂feat[c, h, w] ≈ w[c] / (H*W)``
+        # at the post-conv stage. The naive penalty
+        # ``mean_batch(||∇D||²)`` therefore SHRINKS with feature spatial
+        # size: per scale, ``Σ |∂D/∂feat|² ≈ HW * (1/HW)² = 1/HW``. With
+        # 3 SAM2 scales of {128², 64², 32²}, the 32² scale dominates by
+        # ~16x while the 128² scale contributes ~1/16 as much, and the
+        # absolute magnitude is so small (~1e-3 to 1e-5 with γ=1) that
+        # the penalty is effectively zero — disc saturates unconstrained.
+        #
+        # We restore paper-faithful magnitude by multiplying each scale's
+        # per-sample squared-norm by its own ``H*W`` (undoing the GAP
+        # shrinkage) before averaging across scales. With this, γ=1 puts
+        # the penalty at the same scale as the paper's pixel-manifold
+        # γ=1 result and the disc is properly regularized.
+        def _gap_unscaled_grad_penalty(grads):
+            terms = []
+            for g in grads:
+                # ``g.shape == [B*F, C, H, W]`` — multi-scale features
+                # come out of SAM2 at different spatial dims per scale.
+                spatial_size = g.shape[-2] * g.shape[-1]
+                per_sample_sq = (g.flatten(1) ** 2).sum(dim=1)  # [B*F]
+                terms.append((per_sample_sq * spatial_size).mean())
+            return sum(terms) / max(1, len(terms))
 
         disc = self.r3gan_disc
         # Heads-only DDP wrap (or un-wrapped fallback). Routing the
@@ -2697,6 +3754,195 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             B_pix, F_pix = real_pixel_d.shape[0], real_pixel_d.shape[1]
             real_feats_raw = disc.forward_features(real_pixel_d)
             fake_feats_raw = disc.forward_features(fake_pixel_d)
+
+        # ===== Path 1.5: Train dense per-token approxes (mse / lpips /
+        # gan_d_approx). Reuses the no_grad pixel decodes above. Targets
+        # are dense per-token at the latent-token grid (matches each
+        # approx's post-stem output shape). Approxes train against
+        # ``MSE(approx_pred, target)`` + ``β * MSE(approx_pred.mean(),
+        # target.mean())``. Gen-side loss flows gradient through the
+        # small approxes (no VAE in autograd graph) — see
+        # ``_compute_gen_side_perceptual_loss``.
+        if (
+            self.mse_approx is not None
+            or self.lpips_approx is not None
+            or self.msssim_approx is not None
+            or self.gan_d_approx is not None
+        ):
+            # Target token grid: latent spatial dim ceil-divided by 8
+            # (matches the approx's post-stem shape — 3× stride-2
+            # conv with padding=1 produces ``ceil(H/8)`` tokens, not
+            # ``floor`` — e.g. H=60 → 30 → 15 → 8, not 7).
+            target_h = max(1, (real_lat.shape[-2] + 7) // 8)
+            target_w = max(1, (real_lat.shape[-1] + 7) // 8)
+            (
+                target_mse,
+                target_lpips,
+                target_msssim,
+            ) = self._compute_dense_perceptual_targets(
+                gen_pix=fake_pixel_d,
+                gt_pix=real_pixel_d,
+                F_lat=int(F_),
+                target_h=target_h,
+                target_w=target_w,
+            )
+            # Disc dense targets — pixel-disc's per-token output map
+            # on BOTH the GEN pixels (target_disc_fake) AND the GT
+            # pixels (target_disc_real). Without the real-side target
+            # the gan_d_approx's gt_lat input is uninformative (the
+            # target only depends on gen) — wasted capacity. With both
+            # targets we train two forward passes per iter:
+            #   1. ``approx(gen_lat, gt_lat) → target_disc_fake``
+            #      ("how would the disc score the gen given this GT?")
+            #   2. ``approx(gt_lat,  gt_lat) → target_disc_real``
+            #      ("how would the disc score the GT given this GT?" —
+            #      teaches approx that "gen == GT" should give the
+            #      real-side score, anchoring the gt-conditioning).
+            # Both targets use the same dense-aggregate pipeline.
+            target_disc_fake: Optional[torch.Tensor] = None
+            target_disc_real: Optional[torch.Tensor] = None
+            if (
+                self.gan_d_approx is not None
+                and self.gan_d_approx_loss_weight > 0
+            ):
+                pix_per_lat = F_pix // int(F_)
+                if pix_per_lat * int(F_) != F_pix:
+                    raise RuntimeError(
+                        f"disc dense aggregate: F_pix={F_pix} "
+                        f"not divisible by F_lat={F_}."
+                    )
+
+                def _aggregate_dense(feats_raw):
+                    dense_pix = disc.forward_dense_heads(
+                        feats_raw,
+                        batch_size=B_pix,
+                        num_frames=F_pix,
+                        target_h=target_h,
+                        target_w=target_w,
+                    ).float()
+                    return (
+                        dense_pix
+                        .view(B, int(F_), pix_per_lat, target_h, target_w)
+                        .mean(dim=2)
+                        .float()
+                    )
+
+                with torch.no_grad():
+                    # Two passes (fake then real) — disc was already
+                    # going to process both for its RpGAN-D loss
+                    # anyway, so this extra heads-dense forward adds
+                    # ~1 GB transient each. Sequential so peak
+                    # transient memory is bounded to one at a time.
+                    target_disc_fake = _aggregate_dense(fake_feats_raw)
+                    target_disc_real = _aggregate_dense(real_feats_raw)
+
+            # ----- (2) Diagnostic quality logs (no_grad, lightweight).
+            # Reuse the dense targets we already computed so .mean() is
+            # essentially free — we don't need to recompute heavy
+            # pixel-space subtractions.
+            with torch.no_grad():
+                lat_diff = fake_lat.float() - real_lat.float()
+                out["diag/latent_mse"] = float(
+                    (lat_diff ** 2).mean().item()
+                )
+                out["diag/latent_l1"] = float(
+                    lat_diff.abs().mean().item()
+                )
+                del lat_diff
+                if target_mse is not None:
+                    out["diag/pixel_mse"] = float(target_mse.mean().item())
+                if target_lpips is not None:
+                    out["diag/pixel_lpips"] = float(
+                        target_lpips.mean().item()
+                    )
+                if target_msssim is not None:
+                    out["diag/pixel_msssim"] = float(
+                        target_msssim.mean().item()
+                    )
+            # ----- v11-style multi-noise interpolations (Lipschitz). -----
+            # Sample K interpolation points along the (fake_lat → real_lat)
+            # line. For each, compute dense per-token targets via the
+            # no_grad pipeline (VAE decode + LPIPS + SAM2/disc-dense
+            # if needed). Process sequentially so peak transient
+            # memory is bounded to one interpolation's no_grad cost.
+            # Approxes train on these K extra anchor points in addition
+            # to the original (fake, gt) pair — the densified value-
+            # field supervision is what makes the approx's gradient
+            # (gen-side ``-approx.mean()``) actually meaningful.
+            n_interp = max(0, int(self.perceptual_approx_n_interp_samples))
+            interp_data: List[Dict[str, torch.Tensor]] = []
+            if n_interp > 0:
+                alphas = torch.linspace(
+                    0.0, 1.0, n_interp + 2, device=device,
+                )[1:-1]
+                for alpha_t in alphas:
+                    a = float(alpha_t.item())
+                    interp_lat = (1.0 - a) * fake_lat + a * real_lat
+                    with torch.no_grad():
+                        interp_pixel = _decode_no_grad(interp_lat).to(
+                            torch.float32,
+                        )
+                        (
+                            i_target_mse,
+                            i_target_lpips,
+                            i_target_msssim,
+                        ) = self._compute_dense_perceptual_targets(
+                            gen_pix=interp_pixel,
+                            gt_pix=real_pixel_d,
+                            F_lat=int(F_),
+                            target_h=target_h,
+                            target_w=target_w,
+                        )
+                        i_target_disc = None
+                        if target_disc_fake is not None:
+                            interp_feats = disc.forward_features(
+                                interp_pixel,
+                            )
+                            i_target_disc = _aggregate_dense(
+                                interp_feats,
+                            )
+                            del interp_feats
+                        del interp_pixel
+                    interp_data.append({
+                        "lat": interp_lat.detach(),
+                        "mse": i_target_mse,
+                        "lpips": i_target_lpips,
+                        "msssim": i_target_msssim,
+                        "disc": i_target_disc,
+                    })
+            # Real-pair targets (gt vs gt) for the mse/lpips/msssim
+            # GT-anchor training. Each is essentially the metric value
+            # at the "candidate == reference" point — for MSE it's ~0,
+            # for LPIPS it's ~0, for MS-SSIM it's ~1.0. Built as
+            # constant tensors here so we don't need an extra
+            # no_grad pipeline run.
+            shape_dense = (B, int(F_), target_h, target_w)
+            target_mse_real = (
+                torch.zeros(shape_dense, device=device, dtype=torch.float32)
+                if target_mse is not None else None
+            )
+            target_lpips_real = (
+                torch.zeros(shape_dense, device=device, dtype=torch.float32)
+                if target_lpips is not None else None
+            )
+            target_msssim_real = (
+                torch.ones(shape_dense, device=device, dtype=torch.float32)
+                if target_msssim is not None else None
+            )
+            self._run_perceptual_approx_update(
+                gen_lat=fake_lat,
+                gt_lat=real_lat,
+                target_mse=target_mse,
+                target_lpips=target_lpips,
+                target_msssim=target_msssim,
+                target_disc_fake=target_disc_fake,
+                target_disc_real=target_disc_real,
+                target_mse_real=target_mse_real,
+                target_lpips_real=target_lpips_real,
+                target_msssim_real=target_msssim_real,
+                interp_data=interp_data,
+                out=out,
+            )
         # Detach-and-leaf the features for R1/R2 (Option A: penalty on
         # the feature manifold, not pixel manifold).
         real_feats = [
@@ -2735,14 +3981,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 d_real.sum(), real_feats_iter,
                 create_graph=True, retain_graph=True,
             )
-            r1 = (
-                self.gan_r1_gamma
-                * sum(
-                    (g.flatten(1).norm(dim=1) ** 2).mean()
-                    for g in r1_grads
-                )
-                / max(1, len(r1_grads))
-            )
+            r1 = self.gan_r1_gamma * _gap_unscaled_grad_penalty(r1_grads)
             d_fake_d = heads_for_update(
                 fake_feats_iter, B_pix, F_pix,
             )
@@ -2750,14 +3989,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 d_fake_d.sum(), fake_feats_iter,
                 create_graph=True, retain_graph=True,
             )
-            r2 = (
-                self.gan_r2_gamma
-                * sum(
-                    (g.flatten(1).norm(dim=1) ** 2).mean()
-                    for g in r2_grads
-                )
-                / max(1, len(r2_grads))
-            )
+            r2 = self.gan_r2_gamma * _gap_unscaled_grad_penalty(r2_grads)
             d_main = rpgan_d_loss(d_real, d_fake_d)
             d_total = d_main + r1 + r2
             d_total.backward()
@@ -2780,6 +4012,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             r1_value = float(r1.detach().item())
             r2_value = float(r2.detach().item())
 
+        # When gan_d_approx is active it REPLACES the LatentSAM2Critic
+        # distillation+gen-side path. Skip Path 2 entirely in that case
+        # — the new gan_d_approx training was already done in Path 1.5.
+        if (
+            self.gan_d_approx is not None
+            and self.gan_d_approx_loss_weight > 0
+        ):
+            out["train/gan_d_approx_active"] = 1.0
+            return
+
         # ===== Path 2: Latent critic value+grad distillation ==========
         # Value targets — full-frame, no_grad teacher forward. Reuse
         # Path 1's already-computed features (avoids two redundant
@@ -2791,14 +4033,105 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             teacher_val_fake = disc.forward_heads(
                 fake_feats_raw, batch_size=B_pix, num_frames=F_pix,
             ).float()
-        # Gradient targets — frame subsampling OR periodic full-grad.
-        # Periodic full-grad anchor. Skip until the critic warmup
-        # completes — the anchor's purpose is to correct critic drift
-        # after subset-only gradient updates; before warmup there's
-        # nothing to correct yet. Also gates on ``current_step > 0``
-        # for memory safety (allocator hasn't settled at iter 0).
-        # AND gates on ``grad_loss_weight > 0`` — if gradient
-        # distillation is disabled, the anchor is irrelevant.
+
+        # ----- Frame-rate alignment for distillation -----
+        # In ``frame_pool=none`` mode the disc returns ``[B*F_pix]``
+        # per-pixel-frame logits and the critic returns ``[B*F_lat]``
+        # per-latent-frame logits — different rates because the WAN
+        # VAE has 4× temporal expansion (F_pix = 4·F_lat). To match
+        # them for the value-distillation MSE, we average each latent's
+        # 4 pixel-frame teacher logits down to a single per-latent
+        # logit. Other pool modes already produce ``[B]`` per clip
+        # so no alignment needed.
+        def _align_teacher_to_critic(t: torch.Tensor) -> torch.Tensor:
+            if t.dim() == 1 and t.shape[0] == B * F_pix:
+                # Per-pixel-frame → per-latent-frame averaging.
+                pix_per_lat = F_pix // int(F_)
+                if pix_per_lat * int(F_) != F_pix:
+                    raise RuntimeError(
+                        f"Cannot align disc teacher: F_pix={F_pix} not "
+                        f"divisible by F_lat={F_}."
+                    )
+                return t.view(B, F_, pix_per_lat).mean(dim=2).reshape(
+                    B * F_,
+                )
+            return t
+
+        teacher_val_real = _align_teacher_to_critic(teacher_val_real)
+        teacher_val_fake = _align_teacher_to_critic(teacher_val_fake)
+
+        # ----- (3) Multi-noise (WGAN-GP-style) Path 2 expansion. -----
+        # Value-only critic distillation has only 2 anchor points per
+        # iter (real, fake). With only 2 constraints, infinite valid
+        # gradient solutions exist — so the gen-side gradient through
+        # critic is essentially noise even though the critic perfectly
+        # matches disc *value* on those endpoints.
+        #
+        # We densify by sampling K interpolation points on the line
+        # ``z_α = (1-α)*real_lat + α*fake_lat``, computing teacher
+        # values on each (no_grad V+SAM2 forward), and adding their
+        # MSE to L_value. This constrains the critic's value field
+        # densely enough that gradient becomes meaningful by Lipschitz
+        # interpolation. ``gan_critic_n_interp_samples=0`` keeps the
+        # legacy 2-point-only behavior.
+        n_interp = max(0, int(self.gan_critic_n_interp_samples))
+        interp_lats_stacked: Optional[torch.Tensor] = None
+        teacher_vals_interp: Optional[torch.Tensor] = None
+        if n_interp > 0:
+            # Even spacing in (0, 1) excluding the two endpoints (those
+            # are real_lat / fake_lat which we already constrain).
+            alphas = torch.linspace(
+                0.0, 1.0, n_interp + 2, device=device,
+            )[1:-1]
+            interp_lats_list = []
+            teacher_vals_interp_list = []
+            for alpha_t in alphas:
+                a = float(alpha_t.item())
+                interp_lat = (1.0 - a) * real_lat + a * fake_lat
+                interp_lats_list.append(interp_lat)
+                # Process one interpolation at a time to bound peak
+                # transient memory (each decode + SAM2 forward holds
+                # ~1-2 GB workspace; doing 5 at once would peak at
+                # ~10 GB transient which may blow the budget).
+                with torch.no_grad():
+                    interp_pixel = _decode_no_grad(interp_lat).to(
+                        torch.float32,
+                    )
+                    interp_feat = disc.forward_features(interp_pixel)
+                    B_int = interp_pixel.shape[0]
+                    F_int = interp_pixel.shape[1]
+                    teacher_val_one = disc.forward_heads(
+                        interp_feat,
+                        batch_size=B_int,
+                        num_frames=F_int,
+                    ).float()
+                # Per-pixel-frame → per-latent-frame averaging when
+                # disc is in ``frame_pool=none`` mode (rate alignment
+                # for distillation; same as Path 2's main teacher
+                # alignment above).
+                if (
+                    teacher_val_one.dim() == 1
+                    and teacher_val_one.shape[0] == B_int * F_int
+                ):
+                    pix_per_lat = F_int // int(F_)
+                    if pix_per_lat * int(F_) == F_int:
+                        teacher_val_one = (
+                            teacher_val_one.view(B_int, F_, pix_per_lat)
+                            .mean(dim=2)
+                            .reshape(B_int * F_)
+                        )
+                teacher_vals_interp_list.append(teacher_val_one)
+                # Free the transient pixel + feature buffers before
+                # processing the next alpha.
+                del interp_pixel, interp_feat
+            # Stack along batch dim for the critic-side batched forward.
+            interp_lats_stacked = torch.cat(interp_lats_list, dim=0)
+            teacher_vals_interp = torch.cat(
+                teacher_vals_interp_list, dim=0,
+            ).detach()
+            del interp_lats_list, teacher_vals_interp_list
+
+        # Sobolev (gradient distillation) gates / teacher target compute.
         grad_distill_active = self.gan_critic_grad_loss_weight > 0
         do_full_grad = (
             grad_distill_active
@@ -2857,67 +4190,215 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             n_grad = 0
             teacher_grad_real_sub = None
             teacher_grad_fake_sub = None
-        # Critic forward on FULL clip. With grad-distillation active,
-        # also compute grad w.r.t. input (create_graph=True for the
-        # second-order backward through L_grad). With value-only mode,
-        # skip the input-grad compute entirely (saves ~few hundred MB).
-        real_lat_critic_in = real_lat.clone().detach().requires_grad_(
-            grad_distill_active
-        )
-        fake_lat_critic_in = fake_lat.clone().detach().requires_grad_(
-            grad_distill_active
-        )
-        critic_val_real = critic_for_update(real_lat_critic_in).float()
-        critic_val_fake = critic_for_update(fake_lat_critic_in).float()
-        if grad_distill_active:
-            critic_grad_real = torch.autograd.grad(
-                critic_val_real.sum(), real_lat_critic_in,
-                create_graph=True, retain_graph=True,
-            )[0]
-            critic_grad_fake = torch.autograd.grad(
-                critic_val_fake.sum(), fake_lat_critic_in,
-                create_graph=True, retain_graph=True,
-            )[0]
-        else:
-            critic_grad_real = None
-            critic_grad_fake = None
-        # Value loss.
-        L_value = (
-            ((critic_val_real - teacher_val_real.detach()) ** 2).mean()
-            + ((critic_val_fake - teacher_val_fake.detach()) ** 2).mean()
-        )
-        # Grad loss on the subset (only when distillation is active).
-        if grad_distill_active:
-            critic_grad_real_sub = critic_grad_real[:, grad_frames]
-            critic_grad_fake_sub = critic_grad_fake[:, grad_frames]
-            L_grad = (
-                ((critic_grad_real_sub - teacher_grad_real_sub) ** 2).mean()
-                + ((critic_grad_fake_sub - teacher_grad_fake_sub) ** 2).mean()
+
+        # ----- (2) Finite-difference Sobolev teacher targets -----
+        # Cheap alternative to true Sobolev: perturb fake_lat by small
+        # ε on a random subset of frames, get disc value at the
+        # perturbed point via no_grad V+SAM2 forward, target the
+        # critic such that (critic(z+ε) - critic(z)) matches
+        # (disc(decode(z+ε)) - disc(decode(z))). NO graph-on V+SAM2
+        # backward needed → fits in current memory budget.
+        fd_active = self.gan_critic_fd_loss_weight > 0
+        fd_data: Optional[Dict[str, Any]] = None
+        if fd_active:
+            n_dir = max(1, int(self.gan_critic_fd_n_directions))
+            n_fd_frames = max(1, min(int(self.gan_critic_fd_frames), int(F_)))
+            sigma = float(self.gan_critic_fd_sigma)
+            fd_frame_idx = self._sample_critic_grad_frame_indices(
+                F_, n_fd_frames, device,
             )
-            L_critic = L_value + self.gan_critic_grad_loss_weight * L_grad
-        else:
-            critic_grad_real_sub = None
-            critic_grad_fake_sub = None
-            L_grad = torch.zeros((), device=device)
-            L_critic = L_value
-        if self.latent_critic_optimizer is not None:
-            self.latent_critic_optimizer.zero_grad(set_to_none=True)
-            L_critic.backward()
-            if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
-                critic_params_iter = (
-                    self.latent_critic_ddp.parameters()
-                    if self.latent_critic_ddp is not None
-                    else critic.parameters()
+            # Per-direction-index packed list of perturbations
+            # ε_i: shape [B, F_, C, H, W] — only fd_frame_idx slices
+            # are non-zero. Stacked across directions for batched eval.
+            eps_list = []
+            for _d in range(n_dir):
+                eps_full = torch.zeros_like(fake_lat)
+                eps_sub = torch.randn(
+                    fake_lat.shape[0], n_fd_frames,
+                    fake_lat.shape[2], fake_lat.shape[3],
+                    fake_lat.shape[4],
+                    device=device, dtype=fake_lat.dtype,
+                ) * sigma
+                eps_full[:, fd_frame_idx] = eps_sub
+                eps_list.append(eps_full)
+            # teacher_val_fake is already known (computed above).
+            # Compute disc value at each perturbed point (no_grad).
+            disc_diffs_list = []  # list of [B] scalars per direction
+            for eps_full in eps_list:
+                fake_perturbed = fake_lat + eps_full
+                with torch.no_grad():
+                    pp_pixel = _decode_no_grad(fake_perturbed).to(
+                        torch.float32,
+                    )
+                    pp_feat = disc.forward_features(pp_pixel)
+                    B_pp = pp_pixel.shape[0]
+                    F_pp = pp_pixel.shape[1]
+                    disc_val_perturbed = disc.forward_heads(
+                        pp_feat,
+                        batch_size=B_pp,
+                        num_frames=F_pp,
+                    ).float()
+                # Per-pixel-frame → per-latent-frame averaging when
+                # disc is in ``frame_pool=none`` mode (FD targets must
+                # match the critic's per-latent-frame output rate).
+                if (
+                    disc_val_perturbed.dim() == 1
+                    and disc_val_perturbed.shape[0] == B_pp * F_pp
+                ):
+                    pix_per_lat = F_pp // int(F_)
+                    if pix_per_lat * int(F_) == F_pp:
+                        disc_val_perturbed = (
+                            disc_val_perturbed.view(B_pp, F_, pix_per_lat)
+                            .mean(dim=2)
+                            .reshape(B_pp * F_)
+                        )
+                # Per-batch scalar disc difference.
+                disc_diff = (
+                    disc_val_perturbed - teacher_val_fake.detach()
+                ).flatten()
+                disc_diffs_list.append(disc_diff)
+                del pp_pixel, pp_feat
+            fd_data = {
+                "eps_list": eps_list,
+                "disc_diffs_list": disc_diffs_list,
+            }
+            del eps_list, disc_diffs_list
+
+        # ----- Multi-step critic update loop. -----
+        # Mirrors action_critic's ``critic_updates_per_step`` pattern:
+        # step the critic optimizer K_c times per gen step so the
+        # critic actually converges to the disc within one outer iter.
+        # Default K_c=1 is the legacy single-step behavior. The
+        # teacher targets above (teacher_val_real / teacher_val_fake /
+        # teacher_vals_interp / teacher_grad_*) are constant across
+        # critic updates so we compute them ONCE outside this loop.
+        critic_updates = max(1, int(self.gan_critic_updates_per_step))
+        # Track only the LAST iter's diagnostics for logging.
+        L_value_value = 0.0
+        L_grad_value = 0.0
+        L_critic_value = 0.0
+        L_fd_value = 0.0
+        critic_val_real_last: Optional[torch.Tensor] = None
+        critic_val_fake_last: Optional[torch.Tensor] = None
+        critic_grad_real_sub_last: Optional[torch.Tensor] = None
+        critic_grad_fake_sub_last: Optional[torch.Tensor] = None
+        for _kc in range(critic_updates):
+            if self.latent_critic_optimizer is not None:
+                self.latent_critic_optimizer.zero_grad(set_to_none=True)
+            # Critic forward on FULL clip. With grad-distillation
+            # active, also compute grad w.r.t. input
+            # (create_graph=True for the second-order backward through
+            # L_grad). With value-only mode, skip the input-grad
+            # compute entirely (saves ~few hundred MB).
+            real_lat_critic_in = real_lat.clone().detach().requires_grad_(
+                grad_distill_active
+            )
+            fake_lat_critic_in = fake_lat.clone().detach().requires_grad_(
+                grad_distill_active
+            )
+            critic_val_real = critic_for_update(real_lat_critic_in).float()
+            critic_val_fake = critic_for_update(fake_lat_critic_in).float()
+            if grad_distill_active:
+                critic_grad_real = torch.autograd.grad(
+                    critic_val_real.sum(), real_lat_critic_in,
+                    create_graph=True, retain_graph=True,
+                )[0]
+                critic_grad_fake = torch.autograd.grad(
+                    critic_val_fake.sum(), fake_lat_critic_in,
+                    create_graph=True, retain_graph=True,
+                )[0]
+            else:
+                critic_grad_real = None
+                critic_grad_fake = None
+            # Value loss on (real, fake).
+            L_value = (
+                ((critic_val_real - teacher_val_real.detach()) ** 2).mean()
+                + ((critic_val_fake - teacher_val_fake.detach()) ** 2).mean()
+            )
+            # Multi-noise interp value loss (option 3).
+            if interp_lats_stacked is not None:
+                critic_val_interp = critic_for_update(
+                    interp_lats_stacked,
+                ).float()
+                L_value = L_value + (
+                    (critic_val_interp - teacher_vals_interp) ** 2
+                ).mean()
+                del critic_val_interp
+            # Sobolev L_grad on subset.
+            if grad_distill_active:
+                critic_grad_real_sub = critic_grad_real[:, grad_frames]
+                critic_grad_fake_sub = critic_grad_fake[:, grad_frames]
+                L_grad = (
+                    ((critic_grad_real_sub - teacher_grad_real_sub) ** 2).mean()
+                    + ((critic_grad_fake_sub - teacher_grad_fake_sub) ** 2).mean()
                 )
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in critic_params_iter if p.grad is not None],
-                    self.gan_max_grad_norm,
-                )
-            self.latent_critic_optimizer.step()
-        # Diagnostic: critic↔disc value correlation, grad cosine sim.
+                L_critic = L_value + self.gan_critic_grad_loss_weight * L_grad
+                critic_grad_real_sub_last = critic_grad_real_sub
+                critic_grad_fake_sub_last = critic_grad_fake_sub
+            else:
+                critic_grad_real_sub = None
+                critic_grad_fake_sub = None
+                L_grad = torch.zeros((), device=device)
+                L_critic = L_value
+            # Finite-difference Sobolev L_fd (option 2). Match the
+            # critic's input-direction sensitivity to the disc's
+            # without backproping through V+SAM2.
+            if fd_active and fd_data is not None:
+                fd_terms = []
+                for eps_full, disc_diff in zip(
+                    fd_data["eps_list"], fd_data["disc_diffs_list"],
+                ):
+                    fake_perturbed_lat = (
+                        fake_lat + eps_full
+                    ).detach()
+                    critic_val_perturbed = critic_for_update(
+                        fake_perturbed_lat,
+                    ).float()
+                    critic_diff = (
+                        critic_val_perturbed - critic_val_fake
+                    ).flatten()
+                    fd_terms.append(((critic_diff - disc_diff) ** 2).mean())
+                L_fd = sum(fd_terms) / max(1, len(fd_terms))
+                L_critic = L_critic + self.gan_critic_fd_loss_weight * L_fd
+                L_fd_value = float(L_fd.detach().item())
+            else:
+                L_fd_value = 0.0
+            if self.latent_critic_optimizer is not None:
+                L_critic.backward()
+                if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
+                    critic_params_iter = (
+                        self.latent_critic_ddp.parameters()
+                        if self.latent_critic_ddp is not None
+                        else critic.parameters()
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in critic_params_iter if p.grad is not None],
+                        self.gan_max_grad_norm,
+                    )
+                self.latent_critic_optimizer.step()
+            L_value_value = float(L_value.detach().item())
+            L_grad_value = float(L_grad.detach().item())
+            L_critic_value = float(L_critic.detach().item())
+            critic_val_real_last = critic_val_real.detach()
+            critic_val_fake_last = critic_val_fake.detach()
+        # Diagnostic: critic↔disc value correlation (over all anchor
+        # points: real, fake, AND interpolations if multi-noise active).
+        # More anchor points = a more meaningful Pearson (the 2-point
+        # case is degenerate — see v9 ``c_corr=+1.000`` artifact).
         with torch.no_grad():
-            cv_all = torch.cat([critic_val_real, critic_val_fake], dim=0)
-            tv_all = torch.cat([teacher_val_real, teacher_val_fake], dim=0)
+            cv_parts = [critic_val_real_last, critic_val_fake_last]
+            tv_parts = [teacher_val_real, teacher_val_fake]
+            if interp_lats_stacked is not None:
+                # Recompute critic on interpolations no_grad for the
+                # diagnostic (the loop's last critic_val_interp was
+                # consumed by the loss).
+                critic_val_interp_diag = critic_for_update(
+                    interp_lats_stacked,
+                ).float()
+                cv_parts.append(critic_val_interp_diag)
+                tv_parts.append(teacher_vals_interp)
+            cv_all = torch.cat(cv_parts, dim=0)
+            tv_all = torch.cat(tv_parts, dim=0)
             if cv_all.numel() >= 2:
                 cv_c = cv_all - cv_all.mean()
                 tv_c = tv_all - tv_all.mean()
@@ -2925,10 +4406,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 critic_disc_corr = float((cv_c * tv_c).sum() / denom)
             else:
                 critic_disc_corr = 0.0
-            if grad_distill_active:
+            if grad_distill_active and critic_grad_real_sub_last is not None:
                 cg = torch.cat([
-                    critic_grad_real_sub.flatten(),
-                    critic_grad_fake_sub.flatten(),
+                    critic_grad_real_sub_last.flatten(),
+                    critic_grad_fake_sub_last.flatten(),
                 ])
                 tg = torch.cat([
                     teacher_grad_real_sub.flatten(),
@@ -2949,13 +4430,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["train/r3gan_r2"] = r2_value
         out["train/r3gan_d_real"] = d_real_value
         out["train/r3gan_d_fake_detached"] = d_fake_detached_value
-        out["train/critic_value_loss"] = float(L_value.detach().item())
-        out["train/critic_grad_loss"] = float(L_grad.detach().item())
-        out["train/critic_total_loss"] = float(L_critic.detach().item())
+        out["train/critic_value_loss"] = L_value_value
+        out["train/critic_grad_loss"] = L_grad_value
+        out["train/critic_total_loss"] = L_critic_value
+        out["train/critic_fd_loss"] = L_fd_value
         out["train/critic_logit_mean"] = float(
-            ((critic_val_real.mean() + critic_val_fake.mean()) / 2.0)
-            .detach().item()
-        )
+            (
+                (critic_val_real_last.mean() + critic_val_fake_last.mean())
+                / 2.0
+            ).item()
+        ) if critic_val_real_last is not None else 0.0
         out["train/disc_logit_mean"] = float(
             ((teacher_val_real.mean() + teacher_val_fake.mean()) / 2.0)
             .detach().item()
@@ -2964,6 +4448,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["train/critic_grad_cos_sim"] = critic_grad_cos_sim
         out["train/critic_grad_full_anchor"] = 1.0 if do_full_grad else 0.0
         out["train/critic_n_grad_frames"] = float(n_grad)
+        out["train/critic_n_interp_samples"] = float(n_interp)
+        out["train/critic_updates_per_step"] = float(critic_updates)
 
     def _compute_r3gan_losses(
         self,
@@ -4405,6 +5891,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
+
+        # Pixel-space perceptual losses (LPIPS + pixel reconstruction).
+        # Direct anti-blur + anti-drift signals on a graph-on decoded
+        # frame subset. Independent of the GAN distillation chain
+        # (no critic involved). Gated by their own weight knobs;
+        # zero-weight = no compute. See ``_compute_pixel_perceptual_losses``.
+        if (
+            self.lpips_loss_weight > 0
+            or self.pixel_recon_loss_weight > 0
+        ):
+            # Defragment the allocator before the graph-on VAE decode
+            # — the decoder peaks at a large contiguous workspace
+            # (~1 GB) and the gen rollout's persistent activations
+            # leave only fragmented gaps. Without this, the allocation
+            # can fail at step 2+ even though total free memory is
+            # sufficient.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            perc_loss, perc_logs = self._compute_pixel_perceptual_losses(
+                pred_image=train_chunk,
+                gt_latents_window=gt_window,
+                current_step=int(self.step),
+            )
+            generator_loss = generator_loss + perc_loss
+            out.update(perc_logs)
 
         if sc_dmd_active:
             sc_loss_raw, sc_logs = self.model.sc_dmd_loss(

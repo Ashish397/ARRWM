@@ -192,10 +192,10 @@ class LatentSAM2Critic(nn.Module):
         frame_pool_topk: int = 4,
     ) -> None:
         super().__init__()
-        if frame_pool not in ("mean", "max", "topk_mean"):
+        if frame_pool not in ("mean", "max", "topk_mean", "none"):
             raise ValueError(
-                f"frame_pool must be 'mean' | 'max' | 'topk_mean'; "
-                f"got {frame_pool!r}."
+                f"frame_pool must be 'mean' | 'max' | 'topk_mean' | "
+                f"'none'; got {frame_pool!r}."
             )
         self.in_channels = int(in_channels)
         self.d_model = int(d_model)
@@ -328,8 +328,10 @@ class LatentSAM2Critic(nn.Module):
                 1,
                 per_frame_logit.abs().argmax(dim=1, keepdim=True),
             ).squeeze(1)
-        else:  # topk_mean
+        elif self.frame_pool == "topk_mean":
             k = min(self.frame_pool_topk, F_)
             _, idx = per_frame_logit.abs().topk(k, dim=1)
             per_sample = per_frame_logit.gather(1, idx).mean(dim=1)
+        else:  # "none" — per-frame logits, no temporal aggregation.
+            return per_frame_logit.reshape(B * F_).float()
         return per_sample.float()

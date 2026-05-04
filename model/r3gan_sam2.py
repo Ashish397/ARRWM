@@ -253,6 +253,22 @@ class _ADM2DHead(nn.Module):
         h = F.adaptive_avg_pool2d(h, 1).flatten(1)  # [B*F, 256]
         return self.head(h).squeeze(-1)             # [B*F]
 
+    def forward_dense(self, feat: torch.Tensor) -> torch.Tensor:
+        """Per-position logit map (skip GAP).
+
+        Returns ``[B*F, H_post, W_post]`` per-spatial-position logit.
+        Reuses the same ``Linear`` head's weights as a 1×1 Conv2d so
+        no extra params; both the scalar and dense forward share the
+        same trained classifier — they differ only in WHERE the GAP
+        is applied (scalar = before head, dense = after head).
+        """
+        h = self.body(feat)  # [B*F, 256, H_post, W_post]
+        # Linear weight [1, 256] reshapes to Conv1×1 weight [1, 256, 1, 1].
+        w = self.head.weight.unsqueeze(-1).unsqueeze(-1)
+        b = self.head.bias  # [1]
+        out = F.conv2d(h, w, b)  # [B*F, 1, H_post, W_post]
+        return out.squeeze(1)
+
 
 # Backwards-compat alias so external imports of the legacy class name
 # still resolve (architecturally a drop-in replacement).
@@ -293,10 +309,10 @@ class _R3GANDiscHeads(nn.Module):
         frame_pool_topk: int = 4,
     ) -> None:
         super().__init__()
-        if frame_pool not in ("mean", "max", "topk_mean"):
+        if frame_pool not in ("mean", "max", "topk_mean", "none"):
             raise ValueError(
-                f"frame_pool must be 'mean' | 'max' | 'topk_mean'; "
-                f"got {frame_pool!r}."
+                f"frame_pool must be 'mean' | 'max' | 'topk_mean' | "
+                f"'none'; got {frame_pool!r}."
             )
         self.heads = nn.ModuleList([
             _ADM2DHead(c) for c in feat_channels
@@ -322,11 +338,58 @@ class _R3GANDiscHeads(nn.Module):
                 1,
                 per_frame.abs().argmax(dim=1, keepdim=True),
             ).squeeze(1)
-        else:  # topk_mean
+        elif self.frame_pool == "topk_mean":
             k = min(self.frame_pool_topk, num_frames)
             _, idx = per_frame.abs().topk(k, dim=1)
             per_sample = per_frame.gather(1, idx).mean(dim=1)
+        else:  # "none" — per-frame logits, no temporal aggregation.
+            # Returns ``[B*F]`` so consumers can compute per-frame
+            # adversarial losses (forces disc to enforce sharpness on
+            # every frame independently rather than averaging out
+            # late-frame degradation).
+            return per_frame.reshape(batch_size * num_frames).float()
         return per_sample.float()
+
+    def forward_dense(
+        self,
+        features: List[torch.Tensor],
+        batch_size: int,
+        num_frames: int,
+        target_h: Optional[int] = None,
+        target_w: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Per-frame-per-spatial-token dense logit map.
+
+        For each FPN scale, applies the head's ``forward_dense`` to
+        get ``[B*F, H_s, W_s]`` per-position logits. Bilinear-resizes
+        each scale to a common grid (smallest scale by default, or
+        the supplied ``(target_h, target_w)``), averages across scales,
+        reshapes to ``[B, F, target_h, target_w]``.
+
+        Used as the training target for ``gan_d_approx`` —
+        the approx model predicts this dense logit map from
+        ``(gen_lat, gt_lat)`` without backprop through V+SAM2.
+        """
+        per_scale: List[torch.Tensor] = []
+        for feat, head in zip(features, self.heads):
+            per_scale.append(head.forward_dense(feat))  # [B*F, H_s, W_s]
+        if target_h is None or target_w is None:
+            target_h = min(p.shape[1] for p in per_scale)
+            target_w = min(p.shape[2] for p in per_scale)
+        aligned: List[torch.Tensor] = []
+        for p in per_scale:
+            if p.shape[1] != target_h or p.shape[2] != target_w:
+                p = F.interpolate(
+                    p.unsqueeze(1).float(),
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+            aligned.append(p)
+        avg = torch.stack(aligned, dim=0).mean(dim=0)  # [B*F, t_h, t_w]
+        return avg.reshape(
+            batch_size, num_frames, target_h, target_w,
+        ).float()
 
 
 # ---------------------------------------------------------------------------
@@ -391,10 +454,10 @@ class R3GANDiscriminatorSAM2Pixel(nn.Module):
         # geometry that ``preserve_aspect=False`` (squash) destroys.
         # When True, supersedes ``preserve_aspect``.
         self.pad_to_square = bool(pad_to_square)
-        if frame_pool not in ("mean", "max", "topk_mean"):
+        if frame_pool not in ("mean", "max", "topk_mean", "none"):
             raise ValueError(
-                f"frame_pool must be 'mean' | 'max' | 'topk_mean'; "
-                f"got {frame_pool!r}."
+                f"frame_pool must be 'mean' | 'max' | 'topk_mean' | "
+                f"'none'; got {frame_pool!r}."
             )
         self.frame_pool = frame_pool
         self.frame_pool_topk = max(1, int(frame_pool_topk))
@@ -599,6 +662,27 @@ class R3GANDiscriminatorSAM2Pixel(nn.Module):
         within ``forward(pixel_video)`` and that path is fine.
         """
         return self.heads_module(features, batch_size, num_frames)
+
+    def forward_dense_heads(
+        self,
+        features: List[torch.Tensor],
+        batch_size: int,
+        num_frames: int,
+        target_h: Optional[int] = None,
+        target_w: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Per-frame-per-spatial-token DENSE logit map.
+
+        Used as the training target for ``gan_d_approx`` (the
+        PerceptualApprox-based replacement for LatentSAM2Critic).
+        Delegates to ``self.heads_module.forward_dense``.
+
+        Returns ``[B, F, target_h, target_w]`` (defaults to the
+        smallest scale's grid when ``target_h/w`` are None).
+        """
+        return self.heads_module.forward_dense(
+            features, batch_size, num_frames, target_h, target_w,
+        )
 
     def forward(self, pixel_video: torch.Tensor) -> torch.Tensor:
         """Forward over a pixel video. Equivalent to

@@ -1,0 +1,97 @@
+Binary file model/__pycache__/perceptual_approx.cpython-310.pyc matches
+model/perceptual_approx.py:5:  1. ``mse_approx``     — predicts dense per-token MSE between
+model/perceptual_approx.py:7:  2. ``lpips_approx``   — predicts dense per-token LPIPS distance
+trainer/causal_action_forcing_train.py:679:                self.mse_approx = None
+trainer/causal_action_forcing_train.py:680:                self.mse_approx_ddp = None
+trainer/causal_action_forcing_train.py:681:                self.mse_approx_optimizer = None
+trainer/causal_action_forcing_train.py:682:                self.lpips_approx = None
+trainer/causal_action_forcing_train.py:683:                self.lpips_approx_ddp = None
+trainer/causal_action_forcing_train.py:684:                self.lpips_approx_optimizer = None
+trainer/causal_action_forcing_train.py:693:                    getattr(self.config, "perceptual_approx_d_model", 256)
+trainer/causal_action_forcing_train.py:696:                    getattr(self.config, "perceptual_approx_num_blocks", 4)
+trainer/causal_action_forcing_train.py:698:                _need_mse_approx = float(
+trainer/causal_action_forcing_train.py:699:                    getattr(self.config, "mse_approx_loss_weight", 0.0)
+trainer/causal_action_forcing_train.py:701:                _need_lpips_approx = float(
+trainer/causal_action_forcing_train.py:702:                    getattr(self.config, "lpips_approx_loss_weight", 0.0)
+trainer/causal_action_forcing_train.py:707:                if _need_mse_approx or _need_lpips_approx or _need_gan_d_approx:
+trainer/causal_action_forcing_train.py:708:                    from model.perceptual_approx import PerceptualApprox
+trainer/causal_action_forcing_train.py:738:                    if _need_mse_approx:
+trainer/causal_action_forcing_train.py:739:                        self.mse_approx, self.mse_approx_ddp = _build_approx(
+trainer/causal_action_forcing_train.py:740:                            "MSEApprox"
+trainer/causal_action_forcing_train.py:742:                    if _need_lpips_approx:
+trainer/causal_action_forcing_train.py:743:                        self.lpips_approx, self.lpips_approx_ddp = (
+trainer/causal_action_forcing_train.py:744:                            _build_approx("LPIPSApprox")
+trainer/causal_action_forcing_train.py:1250:        self.pixel_recon_loss_weight = float(
+trainer/causal_action_forcing_train.py:1251:            getattr(cfg, "pixel_recon_loss_weight", 0.0)
+trainer/causal_action_forcing_train.py:1254:        self.pixel_recon_loss_type = str(
+trainer/causal_action_forcing_train.py:1255:            getattr(cfg, "pixel_recon_loss_type", "l1")
+trainer/causal_action_forcing_train.py:1272:        # mean-pool. See ``model/perceptual_approx.py`` for design.
+trainer/causal_action_forcing_train.py:1273:        self.mse_approx_loss_weight = float(
+trainer/causal_action_forcing_train.py:1274:            getattr(cfg, "mse_approx_loss_weight", 0.0)
+trainer/causal_action_forcing_train.py:1276:        self.lpips_approx_loss_weight = float(
+trainer/causal_action_forcing_train.py:1277:            getattr(cfg, "lpips_approx_loss_weight", 0.0)
+trainer/causal_action_forcing_train.py:1292:        self.perceptual_approx_mean_align_weight = float(
+trainer/causal_action_forcing_train.py:1293:            getattr(cfg, "perceptual_approx_mean_align_weight", 0.1)
+trainer/causal_action_forcing_train.py:1296:        self.perceptual_approx_d_model = int(
+trainer/causal_action_forcing_train.py:1297:            getattr(cfg, "perceptual_approx_d_model", 256)
+trainer/causal_action_forcing_train.py:1299:        self.perceptual_approx_num_blocks = int(
+trainer/causal_action_forcing_train.py:1300:            getattr(cfg, "perceptual_approx_num_blocks", 4)
+trainer/causal_action_forcing_train.py:1302:        self.perceptual_approx_lr = float(
+trainer/causal_action_forcing_train.py:1303:            getattr(cfg, "perceptual_approx_lr", 2e-4)
+trainer/causal_action_forcing_train.py:1305:        self.perceptual_approx_warmup_steps = int(
+trainer/causal_action_forcing_train.py:1306:            getattr(cfg, "perceptual_approx_warmup_steps", 25)
+trainer/causal_action_forcing_train.py:1356:        if getattr(self, "mse_approx", None) is not None:
+trainer/causal_action_forcing_train.py:1357:            self.mse_approx_optimizer = torch.optim.AdamW(
+trainer/causal_action_forcing_train.py:1358:                [p for p in self.mse_approx.parameters() if p.requires_grad],
+trainer/causal_action_forcing_train.py:1359:                lr=self.perceptual_approx_lr,
+trainer/causal_action_forcing_train.py:1366:                    "[ActionForcing] MSEApprox optimizer built: "
+trainer/causal_action_forcing_train.py:1369:                    self.perceptual_approx_lr,
+trainer/causal_action_forcing_train.py:1370:                    self.mse_approx_loss_weight,
+trainer/causal_action_forcing_train.py:1371:                    self.perceptual_approx_warmup_steps,
+trainer/causal_action_forcing_train.py:1372:                    self.perceptual_approx_mean_align_weight,
+trainer/causal_action_forcing_train.py:1374:        if getattr(self, "lpips_approx", None) is not None:
+trainer/causal_action_forcing_train.py:1375:            self.lpips_approx_optimizer = torch.optim.AdamW(
+trainer/causal_action_forcing_train.py:1377:                    p for p in self.lpips_approx.parameters()
+trainer/causal_action_forcing_train.py:1380:                lr=self.perceptual_approx_lr,
+trainer/causal_action_forcing_train.py:1387:                    "[ActionForcing] LPIPSApprox optimizer built: "
+trainer/causal_action_forcing_train.py:1390:                    self.perceptual_approx_lr,
+trainer/causal_action_forcing_train.py:1391:                    self.lpips_approx_loss_weight,
+trainer/causal_action_forcing_train.py:1392:                    self.perceptual_approx_warmup_steps,
+trainer/causal_action_forcing_train.py:1393:                    self.perceptual_approx_mean_align_weight,
+trainer/causal_action_forcing_train.py:1401:                lr=self.perceptual_approx_lr,
+trainer/causal_action_forcing_train.py:1412:                    self.perceptual_approx_lr,
+trainer/causal_action_forcing_train.py:1414:                    self.perceptual_approx_warmup_steps,
+trainer/causal_action_forcing_train.py:1415:                    self.perceptual_approx_mean_align_weight,
+trainer/causal_action_forcing_train.py:2699:                "lpips_approx_loss_weight>0 requires the 'lpips' "
+trainer/causal_action_forcing_train.py:2753:            if self.mse_approx_loss_weight > 0:
+trainer/causal_action_forcing_train.py:2767:            if self.lpips_approx_loss_weight > 0:
+trainer/causal_action_forcing_train.py:2793:    def _run_perceptual_approx_update(
+trainer/causal_action_forcing_train.py:2815:                "mse_approx",
+trainer/causal_action_forcing_train.py:2816:                self.mse_approx_ddp,
+trainer/causal_action_forcing_train.py:2817:                self.mse_approx,
+trainer/causal_action_forcing_train.py:2818:                self.mse_approx_optimizer,
+trainer/causal_action_forcing_train.py:2820:                self.mse_approx_loss_weight,
+trainer/causal_action_forcing_train.py:2823:                "lpips_approx",
+trainer/causal_action_forcing_train.py:2824:                self.lpips_approx_ddp,
+trainer/causal_action_forcing_train.py:2825:                self.lpips_approx,
+trainer/causal_action_forcing_train.py:2826:                self.lpips_approx_optimizer,
+trainer/causal_action_forcing_train.py:2828:                self.lpips_approx_loss_weight,
+trainer/causal_action_forcing_train.py:2853:                + self.perceptual_approx_mean_align_weight * L_mean_align
+trainer/causal_action_forcing_train.py:2896:        if current_step < self.perceptual_approx_warmup_steps:
+trainer/causal_action_forcing_train.py:2904:            ("mse_approx", self.mse_approx, self.mse_approx_loss_weight, +1.0),
+trainer/causal_action_forcing_train.py:2906:                "lpips_approx",
+trainer/causal_action_forcing_train.py:2907:                self.lpips_approx,
+trainer/causal_action_forcing_train.py:2908:                self.lpips_approx_loss_weight,
+trainer/causal_action_forcing_train.py:3040:        ``self.pixel_recon_loss_weight > 0``. Returns zero scalar +
+trainer/causal_action_forcing_train.py:3046:        recon_active = self.pixel_recon_loss_weight > 0
+trainer/causal_action_forcing_train.py:3109:            if self.pixel_recon_loss_type == "mse":
+trainer/causal_action_forcing_train.py:3113:            loss = loss + self.pixel_recon_loss_weight * recon_loss
+trainer/causal_action_forcing_train.py:3114:            logs["train/pixel_recon_loss_raw"] = float(
+trainer/causal_action_forcing_train.py:3117:            logs["train/pixel_recon_loss_weighted"] = float(
+trainer/causal_action_forcing_train.py:3118:                (self.pixel_recon_loss_weight * recon_loss).detach().item()
+trainer/causal_action_forcing_train.py:3274:            self.mse_approx is not None
+trainer/causal_action_forcing_train.py:3275:            or self.lpips_approx is not None
+trainer/causal_action_forcing_train.py:3461:            self.mse_approx is not None
+trainer/causal_action_forcing_train.py:3462:            or self.lpips_approx is not None
+trainer/causal_action_forcing_train.py:3509:            self._run_perceptual_approx_update(
+trainer/causal_action_forcing_train.py:5473:            or self.pixel_recon_loss_weight > 0

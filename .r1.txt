@@ -1,0 +1,148 @@
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:672:                # gan_d_approx) — all share the PerceptualApprox 3D-CNN
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:677:                # When ``gan_d_approx_loss_weight > 0``, gan_d_approx
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:679:                self.mse_approx = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:680:                self.mse_approx_ddp = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:681:                self.mse_approx_optimizer = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:682:                self.lpips_approx = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:683:                self.lpips_approx_ddp = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:684:                self.lpips_approx_optimizer = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:685:                self.gan_d_approx = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:686:                self.gan_d_approx_ddp = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:687:                self.gan_d_approx_optimizer = None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:693:                    getattr(self.config, "perceptual_approx_d_model", 256)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:696:                    getattr(self.config, "perceptual_approx_num_blocks", 4)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:698:                _need_mse_approx = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:699:                    getattr(self.config, "mse_approx_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:701:                _need_lpips_approx = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:702:                    getattr(self.config, "lpips_approx_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:704:                _need_gan_d_approx = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:705:                    getattr(self.config, "gan_d_approx_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:707:                if _need_mse_approx or _need_lpips_approx or _need_gan_d_approx:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:708:                    from model.perceptual_approx import PerceptualApprox
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:711:                        m = PerceptualApprox(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:738:                    if _need_mse_approx:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:739:                        self.mse_approx, self.mse_approx_ddp = _build_approx(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:742:                    if _need_lpips_approx:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:743:                        self.lpips_approx, self.lpips_approx_ddp = (
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:746:                    if _need_gan_d_approx:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:748:                            self.gan_d_approx,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:749:                            self.gan_d_approx_ddp,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1240:        # ``lpips_loss_weight=0`` disables. Lazy-loaded on first use.
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1241:        self.lpips_loss_weight = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1242:            getattr(cfg, "lpips_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1244:        self.lpips_n_frames = int(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1245:            getattr(cfg, "lpips_n_frames", 2)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1250:        self.pixel_recon_loss_weight = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1251:            getattr(cfg, "pixel_recon_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1272:        # mean-pool. See ``model/perceptual_approx.py`` for design.
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1273:        self.mse_approx_loss_weight = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1274:            getattr(cfg, "mse_approx_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1276:        self.lpips_approx_loss_weight = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1277:            getattr(cfg, "lpips_approx_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1279:        # gan_d_approx replaces LatentSAM2Critic when > 0. Same arch
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1280:        # (PerceptualApprox), takes (gen_lat, gt_lat), trained against
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1282:        # latent. Gen-side loss = -gan_d_approx(gen, gt).mean() (same
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1284:        self.gan_d_approx_loss_weight = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1285:            getattr(cfg, "gan_d_approx_loss_weight", 0.0)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1292:        self.perceptual_approx_mean_align_weight = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1293:            getattr(cfg, "perceptual_approx_mean_align_weight", 0.1)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1296:        self.perceptual_approx_d_model = int(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1297:            getattr(cfg, "perceptual_approx_d_model", 256)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1299:        self.perceptual_approx_num_blocks = int(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1300:            getattr(cfg, "perceptual_approx_num_blocks", 4)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1302:        self.perceptual_approx_lr = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1303:            getattr(cfg, "perceptual_approx_lr", 2e-4)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1305:        self.perceptual_approx_warmup_steps = int(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1306:            getattr(cfg, "perceptual_approx_warmup_steps", 25)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1356:        if getattr(self, "mse_approx", None) is not None:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1357:            self.mse_approx_optimizer = torch.optim.AdamW(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1358:                [p for p in self.mse_approx.parameters() if p.requires_grad],
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1359:                lr=self.perceptual_approx_lr,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1369:                    self.perceptual_approx_lr,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1370:                    self.mse_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1371:                    self.perceptual_approx_warmup_steps,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1372:                    self.perceptual_approx_mean_align_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1374:        if getattr(self, "lpips_approx", None) is not None:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1375:            self.lpips_approx_optimizer = torch.optim.AdamW(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1377:                    p for p in self.lpips_approx.parameters()
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1380:                lr=self.perceptual_approx_lr,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1390:                    self.perceptual_approx_lr,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1391:                    self.lpips_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1392:                    self.perceptual_approx_warmup_steps,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1393:                    self.perceptual_approx_mean_align_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1395:        if getattr(self, "gan_d_approx", None) is not None:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1396:            self.gan_d_approx_optimizer = torch.optim.AdamW(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1398:                    p for p in self.gan_d_approx.parameters()
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1401:                lr=self.perceptual_approx_lr,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1412:                    self.perceptual_approx_lr,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1413:                    self.gan_d_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1414:                    self.perceptual_approx_warmup_steps,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:1415:                    self.perceptual_approx_mean_align_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2699:                "lpips_approx_loss_weight>0 requires the 'lpips' "
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2753:            if self.mse_approx_loss_weight > 0:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2767:            if self.lpips_approx_loss_weight > 0:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2793:    def _run_perceptual_approx_update(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2815:                "mse_approx",
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2816:                self.mse_approx_ddp,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2817:                self.mse_approx,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2818:                self.mse_approx_optimizer,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2820:                self.mse_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2823:                "lpips_approx",
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2824:                self.lpips_approx_ddp,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2825:                self.lpips_approx,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2826:                self.lpips_approx_optimizer,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2828:                self.lpips_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2831:                "gan_d_approx",
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2832:                self.gan_d_approx_ddp,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2833:                self.gan_d_approx,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2834:                self.gan_d_approx_optimizer,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2836:                self.gan_d_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2853:                + self.perceptual_approx_mean_align_weight * L_mean_align
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2896:        if current_step < self.perceptual_approx_warmup_steps:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2904:            ("mse_approx", self.mse_approx, self.mse_approx_loss_weight, +1.0),
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2906:                "lpips_approx",
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2907:                self.lpips_approx,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2908:                self.lpips_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2912:                "gan_d_approx",
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2913:                self.gan_d_approx,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2914:                self.gan_d_approx_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2941:        model. Returns None when ``lpips_loss_weight == 0``.
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2949:        if self.lpips_loss_weight <= 0:
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2958:                "lpips_loss_weight>0 requires the 'lpips' python "
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2972:                n_params / 1e6, self.lpips_loss_weight,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:2973:                self.lpips_n_frames, self.lpips_crop_size,
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3027:        Decodes a small (``lpips_n_frames``) random subset of the gen
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3039:        Gated by ``self.lpips_loss_weight > 0`` AND/OR
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3040:        ``self.pixel_recon_loss_weight > 0``. Returns zero scalar +
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3045:        lpips_active = self.lpips_loss_weight > 0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3046:        recon_active = self.pixel_recon_loss_weight > 0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3052:        n_pick = max(1, min(int(self.lpips_n_frames), int(F_lat)))
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3103:            loss = loss + self.lpips_loss_weight * lpips_loss
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3105:            logs["train/lpips_loss_weighted"] = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3106:                (self.lpips_loss_weight * lpips_loss).detach().item()
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3113:            loss = loss + self.pixel_recon_loss_weight * recon_loss
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3117:            logs["train/pixel_recon_loss_weighted"] = float(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3118:                (self.pixel_recon_loss_weight * recon_loss).detach().item()
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3120:        logs["train/lpips_n_frames"] = float(n_pick)
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3232:        # When gan_d_approx is active, it REPLACES the LatentSAM2Critic
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3234:        # gan_d_approx via ``_compute_gen_side_perceptual_loss`` below
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3236:        gan_d_approx_active = (
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3237:            self.gan_d_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3238:            and self.gan_d_approx_loss_weight > 0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3244:            and not gan_d_approx_active
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3274:            self.mse_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3275:            or self.lpips_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3453:        # gan_d_approx). Reuses the no_grad pixel decodes above. Targets
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3461:            self.mse_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3462:            or self.lpips_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3463:            or self.gan_d_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3484:                self.gan_d_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3485:                and self.gan_d_approx_loss_weight > 0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3509:            self._run_perceptual_approx_update(
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3586:        # When gan_d_approx is active it REPLACES the LatentSAM2Critic
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3588:        # — the new gan_d_approx training was already done in Path 1.5.
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3590:            self.gan_d_approx is not None
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3591:            and self.gan_d_approx_loss_weight > 0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:3593:            out["train/gan_d_approx_active"] = 1.0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:5472:            self.lpips_loss_weight > 0
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/trainer/causal_action_forcing_train.py:5473:            or self.pixel_recon_loss_weight > 0
