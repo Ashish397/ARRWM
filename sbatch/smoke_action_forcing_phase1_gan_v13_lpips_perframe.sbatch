@@ -90,7 +90,9 @@ export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export WANDB_MODE=disabled
+export WANDB_MODE=online
+export WANDB_PROJECT=arrwm
+export WANDB_RUN_NAME=smoke_v13_lpips_perframe_${SLURM_JOB_ID}
 
 echo "CONFIG=$CONFIG"
 echo "LOGROOT=$LOGROOT"
@@ -113,6 +115,7 @@ srun torchrun \
   --override \
     log_dir=$LOGROOT \
     wandb_dir=$WANDB_SAVE_DIR \
+    wandb_project=longlive-phase1-smoke \
     auto_resume=false \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
@@ -147,12 +150,12 @@ srun torchrun \
     mse_approx_l1_weight=0.5 \
     lpips_approx_loss_weight=1.0 \
     msssim_approx_loss_weight=1.0 \
-    gan_d_approx_loss_weight=1.0 \
     perceptual_approx_d_model=256 \
     perceptual_approx_num_blocks=4 \
     perceptual_approx_warmup_steps=3 \
     perceptual_approx_mean_align_weight=0.1 \
     perceptual_approx_n_interp_samples=3 \
+    gan_critic_n_interp_samples=3 \
     real_teacher_input_mix_gt_p=0.8 \
     aux_teacher_loss_weight=1.75 \
     gan_backbone=sam2_pixel \

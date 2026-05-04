@@ -707,9 +707,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _need_msssim_approx = float(
                     getattr(self.config, "msssim_approx_loss_weight", 0.0)
                 ) > 0
-                _need_gan_d_approx = float(
-                    getattr(self.config, "gan_d_approx_loss_weight", 0.0)
-                ) > 0
+                _need_gan_d_approx = False  # gan_d_approx is now LatentSAM2Critic (existing path); PerceptualApprox-as-disc-approx is dropped per user realignment
                 if (
                     _need_mse_approx or _need_lpips_approx
                     or _need_msssim_approx or _need_gan_d_approx
@@ -757,11 +755,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             self.msssim_approx,
                             self.msssim_approx_ddp,
                         ) = _build_approx("MSSSIMApprox")
-                    if _need_gan_d_approx:
-                        (
-                            self.gan_d_approx,
-                            self.gan_d_approx_ddp,
-                        ) = _build_approx("GANDApprox")
 
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
@@ -1458,28 +1451,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.perceptual_approx_lr,
                     self.msssim_approx_loss_weight,
                     self.perceptual_approx_warmup_steps,
-                )
-        if getattr(self, "gan_d_approx", None) is not None:
-            self.gan_d_approx_optimizer = torch.optim.AdamW(
-                [
-                    p for p in self.gan_d_approx.parameters()
-                    if p.requires_grad
-                ],
-                lr=self.perceptual_approx_lr,
-                betas=(0.0, 0.9),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-            if self.is_main_process:
-                logging.info(
-                    "[ActionForcing] GANDApprox optimizer built: "
-                    "AdamW lr=%.2e weight=%.3f warmup=%d "
-                    "mean_align_w=%.3f (REPLACES LatentSAM2Critic in "
-                    "gen-side path)",
-                    self.perceptual_approx_lr,
-                    self.gan_d_approx_loss_weight,
-                    self.perceptual_approx_warmup_steps,
-                    self.perceptual_approx_mean_align_weight,
                 )
 
         # ------------------------------------------------------------------
@@ -2936,11 +2907,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         target_mse: Optional[torch.Tensor],
         target_lpips: Optional[torch.Tensor],
         target_msssim: Optional[torch.Tensor] = None,
-        target_disc_fake: Optional[torch.Tensor] = None,
-        target_disc_real: Optional[torch.Tensor] = None,
-        target_mse_real: Optional[torch.Tensor] = None,
-        target_lpips_real: Optional[torch.Tensor] = None,
-        target_msssim_real: Optional[torch.Tensor] = None,
         interp_data: Optional[List[Dict[str, torch.Tensor]]] = None,
         out: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -2964,14 +2930,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         gen_lat_d = gen_lat.detach()
         gt_lat_d = gt_lat.detach()
 
-        # Standard single-input approxes (mse / lpips / msssim) use
-        # ``gen_lat`` as the candidate; gan_d_approx is special-cased
-        # below. All three additionally train on a GT-pair anchor
-        # (``approx(gt_lat, gt_lat) → target_real``) so the approx
-        # USES the gt_lat input meaningfully (otherwise it could
-        # learn to ignore it).
+        # Paired-input approxes (mse / lpips / msssim). Each takes
+        # ``(candidate=gen_lat, reference=gt_lat)`` and predicts the
+        # per-token metric value. The reference is essential — these
+        # metrics are inherently comparative; without it the score
+        # is unanchored.
         for (
-            name, model_ddp, model, optim, target, target_real,
+            name, model_ddp, model, optim, target,
             interp_key, weight,
         ) in [
             (
@@ -2980,7 +2945,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.mse_approx,
                 self.mse_approx_optimizer,
                 target_mse,
-                target_mse_real,
                 "mse",
                 self.mse_approx_loss_weight,
             ),
@@ -2990,7 +2954,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.lpips_approx,
                 self.lpips_approx_optimizer,
                 target_lpips,
-                target_lpips_real,
                 "lpips",
                 self.lpips_approx_loss_weight,
             ),
@@ -3000,7 +2963,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.msssim_approx,
                 self.msssim_approx_optimizer,
                 target_msssim,
-                target_msssim_real,
                 "msssim",
                 self.msssim_approx_loss_weight,
             ),
@@ -3017,15 +2979,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 L_dense
                 + self.perceptual_approx_mean_align_weight * L_mean_align
             )
-            # GT-pair anchor: approx(gt, gt) → target_real. For mse it's
-            # ~0, for lpips ~0, for msssim ~1.0. Forces the approx to
-            # use gt_lat input (anchors gt-conditioning).
-            L_real_pair_value = 0.0
-            if target_real is not None:
-                pred_real_pair = model_for_update(gt_lat_d, gt_lat_d).float()
-                L_real_pair = ((pred_real_pair - target_real) ** 2).mean()
-                L_total = L_total + L_real_pair
-                L_real_pair_value = float(L_real_pair.detach().item())
             # v11-style multi-noise: extra anchor points along the
             # (fake → real) line. Each contributes a per-token MSE
             # term to the same training loss. Densifies the value
@@ -3069,107 +3022,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out[f"train/{name}_pred_mean"] = float(pred.detach().mean().item())
             out[f"train/{name}_target_mean"] = float(target.mean().item())
             out[f"train/{name}_interp_loss"] = L_interp_value
-            out[f"train/{name}_real_pair_loss"] = L_real_pair_value
 
         # ----- gan_d_approx training -----
-        # When ``target_disc_real`` is provided, train the paired
-        # forward: (gen, gt)→target_fake AND (gt, gt)→target_real.
-        # Otherwise fall back to fake-only (gen, gt)→target_fake.
-        if (
-            self.gan_d_approx is not None
-            and self.gan_d_approx_optimizer is not None
-            and self.gan_d_approx_loss_weight > 0
-            and target_disc_fake is not None
-        ):
-            self.gan_d_approx_optimizer.zero_grad(set_to_none=True)
-            model = self.gan_d_approx
-            model_for_update = (
-                self.gan_d_approx_ddp if self.gan_d_approx_ddp is not None
-                else model
-            )
-            # Pass 1: fake side — disc score on gen_pixels.
-            pred_fake = model_for_update(gen_lat_d, gt_lat_d).float()
-            L_dense_fake = ((pred_fake - target_disc_fake) ** 2).mean()
-            L_mean_fake = (pred_fake.mean() - target_disc_fake.mean()) ** 2
-            # Pass 2 (optional): real side — disc score on gt_pixels.
-            pred_real = None
-            if target_disc_real is not None:
-                pred_real = model_for_update(gt_lat_d, gt_lat_d).float()
-                L_dense_real = ((pred_real - target_disc_real) ** 2).mean()
-                L_mean_real = (pred_real.mean() - target_disc_real.mean()) ** 2
-                L_total = (
-                    (L_dense_fake + L_dense_real)
-                    + self.perceptual_approx_mean_align_weight
-                    * (L_mean_fake + L_mean_real)
-                )
-            else:
-                L_dense_real = torch.zeros((), device=gen_lat_d.device)
-                L_mean_real = torch.zeros((), device=gen_lat_d.device)
-                L_total = (
-                    L_dense_fake
-                    + self.perceptual_approx_mean_align_weight * L_mean_fake
-                )
-            # v11-style multi-noise interp anchors for gan_d_approx.
-            # Adds extra (interp_lat, gt_lat) → target_disc_interp
-            # constraints so the approx's value field is densely
-            # supervised across the (fake → real) line.
-            gan_d_interp_value = 0.0
-            if interp_data is not None and len(interp_data) > 0:
-                interp_terms = []
-                for d in interp_data:
-                    interp_target = d.get("disc")
-                    if interp_target is None:
-                        continue
-                    interp_pred = model_for_update(
-                        d["lat"], gt_lat_d,
-                    ).float()
-                    interp_terms.append(
-                        ((interp_pred - interp_target) ** 2).mean()
-                    )
-                if interp_terms:
-                    L_interp = sum(interp_terms) / len(interp_terms)
-                    L_total = L_total + L_interp
-                    gan_d_interp_value = float(L_interp.detach().item())
-            L_total.backward()
-            if (
-                self.gan_max_grad_norm is not None
-                and self.gan_max_grad_norm > 0
-            ):
-                params_iter = (
-                    self.gan_d_approx_ddp.parameters()
-                    if self.gan_d_approx_ddp is not None
-                    else model.parameters()
-                )
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in params_iter if p.grad is not None],
-                    self.gan_max_grad_norm,
-                )
-            self.gan_d_approx_optimizer.step()
-            out["train/gan_d_approx_dense_loss_fake"] = float(
-                L_dense_fake.detach().item()
-            )
-            out["train/gan_d_approx_dense_loss_real"] = float(
-                L_dense_real.detach().item()
-            )
-            out["train/gan_d_approx_pred_fake_mean"] = float(
-                pred_fake.detach().mean().item()
-            )
-            if pred_real is not None:
-                out["train/gan_d_approx_pred_real_mean"] = float(
-                    pred_real.detach().mean().item()
-                )
-            out["train/gan_d_approx_target_fake_mean"] = float(
-                target_disc_fake.mean().item()
-            )
-            if target_disc_real is not None:
-                out["train/gan_d_approx_target_real_mean"] = float(
-                    target_disc_real.mean().item()
-                )
-                # Sanity: real should consistently score HIGHER than fake.
-                out["train/gan_d_approx_target_real_minus_fake"] = float(
-                    (target_disc_real.mean() - target_disc_fake.mean()).item()
-                )
-            out["train/gan_d_approx_interp_loss"] = gan_d_interp_value
+        # gan_d_approx training was here (paired PerceptualApprox-based
+        # disc approximator). REMOVED — replaced by the existing
+        # LatentSAM2Critic (single-input) whose distillation runs in
+        # ``_run_distilled_disc_critic_update`` Path 2 with multi-noise
+        # via ``gan_critic_n_interp_samples``. ``self.latent_critic``
+        # IS the gan_d_approx now.
 
     def _compute_gen_side_perceptual_loss(
         self,
@@ -3214,12 +3074,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.msssim_approx_loss_weight,
                 -1.0,
             ),
-            (
-                "gan_d_approx",
-                self.gan_d_approx,
-                self.gan_d_approx_loss_weight,
-                -1.0,
-            ),
+            # NOTE: gan_d_approx (PerceptualApprox-based) entry removed.
+            # The disc-side gradient is delivered to gen via
+            # ``self.latent_critic`` (LatentSAM2Critic) in the existing
+            # Path 3 of ``_compute_r3gan_losses_distilled``.
         ]:
             if model is None or weight <= 0:
                 continue
@@ -3535,19 +3393,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             and paper_aligned_x0_for_adv is None
         )
 
-        # When gan_d_approx is active, it REPLACES the LatentSAM2Critic
-        # gen-side call. The gen-side adversarial signal flows through
-        # gan_d_approx via ``_compute_gen_side_perceptual_loss`` below
-        # (with sign=-1 for "gen wants disc-approx HIGH = looks real").
-        gan_d_approx_active = (
-            self.gan_d_approx is not None
-            and self.gan_d_approx_loss_weight > 0
-        )
         if (
             critic_warmup_done
             and gen_gan_weight > 0
             and not skip_g_side
-            and not gan_d_approx_active
         ):
             # Freeze critic params so the gen backward doesn't write
             # critic-side gradients into the critic optim (the critic
@@ -3767,7 +3616,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.mse_approx is not None
             or self.lpips_approx is not None
             or self.msssim_approx is not None
-            or self.gan_d_approx is not None
         ):
             # Target token grid: latent spatial dim ceil-divided by 8
             # (matches the approx's post-stem shape — 3× stride-2
@@ -3786,55 +3634,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 target_h=target_h,
                 target_w=target_w,
             )
-            # Disc dense targets — pixel-disc's per-token output map
-            # on BOTH the GEN pixels (target_disc_fake) AND the GT
-            # pixels (target_disc_real). Without the real-side target
-            # the gan_d_approx's gt_lat input is uninformative (the
-            # target only depends on gen) — wasted capacity. With both
-            # targets we train two forward passes per iter:
-            #   1. ``approx(gen_lat, gt_lat) → target_disc_fake``
-            #      ("how would the disc score the gen given this GT?")
-            #   2. ``approx(gt_lat,  gt_lat) → target_disc_real``
-            #      ("how would the disc score the GT given this GT?" —
-            #      teaches approx that "gen == GT" should give the
-            #      real-side score, anchoring the gt-conditioning).
-            # Both targets use the same dense-aggregate pipeline.
-            target_disc_fake: Optional[torch.Tensor] = None
-            target_disc_real: Optional[torch.Tensor] = None
-            if (
-                self.gan_d_approx is not None
-                and self.gan_d_approx_loss_weight > 0
-            ):
-                pix_per_lat = F_pix // int(F_)
-                if pix_per_lat * int(F_) != F_pix:
-                    raise RuntimeError(
-                        f"disc dense aggregate: F_pix={F_pix} "
-                        f"not divisible by F_lat={F_}."
-                    )
-
-                def _aggregate_dense(feats_raw):
-                    dense_pix = disc.forward_dense_heads(
-                        feats_raw,
-                        batch_size=B_pix,
-                        num_frames=F_pix,
-                        target_h=target_h,
-                        target_w=target_w,
-                    ).float()
-                    return (
-                        dense_pix
-                        .view(B, int(F_), pix_per_lat, target_h, target_w)
-                        .mean(dim=2)
-                        .float()
-                    )
-
-                with torch.no_grad():
-                    # Two passes (fake then real) — disc was already
-                    # going to process both for its RpGAN-D loss
-                    # anyway, so this extra heads-dense forward adds
-                    # ~1 GB transient each. Sequential so peak
-                    # transient memory is bounded to one at a time.
-                    target_disc_fake = _aggregate_dense(fake_feats_raw)
-                    target_disc_real = _aggregate_dense(real_feats_raw)
+            # NOTE: disc dense target computation removed — the
+            # PerceptualApprox-based gan_d_approx is gone. The
+            # LatentSAM2Critic distillation in Path 2 below uses
+            # per-frame disc logit targets (its existing API).
 
             # ----- (2) Diagnostic quality logs (no_grad, lightweight).
             # Reuse the dense targets we already computed so .mean() is
@@ -3893,53 +3696,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             target_h=target_h,
                             target_w=target_w,
                         )
-                        i_target_disc = None
-                        if target_disc_fake is not None:
-                            interp_feats = disc.forward_features(
-                                interp_pixel,
-                            )
-                            i_target_disc = _aggregate_dense(
-                                interp_feats,
-                            )
-                            del interp_feats
                         del interp_pixel
                     interp_data.append({
                         "lat": interp_lat.detach(),
                         "mse": i_target_mse,
                         "lpips": i_target_lpips,
                         "msssim": i_target_msssim,
-                        "disc": i_target_disc,
                     })
-            # Real-pair targets (gt vs gt) for the mse/lpips/msssim
-            # GT-anchor training. Each is essentially the metric value
-            # at the "candidate == reference" point — for MSE it's ~0,
-            # for LPIPS it's ~0, for MS-SSIM it's ~1.0. Built as
-            # constant tensors here so we don't need an extra
-            # no_grad pipeline run.
-            shape_dense = (B, int(F_), target_h, target_w)
-            target_mse_real = (
-                torch.zeros(shape_dense, device=device, dtype=torch.float32)
-                if target_mse is not None else None
-            )
-            target_lpips_real = (
-                torch.zeros(shape_dense, device=device, dtype=torch.float32)
-                if target_lpips is not None else None
-            )
-            target_msssim_real = (
-                torch.ones(shape_dense, device=device, dtype=torch.float32)
-                if target_msssim is not None else None
-            )
             self._run_perceptual_approx_update(
                 gen_lat=fake_lat,
                 gt_lat=real_lat,
                 target_mse=target_mse,
                 target_lpips=target_lpips,
                 target_msssim=target_msssim,
-                target_disc_fake=target_disc_fake,
-                target_disc_real=target_disc_real,
-                target_mse_real=target_mse_real,
-                target_lpips_real=target_lpips_real,
-                target_msssim_real=target_msssim_real,
                 interp_data=interp_data,
                 out=out,
             )
@@ -4011,16 +3780,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             d_fake_detached_value = float(d_fake_d.detach().mean().item())
             r1_value = float(r1.detach().item())
             r2_value = float(r2.detach().item())
-
-        # When gan_d_approx is active it REPLACES the LatentSAM2Critic
-        # distillation+gen-side path. Skip Path 2 entirely in that case
-        # — the new gan_d_approx training was already done in Path 1.5.
-        if (
-            self.gan_d_approx is not None
-            and self.gan_d_approx_loss_weight > 0
-        ):
-            out["train/gan_d_approx_active"] = 1.0
-            return
 
         # ===== Path 2: Latent critic value+grad distillation ==========
         # Value targets — full-frame, no_grad teacher forward. Reuse
@@ -5815,6 +5574,32 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             for k, v in gen_log.items()
             if not isinstance(v, dict)
         })
+        # Per-rung bin: split the actual gen-side DMD push (= the
+        # signal that backprops into the student) by the active DMD
+        # timestep. ``dmd_t_mean`` is set by ``_compute_kl_grad`` and
+        # surfaces here through the gen_log unpack above. Same high/
+        # low convention as the model-side bin keys so wandb plots
+        # line up across the gen-side push and the LoRA-side training
+        # error.
+        _t_mean_dbg = float(out.get("dmd_t_mean", 0.0))
+        _hi_dbg = _t_mean_dbg > 500.0
+        _gen_loss_dmd_v = float(gen_loss_dmd.detach().item())
+        out["generator_dmd_loss_t_high"] = (
+            _gen_loss_dmd_v if _hi_dbg else 0.0
+        )
+        out["generator_dmd_loss_t_low"] = (
+            _gen_loss_dmd_v if not _hi_dbg else 0.0
+        )
+        # Student-pred latent stats — abs-max / RMS over the chunk the
+        # gen step was just trained on. If RMS climbs unboundedly or
+        # abs_max saturates near the VAE's latent range, the student
+        # is collapsing in latent space — a leading indicator that
+        # decode-time output will go grey/blocky in the next few iters.
+        with torch.no_grad():
+            _tc = train_chunk.detach().float()
+            out["student_pred_rms"] = float(_tc.pow(2).mean().sqrt().item())
+            out["student_pred_abs_max"] = float(_tc.abs().max().item())
+            out["student_pred_mean"] = float(_tc.mean().item())
         if flash_regime is not None:
             out["flash_dmd_iter_t"] = float(flash_regime["flash_dmd_iter_t"])
             out["flash_dmd_regime_high"] = (

@@ -1629,10 +1629,53 @@ class ActionForcingDMD(SelfForcingModel):
             grad = grad / normalizer.clamp_min(1e-6)
         grad = torch.nan_to_num(grad)
 
+        # Diagnostics: separate the "real-vs-fake disagreement" (= the
+        # raw DMD push direction, ``pred_fake - pred_real``) from the
+        # post-normalization gradient. ``dmdtrain_gradient_norm`` is the
+        # post-norm push the student actually sees; ``dmd_pf_minus_pr``
+        # is the unnormalized magnitude — diverges → fake_score and
+        # real_score have stopped agreeing on the marginal.
+        with torch.no_grad():
+            _t_mean = float(timestep.float().mean().item())
+            _pf_minus_pr_mae = float(
+                (pred_fake_image - pred_real_image).abs().mean().item()
+            )
+            _pred_real_l2 = float(
+                pred_real_image.float().pow(2).mean().sqrt().item()
+            )
+            _pred_fake_l2 = float(
+                pred_fake_image.float().pow(2).mean().sqrt().item()
+            )
         log_dict: Dict[str, Any] = {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
             "timestep": timestep.detach(),
+            "dmd_pf_minus_pr_mae": _pf_minus_pr_mae,
+            "pred_real_rms": _pred_real_l2,
+            "pred_fake_rms": _pred_fake_l2,
+            "dmd_t_mean": _t_mean,
         }
+        # Per-DMD-rung bin keys — split by timestep into "high-noise"
+        # (t > 500, ~rungs 1000/625) and "low-noise" (t <= 500, ~rungs
+        # 312.5/178.6). Lets us track the gen-side DMD push and
+        # real-vs-fake divergence at each end of the DMD ladder
+        # individually (one rung often collapses before the other).
+        # 0.0 sentinel on the inactive bucket each iter so wandb can
+        # still plot them as continuous time series; aggregate by mean
+        # downstream and the inactive-iter zeros wash out across
+        # cadence.
+        _hi = _t_mean > 500.0
+        log_dict["dmd_grad_norm_t_high"] = float(
+            torch.mean(torch.abs(grad)).detach().item()
+        ) if _hi else 0.0
+        log_dict["dmd_grad_norm_t_low"] = float(
+            torch.mean(torch.abs(grad)).detach().item()
+        ) if not _hi else 0.0
+        log_dict["dmd_pf_minus_pr_t_high"] = (
+            _pf_minus_pr_mae if _hi else 0.0
+        )
+        log_dict["dmd_pf_minus_pr_t_low"] = (
+            _pf_minus_pr_mae if not _hi else 0.0
+        )
         # Optional eval-time stash so the trainer can decode the
         # scorers' denoised x0 estimates as sample videos. ``None``
         # = capture disabled (default); a dict means the trainer
@@ -1862,6 +1905,34 @@ class ActionForcingDMD(SelfForcingModel):
                 "``self._dmd_score_grad_mask`` so the structurally-OOD "
                 "last-chunk boundary stays masked uniformly)."
             )
+
+        # Always-on: real-score MAE vs GT (and fake-score MAE vs GT).
+        # Independent of ``teacher_freeze_detect_enabled`` so we can
+        # watch the teacher's accuracy and the gen→GT distance every
+        # iter even when the freeze gate is off. Bin the value by the
+        # active DMD timestep (high vs low) so the trace separates
+        # high-noise rungs (where the scorers should diverge most)
+        # from low-noise rungs (where they should agree).
+        if gt_target is not None:
+            with torch.no_grad():
+                gt_t_dbg = gt_target.to(
+                    dtype=pred_real_image_detached.dtype,
+                    device=pred_real_image_detached.device,
+                )
+                if gt_t_dbg.shape == pred_real_image_detached.shape:
+                    real_mae_vs_gt = float(
+                        (pred_real_image_detached.float() - gt_t_dbg.float())
+                        .abs().mean().item()
+                    )
+                    dmd_log_dict["real_score_mae_vs_gt"] = real_mae_vs_gt
+                    _t_mean = float(dmd_log_dict.get("dmd_t_mean", 0.0))
+                    _hi = _t_mean > 500.0
+                    dmd_log_dict["real_score_mae_vs_gt_t_high"] = (
+                        real_mae_vs_gt if _hi else 0.0
+                    )
+                    dmd_log_dict["real_score_mae_vs_gt_t_low"] = (
+                        real_mae_vs_gt if not _hi else 0.0
+                    )
 
         # Teacher-freeze detection. The freeze mask we build below
         # AND-merges into ``gradient_mask`` and ONLY affects this
@@ -3453,26 +3524,30 @@ class ActionForcingDMD(SelfForcingModel):
                 else:
                     stash["clean_x_real_zarr_name"] = ""
 
-        # Teacher-freeze gt_target for streaming: GT video at the
-        # chunk's noisy_x positions (= ride_latents_window indices
-        # [cf + noisy_start_sdn : cf + noisy_start_sdn + chunk_size]).
-        # ``noisy_start_sdn = current_length - new_frames - overlap``
-        # already accounts for the iter's overlap region. No-op when
-        # the feature is off.
+        # gt_target for streaming: GT video at the chunk's noisy_x
+        # positions (= ride_latents_window indices [cf + noisy_start_sdn
+        # : cf + noisy_start_sdn + chunk_size]). ``noisy_start_sdn =
+        # current_length - new_frames - overlap`` already accounts for
+        # the iter's overlap region.
+        # Always build it (cheap slice) so the MAE-vs-GT diagnostics
+        # in compute_distribution_matching_loss can fire every iter
+        # regardless of whether teacher_freeze_detect is on. The
+        # teacher_freeze gate downstream is independent — gt_target
+        # arriving non-None doesn't enable freeze gating; the
+        # ``teacher_freeze_detect_enabled`` flag still gates that.
         gt_target = None
-        if bool(getattr(self, "teacher_freeze_detect_enabled", False)):
-            cf_state = int(s["cf"])
-            chunk_size_state = int(s["chunk_size"])
-            noisy_start_sdn = int(
-                s["current_length"]
-                - info["new_frames"]
-                - info["overlap"]
-            )
-            ride_window = s["ride_latents_window"]
-            chunk_lo = cf_state + noisy_start_sdn
-            chunk_hi = chunk_lo + chunk_size_state
-            if ride_window.shape[1] >= chunk_hi:
-                gt_target = ride_window[:, chunk_lo:chunk_hi]
+        cf_state = int(s["cf"])
+        chunk_size_state = int(s["chunk_size"])
+        noisy_start_sdn = int(
+            s["current_length"]
+            - info["new_frames"]
+            - info["overlap"]
+        )
+        ride_window = s["ride_latents_window"]
+        chunk_lo = cf_state + noisy_start_sdn
+        chunk_hi = chunk_lo + chunk_size_state
+        if ride_window.shape[1] >= chunk_hi:
+            gt_target = ride_window[:, chunk_lo:chunk_hi]
 
         # Pre-compute gt_z_per_slot for the noisy_x window from the
         # ride's per-frame z_actions (already sliced to action_dims at
@@ -3983,10 +4058,43 @@ class ActionForcingDMD(SelfForcingModel):
             gradient_mask=gradient_mask_flat,
         )
 
+        # Diagnostics: MAE form of FlowPredLoss target, gradient_mask-
+        # weighted. Comparable across timesteps in MAE units (loss is
+        # MSE so it's quadratic-biased) and the natural pair to
+        # ``real_score_mae_vs_gt`` on the DMD-side. Also a per-rung
+        # bin so the LoRA's training error and the gen-side DMD push
+        # can be cross-plotted at high (t > 500) vs low (t <= 500)
+        # noise individually — diverging high-rung error while low
+        # stays flat is the leading collapse indicator. NOTE:
+        # ``gradient_mask_flat`` is ALREADY [B*F, C, H, W] (full 5D
+        # mask flattened on the leading two dims), not [B*F]; broadcast
+        # against the per-pixel err is direct.
+        with torch.no_grad():
+            target_dbg = (eps - gt_target).flatten(0, 1)
+            err_dbg = (
+                flow_pred.flatten(0, 1).float() - target_dbg.float()
+            ).abs()
+            mask_f_dbg = gradient_mask_flat.float()
+            denom_dbg = mask_f_dbg.sum().clamp_min(1.0)
+            err_masked_dbg = (err_dbg * mask_f_dbg).sum() / denom_dbg
+            aux_teacher_pred_mae_v = float(err_masked_dbg.item())
+            aux_t_mean_v = float(t.float().mean().item())
         log: Dict[str, Any] = {
             "aux_teacher_loss": loss.detach(),
             "aux_teacher_input_was_gt": 1.0 if use_gt else 0.0,
+            "aux_teacher_pred_mae": aux_teacher_pred_mae_v,
+            "aux_teacher_t_mean": aux_t_mean_v,
         }
+        _hi = aux_t_mean_v > 500.0
+        _loss_v = float(loss.detach().item())
+        log["aux_teacher_loss_t_high"] = _loss_v if _hi else 0.0
+        log["aux_teacher_loss_t_low"] = _loss_v if not _hi else 0.0
+        log["aux_teacher_pred_mae_t_high"] = (
+            aux_teacher_pred_mae_v if _hi else 0.0
+        )
+        log["aux_teacher_pred_mae_t_low"] = (
+            aux_teacher_pred_mae_v if not _hi else 0.0
+        )
         return loss, log
 
     # ------------------------------------------------------------------
@@ -4221,11 +4329,45 @@ class ActionForcingDMD(SelfForcingModel):
             gradient_mask=gradient_mask_flat,
         )
 
+        # Diagnostics: MAE form of FlowPredLoss target (= |flow_pred -
+        # (eps - GT)|), with the same gradient_mask the loss uses. Two
+        # purposes:
+        #   1. Comparable across LoRA timesteps in MAE units (loss is
+        #      MSE so it's quadratic-biased toward outlier frames).
+        #   2. Lets us split the LoRA's training error by DMD-rung
+        #      bin (high/low noise) — diverging high-rung MAE while
+        #      low-rung stays flat is a leading collapse indicator
+        #      (the teacher loses high-noise score-matching first).
+        with torch.no_grad():
+            target = (eps - gt_target).flatten(0, 1)
+            err = (flow_pred.flatten(0, 1).float() - target.float()).abs()
+            mask_f = gradient_mask_flat.float()
+            denom = mask_f.sum().clamp_min(1.0)
+            err_masked = (err * mask_f).sum() / denom
+            real_teacher_pred_mae_v = float(err_masked.item())
+            t_mean = float(t.float().mean().item())
         log: Dict[str, Any] = {
             "real_teacher_loss": loss.detach(),
             "real_teacher_timestep": t.detach(),
             "real_teacher_input_was_gt": 1.0 if use_gt else 0.0,
+            "real_teacher_pred_mae": real_teacher_pred_mae_v,
+            "real_teacher_t_mean": t_mean,
         }
+        # Per-rung bin keys (high-noise t > 500 vs low-noise t <= 500).
+        # The LoRA online-training loss + MAE split into the same two
+        # buckets the gen-side DMD push uses (see _compute_kl_grad), so
+        # gen-side push and teacher-side training error can be cross-
+        # plotted at each end of the DMD ladder individually.
+        _hi = t_mean > 500.0
+        _loss_v = float(loss.detach().item())
+        log["real_teacher_loss_t_high"] = _loss_v if _hi else 0.0
+        log["real_teacher_loss_t_low"] = _loss_v if not _hi else 0.0
+        log["real_teacher_pred_mae_t_high"] = (
+            real_teacher_pred_mae_v if _hi else 0.0
+        )
+        log["real_teacher_pred_mae_t_low"] = (
+            real_teacher_pred_mae_v if not _hi else 0.0
+        )
         return loss, log
 
     # ------------------------------------------------------------------
