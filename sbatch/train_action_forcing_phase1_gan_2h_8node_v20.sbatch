@@ -1,18 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-gan-v17
+#SBATCH --job-name=action-forcing-phase1-gan-v20
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=02:00:00
+#SBATCH --time=01:30:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Same config as v16, with one delta: dmd_context_mix_p ramps linearly
-# from 0.15 (step 0) to 0.75 (step 150).
+# v20: same as v19 (CFG=1.0, dmd_mix ramp 0.15->0.5 over 400 steps),
+# with two deltas:
+#   1. msssim_approx_loss_weight 1.0 -> 0.0
+#      (post-collapse MS-SSIM stays stable while output is clearly
+#      degraded; suggests it locks onto coarse structure and is
+#      insensitive to the fine-detail loss that drove the collapse).
+#   2. Action-loss aux ENABLED (gen-side action_critic z-guidance +
+#      LoRA-side action_critic z-guidance on _x0). Heads load from E.
+#      State_probe stays disabled (real_score is non-causal WanModel,
+#      no tap-collection support — deferred to a future build).
 # =====================================================================
 
 set -e -o pipefail
@@ -20,7 +28,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_v17
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_v20
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -69,9 +77,10 @@ echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-1 Action-Forcing DMD + R3GAN v17 on $(date)"
-echo "Same config as v16 except dmd_context_mix_p linearly ramps"
-echo "from 0.15 at step 0 to 0.75 at step 150."
+echo "Starting Phase-1 Action-Forcing DMD + R3GAN v20 on $(date)"
+echo "v20 from v19: msssim_approx_loss_weight 1.0 -> 0.0 (MS-SSIM"
+echo "off — locks onto coarse structure post-collapse). Action-loss"
+echo "aux ENABLED (gen-side z-guidance 0.125, LoRA-side 0.0625)."
 
 
 srun --ntasks-per-node=1 bash -c \
@@ -94,9 +103,11 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    action_teacher_mode=off \
-    action_critic_aux_enabled=false \
+    action_teacher_mode=all \
+    action_critic_aux_enabled=true \
     state_probe_aux_enabled=false \
+    generator_action_z_guidance_weight=0.125 \
+    lora_action_critic_z_guidance_weight=0.0625 \
     max_rolls_per_ride=300 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=42 \
@@ -107,15 +118,15 @@ srun torchrun \
     local_attn_size_schedule=[[0,42]] \
     dmd_context=mix \
     dmd_context_mix_p=0.15 \
-    dmd_context_mix_p_target=0.75 \
-    dmd_context_mix_p_ramp_steps=100 \
+    dmd_context_mix_p_target=0.5 \
+    dmd_context_mix_p_ramp_steps=400 \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \
     real_guidance_scale=1.0 \
     real_teacher_lr=5e-5 \
     real_teacher_warmup_steps=30 \
-    real_teacher_input_source=gt \
-    real_teacher_input_mix_gt_p=0.9 \
+    real_teacher_input_source=mix \
+    real_teacher_input_mix_gt_p=0.7 \
     dmd_frozen_teacher_pass_enabled=false \
     aux_teacher_loss_weight=1.0 \
     flash_dmd_split_timestep=500 \
@@ -135,22 +146,23 @@ srun torchrun \
     gan_critic_grad_full_every=0 \
     gan_critic_grad_loss_weight=0.0 \
     gan_sam2_frame_pool=none \
+    gan_sam2_encoder_chunk_size=21 \
     lpips_loss_weight=0.0 \
     pixel_recon_loss_weight=0.0 \
-    mse_approx_loss_weight=1.0 \
+    mse_approx_loss_weight=0.0 \
     mse_approx_l2_weight=1.0 \
     mse_approx_l1_weight=0.5 \
     lpips_approx_loss_weight=1.0 \
     msssim_approx_loss_weight=1.0 \
+    msssim_target_domain=edges \
     perceptual_approx_d_model=256 \
     perceptual_approx_num_blocks=4 \
     perceptual_approx_warmup_steps=25 \
     perceptual_approx_mean_align_weight=0.1 \
-    perceptual_approx_n_interp_samples=3 \
-    gan_critic_n_interp_samples=3 \
+    perceptual_approx_n_interp_samples=0 \
+    gan_critic_n_interp_samples=0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v17
+    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v20
 
 echo "Training completed on $(date)"
-

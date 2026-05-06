@@ -1,18 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-gan-v17
+#SBATCH --job-name=action-forcing-phase1-gan-v19
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=02:00:00
+#SBATCH --time=01:30:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Same config as v16, with one delta: dmd_context_mix_p ramps linearly
-# from 0.15 (step 0) to 0.75 (step 150).
+# v19: same as v18, but with real_guidance_scale=1.0 (CFG ON).
+#   * v18 keeps real_guidance_scale=0.0 (cond-only DMD).
+#   * v19 turns CFG back on to A/B the effect on top of the v17->v18
+#     LoRA input-distribution fix. Everything else identical to v18.
 # =====================================================================
 
 set -e -o pipefail
@@ -20,7 +22,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_v17
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_v19
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -69,9 +71,8 @@ echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-1 Action-Forcing DMD + R3GAN v17 on $(date)"
-echo "Same config as v16 except dmd_context_mix_p linearly ramps"
-echo "from 0.15 at step 0 to 0.75 at step 150."
+echo "Starting Phase-1 Action-Forcing DMD + R3GAN v19 on $(date)"
+echo "v19 from v18: real_guidance_scale 0.0 -> 1.0 (CFG ON)."
 
 
 srun --ntasks-per-node=1 bash -c \
@@ -107,15 +108,15 @@ srun torchrun \
     local_attn_size_schedule=[[0,42]] \
     dmd_context=mix \
     dmd_context_mix_p=0.15 \
-    dmd_context_mix_p_target=0.75 \
-    dmd_context_mix_p_ramp_steps=100 \
+    dmd_context_mix_p_target=0.5 \
+    dmd_context_mix_p_ramp_steps=400 \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \
     real_guidance_scale=1.0 \
     real_teacher_lr=5e-5 \
     real_teacher_warmup_steps=30 \
-    real_teacher_input_source=gt \
-    real_teacher_input_mix_gt_p=0.9 \
+    real_teacher_input_source=mix \
+    real_teacher_input_mix_gt_p=0.7 \
     dmd_frozen_teacher_pass_enabled=false \
     aux_teacher_loss_weight=1.0 \
     flash_dmd_split_timestep=500 \
@@ -150,7 +151,9 @@ srun torchrun \
     gan_critic_n_interp_samples=3 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v17
+    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v19
 
 echo "Training completed on $(date)"
+
+echo "returns a good score even when representation breaks down - disable for v20 and beyond"
 

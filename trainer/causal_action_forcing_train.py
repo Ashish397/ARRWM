@@ -433,6 +433,103 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 model.action_critic = self.action_critic_ddp  # type: ignore
 
         # ------------------------------------------------------------------
+        # State-probe (LoRA-side z-supervision). Mirror of the action_
+        # critic DDP-wrap+optim plumbing, fired only when the LoRA-side
+        # state_probe loss is requested (= state_probe_aux_enabled AND
+        # action_teacher_mode != off AND state_probe_z_loss_weight > 0).
+        # The probe was instantiated frozen by ``_build_action_aux_heads_
+        # compat`` for ckpt-load compat; flip to trainable here when the
+        # loss is wired in. Heads share weights between gen-side
+        # (attached to generator wrapper, currently no loss) and
+        # LoRA-side (attached to real_score wrapper by
+        # ``_attach_state_probe_to_real_score``). Single optimizer.
+        # ------------------------------------------------------------------
+        self.state_probe_ddp: Optional[DDP] = None
+        self.state_probe_optimizer: Optional[torch.optim.Optimizer] = None
+        self.state_probe_z_loss_weight = float(
+            getattr(self.config, "state_probe_z_loss_weight", 0.0)
+        )
+        self.state_probe_aux_active = (
+            self.action_critic_loss_active
+            and bool(getattr(self.config, "state_probe_aux_enabled", False))
+            and self.state_probe_z_loss_weight > 0.0
+            and getattr(model, "state_probe", None) is not None
+        )
+        self.state_probe_max_grad_norm = float(
+            getattr(self.config, "state_probe_max_grad_norm", 1.0)
+        )
+        if self.state_probe_aux_active:
+            sp = model.state_probe
+            sp.requires_grad_(True)
+            sp.train()
+            if self.world_size > 1:
+                self.state_probe_ddp = DDP(
+                    sp,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=False,
+                    broadcast_buffers=False,
+                )
+                model.state_probe = self.state_probe_ddp  # type: ignore
+                # Keep the shared wrapper-side references in sync so the
+                # real_score wrapper's forward calls the DDP-wrapped
+                # module (matched all_reduce across ranks). Also point
+                # generator._state_probe at the DDP wrap so any gen-side
+                # forward that does fire the probe (rare under streaming
+                # geometry) routes through DDP rather than the raw
+                # module, avoiding a desync.
+                if hasattr(model, "real_score"):
+                    setattr(model.real_score, "_state_probe", model.state_probe)
+                if hasattr(model, "generator"):
+                    setattr(model.generator, "_state_probe", model.state_probe)
+                # The wrapper's probe-firing gate reads
+                # ``self._state_probe.num_frame_per_block`` directly
+                # (utils/wan_wrapper.py:624) without unwrapping DDP.
+                # DDP doesn't proxy arbitrary attrs, so the lookup
+                # returns 0 and the gate fails — state_preds never
+                # gets returned, the LoRA-side state_probe loss never
+                # fires, no params get gradient. Mirror the attribute
+                # onto the DDP wrap explicitly. Same goes for the
+                # other init-time attrs the wrapper reads from the
+                # probe in older code paths (defensive).
+                self.state_probe_ddp.num_frame_per_block = (
+                    sp.num_frame_per_block
+                )
+            sp_lr = float(getattr(self.config, "state_probe_lr", 1.0e-04))
+            sp_betas = tuple(
+                getattr(self.config, "state_probe_betas", [0.9, 0.999])
+            )
+            sp_eps = float(getattr(self.config, "state_probe_eps", 1.0e-08))
+            sp_wd = float(
+                getattr(self.config, "state_probe_weight_decay", 0.0)
+            )
+            sp_params = [p for p in sp.parameters() if p.requires_grad]
+            self.state_probe_optimizer = torch.optim.AdamW(
+                sp_params,
+                lr=sp_lr, betas=sp_betas, eps=sp_eps, weight_decay=sp_wd,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] state_probe optimizer built: "
+                    "AdamW lr=%.2e wd=%.4f weight=%.3f params=%.2fM",
+                    sp_lr, sp_wd, self.state_probe_z_loss_weight,
+                    sum(p.numel() for p in sp_params) / 1e6,
+                )
+
+        # LoRA-side action_critic z-guidance weight (mirror of the
+        # gen-side ``generator_action_z_guidance_weight`` knob, applied
+        # to the LoRA's denoised x0 instead of the student's pred). Set
+        # to 0.0 to disable. Reads from ``self.config`` so it can be
+        # overridden per-sbatch.
+        self.lora_action_critic_z_guidance_weight = float(
+            getattr(
+                self.config,
+                "lora_action_critic_z_guidance_weight",
+                0.0,
+            )
+        )
+
+        # ------------------------------------------------------------------
         # R3GAN — RpGAN + R1 + R2 discriminator (opt-in via ``gan_enabled``).
         # Built in fp32 to keep the gradient-penalty (second-order)
         # arithmetic numerically clean. The discriminator operates on
@@ -547,6 +644,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 frame_pool_topk = int(
                     getattr(self.config, "gan_sam2_frame_pool_topk", 4)
                 )
+                # Per-frame chunking of the SAM2 encoder forward. With
+                # 84 pixel frames per gen step at 512×512 input, the
+                # encoder's transient activations were the largest
+                # contributor to the GAN distilled-critic peak segment.
+                # Splitting into ``encoder_chunk_size``-sized chunks
+                # along the batched-frame axis cuts that transient
+                # ~84/chunk×; semantically transparent (SAM2 encoder
+                # is per-frame only). Default 0 = no chunking.
+                encoder_chunk_size = int(
+                    getattr(self.config, "gan_sam2_encoder_chunk_size", 0)
+                )
                 disc = R3GANDiscriminatorSAM2Pixel(
                     sam2_checkpoint_path=str(sam2_ckpt),
                     sam2_config_path=str(sam2_cfg),
@@ -557,6 +665,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     pad_to_square=pad_to_square,
                     frame_pool=frame_pool,
                     frame_pool_topk=frame_pool_topk,
+                    encoder_chunk_size=encoder_chunk_size,
                 )
                 disc.train()  # heads → train; encoder pinned to eval
                               # via overridden train() in the class
@@ -784,6 +893,83 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "frame chunk per gen step).",
                 self.sc_dmd_loss_weight,
                 self.sc_dmd_warmup_steps,
+            )
+
+        # dmd_context_mix_p schedule — linear ramp from the config-time
+        # start to ``dmd_context_mix_p_target`` over the first
+        # ``dmd_context_mix_p_ramp_steps`` outer steps. With ramp_steps
+        # <= 0 (default), the knob is held at the start value forever.
+        # Mutates ``self.model.dmd_context_mix_p`` once per iter via
+        # ``_apply_dmd_context_mix_p_schedule``.
+        self._dmd_context_mix_p_start = float(
+            getattr(self.config, "dmd_context_mix_p", 0.5)
+        )
+        self._dmd_context_mix_p_target = float(
+            getattr(
+                self.config,
+                "dmd_context_mix_p_target",
+                self._dmd_context_mix_p_start,
+            )
+        )
+        self._dmd_context_mix_p_ramp_steps = int(
+            getattr(self.config, "dmd_context_mix_p_ramp_steps", 0)
+        )
+        if (
+            self._dmd_context_mix_p_ramp_steps > 0
+            and self._dmd_context_mix_p_start != self._dmd_context_mix_p_target
+            and self.is_main_process
+        ):
+            logging.info(
+                "[ActionForcing] dmd_context_mix_p schedule active: "
+                "linear ramp %.3f -> %.3f over the first %d outer steps.",
+                self._dmd_context_mix_p_start,
+                self._dmd_context_mix_p_target,
+                self._dmd_context_mix_p_ramp_steps,
+            )
+
+        # dmd_context_mix_p sensor-gate — overrides the linear ramp when
+        # ``dmd_context_mix_p_sensor_enabled=true``. Reads the most
+        # recent ``gen/dmd_pf_minus_pr_mae`` value (= |pred_fake -
+        # pred_real|, the unnormalised DMD push direction). When this
+        # drops below ``dmd_context_mix_p_sensor_threshold`` the
+        # scorers are converging — student is catching up to teacher
+        # and the LoRA needs more GT context to remain meaningful as a
+        # supervisory target. The sensor flips ``model.dmd_context_
+        # mix_p`` from ``_low`` to ``_high`` until the metric rises
+        # back above the threshold, then flips back. Stateless gate
+        # (no hysteresis), reads previous gen-iter's metric. Mutates
+        # ``self.model.dmd_context_mix_p`` once per outer iter via
+        # ``_apply_dmd_context_mix_p_schedule``.
+        self._dmd_context_mix_p_sensor_enabled = bool(
+            getattr(self.config, "dmd_context_mix_p_sensor_enabled", False)
+        )
+        self._dmd_context_mix_p_sensor_threshold = float(
+            getattr(self.config, "dmd_context_mix_p_sensor_threshold", 0.1)
+        )
+        self._dmd_context_mix_p_sensor_low = float(
+            getattr(self.config, "dmd_context_mix_p_sensor_low", 0.15)
+        )
+        self._dmd_context_mix_p_sensor_high = float(
+            getattr(self.config, "dmd_context_mix_p_sensor_high", 0.7)
+        )
+        # State updated after each gen step. ``None`` until the first
+        # gen step has produced a metric — sensor falls back to
+        # ``_low`` while None to avoid spuriously flipping high before
+        # we have a real reading.
+        self._latest_dmd_pf_minus_pr_mae: Optional[float] = None
+        if (
+            self._dmd_context_mix_p_sensor_enabled
+            and self.is_main_process
+        ):
+            logging.info(
+                "[ActionForcing] dmd_context_mix_p sensor active: "
+                "threshold=%.3f, low=%.3f, high=%.3f. Reads "
+                "gen/dmd_pf_minus_pr_mae each gen iter; flips mix_p "
+                "high when below threshold, low when above. Overrides "
+                "linear ramp.",
+                self._dmd_context_mix_p_sensor_threshold,
+                self._dmd_context_mix_p_sensor_low,
+                self._dmd_context_mix_p_sensor_high,
             )
 
         # ------------------------------------------------------------------
@@ -1302,6 +1488,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.msssim_approx_loss_weight = float(
             getattr(cfg, "msssim_approx_loss_weight", 0.0)
         )
+        # MS-SSIM input domain. Default ``image`` matches the standard
+        # pytorch_msssim contract (raw normalised pixels). Setting to
+        # ``edges`` runs MS-SSIM on per-channel Sobel gradient
+        # magnitudes — defeats the gray-collapse failure mode where
+        # uniformly-low-contrast outputs still match locally on raw
+        # pixel windows but fail on edge maps. See
+        # ``_compute_dense_perceptual_targets`` for the implementation.
+        self.msssim_target_domain = str(
+            getattr(cfg, "msssim_target_domain", "image")
+        ).lower().strip()
+        if self.msssim_target_domain not in ("image", "edges"):
+            raise ValueError(
+                f"msssim_target_domain must be 'image' or 'edges'; got "
+                f"{self.msssim_target_domain!r}."
+            )
         # gan_d_approx replaces LatentSAM2Critic when > 0. Same arch
         # (PerceptualApprox), takes (gen_lat, gt_lat), trained against
         # the pixel-disc's DENSE per-token output map for the gen
@@ -1714,6 +1915,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # ------------------------------------------------------------------
     def train(self) -> None:
         cfg = self.config
+        # Memory audit: pre-training snapshot. Captures static param +
+        # buffer footprint AFTER all heads / DDP wraps / optimizers
+        # are built but BEFORE any step's activation memory has hit
+        # the allocator. Call again after step 1 + step 5 below
+        # (gated by ``memory_audit_enabled`` so prod runs aren't
+        # spammed). Default off; smoke turns on.
+        if bool(getattr(cfg, "memory_audit_enabled", False)):
+            self._dump_memory_audit("pre_train")
         max_steps = int(getattr(cfg, "max_steps", 10000))
         ckpt_interval = int(getattr(cfg, "checkpoint_interval", 500))
         log_interval = int(getattr(cfg, "log_interval", 10))
@@ -1824,6 +2033,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # closes the open streaming sequence so the next sequence
             # re-allocates the KV cache at the new size.
             self._apply_attn_size_if_changed()
+            # Linear ramp on ``dmd_context_mix_p`` (no-op when the
+            # target == start or ramp_steps <= 0). Mutates
+            # ``self.model.dmd_context_mix_p`` so the next forward
+            # picks up the new value without further plumbing.
+            _dmd_ctx_mix_p_now = self._apply_dmd_context_mix_p_schedule()
             # Decide whether this iter trains the generator or the critic.
             train_generator = (self.step % dfake_gen_update_ratio == 0)
 
@@ -1834,6 +2048,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     max_total_rollout_frames=max_total_rollout_frames,
                     cf_dmdctx=cf_dmdctx,
                 )
+                # Cache the most recent ``dmd_pf_minus_pr_mae`` so the
+                # NEXT iter's schedule call can read it. Sensor-gated
+                # mix_p mode (``dmd_context_mix_p_sensor_enabled``)
+                # uses this value to decide whether to flip mix_p
+                # high (scorers converging → bolster teacher with GT
+                # context) or low (scorers disagreeing → standard).
+                if (
+                    isinstance(generator_log_dict, dict)
+                    and "dmd_pf_minus_pr_mae" in generator_log_dict
+                ):
+                    _v = generator_log_dict["dmd_pf_minus_pr_mae"]
+                    try:
+                        self._latest_dmd_pf_minus_pr_mae = float(_v)
+                    except (TypeError, ValueError):
+                        pass
 
             # Always run the critic step (CF parity).
             critic_log_dict = self._fwdbwd_one_step(
@@ -1873,6 +2102,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                     self.fake_optimizer.step()
                 self.fake_optimizer.zero_grad(set_to_none=True)
+
+            # ----- State-probe optimizer step (LoRA-side aux loss) -----
+            # Mirrors the fake/real_teacher pattern: clip → step → zero.
+            # Probe gets gradient ONLY when the LoRA aux pass populated
+            # state_preds AND the gen-step backward fired (= gen iter).
+            # On critic-only iters the probe params have no grad, so
+            # the params_with_grad check elides the step naturally.
+            state_probe_grad_norm_val = 0.0
+            if self.state_probe_optimizer is not None:
+                sp_params_with_grad = [
+                    p for p in self.state_probe_optimizer.param_groups[0]["params"]
+                    if p.grad is not None
+                ]
+                if sp_params_with_grad:
+                    sgn = torch.nn.utils.clip_grad_norm_(
+                        sp_params_with_grad,
+                        max_norm=self.state_probe_max_grad_norm,
+                    )
+                    state_probe_grad_norm_val = (
+                        float(sgn.item()) if torch.is_tensor(sgn) else float(sgn)
+                    )
+                    self.state_probe_optimizer.step()
+                self.state_probe_optimizer.zero_grad(set_to_none=True)
 
             # Flash-DMD §3.3: EMA fake_score toward generator AFTER
             # the fake_optimizer step. Order matters: applying Adam's
@@ -1922,6 +2174,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.real_teacher_optimizer.zero_grad(set_to_none=True)
 
             self.step += 1
+
+            # Memory audit at steps 1 and 5 (steady-state activation
+            # memory after the warm-up forward + grad path is fully
+            # established). Gated by ``memory_audit_enabled`` so prod
+            # logs don't get spammed.
+            if (
+                bool(getattr(cfg, "memory_audit_enabled", False))
+                and self.step in (1, 5)
+            ):
+                self._dump_memory_audit(f"after_step_{self.step}")
+                self._dump_step_mem_breakdown(f"step_{self.step}")
 
             # Mark wandb log as DUE if the cadence boundary just
             # crossed. With ``dfake_gen_update_ratio>1`` the boundary
@@ -2044,6 +2307,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if self.real_teacher_optimizer is not None:
                         log_payload["critic/real_teacher_lr"] = float(
                             self.real_teacher_optimizer.param_groups[0]["lr"]
+                        )
+                    log_payload["critic/state_probe_grad_norm"] = (
+                        state_probe_grad_norm_val
+                    )
+                    if self.state_probe_optimizer is not None:
+                        log_payload["critic/state_probe_lr"] = float(
+                            self.state_probe_optimizer.param_groups[0]["lr"]
                         )
                     if previous_time is not None:
                         log_payload["per_iter_time"] = time.time() - previous_time
@@ -2215,6 +2485,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.action_critic_loss_active
             or self.gan_enabled
             or self.real_teacher_train_online
+            or self.state_probe_aux_active
         ):
             return
         path = self._checkpoint_path(self.step)
@@ -2238,6 +2509,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if self.critic_optimizer is not None:
                 state["critic_optimizer"] = self.critic_optimizer.state_dict()
                 appended.append("critic_optimizer")
+        if self.state_probe_aux_active:
+            sp = self.model.state_probe
+            sp_module = sp.module if isinstance(sp, DDP) else sp
+            if sp_module is not None:
+                state["state_probe"] = sp_module.state_dict()
+                appended.append("state_probe")
+            if self.state_probe_optimizer is not None:
+                state["state_probe_optimizer"] = (
+                    self.state_probe_optimizer.state_dict()
+                )
+                appended.append("state_probe_optimizer")
         if self.gan_enabled and self.r3gan_disc is not None:
             disc_module = (
                 self.r3gan_disc_ddp.module if self.r3gan_disc_ddp is not None
@@ -2294,6 +2576,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.action_critic_loss_active
             or self.gan_enabled
             or self.real_teacher_train_online
+            or self.state_probe_aux_active
         ):
             return
         if not bool(getattr(self.config, "auto_resume", False)):
@@ -2333,6 +2616,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         logging.warning(
                             "resume: critic_optimizer load failed: %s. "
                             "Starting critic optim from fresh state.", exc,
+                        )
+        if self.state_probe_aux_active:
+            sp = self.model.state_probe
+            sp_module = sp.module if isinstance(sp, DDP) else sp
+            if sp_module is not None and "state_probe" in state:
+                sp_missing, sp_unexpected = sp_module.load_state_dict(
+                    state["state_probe"], strict=False,
+                )
+                if self.is_main_process:
+                    logging.info(
+                        "resume: state_probe missing=%d unexpected=%d",
+                        len(sp_missing), len(sp_unexpected),
+                    )
+            if (
+                self.state_probe_optimizer is not None
+                and "state_probe_optimizer" in state
+            ):
+                try:
+                    self.state_probe_optimizer.load_state_dict(
+                        state["state_probe_optimizer"]
+                    )
+                    if self.is_main_process:
+                        logging.info("resume: state_probe_optimizer state restored")
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: state_probe_optimizer load failed: %s. "
+                            "Starting state_probe optim from fresh state.", exc,
                         )
         if self.gan_enabled and self.r3gan_disc is not None:
             disc_module = (
@@ -2680,6 +2991,134 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return generator_action_loss, logs, teacher_z_8d
 
     # ------------------------------------------------------------------
+    # LoRA-side (real_score) action losses: action_critic z-guidance on
+    # the LoRA's denoised x0 + state_probe MSE on the per-chunk z the
+    # probe reads from real_score's internal taps. Mirror of the
+    # gen-side z-guidance formulation; SHARES the action_critic +
+    # state_probe heads (Option B). Critic is treated as frozen during
+    # this branch (its gradient already came from the gen-side inner
+    # loop in ``_compute_action_critic_losses``); state_probe is
+    # treated as trainable here (the probe gets its only gradient from
+    # this loss, since gen-side currently has no probe loss).
+    # ------------------------------------------------------------------
+    def _compute_lora_action_losses(
+        self,
+        lora_x0: Optional[torch.Tensor],
+        lora_state_preds: Optional[torch.Tensor],
+        target_action_z: torch.Tensor,
+        teacher_z_8d: torch.Tensor,
+        chunk_t: torch.Tensor,
+        current_step: int,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Dict[str, float],
+    ]:
+        """Returns ``(lora_action_loss, lora_state_probe_loss, logs)``.
+
+        Each loss tensor is graph-bearing (grad flows back into LoRA
+        params via the upstream forwards). ``None`` is returned for
+        a loss when its required input is missing or its weight is 0.
+        """
+        logs: Dict[str, float] = {}
+        zero = (
+            torch.tensor(0.0, device=target_action_z.device,
+                         dtype=target_action_z.dtype)
+        )
+
+        # Frozen-critic z-guidance on the LoRA's x0. Same warmup / ramp
+        # contract as the gen-side z-guidance — pulls gen-side and
+        # LoRA-side together so they activate at the same step. Read the
+        # ramp config (``warmup_steps_for_guidance`` /
+        # ``z_guidance_warmup_steps``) from existing trainer attrs.
+        action_loss: Optional[torch.Tensor] = None
+        if (
+            lora_x0 is not None
+            and self.action_critic_loss_active
+            and self.lora_action_critic_z_guidance_weight > 0.0
+        ):
+            critic_for_guidance = (
+                self.model.action_critic.module
+                if isinstance(self.model.action_critic, DDP)
+                else self.model.action_critic
+            )
+            warmup_start = self.warmup_steps_for_guidance
+            if current_step < warmup_start:
+                guidance_scale = 0.0
+            elif self.z_guidance_warmup_steps > 0:
+                ramp = min(
+                    1.0,
+                    (current_step - warmup_start)
+                    / max(1, self.z_guidance_warmup_steps),
+                )
+                guidance_scale = ramp * self.lora_action_critic_z_guidance_weight
+            else:
+                guidance_scale = self.lora_action_critic_z_guidance_weight
+            if guidance_scale > 0.0:
+                critic_for_guidance.requires_grad_(False)
+                try:
+                    with torch.amp.autocast(
+                        device_type="cuda",
+                        dtype=torch.bfloat16,
+                        enabled=True,
+                    ):
+                        chunk_frames = int(self.config.num_frame_per_block)
+                        n_chunks = lora_x0.shape[1] // chunk_frames
+                        # Critic expects chunk-aligned actions
+                        # ``[B, n_chunks, K]`` (mean over fpb frames per
+                        # chunk), NOT the per-frame ``[B, F, K]`` stream.
+                        # Mirror the gen-side prep in
+                        # ``_compute_action_critic_losses``.
+                        chunk_actions = _chunk_actions(
+                            target_action_z, chunk_frames,
+                        )[:, :n_chunks]
+                        lora_pred_z = critic_for_guidance(
+                            lora_x0, chunk_t, chunk_actions,
+                        )
+                        lora_pred_z = lora_pred_z[:, :n_chunks]
+                        lora_z2z7 = lora_pred_z[:, :, self.action_critic_dims]
+                        lora_z_mse = F.mse_loss(
+                            lora_z2z7, chunk_actions.to(lora_z2z7.dtype),
+                        )
+                        action_loss = guidance_scale * lora_z_mse
+                finally:
+                    critic_for_guidance.requires_grad_(True)
+                logs["train/lora_critic_z_loss"] = float(lora_z_mse.detach().item())
+                logs["train/lora_action_loss"] = float(action_loss.detach().item())
+                logs["train/lora_z_guidance_scale"] = float(guidance_scale)
+
+        # State-probe MSE supervision on the LoRA-side per-chunk z. Target
+        # is the SAME ``teacher_z_8d`` the gen-side critic trained
+        # against (= cotracker+ss_vae extracted from the student's pred).
+        # Loss flows to LoRA params via real_score's internal taps and
+        # to state_probe params directly. ``state_probe`` is configured
+        # as TRAINABLE in this branch (built via DDP at trainer init).
+        # Diagnostic logging: surface whether the wrapper actually
+        # produced state_preds this iter so a missing state_probe loss
+        # is debuggable from wandb alone.
+        logs["train/lora_state_preds_present"] = (
+            1.0 if lora_state_preds is not None else 0.0
+        )
+        state_probe_loss: Optional[torch.Tensor] = None
+        if (
+            lora_state_preds is not None
+            and self.state_probe_z_loss_weight > 0.0
+        ):
+            n_chunks = lora_state_preds.shape[1]
+            tz = teacher_z_8d[:, :n_chunks].to(lora_state_preds.dtype)
+            sp_mse = F.mse_loss(lora_state_preds, tz)
+            state_probe_loss = self.state_probe_z_loss_weight * sp_mse
+            logs["train/lora_state_probe_z_loss"] = float(sp_mse.detach().item())
+            logs["train/lora_state_probe_loss"] = float(
+                state_probe_loss.detach().item()
+            )
+            logs["train/state_probe_z_loss_weight"] = float(
+                self.state_probe_z_loss_weight
+            )
+
+        return action_loss, state_probe_loss, logs
+
+    # ------------------------------------------------------------------
     # R3GAN — RpGAN + R1 + R2.
     # Trains a separate 3D-conv discriminator on
     #   real = ride["latents"][:, gen_window_start:gen_window_end]
@@ -2869,6 +3308,50 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         B * F_pix, C, H_pix, W_pix,
                     ).float().clamp(-1, 1) + 1.0
                 ) * 0.5
+                # Edge-domain switch: when ``msssim_target_domain ==
+                # 'edges'`` the MS-SSIM input is the per-pixel Sobel
+                # gradient magnitude rather than the raw image. Defeats
+                # the gray-collapse failure mode where standard MS-SSIM
+                # stays high on a uniformly low-contrast image (the
+                # "gray attack": local-window contrast statistics still
+                # match the GT's locally-low-contrast statistics, even
+                # though the image has lost all detail). On gradient
+                # maps, gray pred ⇒ near-zero edges; GT ⇒ rich edges;
+                # the SSIM crashes to ~0 and the gen receives a strong
+                # push to recover detail. Output is renormalised to
+                # [0, 1] and clamped so MS-SSIM's data_range=1.0
+                # contract is preserved.
+                if self.msssim_target_domain == "edges":
+                    # 3×3 Sobel kernels, applied per-channel via grouped
+                    # conv so the gradient stays per-channel (no cross-
+                    # channel coupling). Reflection pad keeps shape.
+                    sobel_kx = torch.tensor(
+                        [[1.0, 0.0, -1.0],
+                         [2.0, 0.0, -2.0],
+                         [1.0, 0.0, -1.0]],
+                        dtype=gen_norm.dtype, device=gen_norm.device,
+                    ).view(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
+                    sobel_ky = torch.tensor(
+                        [[1.0, 2.0, 1.0],
+                         [0.0, 0.0, 0.0],
+                         [-1.0, -2.0, -1.0]],
+                        dtype=gen_norm.dtype, device=gen_norm.device,
+                    ).view(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
+
+                    def _grad_mag(x: torch.Tensor) -> torch.Tensor:
+                        x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+                        gx = F.conv2d(x_pad, sobel_kx, groups=C)
+                        gy = F.conv2d(x_pad, sobel_ky, groups=C)
+                        # Magnitude in [0, ~4*sqrt(2)*max_pixel] before
+                        # normalisation. Sobel max-response on a step
+                        # edge from 0→1 is 4 per kernel, so |grad| ∈
+                        # [0, ~5.66]. Divide by 5.66 to roughly land in
+                        # [0, 1], then clamp for data_range=1.0.
+                        mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
+                        return (mag / 5.66).clamp(0.0, 1.0)
+
+                    gen_norm = _grad_mag(gen_norm)
+                    gt_norm = _grad_mag(gt_norm)
                 # Chunk to bound memory (MS-SSIM does multi-scale
                 # Gaussian filtering — ~1-2 GB transient per 4-frame
                 # batch at 480x832).
@@ -3594,7 +4077,41 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         # ===== Path 1: D-update (no_grad V+SAM2; R1/R2 on features) =====
         with torch.no_grad():
-            real_pixel_d = _decode_no_grad(real_lat).to(torch.float32)
+            # GT pixels: prefer the pre-decoded uint8 cache (loaded once
+            # per sequence in ``_streaming_setup_sequence_from_ride``)
+            # to skip the WAN VAE decode of GT every iter. Cached
+            # tensor is uint8 [1, F_pix_window, 3, H, W] at the WAN VAE's
+            # native pixel resolution (480x832); slice to the active
+            # chunk window via the chunk_lo stash, dequantize to fp32
+            # in [-1, 1] (matches ``_decode_no_grad`` output range).
+            ss = getattr(self.model, "streaming_state", None) or {}
+            cached_pixels_uint8 = ss.get("ride_pixels_window_uint8")
+            chunk_lo_in_ride = ss.get("last_chunk_lo_in_ride_window")
+            chunk_size_for_pix = ss.get("last_chunk_size")
+            real_pixel_d: Optional[torch.Tensor] = None
+            if (
+                cached_pixels_uint8 is not None
+                and chunk_lo_in_ride is not None
+                and chunk_size_for_pix is not None
+            ):
+                pix_lo = int(chunk_lo_in_ride) * 4
+                pix_hi = (int(chunk_lo_in_ride) + int(chunk_size_for_pix)) * 4
+                if pix_hi <= cached_pixels_uint8.shape[1]:
+                    sl = cached_pixels_uint8[:, pix_lo:pix_hi].to(
+                        device=device, non_blocking=True,
+                    )
+                    real_pixel_d = (
+                        sl.to(torch.float32) / 127.5 - 1.0
+                    ).clamp_(-1.0, 1.0)
+                    if not getattr(self, "_gt_pixel_cache_hit_logged", False):
+                        logging.info(
+                            "[gt-pixel-cache] using cached GT pixels "
+                            "(chunk_lo=%d, %d→%d frames)",
+                            int(chunk_lo_in_ride), pix_lo, pix_hi,
+                        )
+                        self._gt_pixel_cache_hit_logged = True
+            if real_pixel_d is None:
+                real_pixel_d = _decode_no_grad(real_lat).to(torch.float32)
             fake_pixel_d = _decode_no_grad(fake_lat).to(torch.float32)
             # The WAN VAE has 4× temporal expansion + the dummy-frame
             # trick produces ``F_pix = 4 * F_lat``. SAM2 features are
@@ -4846,6 +5363,258 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 break
         return int(active)
 
+    def _mem_step_snapshot(self, label: str) -> None:
+        """Capture (allocated, peak-since-last-snapshot) at a labeled
+        boundary inside one training step. Cleared at the start of each
+        step. Dumped from ``_dump_step_mem_breakdown`` (called at end of
+        step 1 / step 5).
+        """
+        if not (
+            torch.cuda.is_available()
+            and getattr(self, "is_main_process", True)
+            and bool(getattr(self.config, "memory_audit_enabled", False))
+        ):
+            return
+        if not hasattr(self, "_mem_step_snaps"):
+            self._mem_step_snaps: List[Tuple[str, int, int]] = []
+        try:
+            alloc = torch.cuda.memory_allocated()
+            peak = torch.cuda.max_memory_allocated()
+            self._mem_step_snaps.append((label, alloc, peak))
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+    def _dump_step_mem_breakdown(self, step_label: str) -> None:
+        """Print the full sequence of (label, allocated, peak-since-prev)
+        snapshots collected during one step. Reveals which boundary in
+        the step's code path drives each chunk of the transient peak.
+        """
+        if not (
+            torch.cuda.is_available()
+            and getattr(self, "is_main_process", True)
+            and bool(getattr(self.config, "memory_audit_enabled", False))
+        ):
+            return
+        snaps = getattr(self, "_mem_step_snaps", None)
+        if not snaps:
+            return
+
+        def _gb(x: int) -> float:
+            return x / (1024 ** 3)
+
+        prev_alloc = snaps[0][1]
+        logging.info(
+            "[mem-step %s] === Per-boundary alloc + peak-since-prev ===",
+            step_label,
+        )
+        logging.info(
+            "[mem-step %s]   %-32s  alloc=%6.2f GB  peak_in_segment=%6.2f GB  "
+            "delta_alloc=%+6.2f GB",
+            step_label, snaps[0][0], _gb(snaps[0][1]), _gb(snaps[0][2]), 0.0,
+        )
+        for i in range(1, len(snaps)):
+            label, alloc, peak = snaps[i]
+            delta = alloc - prev_alloc
+            logging.info(
+                "[mem-step %s]   %-32s  alloc=%6.2f GB  peak_in_segment=%6.2f GB  "
+                "delta_alloc=%+6.2f GB",
+                step_label, label, _gb(alloc), _gb(peak), _gb(delta),
+            )
+            prev_alloc = alloc
+
+    def _dump_memory_audit(self, label: str) -> None:
+        """Print a structured memory audit so the operator can see
+        WHERE the GPU memory is going. Three sections per call:
+
+          1. Per-top-level-module parameter + buffer byte tally on the
+             current rank. Reveals which subsystems (gen, fake_score,
+             real_score, action_critic, state_probe, perceptual approxes,
+             SAM2 disc, etc.) are the heavy hitters.
+          2. ``torch.cuda.memory_stats`` snapshot: allocated / reserved
+             / fragmentation / peak. Shows how much PyTorch is holding
+             vs. how much it could free.
+          3. Free-vs-total via ``torch.cuda.mem_get_info``: includes the
+             non-PyTorch overhead (NCCL buffers, cuDNN workspace,
+             CUDA context) so we can size the actual usable PyTorch
+             ceiling.
+
+        Only rank 0 logs (so the run.log isn't 32×repeated). Other
+        ranks compute their own peaks for local inspection if needed
+        but stay quiet.
+        """
+        if not (
+            torch.cuda.is_available()
+            and getattr(self, "is_main_process", True)
+        ):
+            return
+        try:
+            dev = torch.cuda.current_device()
+            # ---- (1) Per-module param/buffer tally -----------------
+            buckets: List[Tuple[str, int, int]] = []  # (name, n_params, bytes)
+
+            def _bucket(name: str, mod: Optional[torch.nn.Module]) -> None:
+                if mod is None:
+                    return
+                # Unwrap DDP for honest counting.
+                inner = (
+                    mod.module if isinstance(mod, DDP) else mod
+                )
+                n_param = 0
+                n_bytes = 0
+                for p in inner.parameters():
+                    if p is None:
+                        continue
+                    n_param += p.numel()
+                    n_bytes += p.numel() * p.element_size()
+                for b in inner.buffers():
+                    if b is None:
+                        continue
+                    n_bytes += b.numel() * b.element_size()
+                buckets.append((name, n_param, n_bytes))
+
+            m = self.model
+            _bucket("generator", getattr(m, "generator", None))
+            _bucket("fake_score", getattr(m, "fake_score", None))
+            _bucket("real_score", getattr(m, "real_score", None))
+            _bucket("real_score_frozen", getattr(m, "real_score_frozen", None))
+            _bucket("action_projection", getattr(m, "action_projection", None))
+            _bucket("action_token_projection", getattr(m, "action_token_projection", None))
+            _bucket("action_critic", getattr(m, "action_critic", None))
+            _bucket("state_probe", getattr(m, "state_probe", None))
+            _bucket("mse_approx", getattr(self, "mse_approx", None))
+            _bucket("lpips_approx", getattr(self, "lpips_approx", None))
+            _bucket("msssim_approx", getattr(self, "msssim_approx", None))
+            _bucket("latent_critic", getattr(self, "latent_critic", None))
+            _bucket("r3gan_disc", getattr(self, "r3gan_disc", None))
+            _bucket(
+                "_frozen_cotracker",
+                getattr(self, "_frozen_cotracker", None),
+            )
+            _bucket("_frozen_ss_vae", getattr(self, "_frozen_ss_vae", None))
+            _bucket(
+                "_frozen_vae",
+                getattr(self, "_frozen_vae", None),
+            )
+
+            total_bytes = sum(b for _, _, b in buckets)
+            buckets.sort(key=lambda t: -t[2])
+
+            # ---- (2) PyTorch alloc / reserved / peak ---------------
+            stats = torch.cuda.memory_stats(device=dev)
+            alloc = stats.get("allocated_bytes.all.current", 0)
+            reserved = stats.get("reserved_bytes.all.current", 0)
+            peak_alloc = stats.get("allocated_bytes.all.peak", 0)
+            peak_reserved = stats.get("reserved_bytes.all.peak", 0)
+
+            # ---- (3) Free vs total (includes non-PyTorch overhead) -
+            free_b, total_b = torch.cuda.mem_get_info(dev)
+            non_pt = max(0, (total_b - free_b) - reserved)
+
+            def _gb(x: int) -> float:
+                return x / (1024 ** 3)
+
+            logging.info(
+                "[mem-audit %s] === Per-module param+buffer bytes ===",
+                label,
+            )
+            for name, np_, nb in buckets:
+                if nb == 0:
+                    continue
+                logging.info(
+                    "[mem-audit %s]   %-22s  params=%9.2fM  bytes=%6.2f GB",
+                    label, name, np_ / 1e6, _gb(nb),
+                )
+            logging.info(
+                "[mem-audit %s]   %-22s  bytes=%6.2f GB  (sum of above)",
+                label, "TOTAL_MODULE_BYTES", _gb(total_bytes),
+            )
+            logging.info(
+                "[mem-audit %s] === PyTorch caching allocator ===",
+                label,
+            )
+            logging.info(
+                "[mem-audit %s]   allocated_now=%.2f GB  reserved_now=%.2f GB  "
+                "fragmentation=%.1f%%",
+                label, _gb(alloc), _gb(reserved),
+                100.0 * (1.0 - alloc / max(reserved, 1)),
+            )
+            logging.info(
+                "[mem-audit %s]   peak_allocated=%.2f GB  peak_reserved=%.2f GB",
+                label, _gb(peak_alloc), _gb(peak_reserved),
+            )
+            logging.info(
+                "[mem-audit %s] === GPU as a whole (rank 0) ===",
+                label,
+            )
+            logging.info(
+                "[mem-audit %s]   total=%.2f GB  free=%.2f GB  "
+                "pytorch_reserved=%.2f GB  non_pytorch=%.2f GB",
+                label, _gb(total_b), _gb(free_b),
+                _gb(reserved), _gb(non_pt),
+            )
+        except Exception as exc:
+            logging.warning(
+                "[mem-audit %s] failed: %s", label, exc,
+            )
+
+    def _apply_dmd_context_mix_p_schedule(self) -> float:
+        """Compute and apply ``dmd_context_mix_p`` for this outer iter.
+
+        Two modes, sensor takes priority when enabled:
+
+        1. **Sensor-gated** (``dmd_context_mix_p_sensor_enabled=True``):
+           Reads the most recent ``gen/dmd_pf_minus_pr_mae`` value
+           cached on ``self._latest_dmd_pf_minus_pr_mae`` (updated by
+           ``_streaming_train_one_chunk`` after each gen step). When
+           the metric is below ``..._sensor_threshold``, sets mix_p to
+           ``..._sensor_high`` (more GT context — bolster the teacher
+           when it's about to be insufficient as a target). When above,
+           sets to ``..._sensor_low``. Stateless single-threshold gate.
+           No-op until the first gen iter has produced a reading;
+           defaults to ``..._sensor_low`` until then.
+
+        2. **Linear ramp** (when sensor disabled): from the config-time
+           start (= ``dmd_context_mix_p``) to ``..._target`` over the
+           first ``..._ramp_steps`` outer steps. With ramp_steps <= 0
+           the knob is held at start (legacy behavior).
+
+        Mutates ``self.model.dmd_context_mix_p`` directly. The model
+        reads it every iter inside ``_build_dmd_context_kwargs`` so the
+        next forward picks up the new value without any other plumbing.
+        Returns the value applied this iter so callers can log it.
+        """
+        if self._dmd_context_mix_p_sensor_enabled:
+            sensor_low = float(self._dmd_context_mix_p_sensor_low)
+            sensor_high = float(self._dmd_context_mix_p_sensor_high)
+            sensor_thr = float(self._dmd_context_mix_p_sensor_threshold)
+            latest = self._latest_dmd_pf_minus_pr_mae
+            if latest is None:
+                p = sensor_low
+            elif latest < sensor_thr:
+                p = sensor_high
+            else:
+                p = sensor_low
+        else:
+            start = float(self._dmd_context_mix_p_start)
+            target = float(self._dmd_context_mix_p_target)
+            ramp_steps = int(self._dmd_context_mix_p_ramp_steps)
+            if ramp_steps <= 0 or start == target:
+                p = start
+            elif self.step >= ramp_steps:
+                p = target
+            else:
+                frac = float(self.step) / float(ramp_steps)
+                p = start + (target - start) * frac
+        # Clamp to [0, 1] defensively (the model raises on out-of-range
+        # values at init; mirror the same bound here so a bad config
+        # doesn't surface mid-run).
+        p = max(0.0, min(1.0, p))
+        default_for_compare = float(self._dmd_context_mix_p_start)
+        if p != float(getattr(self.model, "dmd_context_mix_p", default_for_compare)):
+            self.model.dmd_context_mix_p = p
+        return p
+
     def _apply_attn_size_if_changed(self) -> bool:
         """If the schedule says the active ``local_attn_size`` differs
         from what we last applied, push the new value through the
@@ -5557,9 +6326,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if flash_regime is not None:
             train_info.update(flash_regime)
 
+        # ---- memory audit boundary 0: entry to per-chunk training ----
+        self._mem_step_snaps = []
+        self._mem_step_snapshot("0_entry")
+
         gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
             train_chunk, train_info,
         )
+        self._mem_step_snapshot("1_after_compute_gen_loss_streaming")
 
         if _sample_due_now:
             eval_stash = getattr(self.model, "_dmd_eval_stash", None)
@@ -5634,7 +6408,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 (B, n_chunks), ts_int,
                 device=train_chunk.device, dtype=torch.long,
             )
-            gen_action_loss, critic_logs, _teacher_z = (
+            gen_action_loss, critic_logs, teacher_z_8d = (
                 self._compute_action_critic_losses(
                     pred_x0=train_chunk,
                     target_action_z=actions_for_critic,
@@ -5644,9 +6418,46 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             generator_loss = generator_loss + gen_action_loss
             out.update(critic_logs)
+            self._mem_step_snapshot("2_after_action_critic")
+
+            # LoRA-side action losses (action_critic z-guidance on the
+            # LoRA's denoised x0 + state_probe MSE on the per-chunk z
+            # the probe reads from real_score's internal taps). Both
+            # graph-bearing tensors come from the model's aux pass via
+            # ``_aux_teacher_tensors`` in the gen_log dict. Gradient
+            # flows: action_critic → LoRA params via lora_x0; state_probe
+            # → LoRA params via taps + state_probe params via the probe
+            # readout. Skipped when aux pass produced no tensors (= aux
+            # was skipped this iter, e.g. end-of-ride).
+            aux_tensors = gen_log.get("_aux_teacher_tensors") if isinstance(
+                gen_log, dict,
+            ) else None
+            if aux_tensors is not None:
+                lora_action_loss, lora_state_probe_loss, lora_logs = (
+                    self._compute_lora_action_losses(
+                        lora_x0=aux_tensors.get("lora_x0"),
+                        lora_state_preds=aux_tensors.get("lora_state_preds"),
+                        target_action_z=actions_for_critic,
+                        teacher_z_8d=teacher_z_8d,
+                        chunk_t=chunk_t,
+                        current_step=int(self.step),
+                    )
+                )
+                if lora_action_loss is not None:
+                    generator_loss = generator_loss + lora_action_loss
+                if lora_state_probe_loss is not None:
+                    generator_loss = generator_loss + lora_state_probe_loss
+                out.update(lora_logs)
+                self._mem_step_snapshot("3_after_lora_action")
 
         if gan_active:
             gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
+            # Stash the latent chunk_lo on streaming_state so
+            # ``_run_distilled_disc_critic_update`` can index into the
+            # cached uint8 pixel window (when present) without re-
+            # plumbing the chunk geometry through 3 function signatures.
+            self.model.streaming_state["last_chunk_lo_in_ride_window"] = chunk_lo
+            self.model.streaming_state["last_chunk_size"] = chunk_size
             _flash_regime_str = (
                 flash_regime["flash_dmd_regime"]
                 if flash_regime is not None else None
@@ -5676,6 +6487,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
+            self._mem_step_snapshot("4_after_gan_pre_backward")
 
         # Pixel-space perceptual losses (LPIPS + pixel reconstruction).
         # Direct anti-blur + anti-drift signals on a graph-on decoded
@@ -5719,6 +6531,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # retain_graph=True so the critic backward can walk the shared
         # cond_dict / action_projection subgraph that both losses use.
         generator_loss.backward(retain_graph=True)
+        self._mem_step_snapshot("5_after_gen_backward")
 
         critic_loss, critic_log = self.model.compute_critic_loss_streaming(
             train_chunk, train_info,
@@ -5731,6 +6544,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if not isinstance(v, dict)
         })
         critic_loss.backward()
+        self._mem_step_snapshot("6_after_critic_backward")
 
         # Distilled-critic deferred step. Path 1 (D-update) + Path 2
         # (critic value+grad distillation) were stashed by the gen
@@ -5749,6 +6563,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             torch.cuda.empty_cache()
             self._run_distilled_post_backward_step(out)
             torch.cuda.empty_cache()
+            self._mem_step_snapshot("7_after_distilled_post_backward")
+        self._mem_step_snapshot("8_exit")
 
     # ------------------------------------------------------------------
     # Streaming-mode helpers (LongLive parity).
@@ -5859,7 +6675,94 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.model.streaming_state["ride_offset_s"] = int(s)
             self.model.streaming_state["zarr_path"] = zarr_path
             self.model.streaming_state["motion_chunk_offset"] = motion_chunk_offset
+            # Pre-decoded GT pixels: when ``gt_pixel_cache_root`` is set
+            # AND a cached zarr exists for this ride, load the pixel
+            # slice corresponding to the active ride window. Stash on
+            # streaming_state so ``_run_distilled_disc_critic_update``
+            # can short-circuit the live VAE decode of GT. uint8 →
+            # fp32 dequantization is deferred to the consumer (so we
+            # store ~5 GB compressed instead of ~20 GB fp32). Falls
+            # silently to live-decode when the cache file is missing.
+            self.model.streaming_state["ride_pixels_window_uint8"] = (
+                self._maybe_load_cached_gt_pixels(
+                    zarr_path=zarr_path,
+                    ride_offset_s=int(s),
+                    cf_dmdctx=cf_dmdctx,
+                    actual_cap=int(actual_cap),
+                )
+            )
         return True
+
+    def _maybe_load_cached_gt_pixels(
+        self,
+        zarr_path: str,
+        ride_offset_s: int,
+        cf_dmdctx: int,
+        actual_cap: int,
+    ) -> Optional[torch.Tensor]:
+        """Try to load a pre-decoded uint8 pixel slice for the active
+        ride window. Returns ``[1, F_pix, 3, H, W]`` uint8 on cache hit,
+        ``None`` on miss or when the cache root isn't configured.
+
+        Indexing contract: the precompute script (``bin/precompute_gt_
+        pixels.py``) writes ``pixels[F_pix, 3, H, W]`` indexed by
+        DATASET latent indices (post-_LATENT_HEAD_DROP shift), with
+        4× temporal expansion via the WAN VAE dummy-leading-frame
+        trick. Latent index ``i`` (in the dataset's space) decodes to
+        pixel frames ``[4*i, 4*(i+1))``. The active ride window is
+        ``[ride_offset_s : ride_offset_s + cf_dmdctx + actual_cap]``,
+        so the pixel slice we want is ``[ride_offset_s*4 : (ride_
+        offset_s + cf + cap)*4]``.
+        """
+        cache_root = getattr(self.config, "gt_pixel_cache_root", None)
+        if not cache_root:
+            return None
+        if not zarr_path:
+            return None
+        ride_name = Path(zarr_path).stem
+        cache_zarr = Path(cache_root) / f"{ride_name}.zarr"
+        if not cache_zarr.exists():
+            return None
+        try:
+            import zarr as _zarr_lib
+            g = _zarr_lib.open_group(str(cache_zarr), mode="r")
+            pixels_arr = g["pixels"]  # uint8 [F_pix_total, 3, H, W]
+            n_lat_total = int(g.attrs.get(
+                "n_latent_frames",
+                pixels_arr.shape[0] // 4,
+            ))
+            window_lat_lo = ride_offset_s
+            window_lat_hi = ride_offset_s + cf_dmdctx + actual_cap
+            if window_lat_hi > n_lat_total:
+                if self.is_main_process:
+                    logging.warning(
+                        "[gt-pixel-cache] %s window [%d:%d) extends "
+                        "past cached n_lat=%d — cache miss for safety.",
+                        ride_name, window_lat_lo, window_lat_hi, n_lat_total,
+                    )
+                return None
+            pix_lo = window_lat_lo * 4
+            pix_hi = window_lat_hi * 4
+            arr = pixels_arr[pix_lo:pix_hi]  # uint8 numpy
+            t = torch.from_numpy(arr).unsqueeze(0)  # [1, F_pix, 3, H, W]
+            t = t.contiguous()
+            if self.is_main_process:
+                logging.info(
+                    "[gt-pixel-cache] HIT %s [lat %d:%d) → pix %d:%d) "
+                    "(%.2f MB uint8)",
+                    ride_name, window_lat_lo, window_lat_hi,
+                    pix_lo, pix_hi,
+                    t.numel() / (1024 ** 2),
+                )
+            return t
+        except Exception as exc:
+            if self.is_main_process:
+                logging.warning(
+                    "[gt-pixel-cache] load failed for %s: %s — "
+                    "falling back to live decode.",
+                    ride_name, exc,
+                )
+            return None
 
     def _fwdbwd_streaming_step(
         self,

@@ -621,13 +621,44 @@ class WanDiffusionWrapper(torch.nn.Module):
             # Silently skip the probe for those and fall through to the
             # no-probe return — the taps are collected but discarded.
             probe_n_chunks = int(getattr(self, "_state_n_chunks", 0))
+            # ``self._state_probe`` may be DDP-wrapped (when the trainer
+            # builds a separate optimizer for state_probe and wraps it
+            # for grad sync). DDP doesn't proxy arbitrary user attrs
+            # through ``__getattr__``, so ``getattr(ddp_wrap, "num_frame_
+            # per_block", 0)`` returns 0 unless the attribute is
+            # explicitly set on the wrap. Unwrap before reading to make
+            # this robust regardless of trainer-side fixups.
+            probe_module = self._state_probe
+            try:
+                from torch.nn.parallel import DistributedDataParallel as _DDP
+                if isinstance(probe_module, _DDP):
+                    probe_module = probe_module.module
+            except Exception:
+                pass
             probe_fpb = int(getattr(
-                self._state_probe, "num_frame_per_block", 0,
+                probe_module, "num_frame_per_block", 0,
             ) or 0)
             expected_frames = probe_n_chunks * probe_fpb
             if expected_frames > 0 and num_frames == expected_frames:
+                # Memory-vs-grad-coverage trade: backproping through the
+                # taps into the underlying DiT requires keeping the full
+                # forward graph alive between the model forward and the
+                # state_probe loss backward. With LoRA-active real_score
+                # + 6 taps × ~28k tokens × 1536 dim, that pushes the
+                # 95 GB H100 budget over the edge during the gen-step
+                # (real_score forward graph + DMD aux loss graph + GAN
+                # graph all coexist). Detach the taps so state_probe
+                # backward only reaches the probe's own params; the
+                # upstream model is supervised by other losses
+                # (FlowPredLoss in the aux pass, action_critic
+                # z-guidance via _x0). Gated by
+                # ``self._state_probe_detach_taps`` so the trainer can
+                # opt into full-graph mode if memory headroom permits.
+                taps_for_probe = tapped_features
+                if bool(getattr(self, "_state_probe_detach_taps", True)):
+                    taps_for_probe = [t.detach() for t in tapped_features]
                 state_preds, probe_hidden = self._state_probe(
-                    tapped_features, noisy_start, frame_seqlen,
+                    taps_for_probe, noisy_start, frame_seqlen,
                 )
                 return flow_pred, pred_x0, state_preds.float(), probe_hidden
 

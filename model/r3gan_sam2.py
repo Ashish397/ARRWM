@@ -434,6 +434,7 @@ class R3GANDiscriminatorSAM2Pixel(nn.Module):
         pad_to_square: bool = False,
         frame_pool: str = "mean",
         frame_pool_topk: int = 4,
+        encoder_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         if device is None:
@@ -461,6 +462,14 @@ class R3GANDiscriminatorSAM2Pixel(nn.Module):
             )
         self.frame_pool = frame_pool
         self.frame_pool_topk = max(1, int(frame_pool_topk))
+        # ``encoder_chunk_size``: when > 0 and the per-call batch ``B*F``
+        # exceeds this value, run the SAM2 encoder forward in chunks of
+        # this many frames and concat the per-FPN-scale outputs along
+        # the batch axis. Cuts the SAM2 encoder peak transient memory
+        # ~B*F/chunk_size× at no semantic cost (encoder is purely
+        # per-frame; no cross-frame attention). Default 0 = no chunking
+        # (legacy behavior).
+        self.encoder_chunk_size = int(encoder_chunk_size)
         self.image_encoder = _load_sam2_image_encoder(
             sam2_checkpoint_path, sam2_config_path, device, dtype,
         )
@@ -539,13 +548,40 @@ class R3GANDiscriminatorSAM2Pixel(nn.Module):
         list. Encoder params have ``requires_grad=False`` so input
         gradient flows through but no encoder weight gradients are
         allocated.
+
+        Optionally chunked along the batched-frame axis (dim 0) when
+        ``self.encoder_chunk_size > 0`` and ``x.shape[0]`` exceeds it.
+        Chunking is semantically transparent (the SAM2 encoder is
+        purely per-frame; no cross-frame attention) and trims the
+        peak transient activation memory by the chunking factor.
         """
-        out = self.image_encoder(x)
-        if isinstance(out, dict) and "backbone_fpn" in out:
-            return list(out["backbone_fpn"])
-        if isinstance(out, (list, tuple)):
-            return list(out)
-        return [out]
+        def _to_fpn_list(o: object) -> List[torch.Tensor]:
+            if isinstance(o, dict) and "backbone_fpn" in o:
+                return list(o["backbone_fpn"])
+            if isinstance(o, (list, tuple)):
+                return list(o)
+            return [o]  # type: ignore[list-item]
+
+        chunk = int(getattr(self, "encoder_chunk_size", 0))
+        if chunk <= 0 or x.shape[0] <= chunk:
+            return _to_fpn_list(self.image_encoder(x))
+
+        per_scale: List[List[torch.Tensor]] = []
+        for s in range(0, x.shape[0], chunk):
+            e = min(s + chunk, x.shape[0])
+            out = _to_fpn_list(self.image_encoder(x[s:e]))
+            if not per_scale:
+                per_scale = [[t] for t in out]
+            else:
+                if len(out) != len(per_scale):
+                    raise RuntimeError(
+                        "SAM2 encoder returned different FPN-scale count "
+                        f"({len(out)} vs {len(per_scale)}) across chunks; "
+                        "chunked forward assumes a stable feature layout."
+                    )
+                for i, t in enumerate(out):
+                    per_scale[i].append(t)
+        return [torch.cat(scale_chunks, dim=0) for scale_chunks in per_scale]
 
     def forward_features(self, pixel_video: torch.Tensor) -> List[torch.Tensor]:
         """Run the resize → ImageNet-norm → frozen-SAM2 forward and

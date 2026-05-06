@@ -657,6 +657,15 @@ class ActionForcingDMD(SelfForcingModel):
         self._load_real_score_with_v14_lora(args, device)
         self._mirror_generator_into_fake_score()
 
+        # Attach the (now weight-loaded) state_probe to the real_score
+        # wrapper too. Must run AFTER the v14 LoRA peft wrap so the
+        # ``get_base_model`` walk finds the bare DiT, and AFTER the
+        # state_probe weights have been loaded into ``self.state_probe``
+        # by ``_load_generator_from_ode_checkpoint`` so the shared
+        # module on real_score reads from the trained weights from
+        # iter 1. No-op when state_probe is disabled.
+        self._attach_state_probe_to_real_score(args)
+
         # dmd_context is always set. Configure both bidirectional
         # scorers for teacher-forcing input (clean_x + noisy_x joint
         # window). The clean/noisy SHIFT is fixed at one chunk
@@ -925,6 +934,111 @@ class ActionForcingDMD(SelfForcingModel):
                         exc,
                     )
                 self.state_probe = None
+
+    def _attach_state_probe_to_real_score(self, args) -> None:
+        """Mirror ``adding_state_probe_branch`` onto ``self.real_score``
+        without instantiating a second StateProbeModule. The probe nn.
+        Module stays SHARED with the generator (one set of weights, one
+        optimizer). What the real_score wrapper needs to fire its
+        forward-time probe readout:
+
+          * ``self.real_score._state_probe`` — the shared module.
+          * ``self.real_score._state_n_chunks``,
+            ``self.real_score._state_z_out_dim`` — used by the wrapper
+            to gate the probe forward (skips when frame count mismatches).
+          * ``self.real_score.model._state_probe_tap_set`` /
+            ``_state_probe_tap_indices`` — the inner DiT reads these
+            to know which transformer-block depths to snapshot during
+            its forward.
+
+        The aux pass operates on a chunk_size = num_training_frames =
+        21-frame window (= 7 chunks of 3), exactly the geometry the
+        probe was init'd at. So ``state_preds`` fires on every aux
+        forward with full graph-on coverage.
+
+        No-op when state_probe is disabled or when the gen-side attach
+        in ``_build_action_aux_heads_compat`` failed silently.
+        """
+        if self.state_probe is None or self.real_score is None:
+            return
+        gen_n = int(getattr(self.generator, "_state_n_chunks", 0))
+        gen_z = int(getattr(self.generator, "_state_z_out_dim", 0))
+        gen_set = getattr(self.generator.model, "_state_probe_tap_set", None)
+        gen_idx = getattr(self.generator.model, "_state_probe_tap_indices", None)
+        if not gen_n or not gen_z or gen_set is None or gen_idx is None:
+            if _is_main():
+                logging.warning(
+                    "[ActionForcingDMD] _attach_state_probe_to_real_score: "
+                    "generator-side state_probe attach incomplete; skipping "
+                    "real_score attach."
+                )
+            return
+        self.real_score._state_probe = self.state_probe
+        self.real_score._state_n_chunks = gen_n
+        self.real_score._state_z_out_dim = gen_z
+        # Walk to the inner DiT (LoRA-wrapped → unwrap with get_base_model)
+        # and stamp the tap-set on EVERY candidate hop so the actual forward
+        # path (which may traverse peft.LoraModel → base_model → DiT
+        # depending on the peft version's dispatch) reads it from
+        # whichever ``self`` it sees during ``_forward_train``. Setting
+        # on extra hops is harmless — only the DiT's forward consults
+        # ``_state_probe_tap_set``; the LoraModel/PeftModel layers
+        # don't read it at all.
+        # Walk EVERY layer of wrapping the real_score's model can
+        # acquire and stamp the tap_set on each hop. The actual layering
+        # at runtime can be (worst case):
+        #   wrapper.model = DDP(peft.PeftModel(LoraModel(DiT)))
+        # so we need to unwrap DDP first, then peft, then LoraModel,
+        # to hit the bare DiT that ``_forward_train`` reads from. We
+        # also stamp the intermediate hops because some forward paths
+        # propagate through them and a redundant set is harmless.
+        try:
+            from torch.nn.parallel import DistributedDataParallel as _DDP
+        except Exception:
+            _DDP = None
+        candidates = []
+        cur = self.real_score.model
+        # Hop 0: outermost (may be DDP).
+        candidates.append(("outer", cur))
+        # Hop 1: unwrap DDP if present.
+        if _DDP is not None and isinstance(cur, _DDP):
+            cur = cur.module
+            candidates.append(("ddp.module", cur))
+        # Hop 2: peft.PeftModel.get_base_model() if present.
+        if hasattr(cur, "get_base_model"):
+            g = cur.get_base_model()
+            if g is not cur:
+                candidates.append(("get_base_model()", g))
+                cur_after_peft = g
+            else:
+                cur_after_peft = cur
+        else:
+            cur_after_peft = cur
+        # Hop 3: peft.LoraModel intermediate (peft_model.base_model
+        # is the LoraModel; its .model is the bare DiT).
+        outer_for_lora = candidates[1][1] if len(candidates) > 1 else cur
+        if hasattr(outer_for_lora, "base_model"):
+            bm = getattr(outer_for_lora, "base_model")
+            candidates.append(("base_model", bm))
+            if hasattr(bm, "model"):
+                candidates.append(("base_model.model", bm.model))
+        # Stamp all unique objects.
+        seen = set()
+        unique = []
+        for label, obj in candidates:
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            unique.append((label, obj))
+            obj._state_probe_tap_set = set(gen_set)
+            obj._state_probe_tap_indices = list(gen_idx)
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] state_probe attached to real_score "
+                "(shared module, taps at %s, stamped on %d unique hops: %s).",
+                list(gen_idx), len(unique),
+                [label for label, _ in unique],
+            )
 
     # ------------------------------------------------------------------
     # Checkpoint loading (ported from staircase model, simplified)
@@ -1595,28 +1709,34 @@ class ActionForcingDMD(SelfForcingModel):
         else:
             pred_fake_image = pred_fake_image_cond
 
-        # Step 2: real score (CF parity — ALWAYS run both cond + uncond
-        # forwards, no gate on real_guidance_scale). With scale=0 the
-        # math collapses to ``pred_real_image_cond`` exactly, so the
-        # extra forward is "free" semantically; the cost is one
-        # additional real_score forward per training iter relative to a
-        # gated implementation. CF code path matches this byte-for-byte
-        # at ``Causal-Forcing/model/dmd.py:98-112``.
+        # Step 2: real score. CF parity used to ALWAYS run cond + uncond
+        # forwards (no gate on real_guidance_scale) and rely on
+        # ``scale=0`` collapsing the math to ``pred_real_image_cond``.
+        # That cost ~7 GB of activation graph per gen step on this rig
+        # (one full TF 42-frame DiT forward). When ``real_guidance_scale
+        # == 0`` we now skip the uncond forward entirely — the math is
+        # identical (``pred_real = cond + 0 * (cond - uncond) = cond``)
+        # and the saved activation graph is the cheapest single memory
+        # win available. CF parity preserved by-value; only the
+        # forward count differs.
         _, pred_real_image_cond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep=timestep,
             **tf_kwargs_real,
         )
-        _, pred_real_image_uncond = self.real_score(
-            noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=unconditional_dict,
-            timestep=timestep,
-            **tf_kwargs_real,
-        )
-        pred_real_image = pred_real_image_cond + (
-            pred_real_image_cond - pred_real_image_uncond
-        ) * self.real_guidance_scale
+        if self.real_guidance_scale != 0.0:
+            _, pred_real_image_uncond = self.real_score(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=unconditional_dict,
+                timestep=timestep,
+                **tf_kwargs_real,
+            )
+            pred_real_image = pred_real_image_cond + (
+                pred_real_image_cond - pred_real_image_uncond
+            ) * self.real_guidance_scale
+        else:
+            pred_real_image = pred_real_image_cond
 
         # Step 3: DMD grad = (fake - real). CF normalizes by
         # |x0 - real|.mean() (eq. 8). Match exactly.
@@ -4024,14 +4144,29 @@ class ActionForcingDMD(SelfForcingModel):
         ).unflatten(0, chunk.shape[:2])
 
         # Teacher forward — full grad on LoRA params (and on chunk
-        # via noisy_input when use_gt=False).
-        flow_pred, _x0 = self.real_score(
+        # via noisy_input when use_gt=False). When state_probe is
+        # attached to real_score (= aux training enabled), the wrapper
+        # also returns ``state_preds, probe_hidden`` from the probe
+        # readout. The 21-frame aux window matches the probe's
+        # ``n_chunks * num_frame_per_block`` gate, so state_preds is
+        # graph-bearing through both LoRA params (via the taps) and
+        # state_probe params (the probe's own weights). We unpack
+        # both arities so the same code works with the probe on or off.
+        _real_score_out = self.real_score(
             noisy_image_or_video=noisy_input,
             conditional_dict=cond_for_scoring,
             timestep=t,
             clean_x=sc_clean_x_real,
             aug_t=sc_aug_t_real,
         )
+        if isinstance(_real_score_out, tuple) and len(_real_score_out) >= 4:
+            flow_pred, _x0, lora_state_preds, _probe_hidden = (
+                _real_score_out[0], _real_score_out[1],
+                _real_score_out[2], _real_score_out[3],
+            )
+        else:
+            flow_pred, _x0 = _real_score_out
+            lora_state_preds = None
 
         # Eval-time stash: surface the LoRA aux teacher's denoised x0
         # estimate for the sample-video logger. The DMD pass already
@@ -4095,6 +4230,18 @@ class ActionForcingDMD(SelfForcingModel):
         log["aux_teacher_pred_mae_t_low"] = (
             aux_teacher_pred_mae_v if not _hi else 0.0
         )
+        # Expose the graph-bearing LoRA-side outputs so the trainer can
+        # fold action_critic z-guidance and state_probe supervision into
+        # the gen step's total loss before the single backward. These
+        # MUST be tensor-valued (not detached) so gradient flows back
+        # into LoRA params via _x0 and into both LoRA + state_probe
+        # params via lora_state_preds. Keys are nested under "_aux_teacher_
+        # tensors" so the standard ``isinstance(v, dict)`` filter in the
+        # trainer's wandb-log unpack skips them (else .item() would fail).
+        log["_aux_teacher_tensors"] = {
+            "lora_x0": _x0,
+            "lora_state_preds": lora_state_preds,
+        }
         return loss, log
 
     # ------------------------------------------------------------------
