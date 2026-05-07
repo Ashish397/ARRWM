@@ -794,10 +794,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.msssim_approx = None
                 self.msssim_approx_ddp = None
                 self.msssim_approx_optimizer = None
+                self.maniqa_approx = None
+                self.maniqa_approx_ddp = None
+                self.maniqa_approx_optimizer = None
                 self.gan_d_approx = None
                 self.gan_d_approx_ddp = None
                 self.gan_d_approx_optimizer = None
                 self._lpips_target_model = None  # lazy-built no_grad LPIPS
+                self._maniqa_target_model = None  # lazy-built no_grad MANIQA
                 # Read directly from cfg here so we avoid the order-of-
                 # init issue (the knob assignments to self happen later
                 # in this same __init__, after the disc/critic build).
@@ -816,18 +820,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _need_msssim_approx = float(
                     getattr(self.config, "msssim_approx_loss_weight", 0.0)
                 ) > 0
+                _need_maniqa_approx = float(
+                    getattr(self.config, "maniqa_approx_loss_weight", 0.0)
+                ) > 0
                 _need_gan_d_approx = False  # gan_d_approx is now LatentSAM2Critic (existing path); PerceptualApprox-as-disc-approx is dropped per user realignment
                 if (
                     _need_mse_approx or _need_lpips_approx
-                    or _need_msssim_approx or _need_gan_d_approx
+                    or _need_msssim_approx or _need_maniqa_approx
+                    or _need_gan_d_approx
                 ):
                     from model.perceptual_approx import PerceptualApprox
 
-                    def _build_approx(name: str):
+                    def _build_approx(name: str, single_input: bool = False):
                         m = PerceptualApprox(
                             in_channels=16,
                             d_model=_approx_d_model,
                             num_blocks=_approx_num_blocks,
+                            single_input=single_input,
                         ).to(device=self.device, dtype=torch.float32)
                         m.train()
                         ddp = None
@@ -864,6 +873,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             self.msssim_approx,
                             self.msssim_approx_ddp,
                         ) = _build_approx("MSSSIMApprox")
+                    if _need_maniqa_approx:
+                        (
+                            self.maniqa_approx,
+                            self.maniqa_approx_ddp,
+                        ) = _build_approx(
+                            "MANIQAApprox", single_input=True,
+                        )
 
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
@@ -970,6 +986,32 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self._dmd_context_mix_p_sensor_threshold,
                 self._dmd_context_mix_p_sensor_low,
                 self._dmd_context_mix_p_sensor_high,
+            )
+
+        # dmd_context_mix_p HARD step-switch — fires once at outer
+        # ``self.step == dmd_context_mix_p_step_switch_at`` and stays
+        # at ``_target`` thereafter. Default 0 = disabled (legacy
+        # behavior: ramp + optional sensor). When > 0, this overrides
+        # the linear ramp (but is still overridden by the sensor when
+        # ``_sensor_enabled``). Use case: pre-warmup with low GT
+        # context, then step-switch to high GT once the LoRA has
+        # stabilized — discrete, no interpolation.
+        self._dmd_context_mix_p_step_switch_at = int(
+            getattr(self.config, "dmd_context_mix_p_step_switch_at", 0)
+        )
+        if (
+            self._dmd_context_mix_p_step_switch_at > 0
+            and not self._dmd_context_mix_p_sensor_enabled
+            and self.is_main_process
+        ):
+            logging.info(
+                "[ActionForcing] dmd_context_mix_p step-switch active: "
+                "step < %d -> %.3f, step >= %d -> %.3f (overrides "
+                "linear ramp).",
+                self._dmd_context_mix_p_step_switch_at,
+                self._dmd_context_mix_p_start,
+                self._dmd_context_mix_p_step_switch_at,
+                self._dmd_context_mix_p_target,
             )
 
         # ------------------------------------------------------------------
@@ -1503,6 +1545,39 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 f"msssim_target_domain must be 'image' or 'edges'; got "
                 f"{self.msssim_target_domain!r}."
             )
+        # MANIQA NR-IQA approx (no GT — gen-only). Predicts a sparse
+        # per-token quality score map. Targets are built every iter by:
+        #   1. VAE-decoding the gen latents (no_grad) → pixel frames.
+        #   2. Sampling N random 224×224 patches from selected frames
+        #      (DDP-synced offsets, ``maniqa_n_patches_per_frame``).
+        #   3. Forwarding each patch through a frozen pretrained
+        #      MANIQA model → per-patch scalar quality score in [0, 1].
+        #   4. Mapping each patch's pixel region to the latent-token
+        #      coordinates it covers; assigning the score there. All
+        #      other tokens NaN → masked from the approx training loss.
+        # Gen-side loss is sign-flipped (gen wants quality HIGH).
+        # ``maniqa_n_frames``: number of latent frames per iter to
+        # supervise (rest of frames carry NaN this iter; supervised on
+        # later iters via random subsampling). Default 4 (matches LPIPS-
+        # pixel pattern). Set equal to F_lat to supervise every frame
+        # every iter ("option 1" — slower target build).
+        # ``maniqa_n_patches_per_frame``: random 224×224 patches per
+        # selected frame. Default 1.
+        self.maniqa_approx_loss_weight = float(
+            getattr(cfg, "maniqa_approx_loss_weight", 0.0)
+        )
+        self.maniqa_n_frames = int(
+            getattr(cfg, "maniqa_n_frames", 4)
+        )
+        self.maniqa_n_patches_per_frame = int(
+            getattr(cfg, "maniqa_n_patches_per_frame", 1)
+        )
+        # Pretrained MANIQA variant (pyiqa metric_name). 'maniqa-pipal'
+        # was trained on PIPAL (which includes GAN-distortion images);
+        # the default 'maniqa' is KonIQ-10k-trained.
+        self.maniqa_metric_name = str(
+            getattr(cfg, "maniqa_metric_name", "maniqa-pipal")
+        )
         # gan_d_approx replaces LatentSAM2Critic when > 0. Same arch
         # (PerceptualApprox), takes (gen_lat, gt_lat), trained against
         # the pixel-disc's DENSE per-token output map for the gen
@@ -1652,6 +1727,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.perceptual_approx_lr,
                     self.msssim_approx_loss_weight,
                     self.perceptual_approx_warmup_steps,
+                )
+        if getattr(self, "maniqa_approx", None) is not None:
+            self.maniqa_approx_optimizer = torch.optim.AdamW(
+                [
+                    p for p in self.maniqa_approx.parameters()
+                    if p.requires_grad
+                ],
+                lr=self.perceptual_approx_lr,
+                betas=(0.0, 0.9),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] MANIQAApprox optimizer built: "
+                    "AdamW lr=%.2e weight=%.3f warmup=%d "
+                    "n_frames=%d n_patches/frame=%d metric=%s "
+                    "(NR-IQA, single-input, sign FLIPPED — gen wants "
+                    "quality HIGH)",
+                    self.perceptual_approx_lr,
+                    self.maniqa_approx_loss_weight,
+                    self.perceptual_approx_warmup_steps,
+                    self.maniqa_n_frames,
+                    self.maniqa_n_patches_per_frame,
+                    self.maniqa_metric_name,
                 )
 
         # ------------------------------------------------------------------
@@ -3156,6 +3256,225 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             dist.broadcast(idx, src=0)
         return idx.tolist()
 
+    def _get_maniqa_target_model(self) -> Optional["torch.nn.Module"]:
+        """Lazy-build a pyiqa MANIQA NR-IQA metric for use as a frozen
+        no_grad target. Forward signature: ``model(x) -> [B, 1]``
+        scalar quality score in [0, 1] (higher = better) per image.
+        Input ``x`` ``[B, 3, H, W]`` in [0, 1].
+
+        We force ``test_sample=1`` on the inner net so MANIQA returns
+        the score from ONE crop. With our pre-cropped 224×224 input,
+        the crop is an identity (uniform_crop with crop_num=1 picks
+        offset (0, 0) on a 224×224 image = pass-through). This gives
+        us a per-patch score we can map back to specific latent token
+        regions, which is the whole point of patch-sampled NR-IQA.
+        """
+        cached = getattr(self, "_maniqa_target_model", None)
+        if cached is not None:
+            return cached
+        try:
+            import pyiqa as _pyiqa
+        except ImportError as e:
+            raise RuntimeError(
+                "maniqa_approx_loss_weight>0 requires pyiqa: pip "
+                f"install pyiqa. Original error: {e}"
+            )
+        metric_name = self.maniqa_metric_name
+        model = _pyiqa.create_metric(
+            metric_name, as_loss=False, device=self.device,
+        )
+        # Force single-crop forward; default test_sample=20 averages
+        # 20 uniform crops which (a) is wasteful when our input is
+        # already 224×224 and (b) destroys the per-patch granularity
+        # we need for spatial token mapping.
+        try:
+            model.net.test_sample = 1
+        except Exception:
+            pass
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self._maniqa_target_model = model
+        if self.is_main_process:
+            n_params = sum(p.numel() for p in model.parameters())
+            logging.info(
+                "[ActionForcing] MANIQA-target lazy-built: metric=%s "
+                "params=%.2fM (used for no_grad target only; "
+                "test_sample forced to 1)",
+                metric_name, n_params / 1e6,
+            )
+        return model
+
+    def _compute_dense_maniqa_target(
+        self,
+        gen_pix: torch.Tensor,
+        F_lat: int,
+        target_h: int,
+        target_w: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], float]:
+        """Build a sparse per-token MANIQA quality target.
+
+        Args:
+            gen_pix: ``[B, F_pix, 3, H_pix, W_pix]`` in [-1, 1] (VAE
+                output range). F_pix = pix_per_lat * F_lat.
+            F_lat: latent temporal length.
+            target_h, target_w: approx-output token grid spatial dims.
+
+        Returns:
+            ``(target, valid_mask, target_build_ms)`` where:
+              * ``target`` ``[B, F_lat, target_h, target_w]`` float32:
+                MANIQA score in [0, 1] for tokens covered by a
+                sampled patch this iter; NaN elsewhere.
+              * ``valid_mask`` ``[B, F_lat, target_h, target_w]``
+                bool: True where target is valid (not NaN).
+              * ``target_build_ms``: wall-clock for the target build
+                (for the 4-vs-84 frame timing diagnostic).
+
+        Returns ``(None, None, 0.0)`` when MANIQA approx weight is 0.
+
+        Patch sampling: per iter, picks ``maniqa_n_frames`` random
+        latent frames (DDP-synced), and per selected frame, samples
+        ``maniqa_n_patches_per_frame`` random 224×224 patches at
+        DDP-synced offsets. Each patch gets one MANIQA score, and the
+        score is broadcast to all approx-tokens whose pixel coverage
+        overlaps the patch.
+        """
+        if self.maniqa_approx_loss_weight <= 0:
+            return None, None, 0.0
+        if (
+            self.maniqa_approx is None
+            or self.maniqa_approx_optimizer is None
+        ):
+            return None, None, 0.0
+
+        import time as _time
+        t0 = _time.time()
+
+        device = gen_pix.device
+        B, F_pix, C, H_pix, W_pix = gen_pix.shape
+        if F_pix % F_lat != 0:
+            raise RuntimeError(
+                f"_compute_dense_maniqa_target: F_pix={F_pix} not "
+                f"divisible by F_lat={F_lat}."
+            )
+        pix_per_lat = F_pix // F_lat
+        crop = 224
+        if H_pix < crop or W_pix < crop:
+            raise RuntimeError(
+                f"_compute_dense_maniqa_target: pixel resolution "
+                f"({H_pix}, {W_pix}) smaller than MANIQA crop {crop}."
+            )
+
+        # Pick latent-frame indices (DDP-synced).
+        n_frames = max(1, min(int(self.maniqa_n_frames), int(F_lat)))
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            frame_idx = torch.randperm(
+                F_lat, device=device,
+            )[:n_frames].sort().values
+        else:
+            frame_idx = torch.empty(
+                n_frames, dtype=torch.long, device=device,
+            )
+        if dist.is_initialized():
+            dist.broadcast(frame_idx, src=0)
+        frame_list = frame_idx.tolist()
+
+        # Pick a representative pixel-frame per selected latent — the
+        # CENTER pixel of the 4-frame group (index pix_per_lat // 2 of
+        # each group). Avoids averaging across pixel-frames (which
+        # would smear motion artefacts) while still being representative.
+        pix_center_offset = pix_per_lat // 2
+        pix_indices = [
+            f * pix_per_lat + pix_center_offset for f in frame_list
+        ]
+        # Patch offsets (DDP-synced): per (frame, patch_idx) a single
+        # (h_o, w_o). Same offsets for all batch samples.
+        n_patches = max(1, int(self.maniqa_n_patches_per_frame))
+        n_total_patches = n_frames * n_patches
+        if rank == 0:
+            h_o_t = torch.randint(
+                0, H_pix - crop + 1, (n_total_patches,), device=device,
+            )
+            w_o_t = torch.randint(
+                0, W_pix - crop + 1, (n_total_patches,), device=device,
+            )
+        else:
+            h_o_t = torch.empty(
+                n_total_patches, dtype=torch.long, device=device,
+            )
+            w_o_t = torch.empty(
+                n_total_patches, dtype=torch.long, device=device,
+            )
+        if dist.is_initialized():
+            dist.broadcast(h_o_t, src=0)
+            dist.broadcast(w_o_t, src=0)
+        h_offsets = h_o_t.tolist()
+        w_offsets = w_o_t.tolist()
+
+        # Crop all patches into a single batch for MANIQA forward.
+        # Shape: [B * n_total_patches, 3, 224, 224].
+        # Convert [-1, 1] → [0, 1] (clamp first).
+        patches = []
+        patch_meta = []  # (frame_in_F_lat, h_o, w_o)
+        for k_p, f_lat_idx in enumerate(frame_list):
+            pix_f = pix_indices[k_p]
+            for q in range(n_patches):
+                p_idx = k_p * n_patches + q
+                h_o = h_offsets[p_idx]
+                w_o = w_offsets[p_idx]
+                # All B samples at this frame, this patch position.
+                pix_slice = gen_pix[
+                    :, pix_f, :, h_o:h_o + crop, w_o:w_o + crop,
+                ]
+                patches.append(pix_slice)  # [B, 3, 224, 224]
+                patch_meta.append((f_lat_idx, h_o, w_o))
+        # Stack: [n_total_patches, B, 3, 224, 224] → [B, n_total, ...]
+        patches_t = torch.stack(patches, dim=1).contiguous()
+        patches_t = patches_t.view(
+            B * n_total_patches, 3, crop, crop,
+        )
+        patches_t = (patches_t.clamp(-1.0, 1.0) * 0.5 + 0.5).float()
+
+        # MANIQA forward (no_grad).
+        model = self._get_maniqa_target_model()
+        with torch.no_grad():
+            scores = model(patches_t).float()  # [B * n_total, 1]
+        scores = scores.view(B, n_total_patches)
+
+        # Build sparse target. NaN-init, fill the patch-covered tokens.
+        target = torch.full(
+            (B, F_lat, target_h, target_w),
+            float("nan"), device=device, dtype=torch.float32,
+        )
+        pix_per_token_h = H_pix / float(target_h)
+        pix_per_token_w = W_pix / float(target_w)
+        for q_idx, (f_lat_idx, h_o, w_o) in enumerate(patch_meta):
+            t_row_lo = int(max(0, h_o // pix_per_token_h))
+            t_row_hi = int(min(
+                target_h,
+                int((h_o + crop - 1) // pix_per_token_h) + 1,
+            ))
+            t_col_lo = int(max(0, w_o // pix_per_token_w))
+            t_col_hi = int(min(
+                target_w,
+                int((w_o + crop - 1) // pix_per_token_w) + 1,
+            ))
+            score_q = scores[:, q_idx]  # [B]
+            target[
+                :, f_lat_idx, t_row_lo:t_row_hi, t_col_lo:t_col_hi,
+            ] = score_q.view(B, 1, 1)
+
+        valid_mask = ~torch.isnan(target)
+        # Replace NaN in target with 0 so the approx training step
+        # can do a masked-MSE without NaN propagation. Actual target
+        # values at masked-out positions are ignored via valid_mask.
+        target = torch.where(
+            valid_mask, target, torch.zeros_like(target),
+        )
+        target_build_ms = (_time.time() - t0) * 1000.0
+        return target, valid_mask, target_build_ms
+
     def _get_lpips_target_model(self) -> Optional["torch.nn.Module"]:
         """Lazy-build the LPIPS model used to compute DENSE TARGETS for
         the LPIPS approx (no_grad, never trained). Spatial=True returns
@@ -3390,6 +3709,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         target_mse: Optional[torch.Tensor],
         target_lpips: Optional[torch.Tensor],
         target_msssim: Optional[torch.Tensor] = None,
+        target_maniqa: Optional[torch.Tensor] = None,
+        target_maniqa_mask: Optional[torch.Tensor] = None,
         interp_data: Optional[List[Dict[str, torch.Tensor]]] = None,
         out: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -3506,6 +3827,76 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out[f"train/{name}_target_mean"] = float(target.mean().item())
             out[f"train/{name}_interp_loss"] = L_interp_value
 
+        # ----- maniqa_approx training -----
+        # Single-input (NR-IQA, no GT). The target is sparse — only
+        # tokens covered by a sampled MANIQA patch this iter have a
+        # valid target; others are NaN-masked via ``target_maniqa_mask``.
+        # Loss = masked-MSE + masked-mean-align (over valid positions
+        # only). The mean-align term anchors the approx's average
+        # prediction to the sampled patches' mean quality so the model
+        # learns the correct absolute scale even though dense MSE only
+        # covers a fraction of tokens per iter.
+        if (
+            self.maniqa_approx is not None
+            and self.maniqa_approx_optimizer is not None
+            and target_maniqa is not None
+            and target_maniqa_mask is not None
+            and self.maniqa_approx_loss_weight > 0
+        ):
+            optim = self.maniqa_approx_optimizer
+            optim.zero_grad(set_to_none=True)
+            model_for_update = (
+                self.maniqa_approx_ddp if self.maniqa_approx_ddp is not None
+                else self.maniqa_approx
+            )
+            pred = model_for_update(gen_lat_d).float()
+            mask_f = target_maniqa_mask.float()
+            mask_sum = mask_f.sum().clamp_min(1.0)
+            sq = (pred - target_maniqa) ** 2 * mask_f
+            L_dense = sq.sum() / mask_sum
+            # Masked mean-align: align mean over VALID tokens only.
+            pred_masked_mean = (
+                (pred * mask_f).sum() / mask_sum
+            )
+            target_masked_mean = (
+                (target_maniqa * mask_f).sum() / mask_sum
+            )
+            L_mean_align = (pred_masked_mean - target_masked_mean) ** 2
+            L_total = (
+                L_dense
+                + self.perceptual_approx_mean_align_weight * L_mean_align
+            )
+            L_total.backward()
+            if (
+                self.gan_max_grad_norm is not None
+                and self.gan_max_grad_norm > 0
+            ):
+                params_iter = (
+                    self.maniqa_approx_ddp.parameters()
+                    if self.maniqa_approx_ddp is not None
+                    else self.maniqa_approx.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in params_iter if p.grad is not None],
+                    self.gan_max_grad_norm,
+                )
+            optim.step()
+            out["train/maniqa_approx_dense_loss"] = float(
+                L_dense.detach().item()
+            )
+            out["train/maniqa_approx_mean_align_loss"] = float(
+                L_mean_align.detach().item()
+            )
+            out["train/maniqa_approx_pred_mean"] = float(
+                pred_masked_mean.detach().item()
+            )
+            out["train/maniqa_approx_target_mean"] = float(
+                target_masked_mean.detach().item()
+            )
+            out["train/maniqa_approx_n_valid_tokens"] = float(
+                mask_sum.item()
+            )
+
         # ----- gan_d_approx training -----
         # gan_d_approx training was here (paired PerceptualApprox-based
         # disc approximator). REMOVED — replaced by the existing
@@ -3543,19 +3934,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # for similarity / GAN approxes (gen wants pred HIGH).
         # MS-SSIM is in [0, 1] with 1 = identical → sign = -1 so the
         # gen MAXIMIZES it.
-        for name, model, weight, sign in [
-            ("mse_approx", self.mse_approx, self.mse_approx_loss_weight, +1.0),
+        for name, model, weight, sign, single_input in [
+            (
+                "mse_approx",
+                self.mse_approx,
+                self.mse_approx_loss_weight,
+                +1.0,
+                False,
+            ),
             (
                 "lpips_approx",
                 self.lpips_approx,
                 self.lpips_approx_loss_weight,
                 +1.0,
+                False,
             ),
             (
                 "msssim_approx",
                 self.msssim_approx,
                 self.msssim_approx_loss_weight,
                 -1.0,
+                False,
+            ),
+            (
+                "maniqa_approx",
+                self.maniqa_approx,
+                self.maniqa_approx_loss_weight,
+                -1.0,  # gen wants MANIQA quality HIGH
+                True,  # NR-IQA → no GT input
             ),
             # NOTE: gan_d_approx (PerceptualApprox-based) entry removed.
             # The disc-side gradient is delivered to gen via
@@ -3568,9 +3974,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # backward only flows into pred_image, not the approx.
             model.requires_grad_(False)
             try:
-                pred = model(
-                    pred_image.to(pred_image.dtype), gt_lat_det,
-                ).float()
+                if single_input:
+                    pred = model(pred_image.to(pred_image.dtype)).float()
+                else:
+                    pred = model(
+                        pred_image.to(pred_image.dtype), gt_lat_det,
+                    ).float()
                 pred_mean = pred.mean()
                 loss = loss + sign * weight * pred_mean.to(pred_image.dtype)
             finally:
@@ -3911,6 +4320,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if (
             self.mse_approx is not None
             or self.lpips_approx is not None
+            or self.msssim_approx is not None
+            or self.maniqa_approx is not None
         ):
             perc_loss, perc_logs = self._compute_gen_side_perceptual_loss(
                 pred_image=fake_lat_grad,
@@ -4133,6 +4544,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.mse_approx is not None
             or self.lpips_approx is not None
             or self.msssim_approx is not None
+            or self.maniqa_approx is not None
         ):
             # Target token grid: latent spatial dim ceil-divided by 8
             # (matches the approx's post-stem shape — 3× stride-2
@@ -4151,6 +4563,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 target_h=target_h,
                 target_w=target_w,
             )
+            # MANIQA target — sparse spatial (only patch-covered
+            # tokens). NaN at unsupervised positions; approx training
+            # masks them out. Built no_grad on the gen pixels alone
+            # (no GT — NR-IQA). Wall-clock recorded for the timing
+            # smoke (option 1 vs middle option).
+            (
+                target_maniqa,
+                target_maniqa_mask,
+                maniqa_target_build_ms,
+            ) = self._compute_dense_maniqa_target(
+                gen_pix=fake_pixel_d,
+                F_lat=int(F_),
+                target_h=target_h,
+                target_w=target_w,
+            )
+            if maniqa_target_build_ms > 0:
+                out["train/maniqa_target_build_ms"] = float(
+                    maniqa_target_build_ms
+                )
             # NOTE: disc dense target computation removed — the
             # PerceptualApprox-based gan_d_approx is gone. The
             # LatentSAM2Critic distillation in Path 2 below uses
@@ -4226,6 +4657,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 target_mse=target_mse,
                 target_lpips=target_lpips,
                 target_msssim=target_msssim,
+                target_maniqa=target_maniqa,
+                target_maniqa_mask=target_maniqa_mask,
                 interp_data=interp_data,
                 out=out,
             )
@@ -5561,7 +5994,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     def _apply_dmd_context_mix_p_schedule(self) -> float:
         """Compute and apply ``dmd_context_mix_p`` for this outer iter.
 
-        Two modes, sensor takes priority when enabled:
+        Three modes; sensor takes priority, then step-switch, then
+        linear ramp:
 
         1. **Sensor-gated** (``dmd_context_mix_p_sensor_enabled=True``):
            Reads the most recent ``gen/dmd_pf_minus_pr_mae`` value
@@ -5574,10 +6008,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
            No-op until the first gen iter has produced a reading;
            defaults to ``..._sensor_low`` until then.
 
-        2. **Linear ramp** (when sensor disabled): from the config-time
-           start (= ``dmd_context_mix_p``) to ``..._target`` over the
-           first ``..._ramp_steps`` outer steps. With ramp_steps <= 0
-           the knob is held at start (legacy behavior).
+        2. **Hard step-switch** (sensor off,
+           ``dmd_context_mix_p_step_switch_at>0``): mix_p = start when
+           ``self.step < step_switch_at``; mix_p = target thereafter.
+           No interpolation — a single discrete flip at that step.
+
+        3. **Linear ramp** (sensor off, step_switch_at<=0): from the
+           config-time start (= ``dmd_context_mix_p``) to ``..._target``
+           over the first ``..._ramp_steps`` outer steps. With
+           ramp_steps <= 0 the knob is held at start (legacy behavior).
 
         Mutates ``self.model.dmd_context_mix_p`` directly. The model
         reads it every iter inside ``_build_dmd_context_kwargs`` so the
@@ -5595,6 +6034,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 p = sensor_high
             else:
                 p = sensor_low
+        elif self._dmd_context_mix_p_step_switch_at > 0:
+            start = float(self._dmd_context_mix_p_start)
+            target = float(self._dmd_context_mix_p_target)
+            if self.step < self._dmd_context_mix_p_step_switch_at:
+                p = start
+            else:
+                p = target
         else:
             start = float(self._dmd_context_mix_p_start)
             target = float(self._dmd_context_mix_p_target)
@@ -6408,9 +6854,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 (B, n_chunks), ts_int,
                 device=train_chunk.device, dtype=torch.long,
             )
+            # Route action_critic to paper_aligned_x0_for_adv (=
+            # last_rung_full_chunk, the lowest-noise gen forward) when
+            # available. Without this, action_critic supervises the gen
+            # at whatever random exit-rung was sampled this iter (75%
+            # of iters land at high-noise rungs, where pred_x0 is a
+            # blurry/uncertain estimate). Routing to the final-step
+            # forward gives the critic a clean, structurally-coherent
+            # input every iter — same trick the GAN already uses via
+            # fake_lat_grad. Falls back to train_chunk when paper_
+            # aligned is off or this iter didn't emit it. Gated by
+            # ``gen_aux_losses_use_paper_aligned_x0`` (default True).
+            ac_pred_x0 = train_chunk
+            if bool(getattr(
+                self.config, "gen_aux_losses_use_paper_aligned_x0", True,
+            )):
+                _pa_x0 = train_info.get("paper_aligned_x0_for_adv")
+                if _pa_x0 is not None:
+                    ac_pred_x0 = _pa_x0
             gen_action_loss, critic_logs, teacher_z_8d = (
                 self._compute_action_critic_losses(
-                    pred_x0=train_chunk,
+                    pred_x0=ac_pred_x0,
                     target_action_z=actions_for_critic,
                     chunk_t=chunk_t,
                     current_step=int(self.step),

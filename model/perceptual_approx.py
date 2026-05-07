@@ -151,7 +151,13 @@ class PerceptualApprox(nn.Module):
 
     Constructor args:
         in_channels: per-latent channel count (default 16 for WAN VAE).
-            The model receives ``2*in_channels`` after concat.
+            With ``single_input=False`` (default) the model receives
+            ``2*in_channels`` after gen+gt concat. With
+            ``single_input=True`` the model receives ``in_channels``
+            (gen-only — used for no-reference metrics like MANIQA).
+        single_input: when True, ``forward`` takes only ``gen_lat`` and
+            the stem ingests ``in_channels`` channels. Default False
+            preserves the (gen, gt) reference-pair API.
         d_model: 3D CNN hidden dim (default 256).
         num_blocks: number of residual 3D conv blocks at the token
             resolution (default 4).
@@ -162,10 +168,11 @@ class PerceptualApprox(nn.Module):
             starts as the constant-zero field.
 
     Forward signature:
-        ``forward(gen_lat, gt_lat) -> [B, F, H_token, W_token]`` dense
-        scalar prediction. Both inputs ``[B, F, C, H, W]`` with
-        matching shapes (gen with grad if used in gen-side loss; gt
-        always detached).
+        Reference mode (default): ``forward(gen_lat, gt_lat)``.
+        Single-input mode: ``forward(gen_lat)`` — gt_lat ignored.
+        Both return ``[B, F, H_token, W_token]`` dense scalar
+        predictions. Inputs ``[B, F, C, H, W]`` with matching shapes
+        (gen with grad if used in gen-side loss; gt always detached).
     """
 
     def __init__(
@@ -176,17 +183,20 @@ class PerceptualApprox(nn.Module):
         kernel_t: int = 3,
         dropout: float = 0.0,
         zero_init_head: bool = True,
+        single_input: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
         self.d_model = int(d_model)
         self.num_blocks = int(num_blocks)
         self.kernel_t = int(kernel_t)
+        self.single_input = bool(single_input)
 
-        # 3D conv stem: project (gen, gt) concat to d_model and reduce
-        # spatial 8× via 3 stride-(1, 2, 2) convs. Matches the
-        # LatentSAM2Critic stem so token grids are aligned.
-        c_in = 2 * self.in_channels
+        # 3D conv stem: project (gen, gt) concat (or gen-only when
+        # single_input) to d_model and reduce spatial 8× via 3
+        # stride-(1, 2, 2) convs. Matches the LatentSAM2Critic stem so
+        # token grids are aligned.
+        c_in = self.in_channels if self.single_input else 2 * self.in_channels
         c1 = max(d_model // 4, 64)
         c2 = max(d_model // 2, 128)
         c3 = d_model
@@ -244,23 +254,20 @@ class PerceptualApprox(nn.Module):
     def forward(
         self,
         gen_lat: torch.Tensor,
-        gt_lat: torch.Tensor,
+        gt_lat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward over (gen, gt) latent pair.
+        """Forward over (gen, gt) latent pair, or gen-only.
 
         Args:
             gen_lat: ``[B, F, C, H, W]``. Channels must match
                 ``in_channels``.
-            gt_lat: ``[B, F, C, H, W]``. Same shape as ``gen_lat``.
+            gt_lat: ``[B, F, C, H, W]`` with the same shape as
+                ``gen_lat``. Required when ``single_input=False``;
+                ignored when ``single_input=True``.
 
         Returns:
             ``[B, F, H_token, W_token]`` dense scalar predictions.
         """
-        if gen_lat.shape != gt_lat.shape:
-            raise ValueError(
-                f"PerceptualApprox: gen_lat shape {gen_lat.shape} != "
-                f"gt_lat shape {gt_lat.shape}."
-            )
         if gen_lat.dim() != 5:
             raise ValueError(
                 f"PerceptualApprox expects [B, F, C, H, W]; got "
@@ -272,9 +279,22 @@ class PerceptualApprox(nn.Module):
                 f"PerceptualApprox in_channels={self.in_channels} but "
                 f"got C={C}."
             )
-        # Concat along channel dim: [B, F, 2C, H, W].
-        x = torch.cat([gen_lat, gt_lat], dim=2)
-        # [B, F, 2C, H, W] → [B, 2C, F, H, W] for Conv3d.
+        if self.single_input:
+            # NR-IQA / single-input case: skip the gen+gt concat.
+            x = gen_lat
+        else:
+            if gt_lat is None:
+                raise ValueError(
+                    "PerceptualApprox in reference mode requires gt_lat."
+                )
+            if gen_lat.shape != gt_lat.shape:
+                raise ValueError(
+                    f"PerceptualApprox: gen_lat shape {gen_lat.shape} "
+                    f"!= gt_lat shape {gt_lat.shape}."
+                )
+            # Concat along channel dim: [B, F, 2C, H, W].
+            x = torch.cat([gen_lat, gt_lat], dim=2)
+        # [B, F, c_in, H, W] → [B, c_in, F, H, W] for Conv3d.
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         x = self.stem(x)
         for block in self.blocks:

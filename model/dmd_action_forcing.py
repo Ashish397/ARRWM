@@ -253,6 +253,28 @@ class ActionForcingDMD(SelfForcingModel):
                 f"dmd_context_mix_p must be in [0, 1]; got "
                 f"{self.dmd_context_mix_p!r}."
             )
+        # Aux-pass clean_x mix is INDEPENDENT of dmd_context_mix_p. The
+        # LoRA aux pass is the teacher's training step — it should be
+        # conditioned on GT-anchored context, not on the (potentially-
+        # drifting or sensor-flipping) self/GT mix that DMD scoring
+        # uses for regularization. Default 1.0 = pure GT for the aux
+        # pass's clean_x. Set < 1.0 only if you specifically want to
+        # inject student-view context into LoRA training (e.g. to
+        # match v18/v19 behavior, set 0.15; the historical default
+        # before this knob existed). NOTE: this is a behavior change
+        # for existing sbatches that previously inherited
+        # dmd_context_mix_p for both DMD scoring and the aux pass.
+        # Set ``aux_clean_x_mix_p=<your prior dmd_context_mix_p>`` in
+        # the sbatch to keep prior behavior; otherwise the aux pass
+        # now sees pure GT.
+        self.aux_clean_x_mix_p = float(
+            getattr(args, "aux_clean_x_mix_p", 1.0)
+        )
+        if not (0.0 <= self.aux_clean_x_mix_p <= 1.0):
+            raise ValueError(
+                f"aux_clean_x_mix_p must be in [0, 1]; got "
+                f"{self.aux_clean_x_mix_p!r}."
+            )
         # ``"mix"`` mode is now a uniform linear blend across ALL
         # frames:
         #   clean_x_real = (1 - mix_p) * clean_x_self + mix_p * noised_GT
@@ -332,7 +354,7 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "aux_teacher_loss_weight", 1.0)
         )
 
-        # ``real_teacher_input_source`` ∈ {"student", "gt", "mix"}
+        # ``real_teacher_input_source`` ∈ {"student", "gt", "mix", "blend"}
         # controls how ``compute_real_teacher_loss_streaming`` builds
         # ``noisy_input``:
         #   "student" : add_noise(student_chunk_detached, ε, t)
@@ -350,16 +372,31 @@ class ActionForcingDMD(SelfForcingModel):
         #   "mix"     : per-iter Bernoulli(``real_teacher_input_mix_gt_p``);
         #               True = GT, False = student. DDP-synced from
         #               rank 0 so all ranks pick the same source per
-        #               iter.
+        #               iter. The LoRA sees one or the other on each
+        #               iter; over many iters trains on both
+        #               distributions.
+        #   "blend"   : DETERMINISTIC linear blend
+        #               ``noise_base = p * gt_target + (1-p) * chunk``
+        #               where ``p = real_teacher_input_mix_gt_p``. The
+        #               LoRA sees a single interpolated input every
+        #               iter — lower variance but trains on a
+        #               synthetic distribution that doesn't match
+        #               either eval-time query (pure-student during
+        #               DMD scoring, pure-GT in the supervision
+        #               target). A/B experimental — use to test
+        #               whether variance reduction outweighs the
+        #               distribution-shift cost.
         # Whatever source is chosen, the LOSS TARGET is always GT —
         # the source only changes what the noise is added to.
         self.real_teacher_input_source = str(
             getattr(args, "real_teacher_input_source", "student")
         )
-        if self.real_teacher_input_source not in ("student", "gt", "mix"):
+        if self.real_teacher_input_source not in (
+            "student", "gt", "mix", "blend",
+        ):
             raise ValueError(
                 f"real_teacher_input_source must be one of "
-                f"'student' / 'gt' / 'mix'; got "
+                f"'student' / 'gt' / 'mix' / 'blend'; got "
                 f"{self.real_teacher_input_source!r}."
             )
         self.real_teacher_input_mix_gt_p = float(
@@ -861,6 +898,14 @@ class ActionForcingDMD(SelfForcingModel):
         self.sc_dmd_enabled = bool(getattr(args, "sc_dmd_enabled", False))
         self._sc_kv_cache: Optional[list] = None
         self._sc_crossattn_cache: Optional[list] = None
+
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] aux_clean_x_mix_p=%.3f (LoRA "
+                "aux-pass clean_x mix; INDEPENDENT of "
+                "dmd_context_mix_p=%.3f used for DMD scoring).",
+                self.aux_clean_x_mix_p, self.dmd_context_mix_p,
+            )
 
     # ------------------------------------------------------------------
     # Auxiliary head compat shim (heads instantiated, frozen, unused)
@@ -2268,12 +2313,25 @@ class ActionForcingDMD(SelfForcingModel):
         Optional[torch.Tensor],
         dict,
         dict,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
     ]:
         """Prepare per-scorer ``clean_x`` / ``aug_t`` and merge the clean
         action streams into the scoring cond dicts. Returns:
             (clean_x_fake, aug_t_fake,
              clean_x_real, aug_t_real,
-             new_cond_for_scoring, new_uncond_for_scoring)
+             new_cond_for_scoring, new_uncond_for_scoring,
+             clean_x_aux, aug_t_aux)
+
+        ``clean_x_aux`` / ``aug_t_aux`` are the LoRA aux pass's
+        clean_x view, governed by ``self.aux_clean_x_mix_p``
+        (INDEPENDENT of ``self.dmd_context_mix_p``). The aux pass is
+        the LoRA's TRAINING step, so it should be conditioned on a
+        stable distribution regardless of how the DMD scoring's mix
+        is being scheduled or sensor-gated. The trainer reads the
+        last two return slots and passes them through to
+        ``_compute_aux_teacher_loss_streaming`` instead of the DMD
+        scoring's ``sc_clean_x_real``/``sc_aug_t_real``.
 
         ``clean_x_fake`` / ``aug_t_fake`` are ALWAYS the "self" view
         (= ``clean_x_self``, ``aug_t=0``) regardless of ``self.dmd_context``
@@ -2377,6 +2435,59 @@ class ActionForcingDMD(SelfForcingModel):
                 sc_clean_x_real = (1.0 - p) * sc_clean_x + p * noised_gt
                 sc_aug_t_real = sc_aug_t
 
+        # Aux-pass-only clean_x view, governed by
+        # ``self.aux_clean_x_mix_p`` (INDEPENDENT of
+        # ``self.dmd_context_mix_p``). The aux pass is the LoRA's
+        # training step — conditioning it on GT (or near-GT) ensures
+        # the teacher trains on a stable distribution regardless of
+        # how the DMD scoring's mix is being scheduled or sensor-
+        # gated. Reuses ``noised_gt`` / ``aug_t_full_gt`` from the
+        # DMD-scoring branch above when available; otherwise builds
+        # them locally for the aux path.
+        sc_clean_x_aux: Optional[torch.Tensor] = None
+        sc_aug_t_aux: Optional[torch.Tensor] = None
+        p_aux = float(self.aux_clean_x_mix_p)
+        need_aux_gt = build_real_view and p_aux > 0.0
+        if need_aux_gt:
+            if clean_x_GT is None:
+                raise RuntimeError(
+                    f"aux_clean_x_mix_p={p_aux} > 0 requires "
+                    "clean_x_GT this iter but the caller did not "
+                    "provide it. Trainer must assemble clean_x_GT "
+                    "for every gen-step iter when the aux pass "
+                    "needs GT-mixed clean_x."
+                )
+            # Reuse noised_gt / aug_t_full_gt if the DMD-scoring
+            # branch above already built them (i.e. needs_gt=True).
+            # Otherwise build locally for the aux path.
+            if "noised_gt" not in locals() or "aug_t_full_gt" not in locals():
+                aug_t_full_gt = torch.full(
+                    (sc_clean_x.shape[0], self.num_training_frames),
+                    fill_value=int(self.clean_x_aug_t),
+                    device=device, dtype=torch.long,
+                )
+                gt_view = clean_x_GT.to(dtype=dtype, device=device)
+                real_noise = torch.randn_like(gt_view)
+                noised_gt = self.scheduler.add_noise(
+                    gt_view.flatten(0, 1),
+                    real_noise.flatten(0, 1),
+                    aug_t_full_gt.flatten(0, 1),
+                ).unflatten(0, gt_view.shape[:2]).to(dtype=dtype)
+            if p_aux >= 1.0:
+                sc_clean_x_aux = noised_gt
+                sc_aug_t_aux = aug_t_full_gt
+            else:
+                sc_clean_x_aux = (
+                    (1.0 - p_aux) * sc_clean_x + p_aux * noised_gt
+                )
+                # Follow scoring convention (sc_clean_x dominates).
+                sc_aug_t_aux = sc_aug_t
+        elif build_real_view:
+            # p_aux == 0: pure self-view for aux. Same as fake-side
+            # default (sc_clean_x at aug_t=0).
+            sc_clean_x_aux = sc_clean_x
+            sc_aug_t_aux = sc_aug_t
+
         new_cond = dict(cond_for_scoring)
         new_uncond = dict(uncond_for_scoring)
         if clean_conditional_dict is not None:
@@ -2393,7 +2504,12 @@ class ActionForcingDMD(SelfForcingModel):
                 new_uncond["_action_modulation_clean"] = am_u
             if at_u is not None:
                 new_uncond["_action_tokens_clean"] = at_u
-        return sc_clean_x, sc_aug_t, sc_clean_x_real, sc_aug_t_real, new_cond, new_uncond
+        return (
+            sc_clean_x, sc_aug_t,
+            sc_clean_x_real, sc_aug_t_real,
+            new_cond, new_uncond,
+            sc_clean_x_aux, sc_aug_t_aux,
+        )
 
     def generator_loss(
         self,
@@ -2512,6 +2628,8 @@ class ActionForcingDMD(SelfForcingModel):
             sc_aug_t_real,
             cond_for_scoring,
             uncond_for_scoring,
+            _sc_clean_x_aux,  # aux fields unused on this DMD-scoring path
+            _sc_aug_t_aux,
         ) = self._build_dmd_context_kwargs(
             clean_x_self=clean_x_self,
             clean_x_GT=clean_x_GT,
@@ -2704,6 +2822,8 @@ class ActionForcingDMD(SelfForcingModel):
             _unused_aug_t_real,
             cond_for_scoring,
             _unused_uncond,
+            _unused_clean_x_aux,
+            _unused_aug_t_aux,
         ) = self._build_dmd_context_kwargs(
             clean_x_self=clean_x_self,
             clean_x_GT=clean_x_GT,
@@ -3566,6 +3686,7 @@ class ActionForcingDMD(SelfForcingModel):
             sc_clean_x, sc_aug_t,
             sc_clean_x_real, sc_aug_t_real,
             cond_for_scoring, uncond_for_scoring,
+            sc_clean_x_aux, sc_aug_t_aux,
         ) = self._build_dmd_context_kwargs(
             clean_x_self=clean_x_self,
             clean_x_GT=clean_x_GT,
@@ -3835,8 +3956,16 @@ class ActionForcingDMD(SelfForcingModel):
                 chunk=chunk,
                 gradient_mask_eff=gradient_mask_eff,
                 cond_for_scoring=cond_for_scoring,
-                sc_clean_x_real=sc_clean_x_real,
-                sc_aug_t_real=sc_aug_t_real,
+                # The aux pass is the LoRA's training step. Route it
+                # through ``sc_clean_x_aux`` (governed by
+                # ``self.aux_clean_x_mix_p``, INDEPENDENT of the DMD
+                # scoring's ``self.dmd_context_mix_p``) so the LoRA
+                # trains on a stable distribution regardless of DMD
+                # scoring's mix schedule / sensor flips. Parameter is
+                # named ``sc_clean_x_real`` for legacy reasons; we
+                # only change the value passed in, not the name.
+                sc_clean_x_real=sc_clean_x_aux,
+                sc_aug_t_real=sc_aug_t_aux,
                 info=info,
             )
             if aux_loss is not None:
@@ -3901,6 +4030,7 @@ class ActionForcingDMD(SelfForcingModel):
         (
             sc_clean_x, sc_aug_t,
             _r1, _r2, cond_for_scoring, _u,
+            _aux1, _aux2,
         ) = self._build_dmd_context_kwargs(
             clean_x_self=clean_x_self,
             clean_x_GT=None,
@@ -4089,14 +4219,43 @@ class ActionForcingDMD(SelfForcingModel):
         )
         eps = torch.randn_like(chunk)
 
-        # Decide noise base per ``real_teacher_input_source``. "mix"
-        # picks a Bernoulli coin on rank 0 and broadcasts so every
-        # rank uses the same source per iter.
-        if self.real_teacher_input_source == "gt":
+        # Decide noise base per ``real_teacher_input_source``.
+        #
+        #   "gt"      : noise_base = gt_target (always)
+        #   "student" : noise_base = chunk (always)
+        #   "mix"     : per-iter Bernoulli(``real_teacher_input_mix_gt_p``)
+        #               switch between gt_target and chunk. The LoRA
+        #               sees one or the other on each iter; over many
+        #               iters trains on both distributions.
+        #               DDP-synced from rank 0.
+        #   "blend"   : DETERMINISTIC linear blend
+        #               ``noise_base = p * gt_target + (1-p) * chunk``
+        #               where p = ``real_teacher_input_mix_gt_p``. The
+        #               LoRA sees a single interpolated input every
+        #               iter — lower variance but trains on a synthetic
+        #               distribution that doesn't match either eval-time
+        #               query. A/B experimental.
+        if self.real_teacher_input_source == "blend":
+            p_blend = float(self.real_teacher_input_mix_gt_p)
+            noise_base = p_blend * gt_target + (1.0 - p_blend) * chunk
+            # ``use_gt`` flag is for logging only in blend mode; the
+            # gradient still flows through ``chunk`` when p_blend < 1.
+            use_gt = (p_blend >= 0.5)
+            if not getattr(self, "_blend_logged", False) and _is_main():
+                logging.info(
+                    "[aux] real_teacher_input_source=blend p=%.3f "
+                    "(deterministic linear blend; chunk's grad path "
+                    "active as long as p<1.0).",
+                    p_blend,
+                )
+                self._blend_logged = True
+        elif self.real_teacher_input_source == "gt":
             use_gt = True
+            noise_base = gt_target
         elif self.real_teacher_input_source == "student":
             use_gt = False
-        else:
+            noise_base = chunk
+        else:  # "mix" — per-iter Bernoulli
             p_gt = float(self.real_teacher_input_mix_gt_p)
             if p_gt <= 0.0:
                 use_gt = False
@@ -4116,12 +4275,16 @@ class ActionForcingDMD(SelfForcingModel):
                 use_gt = bool(coin.item() > 0.5)
             else:
                 use_gt = bool(torch.rand(1).item() < p_gt)
+            noise_base = gt_target if use_gt else chunk
         # IMPLICIT GRADIENT CHANNEL: the loss flows back to the
-        # student generator THROUGH ``noise_base`` when it equals
-        # ``chunk`` (which carries autograd from the rollout). When
-        # ``noise_base = gt_target`` (sourced from the dataset's
-        # ride_window) the path is dead-ended — gradient lands only
-        # on the LoRA params. This is the documented mechanism by
+        # student generator THROUGH ``noise_base`` when it depends on
+        # ``chunk`` (which carries autograd from the rollout). For
+        # ``"student"`` (always) and ``"mix"`` (when use_gt=False) the
+        # base IS chunk; for ``"blend"`` the base contains a (1-p)
+        # weighting of chunk so chunk's grad is ALWAYS live as long as
+        # p<1.0. When ``noise_base = gt_target`` only (gt mode, or mix
+        # with use_gt=True) the path is dead-ended — gradient lands
+        # only on the LoRA params. This is the documented mechanism by
         # which the aux pass "feeds gradient back to the student"
         # WITHOUT a direct ``MSE(student, GT)`` term. The
         # student-bound gradient comes from
@@ -4129,13 +4292,22 @@ class ActionForcingDMD(SelfForcingModel):
         # with α_t the scheduler's add_noise scaling — i.e. a
         # learned-distillation gradient through the LoRA's flow
         # function, NOT a mean-seeking L2 to GT.
-        noise_base = gt_target if use_gt else chunk
-        if not use_gt:
+        chunk_grad_path_live = (
+            self.real_teacher_input_source == "student"
+            or (self.real_teacher_input_source == "mix" and not use_gt)
+            or (
+                self.real_teacher_input_source == "blend"
+                and float(self.real_teacher_input_mix_gt_p) < 1.0
+            )
+        )
+        if chunk_grad_path_live:
             assert chunk.requires_grad, (
-                "_compute_aux_teacher_loss_streaming: noise_base=chunk "
-                "but chunk has no grad — student-gradient channel is "
-                "broken. Caller must pass an undetached chunk from "
-                "compute_generator_loss_streaming."
+                "_compute_aux_teacher_loss_streaming: chunk grad path "
+                "expected live (source=%s) but chunk has no grad — "
+                "student-gradient channel is broken. Caller must pass "
+                "an undetached chunk from compute_generator_loss_"
+                "streaming."
+                % self.real_teacher_input_source
             )
         noisy_input = self.scheduler.add_noise(
             noise_base.flatten(0, 1),
@@ -4179,7 +4351,14 @@ class ActionForcingDMD(SelfForcingModel):
         if isinstance(stash, dict):
             stash["pred_real_lora"] = _x0.detach()
             stash["aux_teacher_timestep"] = int(t.flatten()[0].item())
-            stash["aux_teacher_input_was_gt"] = 1.0 if use_gt else 0.0
+            # For "blend" mode the binary use_gt is meaningless (chunk
+            # is always part of the input); set to the blend's p for a
+            # sensible cross-mode wandb plot.
+            stash["aux_teacher_input_was_gt"] = (
+                float(self.real_teacher_input_mix_gt_p)
+                if self.real_teacher_input_source == "blend"
+                else (1.0 if use_gt else 0.0)
+            )
 
         gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
         loss = self.denoising_loss_func(
@@ -4216,7 +4395,20 @@ class ActionForcingDMD(SelfForcingModel):
             aux_t_mean_v = float(t.float().mean().item())
         log: Dict[str, Any] = {
             "aux_teacher_loss": loss.detach(),
-            "aux_teacher_input_was_gt": 1.0 if use_gt else 0.0,
+            # For "blend" mode the binary use_gt is meaningless; set
+            # to the blend's p so the wandb plot reads sensibly across
+            # all four modes (gt=1.0 / student=0.0 / mix=Bernoulli
+            # 0/1 / blend=p).
+            "aux_teacher_input_was_gt": (
+                float(self.real_teacher_input_mix_gt_p)
+                if self.real_teacher_input_source == "blend"
+                else (1.0 if use_gt else 0.0)
+            ),
+            "aux_teacher_input_blend_p": (
+                float(self.real_teacher_input_mix_gt_p)
+                if self.real_teacher_input_source == "blend"
+                else 0.0
+            ),
             "aux_teacher_pred_mae": aux_teacher_pred_mae_v,
             "aux_teacher_t_mean": aux_t_mean_v,
         }
@@ -4334,6 +4526,12 @@ class ActionForcingDMD(SelfForcingModel):
             sc_aug_t_real,            # = aug_t (uniform 0 in mix mode)
             cond_for_scoring,         # action streams at noisy positions
             _uncond_for_scoring,      # unused (no CFG on training step)
+            _sc_clean_x_aux,          # aux fields unused on this path
+            _sc_aug_t_aux,            # (legacy compute_real_teacher_loss_streaming
+                                      # uses dmd-scoring's mix; only the
+                                      # gen-step _compute_aux_teacher_
+                                      # loss_streaming caller routes the
+                                      # aux clean_x.)
         ) = self._build_dmd_context_kwargs(
             clean_x_self=clean_x_self,
             clean_x_GT=clean_x_GT,
@@ -4418,14 +4616,25 @@ class ActionForcingDMD(SelfForcingModel):
         eps = torch.randn_like(chunk_detached)
 
         # Decide the noise base for THIS iter based on the input-
-        # source knob. "mix" picks a Bernoulli coin on rank 0 and
-        # broadcasts so every rank uses the same source per iter
-        # (DDP grads need matched conditioning).
-        if self.real_teacher_input_source == "gt":
+        # source knob. Mirrors the dispatch in
+        # ``_compute_aux_teacher_loss_streaming`` — see that function
+        # for the full mode docstring. NOTE: this path uses
+        # ``chunk_detached`` so the IMPLICIT GRADIENT CHANNEL is OFF
+        # regardless of mode (the K=1 standalone teacher step never
+        # feeds gradient back to the student).
+        if self.real_teacher_input_source == "blend":
+            p_blend = float(self.real_teacher_input_mix_gt_p)
+            noise_base = (
+                p_blend * gt_target + (1.0 - p_blend) * chunk_detached
+            )
+            use_gt = (p_blend >= 0.5)  # logging-only
+        elif self.real_teacher_input_source == "gt":
             use_gt = True
+            noise_base = gt_target
         elif self.real_teacher_input_source == "student":
             use_gt = False
-        else:
+            noise_base = chunk_detached
+        else:  # "mix"
             p_gt = float(self.real_teacher_input_mix_gt_p)
             if p_gt <= 0.0:
                 use_gt = False
@@ -4445,7 +4654,7 @@ class ActionForcingDMD(SelfForcingModel):
                 use_gt = bool(coin.item() > 0.5)
             else:
                 use_gt = bool(torch.rand(1).item() < p_gt)
-        noise_base = gt_target if use_gt else chunk_detached
+            noise_base = gt_target if use_gt else chunk_detached
         noisy_input = self.scheduler.add_noise(
             noise_base.flatten(0, 1),
             eps.flatten(0, 1),
