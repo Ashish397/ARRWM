@@ -1794,17 +1794,9 @@ class ActionForcingDMD(SelfForcingModel):
             grad = grad / normalizer.clamp_min(1e-6)
         grad = torch.nan_to_num(grad)
 
-        # Diagnostics: separate the "real-vs-fake disagreement" (= the
-        # raw DMD push direction, ``pred_fake - pred_real``) from the
-        # post-normalization gradient. ``dmdtrain_gradient_norm`` is the
-        # post-norm push the student actually sees; ``dmd_pf_minus_pr``
-        # is the unnormalized magnitude — diverges → fake_score and
-        # real_score have stopped agreeing on the marginal.
+        # Diagnostics: pred_real / pred_fake L2 norms (RMS) for the gen
+        # and teacher score outputs at the sampled DMD timestep.
         with torch.no_grad():
-            _t_mean = float(timestep.float().mean().item())
-            _pf_minus_pr_mae = float(
-                (pred_fake_image - pred_real_image).abs().mean().item()
-            )
             _pred_real_l2 = float(
                 pred_real_image.float().pow(2).mean().sqrt().item()
             )
@@ -1814,33 +1806,9 @@ class ActionForcingDMD(SelfForcingModel):
         log_dict: Dict[str, Any] = {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
             "timestep": timestep.detach(),
-            "dmd_pf_minus_pr_mae": _pf_minus_pr_mae,
             "pred_real_rms": _pred_real_l2,
             "pred_fake_rms": _pred_fake_l2,
-            "dmd_t_mean": _t_mean,
         }
-        # Per-DMD-rung bin keys — split by timestep into "high-noise"
-        # (t > 500, ~rungs 1000/625) and "low-noise" (t <= 500, ~rungs
-        # 312.5/178.6). Lets us track the gen-side DMD push and
-        # real-vs-fake divergence at each end of the DMD ladder
-        # individually (one rung often collapses before the other).
-        # 0.0 sentinel on the inactive bucket each iter so wandb can
-        # still plot them as continuous time series; aggregate by mean
-        # downstream and the inactive-iter zeros wash out across
-        # cadence.
-        _hi = _t_mean > 500.0
-        log_dict["dmd_grad_norm_t_high"] = float(
-            torch.mean(torch.abs(grad)).detach().item()
-        ) if _hi else 0.0
-        log_dict["dmd_grad_norm_t_low"] = float(
-            torch.mean(torch.abs(grad)).detach().item()
-        ) if not _hi else 0.0
-        log_dict["dmd_pf_minus_pr_t_high"] = (
-            _pf_minus_pr_mae if _hi else 0.0
-        )
-        log_dict["dmd_pf_minus_pr_t_low"] = (
-            _pf_minus_pr_mae if not _hi else 0.0
-        )
         # Optional eval-time stash so the trainer can decode the
         # scorers' denoised x0 estimates as sample videos. ``None``
         # = capture disabled (default); a dict means the trainer
@@ -2090,14 +2058,6 @@ class ActionForcingDMD(SelfForcingModel):
                         .abs().mean().item()
                     )
                     dmd_log_dict["real_score_mae_vs_gt"] = real_mae_vs_gt
-                    _t_mean = float(dmd_log_dict.get("dmd_t_mean", 0.0))
-                    _hi = _t_mean > 500.0
-                    dmd_log_dict["real_score_mae_vs_gt_t_high"] = (
-                        real_mae_vs_gt if _hi else 0.0
-                    )
-                    dmd_log_dict["real_score_mae_vs_gt_t_low"] = (
-                        real_mae_vs_gt if not _hi else 0.0
-                    )
 
         # Teacher-freeze detection. The freeze mask we build below
         # AND-merges into ``gradient_mask`` and ONLY affects this
@@ -2902,9 +2862,7 @@ class ActionForcingDMD(SelfForcingModel):
         # Surface the rollout's last-chunk MAE (computed by the pipeline
         # in ``_last_extension_metrics``) so the trainer can collapse-
         # gate the critic step the same way it does the gen step.
-        critic_log: Dict[str, Any] = {
-            "critic_timestep": critic_timestep.detach(),
-        }
+        critic_log: Dict[str, Any] = {}
         ext_metrics = getattr(
             self.inference_pipeline, "_last_extension_metrics", None,
         ) or {}
@@ -3925,12 +3883,6 @@ class ActionForcingDMD(SelfForcingModel):
                     "the pipeline emits the last-rung output."
                 )
             info["paper_aligned_x0_for_adv"] = last_rung_chunk
-            dmd_log["flash_dmd_paper_aligned_adv"] = 1.0
-            dmd_log["flash_dmd_adv_low_noise_t"] = float(
-                int(round(float(
-                    self.inference_pipeline.denoising_step_list[-1]
-                )))
-            )
 
         # Auxiliary online-teacher pass (option 3 of the dual-teacher
         # design). When ``real_teacher_train_online`` is True we run a
@@ -3971,9 +3923,11 @@ class ActionForcingDMD(SelfForcingModel):
             if aux_loss is not None:
                 total_loss = total_loss + self.aux_teacher_loss_weight * aux_loss
 
-        for k in ("baseline_last_chunk_mae", "baseline_avg_rollout_mae", "last_chunk_mae", "mae_extension_count"):
-            if k in info:
-                dmd_log[k] = info[k]
+        # mae_extension_count is the only pipeline-emitted metric we
+        # still surface; the baseline MAE keys were dropped (always
+        # NaN under compute_baseline_mae=False, see trainer).
+        if "mae_extension_count" in info:
+            dmd_log["mae_extension_count"] = info["mae_extension_count"]
         dmd_log["streaming_new_frames"] = float(info["new_frames"])
         dmd_log["streaming_current_length"] = float(info["current_length"])
         # Replacement for the (removed) ``dmd_context_branch_gt`` key.
@@ -4088,7 +4042,6 @@ class ActionForcingDMD(SelfForcingModel):
             ).unflatten(0, chunk.shape[:2])
 
         critic_log: Dict[str, Any] = {
-            "critic_timestep": critic_timestep.detach(),
             "streaming_new_frames": float(info["new_frames"]),
             "streaming_current_length": float(info["current_length"]),
         }
@@ -4098,14 +4051,8 @@ class ActionForcingDMD(SelfForcingModel):
         # blind on the empty-mask early return below — same
         # telemetry-vs-loss-path independence Fix 1 enforced for the
         # gen step.
-        for k in (
-            "baseline_last_chunk_mae",
-            "baseline_avg_rollout_mae",
-            "last_chunk_mae",
-            "mae_extension_count",
-        ):
-            if k in info:
-                critic_log[k] = info[k]
+        if "mae_extension_count" in info:
+            critic_log["mae_extension_count"] = info["mae_extension_count"]
         if not gradient_mask.any():
             # End-of-sequence iter where ``new_frames`` (= npb) lands
             # entirely inside the last-chunk-masked tail → AND is all
@@ -4404,24 +4351,9 @@ class ActionForcingDMD(SelfForcingModel):
                 if self.real_teacher_input_source == "blend"
                 else (1.0 if use_gt else 0.0)
             ),
-            "aux_teacher_input_blend_p": (
-                float(self.real_teacher_input_mix_gt_p)
-                if self.real_teacher_input_source == "blend"
-                else 0.0
-            ),
             "aux_teacher_pred_mae": aux_teacher_pred_mae_v,
             "aux_teacher_t_mean": aux_t_mean_v,
         }
-        _hi = aux_t_mean_v > 500.0
-        _loss_v = float(loss.detach().item())
-        log["aux_teacher_loss_t_high"] = _loss_v if _hi else 0.0
-        log["aux_teacher_loss_t_low"] = _loss_v if not _hi else 0.0
-        log["aux_teacher_pred_mae_t_high"] = (
-            aux_teacher_pred_mae_v if _hi else 0.0
-        )
-        log["aux_teacher_pred_mae_t_low"] = (
-            aux_teacher_pred_mae_v if not _hi else 0.0
-        )
         # Expose the graph-bearing LoRA-side outputs so the trainer can
         # fold action_critic z-guidance and state_probe supervision into
         # the gen step's total loss before the single backward. These

@@ -1458,6 +1458,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_critic_fd_loss_weight = float(
             getattr(cfg, "gan_critic_fd_loss_weight", 0.0)
         )
+        # Dense per-token value distillation. When True, Path 2's
+        # value-distillation MSE matches the critic's PER-TOKEN logit
+        # map (LatentSAM2Critic.forward(dense=True)) against the disc's
+        # PER-TOKEN logit map (forward_dense_heads, pooled 4-pix-frames
+        # → 1-latent-frame). 8x13 ≈ 104x more constraints per sample
+        # than the scalar/per-frame MSE the legacy path used. Default
+        # False = legacy scalar MSE (for back-compat). The dense flag
+        # only changes the (real, fake) value-distillation MSE; the
+        # multi-noise interp / FD-Sobolev / Sobolev paths stay scalar
+        # (they're regularization densifiers, not the primary signal).
+        self.gan_critic_dense_distillation = bool(
+            getattr(cfg, "gan_critic_dense_distillation", False)
+        )
         self.gan_critic_fd_sigma = float(
             getattr(cfg, "gan_critic_fd_sigma", 0.01)
         )
@@ -3388,29 +3401,61 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         pix_indices = [
             f * pix_per_lat + pix_center_offset for f in frame_list
         ]
-        # Patch offsets (DDP-synced): per (frame, patch_idx) a single
-        # (h_o, w_o). Same offsets for all batch samples.
+        # Patch offsets — DETERMINISTIC ORDERED tiling that covers the
+        # whole image. Random placement was previously used here; it's
+        # been removed because random patches sample the same regions
+        # repeatedly across iters (and miss other regions entirely),
+        # producing a more variable / less complete approx target.
+        # Ordered tiling guarantees that every iter the approximator
+        # sees the SAME spatial coverage, so its dense per-token
+        # supervision is uniform.
+        #
+        # Layout: factor n_patches into (rows, cols) closest to the
+        # image's aspect ratio (H_pix / W_pix). For our 480×832 input
+        # at n_patches=8, that picks (2, 4) — 2 rows × 4 cols. Each
+        # axis uses even spacing from offset=0 to offset=L-P with
+        # ``stride = (L-P)/(n-1)``, so the corner patches sit exactly
+        # at (0, 0) and (H-P, W-P).
+        # Coverage at 480×832 / n=8 / patch=224:
+        #   * rows: 2 patches at h=0, h=256 cover 0..223 ∪ 256..479
+        #     — a 32-row gap at 224..255 (rows alone = 93.3%).
+        #   * cols: 4 patches at w=0, 203, 405, 608 overlap into full
+        #     coverage of 0..831 (100% width).
+        # Net area coverage ≈ 93.3% — matches the "~90%" target.
         n_patches = max(1, int(self.maniqa_n_patches_per_frame))
-        n_total_patches = n_frames * n_patches
-        if rank == 0:
-            h_o_t = torch.randint(
-                0, H_pix - crop + 1, (n_total_patches,), device=device,
-            )
-            w_o_t = torch.randint(
-                0, W_pix - crop + 1, (n_total_patches,), device=device,
-            )
-        else:
-            h_o_t = torch.empty(
-                n_total_patches, dtype=torch.long, device=device,
-            )
-            w_o_t = torch.empty(
-                n_total_patches, dtype=torch.long, device=device,
-            )
-        if dist.is_initialized():
-            dist.broadcast(h_o_t, src=0)
-            dist.broadcast(w_o_t, src=0)
-        h_offsets = h_o_t.tolist()
-        w_offsets = w_o_t.tolist()
+
+        def _factor_grid(n: int, h: int, w: int):
+            target = float(h) / float(w)
+            best_rc = (1, n)
+            best_diff = abs((1.0 / n) - target)
+            for r in range(1, n + 1):
+                if n % r == 0:
+                    c = n // r
+                    diff = abs((r / c) - target)
+                    if diff < best_diff:
+                        best_rc, best_diff = (r, c), diff
+            return best_rc
+
+        def _tile_positions(L: int, P: int, n: int):
+            if n <= 1:
+                return [(L - P) // 2]
+            stride = (L - P) / (n - 1)
+            return [int(round(i * stride)) for i in range(n)]
+
+        rows, cols = _factor_grid(n_patches, H_pix, W_pix)
+        h_pos = _tile_positions(H_pix, crop, rows)
+        w_pos = _tile_positions(W_pix, crop, cols)
+        # Build per-(frame, patch) (h_o, w_o) lists; same offsets for
+        # every selected frame and every batch sample. Deterministic →
+        # no DDP broadcast needed.
+        h_offsets: list = []
+        w_offsets: list = []
+        for _ in range(n_frames):
+            for r in range(rows):
+                for c in range(cols):
+                    h_offsets.append(h_pos[r])
+                    w_offsets.append(w_pos[c])
+        n_total_patches = len(h_offsets)
 
         # Crop all patches into a single batch for MANIQA forward.
         # Shape: [B * n_total_patches, 3, 224, 224].
@@ -4592,14 +4637,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # essentially free — we don't need to recompute heavy
             # pixel-space subtractions.
             with torch.no_grad():
-                lat_diff = fake_lat.float() - real_lat.float()
-                out["diag/latent_mse"] = float(
-                    (lat_diff ** 2).mean().item()
-                )
-                out["diag/latent_l1"] = float(
-                    lat_diff.abs().mean().item()
-                )
-                del lat_diff
                 if target_mse is not None:
                     out["diag/pixel_mse"] = float(target_mse.mean().item())
                 if target_lpips is not None:
@@ -4735,6 +4772,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Value targets — full-frame, no_grad teacher forward. Reuse
         # Path 1's already-computed features (avoids two redundant
         # SAM2 forwards per iter, saving ~6 GB transient workspace).
+        # When dense distillation is enabled, additionally compute the
+        # per-token logit maps (forward_dense_heads at the critic's
+        # post-stem grid) and pool 4 pixel-frames → 1 latent-frame.
+        from model.latent_sam2_critic import LatentSAM2Critic as _LSAM2C
+        dense_distill = bool(self.gan_critic_dense_distillation)
+        # Compute the post-stem grid the critic will produce so we can
+        # ask the disc for a matching dense target. Defensive fallback
+        # to the latent's spatial dims floor-divided by 8 (which is what
+        # the critic's stem produces by construction).
+        target_h, target_w = _LSAM2C.post_stem_grid(
+            int(real_lat.shape[-2]), int(real_lat.shape[-1]),
+        )
         with torch.no_grad():
             teacher_val_real = disc.forward_heads(
                 real_feats_raw, batch_size=B_pix, num_frames=F_pix,
@@ -4742,6 +4791,39 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             teacher_val_fake = disc.forward_heads(
                 fake_feats_raw, batch_size=B_pix, num_frames=F_pix,
             ).float()
+            if dense_distill:
+                teacher_dense_real = disc.forward_dense_heads(
+                    real_feats_raw,
+                    batch_size=B_pix,
+                    num_frames=F_pix,
+                    target_h=target_h,
+                    target_w=target_w,
+                ).float()  # [B, F_pix, target_h, target_w]
+                teacher_dense_fake = disc.forward_dense_heads(
+                    fake_feats_raw,
+                    batch_size=B_pix,
+                    num_frames=F_pix,
+                    target_h=target_h,
+                    target_w=target_w,
+                ).float()
+                # Pool F_pix → F_lat by averaging 4 pixel-frames per
+                # latent (WAN VAE temporal expansion). Result:
+                # [B, F_lat, target_h, target_w].
+                pix_per_lat = F_pix // int(F_)
+                if pix_per_lat * int(F_) != F_pix:
+                    raise RuntimeError(
+                        f"Dense distillation: F_pix={F_pix} not "
+                        f"divisible by F_lat={F_}."
+                    )
+                teacher_dense_real = teacher_dense_real.view(
+                    B, int(F_), pix_per_lat, target_h, target_w,
+                ).mean(dim=2)
+                teacher_dense_fake = teacher_dense_fake.view(
+                    B, int(F_), pix_per_lat, target_h, target_w,
+                ).mean(dim=2)
+            else:
+                teacher_dense_real = None
+                teacher_dense_fake = None
 
         # ----- Frame-rate alignment for distillation -----
         # In ``frame_pool=none`` mode the disc returns ``[B*F_pix]``
@@ -4984,6 +5066,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         critic_updates = max(1, int(self.gan_critic_updates_per_step))
         # Track only the LAST iter's diagnostics for logging.
         L_value_value = 0.0
+        L_value_dense_value = 0.0
         L_grad_value = 0.0
         L_critic_value = 0.0
         L_fd_value = 0.0
@@ -5019,11 +5102,39 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 critic_grad_real = None
                 critic_grad_fake = None
-            # Value loss on (real, fake).
+            # Value loss on (real, fake) — scalar/per-frame MSE
+            # (legacy; preserved for back-compat when dense_distill
+            # is off, and as a complementary signal when on).
             L_value = (
                 ((critic_val_real - teacher_val_real.detach()) ** 2).mean()
                 + ((critic_val_fake - teacher_val_fake.detach()) ** 2).mean()
             )
+            # Dense per-token value loss. Routes through ``forward``
+            # with the ``dense=True`` kwarg so DDP intercepts the call
+            # correctly (calling ``critic.forward_dense`` directly on
+            # the DDP wrapper would skip grad-sync hooks and silently
+            # break param synchronization).
+            L_value_dense_value = 0.0
+            if dense_distill and teacher_dense_real is not None:
+                critic_val_real_dense = critic_for_update(
+                    real_lat_critic_in, dense=True,
+                ).float()  # [B, F_lat, target_h, target_w]
+                critic_val_fake_dense = critic_for_update(
+                    fake_lat_critic_in, dense=True,
+                ).float()
+                L_value_dense = (
+                    (
+                        (critic_val_real_dense - teacher_dense_real.detach())
+                        ** 2
+                    ).mean()
+                    + (
+                        (critic_val_fake_dense - teacher_dense_fake.detach())
+                        ** 2
+                    ).mean()
+                )
+                L_value = L_value + L_value_dense
+                L_value_dense_value = float(L_value_dense.detach().item())
+                del critic_val_real_dense, critic_val_fake_dense
             # Multi-noise interp value loss (option 3).
             if interp_lats_stacked is not None:
                 critic_val_interp = critic_for_update(
@@ -5140,6 +5251,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["train/r3gan_d_real"] = d_real_value
         out["train/r3gan_d_fake_detached"] = d_fake_detached_value
         out["train/critic_value_loss"] = L_value_value
+        out["train/critic_value_dense_loss"] = L_value_dense_value
         out["train/critic_grad_loss"] = L_grad_value
         out["train/critic_total_loss"] = L_critic_value
         out["train/critic_fd_loss"] = L_fd_value
@@ -6797,19 +6909,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Per-rung bin: split the actual gen-side DMD push (= the
         # signal that backprops into the student) by the active DMD
         # timestep. ``dmd_t_mean`` is set by ``_compute_kl_grad`` and
-        # surfaces here through the gen_log unpack above. Same high/
-        # low convention as the model-side bin keys so wandb plots
-        # line up across the gen-side push and the LoRA-side training
-        # error.
-        _t_mean_dbg = float(out.get("dmd_t_mean", 0.0))
-        _hi_dbg = _t_mean_dbg > 500.0
-        _gen_loss_dmd_v = float(gen_loss_dmd.detach().item())
-        out["generator_dmd_loss_t_high"] = (
-            _gen_loss_dmd_v if _hi_dbg else 0.0
-        )
-        out["generator_dmd_loss_t_low"] = (
-            _gen_loss_dmd_v if not _hi_dbg else 0.0
-        )
         # Student-pred latent stats — abs-max / RMS over the chunk the
         # gen step was just trained on. If RMS climbs unboundedly or
         # abs_max saturates near the VAE's latent range, the student
@@ -6820,11 +6919,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["student_pred_rms"] = float(_tc.pow(2).mean().sqrt().item())
             out["student_pred_abs_max"] = float(_tc.abs().max().item())
             out["student_pred_mean"] = float(_tc.mean().item())
-        if flash_regime is not None:
-            out["flash_dmd_iter_t"] = float(flash_regime["flash_dmd_iter_t"])
-            out["flash_dmd_regime_high"] = (
-                1.0 if flash_regime["flash_dmd_regime"] == "high" else 0.0
-            )
 
         generator_loss = gen_loss_dmd
 
@@ -7368,12 +7462,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 for k, v in gen_log.items()
                 if not isinstance(v, dict)
             })
-            if flash_regime is not None:
-                merged["flash_dmd_iter_t"] = float(flash_regime["flash_dmd_iter_t"])
-                merged["flash_dmd_regime_high"] = (
-                    1.0 if flash_regime["flash_dmd_regime"] == "high" else 0.0
-                )
-
             generator_loss = gen_loss_dmd
 
             # ---- Auxiliary losses (mirror the legacy aux block) ----

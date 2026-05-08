@@ -268,17 +268,30 @@ class LatentSAM2Critic(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """Forward over a latent video.
+    @staticmethod
+    def post_stem_grid(latent_h: int, latent_w: int) -> tuple:
+        """Compute the post-stem token grid ``(H_post, W_post)`` for a
+        given input latent spatial size. The stem applies 3 stride-(1,
+        2, 2) Conv3d layers with padding=1, so each spatial dim gets
+        ``ceil(d / 2) → ceil(./2) → ceil(./2)`` = ``ceil(d / 8)``.
 
-        Args:
-            latent: ``[B, F, C, H, W]``. Channels must match
-                ``in_channels``. ``F`` ≤ ``max_frames``.
+        Used by callers (e.g. the trainer's distillation path) to know
+        what ``(target_h, target_w)`` to ask the pixel disc's
+        ``forward_dense_heads`` for so the disc's dense logit map and
+        this critic's ``forward_dense`` output share the same grid.
+        """
+        return (max(1, (latent_h + 7) // 8), max(1, (latent_w + 7) // 8))
 
-        Returns:
-            ``[B]`` scalar logits. The frame_pool aggregation matches
-            the pixel disc's contract so distilled-mode losses can
-            be written as if disc and critic produced the same shape.
+    def _backbone(
+        self, latent: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shared backbone for ``forward`` and ``forward_dense``.
+
+        Returns ``[B, F, N_spatial, d_model]`` post-attention token
+        features (NOT yet pooled, normed, or head-applied). Both the
+        scalar forward (which mean-pools over spatial then norm + head)
+        and the dense forward (which norm + head per token directly)
+        consume this same intermediate.
         """
         if latent.dim() != 5:
             raise ValueError(
@@ -315,8 +328,39 @@ class LatentSAM2Critic(nn.Module):
         x = x.reshape(B, F_ * N_spatial, D)
         for block in self.blocks:
             x = block(x)
+        return x.reshape(B, F_, N_spatial, D), Hs, Ws
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        *,
+        dense: bool = False,
+    ) -> torch.Tensor:
+        """Forward over a latent video.
+
+        Args:
+            latent: ``[B, F, C, H, W]``. Channels must match
+                ``in_channels``. ``F`` ≤ ``max_frames``.
+            dense: when True, dispatches to the dense per-token
+                forward (returns ``[B, F, H_post, W_post]``). When
+                False (default), runs the scalar / per-frame path
+                that ends in frame_pool aggregation. The dense path
+                is wired through ``forward`` (not a separate method)
+                so DDP's wrapper intercepts the call correctly and
+                gradient sync fires on the trainable params.
+
+        Returns:
+            * ``dense=False``: ``[B]`` scalar logits (or ``[B*F]``
+              with ``frame_pool='none'``). The frame_pool aggregation
+              matches the pixel disc's contract.
+            * ``dense=True``: ``[B, F, H_post, W_post]`` per-token
+              logit map. See ``forward_dense`` docstring.
+        """
+        if dense:
+            return self.forward_dense(latent)
+        x, _Hs, _Ws = self._backbone(latent)
+        B, F_, _, D = x.shape
         # Per-frame mean-pool over spatial tokens.
-        x = x.reshape(B, F_, N_spatial, D)
         per_frame = x.mean(dim=2)  # [B, F, d_model]
         per_frame = self.norm_out(per_frame)
         per_frame_logit = self.head(per_frame).squeeze(-1)  # [B, F]
@@ -335,3 +379,37 @@ class LatentSAM2Critic(nn.Module):
         else:  # "none" — per-frame logits, no temporal aggregation.
             return per_frame_logit.reshape(B * F_).float()
         return per_sample.float()
+
+    def forward_dense(self, latent: torch.Tensor) -> torch.Tensor:
+        """Per-token logit map ``[B, F, H_post, W_post]``.
+
+        Used by the trainer's Path-2 critic distillation to match the
+        SAM2 pixel disc's dense per-position logit map (via
+        ``R3GANDiscriminatorSAM2Pixel.forward_dense_heads``). Each
+        latent token covers an 8×8-pixel × 4-frame block (WAN VAE
+        downsample factors); the disc's per-pixel logits are pooled
+        down to this same ``(H_post, W_post)`` grid (8×13 for our
+        60×104 latent input) and then averaged across the 4 pixel
+        frames per latent before MSE-distillation against this output.
+
+        Architecture difference vs ``forward``: skip the per-frame
+        spatial mean-pool, apply ``norm_out`` + ``head`` per token
+        directly. Same trained weights are reused — the dense and
+        scalar paths share the head, so a critic trained with one can
+        still produce sensible outputs in the other (the scalar value
+        equals the per-token map's mean, modulo the LayerNorm-after-
+        spatial-mean vs LayerNorm-per-token difference, which is small
+        when the per-token activations are close in scale).
+
+        Returns ``[B, F, H_post, W_post]`` float32. ``F`` is the input
+        latent's frame count (NOT pixel frame count — the temporal
+        rate alignment is the caller's responsibility).
+        """
+        x, Hs, Ws = self._backbone(latent)
+        B, F_, N_spatial, D = x.shape
+        # Per-token norm + head. Apply LayerNorm over the channel dim
+        # of EVERY token (not over the spatial-mean-pooled per-frame
+        # vector) so spatial information is preserved at norm time.
+        x = self.norm_out(x)                     # [B, F, N_spatial, D]
+        per_token = self.head(x).squeeze(-1)     # [B, F, N_spatial]
+        return per_token.reshape(B, F_, Hs, Ws).float()
