@@ -174,12 +174,12 @@ srun torchrun \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=300 \
     dfake_gen_update_ratio=5 \
-    model_kwargs.local_attn_size=42 \
+    model_kwargs.local_attn_size=21 \
     num_workers=0 \
     boundary_vae_roundtrip=true \
     collapse_mae_threshold=0.2 \
     mae_extension_threshold=0.2 \
-    local_attn_size_schedule=[[0,42]] \
+    local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \

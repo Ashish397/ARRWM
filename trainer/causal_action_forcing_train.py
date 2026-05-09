@@ -1158,32 +1158,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
         context_noise = int(getattr(cfg, "context_noise", 0))
 
-        # MAE-driven dynamic rollout extension. ``threshold`` is the
-        # upper bound on last-3-frames latent-MAE below which the
-        # pipeline rolls one more 3-frame chunk (no_grad, full
-        # denoise). ``max_extra_chunks`` caps how many extras we'll
-        # roll per iter (each extra chunk costs cache memory; the
-        # cache is sized to the sum of baseline + max extras).
-        # Threshold can be ``null`` to disable the extension loop
-        # entirely (still computes baseline_last_chunk_mae for
-        # logging when ``gt_latents`` is passed; never extends).
-        mae_extension_threshold_raw = getattr(cfg, "mae_extension_threshold", None)
-        mae_extension_threshold = (
-            float(mae_extension_threshold_raw)
-            if mae_extension_threshold_raw is not None
-            else None
-        )
-        # Renamed from ``mae_extension_max_extra_chunks`` (legacy
-        # slide-loop) to ``max_rolls_per_ride`` (K=1-per-step state
-        # machine). Kept readable from the old name for back-compat
-        # with non-freeze YAMLs that still spell it the old way.
-        mae_extension_max_extra_chunks = int(
-            getattr(
-                cfg, "max_rolls_per_ride",
-                getattr(cfg, "mae_extension_max_extra_chunks", 0),
-            )
-        )
-
         self.pipeline = ActionForcingTrainingPipeline(
             denoising_step_list=denoising_step_list,
             scheduler=self.model.scheduler,
@@ -1194,8 +1168,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             last_step_only=last_step_only,
             num_max_frames=num_max_frames,
             rollout_frames=rollout_frames,
-            mae_extension_threshold=mae_extension_threshold,
-            mae_extension_max_extra_chunks=mae_extension_max_extra_chunks,
             context_noise=context_noise,
         )
         # The ActionForcingDMD model needs the pipeline reference for backward
@@ -1204,16 +1176,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         if self.is_main_process:
             logging.info(
-                "[ActionForcing] Pipeline: num_frame_per_block=%d chunks_per_rolling_step=%d "
-                "denoising_step_list=%s context_noise=%d num_max_frames=%d "
-                "rollout_frames=%d (gradient window = last %d frames; "
-                "warmup = %d frames) mae_extension_threshold=%s "
-                "mae_extension_max_extra_chunks=%d",
+                "[ActionForcing] Pipeline: num_frame_per_block=%d "
+                "chunks_per_rolling_step=%d denoising_step_list=%s "
+                "context_noise=%d num_max_frames=%d rollout_frames=%d "
+                "(gradient window = last %d frames; warmup = %d frames)",
                 num_frame_per_block, chunks_per_rolling_step,
                 denoising_step_list, context_noise, num_max_frames,
                 rollout_frames, num_max_frames,
                 rollout_frames - num_max_frames,
-                mae_extension_threshold, mae_extension_max_extra_chunks,
             )
 
         # ------------------------------------------------------------------
@@ -1831,24 +1801,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.real_teacher_warmup_steps = 0
             self._real_teacher_base_lr = 0.0
 
-        # ------------------------------------------------------------------
-        # Flash-DMD (paper arXiv:2511.20549) — timestep-aware DMD/GAN
-        # gating + EMA fake_score from generator.
-        # ------------------------------------------------------------------
-        # ``flash_dmd_split_timestep`` (None = legacy DMD2 summing every
-        # iter; int = engage Flash-DMD decoupling). When set, each gen
-        # iter rolls one DDP-synced scalar t ~ U[min_score_timestep,
-        # num_train_timestep). High-noise iter (t > split): DMD active,
-        # generator's GAN loss skipped. Low-noise iter: DMD skipped,
-        # generator's GAN loss active. The discriminator updates every
-        # iter regardless. Aux teacher pass is unaffected.
-        _split = getattr(cfg, "flash_dmd_split_timestep", None)
-        self.flash_dmd_split_timestep = (
-            int(_split) if _split is not None else None
-        )
-        self.flash_dmd_min_t = int(getattr(cfg, "min_score_timestep", 0))
-        self.flash_dmd_max_t = int(getattr(cfg, "num_train_timestep", 1000))
-
         # ``fake_score_ema_weight`` (0.0 = off, current behavior; e.g.
         # 0.95 = engage). After each generator optimizer.step(), the
         # fake_score's params get EMA-pulled toward the generator's
@@ -1865,75 +1817,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 f"fake_score_ema_weight must be in [0, 1); got "
                 f"{self.fake_score_ema_weight!r}."
             )
-        if self.is_main_process and (
-            self.flash_dmd_split_timestep is not None
-            or self.fake_score_ema_weight > 0.0
-        ):
+        if self.is_main_process and self.fake_score_ema_weight > 0.0:
             logging.info(
-                "[ActionForcing] Flash-DMD active: split_timestep=%s, "
-                "fake_score_ema_weight=%.4f",
-                self.flash_dmd_split_timestep,
+                "[ActionForcing] fake_score_ema_weight=%.4f",
                 self.fake_score_ema_weight,
             )
-
-    def _flash_dmd_sample_iter_regime(self, device) -> Optional[Dict[str, Any]]:
-        """Sample one DDP-synced scalar t per gen iter and return the
-        regime dict to inject into ``info``. Returns None when
-        Flash-DMD is disabled (legacy DMD2 summing).
-
-        High-noise iter (t > split): DMD active, constrained to
-        ``[split, max_t]``; trainer skips the generator's GAN loss.
-        Low-noise iter (t <= split): DMD skipped (zero-loss in the
-        model); generator's GAN loss is the only signal.
-        """
-        if self.flash_dmd_split_timestep is None:
-            return None
-        if dist.is_available() and dist.is_initialized():
-            if dist.get_rank() == 0:
-                t_iter = float(
-                    torch.randint(
-                        self.flash_dmd_min_t,
-                        self.flash_dmd_max_t,
-                        (1,),
-                    ).item()
-                )
-            else:
-                t_iter = 0.0
-            t_tensor = torch.tensor(
-                [t_iter], device=device, dtype=torch.float32,
-            )
-            dist.broadcast(t_tensor, src=0)
-            t_iter = float(t_tensor.item())
-        else:
-            t_iter = float(
-                torch.randint(
-                    self.flash_dmd_min_t, self.flash_dmd_max_t, (1,),
-                ).item()
-            )
-        regime = "high" if t_iter > self.flash_dmd_split_timestep else "low"
-        # Hard bounds for the DMD's per-frame timestep sampling. We
-        # use NEW keys (``flash_dmd_t_min/max``) consumed directly by
-        # ``_sample_dmd_timestep`` so the bounds always engage —
-        # ``denoised_timestep_from/to`` is gated by the
-        # ``ts_schedule`` config flag (currently false in our active
-        # configs) and is also read by the action-critic chunk_t,
-        # which we must not overwrite.
-        # High-noise iter: per-frame t in [split, max_t).
-        # Low-noise iter: DMD is skipped entirely (model-side gate),
-        # but we still set bounds for documentation / sanity if any
-        # downstream call hits the sampler.
-        if regime == "high":
-            t_min = self.flash_dmd_split_timestep
-            t_max = self.flash_dmd_max_t
-        else:
-            t_min = self.flash_dmd_min_t
-            t_max = self.flash_dmd_split_timestep
-        return {
-            "flash_dmd_regime": regime,
-            "flash_dmd_iter_t": t_iter,
-            "flash_dmd_t_min": t_min,
-            "flash_dmd_t_max": t_max,
-        }
 
     def _maybe_ema_fake_score_from_generator(self) -> None:
         """Flash-DMD §3.3 EMA: after each generator optimizer.step(),
@@ -2047,41 +1935,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             int(rollout_frames_raw) if rollout_frames_raw is not None
             else num_training_frames
         )
-        # MAE-extension cap (must mirror what was passed to the pipeline
-        # in ``_build_pipeline``). The trainer uses this to size the
-        # ride slice + action conditioning streams so that even if the
-        # extension fires the maximum number of times, the per-frame
-        # streams cover the full extended window.
-        #
-        # Gating MUST mirror the pipeline's gating exactly
-        # (``ActionForcingTrainingPipeline.inference_with_trajectory``:
-        # ``extension_active = enable_mae_extension AND threshold is not
-        # None AND max_extra_chunks > 0``). Otherwise threshold=null with
-        # cap>0 (or vice-versa) would still have the trainer slice an
-        # extended ride + build action conditioning over the extended
-        # window, even though the pipeline never extends — that's the
-        # "set threshold=null to disable" path failing to be free.
-        mae_extension_threshold_for_alloc = getattr(
-            cfg, "mae_extension_threshold", None
-        )
-        # ``max_rolls_per_ride`` is the new (K=1-per-step) name; legacy
-        # configs still spell it ``mae_extension_max_extra_chunks``.
+        # MAE-extension code path was removed; rollouts no longer grow
+        # beyond ``rollout_frames``. ``max_total_rollout_frames`` stays
+        # as a name for downstream slicing but equals ``rollout_frames``.
         max_rolls_per_ride = int(
-            getattr(
-                cfg, "max_rolls_per_ride",
-                getattr(cfg, "mae_extension_max_extra_chunks", 0),
-            )
+            getattr(cfg, "max_rolls_per_ride", 0)
         )
-        extensions_active = (
-            mae_extension_threshold_for_alloc is not None
-            and max_rolls_per_ride > 0
-        )
-        max_extension_frames = (
-            max_rolls_per_ride * num_frame_per_block
-            if extensions_active
-            else 0
-        )
-        max_total_rollout_frames = rollout_frames + max_extension_frames
+        max_total_rollout_frames = rollout_frames
 
         # dmd_context shifts the student's rollout window forward by
         # ``cf`` frames in the ride (= ride frames [cf, cf +
@@ -4226,8 +4086,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         pred_image: torch.Tensor,
         gt_latents_window: torch.Tensor,
         current_step: int,
-        flash_dmd_regime: Optional[str] = None,
-        paper_aligned_x0_for_adv: Optional[torch.Tensor] = None,
+        flash_dmd_gan_x0: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Distilled-critic R3GAN flow with action_critic-style boosts.
 
@@ -4269,11 +4128,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         # ----- Latents (fp32 for R1/R2 stability — Paths 1 + 2 both fp32).
         real_lat = gt_latents_window.detach().to(torch.float32)
-        # G-side fake latent: paper-aligned-adv = last_rung_full_chunk
+        # G-side fake latent: Flash-DMD = flash_dmd_gan_x0
         # (paper §3.3 Eq. 9); else the rolling rollout's pred_image.
         # Path 3 uses the GRAD-attached version; Paths 1+2 use detached.
-        if paper_aligned_x0_for_adv is not None:
-            fake_lat_grad = paper_aligned_x0_for_adv.to(torch.float32)
+        if flash_dmd_gan_x0 is not None:
+            fake_lat_grad = flash_dmd_gan_x0.to(torch.float32)
         else:
             fake_lat_grad = pred_image.to(torch.float32)
         fake_lat = fake_lat_grad.detach()
@@ -4325,16 +4184,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             gen_gan_weight = 0.0
 
-        skip_g_side = (
-            flash_dmd_regime == "high"
-            and paper_aligned_x0_for_adv is None
-        )
-
-        if (
-            critic_warmup_done
-            and gen_gan_weight > 0
-            and not skip_g_side
-        ):
+        if critic_warmup_done and gen_gan_weight > 0:
             # Freeze critic params so the gen backward doesn't write
             # critic-side gradients into the critic optim (the critic
             # has already been updated above for this iter, OR will be
@@ -5277,8 +5127,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         pred_image: torch.Tensor,
         gt_latents_window: torch.Tensor,
         current_step: int,
-        flash_dmd_regime: Optional[str] = None,
-        paper_aligned_x0_for_adv: Optional[torch.Tensor] = None,
+        flash_dmd_gan_x0: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Run a D-update on (real, fake) and return the G-side RpGAN
         term (graph-carrying).
@@ -5293,12 +5142,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 G-side path (G never sees real samples directly in
                 R3GAN — only D's pairwise score).
             current_step: training step (for G-side warmup ramp).
-            flash_dmd_regime: optional Flash-DMD regime indicator
-                (``"high"`` / ``"low"`` / ``None`` for legacy mode).
-                On ``"high"`` (DMD-only iter) the trainer caller
-                discards ``generator_gan_loss``; this method skips
-                the G-side decode + discriminator forward to save
-                wallclock — the D-update still fires every iter.
+            flash_dmd_gan_x0: optional graph-on output of the Flash-DMD
+                t=flash_dmd_gan_t gen forward. When provided, the G-side
+                path uses this as the fake (so the GAN supervises only
+                the gen's near-clean texture-refinement behavior).
 
         Returns:
             ``(generator_gan_loss, logs)`` — ``generator_gan_loss``
@@ -5321,8 +5168,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 pred_image=pred_image,
                 gt_latents_window=gt_latents_window,
                 current_step=current_step,
-                flash_dmd_regime=flash_dmd_regime,
-                paper_aligned_x0_for_adv=paper_aligned_x0_for_adv,
+                flash_dmd_gan_x0=flash_dmd_gan_x0,
             )
 
         disc_for_update = (
@@ -5336,27 +5182,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # the G-side branch; ``*_detached`` versions feed the D-update.
         real_detached_lat = gt_latents_window.detach().to(torch.float32)
         fake_detached_lat = pred_image.detach().to(torch.float32)
-        # Paper-aligned adv (Flash-DMD §3.3 Eq. 8-9): the G-side fake
-        # is NOT the rolling rollout's pred_image — it's an EXTRA
-        # gen forward at low-noise ˆt on re-noised pred_x0. The
-        # model stashes the result on ``info["paper_aligned_x0_for_adv"]``
-        # and the caller passes it here. Grad through this latent
-        # flows back to the gen via the extra forward only, never
-        # through the rolling rollout's high-noise denoising steps.
-        if paper_aligned_x0_for_adv is not None:
-            pred_image_for_g_lat = paper_aligned_x0_for_adv.to(torch.float32)
+        # Flash-DMD: the G-side fake is the t=flash_dmd_gan_t forward
+        # output (a separate near-clean gen forward) when available;
+        # otherwise the rolling rollout's pred_image is used. Grad
+        # path is restricted to the t=gan_t forward — the high-noise
+        # denoising rungs were no_grad.
+        if flash_dmd_gan_x0 is not None:
+            pred_image_for_g_lat = flash_dmd_gan_x0.to(torch.float32)
         else:
             pred_image_for_g_lat = pred_image.to(torch.float32)
-        # Flash-DMD high-noise iter: the trainer caller will discard
-        # ``generator_gan_loss``; skip the G-side decode + SAM2 forward
-        # to save wallclock. The D-side decode + update still runs
-        # every iter so the discriminator keeps learning. Paper-aligned
-        # mode bypasses the regime gate (both losses fire every iter)
-        # so skip_g_side is False there regardless of regime.
-        skip_g_side = (
-            flash_dmd_regime == "high"
-            and paper_aligned_x0_for_adv is None
-        )
+        skip_g_side = False
 
         if self.gan_backbone == "sam2_pixel":
             # Pixel-space discriminator: decode the latent video to
@@ -6598,7 +6433,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         outer ``optim.step()`` runs after this returns.
         """
         cfg = self.config
-        threshold = float(cfg.mae_extension_threshold)
         max_rolls = int(getattr(cfg, "max_rolls_per_ride", 60))
         force_exit_step_enabled = bool(
             getattr(cfg, "force_exit_step_enabled", False)
@@ -6876,14 +6710,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             self.model._dmd_eval_stash = None
 
-        # Flash-DMD: roll the iter's regime once, inject into info so
-        # the model gates the DMD compute and the GAN gate below
-        # consults the same flag. None-return (legacy mode) leaves
-        # info untouched.
-        flash_regime = self._flash_dmd_sample_iter_regime(train_chunk.device)
-        if flash_regime is not None:
-            train_info.update(flash_regime)
-
         # ---- memory audit boundary 0: entry to per-chunk training ----
         self._mem_step_snaps = []
         self._mem_step_snapshot("0_entry")
@@ -6948,8 +6774,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 (B, n_chunks), ts_int,
                 device=train_chunk.device, dtype=torch.long,
             )
-            # Route action_critic to paper_aligned_x0_for_adv (=
-            # last_rung_full_chunk, the lowest-noise gen forward) when
+            # Route action_critic to flash_dmd_gan_x0 (=
+            # flash_dmd_gan_x0, the t=flash_dmd_gan_t gen forward) when
             # available. Without this, action_critic supervises the gen
             # at whatever random exit-rung was sampled this iter (75%
             # of iters land at high-noise rungs, where pred_x0 is a
@@ -6963,7 +6789,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if bool(getattr(
                 self.config, "gen_aux_losses_use_paper_aligned_x0", True,
             )):
-                _pa_x0 = train_info.get("paper_aligned_x0_for_adv")
+                _pa_x0 = train_info.get("flash_dmd_gan_x0")
                 if _pa_x0 is not None:
                     ac_pred_x0 = _pa_x0
             gen_action_loss, critic_logs, teacher_z_8d = (
@@ -7016,34 +6842,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # plumbing the chunk geometry through 3 function signatures.
             self.model.streaming_state["last_chunk_lo_in_ride_window"] = chunk_lo
             self.model.streaming_state["last_chunk_size"] = chunk_size
-            _flash_regime_str = (
-                flash_regime["flash_dmd_regime"]
-                if flash_regime is not None else None
-            )
-            # Paper-aligned adv: the model stashes the extra low-noise
-            # gen forward output on ``info["paper_aligned_x0_for_adv"]``;
-            # pass it through so the disc sees x0_for_adv as fake.
-            _paper_aligned_x0 = train_info.get("paper_aligned_x0_for_adv")
+            # Flash-DMD: the model stashes the per-block t=flash_dmd_gan_t
+            # gen forward output on ``info["flash_dmd_gan_x0"]``; pass it
+            # through so the disc and gen-side aux losses consume the
+            # near-clean output as the G-side fake.
+            _flash_dmd_gan_x0 = train_info.get("flash_dmd_gan_x0")
             gen_gan_loss, gan_logs = self._compute_r3gan_losses(
                 pred_image=train_chunk,
                 gt_latents_window=gt_window,
                 current_step=int(self.step),
-                flash_dmd_regime=_flash_regime_str,
-                paper_aligned_x0_for_adv=_paper_aligned_x0,
+                flash_dmd_gan_x0=_flash_dmd_gan_x0,
             )
-            # Flash-DMD: skip the generator's GAN gradient on
-            # high-noise iters when running per-iter alternation.
-            # Paper-aligned mode (``paper_aligned_x0_for_adv``)
-            # bypasses the gate — both DMD and adv fire every iter
-            # per Flash-DMD §3.3 Eq. 8-9.
-            if (
-                _paper_aligned_x0 is None
-                and flash_regime is not None
-                and flash_regime["flash_dmd_regime"] == "high"
-            ):
-                gan_logs["gan_gen_loss_skipped_high_noise"] = 1.0
-            else:
-                generator_loss = generator_loss + gen_gan_loss
+            generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
             self._mem_step_snapshot("4_after_gan_pre_backward")
 
@@ -7329,319 +7139,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         max_total_rollout_frames: int,
         cf_dmdctx: int,
     ) -> Optional[Dict[str, Any]]:
-        """Streaming-mode per-iter step.
+        """Streaming-mode per-iter step (K=1 per step).
 
-        Phase-1 freeze default (``mae_extension_threshold`` set AND
-        ``max_rolls_per_ride > 0``): K=1 per step. The gen-iter path
-        routes to ``_streaming_step`` which rolls one chunk on the
-        persistent ride state, trains every active head (gen / DMD
-        critic / aux / R3GAN / SC-DMD), and decides whether to reset
-        the ride for the next step. The standalone critic-iter call
-        is a no-op (the K=1 path already trained the critic on the
-        same chunk).
-
-        Legacy per-chunk path (``mae_extension_threshold`` unset or
-        ``max_rolls_per_ride == 0``) is preserved for test configs
-        but unreachable in production.
+        The gen-iter path routes to ``_streaming_step`` which rolls
+        one chunk on the persistent ride state, trains every active
+        head (gen / DMD critic / aux / R3GAN / SC-DMD), and decides
+        whether to reset the ride for the next step. The standalone
+        critic-iter call is a no-op — the K=1 path already trained
+        the critic on the same chunk.
         """
-        cfg = self.config
-        extension_active = (
-            getattr(cfg, "mae_extension_threshold", None) is not None
-            and int(getattr(cfg, "max_rolls_per_ride", 0)) > 0
-        )
-        if extension_active:
-            if train_generator:
-                return self._streaming_step(
-                    rollout_frames=rollout_frames,
-                    cf_dmdctx=cf_dmdctx,
-                )
-            # Critic-iter no-op: the K=1 step already trained the
-            # critic on this chunk. Running another critic update
-            # here would either re-roll into a closed sequence or
-            # re-train on a fresh ride (DMD2-decoupling violation).
-            return {"streaming_critic_skipped": 1.0}
-
-        # Legacy per-chunk path (extension_active=False). Open a
-        # sequence if needed.
-        if (
-            self.model.streaming_state is None
-            or not self.model.can_generate_more()
-        ):
-            self.model.reset_streaming_state()
-            if not self._streaming_setup_sequence_from_ride(
-                rollout_frames=rollout_frames,
-                max_total_rollout_frames=max_total_rollout_frames,
-                cf_dmdctx=cf_dmdctx,
-            ):
-                return None
-
         if train_generator:
-            aux_active = (
-                self.action_critic_loss_active
-                and self.critic_optimizer is not None
+            return self._streaming_step(
+                rollout_frames=rollout_frames,
+                cf_dmdctx=cf_dmdctx,
             )
-            gan_active = (
-                self.gan_enabled
-                and self.r3gan_disc is not None
-                and self.r3gan_optimizer is not None
-            )
-            sc_dmd_active = bool(self.sc_dmd_enabled)
-
-            chunk, info = self.model.generate_next_chunk(requires_grad=True)
-
-            # Stash the chunk for the periodic wandb sample-video logger
-            # (parity with the legacy aux/plain branches). ``chunk``
-            # includes the overlap so the rendered mp4 reflects what
-            # DMD just scored. Detach + float32 to release the
-            # autograd graph (logger never backwards through this).
-            _sample_due_now = self._video_sample_due(int(self.step) + 1)
-            if _sample_due_now:
-                try:
-                    self._pending_video_latents = (
-                        chunk.detach().to(torch.float32)
-                    )
-                    _cs = int(self.step) + 1
-                    while (
-                        self._sample_at_steps_pending
-                        and self._sample_at_steps_pending[0] <= _cs
-                    ):
-                        self._sample_at_steps_pending.pop(0)
-                    # Consume the sticky deferral bit (set when a
-                    # previous critic-only iter crossed the cadence
-                    # boundary). Safe to clear unconditionally — if it
-                    # was already False the periodic ``%==0`` gate or
-                    # ``sample_at_steps`` triggered us, and clearing has
-                    # no effect.
-                    self._video_sample_due_bit = False
-                except Exception as _exc:
-                    logging.warning(
-                        "[ActionForcing] failed to stash streaming chunk "
-                        "for video at step=%d: %s",
-                        int(self.step) + 1, _exc,
-                    )
-                    self._pending_video_latents = None
-
-            # Arm the DMD-scorer eval stash: when set to a dict,
-            # ``compute_generator_loss_streaming`` (and its inner
-            # ``_compute_kl_grad``) populate the scorers' denoised x0
-            # estimates and the clean_x conditioning views so the
-            # video logger can decode them as side-by-side diagnostic
-            # videos. Cleared after harvest. No effect on training
-            # math (read-only ``.detach()`` copies into a dict).
-            if _sample_due_now:
-                self.model._dmd_eval_stash = {}
-            else:
-                self.model._dmd_eval_stash = None
-
-            # Flash-DMD: roll the iter's regime once, inject into info
-            # so the model gates the DMD compute and the GAN gate
-            # below consults the same flag.
-            flash_regime = self._flash_dmd_sample_iter_regime(chunk.device)
-            if flash_regime is not None:
-                info.update(flash_regime)
-
-            gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
-                chunk, info,
-            )
-
-            # Harvest scorer outputs + clean_x views into a parallel
-            # ``self._pending_dmd_eval_latents`` so the video logger
-            # can decode them without the metrics path having to skip
-            # non-scalar values.
-            if _sample_due_now:
-                eval_stash = getattr(self.model, "_dmd_eval_stash", None)
-                if isinstance(eval_stash, dict) and eval_stash:
-                    self._pending_dmd_eval_latents = eval_stash
-                self.model._dmd_eval_stash = None
-            merged: Dict[str, Any] = {
-                "generator_dmd_loss": float(gen_loss_dmd.detach().item()),
-            }
-            merged.update({
-                k: (float(v.detach().float().mean().item())
-                    if torch.is_tensor(v) else v)
-                for k, v in gen_log.items()
-                if not isinstance(v, dict)
-            })
-            generator_loss = gen_loss_dmd
-
-            # ---- Auxiliary losses (mirror the legacy aux block) ----
-            # Streaming chunk's ride window in
-            # ``state["ride_*_window"]`` indices: the noisy-half lives
-            # at cumulative-sdn positions ``[noisy_start_sdn,
-            # noisy_start_sdn + chunk_size)``, which translates to
-            # ``ride_*_window[cf + noisy_start_sdn : cf + noisy_start_sdn
-            # + chunk_size]``. ``noisy_start_sdn = current_length -
-            # new_frames - overlap`` (info-supplied).
-            state = self.model.streaming_state
-            cf = int(state["cf"])
-            chunk_size = int(state["chunk_size"])
-            noisy_start_sdn = int(
-                state["current_length"]
-                - info["new_frames"]
-                - info["overlap"]
-            )
-            chunk_lo = cf + noisy_start_sdn
-            chunk_hi = chunk_lo + chunk_size
-
-            if aux_active:
-                actions_chunk = state["ride_actions_window"][
-                    :, chunk_lo:chunk_hi,
-                ]
-                actions_for_critic = self._slice_actions_for_critic(
-                    actions_chunk
-                ).to(chunk.dtype)
-                ts_value = info.get("denoised_timestep_from", None)
-                ts_int = int(ts_value) if ts_value is not None else 0
-                B = chunk.shape[0]
-                n_chunks = chunk.shape[1] // int(self.config.num_frame_per_block)
-                chunk_t = torch.full(
-                    (B, n_chunks), ts_int,
-                    device=chunk.device, dtype=torch.long,
-                )
-                gen_action_loss, critic_logs, _teacher_z = (
-                    self._compute_action_critic_losses(
-                        pred_x0=chunk,
-                        target_action_z=actions_for_critic,
-                        chunk_t=chunk_t,
-                        current_step=int(self.step),
-                    )
-                )
-                generator_loss = generator_loss + gen_action_loss
-                merged.update(critic_logs)
-
-            if gan_active:
-                gt_window = state["ride_latents_window"][
-                    :, chunk_lo:chunk_hi,
-                ]
-                _flash_regime_str = (
-                    flash_regime["flash_dmd_regime"]
-                    if flash_regime is not None else None
-                )
-                # Paper-aligned adv: model stashes the extra
-                # low-noise gen forward output on
-                # ``info["paper_aligned_x0_for_adv"]``.
-                _paper_aligned_x0 = info.get("paper_aligned_x0_for_adv")
-                gen_gan_loss, gan_logs = self._compute_r3gan_losses(
-                    pred_image=chunk,
-                    gt_latents_window=gt_window,
-                    current_step=int(self.step),
-                    flash_dmd_regime=_flash_regime_str,
-                    paper_aligned_x0_for_adv=_paper_aligned_x0,
-                )
-                # Flash-DMD: skip the generator's GAN gradient on
-                # high-noise iters in per-iter-alternation mode.
-                # Paper-aligned mode bypasses the gate — both losses
-                # fire every iter per Flash-DMD §3.3 Eq. 8-9.
-                if (
-                    _paper_aligned_x0 is None
-                    and flash_regime is not None
-                    and flash_regime["flash_dmd_regime"] == "high"
-                ):
-                    gan_logs["gan_gen_loss_skipped_high_noise"] = 1.0
-                else:
-                    generator_loss = generator_loss + gen_gan_loss
-                merged.update(gan_logs)
-
-            if sc_dmd_active:
-                # SC regularizer runs on a fresh chunk-0 KV cache, so
-                # the absolute frame position doesn't matter — pass
-                # the rollout-only ``ride_latents_window[cf:]`` as
-                # ``clean_latent`` (same role as ``latents`` in the
-                # legacy path) and the iter's fresh full-window cond
-                # dict (from ``info``, NOT from state — stashed cond
-                # dicts on state would leak the action-projection
-                # graph across iters) with ``seed_frames=cf`` so
-                # sc_dmd_loss skips the seed streams when slicing
-                # chunk-0 actions.
-                sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
-                    conditional_dict=info["conditional_dict"],
-                    clean_latent=state["ride_latents_window"][:, cf:],
-                    seed_frames=cf,
-                )
-                sc_weight = self._sc_dmd_current_weight(int(self.step))
-                weighted_sc = sc_loss_raw * sc_weight
-                generator_loss = generator_loss + weighted_sc
-                merged.update(sc_logs)
-                merged["sc_dmd_weight_effective"] = float(sc_weight)
-                merged["sc_dmd_loss_weighted"] = float(
-                    weighted_sc.detach().item()
-                )
-
-            merged["generator_loss"] = float(generator_loss.detach().item())
-            generator_loss.backward()
-
-            # Collapse gate: if the last-chunk MAE > threshold, the
-            # student collapsed on this ride — close the sequence so
-            # next iter pulls a fresh ride. Current chunk still trained
-            # (gradient already accumulated via .backward()).
-            mae = float(gen_log.get("baseline_avg_rollout_mae", float("nan")))
-            collapsed = (
-                self.collapse_mae_threshold is not None
-                and mae == mae
-                and mae > self.collapse_mae_threshold
-            )
-            if collapsed:
-                merged["streaming_reset_for_collapse"] = 1.0
-                self.model.reset_streaming_state()
-            return merged
-        else:
-            chunk, info = self.model.generate_next_chunk(requires_grad=False)
-            critic_loss, critic_log = self.model.compute_critic_loss_streaming(
-                chunk, info,
-            )
-            critic_loss.backward()
-            merged: Dict[str, Any] = {
-                "critic_loss": float(critic_loss.detach().item()),
-            }
-            merged.update({
-                k: (float(v.detach().float().mean().item())
-                    if torch.is_tensor(v) else v)
-                for k, v in critic_log.items()
-                if not isinstance(v, dict)
-            })
-
-            # ----- Online real_teacher step (riding shotgun with critic) -----
-            # Reuse the SAME chunk + info from the critic step so the
-            # streaming KV cache state is not advanced again. Backward
-            # is fully independent (gradient flows only through real_score
-            # LoRA params; chunk is detached inside
-            # compute_real_teacher_loss_streaming).
-            if (
-                self.real_teacher_train_online
-                and self.real_teacher_optimizer is not None
-            ):
-                rt_loss, rt_log = self.model.compute_real_teacher_loss_streaming(
-                    chunk, info,
-                )
-                # End-of-ride DDP-synced skip: when ANY rank can't
-                # build a gt_target this iter, ALL ranks skip the
-                # backward (otherwise the rank-local skip would hang
-                # DDP's AllReduce on the peer ranks). The model's
-                # ``compute_real_teacher_loss_streaming`` does the
-                # all_reduce internally and returns a no-grad zero
-                # plus the flag below. ``.backward()`` on a no-grad
-                # tensor would also raise — both reasons to gate.
-                if not rt_log.get(
-                    type(self.model).REAL_TEACHER_SKIP_KEY, 0.0,
-                ):
-                    rt_loss.backward()
-                merged["real_teacher_loss"] = float(rt_loss.detach().item())
-                merged.update({
-                    k: (float(v.detach().float().mean().item())
-                        if torch.is_tensor(v) else v)
-                    for k, v in rt_log.items()
-                    if not isinstance(v, dict)
-                })
-
-            mae = float(critic_log.get("baseline_avg_rollout_mae", float("nan")))
-            if (
-                self.collapse_mae_threshold is not None
-                and mae == mae
-                and mae > self.collapse_mae_threshold
-            ):
-                merged["streaming_reset_for_collapse"] = 1.0
-                self.model.reset_streaming_state()
-            return merged
+        # Critic-iter no-op: the K=1 _streaming_step already trained
+        # the critic on this chunk. Running another critic update
+        # here would either re-roll into a closed sequence or
+        # re-train on a fresh ride (DMD2-decoupling violation).
+        return {"streaming_critic_skipped": 1.0}
 
     # ------------------------------------------------------------------
     # Per-iter forward/backward.

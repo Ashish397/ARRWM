@@ -25,14 +25,13 @@ _extends: action_forcing_phase1.yaml
 config_name: action-forcing-phase1-gan
 run_name: action_forcing_phase1_gan
 
-# Pinned 42-frame KV cache window — the discriminator was tuned at
-# this window size; ramping it would push the disc OOD per step.
-local_attn_size_schedule: [[0, 42]]
+# 21-frame KV cache window — covers a single rolled chunk
+# (rollout_frames = num_max_frames = 21). The MAE-extension code
+# path is removed; rollouts no longer grow past ``rollout_frames``.
+local_attn_size_schedule: [[0, 21]]
 
-# Tighter MAE thresholds (the GAN side amplifies single-frame error;
-# we ride-extend less aggressively and reset the streaming sequence
-# sooner if quality slips).
-mae_extension_threshold: 0.2
+# Collapse threshold (still used for streaming-state reset). MAE-
+# extension threshold removed — extension code path is gone.
 collapse_mae_threshold: 0.2
 
 # R3GAN — RpGAN + R1 + R2 discriminator on GT vs student latent

@@ -408,48 +408,24 @@ class ActionForcingDMD(SelfForcingModel):
                 f"{self.real_teacher_input_mix_gt_p!r}."
             )
 
-        # ``flash_dmd_split_timestep`` — Flash-DMD-style decoupling of
-        # DMD vs GAN gradients per iter (paper arXiv:2511.20549, §3.3).
-        # When None (default) the legacy DMD2 summing of both losses
-        # every iter is used. When set to an int (e.g. 500), the
-        # trainer rolls a single DDP-synced scalar t per gen iter and
-        # writes ``info["flash_dmd_regime"]`` ∈ {"high", "low"}:
-        #   * High-noise iter (t > split): DMD active, constrained to
-        #     [split, num_train_timestep]; trainer skips the
-        #     generator's GAN-loss contribution (discriminator still
-        #     trains independently).
-        #   * Low-noise iter (t <= split): DMD skipped (zero-loss
-        #     through chunk so backward still flows zero gradient
-        #     through the generator); generator's GAN gradient is the
-        #     only signal this iter.
-        # The aux-teacher pass is orthogonal — it always fires when
-        # ``aux_teacher_loss_weight > 0`` regardless of regime.
-        # Critic (fake_score) training is unaffected.
-        _split = getattr(args, "flash_dmd_split_timestep", None)
-        self.flash_dmd_split_timestep = (
-            int(_split) if _split is not None else None
+        # Flash DMD: when enabled, every block's rollout adds ONE extra
+        # graph-on gen forward at ``flash_dmd_gan_t`` (default 60, raw
+        # post-warp timestep) on top of the standard random-exit-rung
+        # DMD pass. The extra forward's output feeds the GAN's adv
+        # loss (and other gen-side aux losses); DMD scoring continues
+        # to use the random-exit-rung output. Gradient through the
+        # t=60 forward flows ONLY through that forward's gen weights —
+        # the K/V it writes into the rolling cache is overwritten by
+        # the per-block context-noise commit, preserving the paper's
+        # cross-timestep decoupling. Default ON. ``flash_dmd_gan_t``
+        # is the post-warp timestep (matches the convention of the
+        # existing rungs 1000/625/312.5/178.57); ``60`` corresponds to
+        # a near-clean image.
+        self.flash_dmd_enabled = bool(
+            getattr(args, "flash_dmd_enabled", True)
         )
-
-        # ``flash_dmd_paper_aligned_adv`` (default false) — Flash-DMD
-        # paper §3.3 Eq. 8-9 path: every gen iter does BOTH DMD and
-        # adv losses, summed (L_Gθ = L_DMD + λ · L_adv). Decoupling
-        # is by timestep:
-        #   * DMD: gen forward 1 at high-noise t (the existing rolling
-        #     rollout, with grad through the random exit rung).
-        #   * adv: ONE EXTRA gen forward 2 at LOW-noise ˆt on
-        #     re-noised pred_x0, with grad ONLY through this single
-        #     forward. The adv gradient never reaches the rolling
-        #     rollout's high-noise denoising steps, so the GAN only
-        #     updates the gen's texture-refinement behavior — exactly
-        #     the paper's spec.
-        # When True, the per-iter alternation (flash_dmd_split_timestep)
-        # gate is bypassed in compute_generator_loss_streaming —
-        # both losses fire every iter.
-        # Memory: extra ~3-6 GB per rank (one extra gen forward + a
-        # 21-frame KV cache); the cache is cached on self after
-        # first allocation.
-        self.flash_dmd_paper_aligned_adv = bool(
-            getattr(args, "flash_dmd_paper_aligned_adv", False)
+        self.flash_dmd_gan_t = int(
+            getattr(args, "flash_dmd_gan_t", 60)
         )
 
         # Warm-start init: subsequent rolling chunks denoise from the
@@ -463,7 +439,7 @@ class ActionForcingDMD(SelfForcingModel):
         # rung in the standard 4-step ladder); move it later in the
         # ladder for less-aggressive warm-start. Validation against
         # the actual denoising_step_list length lives in the pipeline.
-        self.warm_start_init = bool(getattr(args, "warm_start_init", False))
+        self.warm_start_init = bool(getattr(args, "warm_start_init", True))
         self.warm_start_rung_idx = int(getattr(args, "warm_start_rung_idx", 1))
 
         # Number of leading GT frames that seed the KV cache before the
@@ -1463,7 +1439,6 @@ class ActionForcingDMD(SelfForcingModel):
         conditional_dict: dict,
         clean_latent=None,
         initial_latent: Optional[torch.Tensor] = None,
-        enable_mae_extension: bool = False,
         seed_latents: Optional[torch.Tensor] = None,
         requires_grad: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
@@ -1560,12 +1535,12 @@ class ActionForcingDMD(SelfForcingModel):
             noise_shape, device=self.device, dtype=self.dtype,
         )
 
-        # ``dual_grad_rollout`` is gated on the paper-aligned-adv knob
-        # AND ``requires_grad=True``. The critic step (requires_grad=
-        # False) doesn't need a last-rung grad forward, so disable the
-        # two-grad-point path there to avoid wasting one extra forward
-        # per chunk on a pred we'll never backprop through.
-        dual_grad_rollout = bool(self.flash_dmd_paper_aligned_adv) and bool(
+        # Flash-DMD: when enabled AND requires_grad=True, the pipeline
+        # adds a per-block t=flash_dmd_gan_t grad-on forward whose
+        # output goes to the GAN / aux losses. The critic step
+        # (requires_grad=False) doesn't need this; pass enabled=False
+        # there to skip the extra forward.
+        flash_dmd_enabled = bool(self.flash_dmd_enabled) and bool(
             requires_grad
         )
         # Warm-start init applies to BOTH gen and critic rollouts so
@@ -1577,10 +1552,10 @@ class ActionForcingDMD(SelfForcingModel):
                 noise=noise,
                 clean_image_or_video=None,
                 gt_latents=clean_latent,
-                enable_mae_extension=enable_mae_extension,
                 seed_latents=seed_latents,
                 requires_grad=requires_grad,
-                dual_grad_rollout=dual_grad_rollout,
+                flash_dmd_enabled=flash_dmd_enabled,
+                flash_dmd_gan_t=int(self.flash_dmd_gan_t),
                 warm_start_init=self.warm_start_init,
                 warm_start_rung_idx=self.warm_start_rung_idx,
                 **conditional_dict,
@@ -1894,34 +1869,15 @@ class ActionForcingDMD(SelfForcingModel):
         denoised_timestep_from: Optional[int],
         denoised_timestep_to: Optional[int],
         device: torch.device,
-        flash_dmd_t_min: Optional[int] = None,
-        flash_dmd_t_max: Optional[int] = None,
     ) -> torch.Tensor:
-        """Sample DMD timestep with CF's ``ts_schedule`` clamp + shift.
-
-        ``flash_dmd_t_min`` / ``flash_dmd_t_max`` are HARD bounds set
-        by the trainer's Flash-DMD regime gate. Unlike
-        ``denoised_timestep_from/to`` (which are gated by the
-        ``ts_schedule`` / ``ts_schedule_max`` config flags), the
-        Flash-DMD bounds always take effect when supplied — they
-        shouldn't be ignored just because the ts_schedule flags are
-        off in the active config. They override the corresponding
-        endpoint; the other endpoint follows the existing
-        ts_schedule-or-default logic.
-        """
-        # Lower bound: Flash-DMD override > ts_schedule from-pipeline
-        # > config default.
-        if flash_dmd_t_min is not None:
-            min_timestep = int(flash_dmd_t_min)
-        elif self.ts_schedule and denoised_timestep_to is not None:
+        """Sample DMD timestep with CF's ``ts_schedule`` clamp + shift."""
+        # Lower bound: ts_schedule from-pipeline > config default.
+        if self.ts_schedule and denoised_timestep_to is not None:
             min_timestep = denoised_timestep_to
         else:
             min_timestep = self.min_score_timestep
-        # Upper bound: Flash-DMD override > ts_schedule from-pipeline
-        # > config default.
-        if flash_dmd_t_max is not None:
-            max_timestep = int(flash_dmd_t_max)
-        elif self.ts_schedule_max and denoised_timestep_from is not None:
+        # Upper bound: ts_schedule from-pipeline > config default.
+        if self.ts_schedule_max and denoised_timestep_from is not None:
             max_timestep = denoised_timestep_from
         else:
             max_timestep = self.num_train_timestep
@@ -1957,8 +1913,6 @@ class ActionForcingDMD(SelfForcingModel):
         aug_t_real: Optional[torch.Tensor] = None,
         gt_target: Optional[torch.Tensor] = None,
         gt_z_per_slot: Optional[torch.Tensor] = None,
-        flash_dmd_t_min: Optional[int] = None,
-        flash_dmd_t_max: Optional[int] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """CF-parity DMD loss (eq. 7).
 
@@ -1993,8 +1947,6 @@ class ActionForcingDMD(SelfForcingModel):
                 batch_size, num_frame,
                 denoised_timestep_from, denoised_timestep_to,
                 device=image_or_video.device,
-                flash_dmd_t_min=flash_dmd_t_min,
-                flash_dmd_t_max=flash_dmd_t_max,
             )
             noise = torch.randn_like(image_or_video)
             noisy_latent = self.scheduler.add_noise(
@@ -2545,7 +2497,6 @@ class ActionForcingDMD(SelfForcingModel):
             conditional_dict=conditional_dict,
             clean_latent=clean_latent,
             initial_latent=initial_latent,
-            enable_mae_extension=True,
             seed_latents=seed_latents,
         )
         scoring_frames = self.num_training_frames
@@ -2740,7 +2691,6 @@ class ActionForcingDMD(SelfForcingModel):
                 conditional_dict=conditional_dict,
                 clean_latent=clean_latent,
                 initial_latent=initial_latent,
-                enable_mae_extension=False,
                 seed_latents=seed_latents,
                 requires_grad=False,
             )
@@ -3304,10 +3254,10 @@ class ActionForcingDMD(SelfForcingModel):
         # grad-active forward at the LAST rung in the same rollout.
         # The last-rung K/V is committed to the cache as-is (no
         # separate context_noise commit). The pipeline stashes the
-        # last-rung pred on ``pipe._last_rung_output``; we re-stitch
-        # it into a chunk_size-frame slab below for the GAN.
-        dual_grad_rollout = bool(
-            self.flash_dmd_paper_aligned_adv and requires_grad
+        # Flash-DMD t=flash_dmd_gan_t pred on ``pipe._flash_dmd_gan_output``;
+        # we re-stitch it into a chunk_size-frame slab below for the GAN.
+        flash_dmd_enabled = bool(
+            self.flash_dmd_enabled and requires_grad
         )
         # Warm-start init: when on, the iter's first block warm-starts
         # from the prior call's clean pred (= ``previous_clean_chunk``)
@@ -3327,16 +3277,19 @@ class ActionForcingDMD(SelfForcingModel):
             gt_latents=gt_chunk,
             sync_exit_flags=sync_exit_flags,
             force_exit_step=force_exit_step,
-            dual_grad_rollout=dual_grad_rollout,
+            flash_dmd_enabled=flash_dmd_enabled,
+            flash_dmd_gan_t=int(self.flash_dmd_gan_t),
             warm_start_init=warm_start_init,
             warm_start_rung_idx=self.warm_start_rung_idx,
             initial_prev_clean=initial_prev_clean,
             **cond_dict,
         )
-        # Pull the last-rung output (None when dual_grad_rollout=False).
+        # Pull the Flash-DMD t=gan_t output (None when flash_dmd_enabled=False).
         # Shape ``[B, new_frames, C, H, W]`` — the SAME npb-aligned slab
         # the pipeline rolled this iter.
-        new_last_rung_chunk = pipe._last_rung_output if dual_grad_rollout else None
+        new_last_rung_chunk = (
+            pipe._flash_dmd_gan_output if flash_dmd_enabled else None
+        )
         # Capture this call's last-block clean pred for the NEXT call's
         # warm-start seed. ``_last_clean_pred`` is the post-finish-
         # denoise cache_pred of the rollout's final block (already
@@ -3456,12 +3409,14 @@ class ActionForcingDMD(SelfForcingModel):
             "unconditional_dict": uncond_dict,
             "clean_conditional_dict": clean_cond_dict,
             "clean_unconditional_dict": clean_uncond_dict,
-            # Two-grad-point last-rung view (Flash-DMD §3.3). None when
-            # paper_aligned_adv is off OR this is a no-grad iter. The
-            # generator-loss path stashes this onto
-            # ``info["paper_aligned_x0_for_adv"]`` so the trainer's
-            # ``_compute_r3gan_losses`` consumes it as the G-side fake.
-            "last_rung_full_chunk": full_last_rung_chunk,
+            # Flash-DMD t=flash_dmd_gan_t view. None when
+            # ``flash_dmd_enabled`` is off OR this is a no-grad iter.
+            # The generator-loss path stashes this onto
+            # ``info["flash_dmd_gan_x0"]`` so the trainer's
+            # ``_compute_r3gan_losses`` and the gen-side aux losses
+            # (LPIPS / MS-SSIM / MANIQA / action_critic) consume it
+            # as the G-side fake.
+            "flash_dmd_gan_chunk": full_last_rung_chunk,
         }
         # Surface MAE from pipeline.
         ext = getattr(pipe, "_last_extension_metrics", None) or {}
@@ -3772,71 +3727,19 @@ class ActionForcingDMD(SelfForcingModel):
                     B, n_slots, npb, A,
                 ).mean(dim=2)
 
-        # Flash-DMD timestep gate: when the trainer rolls a low-noise
-        # iter, skip the entire DMD compute (no real_score / fake_score
-        # forward, no DMD gradient). The student gets only the GAN
-        # gradient this iter (gated trainer-side). Backward still works
-        # because we return a zero-loss bound to ``chunk`` so the
-        # autograd graph stays intact through the gen forward.
-        # ``flash_dmd_t_min/max`` (info-supplied by the trainer's
-        # regime gate) are HARD bounds for the DMD's per-frame
-        # timestep distribution, applied unconditionally inside
-        # ``_sample_dmd_timestep`` (i.e. they bypass the ``ts_schedule``
-        # / ``ts_schedule_max`` config flags).
-        flash_dmd_regime = info.get("flash_dmd_regime")  # "high"|"low"|None
-        flash_dmd_t_min = info.get("flash_dmd_t_min")
-        flash_dmd_t_max = info.get("flash_dmd_t_max")
-        # Paper-aligned adv path bypasses the per-iter regime gate —
-        # both DMD and adv fire every iter (paper Algorithm 1, lines
-        # 13-16). The DMD path uses high-noise t (constrained via
-        # the existing flash_dmd_t_min/max plumbing); the adv path
-        # uses an EXTRA single gen forward at low-noise ˆt computed
-        # below.
-        if self.flash_dmd_paper_aligned_adv:
-            flash_dmd_regime = None
-        if flash_dmd_regime == "low":
-            # Skip DMD entirely. Surface a sparse log dict (no
-            # ``timestep`` / ``dmdtrain_gradient_norm`` keys) so wandb
-            # plots aren't polluted with 0s on every low-noise iter —
-            # the regime indicator (``flash_dmd_regime``) below tells
-            # operators why a step is missing those metrics.
-            dmd_loss = (chunk * 0.0).sum()
-            dmd_log: Dict[str, Any] = {
-                "flash_dmd_skipped_low_noise": 1.0,
-            }
-        else:
-            # Dual-teacher routing: when a frozen merged-v14 teacher is
-            # held, the DMD scoring forwards through THAT module (a clean
-            # ``p_real`` model — no GT contamination, no moving target),
-            # not through the LoRA-active ``self.real_score``. We swap
-            # ``self.real_score`` ↔ ``self.real_score_frozen`` for the
-            # duration of the DMD call and pass clean_x_real=None so the
-            # frozen teacher sees only the self-view clean_x (proper DMD,
-            # no GT in the conditioning either). The aux pass below uses
-            # the LoRA teacher with the GT-mixed clean_x_real, gradient
-            # to BOTH the LoRA AND the student.
-            dual_teacher_active = self.real_score_frozen is not None
-            if dual_teacher_active:
-                _saved_real_score = self.real_score
-                self.real_score = self.real_score_frozen
-                try:
-                    dmd_loss, dmd_log = self.compute_distribution_matching_loss(
-                        image_or_video=chunk,
-                        conditional_dict=cond_for_scoring,
-                        unconditional_dict=uncond_for_scoring,
-                        gradient_mask=gradient_mask_eff,
-                        denoised_timestep_from=info.get("denoised_timestep_from"),
-                        denoised_timestep_to=info.get("denoised_timestep_to"),
-                        clean_x=sc_clean_x, aug_t=sc_aug_t,
-                        gt_target=gt_target,
-                        gt_z_per_slot=gt_z_per_slot,
-                        clean_x_real=None, aug_t_real=None,
-                        flash_dmd_t_min=flash_dmd_t_min,
-                        flash_dmd_t_max=flash_dmd_t_max,
-                    )
-                finally:
-                    self.real_score = _saved_real_score
-            else:
+        # Standard DMD: random exit-rung output is graph-on; DMD
+        # samples a timestep from the rung-bounded range and computes
+        # the score-matching loss. Dual-teacher routing applies when a
+        # frozen merged-v14 teacher is held — DMD scoring forwards
+        # through THAT module (clean p_real, no LoRA-active drift)
+        # and passes clean_x_real=None so the frozen teacher sees only
+        # the self-view clean_x. The aux pass below uses the LoRA
+        # teacher with the GT-mixed clean_x_real.
+        dual_teacher_active = self.real_score_frozen is not None
+        if dual_teacher_active:
+            _saved_real_score = self.real_score
+            self.real_score = self.real_score_frozen
+            try:
                 dmd_loss, dmd_log = self.compute_distribution_matching_loss(
                     image_or_video=chunk,
                     conditional_dict=cond_for_scoring,
@@ -3847,42 +3750,46 @@ class ActionForcingDMD(SelfForcingModel):
                     clean_x=sc_clean_x, aug_t=sc_aug_t,
                     gt_target=gt_target,
                     gt_z_per_slot=gt_z_per_slot,
-                    clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
-                    flash_dmd_t_min=flash_dmd_t_min,
-                    flash_dmd_t_max=flash_dmd_t_max,
+                    clean_x_real=None, aug_t_real=None,
                 )
-            dmd_loss = dmd_loss * self.dmd_loss_weight
-            if flash_dmd_regime == "high":
-                dmd_log["flash_dmd_high_noise"] = 1.0
-        if flash_dmd_regime is not None:
-            dmd_log["flash_dmd_regime"] = (
-                1.0 if flash_dmd_regime == "high" else 0.0
+            finally:
+                self.real_score = _saved_real_score
+        else:
+            dmd_loss, dmd_log = self.compute_distribution_matching_loss(
+                image_or_video=chunk,
+                conditional_dict=cond_for_scoring,
+                unconditional_dict=uncond_for_scoring,
+                gradient_mask=gradient_mask_eff,
+                denoised_timestep_from=info.get("denoised_timestep_from"),
+                denoised_timestep_to=info.get("denoised_timestep_to"),
+                clean_x=sc_clean_x, aug_t=sc_aug_t,
+                gt_target=gt_target,
+                gt_z_per_slot=gt_z_per_slot,
+                clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
             )
+        dmd_loss = dmd_loss * self.dmd_loss_weight
 
-        # Flash-DMD paper §3.3 Eq. 8-9: when paper_aligned_adv is on,
-        # the rolling rollout's two-grad-point mode emitted a grad-
-        # active LAST-RUNG forward in the SAME rollout (no extra gen
-        # forward; the last-rung pred replaces the standard cache-
-        # commit forward). ``info["last_rung_full_chunk"]`` carries
-        # the chunk_size-aligned slab (overlap from prior iter's
-        # last-rung pred + this iter's grad-active last-rung pred).
-        # Grad path:
-        #   adv_loss → last_rung_full_chunk → last-rung gen forward
-        #     in rollout → gen params
+        # Flash-DMD: when enabled, the rolling rollout emitted a
+        # per-block t=flash_dmd_gan_t grad-on forward. The chunk_size-
+        # aligned slab (overlap from prior iter's t=gan_t pred + this
+        # iter's grad-active t=gan_t preds) lives in
+        # ``info["flash_dmd_gan_chunk"]``. We surface it as
+        # ``info["flash_dmd_gan_x0"]`` so the trainer's GAN and aux
+        # losses can consume it. Grad path:
+        #   adv_loss → flash_dmd_gan_x0 → t=gan_t gen forward → gen.
         # The gradient does NOT traverse the high-noise denoising
-        # rungs (those stayed no_grad); the paper's claim that adv
-        # supervises only the gen's texture-refinement (low-noise)
-        # behavior is preserved.
-        if self.flash_dmd_paper_aligned_adv:
-            last_rung_chunk = info.get("last_rung_full_chunk")
+        # rungs (no_grad); GAN supervision is restricted to texture
+        # refinement at near-clean noise.
+        if self.flash_dmd_enabled:
+            last_rung_chunk = info.get("flash_dmd_gan_chunk")
             if last_rung_chunk is None:
                 raise RuntimeError(
-                    "flash_dmd_paper_aligned_adv=True but "
-                    "info['last_rung_full_chunk'] is None — the "
-                    "rollout must run with dual_grad_rollout=True so "
-                    "the pipeline emits the last-rung output."
+                    "flash_dmd_enabled=True but "
+                    "info['flash_dmd_gan_chunk'] is None — the "
+                    "rollout must run with flash_dmd_enabled=True so "
+                    "the pipeline emits the t=flash_dmd_gan_t output."
                 )
-            info["paper_aligned_x0_for_adv"] = last_rung_chunk
+            info["flash_dmd_gan_x0"] = last_rung_chunk
 
         # Auxiliary online-teacher pass (option 3 of the dual-teacher
         # design). When ``real_teacher_train_online`` is True we run a

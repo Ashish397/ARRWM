@@ -156,8 +156,6 @@ class ActionForcingTrainingPipeline:
         last_step_only: bool = False,
         num_max_frames: int = 21,
         rollout_frames: Optional[int] = None,
-        mae_extension_threshold: Optional[float] = None,
-        mae_extension_max_extra_chunks: int = 0,
         context_noise: int = 0,
         **kwargs,
     ):
@@ -205,27 +203,6 @@ class ActionForcingTrainingPipeline:
                 f"num_max_frames ({self.num_max_frames}); the gradient "
                 f"window is the LAST num_max_frames frames of the "
                 f"rollout, so the rollout must be at least that long."
-            )
-
-        # MAE-driven dynamic rollout extension. ``mae_extension_threshold``
-        # is the upper bound on the latent-space mean-absolute-error of
-        # the last 3 generated frames vs GT; below this we roll one
-        # more 3-frame chunk (no_grad, full denoise). ``max_extra_chunks``
-        # bounds how many extra chunks we'll roll per call (a COMPUTE
-        # cap, not a memory cap — extension chunks commit through the
-        # rolling cache, see ``kv_cache_size`` below). Set the threshold
-        # to ``None`` to disable extensions entirely; this is genuinely
-        # free since the cache buffer never grows for extensions.
-        self.mae_extension_threshold: Optional[float] = (
-            float(mae_extension_threshold)
-            if mae_extension_threshold is not None
-            else None
-        )
-        self.mae_extension_max_extra_chunks = int(mae_extension_max_extra_chunks)
-        if self.mae_extension_max_extra_chunks < 0:
-            raise ValueError(
-                f"mae_extension_max_extra_chunks must be >= 0; got "
-                f"{self.mae_extension_max_extra_chunks}"
             )
 
         # Per-call metrics dict, populated by ``inference_with_trajectory``.
@@ -395,12 +372,12 @@ class ActionForcingTrainingPipeline:
         clean_image_or_video: Optional[torch.Tensor] = None,
         initial_latent: Optional[torch.Tensor] = None,
         gt_latents: Optional[torch.Tensor] = None,
-        enable_mae_extension: bool = False,
         return_sim_step: bool = False,
         seed_latents: Optional[torch.Tensor] = None,
         prefer_cache_pred_in_output: bool = False,
         requires_grad: bool = True,
-        dual_grad_rollout: bool = False,
+        flash_dmd_enabled: bool = False,
+        flash_dmd_gan_t: int = 60,
         warm_start_init: bool = False,
         warm_start_rung_idx: int = 1,
         initial_prev_clean: Optional[torch.Tensor] = None,
@@ -415,16 +392,9 @@ class ActionForcingTrainingPipeline:
                 exclusive with ``seed_latents``.
             gt_latents: ``[B, F_gt, C, H, W]`` ground-truth latents
                 covering the BASELINE rollout AND any frames the MAE-
-                extension loop might roll into. ``F_gt`` must be at
-                least ``rollout_frames``; extensions are bounded
-                additionally by ``F_gt - rollout_frames`` (i.e. they
-                stop when GT runs out). Pass ``None`` to disable
-                extensions and skip MAE metric collection.
-            enable_mae_extension: gates the extension loop. The
-                generator step passes ``True``; the critic step
-                passes ``False`` to avoid a duplicate (gradient-free)
-                rollout that would only produce the same metrics
-                the generator step already logged.
+                extension loop might roll into (legacy; unused now
+                that the MAE-extension path is removed). Pass
+                ``None`` to skip MAE metric collection.
             return_sim_step: if True, also return the exit step index
                 (legacy interface, unused by Phase-1 Action-Forcing).
             seed_latents: ``[B, cf, C, H, W]`` clean GT latents to
@@ -440,15 +410,11 @@ class ActionForcingTrainingPipeline:
                 When ``seed_latents`` is provided the streams must
                 cover ``cf + rollout_frames`` frames (seed first,
                 then rollout). Otherwise must cover at least
-                ``rollout_frames``; extension mode covers up to
-                ``rollout_frames + max_extra_chunks*npb``.
+                ``rollout_frames``.
 
         Returns:
             ``(output, denoised_timestep_from, denoised_timestep_to)``
-            where ``output`` is shape ``[B, rollout_frames, C, H, W]``
-            (BASELINE only — extensions are not included so the DMD
-            scoring path is unaffected). MAE-extension metrics live on
-            ``self._last_extension_metrics`` after the call.
+            where ``output`` is shape ``[B, rollout_frames, C, H, W]``.
         """
         if seed_latents is not None and initial_latent is not None:
             raise ValueError(
@@ -456,20 +422,15 @@ class ActionForcingTrainingPipeline:
                 "Phase-1 Action-Forcing uses seed_latents (cf-frame KV "
                 "prefill), the i2v initial_latent path is legacy."
             )
-        # Reset per-call metrics (NaN = not computed; gets overwritten
-        # in the extension path when gt_latents is available).
-        nan_f = float("nan")
-        self._last_extension_metrics = {
-            "mae_extension_count": 0,
-            "last_chunk_mae": nan_f,
-            "baseline_last_chunk_mae": nan_f,
-            "baseline_avg_rollout_mae": nan_f,
-        }
-        # Reset per-call last-rung output (Flash-DMD §3.3 two-grad-point
-        # rollout). Populated below when ``dual_grad_rollout=True``;
-        # remains None otherwise so callers can fail-fast if they
-        # expect it but the rollout wasn't run in two-grad-point mode.
-        self._last_rung_output: Optional[torch.Tensor] = None
+        # Reset per-call metrics dict (kept for back-compat with the
+        # ``mae_extension_count`` consumer; the rest of the legacy
+        # baseline_* / last_chunk_mae keys are no longer populated).
+        self._last_extension_metrics = {"mae_extension_count": 0}
+        # Reset per-call Flash-DMD t=flash_dmd_gan_t output. Populated
+        # below when ``flash_dmd_enabled=True``; remains None otherwise
+        # so callers can fail-fast if they expect it but the rollout
+        # wasn't run with Flash DMD active.
+        self._flash_dmd_gan_output: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (= cache_pred at the
         # last rung's t after the post-exit finish-denoise chain;
         # captured BEFORE the standard mode's context_noise commit
@@ -618,24 +579,19 @@ class ActionForcingTrainingPipeline:
 
         # Step 3: Per-rolling-step denoise loop with truncated random-exit.
         num_denoising_steps = len(self.denoising_step_list)
-        # ``dual_grad_rollout=True`` (Flash-DMD §3.3 two-grad-point):
-        #   * DMD takes grad at a RANDOM exit rung, sampled from
-        #     ``[0, num_denoising_steps - 1)`` (last rung excluded).
-        #   * The post-exit chain finishes denoising with NO grad up to
-        #     the last rung; the LAST rung's forward is grad-active and
-        #     produces ``last_rung_pred`` (the gen's "texture refinement"
-        #     output). Its K/V is committed to the cache as-is — no
-        #     separate context_noise commit forward (Step 3.4 below
-        #     becomes a no-op in this mode).
-        #   * Both pred_x0 (DMD-grad at exit rung) and last_rung_pred
-        #     (GAN-grad at last rung) live in a single rollout's
-        #     autograd graph; the trainer sums L = L_DMD + λ · L_adv
-        #     and a single backward populates both gen-side gradients.
-        if dual_grad_rollout and num_denoising_steps < 2:
-            raise ValueError(
-                "dual_grad_rollout=True requires denoising_step_list of "
-                f"length >= 2; got {num_denoising_steps}."
-            )
+        # ``flash_dmd_enabled=True``: every block adds ONE extra graph-on
+        # gen forward at ``flash_dmd_gan_t`` (default 60, raw post-warp
+        # timestep) AFTER the standard denoise chain finishes. The extra
+        # forward's output (= ``flash_dmd_gan_pred`` per block, assembled
+        # into ``flash_dmd_gan_output``) is consumed by the GAN adv loss
+        # and the gen-side aux losses (LPIPS / MS-SSIM / MANIQA /
+        # action_critic). DMD scoring continues to use the random-exit-
+        # rung output (= ``denoised_pred``). The K/V slots written by
+        # the flash_dmd forward are overwritten by Step 3.4's context-
+        # noise commit so the next block's exit-rung forward reads
+        # graph-free K/V (paper §3.3 cross-timestep decoupling).
+        # The random exit pool now spans ALL rungs (including the last)
+        # since GAN no longer reserves the last rung.
         # ``warm_start_init=True``: blocks that have a prior chunk's
         # clean pred (block_index >= 1 within this call, OR block 0
         # when ``initial_prev_clean`` is supplied by the caller) skip
@@ -671,11 +627,11 @@ class ActionForcingTrainingPipeline:
         if warm_start_init:
             cold_flags = self.generate_and_sync_list(
                 len(all_num_frames), num_denoising_steps, device=noise.device,
-                exclude_last_rung=dual_grad_rollout, low=0,
+                exclude_last_rung=False, low=0,
             )
             warm_flags = self.generate_and_sync_list(
                 len(all_num_frames), num_denoising_steps, device=noise.device,
-                exclude_last_rung=dual_grad_rollout,
+                exclude_last_rung=False,
                 low=warm_start_rung_idx,
             )
             block0_is_warm = initial_prev_clean is not None
@@ -693,21 +649,21 @@ class ActionForcingTrainingPipeline:
         else:
             exit_flags = self.generate_and_sync_list(
                 len(all_num_frames), num_denoising_steps, device=noise.device,
-                exclude_last_rung=dual_grad_rollout,
+                exclude_last_rung=False,
             )
-        # Buffer for accumulating last-rung grad-active outputs across
-        # blocks (one [B, current_num_frames, C, H, W] slab per block,
-        # zero-init for warmup blocks where last-rung forward stays
-        # no_grad). Sized to num_output_frames so block writes use
-        # absolute current_start_frame indexing, mirroring ``output``.
-        if dual_grad_rollout:
-            last_rung_output = torch.zeros(
+        # Buffer for accumulating Flash-DMD t=flash_dmd_gan_t grad-active
+        # outputs across blocks (one [B, current_num_frames, C, H, W]
+        # slab per block, zero-init for warmup blocks where the forward
+        # stays no_grad). Sized to num_output_frames so block writes
+        # use absolute current_start_frame indexing, mirroring ``output``.
+        if flash_dmd_enabled:
+            flash_dmd_gan_output = torch.zeros(
                 [batch_size, num_output_frames, num_channels, height, width],
                 device=noise.device,
                 dtype=noise.dtype,
             )
         else:
-            last_rung_output = None
+            flash_dmd_gan_output = None
         # CF-parity #11: gradient-window gate. CF hardcodes a literal
         # 21 here (``Causal-Forcing/pipeline/self_forcing_training.py:
         # 120``: ``start_gradient_frame_index = num_output_frames - 21``)
@@ -881,38 +837,11 @@ class ActionForcingTrainingPipeline:
                     break
 
             # Step 3.2: Finish the denoising chain past the random exit
-            # rung. ``denoised_pred`` from the exit forward is the
-            # model's x0 estimate AT the random exit timestep — used by
-            # DMD as the grad-active output.
-            #
-            # Standard mode (``dual_grad_rollout=False``): every
-            # post-exit forward runs under ``no_grad``. ``cache_pred``
-            # ends up at the last rung's clean x0 estimate, then Step
-            # 3.4 below commits a t=context_noise forward to the cache.
-            #
-            # Two-grad-point mode (``dual_grad_rollout=True``,
-            # Flash-DMD §3.3): exit_index ∈ [0, N-2] (last rung was
-            # excluded at sampling). The post-exit chain stays no_grad
-            # for all but the LAST rung; at j == N-1 we run a
-            # GRAD-ACTIVE forward whose output is ``last_rung_pred``
-            # (the gen's "texture refinement" output, paper Eq. 9 with
-            # ˆt = denoising_step_list[-1]). The grad path through this
-            # forward feeds the GAN's adv loss only.
-            #
-            # CRITICAL — paper §3.3 K/V decoupling: the grad-active
-            # last-rung forward also WRITES graph-attached K/V to the
-            # rolling cache. We MUST then run the standard no_grad
-            # context_noise commit forward (Step 3.4 below — runs in
-            # both modes) to OVERWRITE those slots with graph-free K/V
-            # at t=context_noise. Without this overwrite, the next
-            # block's exit-flag (DMD-grad) forward would read graph-
-            # attached K/V and DMD's high-noise gradient would chain
-            # back through the prior block's last-rung (low-noise) gen
-            # forward — exactly the cross-timestep interference the
-            # paper's decoupling guarantee forbids. Cost: +1 gen
-            # forward per block (matches standard mode's budget).
+            # rung — fully no_grad. ``cache_pred`` ends up at the last
+            # rung's clean x0 estimate. ``denoised_pred`` (the random
+            # exit-rung's grad-active output) is what DMD scoring
+            # consumes; it's preserved unchanged.
             cache_pred = denoised_pred.detach()
-            last_rung_pred: Optional[torch.Tensor] = None
             num_rungs = len(self.denoising_step_list)
             for j in range(exit_index + 1, num_rungs):
                 next_t_value = int(round(float(
@@ -930,32 +859,7 @@ class ActionForcingTrainingPipeline:
                     ),
                 ).unflatten(0, denoised_pred.shape[:2])
                 step_t = torch.full_like(timestep, next_t_value)
-                is_last_rung = (j == num_rungs - 1)
-                # Last-rung grad gate: in two-grad-point mode AND when
-                # the block is in the gradient-active window AND when
-                # this is the FINAL BLOCK of the rollout call. The
-                # final-block restriction is the memory fix for v8:
-                # making every block's last-rung forward grad-active
-                # adds N grad-active forwards per call (N=7 for
-                # rollout_frames=21, npb=3) and OOMs the 95 GB GPU.
-                # The disc consumes the assembled last_rung_full_chunk
-                # = chunk_size frames = (overlap-detached) + (new-grad).
-                # Only the new-frames region carries gradient back to
-                # the gen anyway (overlap is detached at the model-side
-                # stitcher), so making earlier blocks' last-rung
-                # forwards grad-active here would burn activations for
-                # gradients that never propagate back to gen weights.
-                # Saves ~6 grad-active forwards × ~1.5 GB activations
-                # in iter 1 (multi-block calls) ≈ 9 GB. No-op for
-                # iter 2+ (single-block calls) where last == only.
-                is_final_block = (block_index == len(all_num_frames) - 1)
-                last_rung_grad = (
-                    dual_grad_rollout
-                    and is_last_rung
-                    and is_final_block
-                    and current_start_frame >= start_gradient_frame_index
-                )
-                if last_rung_grad:
+                with torch.no_grad():
                     _, cache_pred = self.generator(
                         noisy_image_or_video=cache_input,
                         conditional_dict=block_cond,
@@ -964,30 +868,54 @@ class ActionForcingTrainingPipeline:
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
-                    last_rung_pred = cache_pred
+
+            # Step 3.2.b: Flash-DMD t=flash_dmd_gan_t grad-on forward.
+            # When ``flash_dmd_enabled``, take the post-chain clean x0
+            # (= ``cache_pred``, no_grad), noise to ``flash_dmd_gan_t``,
+            # forward graph-on (in the gradient-active window) or
+            # no_grad (warmup blocks). The output's gradient flows ONLY
+            # through this forward's gen weights — the input is detached
+            # upstream. Step 3.4 below overwrites the K/V slots with
+            # no_grad context-noise K/V so the NEXT block's exit-rung
+            # forward reads graph-free K/V (paper §3.3 cross-timestep
+            # decoupling). Fires on EVERY block in the grad window
+            # (no final-block restriction).
+            flash_dmd_pred: Optional[torch.Tensor] = None
+            if flash_dmd_enabled:
+                flash_t_value = int(flash_dmd_gan_t)
+                flash_flat = cache_pred.flatten(0, 1)
+                flash_input = self.scheduler.add_noise(
+                    flash_flat,
+                    torch.randn_like(flash_flat),
+                    flash_t_value * torch.ones(
+                        [batch_size * current_num_frames],
+                        device=noise.device, dtype=torch.long,
+                    ),
+                ).unflatten(0, cache_pred.shape[:2])
+                flash_t_step = torch.full_like(timestep, flash_t_value)
+                flash_grad_active = (
+                    requires_grad
+                    and current_start_frame >= start_gradient_frame_index
+                )
+                if flash_grad_active:
+                    _, flash_dmd_pred = self.generator(
+                        noisy_image_or_video=flash_input,
+                        conditional_dict=block_cond,
+                        timestep=flash_t_step,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
                 else:
                     with torch.no_grad():
-                        _, cache_pred = self.generator(
-                            noisy_image_or_video=cache_input,
+                        _, flash_dmd_pred = self.generator(
+                            noisy_image_or_video=flash_input,
                             conditional_dict=block_cond,
-                            timestep=step_t,
+                            timestep=flash_t_step,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length,
                         )
-                    if dual_grad_rollout and is_last_rung:
-                        # Warmup block in two-grad-point mode: surface
-                        # the no_grad last-rung pred so the assembled
-                        # ``last_rung_output`` has a populated slab
-                        # (the trainer slices the trailing
-                        # ``num_max_frames`` for the GAN — warmup
-                        # frames are discarded by that slice, but
-                        # leaving zeros here would feed bogus pixel
-                        # video to the SAM2 disc on the boundary
-                        # block when rollout_frames == num_max_frames
-                        # the warmup region is empty so this branch
-                        # is rarely hit).
-                        last_rung_pred = cache_pred
 
             # Step 3.3: Record the model's output. By default this is
             # the grad-active ``denoised_pred`` (x0 at the random exit
@@ -1014,52 +942,44 @@ class ActionForcingTrainingPipeline:
             # rollout's final ``_last_clean_pred`` after the last
             # block). Detach so subsequent blocks' autograd graphs
             # don't chain back through this block's gen forwards.
-            # Captured BEFORE Step 3.4's context_noise commit in
-            # standard mode (which overwrites cache_pred with its
-            # re-noised version); in dual_grad mode cache_pred is
-            # already the grad-active last-rung pred.
+            # Captured BEFORE Step 3.4's context_noise commit (which
+            # overwrites cache_pred K/V with its re-noised version).
             prev_block_clean = cache_pred.detach()
 
-            if dual_grad_rollout:
-                # Stash the last-rung pred (grad-active for in-window
-                # blocks, no_grad for warmup blocks) into the
-                # per-rollout ``last_rung_output`` buffer at the same
-                # absolute frame indices as ``output`` for the trainer
-                # to pick up on the GAN side. The rolling cache's K/V
-                # written by this last-rung forward is overwritten by
-                # the context_noise commit below — the GAN's grad path
-                # lives in ``last_rung_output``, not in the cache.
-                if last_rung_pred is None:
+            if flash_dmd_enabled:
+                # Stash the Flash-DMD t=flash_dmd_gan_t pred (grad-active
+                # for in-window blocks, no_grad for warmup blocks) into
+                # the per-rollout ``flash_dmd_gan_output`` buffer at the
+                # same absolute frame indices as ``output`` for the
+                # trainer to pick up on the GAN / aux-loss side. The
+                # rolling cache's K/V written by this forward is
+                # overwritten by the context_noise commit below — the
+                # GAN's grad path lives in ``flash_dmd_gan_output``,
+                # not in the cache.
+                if flash_dmd_pred is None:
                     raise RuntimeError(
-                        "dual_grad_rollout=True but post-exit chain "
-                        "did not produce last_rung_pred. This indicates "
-                        "exit_index sampling escaped the [0, N-2] bound."
+                        "flash_dmd_enabled=True but Step 3.2.b did not "
+                        "produce flash_dmd_pred."
                     )
-                last_rung_output[
+                flash_dmd_gan_output[
                     :,
                     current_start_frame: current_start_frame + current_num_frames,
-                ] = last_rung_pred
+                ] = flash_dmd_pred
 
             # Step 3.4: Cache-update forward at t=context_noise. Runs
-            # in BOTH modes:
-            #   * Standard (dual_grad_rollout=False): committing the
-            #     fully-denoised cache_pred at context_noise gives the
-            #     rolling cache a clean x0 estimate (no noise
-            #     compounding for downstream chunks).
-            #   * Dual-grad (dual_grad_rollout=True): MANDATORY for
-            #     paper §3.3 K/V decoupling — overwrites the grad-
-            #     attached K/V slots written by the last-rung grad
-            #     forward with graph-free K/V at t=context_noise so
-            #     the next block's exit-flag (DMD-grad) forward reads
-            #     detached K/V.
-            # In dual-grad mode the input is detached so we don't
-            # build an extra autograd path through ``add_noise``; the
-            # generator's no_grad context already guarantees graph-
-            # free K/V writes, but the upstream detach releases the
-            # input's autograd nodes early (memory hygiene).
-            commit_input_clean = (
-                cache_pred.detach() if dual_grad_rollout else cache_pred
-            )
+            # in BOTH modes (flash_dmd_enabled or not):
+            #   * Standard: committing the fully-denoised cache_pred at
+            #     context_noise gives the rolling cache a clean x0
+            #     estimate (no noise compounding for downstream chunks).
+            #   * Flash-DMD: MANDATORY for paper §3.3 K/V decoupling —
+            #     overwrites the grad-attached K/V slots written by
+            #     the t=flash_dmd_gan_t grad-on forward with graph-free
+            #     K/V at t=context_noise so the next block's exit-rung
+            #     (DMD-grad) forward reads detached K/V.
+            # The input is always detached (cache_pred came from a
+            # no_grad chain anyway, but the explicit detach releases
+            # any autograd nodes early — memory hygiene).
+            commit_input_clean = cache_pred.detach()
             context_timestep = torch.full_like(timestep, self.context_noise)
             cache_commit_input = self.scheduler.add_noise(
                 commit_input_clean.flatten(0, 1),
@@ -1077,138 +997,6 @@ class ActionForcingTrainingPipeline:
                 )
 
             current_start_frame += current_num_frames
-
-        # Step 3.4: MAE metrics + dynamic rollout extension.
-        # We always compute the baseline last-chunk MAE if ``gt_latents``
-        # is available (caller wants this on wandb regardless of
-        # whether extensions are enabled). Extensions then fire ONLY
-        # when ``enable_mae_extension`` is True AND the threshold is
-        # set AND there's GT room to grow into AND the extension cap
-        # isn't already 0.
-        npb = self.num_frame_per_block
-        baseline_can_compute_mae = (
-            gt_latents is not None
-            and denoised_pred is not None
-            and gt_latents.shape[1] >= current_start_frame
-        )
-        if baseline_can_compute_mae:
-            baseline_last_mae_value = self._compute_chunk_mae(
-                pred_chunk=output[
-                    :, current_start_frame - npb: current_start_frame
-                ].detach(),
-                gt_chunk=gt_latents[
-                    :, current_start_frame - npb: current_start_frame
-                ],
-            )
-            self._last_extension_metrics["baseline_last_chunk_mae"] = (
-                baseline_last_mae_value
-            )
-            self._last_extension_metrics["last_chunk_mae"] = (
-                baseline_last_mae_value
-            )
-            # Average MAE across the FULL baseline rollout (= the
-            # gradient-active scoring window). This is the metric the
-            # collapse gate uses — averaging over the whole rollout
-            # is more robust than the last-chunk MAE which can be
-            # dominated by the structural end-of-window OOD region
-            # (RoPE [N, N+shift) with no clean-half counterpart). Same
-            # ``_compute_chunk_mae`` so all-reduce semantics match.
-            #
-            # ``rollout_start = current_start_frame - rollout_frames``
-            # (= seed_frames after seed prefill). The slice covers the
-            # entire baseline output[seed:seed+rollout_frames] vs GT
-            # at the same absolute ride positions.
-            rollout_start = current_start_frame - rollout_frames
-            if (
-                rollout_start >= 0
-                and gt_latents.shape[1] >= current_start_frame
-            ):
-                baseline_avg_rollout_mae_value = self._compute_chunk_mae(
-                    pred_chunk=output[
-                        :, rollout_start: current_start_frame
-                    ].detach(),
-                    gt_chunk=gt_latents[
-                        :, rollout_start: current_start_frame
-                    ],
-                )
-                self._last_extension_metrics["baseline_avg_rollout_mae"] = (
-                    baseline_avg_rollout_mae_value
-                )
-
-        extension_active = (
-            enable_mae_extension
-            and self.mae_extension_threshold is not None
-            and self.mae_extension_max_extra_chunks > 0
-            and gt_latents is not None
-            and baseline_can_compute_mae
-        )
-        if extension_active:
-            threshold = float(self.mae_extension_threshold)
-            extension_count = 0
-            last_chunk_mae_value = (
-                self._last_extension_metrics["baseline_last_chunk_mae"]
-            )
-
-            # DDP-safe extension cap. ``_compute_chunk_mae`` performs an
-            # ``all_reduce`` inside the loop, so EVERY rank must enter and
-            # exit it the same number of times. Different ranks can have
-            # DIFFERENT GT lengths (rides aren't truncated to a fixed
-            # length — see ``causal_action_forcing_train._load_ride_tensors``
-            # called with ``max_frames=None``), so a rank-local stop
-            # condition like ``current_start + npb <= gt_latents.shape[1]``
-            # would let one rank exit while peers wait forever on the next
-            # all-reduce.
-            #
-            # Fix: reduce the per-rank "how many more 3-frame chunks of GT
-            # do I have left" with ``ReduceOp.MIN`` BEFORE the loop, then
-            # use that synced count as the only loop bound. The MAE-vs-
-            # threshold check is already lockstep (averaged across ranks
-            # in ``_compute_chunk_mae``).
-            local_available = max(
-                0, (gt_latents.shape[1] - current_start_frame) // npb
-            )
-            avail_t = torch.tensor(
-                [local_available],
-                device=gt_latents.device,
-                dtype=torch.long,
-            )
-            if dist.is_initialized():
-                dist.all_reduce(avail_t, op=dist.ReduceOp.MIN)
-            synced_available = int(avail_t.item())
-            max_iters = min(
-                self.mae_extension_max_extra_chunks, synced_available
-            )
-
-            while (
-                extension_count < max_iters
-                and last_chunk_mae_value == last_chunk_mae_value  # NaN guard
-                and last_chunk_mae_value < threshold
-            ):
-                ext_denoised = self._run_extension_block(
-                    batch_size=batch_size,
-                    num_channels=num_channels,
-                    height=height,
-                    width=width,
-                    current_start_frame=current_start_frame,
-                    conditional_dict=conditional_dict,
-                    device=noise.device,
-                    dtype=noise.dtype,
-                )
-                last_chunk_mae_value = self._compute_chunk_mae(
-                    pred_chunk=ext_denoised,
-                    gt_chunk=gt_latents[
-                        :, current_start_frame: current_start_frame + npb
-                    ],
-                )
-                extension_count += 1
-                current_start_frame += npb
-
-            self._last_extension_metrics["mae_extension_count"] = (
-                extension_count
-            )
-            self._last_extension_metrics["last_chunk_mae"] = (
-                last_chunk_mae_value
-            )
 
         # Step 3.5: Engineering trick — derive the timestep range we
         # supervised in this rollout (used by DMD's ts_schedule clamp).
@@ -1246,16 +1034,16 @@ class ActionForcingTrainingPipeline:
         # region, frames [num_input_frames + num_seed_frames :].
         if num_seed_frames > 0 or num_input_frames > 0:
             output = output[:, num_input_frames + num_seed_frames:]
-            if last_rung_output is not None:
-                last_rung_output = last_rung_output[
+            if flash_dmd_gan_output is not None:
+                flash_dmd_gan_output = flash_dmd_gan_output[
                     :, num_input_frames + num_seed_frames:
                 ]
 
-        # Stash the two-grad-point last-rung output on the pipeline
+        # Stash the Flash-DMD t=flash_dmd_gan_t output on the pipeline
         # instance so the model can read it without a return-tuple
         # signature change (mirrors ``_last_extension_metrics``).
-        # ``None`` when ``dual_grad_rollout=False``.
-        self._last_rung_output = last_rung_output
+        # ``None`` when ``flash_dmd_enabled=False``.
+        self._flash_dmd_gan_output = flash_dmd_gan_output
 
         # Stash the rollout's final block clean pred for the caller
         # to use as the next call's ``initial_prev_clean`` (warm-start
@@ -1304,94 +1092,6 @@ class ActionForcingTrainingPipeline:
         if dist.is_initialized():
             dist.all_reduce(mae, op=dist.ReduceOp.AVG)
         return float(mae.item())
-
-    def _run_extension_block(
-        self,
-        batch_size: int,
-        num_channels: int,
-        height: int,
-        width: int,
-        current_start_frame: int,
-        conditional_dict: dict,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Run one ``num_frame_per_block``-frame extension chunk.
-
-        Always under ``no_grad`` (extensions never carry gradient — the
-        DMD scoring window is the BASELINE rollout's last
-        ``num_max_frames`` frames). Full denoise: every rung in
-        ``denoising_step_list`` runs, no random exit. After the final
-        denoise, a t=context_noise forward commits the K/V to the
-        cache exactly like the baseline blocks, so subsequent extensions
-        see the new chunk as committed context.
-
-        Returns the final denoised prediction
-        ``[B, num_frame_per_block, C, H, W]`` for the caller's MAE
-        check.
-        """
-        npb = self.num_frame_per_block
-        block_cond = _slice_per_frame_streams(
-            conditional_dict,
-            frame_start=current_start_frame,
-            frame_count=npb,
-        )
-
-        noisy_input = torch.randn(
-            [batch_size, npb, num_channels, height, width],
-            device=device, dtype=dtype,
-        )
-
-        num_denoising_steps = len(self.denoising_step_list)
-        denoised_pred: Optional[torch.Tensor] = None
-        timestep: Optional[torch.Tensor] = None
-
-        with torch.no_grad():
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                ts_value = int(round(float(current_timestep)))
-                timestep = torch.full(
-                    [batch_size, npb], ts_value,
-                    device=device, dtype=torch.int64,
-                )
-                _, denoised_pred = self.generator(
-                    noisy_image_or_video=noisy_input,
-                    conditional_dict=block_cond,
-                    timestep=timestep,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
-                )
-                if index < num_denoising_steps - 1:
-                    next_t_value = int(round(float(
-                        self.denoising_step_list[index + 1]
-                    )))
-                    flat = denoised_pred.flatten(0, 1)
-                    noisy_input = self.scheduler.add_noise(
-                        flat,
-                        torch.randn_like(flat),
-                        next_t_value * torch.ones(
-                            [batch_size * npb],
-                            device=device, dtype=torch.long,
-                        ),
-                    ).unflatten(0, denoised_pred.shape[:2])
-
-            assert denoised_pred is not None and timestep is not None
-            context_timestep = torch.full_like(timestep, self.context_noise)
-            cache_pred = self.scheduler.add_noise(
-                denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
-                context_timestep.flatten(0, 1),
-            ).unflatten(0, denoised_pred.shape[:2])
-            self.generator(
-                noisy_image_or_video=cache_pred,
-                conditional_dict=block_cond,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
-
-        return denoised_pred.detach()
 
     # -----------------------------------------------------------------
     # Cache initializers (CF-shape: [B, kv_cache_size, 12, 128]).
@@ -1452,7 +1152,8 @@ class ActionForcingTrainingPipeline:
         gt_latents: Optional[torch.Tensor] = None,
         sync_exit_flags: bool = True,
         force_exit_step: Optional[int] = None,
-        dual_grad_rollout: bool = False,
+        flash_dmd_enabled: bool = False,
+        flash_dmd_gan_t: int = 60,
         warm_start_init: bool = False,
         warm_start_rung_idx: int = 1,
         initial_prev_clean: Optional[torch.Tensor] = None,
@@ -1499,15 +1200,12 @@ class ActionForcingTrainingPipeline:
                 "(typically via ``setup_sequence``) before this method."
             )
 
-        nan_f = float("nan")
-        self._last_extension_metrics = {
-            "mae_extension_count": 0,
-            "last_chunk_mae": nan_f,
-            "baseline_last_chunk_mae": nan_f,
-            "baseline_avg_rollout_mae": nan_f,
-        }
-        # Reset per-call last-rung output (Flash-DMD §3.3 two-grad-point).
-        self._last_rung_output: Optional[torch.Tensor] = None
+        # Reset per-call metrics dict (mae_extension_count kept for
+        # back-compat; baseline_* / last_chunk_mae keys removed with
+        # the streaming MAE-extension path).
+        self._last_extension_metrics = {"mae_extension_count": 0}
+        # Reset per-call Flash-DMD t=flash_dmd_gan_t output.
+        self._flash_dmd_gan_output: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (warm-start carry).
         self._last_clean_pred: Optional[torch.Tensor] = None
 
@@ -1529,18 +1227,13 @@ class ActionForcingTrainingPipeline:
             remaining_blocks -= chunks_this_step
 
         output = torch.zeros_like(noise)
-        # Two-grad-point buffer (Flash-DMD §3.3). See
+        # Flash-DMD t=flash_dmd_gan_t buffer. See
         # ``inference_with_trajectory`` for full rationale.
-        last_rung_output = (
-            torch.zeros_like(noise) if dual_grad_rollout else None
+        flash_dmd_gan_output = (
+            torch.zeros_like(noise) if flash_dmd_enabled else None
         )
 
         num_denoising_steps = len(self.denoising_step_list)
-        if dual_grad_rollout and num_denoising_steps < 2:
-            raise ValueError(
-                "dual_grad_rollout=True requires denoising_step_list of "
-                f"length >= 2; got {num_denoising_steps}."
-            )
         if warm_start_init:
             if num_denoising_steps < 2:
                 raise ValueError(
@@ -1560,12 +1253,12 @@ class ActionForcingTrainingPipeline:
             cold_flags = self.generate_and_sync_list(
                 len(all_num_frames), num_denoising_steps, device=noise.device,
                 sync=sync_exit_flags, force_exit_step=force_exit_step,
-                exclude_last_rung=dual_grad_rollout, low=0,
+                exclude_last_rung=False, low=0,
             )
             warm_flags = self.generate_and_sync_list(
                 len(all_num_frames), num_denoising_steps, device=noise.device,
                 sync=sync_exit_flags, force_exit_step=force_exit_step,
-                exclude_last_rung=dual_grad_rollout,
+                exclude_last_rung=False,
                 low=warm_start_rung_idx,
             )
             block0_is_warm = initial_prev_clean is not None
@@ -1582,7 +1275,7 @@ class ActionForcingTrainingPipeline:
             exit_flags = self.generate_and_sync_list(
                 len(all_num_frames), num_denoising_steps, device=noise.device,
                 sync=sync_exit_flags, force_exit_step=force_exit_step,
-                exclude_last_rung=dual_grad_rollout,
+                exclude_last_rung=False,
             )
         # In streaming mode the generator's gradient gate is not the
         # rollout-vs-warmup split — it's a single flag from the caller.
@@ -1702,14 +1395,9 @@ class ActionForcingTrainingPipeline:
                     exit_index = index
                     break
 
-            # Finish the denoising chain past the exit rung. Standard
-            # mode: every step under no_grad, cache committed at
-            # context_noise. Two-grad-point mode (Flash-DMD §3.3):
-            # no_grad for all but the last rung; the last rung's
-            # forward is grad-active when ``requires_grad=True``, and
-            # its K/V is the rolling cache commit (Step 3.4 skipped).
+            # Post-exit no_grad chain through remaining rungs. Ends
+            # with ``cache_pred`` = clean x0 estimate at the last rung.
             cache_pred = denoised_pred.detach()
-            last_rung_pred: Optional[torch.Tensor] = None
             for j in range(exit_index + 1, num_denoising_steps):
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
@@ -1724,22 +1412,7 @@ class ActionForcingTrainingPipeline:
                     ),
                 ).unflatten(0, denoised_pred.shape[:2])
                 step_t = torch.full_like(timestep, next_t_value)
-                is_last_rung = (j == num_denoising_steps - 1)
-                # Final-block restriction (memory fix — see
-                # ``inference_with_trajectory``): only the LAST block
-                # of this call gets a grad-active last-rung forward.
-                # In streaming mode iter 1 has multiple blocks
-                # (chunk_size frames) and earlier blocks' last-rung
-                # grad would burn activations for gradients that the
-                # model-side stitcher detaches anyway.
-                is_final_block = (block_index == len(all_num_frames) - 1)
-                last_rung_grad = (
-                    dual_grad_rollout
-                    and is_last_rung
-                    and is_final_block
-                    and requires_grad
-                )
-                if last_rung_grad:
+                with torch.no_grad():
                     _, cache_pred = self.generator(
                         noisy_image_or_video=cache_input,
                         conditional_dict=block_cond,
@@ -1748,19 +1421,44 @@ class ActionForcingTrainingPipeline:
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
-                    last_rung_pred = cache_pred
+
+            # Flash-DMD t=flash_dmd_gan_t grad-on forward (per block,
+            # no final-block restriction). Inputs: noised cache_pred
+            # at flash_dmd_gan_t. Output goes to ``flash_dmd_gan_output``
+            # for the GAN / aux losses; K/V slots overwritten by
+            # Step 3.4 below for paper §3.3 cross-timestep decoupling.
+            flash_dmd_pred: Optional[torch.Tensor] = None
+            if flash_dmd_enabled:
+                flash_t_value = int(flash_dmd_gan_t)
+                flash_flat = cache_pred.flatten(0, 1)
+                flash_input = self.scheduler.add_noise(
+                    flash_flat,
+                    torch.randn_like(flash_flat),
+                    flash_t_value * torch.ones(
+                        [batch_size * current_num_frames],
+                        device=noise.device, dtype=torch.long,
+                    ),
+                ).unflatten(0, cache_pred.shape[:2])
+                flash_t_step = torch.full_like(timestep, flash_t_value)
+                if requires_grad:
+                    _, flash_dmd_pred = self.generator(
+                        noisy_image_or_video=flash_input,
+                        conditional_dict=block_cond,
+                        timestep=flash_t_step,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
                 else:
                     with torch.no_grad():
-                        _, cache_pred = self.generator(
-                            noisy_image_or_video=cache_input,
+                        _, flash_dmd_pred = self.generator(
+                            noisy_image_or_video=flash_input,
                             conditional_dict=block_cond,
-                            timestep=step_t,
+                            timestep=flash_t_step,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length,
                         )
-                    if dual_grad_rollout and is_last_rung:
-                        last_rung_pred = cache_pred
 
             output_pred = (
                 cache_pred.to(denoised_pred.dtype)
@@ -1774,26 +1472,24 @@ class ActionForcingTrainingPipeline:
             # Warm-start carry — see ``inference_with_trajectory``.
             prev_block_clean = cache_pred.detach()
 
-            if dual_grad_rollout:
-                if last_rung_pred is None:
+            if flash_dmd_enabled:
+                if flash_dmd_pred is None:
                     raise RuntimeError(
-                        "dual_grad_rollout=True but post-exit chain "
-                        "did not produce last_rung_pred."
+                        "flash_dmd_enabled=True but Flash-DMD step did "
+                        "not produce flash_dmd_pred."
                     )
-                last_rung_output[
+                flash_dmd_gan_output[
                     :, block_start_in_noise: block_start_in_noise + current_num_frames,
-                ] = last_rung_pred
+                ] = flash_dmd_pred
 
             # Cache-update commit at t=context_noise. Runs in BOTH
             # modes — see ``inference_with_trajectory`` for the full
             # rationale (paper §3.3 K/V decoupling: must overwrite
-            # the grad-attached K/V slots written by the last-rung
+            # the grad-attached K/V slots written by the Flash-DMD
             # forward with graph-free K/V so the next block's exit-
-            # flag forward doesn't pull DMD's grad through the prior
-            # block's last-rung gen forward).
-            commit_input_clean = (
-                cache_pred.detach() if dual_grad_rollout else cache_pred
-            )
+            # rung forward doesn't pull DMD's grad through the prior
+            # block's Flash-DMD gen forward).
+            commit_input_clean = cache_pred.detach()
             context_timestep = torch.full_like(timestep, self.context_noise)
             cache_commit = self.scheduler.add_noise(
                 commit_input_clean.flatten(0, 1),
@@ -1811,33 +1507,6 @@ class ActionForcingTrainingPipeline:
                 )
 
             current_start_frame += current_num_frames
-
-        # Per-chunk MAE vs GT (when provided).
-        if gt_latents is not None and denoised_pred is not None:
-            try:
-                last_block_lo = current_start_frame - npb - sequence_start
-                last_block_hi = current_start_frame - sequence_start
-                if (
-                    gt_latents.shape[1] >= last_block_hi
-                    and last_block_lo >= 0
-                ):
-                    val = self._compute_chunk_mae(
-                        pred_chunk=output[:, last_block_lo:last_block_hi].detach(),
-                        gt_chunk=gt_latents[:, last_block_lo:last_block_hi],
-                    )
-                    self._last_extension_metrics["baseline_last_chunk_mae"] = val
-                    self._last_extension_metrics["last_chunk_mae"] = val
-                    # Mirror to ``baseline_avg_rollout_mae`` so the
-                    # trainer's streaming collapse gate (which reads
-                    # this key) actually fires. In streaming mode the
-                    # per-iter rollout is one chunk (npb frames), so
-                    # "avg rollout" = "last chunk" by construction.
-                    # Without this mirror the gate's NaN-guard
-                    # ``mae == mae`` fails on the default NaN init at
-                    # line 1113 and the gate is silently dormant.
-                    self._last_extension_metrics["baseline_avg_rollout_mae"] = val
-            except Exception:
-                pass
 
         # Compute denoised_t_from / denoised_t_to from the exit_flag.
         # In warm_start mode, prefer the warm rung (block_index=1) when
@@ -1860,8 +1529,8 @@ class ActionForcingTrainingPipeline:
             pass
 
         # Stash the two-grad-point last-rung output (None when
-        # ``dual_grad_rollout=False``) so the model can read it.
-        self._last_rung_output = last_rung_output
+        # ``flash_dmd_enabled=False``) so the model can read it.
+        self._flash_dmd_gan_output = flash_dmd_gan_output
         # Stash the rollout's final block clean pred for the caller's
         # next-call warm-start init. Already detached above.
         self._last_clean_pred = prev_block_clean
