@@ -585,10 +585,13 @@ def _bidir_forward_with_action_tokens(
         context = torch.concat([context_clip, context], dim=1)
 
     # Propagate a_per_f and tf_rope_offset to each block's self_attn.
-    # In TF mode tf_rope_offset_frames = dmd_context_clean_frames (= cf,
-    # in latent frames), so the noisy half is RoPE-positioned at
-    # [cf, cf + F) while the clean half stays at [0, F) — preserving
-    # v14's RoPE convention.
+    # In TF mode tf_rope_offset_frames = num_frame_per_block (= 3 latent
+    # frames = 1 chunk shift), so the noisy half is RoPE-positioned at
+    # [npb, npb + F) while the clean half stays at [0, F). Total RoPE
+    # span = F + npb = 8 chunks. Each chunk index occupies the same
+    # RoPE position whether seen as clean or noisy (in the overlap
+    # region). This is v14 LoRA's training contract — do not change
+    # without retraining.
     #
     # FUNDAMENTAL: bidirectional DMD scorers ALWAYS use full-bidir
     # ``flash_attention``. We do NOT build or apply a causal block_mask
@@ -597,15 +600,20 @@ def _bidir_forward_with_action_tokens(
     # (``CausalWanModel._prepare_teacher_forcing_mask``) — that's
     # untouched. Only the DMD scorers' joint forward is unmasked.
     if clean_x is not None:
-        tf_rope_offset = int(getattr(self, "tf_rope_offset_frames", 0))
-        if tf_rope_offset <= 0:
+        # ``None`` is the "not set" sentinel; an explicit integer
+        # (including 0) is honoured. Action-aware scorers MUST have
+        # this set — raise loudly rather than silently falling back to
+        # a derivation that would mis-position v14's noisy half.
+        explicit = getattr(self, "tf_rope_offset_frames", None)
+        if explicit is None:
             raise RuntimeError(
                 "_bidir_forward_with_action_tokens called with clean_x "
-                "but model.tf_rope_offset_frames is 0; the caller must "
-                "set it (= dmd_context_clean_frames in latent frames) "
-                "before calling with clean_x so the noisy half gets the "
-                "correct shifted RoPE positions."
+                "but model.tf_rope_offset_frames is unset (None); the "
+                "caller must set it (= num_frame_per_block, = 1-chunk "
+                "shift for v14) before calling with clean_x so the "
+                "noisy half gets the correct shifted RoPE positions."
             )
+        tf_rope_offset = int(explicit)
     else:
         tf_rope_offset = 0
     for block in self.blocks:

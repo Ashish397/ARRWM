@@ -98,6 +98,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from utils.scheduler import SchedulerInterface
 from utils.wan_wrapper import WanDiffusionWrapper
@@ -205,7 +206,9 @@ class ActionForcingTrainingPipeline:
                 f"rollout, so the rollout must be at least that long."
             )
 
-        # Per-call metrics dict, populated by ``inference_with_trajectory``.
+        # Legacy per-call metrics dict, retained as an empty stash for
+        # back-compat with any downstream consumers; the MAE-extension
+        # path was removed and no longer populates it.
         # Keys (always present after a call):
         #   - mae_extension_count (int): number of extension chunks rolled
         #   - last_chunk_mae (float): MAE of the FINAL evaluated chunk
@@ -422,10 +425,7 @@ class ActionForcingTrainingPipeline:
                 "Phase-1 Action-Forcing uses seed_latents (cf-frame KV "
                 "prefill), the i2v initial_latent path is legacy."
             )
-        # Reset per-call metrics dict (kept for back-compat with the
-        # ``mae_extension_count`` consumer; the rest of the legacy
-        # baseline_* / last_chunk_mae keys are no longer populated).
-        self._last_extension_metrics = {"mae_extension_count": 0}
+        self._last_extension_metrics = {}
         # Reset per-call Flash-DMD t=flash_dmd_gan_t output. Populated
         # below when ``flash_dmd_enabled=True``; remains None otherwise
         # so callers can fail-fast if they expect it but the rollout
@@ -814,7 +814,15 @@ class ActionForcingTrainingPipeline:
                             ),
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    if current_start_frame < start_gradient_frame_index:
+                    # Skip the grad-active random-exit rung forward on
+                    # the LAST block of the rollout. The DMD scoring
+                    # mask zeros the trailing ``num_frame_per_block``
+                    # frames structurally (v14 joint-TF OOD region) —
+                    # so the last block's grad activations are pure
+                    # waste. See ``generate_chunk_with_cache`` for
+                    # the full rationale.
+                    is_last_block = (block_index == len(all_num_frames) - 1)
+                    if current_start_frame < start_gradient_frame_index or is_last_block:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
@@ -825,13 +833,36 @@ class ActionForcingTrainingPipeline:
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
                     else:
-                        _, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=block_cond,
-                            timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length,
+                        # Activation-checkpoint the grad-active random-
+                        # exit rung forward. This is the dominant
+                        # held-activation source per block (~30 layer-
+                        # inputs at 14 MB each = ~420 MB per block,
+                        # ~3 GB across 7 blocks). Same default-args
+                        # closure trick as the flash-DMD ckpt to capture
+                        # by value; same cache-safety story (per-block
+                        # K/V slots get overwritten by Step 3.4
+                        # context-noise commits and stay stable until
+                        # next rollout reset).
+                        def _exit_fn(
+                            x,
+                            _gen=self.generator,
+                            _cond=block_cond,
+                            _t=timestep,
+                            _kv=self.kv_cache1,
+                            _xa=self.crossattn_cache,
+                            _start=current_start_frame * self.frame_seq_length,
+                        ):
+                            return _gen(
+                                noisy_image_or_video=x,
+                                conditional_dict=_cond,
+                                timestep=_t,
+                                kv_cache=_kv,
+                                crossattn_cache=_xa,
+                                current_start=_start,
+                            )
+
+                        _, denoised_pred = _ckpt(
+                            _exit_fn, noisy_input, use_reentrant=False,
                         )
                     exit_index = index
                     break
@@ -893,18 +924,71 @@ class ActionForcingTrainingPipeline:
                     ),
                 ).unflatten(0, cache_pred.shape[:2])
                 flash_t_step = torch.full_like(timestep, flash_t_value)
+                # Skip the grad-active flash-DMD forward on the LAST
+                # block of MULTI-BLOCK calls. Matches the streaming
+                # path's gating in ``generate_chunk_with_cache`` so
+                # both functions agree on what "skip last chunk"
+                # means: drop only the trailing block of multi-block
+                # rollouts (= iter 1 in streaming; full-rollout calls
+                # here). Single-block calls keep their flash forward
+                # grad-active. Saves the trailing block's per-block
+                # transformer activations.
+                is_last_block = (block_index == len(all_num_frames) - 1)
+                is_multi_block = (len(all_num_frames) > 1)
                 flash_grad_active = (
                     requires_grad
                     and current_start_frame >= start_gradient_frame_index
+                    and not (is_last_block and is_multi_block)
                 )
                 if flash_grad_active:
-                    _, flash_dmd_pred = self.generator(
-                        noisy_image_or_video=flash_input,
-                        conditional_dict=block_cond,
-                        timestep=flash_t_step,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
+                    # Activation-checkpoint the per-block grad-on
+                    # flash-DMD forward. Saves ~9 GB peak by
+                    # recomputing the forward in backward instead of
+                    # holding all 7 blocks' transformer activations
+                    # in flight. Cost: +15-20% wallclock per gen step.
+                    #
+                    # Closure capture via default args: ``block_cond``
+                    # / ``flash_t_step`` / ``current_start_frame`` are
+                    # loop-local and rebind each iter. Without the
+                    # default-arg trick, every checkpoint's recompute
+                    # would use the FINAL iter's bindings at backward
+                    # time. Default-arg evaluation captures by value
+                    # at function-definition time → each iter's
+                    # closure is correctly pinned to that iter's
+                    # values. ``self.kv_cache1`` /
+                    # ``self.crossattn_cache`` are stable references
+                    # to the same dict objects across the rollout
+                    # (their contents mutate, but the references
+                    # don't), so accessing them via ``self`` is safe.
+                    #
+                    # Cache safety: chunk K's flash forward reads
+                    # prior chunks' K/V (slots 1..K-1). Those slots
+                    # are committed to context_noise K/V by their
+                    # Step 3.4 (no_grad, not checkpointed) and never
+                    # subsequently overwritten. So at backward-time
+                    # recompute, the prior-slot K/V state is
+                    # bit-identical to the original-forward state.
+                    # ✓ Mathematically clean.
+                    def _flash_fn(
+                        x,
+                        _gen=self.generator,
+                        _cond=block_cond,
+                        _t=flash_t_step,
+                        _kv=self.kv_cache1,
+                        _xa=self.crossattn_cache,
+                        _start=current_start_frame * self.frame_seq_length,
+                    ):
+                        return _gen(
+                            noisy_image_or_video=x,
+                            conditional_dict=_cond,
+                            timestep=_t,
+                            kv_cache=_kv,
+                            crossattn_cache=_xa,
+                            current_start=_start,
+                        )
+
+                    _, flash_dmd_pred = _ckpt(
+                        _flash_fn, flash_input, use_reentrant=False,
                     )
                 else:
                     with torch.no_grad():
@@ -1200,10 +1284,7 @@ class ActionForcingTrainingPipeline:
                 "(typically via ``setup_sequence``) before this method."
             )
 
-        # Reset per-call metrics dict (mae_extension_count kept for
-        # back-compat; baseline_* / last_chunk_mae keys removed with
-        # the streaming MAE-extension path).
-        self._last_extension_metrics = {"mae_extension_count": 0}
+        self._last_extension_metrics = {}
         # Reset per-call Flash-DMD t=flash_dmd_gan_t output.
         self._flash_dmd_gan_output: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (warm-start carry).
@@ -1373,7 +1454,26 @@ class ActionForcingTrainingPipeline:
                             ),
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    if not requires_grad:
+                    # Skip the grad-active random-exit rung forward on
+                    # the LAST block of any call. The DMD scoring
+                    # mask (``_dmd_score_grad_mask``) zeros the
+                    # trailing ``num_frame_per_block`` frames of the
+                    # ``chunk_size``-length scoring window — those
+                    # positions are structurally OOD in v14's joint-TF
+                    # layout (the noisy half at RoPE [npb, npb+F)
+                    # has frames that have no clean-half counterpart).
+                    # Whatever the random-exit forward produces for
+                    # those frames carries zero DMD gradient. So
+                    # holding ~3 GB of layer-input activations for
+                    # the last block is pure waste — run it under
+                    # ``no_grad`` and let the trainer's mask zero
+                    # the slice as it always has. Unlike the flash-
+                    # DMD skip (which is gated on
+                    # ``is_multi_block`` to preserve GAN signal in
+                    # single-block iters), this skip is safe in all
+                    # call shapes because the mask is structural.
+                    is_last_block = (block_index == len(all_num_frames) - 1)
+                    if (not requires_grad) or is_last_block:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
@@ -1384,13 +1484,34 @@ class ActionForcingTrainingPipeline:
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
                     else:
-                        _, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=block_cond,
-                            timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length,
+                        # Activation-checkpoint the grad-active random-
+                        # exit rung forward (the dominant per-block
+                        # held activation; ~3 GB across the iter-1
+                        # rollout's 7 blocks). Mirrors the flash-DMD
+                        # ckpt below: default-args closure for
+                        # by-value capture; cache safety guaranteed
+                        # by Step 3.4 context-noise commits being
+                        # outside the checkpoint scope.
+                        def _exit_fn(
+                            x,
+                            _gen=self.generator,
+                            _cond=block_cond,
+                            _t=timestep,
+                            _kv=self.kv_cache1,
+                            _xa=self.crossattn_cache,
+                            _start=current_start_frame * self.frame_seq_length,
+                        ):
+                            return _gen(
+                                noisy_image_or_video=x,
+                                conditional_dict=_cond,
+                                timestep=_t,
+                                kv_cache=_kv,
+                                crossattn_cache=_xa,
+                                current_start=_start,
+                            )
+
+                        _, denoised_pred = _ckpt(
+                            _exit_fn, noisy_input, use_reentrant=False,
                         )
                     exit_index = index
                     break
@@ -1440,14 +1561,50 @@ class ActionForcingTrainingPipeline:
                     ),
                 ).unflatten(0, cache_pred.shape[:2])
                 flash_t_step = torch.full_like(timestep, flash_t_value)
-                if requires_grad:
-                    _, flash_dmd_pred = self.generator(
-                        noisy_image_or_video=flash_input,
-                        conditional_dict=block_cond,
-                        timestep=flash_t_step,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
+                # Skip the grad-active flash-DMD forward on the LAST
+                # block of MULTI-BLOCK calls only. In streaming mode
+                # iter 1 rolls all 7 chunks in one call (multi-block:
+                # skip block 6 = the trailing chunk of the 21-frame
+                # rollout); iters k>=2 roll 1 chunk per call (single-
+                # block: keep the only-block grad-active so GAN signal
+                # survives in subsequent iters). Matches the user's
+                # "6 chunks instead of 7" intent for the heavy iter 1
+                # without nuking GAN supervision in the 99% of calls
+                # that are single-block.
+                is_last_block = (block_index == len(all_num_frames) - 1)
+                is_multi_block = (len(all_num_frames) > 1)
+                flash_grad_active = (
+                    requires_grad
+                    and not (is_last_block and is_multi_block)
+                )
+                if flash_grad_active:
+                    # Activation-checkpoint via default-args closure;
+                    # see ``inference_with_trajectory`` for the cache
+                    # safety analysis (prior chunks' K/V are committed
+                    # to context_noise by Step 3.4 and stable until
+                    # next rollout reset, so backward-time recompute
+                    # reads bit-identical state to the original
+                    # forward).
+                    def _flash_fn(
+                        x,
+                        _gen=self.generator,
+                        _cond=block_cond,
+                        _t=flash_t_step,
+                        _kv=self.kv_cache1,
+                        _xa=self.crossattn_cache,
+                        _start=current_start_frame * self.frame_seq_length,
+                    ):
+                        return _gen(
+                            noisy_image_or_video=x,
+                            conditional_dict=_cond,
+                            timestep=_t,
+                            kv_cache=_kv,
+                            crossattn_cache=_xa,
+                            current_start=_start,
+                        )
+
+                    _, flash_dmd_pred = _ckpt(
+                        _flash_fn, flash_input, use_reentrant=False,
                     )
                 else:
                     with torch.no_grad():

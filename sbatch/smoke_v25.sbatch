@@ -121,7 +121,7 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
@@ -166,6 +166,7 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
+    encoded_root=/scratch/u6ex/as1748.u6ex/ARRWM/smoke_zarr \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -185,7 +186,6 @@ srun torchrun \
     real_teacher_warmup_steps=200 \
     real_teacher_input_source=blend \
     real_teacher_input_mix_gt_p=0.7 \
-    aux_clean_x_mix_p=0.7 \
     aux_teacher_loss_weight=1.0 \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \

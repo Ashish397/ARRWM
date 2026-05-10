@@ -176,9 +176,7 @@ srun torchrun \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
-    boundary_vae_roundtrip=true \
-    collapse_mae_threshold=0.2 \
-    mae_extension_threshold=0.2 \
+    boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
     real_teacher_train_online=true \
@@ -186,14 +184,12 @@ srun torchrun \
     real_guidance_scale=1.0 \
     real_teacher_lr=5e-5 \
     real_teacher_warmup_steps=200 \
-    real_teacher_input_source=both \
+    real_teacher_input_source=blend \
     real_teacher_input_mix_gt_p=None \
     aux_clean_x_mix_p=0.7 \
     aux_teacher_loss_weight=1.0 \
     dmd_frozen_teacher_pass_enabled=false \
-    flash_dmd_split_timestep=None \
     fake_score_ema_weight=0.95 \
-    flash_dmd_paper_aligned_adv=true \
     gan_loss_weight=1.0 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \

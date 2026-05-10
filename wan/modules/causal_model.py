@@ -1,5 +1,7 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+from typing import Optional
+
 from wan.modules.attention import attention
 from wan.modules.model import (
     WanRMSNorm,
@@ -822,6 +824,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_frame_per_block = 1
         self.independent_first_frame = False
         self.context_shift = 0
+        # Single source of truth for the joint-TF noisy-half RoPE
+        # offset. ``None`` is the "not set" sentinel — the
+        # ``CausalWanModel.forward`` clean_x branch falls back to the
+        # legacy ``context_shift * num_frame_per_block`` derivation in
+        # that case so ODE-distill / eval pipelines continue to work
+        # unchanged. The action-forcing trainer sets this attribute
+        # explicitly to lock in v14's training-time convention; an
+        # explicit value (including ``0``) wins over the derivation.
+        self.tf_rope_offset_frames: Optional[int] = None
         # Total non-spatial tokens appended per frame (action + state).
         # RoPE is applied only to spatial tokens; this count tells the
         # separation helpers how many trailing tokens to skip.
@@ -1407,7 +1418,28 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         s_per_f = self.state_tokens_per_frame
         a_per_f = self.action_tokens_per_frame
 
-        rope_offset = self.context_shift * self.num_frame_per_block if clean_x is not None else 0
+        # Single source of truth: ``model.tf_rope_offset_frames`` (set
+        # by the trainer — see ``model/dmd_action_forcing.py`` for the
+        # action-forcing scorer setup). Legacy callers (ODE distillation,
+        # eval scripts) only set ``context_shift`` and never touch
+        # ``tf_rope_offset_frames``; for them we fall back to the
+        # historic derivation ``context_shift * num_frame_per_block``
+        # so existing pipelines continue to work unchanged. The
+        # action-forcing trainer sets ``tf_rope_offset_frames``
+        # explicitly to lock in v14's training-time convention; that
+        # explicit value wins (including an explicit ``0``).
+        # ``None`` (the default in ``__init__``) is the "not set"
+        # sentinel and falls through to the derivation. Distinguishing
+        # ``None`` from ``0`` lets future callers explicitly request
+        # zero shift without being silently overridden.
+        if clean_x is not None:
+            explicit = getattr(self, "tf_rope_offset_frames", None)
+            rope_offset = (
+                int(explicit) if explicit is not None
+                else self.context_shift * self.num_frame_per_block
+            )
+        else:
+            rope_offset = 0
         for block in self.blocks:
             block.self_attn.tf_rope_offset = rope_offset
             block.self_attn.action_tokens_per_frame = a_per_f

@@ -546,16 +546,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # (the frozen SAM2 encoder is left un-wrapped). Only set when
         # ``gan_sam2_distilled_critic=True`` and world_size > 1.
         self.r3gan_heads_ddp: Optional[DDP] = None
-        # Slot for inputs to the deferred D-update + critic-distillation
-        # step (distilled mode only). Populated during the gen step (which
-        # only computes the light Path 3 = ``-critic(pred_image)``);
-        # consumed by ``_run_distilled_post_backward_step`` AFTER gen +
-        # action-critic backwards have freed gen-rollout activations
-        # (~70 GB). Without this defer, the heavy V+SAM2 forwards in
-        # Path 1 (D-update no_grad features) and Path 2 (critic value+grad
-        # distillation) compete with the gen rollout's persistent state
-        # and OOM the 95 GB GH200 budget.
-        self._distilled_pending: Optional[Dict[str, Any]] = None
         # ``gan_backbone`` selects the discriminator architecture:
         #   * "latent_3d_conv" (default, legacy) — 3D ConvNet on the
         #     student's latent video. Cheap, no VAE decode required.
@@ -1025,21 +1015,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # the model — the trainer never sees it.
         # ------------------------------------------------------------------
 
-        # Collapse gating: the threshold is consulted when deciding
-        # whether to EXTEND a rollout (multi-batch on the same ride)
-        # vs swap to a fresh ride next iter. ``MAE > threshold`` ⇒
-        # student has collapsed on this ride, so don't extend; just
-        # train on the current rollout and let the next iter pull a
-        # new ride. ``MAE <= threshold`` ⇒ keep rolling on this ride.
-        # In streaming mode this gates the per-iter "advance same
-        # sequence vs setup fresh sequence" decision; in legacy
-        # single-batch mode it's parsed and stored but unused.
-        # ``None`` disables the gate.
-        _collapse_t = getattr(self.config, "collapse_mae_threshold", 0.5)
-        self.collapse_mae_threshold: Optional[float] = (
-            None if _collapse_t is None else float(_collapse_t)
-        )
-
         # Streaming-mode flag (LongLive-style persistent KV cache +
         # rolling-sequence training). When True, ``_fwdbwd_one_step``
         # uses ``model.setup_sequence`` / ``generate_next_chunk`` /
@@ -1395,38 +1370,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_critic_warmup_steps = int(
             getattr(cfg, "gan_critic_warmup_steps", 500)
         )
-        self.gan_critic_grad_frames = int(
-            getattr(cfg, "gan_critic_grad_frames", 3)
-        )
-        self.gan_critic_grad_full_every = int(
-            getattr(cfg, "gan_critic_grad_full_every", 50)
-        )
-        self.gan_critic_grad_loss_weight = float(
-            getattr(cfg, "gan_critic_grad_loss_weight", 1.0)
-        )
         # Multi-step critic training (mirrors action_critic's
         # ``critic_updates_per_step``): step the critic optimizer K_c
         # times per gen step. Default 1 = legacy single-step behavior.
         self.gan_critic_updates_per_step = int(
             getattr(cfg, "gan_critic_updates_per_step", 1)
-        )
-        # Multi-noise (WGAN-GP-style) Path 2 expansion: K interpolation
-        # points between (real_lat, fake_lat) for value-distillation.
-        # Densifies the critic's value-field constraints so its gradient
-        # becomes meaningful by Lipschitz interpolation. Default 0 =
-        # legacy 2-point (real, fake) only.
-        self.gan_critic_n_interp_samples = int(
-            getattr(cfg, "gan_critic_n_interp_samples", 0)
-        )
-        # Finite-difference Sobolev: train the critic's input-gradient
-        # to match the disc's input-gradient via (no_grad) finite
-        # differences. Cheap alternative to true Sobolev (no graph-on
-        # V+SAM2 backward). When ``gan_critic_fd_loss_weight > 0``,
-        # perturb fake_lat by ε~N(0, σ²) on a random subset of frames,
-        # match (critic(z+ε)-critic(z))/ε to (disc(decode(z+ε))
-        # -disc(decode(z)))/ε. Default 0 = disabled.
-        self.gan_critic_fd_loss_weight = float(
-            getattr(cfg, "gan_critic_fd_loss_weight", 0.0)
         )
         # Dense per-token value distillation. When True, Path 2's
         # value-distillation MSE matches the critic's PER-TOKEN logit
@@ -1434,21 +1382,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # PER-TOKEN logit map (forward_dense_heads, pooled 4-pix-frames
         # → 1-latent-frame). 8x13 ≈ 104x more constraints per sample
         # than the scalar/per-frame MSE the legacy path used. Default
-        # False = legacy scalar MSE (for back-compat). The dense flag
-        # only changes the (real, fake) value-distillation MSE; the
-        # multi-noise interp / FD-Sobolev / Sobolev paths stay scalar
-        # (they're regularization densifiers, not the primary signal).
+        # False = legacy scalar MSE (for back-compat).
         self.gan_critic_dense_distillation = bool(
             getattr(cfg, "gan_critic_dense_distillation", False)
-        )
-        self.gan_critic_fd_sigma = float(
-            getattr(cfg, "gan_critic_fd_sigma", 0.01)
-        )
-        self.gan_critic_fd_frames = int(
-            getattr(cfg, "gan_critic_fd_frames", 1)
-        )
-        self.gan_critic_fd_n_directions = int(
-            getattr(cfg, "gan_critic_fd_n_directions", 1)
         )
         # ---------- Pixel-space perceptual losses (v13) ----------
         # LPIPS (Zhang et al., CVPR 2018) — VGG-based perceptual
@@ -1634,21 +1570,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 logging.info(
                     "[ActionForcing] LatentSAM2Critic optimizer built: "
                     "AdamW lr=%.2e betas=%s wd=%.4f params=%.2fM "
-                    "(warmup=%d, grad_frames=%d, grad_full_every=%d, "
-                    "grad_loss_weight=%.3f, updates_per_step=%d, "
-                    "n_interp=%d, fd_loss_weight=%.3f, fd_sigma=%.4f, "
-                    "fd_frames=%d, fd_n_directions=%d)",
+                    "(warmup=%d, updates_per_step=%d, dense=%s)",
                     critic_lr, critic_betas, critic_wd, n_params / 1e6,
                     self.gan_critic_warmup_steps,
-                    self.gan_critic_grad_frames,
-                    self.gan_critic_grad_full_every,
-                    self.gan_critic_grad_loss_weight,
                     self.gan_critic_updates_per_step,
-                    self.gan_critic_n_interp_samples,
-                    self.gan_critic_fd_loss_weight,
-                    self.gan_critic_fd_sigma,
-                    self.gan_critic_fd_frames,
-                    self.gan_critic_fd_n_directions,
+                    self.gan_critic_dense_distillation,
                 )
 
         # ----- Perceptual approx optimizers (mse / lpips) -----
@@ -4101,25 +4027,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
              gradients, not the previous iter's stale critic.
 
         This mirrors the action-critic pattern: train the critic just
-        before the generator consumes it. Previously Paths 1+2 ran in
-        ``_run_distilled_post_backward_step`` AFTER gen.backward, which
-        meant the gen always saw a one-iter-stale critic. We now run
-        them INLINE up-front when memory permits (Sobolev OFF).
-
-        Memory rationale:
-          * Sobolev OFF (``gan_critic_grad_loss_weight == 0``): Paths
-            1+2 only need V+SAM2 in no_grad mode + a small critic
-            forward+backward (~5-8 GB transient) — fits alongside the
-            gen rollout's ~70 GB activations on the 95 GB GH200. Run
-            inline so Path 3 sees the fresh critic.
-          * Sobolev ON: Path 2's gradient-distillation target requires
-            graph-on V+SAM2+disc forward (~10-15 GB workspace). That
-            does NOT fit alongside the gen rollout activations, so we
-            stash to ``self._distilled_pending`` and defer to
-            ``_run_distilled_post_backward_step`` AFTER gen.backward
-            frees the rollout's activations. Critic is one iter stale
-            in this branch (acceptable trade-off since the Sobolev
-            target itself is much stronger supervision).
+        before the generator consumes it. Paths 1+2 run INLINE up-front
+        so Path 3 sees the freshly-updated critic.
         """
         device = pred_image.device
         zero = torch.zeros((), device=device, dtype=torch.float32)
@@ -4128,9 +4037,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         # ----- Latents (fp32 for R1/R2 stability — Paths 1 + 2 both fp32).
         real_lat = gt_latents_window.detach().to(torch.float32)
-        # G-side fake latent: Flash-DMD = flash_dmd_gan_x0
-        # (paper §3.3 Eq. 9); else the rolling rollout's pred_image.
-        # Path 3 uses the GRAD-attached version; Paths 1+2 use detached.
+        # G-side fake latent: Flash-DMD = flash_dmd_gan_x0 (paper §3.3
+        # Eq. 9); else the rolling rollout's pred_image. Path 3 uses
+        # the GRAD-attached version; Paths 1+2 use detached.
         if flash_dmd_gan_x0 is not None:
             fake_lat_grad = flash_dmd_gan_x0.to(torch.float32)
         else:
@@ -4139,27 +4048,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         logs: Dict[str, float] = {}
 
-        # ===== Inline Paths 1+2 when Sobolev is off ===================
-        # Sobolev's graph-on V+SAM2 forward is the only thing that
-        # forces the deferred path. With it off, Paths 1+2 fit alongside
-        # gen activations and the gen sees a fresh critic in Path 3.
-        sobolev_active = self.gan_critic_grad_loss_weight > 0
-        if not sobolev_active:
-            self._run_distilled_disc_critic_update(
-                real_lat=real_lat,
-                fake_lat=fake_lat,
-                current_step=current_step,
-                out=logs,
-            )
-            self._distilled_pending = None
-        else:
-            # Sobolev path: defer Paths 1+2 to post-backward (memory
-            # budget). Critic in Path 3 is from the previous iter.
-            self._distilled_pending = {
-                "real_lat": real_lat,
-                "fake_lat": fake_lat,
-                "current_step": current_step,
-            }
+        # ===== Paths 1+2: D-update + critic value-distillation =======
+        self._run_distilled_disc_critic_update(
+            real_lat=real_lat,
+            fake_lat=fake_lat,
+            current_step=current_step,
+            out=logs,
+        )
 
         # ===== Path 3: Gen-side via critic (after warmup) =============
         critic_warmup_done = (
@@ -4237,40 +4132,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             ),
             "train/r3gan_g_weight": float(gen_gan_weight),
             "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
-            "train/critic_trained_inline": 0.0 if sobolev_active else 1.0,
         })
         return generator_gan_loss, logs
-
-    def _run_distilled_post_backward_step(
-        self, out: Dict[str, Any],
-    ) -> None:
-        """Deferred D-update + critic value+grad distillation.
-
-        Used ONLY when Sobolev (gradient distillation) is active —
-        Path 2's graph-on V+SAM2 forward exceeds memory budget if run
-        alongside the gen rollout's persistent grad activations. The
-        deferred step runs AFTER both gen and action-critic backwards
-        have freed the rollout's ~70 GB activations.
-
-        With Sobolev OFF (the v9 default), Paths 1+2 run INLINE in
-        ``_compute_r3gan_losses_distilled`` BEFORE Path 3, so the gen
-        sees a freshly-trained critic (mirrors the action-critic's
-        train-then-evaluate pattern).
-
-        Mutates ``out`` in place with Path 1 + Path 2 diagnostics.
-        Clears ``self._distilled_pending`` after consumption.
-        """
-        if self._distilled_pending is None:
-            return
-        pending = self._distilled_pending
-        self._distilled_pending = None
-
-        self._run_distilled_disc_critic_update(
-            real_lat=pending["real_lat"],
-            fake_lat=pending["fake_lat"],
-            current_step=pending["current_step"],
-            out=out,
-        )
 
     def _run_distilled_disc_critic_update(
         self,
@@ -4281,11 +4144,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     ) -> None:
         """Train the SAM2 disc heads (Path 1) + LatentSAM2Critic (Path 2).
 
-        Operates on detached real/fake latents. Mutates ``out`` in place
-        with Path 1 + Path 2 diagnostics. Called inline before Path 3
-        when Sobolev is off (so gen consumes a fresh critic), or via
-        ``_run_distilled_post_backward_step`` after gen.backward when
-        Sobolev is on (memory budget for graph-on V+SAM2).
+        Operates on detached real/fake latents. Mutates ``out`` in
+        place with Path 1 + Path 2 diagnostics. Runs INLINE before
+        Path 3 so the gen consumes a freshly-trained critic.
         """
         from model.r3gan import rpgan_d_loss
 
@@ -4701,260 +4562,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         teacher_val_real = _align_teacher_to_critic(teacher_val_real)
         teacher_val_fake = _align_teacher_to_critic(teacher_val_fake)
 
-        # ----- (3) Multi-noise (WGAN-GP-style) Path 2 expansion. -----
-        # Value-only critic distillation has only 2 anchor points per
-        # iter (real, fake). With only 2 constraints, infinite valid
-        # gradient solutions exist — so the gen-side gradient through
-        # critic is essentially noise even though the critic perfectly
-        # matches disc *value* on those endpoints.
-        #
-        # We densify by sampling K interpolation points on the line
-        # ``z_α = (1-α)*real_lat + α*fake_lat``, computing teacher
-        # values on each (no_grad V+SAM2 forward), and adding their
-        # MSE to L_value. This constrains the critic's value field
-        # densely enough that gradient becomes meaningful by Lipschitz
-        # interpolation. ``gan_critic_n_interp_samples=0`` keeps the
-        # legacy 2-point-only behavior.
-        n_interp = max(0, int(self.gan_critic_n_interp_samples))
-        interp_lats_stacked: Optional[torch.Tensor] = None
-        teacher_vals_interp: Optional[torch.Tensor] = None
-        if n_interp > 0:
-            # Even spacing in (0, 1) excluding the two endpoints (those
-            # are real_lat / fake_lat which we already constrain).
-            alphas = torch.linspace(
-                0.0, 1.0, n_interp + 2, device=device,
-            )[1:-1]
-            interp_lats_list = []
-            teacher_vals_interp_list = []
-            for alpha_t in alphas:
-                a = float(alpha_t.item())
-                interp_lat = (1.0 - a) * real_lat + a * fake_lat
-                interp_lats_list.append(interp_lat)
-                # Process one interpolation at a time to bound peak
-                # transient memory (each decode + SAM2 forward holds
-                # ~1-2 GB workspace; doing 5 at once would peak at
-                # ~10 GB transient which may blow the budget).
-                with torch.no_grad():
-                    interp_pixel = _decode_no_grad(interp_lat).to(
-                        torch.float32,
-                    )
-                    interp_feat = disc.forward_features(interp_pixel)
-                    B_int = interp_pixel.shape[0]
-                    F_int = interp_pixel.shape[1]
-                    teacher_val_one = disc.forward_heads(
-                        interp_feat,
-                        batch_size=B_int,
-                        num_frames=F_int,
-                    ).float()
-                # Per-pixel-frame → per-latent-frame averaging when
-                # disc is in ``frame_pool=none`` mode (rate alignment
-                # for distillation; same as Path 2's main teacher
-                # alignment above).
-                if (
-                    teacher_val_one.dim() == 1
-                    and teacher_val_one.shape[0] == B_int * F_int
-                ):
-                    pix_per_lat = F_int // int(F_)
-                    if pix_per_lat * int(F_) == F_int:
-                        teacher_val_one = (
-                            teacher_val_one.view(B_int, F_, pix_per_lat)
-                            .mean(dim=2)
-                            .reshape(B_int * F_)
-                        )
-                teacher_vals_interp_list.append(teacher_val_one)
-                # Free the transient pixel + feature buffers before
-                # processing the next alpha.
-                del interp_pixel, interp_feat
-            # Stack along batch dim for the critic-side batched forward.
-            interp_lats_stacked = torch.cat(interp_lats_list, dim=0)
-            teacher_vals_interp = torch.cat(
-                teacher_vals_interp_list, dim=0,
-            ).detach()
-            del interp_lats_list, teacher_vals_interp_list
-
-        # Sobolev (gradient distillation) gates / teacher target compute.
-        grad_distill_active = self.gan_critic_grad_loss_weight > 0
-        do_full_grad = (
-            grad_distill_active
-            and self.gan_critic_grad_full_every > 0
-            and current_step > 0
-            and current_step >= self.gan_critic_warmup_steps
-            and (current_step % self.gan_critic_grad_full_every) == 0
-        )
-        # When ``grad_loss_weight=0``, skip the entire teacher-gradient
-        # computation (the most expensive piece — graph-on V+SAM2+disc
-        # forward). Critic trains on value-only distillation in that
-        # case. Loses the Sobolev guarantee but eliminates the
-        # remaining V+SAM2 graph-on memory cost (~3-15 GB depending on
-        # subset vs anchor).
-        if grad_distill_active:
-            if do_full_grad:
-                grad_frames = list(range(F_))
-            else:
-                grad_frames = self._sample_critic_grad_frame_indices(
-                    F_, self.gan_critic_grad_frames, device,
-                )
-            n_grad = len(grad_frames)
-            real_lat_sub = real_lat[:, grad_frames].clone().detach().requires_grad_(True)
-            fake_lat_sub = fake_lat[:, grad_frames].clone().detach().requires_grad_(True)
-            from torch.utils.checkpoint import checkpoint as _ckpt
-
-            def _teacher_value(z: torch.Tensor) -> torch.Tensor:
-                pix = _decode_grad(z).to(torch.float32)
-                return disc(pix).float()
-
-            if do_full_grad:
-                teacher_real_sub = _ckpt(
-                    _teacher_value, real_lat_sub, use_reentrant=False,
-                )
-            else:
-                teacher_real_sub = _teacher_value(real_lat_sub)
-            teacher_grad_real_sub = torch.autograd.grad(
-                teacher_real_sub.sum(), real_lat_sub,
-                create_graph=False, retain_graph=False,
-            )[0].detach()
-            del teacher_real_sub
-            if do_full_grad:
-                teacher_fake_sub = _ckpt(
-                    _teacher_value, fake_lat_sub, use_reentrant=False,
-                )
-            else:
-                teacher_fake_sub = _teacher_value(fake_lat_sub)
-            teacher_grad_fake_sub = torch.autograd.grad(
-                teacher_fake_sub.sum(), fake_lat_sub,
-                create_graph=False, retain_graph=False,
-            )[0].detach()
-            del teacher_fake_sub
-        else:
-            # Value-only distillation — no teacher gradient computation.
-            grad_frames = []
-            n_grad = 0
-            teacher_grad_real_sub = None
-            teacher_grad_fake_sub = None
-
-        # ----- (2) Finite-difference Sobolev teacher targets -----
-        # Cheap alternative to true Sobolev: perturb fake_lat by small
-        # ε on a random subset of frames, get disc value at the
-        # perturbed point via no_grad V+SAM2 forward, target the
-        # critic such that (critic(z+ε) - critic(z)) matches
-        # (disc(decode(z+ε)) - disc(decode(z))). NO graph-on V+SAM2
-        # backward needed → fits in current memory budget.
-        fd_active = self.gan_critic_fd_loss_weight > 0
-        fd_data: Optional[Dict[str, Any]] = None
-        if fd_active:
-            n_dir = max(1, int(self.gan_critic_fd_n_directions))
-            n_fd_frames = max(1, min(int(self.gan_critic_fd_frames), int(F_)))
-            sigma = float(self.gan_critic_fd_sigma)
-            fd_frame_idx = self._sample_critic_grad_frame_indices(
-                F_, n_fd_frames, device,
-            )
-            # Per-direction-index packed list of perturbations
-            # ε_i: shape [B, F_, C, H, W] — only fd_frame_idx slices
-            # are non-zero. Stacked across directions for batched eval.
-            eps_list = []
-            for _d in range(n_dir):
-                eps_full = torch.zeros_like(fake_lat)
-                eps_sub = torch.randn(
-                    fake_lat.shape[0], n_fd_frames,
-                    fake_lat.shape[2], fake_lat.shape[3],
-                    fake_lat.shape[4],
-                    device=device, dtype=fake_lat.dtype,
-                ) * sigma
-                eps_full[:, fd_frame_idx] = eps_sub
-                eps_list.append(eps_full)
-            # teacher_val_fake is already known (computed above).
-            # Compute disc value at each perturbed point (no_grad).
-            disc_diffs_list = []  # list of [B] scalars per direction
-            for eps_full in eps_list:
-                fake_perturbed = fake_lat + eps_full
-                with torch.no_grad():
-                    pp_pixel = _decode_no_grad(fake_perturbed).to(
-                        torch.float32,
-                    )
-                    pp_feat = disc.forward_features(pp_pixel)
-                    B_pp = pp_pixel.shape[0]
-                    F_pp = pp_pixel.shape[1]
-                    disc_val_perturbed = disc.forward_heads(
-                        pp_feat,
-                        batch_size=B_pp,
-                        num_frames=F_pp,
-                    ).float()
-                # Per-pixel-frame → per-latent-frame averaging when
-                # disc is in ``frame_pool=none`` mode (FD targets must
-                # match the critic's per-latent-frame output rate).
-                if (
-                    disc_val_perturbed.dim() == 1
-                    and disc_val_perturbed.shape[0] == B_pp * F_pp
-                ):
-                    pix_per_lat = F_pp // int(F_)
-                    if pix_per_lat * int(F_) == F_pp:
-                        disc_val_perturbed = (
-                            disc_val_perturbed.view(B_pp, F_, pix_per_lat)
-                            .mean(dim=2)
-                            .reshape(B_pp * F_)
-                        )
-                # Per-batch scalar disc difference.
-                disc_diff = (
-                    disc_val_perturbed - teacher_val_fake.detach()
-                ).flatten()
-                disc_diffs_list.append(disc_diff)
-                del pp_pixel, pp_feat
-            fd_data = {
-                "eps_list": eps_list,
-                "disc_diffs_list": disc_diffs_list,
-            }
-            del eps_list, disc_diffs_list
-
         # ----- Multi-step critic update loop. -----
         # Mirrors action_critic's ``critic_updates_per_step`` pattern:
         # step the critic optimizer K_c times per gen step so the
         # critic actually converges to the disc within one outer iter.
-        # Default K_c=1 is the legacy single-step behavior. The
-        # teacher targets above (teacher_val_real / teacher_val_fake /
-        # teacher_vals_interp / teacher_grad_*) are constant across
-        # critic updates so we compute them ONCE outside this loop.
+        # Default K_c=1 is the legacy single-step behavior.
         critic_updates = max(1, int(self.gan_critic_updates_per_step))
         # Track only the LAST iter's diagnostics for logging.
         L_value_value = 0.0
         L_value_dense_value = 0.0
-        L_grad_value = 0.0
-        L_critic_value = 0.0
-        L_fd_value = 0.0
         critic_val_real_last: Optional[torch.Tensor] = None
         critic_val_fake_last: Optional[torch.Tensor] = None
-        critic_grad_real_sub_last: Optional[torch.Tensor] = None
-        critic_grad_fake_sub_last: Optional[torch.Tensor] = None
         for _kc in range(critic_updates):
             if self.latent_critic_optimizer is not None:
                 self.latent_critic_optimizer.zero_grad(set_to_none=True)
-            # Critic forward on FULL clip. With grad-distillation
-            # active, also compute grad w.r.t. input
-            # (create_graph=True for the second-order backward through
-            # L_grad). With value-only mode, skip the input-grad
-            # compute entirely (saves ~few hundred MB).
-            real_lat_critic_in = real_lat.clone().detach().requires_grad_(
-                grad_distill_active
-            )
-            fake_lat_critic_in = fake_lat.clone().detach().requires_grad_(
-                grad_distill_active
-            )
+            # Critic forward on FULL clip — value-only distillation.
+            real_lat_critic_in = real_lat.clone().detach()
+            fake_lat_critic_in = fake_lat.clone().detach()
             critic_val_real = critic_for_update(real_lat_critic_in).float()
             critic_val_fake = critic_for_update(fake_lat_critic_in).float()
-            if grad_distill_active:
-                critic_grad_real = torch.autograd.grad(
-                    critic_val_real.sum(), real_lat_critic_in,
-                    create_graph=True, retain_graph=True,
-                )[0]
-                critic_grad_fake = torch.autograd.grad(
-                    critic_val_fake.sum(), fake_lat_critic_in,
-                    create_graph=True, retain_graph=True,
-                )[0]
-            else:
-                critic_grad_real = None
-                critic_grad_fake = None
-            # Value loss on (real, fake) — scalar/per-frame MSE
-            # (legacy; preserved for back-compat when dense_distill
-            # is off, and as a complementary signal when on).
+            # Value loss on (real, fake) — scalar/per-frame MSE.
             L_value = (
                 ((critic_val_real - teacher_val_real.detach()) ** 2).mean()
                 + ((critic_val_fake - teacher_val_fake.detach()) ** 2).mean()
@@ -4964,7 +4591,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # correctly (calling ``critic.forward_dense`` directly on
             # the DDP wrapper would skip grad-sync hooks and silently
             # break param synchronization).
-            L_value_dense_value = 0.0
             if dense_distill and teacher_dense_real is not None:
                 critic_val_real_dense = critic_for_update(
                     real_lat_critic_in, dense=True,
@@ -4985,56 +4611,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 L_value = L_value + L_value_dense
                 L_value_dense_value = float(L_value_dense.detach().item())
                 del critic_val_real_dense, critic_val_fake_dense
-            # Multi-noise interp value loss (option 3).
-            if interp_lats_stacked is not None:
-                critic_val_interp = critic_for_update(
-                    interp_lats_stacked,
-                ).float()
-                L_value = L_value + (
-                    (critic_val_interp - teacher_vals_interp) ** 2
-                ).mean()
-                del critic_val_interp
-            # Sobolev L_grad on subset.
-            if grad_distill_active:
-                critic_grad_real_sub = critic_grad_real[:, grad_frames]
-                critic_grad_fake_sub = critic_grad_fake[:, grad_frames]
-                L_grad = (
-                    ((critic_grad_real_sub - teacher_grad_real_sub) ** 2).mean()
-                    + ((critic_grad_fake_sub - teacher_grad_fake_sub) ** 2).mean()
-                )
-                L_critic = L_value + self.gan_critic_grad_loss_weight * L_grad
-                critic_grad_real_sub_last = critic_grad_real_sub
-                critic_grad_fake_sub_last = critic_grad_fake_sub
-            else:
-                critic_grad_real_sub = None
-                critic_grad_fake_sub = None
-                L_grad = torch.zeros((), device=device)
-                L_critic = L_value
-            # Finite-difference Sobolev L_fd (option 2). Match the
-            # critic's input-direction sensitivity to the disc's
-            # without backproping through V+SAM2.
-            if fd_active and fd_data is not None:
-                fd_terms = []
-                for eps_full, disc_diff in zip(
-                    fd_data["eps_list"], fd_data["disc_diffs_list"],
-                ):
-                    fake_perturbed_lat = (
-                        fake_lat + eps_full
-                    ).detach()
-                    critic_val_perturbed = critic_for_update(
-                        fake_perturbed_lat,
-                    ).float()
-                    critic_diff = (
-                        critic_val_perturbed - critic_val_fake
-                    ).flatten()
-                    fd_terms.append(((critic_diff - disc_diff) ** 2).mean())
-                L_fd = sum(fd_terms) / max(1, len(fd_terms))
-                L_critic = L_critic + self.gan_critic_fd_loss_weight * L_fd
-                L_fd_value = float(L_fd.detach().item())
-            else:
-                L_fd_value = 0.0
             if self.latent_critic_optimizer is not None:
-                L_critic.backward()
+                L_value.backward()
                 if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
                     critic_params_iter = (
                         self.latent_critic_ddp.parameters()
@@ -5047,28 +4625,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                 self.latent_critic_optimizer.step()
             L_value_value = float(L_value.detach().item())
-            L_grad_value = float(L_grad.detach().item())
-            L_critic_value = float(L_critic.detach().item())
             critic_val_real_last = critic_val_real.detach()
             critic_val_fake_last = critic_val_fake.detach()
-        # Diagnostic: critic↔disc value correlation (over all anchor
-        # points: real, fake, AND interpolations if multi-noise active).
-        # More anchor points = a more meaningful Pearson (the 2-point
-        # case is degenerate — see v9 ``c_corr=+1.000`` artifact).
+        # Diagnostic: critic↔disc value correlation on (real, fake).
         with torch.no_grad():
-            cv_parts = [critic_val_real_last, critic_val_fake_last]
-            tv_parts = [teacher_val_real, teacher_val_fake]
-            if interp_lats_stacked is not None:
-                # Recompute critic on interpolations no_grad for the
-                # diagnostic (the loop's last critic_val_interp was
-                # consumed by the loss).
-                critic_val_interp_diag = critic_for_update(
-                    interp_lats_stacked,
-                ).float()
-                cv_parts.append(critic_val_interp_diag)
-                tv_parts.append(teacher_vals_interp)
-            cv_all = torch.cat(cv_parts, dim=0)
-            tv_all = torch.cat(tv_parts, dim=0)
+            cv_all = torch.cat([critic_val_real_last, critic_val_fake_last], dim=0)
+            tv_all = torch.cat([teacher_val_real, teacher_val_fake], dim=0)
             if cv_all.numel() >= 2:
                 cv_c = cv_all - cv_all.mean()
                 tv_c = tv_all - tv_all.mean()
@@ -5076,25 +4638,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 critic_disc_corr = float((cv_c * tv_c).sum() / denom)
             else:
                 critic_disc_corr = 0.0
-            if grad_distill_active and critic_grad_real_sub_last is not None:
-                cg = torch.cat([
-                    critic_grad_real_sub_last.flatten(),
-                    critic_grad_fake_sub_last.flatten(),
-                ])
-                tg = torch.cat([
-                    teacher_grad_real_sub.flatten(),
-                    teacher_grad_fake_sub.flatten(),
-                ])
-                denom = (cg.norm() * tg.norm()).clamp_min(1e-8)
-                critic_grad_cos_sim = float((cg * tg).sum() / denom)
-            else:
-                critic_grad_cos_sim = 0.0  # n/a in value-only mode
 
-        # Path 3 (gen-side ``-critic(pred_image)``) was already
-        # computed in ``_compute_r3gan_losses_distilled`` and
-        # backpropagated into the generator. The deferred step's job
-        # is just D-update + critic distillation; no gen-side work
-        # remains here. Append diagnostics to ``out``.
+        # Diagnostics for ``out``.
         out["train/r3gan_d_loss"] = d_loss_value
         out["train/r3gan_r1"] = r1_value
         out["train/r3gan_r2"] = r2_value
@@ -5102,9 +4647,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["train/r3gan_d_fake_detached"] = d_fake_detached_value
         out["train/critic_value_loss"] = L_value_value
         out["train/critic_value_dense_loss"] = L_value_dense_value
-        out["train/critic_grad_loss"] = L_grad_value
-        out["train/critic_total_loss"] = L_critic_value
-        out["train/critic_fd_loss"] = L_fd_value
         out["train/critic_logit_mean"] = float(
             (
                 (critic_val_real_last.mean() + critic_val_fake_last.mean())
@@ -5116,10 +4658,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             .detach().item()
         )
         out["train/critic_disc_corr"] = critic_disc_corr
-        out["train/critic_grad_cos_sim"] = critic_grad_cos_sim
-        out["train/critic_grad_full_anchor"] = 1.0 if do_full_grad else 0.0
-        out["train/critic_n_grad_frames"] = float(n_grad)
-        out["train/critic_n_interp_samples"] = float(n_interp)
         out["train/critic_updates_per_step"] = float(critic_updates)
 
     def _compute_r3gan_losses(
@@ -6576,12 +6114,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # reset; the cost is a few resets that some ranks didn't
         # individually need (their ride state still gets thrown away),
         # but that's strictly better than a hang.
-        local_crossed_mae = bool(avg_mae == avg_mae and avg_mae > threshold)
+        # MAE-collapse reset removed (the MAE-extension path was
+        # deleted; we no longer monitor MAE for ride resets).
+        # The cap + exhausted gates still fire normally.
         local_hit_cap = self._chunks_in_current_ride >= max_rolls
         local_exhausted = not self.model.can_generate_more()
-        local_should_reset = (
-            local_crossed_mae or local_hit_cap or local_exhausted
-        )
+        local_should_reset = local_hit_cap or local_exhausted
         if dist.is_initialized() and dist.get_world_size() > 1:
             flag_t = torch.tensor(
                 [1 if local_should_reset else 0],
@@ -6597,9 +6135,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # reset". Both ranks always agree on the boolean now.
         if should_reset:
             out["streaming_did_reset"] = 1.0
-            if local_crossed_mae:
-                out["streaming_reset_reason_mae"] = 1.0
-            elif local_hit_cap:
+            # MAE-collapse reset removed alongside the MAE-extension
+            # path. Only cap / end-of-ride / peer-triggered reasons
+            # remain.
+            if local_hit_cap:
                 out["streaming_reset_reason_cap"] = 1.0
             elif local_exhausted:
                 out["streaming_reset_reason_end_of_ride"] = 1.0
@@ -6714,6 +6253,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self._mem_step_snaps = []
         self._mem_step_snapshot("0_entry")
 
+        # Plumb the trainer's current step into ``info`` so the model
+        # can resolve step-dependent schedules (e.g. the aux teacher's
+        # piecewise-linear ``real_teacher_input_mix_gt_p`` schedule)
+        # without separately threading the step through the call
+        # signature.
+        train_info["current_step"] = int(self.step)
         gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
             train_chunk, train_info,
         )
@@ -6922,16 +6467,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # backward can walk the shared cond_dict / action_projection
         # subgraph) which keeps gen activations alive even after the
         # action-critic backward completes. Explicitly empty the
-        # CUDA allocator cache before launching the heavy V+SAM2
-        # forwards in Paths 1+2 to release any fragmented free
-        # blocks back to CUDA — without this, the allocator may
-        # have ~5-10 GB of small unusable holes that block a
-        # contiguous ~1 GB workspace allocation.
-        if self._distilled_pending is not None:
-            torch.cuda.empty_cache()
-            self._run_distilled_post_backward_step(out)
-            torch.cuda.empty_cache()
-            self._mem_step_snapshot("7_after_distilled_post_backward")
         self._mem_step_snapshot("8_exit")
 
     # ------------------------------------------------------------------

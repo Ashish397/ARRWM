@@ -32,7 +32,6 @@ local_attn_size_schedule: [[0, 21]]
 
 # Collapse threshold (still used for streaming-state reset). MAE-
 # extension threshold removed — extension code path is gone.
-collapse_mae_threshold: 0.2
 
 # R3GAN — RpGAN + R1 + R2 discriminator on GT vs student latent
 # video. Recipe ported verbatim from the original action_forcing_

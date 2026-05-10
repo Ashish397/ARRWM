@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-baseline
+#SBATCH --job-name=action-forcing-phase3-baseline-NR-W
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,25 +11,20 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 baseline (TRUE baseline). Pure DMD only.
+# Phase-3 baseline_NR_W: baseline + MANIQA NR-IQA + warm_start_init.
 #
 #   GAN:           OFF  (gan_enabled=false, gan_loss_weight=0.0)
-#   MANIQA NR-IQA: OFF  (maniqa_approx_loss_weight=0.0)
-#   warm_start:    OFF  (warm_start_init=false; chunks cold-start
-#                        from pure noise + full ladder)
+#   MANIQA NR-IQA: ON   (maniqa_approx_loss_weight=1.0, n_frames=84,
+#                        n_patches_per_frame=8, maniqa-pipal)
+#   warm_start:    ON   (warm_start_init=true)
 #
-# A/B grid for the four-cell ablation:
-#   baseline       — no GAN, no warm-start  (this file)
-#   baseline_W     — no GAN, warm-start
-#   baseline_G     — GAN,    no warm-start
-#   baseline_G_W   — GAN,    warm-start
-# All four disable MANIQA so the GAN/warm-start signals are isolated.
-#
-# Other phase-3 contract (preserved across all four):
-#   * 21-frame student rollout, 200-step max.
-#   * Teacher: v14 LoRA merged into base WAN, FROZEN. No online
-#     teacher training, no aux loss.
-#   * wandb_project=longlive-phase-3.
+# Six-cell A/B grid (NR = NR-IQA / MANIQA, G = GAN, W = warm-start):
+#   baseline       — none
+#   baseline_W     — warm-start
+#   baseline_G     — GAN
+#   baseline_G_W   — GAN + warm-start
+#   baseline_NR    — MANIQA
+#   baseline_NR_W  — MANIQA + warm-start  (this file)
 # =====================================================================
 
 set -e -o pipefail
@@ -37,14 +32,13 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_baseline
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_baseline_NR_W
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
 
-# GAN OFF → no SAM2 prereq checks needed. The disc + critic are not
-# constructed when ``gan_enabled=false``.
+# GAN OFF → no SAM2 prereq checks needed.
 
 CACHE_DIR='/scratch/u6ex/as1748.u6ex/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
@@ -68,8 +62,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 BASELINE (true baseline) on $(date)"
-echo "  * GAN: OFF, MANIQA: OFF, warm_start: OFF"
+echo "Starting Phase-3 BASELINE_NR_W (MANIQA + warm_start ON) on $(date)"
+echo "  * GAN: OFF, MANIQA: ON, warm_start: ON"
 echo "  * 21-frame student rollout, 200-step max."
 echo "  * Teacher: v14 LoRA merged into base WAN, FROZEN."
 echo "  * wandb_project=longlive-phase-3."
@@ -114,12 +108,15 @@ srun torchrun \
     aux_teacher_loss_weight=0.0 \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
-    warm_start_init=false \
+    warm_start_init=true \
     gan_enabled=false \
     gan_loss_weight=0.0 \
-    maniqa_approx_loss_weight=0.0 \
+    maniqa_approx_loss_weight=1.0 \
+    maniqa_n_frames=84 \
+    maniqa_n_patches_per_frame=8 \
+    maniqa_metric_name=maniqa-pipal \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_baseline_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_baseline_NR_W_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

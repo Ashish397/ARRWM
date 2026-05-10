@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-v1
+#SBATCH --job-name=action-forcing-phase3-baseline-G-W
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,34 +11,18 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 v1: 21-frame student rollout, ONLINE teacher training with
-# blend-mode piecewise-linear p schedule.
+# Phase-3 baseline_G_W: baseline + R3GAN + warm_start_init.
 #
-# Compared to phase3_baseline:
-#   * real_teacher_train_online = TRUE — the v14 LoRA stays attached
-#     (no merge_and_unload); the LoRA params receive flow-loss
-#     gradient against GT every iter via the aux pass, and get an
-#     optimizer step at the end of each gen step.
-#   * aux_teacher_loss_weight = 1.0 (active aux loss).
-#   * real_teacher_input_source = blend (deterministic linear blend
-#     of GT and student in noise_base).
-#   * aux_teacher_p_schedule_enabled = true with the piecewise-linear
-#     curriculum:
-#         step 0       → p = 1.0   (all GT)
-#         step 50      → p = 0.65  (end of segment 1)
-#         step 50      → p = 0.35  (start of segment 2; discontinuous drop)
-#         step 100     → p = 0.0   (end of segment 2; pure student)
-#         step 100+    → p = 0.0   (clamped, pure student forever)
-#     All schedule anchors and segment lengths config-settable; the
-#     numbers below are the v1 defaults.
-#   * aux_teacher_send_student_grad = true (default; explicit for
-#     clarity). If set false, the implicit gradient channel back to
-#     the student via noise_base = chunk gets severed; LoRA still
-#     trains on whatever input distribution the schedule resolves to,
-#     but DMD becomes the only student-grad path through real_score.
+#   GAN:           ON   (R3GAN + SAM2 pixel disc, distilled critic;
+#                        gan_enabled=true, gan_loss_weight=1.0)
+#   MANIQA NR-IQA: OFF  (maniqa_approx_loss_weight=0.0)
+#   warm_start:    ON   (warm_start_init=true)
 #
-# Everything else (max_steps=200, wandb_project, GAN/SAM2/MANIQA
-# wiring, RoPE alignment) inherits from phase3_baseline.
+# A/B grid for the four-cell ablation:
+#   baseline       — no GAN, no warm-start
+#   baseline_W     — no GAN, warm-start
+#   baseline_G     — GAN,    no warm-start
+#   baseline_G_W   — GAN,    warm-start  (this file)
 # =====================================================================
 
 set -e -o pipefail
@@ -46,10 +30,10 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_v1
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_baseline_G_W
 WANDB_SAVE_DIR=wandb
 
-# ---- SAM2 paths (must be set; see PREREQUISITES) ----
+# ---- SAM2 paths (must be set when gan_enabled=true) ----
 GAN_SAM2_CKPT=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_base_plus.pt
 GAN_SAM2_CFG=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_b+.yaml
 
@@ -59,7 +43,7 @@ conda activate arrwm
 # Pre-flight SAM2 sanity checks. Fail-fast on missing prereqs so the
 # job exits at submission rather than ~5 min into model load.
 python -c "import sam2" 2>/dev/null || {
-  echo "ERROR: sam2 package not installed. See PREREQUISITES in this sbatch."
+  echo "ERROR: sam2 package not installed."
   exit 1
 }
 [ -f "$GAN_SAM2_CKPT" ] || {
@@ -89,17 +73,16 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-3 v1 (online teacher + blend-p schedule) on $(date)"
+echo "Starting Phase-3 BASELINE_G_W (GAN + warm_start ON) on $(date)"
+echo "  * GAN: ON, MANIQA: OFF, warm_start: ON"
 echo "  * 21-frame student rollout, 200-step max."
-echo "  * Teacher: v14 LoRA, ONLINE TRAINING via aux pass."
-echo "  * Blend-mode p schedule: 1.0 -> 0.65 over steps [0, 50),"
-echo "    drop to 0.35, ramp to 0.0 over steps [50, 100); flat 0.0 after."
+echo "  * Teacher: v14 LoRA merged into base WAN, FROZEN."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -136,29 +119,19 @@ srun torchrun \
     boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
-    real_teacher_train_online=true \
+    real_teacher_train_online=false \
     real_teacher_causal_mask=false \
     real_guidance_scale=1.0 \
-    real_teacher_lr=5e-5 \
-    real_teacher_warmup_steps=200 \
-    real_teacher_input_source=blend \
-    real_teacher_input_mix_gt_p=None \
-    aux_teacher_p_schedule_enabled=true \
-    aux_teacher_p_seg1_start=1.0 \
-    aux_teacher_p_seg1_end=0.65 \
-    aux_teacher_p_seg1_steps=50 \
-    aux_teacher_p_seg2_start=0.35 \
-    aux_teacher_p_seg2_end=0.0 \
-    aux_teacher_p_seg2_steps=50 \
-    aux_teacher_send_student_grad=false \
-    aux_teacher_loss_weight=1.0 \
+    aux_teacher_loss_weight=0.0 \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
+    warm_start_init=true \
+    gan_enabled=true \
     gan_loss_weight=1.0 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
     gan_sam2_config_path=$GAN_SAM2_CFG \
-    gan_sam2_resolution=768 \
+    gan_sam2_resolution=512 \
     gan_sam2_preserve_aspect=false \
     gan_sam2_pad_to_square=true \
     gan_sam2_distilled_critic=true \
@@ -166,13 +139,10 @@ srun torchrun \
     gan_warmup_steps=80 \
     gan_sam2_frame_pool=none \
     gan_sam2_encoder_chunk_size=84 \
-    maniqa_approx_loss_weight=1.0 \
-    maniqa_n_frames=84 \
-    maniqa_n_patches_per_frame=8 \
-    maniqa_metric_name=maniqa-pipal \
     gan_critic_dense_distillation=true \
+    maniqa_approx_loss_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_v1_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_baseline_G_W_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
