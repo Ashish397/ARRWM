@@ -2040,7 +2040,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
             # ----- Online real_teacher: clip + step + zero -----
             real_teacher_grad_norm_val = 0.0
-            if self.real_teacher_optimizer is not None:
+            # Hard gate: skip the LoRA optimizer step entirely until
+            # ``aux_teacher_start_step``. The aux pass is also gated
+            # in ``compute_generator_loss_streaming`` (so no aux grad
+            # accumulates pre-start), but defensively zero any stray
+            # gradient here too in case some other path populates it.
+            _aux_start_step = int(
+                getattr(self.config, "aux_teacher_start_step", 0)
+            )
+            _aux_step_open = self.step >= _aux_start_step
+            if (
+                self.real_teacher_optimizer is not None
+                and _aux_step_open
+            ):
                 rt_params_with_grad = [
                     p for p in self.real_teacher_optimizer.param_groups[0]["params"]
                     if p.grad is not None
@@ -2070,6 +2082,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         float(rtgn.item()) if torch.is_tensor(rtgn) else float(rtgn)
                     )
                     self.real_teacher_optimizer.step()
+                self.real_teacher_optimizer.zero_grad(set_to_none=True)
+            elif self.real_teacher_optimizer is not None:
+                # Below start_step (or aux gate closed for any other
+                # reason): zero any stray gradient so the next iter
+                # starts clean. No optimizer step taken.
                 self.real_teacher_optimizer.zero_grad(set_to_none=True)
 
             self.step += 1
@@ -6228,9 +6245,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         _sample_due_now = self._video_sample_due(int(self.step) + 1)
         if _sample_due_now:
             try:
-                self._pending_video_latents = (
-                    train_chunk.detach().to(torch.float32)
+                # Prefer the post-Step-3.3.5 refined cache_pred from
+                # the pipeline's ``_clean_chunk`` buffer — cleanest
+                # available student state at t=60 (vs ``train_chunk``
+                # which is the random-exit-rung output at a noisier,
+                # variable t). Falls back to ``train_chunk`` when
+                # ``flash_dmd_enabled=False`` (buffer is None).
+                _clean = getattr(
+                    self.model.inference_pipeline, "_clean_chunk", None,
                 )
+                if _clean is not None:
+                    self._pending_video_latents = (
+                        _clean.detach().to(torch.float32)
+                    )
+                else:
+                    self._pending_video_latents = (
+                        train_chunk.detach().to(torch.float32)
+                    )
                 _cs = int(self.step) + 1
                 while (
                     self._sample_at_steps_pending
@@ -6285,8 +6316,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # abs_max saturates near the VAE's latent range, the student
         # is collapsing in latent space — a leading indicator that
         # decode-time output will go grey/blocky in the next few iters.
+        # Prefer the post-Step-3.3.5 refined cache_pred (cleanest
+        # student state at t=60) when available; fall back to
+        # ``train_chunk`` (random-exit-rung output) when
+        # ``flash_dmd_enabled=False``. More representative of
+        # inference-time output quality.
         with torch.no_grad():
-            _tc = train_chunk.detach().float()
+            _clean = getattr(
+                self.model.inference_pipeline, "_clean_chunk", None,
+            )
+            _tc = (_clean if _clean is not None else train_chunk).detach().float()
             out["student_pred_rms"] = float(_tc.pow(2).mean().sqrt().item())
             out["student_pred_abs_max"] = float(_tc.abs().max().item())
             out["student_pred_mean"] = float(_tc.mean().item())

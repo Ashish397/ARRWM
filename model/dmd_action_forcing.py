@@ -73,6 +73,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from model.base import SelfForcingModel
 from pipeline.action_forcing_training import (
@@ -278,6 +279,32 @@ class ActionForcingDMD(SelfForcingModel):
         self.real_teacher_train_online = bool(
             getattr(args, "real_teacher_train_online", False)
         )
+        # Online aux teacher LoRA rank / alpha / dropout. Configurable
+        # SEPARATELY from v14's rank: when ``real_teacher_train_online``
+        # is True we MERGE v14's rank-256 LoRA into the base model
+        # (folds v14's learned weights into the WAN base permanently),
+        # then apply a FRESH trainable adapter at ``aux_teacher_lora_
+        # rank`` (default 32) on top. Reducing rank cuts LoRA params +
+        # Adam state + grad buffers by ``256/rank`` and saves ~1 GB at
+        # rank 32. ``alpha`` should track rank to preserve the LoRA
+        # scaling factor ``α/r`` (default ``α=rank`` → ``α/r=1.0``;
+        # changing only one of them is almost always a bug). When
+        # ``real_teacher_train_online=False`` these knobs are unused
+        # (v14 is still merged in by the legacy path).
+        self.aux_teacher_lora_rank = int(
+            getattr(args, "aux_teacher_lora_rank", 32)
+        )
+        self.aux_teacher_lora_alpha = float(
+            getattr(args, "aux_teacher_lora_alpha", self.aux_teacher_lora_rank)
+        )
+        self.aux_teacher_lora_dropout = float(
+            getattr(args, "aux_teacher_lora_dropout", 0.0)
+        )
+        if self.aux_teacher_lora_rank <= 0:
+            raise ValueError(
+                f"aux_teacher_lora_rank={self.aux_teacher_lora_rank} "
+                f"must be > 0"
+            )
         # Causal mask flag on the joint [clean | noisy] TF sequence
         # (v14 parity = True). When False, the inner CausalWanModel's
         # ``_prepare_teacher_forcing_mask`` returns a full-bidirectional
@@ -397,6 +424,39 @@ class ActionForcingDMD(SelfForcingModel):
         self.aux_teacher_send_student_grad = bool(
             getattr(args, "aux_teacher_send_student_grad", True)
         )
+
+        # Hard start-step gate for the aux teacher pass. Below this
+        # step the aux pass does not fire at all (no real_score
+        # forward, no LoRA gradient accumulated). Lets the student
+        # produce reasonable outputs first so the LoRA isn't trained
+        # on early-step student garbage. Independent of
+        # ``real_teacher_warmup_steps`` (which is an LR-warmup ramp
+        # only, applied AFTER this gate opens). Default 0 = no delay
+        # (current behavior).
+        self.aux_teacher_start_step = int(
+            getattr(args, "aux_teacher_start_step", 0)
+        )
+        if self.aux_teacher_start_step < 0:
+            raise ValueError(
+                f"aux_teacher_start_step={self.aux_teacher_start_step} "
+                f"must be >= 0"
+            )
+
+        # Linear warmup on top of the start-step gate: from
+        # ``aux_teacher_start_step`` the effective aux loss weight
+        # ramps from 0 → ``aux_teacher_loss_weight`` over
+        # ``aux_teacher_loss_warmup_steps`` steps, then holds at
+        # ``aux_teacher_loss_weight``. Independent of
+        # ``real_teacher_warmup_steps`` (LR warmup). Default 0 =
+        # instantaneous full weight at start_step (current behavior).
+        self.aux_teacher_loss_warmup_steps = int(
+            getattr(args, "aux_teacher_loss_warmup_steps", 0)
+        )
+        if self.aux_teacher_loss_warmup_steps < 0:
+            raise ValueError(
+                f"aux_teacher_loss_warmup_steps="
+                f"{self.aux_teacher_loss_warmup_steps} must be >= 0"
+            )
 
         # Optional piecewise-linear schedule for
         # ``real_teacher_input_mix_gt_p`` so the LoRA starts seeing
@@ -691,6 +751,35 @@ class ActionForcingDMD(SelfForcingModel):
             self.scheduler.alphas_cumprod = None
 
         self.dmd_loss_weight = float(getattr(args, "dmd_loss_weight", 1.0))
+
+        # DMD loss start-step + linear warmup gate. Below ``dmd_loss_
+        # start_step`` the gen-side DMD loss is zero (no gradient to
+        # the student from DMD); from ``dmd_loss_start_step`` to
+        # ``dmd_loss_start_step + dmd_loss_warmup_steps`` the
+        # effective weight ramps linearly from 0 to ``dmd_loss_weight``.
+        # Past that, the full weight applies. Default
+        # ``dmd_loss_start_step=0, dmd_loss_warmup_steps=0`` reproduces
+        # the prior "DMD full from step 0" behavior bit-identically.
+        # Use case: let the student rollout warm up on GAN/MANIQA
+        # signal first (steps 0-49), then phase DMD in (50-100), then
+        # full from step 100. Independent of GAN's own
+        # ``gan_warmup_steps`` / ``gan_critic_warmup_steps`` ramps.
+        self.dmd_loss_start_step = int(
+            getattr(args, "dmd_loss_start_step", 0)
+        )
+        self.dmd_loss_warmup_steps = int(
+            getattr(args, "dmd_loss_warmup_steps", 0)
+        )
+        if self.dmd_loss_start_step < 0:
+            raise ValueError(
+                f"dmd_loss_start_step={self.dmd_loss_start_step} "
+                f"must be >= 0"
+            )
+        if self.dmd_loss_warmup_steps < 0:
+            raise ValueError(
+                f"dmd_loss_warmup_steps={self.dmd_loss_warmup_steps} "
+                f"must be >= 0"
+            )
 
         # Fake-score updates: ON by default for DMD2.
         self.fake_score_updates_enabled = bool(
@@ -1342,18 +1431,48 @@ class ActionForcingDMD(SelfForcingModel):
                 )
 
         if self.real_teacher_train_online:
-            # Online teacher: apply v14 LoRA to ``self.real_score``
-            # WITHOUT merging — the peft adapter stays alive, base is
-            # frozen, LoRA params are trainable. Trainer builds an
-            # optimizer over ``_real_teacher_trainable_params`` below;
-            # DDP-wraps ``real_score.model`` separately.
-            trainable_lora = _apply_v14_lora(self.real_score, merge=False)
+            # Online teacher: TWO-STAGE LoRA setup.
+            #
+            # Stage 1 — MERGE v14 into the base: fold v14's rank-256
+            # LoRA weights into the WAN base permanently. v14's learned
+            # behavior is now baked into the base parameters; the peft
+            # wrapper is removed.
+            _apply_v14_lora(self.real_score, merge=True)
+            # Stage 2 — apply a FRESH rank-``aux_teacher_lora_rank``
+            # LoRA on top of the v14-merged base. This new adapter
+            # starts from zero output (random init), is what the
+            # online aux teacher trains, and has 8x fewer params than
+            # v14 at rank 32 (~1 GB savings on params + Adam state +
+            # grads). Target modules are re-collected from the merged
+            # base (peft strips the wrapper after merge_and_unload).
+            target_modules = self._collect_target_modules(self.real_score.model)
+            if not target_modules:
+                target_modules = ["q", "k", "v", "o"]
+            fresh_lora_config = LoraConfig(
+                r=int(self.aux_teacher_lora_rank),
+                lora_alpha=float(self.aux_teacher_lora_alpha),
+                lora_dropout=float(self.aux_teacher_lora_dropout),
+                target_modules=target_modules,
+                bias="none",
+            )
+            self.real_score.model = peft.get_peft_model(
+                self.real_score.model, fresh_lora_config,
+            )
+            # Mark fresh LoRA params trainable; base stays frozen.
+            trainable_lora: List[nn.Parameter] = []
+            for name, p in self.real_score.model.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad_(True)
+                    trainable_lora.append(p)
+                else:
+                    p.requires_grad_(False)
             self._real_teacher_trainable_params = trainable_lora
             if not trainable_lora:
                 raise RuntimeError(
                     "[ActionForcingDMD] real_teacher_train_online=True but "
-                    "no LoRA params were marked trainable after the peft "
-                    "wrap — check peft naming convention or LoRA config."
+                    "no LoRA params were marked trainable after the fresh "
+                    "rank-%d peft wrap — check peft naming convention or "
+                    "LoRA config." % int(self.aux_teacher_lora_rank)
                 )
             # Causal mask flag — consumed by
             # ``CausalWanModel._prepare_teacher_forcing_mask`` (see
@@ -1375,9 +1494,13 @@ class ActionForcingDMD(SelfForcingModel):
             if _is_main():
                 logging.info(
                     "[ActionForcingDMD] real_teacher_train_online=True: "
-                    "v14 LoRA adapter kept (no merge), %d LoRA params "
-                    "trainable, tf_use_causal_mask=%s, "
+                    "v14 LoRA MERGED into base; fresh rank-%d LoRA "
+                    "(alpha=%.1f, dropout=%.3f) applied on top, %d LoRA "
+                    "params trainable, tf_use_causal_mask=%s, "
                     "gradient_checkpointing=%s.",
+                    int(self.aux_teacher_lora_rank),
+                    float(self.aux_teacher_lora_alpha),
+                    float(self.aux_teacher_lora_dropout),
                     len(trainable_lora),
                     self.real_teacher_causal_mask,
                     gc_on,
@@ -3159,6 +3282,16 @@ class ActionForcingDMD(SelfForcingModel):
             "previous_clean_chunk": anchor_clean.detach(),
             "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill (anchor adds npb on top)
             "anchor_chunk": anchor_chunk,  # [B, npb, C, H, W] — iter 1's clean_x_self anchor
+            # Stable snapshot of the FIRST 6 student chunks' post-
+            # Step-3.3.5 refined cache_pred (= ``chunk_size - npb`` =
+            # 18 frames). Captured on iter 1 once the pipeline's
+            # ``_clean_chunk`` buffer is fully populated. Used by
+            # ``_compute_aux_teacher_loss_streaming`` to assemble
+            # ``clean_x_aux = cat(GT_seed_last, snapshot)`` every
+            # iter — gives the LoRA a stable 21-frame clean_x context
+            # of GT seed-tail + first 6 student chunks. Reset on
+            # streaming reset.
+            "aux_clean_x_snapshot": None,
         }
 
     def _streaming_build_cond_dicts(
@@ -3886,7 +4019,12 @@ class ActionForcingDMD(SelfForcingModel):
                 gt_z_per_slot=gt_z_per_slot,
                 clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
             )
-        dmd_loss = dmd_loss * self.dmd_loss_weight
+        # Resolved DMD loss weight: applies the start-step gate +
+        # linear warmup ramp on top of the static ``dmd_loss_weight``.
+        # ``current_step`` was already plumbed via ``info`` (also used
+        # by the aux teacher schedule resolver above).
+        dmd_weight_resolved = self._resolved_dmd_loss_weight(current_step)
+        dmd_loss = dmd_loss * dmd_weight_resolved
 
         # Flash-DMD: when enabled, the rolling rollout emitted a
         # per-block t=flash_dmd_gan_t grad-on forward. The chunk_size-
@@ -3926,10 +4064,18 @@ class ActionForcingDMD(SelfForcingModel):
         # the pass entirely.
         aux_log: Dict[str, Any] = {}
         total_loss = dmd_loss
-        if (
+        # Hard gate: aux pass fires only when (a) real_teacher_train_online,
+        # (b) loss weight > 0, AND (c) we're past
+        # ``aux_teacher_start_step``. Below the start step the real_score
+        # forward is skipped entirely so no LoRA gradient accumulates.
+        # Belt-and-braces companion gate exists in the trainer's
+        # real_teacher_optimizer.step() block.
+        aux_active = (
             self.real_teacher_train_online
             and self.aux_teacher_loss_weight > 0.0
-        ):
+            and int(current_step) >= int(self.aux_teacher_start_step)
+        )
+        if aux_active:
             aux_loss, aux_log = self._compute_aux_teacher_loss_streaming(
                 chunk=chunk,
                 gradient_mask_eff=gradient_mask_eff,
@@ -3946,10 +4092,40 @@ class ActionForcingDMD(SelfForcingModel):
                 aux_p=aux_p,
             )
             if aux_loss is not None:
-                total_loss = total_loss + self.aux_teacher_loss_weight * aux_loss
+                # Resolved aux teacher loss weight applies the start-
+                # step gate + linear warmup ramp on top of the static
+                # ``aux_teacher_loss_weight``. Mirrors the DMD weight
+                # ramp; ``warmup_steps=0`` reproduces instantaneous
+                # full weight at start_step.
+                aux_weight_resolved = self._resolved_aux_teacher_loss_weight(
+                    int(current_step)
+                )
+                total_loss = total_loss + aux_weight_resolved * aux_loss
+                aux_log["aux_teacher_loss_weight_resolved"] = float(
+                    aux_weight_resolved
+                )
+        elif (
+            self.real_teacher_train_online
+            and self.aux_teacher_loss_weight > 0.0
+        ):
+            # Online aux is configured but the start-step gate is closed
+            # this iter. Surface a dedicated diagnostic so the wandb
+            # plot shows the frozen-pre-start window distinctly from
+            # "aux is off entirely".
+            aux_log["aux_teacher_frozen_pre_start"] = 1.0
+            aux_log["aux_teacher_loss_weight_resolved"] = 0.0
+        else:
+            aux_log["aux_teacher_loss_weight_resolved"] = 0.0
+        # Visible-in-wandb gate state every iter (1.0 when fired this
+        # step, 0.0 when skipped — including the no-online case).
+        aux_log["aux_teacher_active"] = 1.0 if aux_active else 0.0
 
         dmd_log["streaming_new_frames"] = float(info["new_frames"])
         dmd_log["streaming_current_length"] = float(info["current_length"])
+        # Visible-in-wandb DMD-weight ramp state. Traces 0 → full over
+        # ``[dmd_loss_start_step, dmd_loss_start_step + dmd_loss_warmup_steps]``.
+        dmd_log["dmd_loss_weight_resolved"] = float(dmd_weight_resolved)
+        dmd_log["dmd_loss_active"] = 1.0 if dmd_weight_resolved > 0.0 else 0.0
         # Replacement for the (removed) ``dmd_context_branch_gt`` key.
         # Under the uniform-mix regime the GT contribution is constant
         # = ``dmd_context_mix_p`` on every chunk (no per-chunk dice),
@@ -3964,6 +4140,28 @@ class ActionForcingDMD(SelfForcingModel):
         )
         for k, v in aux_log.items():
             dmd_log[k] = v
+
+        # Defensive graph anchor. When the start-step gates are all
+        # closed (e.g. early production steps: dmd_loss_start_step=50,
+        # aux_teacher_start_step=10, gan_critic_warmup_steps=10) the
+        # gen-side losses can be a sum of 0-weighted contributions plus
+        # leaf-zero placeholders. The mathematical expectation is that
+        # ``dmd_loss * 0.0`` still preserves the autograd graph via
+        # MulBackward, but in practice the empty-mask short-circuit
+        # combined with a chain of 0-weight multiplies has produced
+        # ``RuntimeError: element 0 of tensors does not require grad``
+        # at gen backward (observed at production iter 6 with single-
+        # block ``new_frames=3`` rollouts). Add a guaranteed-graph
+        # anchor when needed: ``0.0 * chunk.sum()`` is graph-attached
+        # through the gen rollout, contributes exactly zero to the
+        # loss value, and lets ``.backward()`` walk the rollout graph
+        # so DDP gradient sync proceeds lockstep across ranks.
+        if not total_loss.requires_grad:
+            anchor = (chunk.float() * 0.0).sum()
+            total_loss = total_loss + anchor
+            dmd_log["gen_loss_graph_anchor_used"] = 1.0
+        else:
+            dmd_log["gen_loss_graph_anchor_used"] = 0.0
         return total_loss, dmd_log
 
     def compute_critic_loss_streaming(
@@ -4107,6 +4305,54 @@ class ActionForcingDMD(SelfForcingModel):
     # LoRA training cadence; this function provides the every-gen-iter
     # student-gradient channel.
     # ------------------------------------------------------------------
+    def _resolved_dmd_loss_weight(self, current_step: int) -> float:
+        """Return the effective DMD loss weight at this step.
+
+        Below ``dmd_loss_start_step``: 0.
+        In ``[start_step, start_step + warmup_steps)``: linear ramp
+        from 0 to ``dmd_loss_weight``.
+        From ``start_step + warmup_steps`` onward: ``dmd_loss_weight``.
+
+        Defaults (``start_step=0, warmup_steps=0``) collapse to a
+        constant ``dmd_loss_weight`` for backward compatibility.
+        """
+        s = int(current_step)
+        start = int(self.dmd_loss_start_step)
+        warmup = int(self.dmd_loss_warmup_steps)
+        full = float(self.dmd_loss_weight)
+        if s < start:
+            return 0.0
+        if warmup <= 0:
+            return full
+        if s >= start + warmup:
+            return full
+        # Linear ramp from 0 at s=start to full at s=start+warmup.
+        return full * float(s - start) / float(warmup)
+
+    def _resolved_aux_teacher_loss_weight(self, current_step: int) -> float:
+        """Return the effective aux-teacher loss weight at this step.
+
+        Below ``aux_teacher_start_step``: 0.
+        In ``[start_step, start_step + warmup_steps)``: linear ramp
+        from 0 to ``aux_teacher_loss_weight``.
+        From ``start_step + warmup_steps`` onward:
+        ``aux_teacher_loss_weight``.
+
+        Defaults (``warmup_steps=0``) collapse to instantaneous full
+        weight at start_step for backward compatibility.
+        """
+        s = int(current_step)
+        start = int(self.aux_teacher_start_step)
+        warmup = int(self.aux_teacher_loss_warmup_steps)
+        full = float(self.aux_teacher_loss_weight)
+        if s < start:
+            return 0.0
+        if warmup <= 0:
+            return full
+        if s >= start + warmup:
+            return full
+        return full * float(s - start) / float(warmup)
+
     def _resolved_real_teacher_input_mix_gt_p(self, current_step: int) -> float:
         """Return the per-step ``real_teacher_input_mix_gt_p`` value.
 
@@ -4345,6 +4591,58 @@ class ActionForcingDMD(SelfForcingModel):
             t.flatten(0, 1),
         ).unflatten(0, chunk.shape[:2])
 
+        # Override clean_x with a stable reference: GT last-seed-chunk
+        # concatenated with the first 6 student chunks' post-Step-3.3.5
+        # refined cache_pred (detached). The pipeline writes per-block
+        # refined cache_pred into ``self.inference_pipeline._clean_chunk``
+        # during the rollout. On iter 1 the buffer holds the full
+        # ``chunk_size``-frame view; we snapshot the first
+        # ``chunk_size - npb`` frames into ``streaming_state`` so
+        # subsequent iters reuse the same stable reference (matches
+        # the user's "first 6 student chunks" semantics — fixed
+        # reference per streaming sequence; reset on
+        # ``reset_streaming_state``).
+        #
+        # When ``flash_dmd_enabled=False`` the pipeline leaves
+        # ``_clean_chunk = None`` and we fall back to the legacy
+        # ``sc_clean_x_real``/``sc_aug_t_real`` (the existing
+        # ``_streaming_build_clean_x_self``-derived view) so flash-
+        # off baselines remain bit-identical to before this change.
+        clean_x_for_real = sc_clean_x_real
+        aug_t_for_real = sc_aug_t_real
+        npb = int(s["shift"])
+        cf_state = int(s["cf"])
+        pipe = getattr(self, "inference_pipeline", None)
+        clean_chunk_buf = (
+            getattr(pipe, "_clean_chunk", None) if pipe is not None else None
+        )
+        if clean_chunk_buf is not None:
+            # Snapshot on iter 1 (or after a streaming reset) once
+            # the buffer holds at least ``chunk_size - npb`` frames.
+            need_frames = chunk_size - npb
+            if s.get("aux_clean_x_snapshot") is None:
+                if int(clean_chunk_buf.shape[1]) >= need_frames:
+                    s["aux_clean_x_snapshot"] = (
+                        clean_chunk_buf[:, :need_frames].detach().clone()
+                    )
+            snapshot = s.get("aux_clean_x_snapshot")
+            if snapshot is not None:
+                # GT last-seed-chunk: ride frames [cf-npb : cf] —
+                # the chunk immediately preceding the rollout's
+                # first frame. Detached, no grad.
+                seed_last = ride_window[:, cf_state - npb: cf_state].to(
+                    dtype=chunk.dtype, device=chunk.device,
+                ).detach()
+                clean_x_for_real = torch.cat(
+                    [seed_last, snapshot.to(dtype=chunk.dtype, device=chunk.device)],
+                    dim=1,
+                ).detach()
+                # v14's clean half is at zero noise.
+                aug_t_for_real = torch.zeros(
+                    (clean_x_for_real.shape[0], clean_x_for_real.shape[1]),
+                    device=chunk.device, dtype=torch.long,
+                )
+
         # Teacher forward — full grad on LoRA params (and on chunk
         # via noisy_input when use_gt=False). When state_probe is
         # attached to real_score (= aux training enabled), the wrapper
@@ -4354,12 +4652,45 @@ class ActionForcingDMD(SelfForcingModel):
         # graph-bearing through both LoRA params (via the taps) and
         # state_probe params (the probe's own weights). We unpack
         # both arities so the same code works with the probe on or off.
-        _real_score_out = self.real_score(
-            noisy_image_or_video=noisy_input,
-            conditional_dict=cond_for_scoring,
-            timestep=t,
-            clean_x=sc_clean_x_real,
-            aug_t=sc_aug_t_real,
+        #
+        # Activation-checkpoint the OUTER call. The inner per-
+        # transformer-block ``real_score_gradient_checkpointing=True``
+        # already discards per-layer activations on backward, but the
+        # outer call still holds ~30 layer-input tensors (~75 MB each
+        # at the aux pass's 21-frame × hidden_dim × bf16 shape =
+        # ~2-3 GB total). Wrapping in ``torch.utils.checkpoint`` makes
+        # the backward re-run the full real_score forward instead of
+        # holding those layer inputs — frees ~3 GB on aux iters.
+        # Cost: +15-20% backward wallclock on those iters.
+        #
+        # Closure capture via default args (pattern identical to the
+        # flash-DMD ckpt in the pipeline): ``cond_for_scoring`` /
+        # ``t`` / ``clean_x_for_real`` / ``aug_t_for_real`` are
+        # loop-local-ish here (rebound per iter) but the closure
+        # snapshot below is defensive against any future move into a
+        # loop. ``noisy_input`` is passed positionally — it carries
+        # the autograd graph back to ``chunk`` when
+        # ``aux_teacher_send_student_grad=True``, so it must be a
+        # ``Tensor`` arg (not a closed-over name) for checkpoint to
+        # plumb backward correctly.
+        def _aux_real_score_fn(
+            x,
+            _gen=self.real_score,
+            _cond=cond_for_scoring,
+            _t=t,
+            _clean=clean_x_for_real,
+            _aug=aug_t_for_real,
+        ):
+            return _gen(
+                noisy_image_or_video=x,
+                conditional_dict=_cond,
+                timestep=_t,
+                clean_x=_clean,
+                aug_t=_aug,
+            )
+
+        _real_score_out = _ckpt(
+            _aux_real_score_fn, noisy_input, use_reentrant=False,
         )
         if isinstance(_real_score_out, tuple) and len(_real_score_out) >= 4:
             flow_pred, _x0, lora_state_preds, _probe_hidden = (

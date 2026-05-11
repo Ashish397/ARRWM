@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-v1
+#SBATCH --job-name=action-forcing-phase3-baseline-G-NR
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,34 +11,56 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 v1: 21-frame student rollout, ONLINE teacher training with
-# blend-mode piecewise-linear p schedule.
+# Phase-3 baseline_G_NR: 21-frame student rollout, frozen v14 teacher,
+# WITH GAN (R3GAN + SAM2 distilled critic) and NR-IQA (MANIQA) heads
+# both active. Naming: G = GAN active, NR = no-reference IQA (MANIQA).
+# A no-GAN/no-NR variant lives in
+# ``train_action_forcing_phase3_baseline_wo_gan.sbatch``.
 #
-# Compared to phase3_baseline:
-#   * real_teacher_train_online = TRUE — the v14 LoRA stays attached
-#     (no merge_and_unload); the LoRA params receive flow-loss
-#     gradient against GT every iter via the aux pass, and get an
-#     optimizer step at the end of each gen step.
-#   * aux_teacher_loss_weight = 1.0 (active aux loss).
-#   * real_teacher_input_source = blend (deterministic linear blend
-#     of GT and student in noise_base).
-#   * aux_teacher_p_schedule_enabled = true with the piecewise-linear
-#     curriculum:
-#         step 0       → p = 1.0   (all GT)
-#         step 50      → p = 0.65  (end of segment 1)
-#         step 50      → p = 0.35  (start of segment 2; discontinuous drop)
-#         step 100     → p = 0.0   (end of segment 2; pure student)
-#         step 100+    → p = 0.0   (clamped, pure student forever)
-#     All schedule anchors and segment lengths config-settable; the
-#     numbers below are the v1 defaults.
-#   * aux_teacher_send_student_grad = true (default; explicit for
-#     clarity). If set false, the implicit gradient channel back to
-#     the student via noise_base = chunk gets severed; LoRA still
-#     trains on whatever input distribution the schedule resolves to,
-#     but DMD becomes the only student-grad path through real_score.
+# Compared to v25 (the last phase-1 run):
+#   * max_steps = 200 (short A/B horizon, not a full training run).
+#   * wandb_project = longlive-phase-3 (new directory).
+#   * real_teacher_train_online = FALSE — the v14 LoRA is loaded and
+#     merge_and_unload'd into base WAN weights at startup; the
+#     resulting model is used as a frozen bidirectional teacher for
+#     DMD scoring. No online teacher training, no aux loss, no LoRA
+#     gradient.
+#   * aux_teacher_loss_weight = 0.0 (belt-and-braces; the aux pass is
+#     already gated off when real_teacher_train_online=false, but set
+#     explicitly so any future code path that reads the weight gets
+#     a hard zero).
 #
-# Everything else (max_steps=200, wandb_project, GAN/SAM2/MANIQA
-# wiring, RoPE alignment) inherits from phase3_baseline.
+# All other v25 settings preserved (GAN / SAM2 / MANIQA / DMD wiring).
+# Phase-3 RoPE alignment cleanup (locked tf_rope_offset = npb, removed
+# DIAG_TF_ROPE_OFFSET, single-source-of-truth in causal_model.py)
+# already in the codebase from the prior cleanup PR — no sbatch knobs
+# needed.
+
+# =====================================================================
+# Phase-3 baseline_G_NR: 21-frame student rollout, frozen v14 teacher,
+# WITH GAN (R3GAN + SAM2 distilled critic) and NR-IQA (MANIQA) heads
+# both active. Naming: G = GAN active, NR = no-reference IQA (MANIQA).
+# A no-GAN/no-NR variant lives in
+# ``train_action_forcing_phase3_baseline_wo_gan.sbatch``.
+#
+# Compared to v25 (the last phase-1 run):
+#   * max_steps = 200 (short A/B horizon, not a full training run).
+#   * wandb_project = longlive-phase-3 (new directory).
+#   * real_teacher_train_online = FALSE — the v14 LoRA is loaded and
+#     merge_and_unload'd into base WAN weights at startup; the
+#     resulting model is used as a frozen bidirectional teacher for
+#     DMD scoring. No online teacher training, no aux loss, no LoRA
+#     gradient.
+#   * aux_teacher_loss_weight = 0.0 (belt-and-braces; the aux pass is
+#     already gated off when real_teacher_train_online=false, but set
+#     explicitly so any future code path that reads the weight gets
+#     a hard zero).
+#
+# All other v25 settings preserved (GAN / SAM2 / MANIQA / DMD wiring).
+# Phase-3 RoPE alignment cleanup (locked tf_rope_offset = npb, removed
+# DIAG_TF_ROPE_OFFSET, single-source-of-truth in causal_model.py)
+# already in the codebase from the prior cleanup PR — no sbatch knobs
+# needed.
 # =====================================================================
 
 set -e -o pipefail
@@ -46,7 +68,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_v1
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_baseline_G_NR
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -95,11 +117,10 @@ echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-3 v1 (online teacher + blend-p schedule) on $(date)"
+echo "Starting Phase-3 BASELINE on $(date)"
 echo "  * 21-frame student rollout, 200-step max."
-echo "  * Teacher: v14 LoRA, ONLINE TRAINING via aux pass."
-echo "  * Blend-mode p schedule: 1.0 -> 0.65 over steps [0, 50),"
-echo "    drop to 0.35, ramp to 0.0 over steps [50, 100); flat 0.0 after."
+echo "  * Teacher: v14 LoRA merged into base WAN, FROZEN. No online"
+echo "    teacher training, no aux loss."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -136,22 +157,10 @@ srun torchrun \
     boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
-    real_teacher_train_online=true \
+    real_teacher_train_online=false \
     real_teacher_causal_mask=false \
     real_guidance_scale=1.0 \
-    real_teacher_lr=5e-5 \
-    real_teacher_warmup_steps=200 \
-    real_teacher_input_source=blend \
-    real_teacher_input_mix_gt_p=None \
-    aux_teacher_p_schedule_enabled=true \
-    aux_teacher_p_seg1_start=1.0 \
-    aux_teacher_p_seg1_end=0.65 \
-    aux_teacher_p_seg1_steps=50 \
-    aux_teacher_p_seg2_start=0.35 \
-    aux_teacher_p_seg2_end=0.0 \
-    aux_teacher_p_seg2_steps=50 \
-    aux_teacher_send_student_grad=false \
-    aux_teacher_loss_weight=1.0 \
+    aux_teacher_loss_weight=0.0 \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     gan_loss_weight=1.0 \
@@ -173,6 +182,6 @@ srun torchrun \
     gan_critic_dense_distillation=true \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_v1_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_baseline_G_NR_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

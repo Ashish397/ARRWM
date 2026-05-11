@@ -431,6 +431,16 @@ class ActionForcingTrainingPipeline:
         # so callers can fail-fast if they expect it but the rollout
         # wasn't run with Flash DMD active.
         self._flash_dmd_gan_output: Optional[torch.Tensor] = None
+        # Per-block CLEAN PRED buffer for the aux teacher's clean_x.
+        # Populated post-Step-3.3.5 (= refined cache_pred when flash
+        # is enabled; post-rung cache_pred otherwise). Detached,
+        # graph-free. Read by ``_compute_aux_teacher_loss_streaming``
+        # to assemble the LoRA's clean half as
+        # ``cat(GT_seed_last, refined_cache_pred[: chunk_size-npb])``.
+        # Sized to the rollout window (post-slice); ``None`` when
+        # ``flash_dmd_enabled=False`` so the aux pass falls back to
+        # the legacy ``_streaming_build_clean_x_self`` path.
+        self._clean_chunk: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (= cache_pred at the
         # last rung's t after the post-exit finish-denoise chain;
         # captured BEFORE the standard mode's context_noise commit
@@ -664,6 +674,22 @@ class ActionForcingTrainingPipeline:
             )
         else:
             flash_dmd_gan_output = None
+        # Aux-teacher clean_x buffer: per-block post-Step-3.3.5
+        # cache_pred (refined when flash_dmd_enabled, else post-rung).
+        # Detached, no autograd graph. Sized to num_output_frames so
+        # block writes use absolute current_start_frame indexing.
+        # Allocated only when ``flash_dmd_enabled`` (the regime where
+        # the aux pass consumes it); ``None`` otherwise lets the aux
+        # pass fall back to the legacy ``_streaming_build_clean_x_self``
+        # path on baselines without flash.
+        if flash_dmd_enabled:
+            clean_chunk = torch.zeros(
+                [batch_size, num_output_frames, num_channels, height, width],
+                device=noise.device,
+                dtype=noise.dtype,
+            )
+        else:
+            clean_chunk = None
         # CF-parity #11: gradient-window gate. CF hardcodes a literal
         # 21 here (``Causal-Forcing/pipeline/self_forcing_training.py:
         # 120``: ``start_gradient_frame_index = num_output_frames - 21``)
@@ -815,14 +841,22 @@ class ActionForcingTrainingPipeline:
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # Skip the grad-active random-exit rung forward on
-                    # the LAST block of the rollout. The DMD scoring
-                    # mask zeros the trailing ``num_frame_per_block``
-                    # frames structurally (v14 joint-TF OOD region) —
-                    # so the last block's grad activations are pure
-                    # waste. See ``generate_chunk_with_cache`` for
-                    # the full rationale.
+                    # the LAST block of MULTI-BLOCK calls. The DMD
+                    # scoring mask zeros the trailing
+                    # ``num_frame_per_block`` frames structurally (v14
+                    # joint-TF OOD region) — so the last block's grad
+                    # activations are pure waste. ``is_multi_block``
+                    # gate is critical: in single-block calls (e.g.
+                    # streaming iter k>=2 with ``new_frames=npb``),
+                    # the only block IS marked last; skipping its grad
+                    # would detach the entire rollout output and break
+                    # the gen backward. See
+                    # ``generate_chunk_with_cache`` for the full
+                    # rationale.
                     is_last_block = (block_index == len(all_num_frames) - 1)
-                    if current_start_frame < start_gradient_frame_index or is_last_block:
+                    is_multi_block = (len(all_num_frames) > 1)
+                    skip_last_block_grad = is_last_block and is_multi_block
+                    if current_start_frame < start_gradient_frame_index or skip_last_block_grad:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
@@ -1050,6 +1084,64 @@ class ActionForcingTrainingPipeline:
                     current_start_frame: current_start_frame + current_num_frames,
                 ] = flash_dmd_pred
 
+            # Step 3.3.5: Independent t=flash_dmd_gan_t no_grad
+            # refinement of cache_pred. Hardcoded ON when
+            # ``flash_dmd_enabled``. Rationale: the model has been
+            # trained on t=flash_dmd_gan_t inputs (via the grad-on
+            # Step 3.2.b flash forward + GAN/MANIQA supervision), so
+            # one extra forward at that timestep produces a
+            # higher-quality clean x0 estimate than the post-rung
+            # output alone. We extend the K/V chain from
+            # ``[1000, 625, 312.5, 178.6, 0_commit]`` to
+            # ``[1000, 625, 312.5, 178.6, gan_t, 0_commit]``.
+            #
+            # Mechanics: re-noise the post-rung ``cache_pred`` at
+            # t=gan_t, run a SEPARATE no_grad forward (independent
+            # of Step 3.2.b's grad-on flash forward — that one's
+            # output goes to ``flash_dmd_gan_output`` for the GAN/
+            # MANIQA loss). Update ``cache_pred`` to this refined
+            # output; Step 3.4 below uses the refined value as the
+            # input to the t=context_noise commit. The K/V written
+            # at this slot will be overwritten by Step 3.4 anyway,
+            # so the only persistent effect is the refinement of
+            # ``cache_pred`` itself. ``prev_block_clean`` was
+            # captured BEFORE this refinement so warm-start carries
+            # the post-rung pred unchanged (preserves the warm-start
+            # contract).
+            if flash_dmd_enabled:
+                refine_t_value = int(flash_dmd_gan_t)
+                refine_flat = cache_pred.detach().flatten(0, 1)
+                refine_input = self.scheduler.add_noise(
+                    refine_flat,
+                    torch.randn_like(refine_flat),
+                    refine_t_value * torch.ones(
+                        [batch_size * current_num_frames],
+                        device=noise.device, dtype=torch.long,
+                    ),
+                ).unflatten(0, cache_pred.shape[:2])
+                refine_t_step = torch.full_like(timestep, refine_t_value)
+                with torch.no_grad():
+                    _, cache_pred = self.generator(
+                        noisy_image_or_video=refine_input,
+                        conditional_dict=block_cond,
+                        timestep=refine_t_step,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+
+            # Stash the post-Step-3.3.5 ``cache_pred`` (refined when
+            # flash_dmd_enabled, post-rung otherwise) into the per-
+            # rollout ``clean_chunk`` buffer for the aux teacher's
+            # clean half. Detached — the aux pass is the LoRA's
+            # training step; gradient must NOT flow back through this
+            # tensor into the student.
+            if clean_chunk is not None:
+                clean_chunk[
+                    :,
+                    current_start_frame: current_start_frame + current_num_frames,
+                ] = cache_pred.detach()
+
             # Step 3.4: Cache-update forward at t=context_noise. Runs
             # in BOTH modes (flash_dmd_enabled or not):
             #   * Standard: committing the fully-denoised cache_pred at
@@ -1059,7 +1151,9 @@ class ActionForcingTrainingPipeline:
             #     overwrites the grad-attached K/V slots written by
             #     the t=flash_dmd_gan_t grad-on forward with graph-free
             #     K/V at t=context_noise so the next block's exit-rung
-            #     (DMD-grad) forward reads detached K/V.
+            #     (DMD-grad) forward reads detached K/V. The input
+            #     ``cache_pred`` here has been refined by Step 3.3.5
+            #     when ``flash_dmd_enabled``.
             # The input is always detached (cache_pred came from a
             # no_grad chain anyway, but the explicit detach releases
             # any autograd nodes early — memory hygiene).
@@ -1122,12 +1216,18 @@ class ActionForcingTrainingPipeline:
                 flash_dmd_gan_output = flash_dmd_gan_output[
                     :, num_input_frames + num_seed_frames:
                 ]
+            if clean_chunk is not None:
+                clean_chunk = clean_chunk[
+                    :, num_input_frames + num_seed_frames:
+                ]
 
         # Stash the Flash-DMD t=flash_dmd_gan_t output on the pipeline
         # instance so the model can read it without a return-tuple
         # signature change (mirrors ``_last_extension_metrics``).
         # ``None`` when ``flash_dmd_enabled=False``.
         self._flash_dmd_gan_output = flash_dmd_gan_output
+        # Same stash for the aux-teacher clean_chunk buffer.
+        self._clean_chunk = clean_chunk
 
         # Stash the rollout's final block clean pred for the caller
         # to use as the next call's ``initial_prev_clean`` (warm-start
@@ -1287,6 +1387,10 @@ class ActionForcingTrainingPipeline:
         self._last_extension_metrics = {}
         # Reset per-call Flash-DMD t=flash_dmd_gan_t output.
         self._flash_dmd_gan_output: Optional[torch.Tensor] = None
+        # Reset per-call clean_chunk buffer (per-block post-Step-3.3.5
+        # cache_pred, detached). See ``__init__`` docstring for
+        # consumer details.
+        self._clean_chunk: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (warm-start carry).
         self._last_clean_pred: Optional[torch.Tensor] = None
 
@@ -1311,6 +1415,11 @@ class ActionForcingTrainingPipeline:
         # Flash-DMD t=flash_dmd_gan_t buffer. See
         # ``inference_with_trajectory`` for full rationale.
         flash_dmd_gan_output = (
+            torch.zeros_like(noise) if flash_dmd_enabled else None
+        )
+        # Aux-teacher clean_x buffer (per-block post-Step-3.3.5 cache_pred,
+        # detached). See ``inference_with_trajectory`` for rationale.
+        clean_chunk = (
             torch.zeros_like(noise) if flash_dmd_enabled else None
         )
 
@@ -1455,25 +1564,24 @@ class ActionForcingTrainingPipeline:
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # Skip the grad-active random-exit rung forward on
-                    # the LAST block of any call. The DMD scoring
-                    # mask (``_dmd_score_grad_mask``) zeros the
-                    # trailing ``num_frame_per_block`` frames of the
-                    # ``chunk_size``-length scoring window — those
-                    # positions are structurally OOD in v14's joint-TF
-                    # layout (the noisy half at RoPE [npb, npb+F)
-                    # has frames that have no clean-half counterpart).
-                    # Whatever the random-exit forward produces for
-                    # those frames carries zero DMD gradient. So
-                    # holding ~3 GB of layer-input activations for
-                    # the last block is pure waste — run it under
-                    # ``no_grad`` and let the trainer's mask zero
-                    # the slice as it always has. Unlike the flash-
-                    # DMD skip (which is gated on
-                    # ``is_multi_block`` to preserve GAN signal in
-                    # single-block iters), this skip is safe in all
-                    # call shapes because the mask is structural.
+                    # the LAST block of MULTI-BLOCK calls. The DMD
+                    # scoring mask (``_dmd_score_grad_mask``) zeros
+                    # the trailing ``num_frame_per_block`` frames of
+                    # the ``chunk_size``-length scoring window
+                    # structurally (v14 joint-TF OOD region). The
+                    # ``is_multi_block`` gate is CRITICAL: in single-
+                    # block calls (streaming iter k>=2 with
+                    # ``new_frames=npb``), the only block IS marked
+                    # last; skipping its grad would detach the entire
+                    # rollout output → ``full_chunk`` cat returns a
+                    # no-grad tensor → DMD empty-mask short-circuit's
+                    # ``zero_loss`` has no graph → gen backward fails
+                    # with "element 0 of tensors does not require
+                    # grad" (observed at production iter 6).
                     is_last_block = (block_index == len(all_num_frames) - 1)
-                    if (not requires_grad) or is_last_block:
+                    is_multi_block = (len(all_num_frames) > 1)
+                    skip_last_block_grad = is_last_block and is_multi_block
+                    if (not requires_grad) or skip_last_block_grad:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
@@ -1639,6 +1747,53 @@ class ActionForcingTrainingPipeline:
                     :, block_start_in_noise: block_start_in_noise + current_num_frames,
                 ] = flash_dmd_pred
 
+            # Step 3.3.5: Independent t=flash_dmd_gan_t no_grad
+            # refinement of cache_pred. Hardcoded ON when
+            # ``flash_dmd_enabled``. See ``inference_with_trajectory``
+            # for the full rationale: extends the K/V chain from
+            # ``[1000, 625, 312.5, 178.6, 0_commit]`` to
+            # ``[1000, 625, 312.5, 178.6, gan_t, 0_commit]`` so the
+            # final commit's input is the model's t=gan_t-refined
+            # clean estimate (the model has been trained at this
+            # timestep via the grad-on Step 3.2.b flash forward +
+            # GAN/MANIQA supervision). Independent of Step 3.2.b's
+            # grad-on forward (that one's output goes to the GAN
+            # buffer; this one only updates ``cache_pred`` for the
+            # subsequent commit). ``prev_block_clean`` was captured
+            # before this point so warm-start carries the post-rung
+            # pred unchanged.
+            if flash_dmd_enabled:
+                refine_t_value = int(flash_dmd_gan_t)
+                refine_flat = cache_pred.detach().flatten(0, 1)
+                refine_input = self.scheduler.add_noise(
+                    refine_flat,
+                    torch.randn_like(refine_flat),
+                    refine_t_value * torch.ones(
+                        [batch_size * current_num_frames],
+                        device=noise.device, dtype=torch.long,
+                    ),
+                ).unflatten(0, cache_pred.shape[:2])
+                refine_t_step = torch.full_like(timestep, refine_t_value)
+                with torch.no_grad():
+                    _, cache_pred = self.generator(
+                        noisy_image_or_video=refine_input,
+                        conditional_dict=block_cond,
+                        timestep=refine_t_step,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+
+            # Stash post-Step-3.3.5 ``cache_pred`` into the per-rollout
+            # ``clean_chunk`` buffer. Detached. Indexing mirrors the
+            # ``output`` write above (``block_start_in_noise`` for the
+            # streaming path's noise-tensor-relative offset).
+            if clean_chunk is not None:
+                clean_chunk[
+                    :,
+                    block_start_in_noise: block_start_in_noise + current_num_frames,
+                ] = cache_pred.detach()
+
             # Cache-update commit at t=context_noise. Runs in BOTH
             # modes — see ``inference_with_trajectory`` for the full
             # rationale (paper §3.3 K/V decoupling: must overwrite
@@ -1688,6 +1843,10 @@ class ActionForcingTrainingPipeline:
         # Stash the two-grad-point last-rung output (None when
         # ``flash_dmd_enabled=False``) so the model can read it.
         self._flash_dmd_gan_output = flash_dmd_gan_output
+        # Stash the aux-teacher clean_chunk buffer (per-block
+        # post-Step-3.3.5 cache_pred, detached). ``None`` when
+        # ``flash_dmd_enabled=False``.
+        self._clean_chunk = clean_chunk
         # Stash the rollout's final block clean pred for the caller's
         # next-call warm-start init. Already detached above.
         self._last_clean_pred = prev_block_clean

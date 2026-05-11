@@ -1,28 +1,39 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase1-gan-v21
-#SBATCH --nodes=8
+#SBATCH --job-name=smoke-online-teacher-G-NR-prodsched
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=01:30:00
-#SBATCH --requeue
+#SBATCH --time=00:45:00
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# v21: same as v20, with two deltas:
-#   1. dmd_context_mix_p schedule REVERSED: 0.15 -> 0.0 over 200 steps.
-#      v20 ramped UP toward 0.5; v21 ramps DOWN to 0.0 — pulls GT out
-#      of the DMD scoring context as training progresses, forcing the
-#      teacher to score the student's self-view at low noise. Tests
-#      whether sustained GT-context contamination was anchoring the
-#      student to GT and preventing real generalisation.
-#   2. Action-loss aux DISABLED (action_teacher_mode=off,
-#      action_critic_aux_enabled=false). Isolates the DMD-mix-ramp
-#      effect from the action_critic supervision so we can attribute
-#      changes cleanly. CoTracker + ss_vae also not loaded, freeing
-#      ~several GB of memory.
+# Smoke for online_teacher_G_NR with ALL schedules disabled.
+#
+# Goal: stress-test peak memory under the heaviest config — every loss
+# (DMD, GAN, MANIQA, aux teacher) firing at full weight from step 0.
+# This is the worst-case memory profile the production run will hit
+# at step 100+ (after all the ramps complete).
+#
+# Schedule overrides (everything starts from step 0):
+#   aux_teacher_start_step=0
+#   aux_teacher_loss_warmup_steps=0
+#   dmd_loss_start_step=0
+#   dmd_loss_warmup_steps=0
+#   gan_critic_warmup_steps=0
+#   gan_warmup_steps=0
+#
+# Other deltas vs the full online_teacher_G_NR sbatch:
+#   * nodes=1 (4-GPU smoke vs 8-node, 32-rank prod)
+#   * max_steps=20 (vs 200)
+#   * log_interval=1 (every-step memory readouts)
+#   * encoded_root → smoke_zarr (8-zarr local fast-scan)
+#   * vis_save_local=false, sample_interval=0 (no video logging in smoke)
+#   * checkpoint_interval=999 (no checkpointing)
+#   * auto_resume=false
+#   * wandb_project=longlive-phase3-smoke
 # =====================================================================
 
 set -e -o pipefail
@@ -30,20 +41,19 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase1_gan_v21
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/smoke_online_teacher_G_NR_prodsched_j${SLURM_JOB_ID}
 WANDB_SAVE_DIR=wandb
 
-# ---- SAM2 paths (must be set; see PREREQUISITES) ----
+# ---- SAM2 paths ----
 GAN_SAM2_CKPT=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_base_plus.pt
 GAN_SAM2_CFG=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_b+.yaml
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
 
-# Pre-flight SAM2 sanity checks. Fail-fast on missing prereqs so the
-# job exits at submission rather than ~5 min into model load.
+# Pre-flight SAM2 sanity checks.
 python -c "import sam2" 2>/dev/null || {
-  echo "ERROR: sam2 package not installed. See PREREQUISITES in this sbatch."
+  echo "ERROR: sam2 package not installed."
   exit 1
 }
 [ -f "$GAN_SAM2_CKPT" ] || {
@@ -73,18 +83,15 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-1 Action-Forcing DMD + R3GAN v21 on $(date)"
-echo "v21 from v20:"
-echo "  * dmd_context_mix_p 0.15 -> 0.0 ramp over 200 steps."
-echo "  * Action-loss aux DISABLED (action_teacher_mode=off,"
-echo "    action_critic_aux_enabled=false)."
-
+echo "Starting smoke (online_teacher_G_NR, step-0 schedule overrides) on $(date)"
+echo "  * GAN/MANIQA/DMD/aux teacher all firing at step 0 — worst-case mem."
+echo "  * 4-GPU single-node smoke; max_steps=20; smoke_zarr fast-scan."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -106,6 +113,14 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
+    wandb_project=longlive-phase3-smoke \
+    encoded_root=/scratch/u6ex/as1748.u6ex/ARRWM/smoke_zarr \
+    max_steps=20 \
+    log_interval=1 \
+    checkpoint_interval=999 \
+    sample_interval=0 \
+    vis_save_local=false \
+    auto_resume=false \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -113,59 +128,47 @@ srun torchrun \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=300 \
     dfake_gen_update_ratio=5 \
-    model_kwargs.local_attn_size=42 \
+    model_kwargs.local_attn_size=21 \
     num_workers=0 \
-    boundary_vae_roundtrip=true \
-    collapse_mae_threshold=0.2 \
-    mae_extension_threshold=0.2 \
-    local_attn_size_schedule=[[0,42]] \
-    dmd_context=mix \
-    dmd_context_mix_p=0.15 \
-    dmd_context_mix_p_target=0.0 \
-    dmd_context_mix_p_ramp_steps=300 \
+    boundary_vae_roundtrip=false \
+    local_attn_size_schedule=[[0,21]] \
+    dmd_context=self \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \
     real_guidance_scale=1.0 \
     real_teacher_lr=5e-5 \
-    real_teacher_warmup_steps=30 \
-    real_teacher_input_source=mix \
-    real_teacher_input_mix_gt_p=0.7 \
-    dmd_frozen_teacher_pass_enabled=false \
+    real_teacher_warmup_steps=0 \
+    real_teacher_input_source=student \
+    aux_teacher_p_schedule_enabled=false \
+    aux_teacher_send_student_grad=false \
+    aux_teacher_start_step=10 \
     aux_teacher_loss_weight=1.0 \
-    flash_dmd_split_timestep=500 \
-    fake_score_ema_weight=0.99 \
-    flash_dmd_paper_aligned_adv=true \
+    aux_teacher_loss_warmup_steps=90 \
+    aux_teacher_lora_rank=32 \
+    aux_teacher_lora_alpha=32 \
+    dmd_loss_start_step=50 \
+    dmd_loss_warmup_steps=50 \
+    dmd_frozen_teacher_pass_enabled=false \
+    fake_score_ema_weight=0.95 \
     gan_loss_weight=1.0 \
-    gan_warmup_steps=400 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
     gan_sam2_config_path=$GAN_SAM2_CFG \
-    gan_sam2_resolution=512 \
+    gan_sam2_resolution=768 \
     gan_sam2_preserve_aspect=false \
     gan_sam2_pad_to_square=true \
     gan_sam2_distilled_critic=true \
-    gan_critic_warmup_steps=25 \
-    gan_critic_grad_frames=1 \
-    gan_critic_grad_full_every=0 \
-    gan_critic_grad_loss_weight=0.0 \
+    gan_critic_warmup_steps=10 \
+    gan_warmup_steps=80 \
     gan_sam2_frame_pool=none \
-    gan_sam2_encoder_chunk_size=21 \
-    lpips_loss_weight=0.0 \
-    pixel_recon_loss_weight=0.0 \
-    mse_approx_loss_weight=0.0 \
-    mse_approx_l2_weight=1.0 \
-    mse_approx_l1_weight=0.5 \
-    lpips_approx_loss_weight=1.0 \
-    msssim_approx_loss_weight=1.0 \
-    msssim_target_domain=edges \
-    perceptual_approx_d_model=256 \
-    perceptual_approx_num_blocks=4 \
-    perceptual_approx_warmup_steps=25 \
-    perceptual_approx_mean_align_weight=0.1 \
-    perceptual_approx_n_interp_samples=0 \
-    gan_critic_n_interp_samples=0 \
+    gan_sam2_encoder_chunk_size=84 \
+    maniqa_approx_loss_weight=1.0 \
+    maniqa_n_frames=84 \
+    maniqa_n_patches_per_frame=8 \
+    maniqa_metric_name=maniqa-pipal \
+    gan_critic_dense_distillation=true \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase1_gan_j${SLURM_JOB_ID}_v21
+    run_name=smoke_online_teacher_G_NR_prodsched_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
