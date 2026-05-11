@@ -6482,7 +6482,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["generator_loss"] = float(generator_loss.detach().item())
         # retain_graph=True so the critic backward can walk the shared
         # cond_dict / action_projection subgraph that both losses use.
-        generator_loss.backward(retain_graph=True)
+        #
+        # DDP-safe skip when generator_loss has no autograd graph.
+        # Happens at production early steps (DMD/aux/GAN all gated off
+        # via dmd_loss_start_step / aux_teacher_start_step /
+        # gan_critic_warmup_steps) — the sum of 0-weighted losses
+        # collapses to a leaf zero tensor with no grad_fn. Backward
+        # would raise "element 0 of tensors does not require grad".
+        # Mathematically there's no gen gradient to compute (every
+        # contributor is zero-weighted), so skipping ``.backward()``
+        # produces a bit-identical optimizer step (gen params get no
+        # update either way). DDP-lockstep enforced via all_reduce —
+        # if ANY rank has grad, ALL ranks must run backward together
+        # to keep the gradient bucket reduction count matched.
+        gen_has_grad_local = (
+            1.0 if generator_loss.requires_grad else 0.0
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            flag = torch.tensor(
+                [gen_has_grad_local],
+                device=generator_loss.device, dtype=torch.float32,
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            gen_should_backward = bool(flag.item() > 0.5)
+        else:
+            gen_should_backward = bool(gen_has_grad_local > 0.5)
+        out["gen_backward_skipped"] = (
+            0.0 if gen_should_backward else 1.0
+        )
+        if gen_should_backward:
+            generator_loss.backward(retain_graph=True)
         self._mem_step_snapshot("5_after_gen_backward")
 
         critic_loss, critic_log = self.model.compute_critic_loss_streaming(

@@ -4141,23 +4141,48 @@ class ActionForcingDMD(SelfForcingModel):
         for k, v in aux_log.items():
             dmd_log[k] = v
 
-        # Defensive graph anchor. When the start-step gates are all
-        # closed (e.g. early production steps: dmd_loss_start_step=50,
-        # aux_teacher_start_step=10, gan_critic_warmup_steps=10) the
-        # gen-side losses can be a sum of 0-weighted contributions plus
-        # leaf-zero placeholders. The mathematical expectation is that
-        # ``dmd_loss * 0.0`` still preserves the autograd graph via
-        # MulBackward, but in practice the empty-mask short-circuit
-        # combined with a chain of 0-weight multiplies has produced
-        # ``RuntimeError: element 0 of tensors does not require grad``
-        # at gen backward (observed at production iter 6 with single-
-        # block ``new_frames=3`` rollouts). Add a guaranteed-graph
-        # anchor when needed: ``0.0 * chunk.sum()`` is graph-attached
-        # through the gen rollout, contributes exactly zero to the
-        # loss value, and lets ``.backward()`` walk the rollout graph
-        # so DDP gradient sync proceeds lockstep across ranks.
-        if not total_loss.requires_grad:
-            anchor = (chunk.float() * 0.0).sum()
+        # UNCONDITIONAL graph anchor through the rollout chunk.
+        # When the start-step gates are all closed (early production
+        # steps with dmd_loss_start_step=50, aux_teacher_start_step
+        # =10, gan_critic_warmup_steps=10) the gen-side losses sum to
+        # 0-weighted contributions and leaf-zero placeholders, leaving
+        # ``total_loss.requires_grad=False`` and
+        # ``total_loss.grad_fn=None`` → ``.backward()`` raises
+        # "element 0 of tensors does not require grad".
+        #
+        # The anchor flows through ``chunk`` (the rollout output)
+        # rather than a single generator parameter for a critical
+        # DDP reason: the gen rollout makes MANY forwards per iter
+        # (random-exit rung, post-exit no_grad chain, flash-DMD t=60
+        # forward, context-noise commit), and ``chunk`` carries the
+        # autograd subgraph from EVERY grad-on forward via the
+        # cat+write-into-output chain. Anchoring through ``chunk``
+        # therefore registers every gen-forward output's grad chain
+        # in the backward pass. A parameter-based anchor only feeds
+        # grad to one param, which DDP rejects (find_unused_parameters
+        # =True helps for unused PARAMS but not unused forward
+        # OUTPUTS).
+        #
+        # Unconditional (not gated on ``not requires_grad``) because
+        # the cost is negligible (~5 MB transient + one cast +
+        # multiply + sum, all bf16/fp32 cheap ops) and being
+        # unconditional eliminates the ambiguity of WHEN exactly the
+        # downstream pieces lose grad. Numerical impact: zero (the
+        # multiplier is 0.0; the optimizer step is bit-identical to
+        # without the anchor).
+        # Anchor when chunk has grad: ``((x - x.detach()) ** 2).mean()``
+        # is mathematically zero (x - x.detach() = 0) but forces
+        # PyTorch to construct the autograd graph through 4 ops.
+        # When chunk has no grad (observed at 32-rank early-iter
+        # production runs — under investigation), the anchor itself
+        # is detached and can't save the graph. In that case the
+        # trainer-side skip (in ``_streaming_train_one_chunk``) will
+        # detect ``not generator_loss.requires_grad`` and skip
+        # backward in DDP-lockstep — bit-identical to running
+        # backward on a sum of 0-weighted losses (zero gradient
+        # either way).
+        if chunk.requires_grad:
+            anchor = ((chunk - chunk.detach()).float().pow(2).mean()) * 0.0
             total_loss = total_loss + anchor
             dmd_log["gen_loss_graph_anchor_used"] = 1.0
         else:
