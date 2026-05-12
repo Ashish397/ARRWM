@@ -4189,6 +4189,111 @@ class ActionForcingDMD(SelfForcingModel):
             dmd_log["gen_loss_graph_anchor_used"] = 0.0
         return total_loss, dmd_log
 
+    def run_extra_aux_pass(
+        self,
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Compute a fresh aux teacher loss on a detached chunk with
+        a new (ε, t). Used by the trainer's ``teacher_cadence='fake'``
+        path to run extra LoRA training steps per outer iter without
+        re-rolling a new student chunk.
+
+        Mirrors the aux-pass setup in
+        ``compute_generator_loss_streaming`` but produces only the
+        aux loss (no DMD / GAN / MANIQA). Returned loss is already
+        scaled by the resolved ``aux_teacher_loss_weight``.
+
+        ``chunk`` must be detached — gradient never flows back to the
+        student through these extra passes (semantically matches
+        ``aux_teacher_send_student_grad=False`` regardless of config).
+        Returns ``(None, log)`` when aux is gated off, missing inputs,
+        or all ranks agreed to skip via the short-ride sync inside
+        ``_compute_aux_teacher_loss_streaming``.
+        """
+        current_step = int(info.get("current_step", 0))
+        aux_active = (
+            self.real_teacher_train_online
+            and self.aux_teacher_loss_weight > 0.0
+            and current_step >= int(self.aux_teacher_start_step)
+        )
+        if not aux_active:
+            return None, {"aux_teacher_active_extra": 0.0}
+        if self.streaming_state is None:
+            return None, {"aux_teacher_active_extra": 0.0}
+        per_iter_mask = info.get("gradient_mask")
+        if per_iter_mask is None:
+            return None, {"aux_teacher_active_extra": 0.0}
+        last_chunk_mask = self._dmd_score_grad_mask(chunk.shape, chunk.device)
+        gradient_mask_eff = per_iter_mask & last_chunk_mask
+
+        clean_x_self = self._streaming_build_clean_x_self(chunk, info)
+        aux_p = self._resolved_real_teacher_input_mix_gt_p(current_step)
+        _need_gt = (self.dmd_context in ("GT", "mix") or aux_p > 0.0)
+        clean_x_GT = (
+            self._streaming_build_clean_x_GT(info) if _need_gt else None
+        )
+        cond_for_scoring, uncond_for_scoring = self._streaming_noisy_cond_slice(info)
+        clean_cond, clean_uncond = self._streaming_clean_cond_slice(info)
+        # Detach every tensor reachable through the cond dicts and the
+        # clean_x views. The first gen iter's backward already consumed
+        # the autograd graph attached to ``info["conditional_dict"]`` /
+        # ``info["clean_conditional_dict"]`` (which carry grad into
+        # action-projection params via ``build_action_conditional``)
+        # and to ``streaming_state["anchor_chunk"]`` (already detached
+        # in setup, but defensive). Without this, re-using the same
+        # tensor objects in a fresh aux forward triggers a "Trying to
+        # backward through the graph a second time" RuntimeError on
+        # the second ``aux_loss_extra.backward()``. The aux pass needs
+        # only the LoRA-side grad anyway (and the chunk arg is already
+        # detached by the caller), so dropping the rest is correct.
+        def _detach_cond(d):
+            return {
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in d.items()
+            }
+        cond_for_scoring = _detach_cond(cond_for_scoring)
+        uncond_for_scoring = _detach_cond(uncond_for_scoring)
+        clean_cond = _detach_cond(clean_cond)
+        clean_uncond = _detach_cond(clean_uncond)
+        clean_x_self = clean_x_self.detach()
+        if clean_x_GT is not None:
+            clean_x_GT = clean_x_GT.detach()
+        (
+            sc_clean_x, sc_aug_t,
+            sc_clean_x_real, sc_aug_t_real,
+            cond_for_scoring, uncond_for_scoring,
+            sc_clean_x_aux, sc_aug_t_aux,
+        ) = self._build_dmd_context_kwargs(
+            clean_x_self=clean_x_self,
+            clean_x_GT=clean_x_GT,
+            clean_conditional_dict=clean_cond,
+            clean_unconditional_dict=clean_uncond,
+            cond_for_scoring=cond_for_scoring,
+            uncond_for_scoring=uncond_for_scoring,
+            device=chunk.device, dtype=chunk.dtype,
+            build_real_view=True,
+            aux_p=aux_p,
+        )
+
+        aux_loss, aux_log = self._compute_aux_teacher_loss_streaming(
+            chunk=chunk,
+            gradient_mask_eff=gradient_mask_eff,
+            cond_for_scoring=cond_for_scoring,
+            sc_clean_x_real=sc_clean_x_aux,
+            sc_aug_t_real=sc_aug_t_aux,
+            info=info,
+            aux_p=aux_p,
+        )
+        if aux_loss is None:
+            aux_log["aux_teacher_active_extra"] = 0.0
+            return None, aux_log
+        weight = self._resolved_aux_teacher_loss_weight(current_step)
+        aux_loss = weight * aux_loss
+        aux_log["aux_teacher_active_extra"] = 1.0
+        aux_log["aux_teacher_loss_weight_resolved_extra"] = float(weight)
+        return aux_loss, aux_log
+
     def compute_critic_loss_streaming(
         self,
         chunk: torch.Tensor,

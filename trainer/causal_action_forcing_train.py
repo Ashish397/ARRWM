@@ -1370,6 +1370,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_critic_warmup_steps = int(
             getattr(cfg, "gan_critic_warmup_steps", 500)
         )
+        # Defers D-side training (the SAM2 disc heads + LatentSAM2Critic
+        # value-distillation step) until this outer step. Pre-start the
+        # entire D pass (forwards, R1/R2 penalty, D backward, D optimizer
+        # step) is skipped — no D activations live, no D gradient, no
+        # D-side compute. Decouples from ``gan_critic_warmup_steps``,
+        # which gates only the GEN-side gradient (Path 3). Default 0
+        # preserves the original behaviour (D trains every iter from
+        # step 0). DDP-safe: the gate reads ``current_step`` which is
+        # rank-invariant, so every rank skips/runs in lockstep — no
+        # NCCL collective count mismatch.
+        self.gan_disc_start_step = int(
+            getattr(cfg, "gan_disc_start_step", 0)
+        )
         # Multi-step critic training (mirrors action_critic's
         # ``critic_updates_per_step``): step the critic optimizer K_c
         # times per gen step. Default 1 = legacy single-step behavior.
@@ -4066,12 +4079,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         logs: Dict[str, float] = {}
 
         # ===== Paths 1+2: D-update + critic value-distillation =======
-        self._run_distilled_disc_critic_update(
-            real_lat=real_lat,
-            fake_lat=fake_lat,
-            current_step=current_step,
-            out=logs,
-        )
+        # Gated by ``gan_disc_start_step`` (default 0 = train from step
+        # 0). When deferred, the entire D pass is skipped — no D
+        # activations live, no D backward, no D optim step. Surfaces a
+        # ``train/r3gan_disc_skipped`` flag so wandb can mark the gap.
+        if current_step >= self.gan_disc_start_step:
+            self._run_distilled_disc_critic_update(
+                real_lat=real_lat,
+                fake_lat=fake_lat,
+                current_step=current_step,
+                out=logs,
+            )
+            logs["train/r3gan_disc_skipped"] = 0.0
+        else:
+            logs["train/r3gan_disc_skipped"] = 1.0
 
         # ===== Path 3: Gen-side via critic (after warmup) =============
         critic_warmup_done = (
@@ -6526,6 +6547,76 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         })
         critic_loss.backward()
         self._mem_step_snapshot("6_after_critic_backward")
+
+        # teacher_cadence='fake': run ``dfake_gen_update_ratio`` total
+        # LoRA optimizer steps per outer iter (vs the default 1 under
+        # 'student'). Cycle i=0 consumes the gradient already on the
+        # LoRA params from the main gen backward above (which included
+        # the gen-iter's aux pass). Cycles i=1..n-1 each do a fresh
+        # aux forward+backward on the SAME detached chunk with new
+        # (ε, t), then step and zero. After this loop LoRA grads are
+        # None, so the outer loop's real_teacher_optimizer.step() at
+        # ~line 2084 finds nothing to apply and short-circuits.
+        # DDP-safe: every rank runs the same number of cycles; the
+        # short-ride skip inside ``_compute_aux_teacher_loss_streaming``
+        # is already all_reduce(MAX)-synced across ranks.
+        teacher_cadence = str(
+            getattr(self.config, "teacher_cadence", "student")
+        ).lower()
+        if (
+            teacher_cadence == "fake"
+            and getattr(self, "real_teacher_optimizer", None) is not None
+        ):
+            n_total = int(
+                getattr(self.config, "dfake_gen_update_ratio", 1)
+            )
+            _aux_start = int(getattr(self.config, "aux_teacher_start_step", 0))
+            _aux_open = self.step >= _aux_start
+            if _aux_open and n_total >= 1:
+                # Match the outer loop's LR-warmup schedule so every
+                # in-loop step uses the same LR that the outer loop
+                # would have applied.
+                warm_lr = self._real_teacher_base_lr
+                if (
+                    self.real_teacher_warmup_steps > 0
+                    and self.step < self.real_teacher_warmup_steps
+                ):
+                    warm_lr = self._real_teacher_base_lr * (
+                        (self.step + 1) / self.real_teacher_warmup_steps
+                    )
+                for pg in self.real_teacher_optimizer.param_groups:
+                    pg["lr"] = warm_lr
+
+                _fired = 0
+                for i in range(n_total):
+                    if i > 0:
+                        aux_loss_extra, aux_log_extra = (
+                            self.model.run_extra_aux_pass(
+                                train_chunk.detach(), train_info,
+                            )
+                        )
+                        if (
+                            aux_loss_extra is None
+                            or not aux_loss_extra.requires_grad
+                        ):
+                            continue
+                        aux_loss_extra.backward()
+                    rt_params = [
+                        p
+                        for p in self.real_teacher_optimizer
+                            .param_groups[0]["params"]
+                        if p.grad is not None
+                    ]
+                    if rt_params:
+                        torch.nn.utils.clip_grad_norm_(
+                            rt_params,
+                            max_norm=self.real_teacher_max_grad_norm,
+                        )
+                        self.real_teacher_optimizer.step()
+                        _fired += 1
+                    self.real_teacher_optimizer.zero_grad(set_to_none=True)
+                out["teacher_cadence_steps_fired"] = float(_fired)
+                self._mem_step_snapshot("7_after_teacher_cadence_fake_loop")
 
         # Distilled-critic deferred step. Path 1 (D-update) + Path 2
         # (critic value+grad distillation) were stashed by the gen
