@@ -1570,6 +1570,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.perceptual_approx_ramp_steps = int(
             getattr(cfg, "perceptual_approx_ramp_steps", 0)
         )
+        # Constant-weight L1 (MAE) and L2 (MSE) between the student's
+        # pred_image latent and the GT latent window. Direct anti-drift
+        # anchor, applied EVERY step with no ramp or warmup. Default 0
+        # for both keeps earlier configs unchanged. Used by v10 onwards
+        # as a small constant pull toward GT to complement DMD+GAN.
+        self.gt_latent_mae_loss_weight = float(
+            getattr(cfg, "gt_latent_mae_loss_weight", 0.0)
+        )
+        self.gt_latent_mse_loss_weight = float(
+            getattr(cfg, "gt_latent_mse_loss_weight", 0.0)
+        )
         # ----- v11-style multi-noise (Lipschitz-by-density) -----
         # When > 0, sample K interpolation points between
         # ``fake_lat`` and ``real_lat`` each iter, compute the dense
@@ -3811,6 +3822,45 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # ``_run_distilled_disc_critic_update`` Path 2 with multi-noise
         # via ``gan_critic_n_interp_samples``. ``self.latent_critic``
         # IS the gan_d_approx now.
+
+    def _compute_gt_latent_recon_loss(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Direct latent-space MAE+MSE between pred_image and GT.
+
+        Gated by ``gt_latent_mae_loss_weight`` and
+        ``gt_latent_mse_loss_weight``. Both apply at constant weight
+        every step — no warmup, no ramp. Returns ``(loss, logs)``;
+        ``loss`` is a graph-attached scalar to add to ``generator_loss``.
+        Zero scalar + empty logs when both weights are 0.
+        """
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        w_mae = self.gt_latent_mae_loss_weight
+        w_mse = self.gt_latent_mse_loss_weight
+        if w_mae <= 0.0 and w_mse <= 0.0:
+            return zero, {}
+        gt_det = gt_latents_window.detach().to(pred_image.dtype)
+        diff = pred_image - gt_det
+        loss = zero
+        logs: Dict[str, float] = {}
+        if w_mae > 0.0:
+            mae_raw = diff.abs().mean()
+            loss = loss + w_mae * mae_raw.to(pred_image.dtype)
+            logs["train/gt_latent_mae_raw"] = float(mae_raw.detach().item())
+            logs["train/gt_latent_mae_weighted"] = float(
+                (w_mae * mae_raw).detach().item()
+            )
+        if w_mse > 0.0:
+            mse_raw = diff.pow(2).mean()
+            loss = loss + w_mse * mse_raw.to(pred_image.dtype)
+            logs["train/gt_latent_mse_raw"] = float(mse_raw.detach().item())
+            logs["train/gt_latent_mse_weighted"] = float(
+                (w_mse * mse_raw).detach().item()
+            )
+        return loss, logs
 
     def _compute_gen_side_perceptual_loss(
         self,
@@ -6545,6 +6595,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 out.update(lora_logs)
                 self._mem_step_snapshot("3_after_lora_action")
 
+        # Constant-weight latent-space MAE + MSE between student's
+        # pred_image (= ``train_chunk``) and the GT latent window. Fires
+        # every step when the weights are set, no warmup/ramp.
+        if (
+            self.gt_latent_mae_loss_weight > 0.0
+            or self.gt_latent_mse_loss_weight > 0.0
+        ):
+            _gt_window_for_recon = (
+                state["ride_latents_window"][:, chunk_lo:chunk_hi]
+            )
+            recon_loss, recon_logs = self._compute_gt_latent_recon_loss(
+                pred_image=train_chunk,
+                gt_latents_window=_gt_window_for_recon,
+            )
+            generator_loss = generator_loss + recon_loss
+            out.update(recon_logs)
+
         if gan_active:
             gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
             # Stash the latent chunk_lo on streaming_state so
@@ -7243,6 +7310,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                     generator_loss = generator_loss + gen_action_loss
                     merged.update(critic_logs)
+
+                # Constant-weight latent-space MAE + MSE between
+                # pred_image and the GT latent window. Fires every step
+                # when the weights are set, no warmup/ramp.
+                if (
+                    self.gt_latent_mae_loss_weight > 0.0
+                    or self.gt_latent_mse_loss_weight > 0.0
+                ):
+                    _gt_window_for_recon = (
+                        latents[:, gen_window_start:gen_window_end]
+                    )
+                    recon_loss, recon_logs = (
+                        self._compute_gt_latent_recon_loss(
+                            pred_image=pred_image,
+                            gt_latents_window=_gt_window_for_recon,
+                        )
+                    )
+                    generator_loss = generator_loss + recon_loss
+                    merged.update(recon_logs)
 
                 if gan_active:
                     gt_window = latents[:, gen_window_start:gen_window_end]
