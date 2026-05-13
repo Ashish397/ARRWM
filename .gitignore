@@ -19,6 +19,7 @@ pre_encode.log
 # and env fixes like the conda-activate arg hygiene in
 # ``run_action_ode_distill_8n.sbatch`` need to survive across clones).
 *.outcore
+*.zip
 
 test_grid_outputs/
 test_predictions/
