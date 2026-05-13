@@ -67,12 +67,14 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils import swap_tensors as _swap_tensors
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from model.base import SelfForcingModel
@@ -340,6 +342,58 @@ class ActionForcingDMD(SelfForcingModel):
         # path is enabled. None otherwise. Loaded by
         # ``_load_real_score_with_v14_lora``.
         self.real_score_frozen: Optional[nn.Module] = None
+
+        # ``real_score_ema_weight``: target-network EMA on the LoRA
+        # adapter of ``self.real_score``. When > 0, the DMD scoring
+        # path (compute_distribution_matching_loss) forwards through a
+        # slow-moving EMA copy of the LoRA weights instead of the live
+        # LoRA. The aux teacher loss and the standalone real_teacher
+        # loss continue to forward through the live LoRA (so gradient
+        # still trains it). Mirror of fake_score_ema_weight on the
+        # other side of the DMD subtraction; same RL target-network
+        # idea (DQN/DDPG/TD3).
+        #
+        # Mutually exclusive with dmd_frozen_teacher_pass_enabled: if
+        # both are on, the frozen merged-v14 teacher path wins (it's
+        # checked first in compute_generator_loss_streaming).
+        #
+        # Memory cost: a dict of cloned LoRA-adapter tensors (~tens of
+        # MB for rank-32), held on each rank. NOT a full module copy.
+        # The EMA is applied IN PLACE on the existing real_score's
+        # LoRA params during the DMD forward via a swap-and-restore
+        # context manager, so no second WAN transformer is allocated.
+        #
+        # Value range: 0.0 (default = disabled) to <1.0. Typical
+        # values: 0.95-0.99. With teacher_cadence='fake' the EMA
+        # update fires after EVERY LoRA optimizer step (5x per outer
+        # iter), so 0.99 → half-life ~70 LoRA-steps ~14 outer steps.
+        self.real_score_ema_weight = float(
+            getattr(args, "real_score_ema_weight", 0.0)
+        )
+        if not (0.0 <= self.real_score_ema_weight < 1.0):
+            raise ValueError(
+                "real_score_ema_weight must be in [0, 1); got "
+                f"{self.real_score_ema_weight!r}."
+            )
+        # Lazy-initialised dict of {param_name -> EMA tensor} for the
+        # LoRA adapter of self.real_score. None until the first call
+        # to ``ema_update_real_score_lora`` — first call snapshots the
+        # current LoRA state and exits without an EMA update (so the
+        # very first DMD-with-EMA pass sees an EMA == live).
+        self._real_score_ema_lora_state: Optional[Dict[str, torch.Tensor]] = None
+        # Diagnostic flag: emit a one-shot audit log on the first EMA
+        # update (mirror of _fake_ema_audit_done in the trainer) so a
+        # silent param-name drift is loud rather than invisible.
+        self._real_score_ema_audit_done: bool = False
+        # Diagnostic scalar: relative L2 distance between live LoRA and
+        # EMA-LoRA after each EMA update, ‖live - ema‖₂ / ‖live‖₂.
+        # Trainer reads this and surfaces it as
+        # ``train/real_score_ema_rel_l2`` so wandb shows the gap.
+        # Saturating-near-zero = EMA isn't buying decoupling (live not
+        # moving); growing-unboundedly = live diverging from EMA in a
+        # way that signals upcoming instability. None until the first
+        # post-init EMA update.
+        self._real_score_ema_rel_l2: Optional[float] = None
 
         # ``aux_teacher_loss_weight``: weight on the auxiliary
         # online-teacher flow loss in the gen-step total loss. When
@@ -3335,6 +3389,217 @@ class ActionForcingDMD(SelfForcingModel):
         s = self.streaming_state
         return (s["current_length"] + self.streaming_min_new_frame) <= s["max_length"]
 
+    def ema_update_real_score_lora(self, compute_rel_l2: bool = True) -> None:
+        """Update the EMA snapshot of self.real_score's LoRA adapter
+        from the live LoRA params. No-op when
+        ``real_score_ema_weight == 0`` (default).
+
+        ``compute_rel_l2`` controls whether the diagnostic
+        ‖live - ema‖₂ / ‖live‖₂ scalar is computed this call. With
+        ``teacher_cadence='fake'`` the trainer fires this method 5×
+        per outer step (once per LoRA-step inside the inner loop);
+        only the LAST inner-loop call needs the diagnostic since
+        wandb only logs once per outer step. Skipping the rel_l2
+        computation on the first N-1 inner calls saves ~4× the
+        per-param transient allocations and a GPU→CPU sync. Default
+        True preserves backward-compat for callers that don't care
+        about cadence.
+
+        Iterates LoRA-tagged named_parameters (those whose name
+        contains ``lora_`` — matches the same selector used at LoRA
+        wrap time). On first invocation, snapshots the current live
+        state into ``_real_score_ema_lora_state`` and returns (so the
+        EMA starts at the live values, not at 0). Subsequent
+        invocations EMA-pull:
+
+            ema = w * ema + (1 - w) * live
+
+        Memory: tensors are allocated on the same device as the live
+        params, and cloned with .detach() so they hold no autograd
+        graph.
+
+        DDP-safe: live params are already grad-synced by the time the
+        trainer calls this (post real_teacher_optimizer.step()), so
+        each rank sees the same live values → each rank's EMA update
+        produces the same result. No additional collective needed.
+        """
+        if self.real_score_ema_weight <= 0.0:
+            return
+        w = self.real_score_ema_weight
+        # Resolve the inner module that holds the LoRA-tagged params.
+        # In the codebase real_score is a wrapper whose .model attr
+        # holds the WAN transformer; the LoRA adapter lives inside
+        # that.
+        inner = getattr(self.real_score, "model", None)
+        if inner is None:
+            return
+        with torch.no_grad():
+            if self._real_score_ema_lora_state is None:
+                # First call: snapshot the live LoRA state into the
+                # EMA buffer. NO EMA update yet — the very next DMD
+                # pass with EMA active should see EMA == live, which
+                # is bit-identical to running without EMA.
+                self._real_score_ema_lora_state = {
+                    name: p.detach().clone()
+                    for name, p in inner.named_parameters()
+                    if "lora_" in name
+                }
+                if (
+                    not self._real_score_ema_audit_done
+                    and _is_main()
+                ):
+                    n = len(self._real_score_ema_lora_state)
+                    total_numel = sum(
+                        t.numel() for t in self._real_score_ema_lora_state.values()
+                    )
+                    logging.info(
+                        "[ActionForcingDMD] real_score EMA initialised: "
+                        "%d LoRA-tagged params, %.2fM total elements "
+                        "(weight=%.4f).",
+                        n, total_numel / 1e6, w,
+                    )
+                    self._real_score_ema_audit_done = True
+                return
+            # Steady-state. Optionally accumulate ‖live - ema‖² and
+            # ‖live‖² as we walk the params for the EMA pull. The
+            # accumulators are persistent fp32 scalars on the same
+            # device as the params; in-place .add_() avoids allocating
+            # a new scalar tensor per param-iter. Per-param sums use
+            # .sum(dtype=torch.float32) to upcast at reduction time
+            # without materialising a full-tensor fp32 copy (which
+            # was costing ~8 MB transient per param × 600 params on
+            # the previous implementation).
+            diff_sq_total: Optional[torch.Tensor] = None
+            live_sq_total: Optional[torch.Tensor] = None
+            if compute_rel_l2:
+                # Lazy-init persistent accumulators on the first
+                # rel_l2 call (any subsequent rel_l2 call zeroes
+                # them in place — no new allocation).
+                if getattr(self, "_real_score_ema_diff_sq_acc", None) is None:
+                    # Use the first LoRA param's device — guaranteed
+                    # to exist because we already enter the loop.
+                    _device_probe = next(
+                        (p.device for n, p in inner.named_parameters()
+                         if "lora_" in n),
+                        None,
+                    )
+                    if _device_probe is not None:
+                        self._real_score_ema_diff_sq_acc = torch.zeros(
+                            (), dtype=torch.float32, device=_device_probe,
+                        )
+                        self._real_score_ema_live_sq_acc = torch.zeros(
+                            (), dtype=torch.float32, device=_device_probe,
+                        )
+                diff_sq_total = self._real_score_ema_diff_sq_acc
+                live_sq_total = self._real_score_ema_live_sq_acc
+                if diff_sq_total is not None:
+                    diff_sq_total.zero_()
+                    live_sq_total.zero_()
+            for name, p in inner.named_parameters():
+                ema_t = self._real_score_ema_lora_state.get(name)
+                if ema_t is None:
+                    continue  # skip any param that wasn't in the
+                              # snapshot (e.g. mid-run architectural
+                              # change). Should not normally happen.
+                if ema_t.shape != p.shape:
+                    # Shape drift — log once and skip. Avoids silent
+                    # corruption.
+                    if _is_main():
+                        logging.warning(
+                            "[ActionForcingDMD] real_score EMA shape "
+                            "mismatch for %s (ema=%s vs live=%s); "
+                            "skipping this param.",
+                            name, tuple(ema_t.shape), tuple(p.shape),
+                        )
+                    continue
+                if compute_rel_l2 and diff_sq_total is not None:
+                    # Compute diagnostic BEFORE the EMA pull. The
+                    # metric reflects "the gap that the just-completed
+                    # live step opened up" — after the EMA pull the
+                    # gap would look smaller by exactly the (1-w)
+                    # factor, which carries no new information.
+                    # ``.sum(dtype=torch.float32)`` upcasts at reduction,
+                    # avoiding the full-tensor fp32 transient.
+                    diff_sq_total.add_(
+                        (p.detach() - ema_t).pow(2).sum(dtype=torch.float32)
+                    )
+                    live_sq_total.add_(
+                        p.detach().pow(2).sum(dtype=torch.float32)
+                    )
+                # EMA pull.
+                ema_t.mul_(w).add_(p.detach(), alpha=1.0 - w)
+            if compute_rel_l2 and diff_sq_total is not None and live_sq_total is not None:
+                rel = (
+                    diff_sq_total.clamp_min(0.0)
+                    / live_sq_total.clamp_min(1e-12)
+                ).sqrt()
+                self._real_score_ema_rel_l2 = float(rel.item())
+
+    @contextmanager
+    def _real_score_ema_swap(self):
+        """Context manager: temporarily swap self.real_score's LoRA
+        params to the EMA values, restore on exit. Used to wrap the
+        DMD scoring forward so DMD reads a slow-moving target while
+        the aux teacher loss continues to forward through the live
+        LoRA outside this context.
+
+        Implementation: ``torch.utils.swap_tensors`` exchanges the
+        underlying storage of two Tensors with zero allocation. After
+        the first swap, ``p.data`` holds the EMA values and the
+        ``ema_t`` entry in the dict temporarily holds the live
+        values. The DMD forward (no_grad) reads ``p.data`` as
+        normal. On exit the swap-back restores both — ``p.data``
+        back to live values, ``ema_t`` back to EMA values — with no
+        additional memory churn. Avoids the ~87 MB live_backup
+        allocation the clone-and-copy approach required.
+
+        Safe to swap ``p.data`` because:
+          * Both tensors have identical shape/dtype/device (the EMA
+            buffer was constructed via ``.clone()`` from the live
+            params).
+          * The swap happens inside no_grad — DDP isn't running
+            collectives on these params during the swap window.
+          * We swap the underlying tensors, not the Parameter
+            wrappers, so DDP's parameter refs are unaffected.
+
+        No-op when EMA is disabled (weight == 0) or not yet
+        initialised (pre-first LoRA optim step). In those cases the
+        live params are used unchanged.
+
+        Restore is unconditional via try/finally — if the wrapped
+        forward raises, the live LoRA state is still restored before
+        the exception propagates.
+        """
+        if (
+            self.real_score_ema_weight <= 0.0
+            or self._real_score_ema_lora_state is None
+        ):
+            yield
+            return
+        inner = getattr(self.real_score, "model", None)
+        if inner is None:
+            yield
+            return
+        # Build the swap list once. Only includes LoRA-tagged params
+        # whose EMA entry is shape-compatible (defensive against
+        # mid-run param-shape drift, which shouldn't happen but is
+        # cheap to guard against).
+        swap_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for name, p in inner.named_parameters():
+            ema_t = self._real_score_ema_lora_state.get(name)
+            if ema_t is None or ema_t.shape != p.shape:
+                continue
+            swap_pairs.append((p.data, ema_t))
+        with torch.no_grad():
+            for p_data, ema_t in swap_pairs:
+                _swap_tensors(p_data, ema_t)
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for p_data, ema_t in swap_pairs:
+                    _swap_tensors(p_data, ema_t)
+
     def reset_streaming_state(self) -> None:
         """Tear down the open sequence (typically when collapse gate
         fires or ``can_generate_more`` returns False)."""
@@ -3988,6 +4253,11 @@ class ActionForcingDMD(SelfForcingModel):
         # the self-view clean_x. The aux pass below uses the LoRA
         # teacher with the GT-mixed clean_x_real.
         dual_teacher_active = self.real_score_frozen is not None
+        ema_real_score_active = (
+            not dual_teacher_active
+            and self.real_score_ema_weight > 0.0
+            and self._real_score_ema_lora_state is not None
+        )
         if dual_teacher_active:
             _saved_real_score = self.real_score
             self.real_score = self.real_score_frozen
@@ -4006,6 +4276,26 @@ class ActionForcingDMD(SelfForcingModel):
                 )
             finally:
                 self.real_score = _saved_real_score
+        elif ema_real_score_active:
+            # Target-network EMA path: swap the live LoRA params to
+            # their EMA values for the DMD scoring forward, restore
+            # afterwards. The aux teacher loss (which runs LATER in
+            # this same compute_generator_loss_streaming call) sees
+            # the LIVE params unchanged. See _real_score_ema_swap for
+            # the swap/restore mechanics.
+            with self._real_score_ema_swap():
+                dmd_loss, dmd_log = self.compute_distribution_matching_loss(
+                    image_or_video=chunk,
+                    conditional_dict=cond_for_scoring,
+                    unconditional_dict=uncond_for_scoring,
+                    gradient_mask=gradient_mask_eff,
+                    denoised_timestep_from=info.get("denoised_timestep_from"),
+                    denoised_timestep_to=info.get("denoised_timestep_to"),
+                    clean_x=sc_clean_x, aug_t=sc_aug_t,
+                    clean_x_real=sc_clean_x_real, aug_t_real=sc_aug_t_real,
+                    gt_target=gt_target,
+                    gt_z_per_slot=gt_z_per_slot,
+                )
         else:
             dmd_loss, dmd_log = self.compute_distribution_matching_loss(
                 image_or_video=chunk,

@@ -30,6 +30,7 @@ from __future__ import annotations
 import atexit
 import gc
 import logging
+import math
 import os
 import random
 import subprocess
@@ -1321,6 +1322,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # The D-side update runs from step 0 (it has to learn before
         # it can give G a signal). Default 500 (== z_guidance_warmup_steps).
         self.gan_warmup_steps = int(getattr(cfg, "gan_warmup_steps", 500))
+        # ``gan_warmup_shape``: shape of the gen-side GAN weight ramp
+        # over ``gan_warmup_steps``. ``"linear"`` (default, legacy
+        # behaviour): t/T constant derivative — first non-zero step
+        # delivers (1/T) × plateau weight. ``"quadratic"``: (t/T)² —
+        # zero derivative at gate-open; first non-zero step delivers
+        # (1/T²) × plateau, two orders of magnitude softer than
+        # linear at small t. ``"cosine"``: ½(1-cos(πt/T)) — S-curve
+        # with zero derivative at both ends. Recommended "quadratic"
+        # to suppress fish-scale artifacts at GAN onset.
+        self.gan_warmup_shape = str(
+            getattr(cfg, "gan_warmup_shape", "linear")
+        ).lower()
+        if self.gan_warmup_shape not in ("linear", "quadratic", "cosine"):
+            raise ValueError(
+                "gan_warmup_shape must be one of 'linear' | 'quadratic' "
+                f"| 'cosine'; got {self.gan_warmup_shape!r}."
+            )
         self.gan_updates_per_step = int(
             getattr(cfg, "gan_updates_per_step", 1)
         )
@@ -1538,6 +1556,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
         self.perceptual_approx_warmup_steps = int(
             getattr(cfg, "perceptual_approx_warmup_steps", 25)
+        )
+        # Optional linear ramp on the perceptual-approx gen-side
+        # contribution AFTER the warmup gate fires. Default 0 = hard
+        # switch at warmup_steps (legacy behaviour). When > 0, the
+        # combined ramp_factor multiplies every per-approx weight in
+        # _compute_gen_side_perceptual_loss, growing linearly from 0
+        # to 1.0 over ``perceptual_approx_ramp_steps`` outer steps
+        # starting at ``perceptual_approx_warmup_steps``. Useful when
+        # MANIQA's full-weight onset would otherwise destabilise
+        # nearby losses (the additive "bias" effect on the bundled
+        # r3gan_g_loss_weighted seen in v3/v4 runs).
+        self.perceptual_approx_ramp_steps = int(
+            getattr(cfg, "perceptual_approx_ramp_steps", 0)
         )
         # ----- v11-style multi-noise (Lipschitz-by-density) -----
         # When > 0, sample K interpolation points between
@@ -2095,6 +2126,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         float(rtgn.item()) if torch.is_tensor(rtgn) else float(rtgn)
                     )
                     self.real_teacher_optimizer.step()
+                    # Target-network EMA pull on the LoRA adapter
+                    # (no-op when real_score_ema_weight == 0). Fires
+                    # AFTER optim.step on every LoRA update so the
+                    # EMA tracks the post-step weights, including
+                    # the just-clipped gradient's effect.
+                    self.model.ema_update_real_score_lora()
                 self.real_teacher_optimizer.zero_grad(set_to_none=True)
             elif self.real_teacher_optimizer is not None:
                 # Below start_step (or aux gate closed for any other
@@ -2237,6 +2274,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         log_payload["critic/real_teacher_lr"] = float(
                             self.real_teacher_optimizer.param_groups[0]["lr"]
                         )
+                    # EMA-LoRA drift diagnostic (None when
+                    # real_score_ema_weight==0 or before first LoRA
+                    # optim step). Picks up whatever the most recent
+                    # EMA-update computed.
+                    _ema_rel_l2 = getattr(
+                        self.model, "_real_score_ema_rel_l2", None,
+                    )
+                    if _ema_rel_l2 is not None:
+                        log_payload["critic/real_score_ema_rel_l2"] = float(_ema_rel_l2)
                     log_payload["critic/state_probe_grad_norm"] = (
                         state_probe_grad_norm_val
                     )
@@ -3788,8 +3834,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         zero = torch.zeros((), device=device, dtype=torch.float32)
         if current_step < self.perceptual_approx_warmup_steps:
             return zero, {}
+        # Linear ramp factor after the warmup gate opens. Multiplies
+        # every per-approx weight uniformly so MANIQA/LPIPS/MS-SSIM/MSE
+        # all share the same on-ramp shape. ramp_steps == 0 preserves
+        # the legacy hard-switch behaviour.
+        if self.perceptual_approx_ramp_steps > 0:
+            ramp_in = current_step - self.perceptual_approx_warmup_steps
+            ramp_factor = min(
+                1.0,
+                max(0.0, float(ramp_in) / float(self.perceptual_approx_ramp_steps)),
+            )
+        else:
+            ramp_factor = 1.0
         loss = zero
-        logs: Dict[str, float] = {}
+        logs: Dict[str, float] = {
+            "train/perc_ramp_factor": float(ramp_factor),
+        }
         gt_lat_det = gt_latents_window.detach().to(pred_image.dtype)
         # ``sign``: +1 for distance approxes (gen wants pred LOW); -1
         # for similarity / GAN approxes (gen wants pred HIGH).
@@ -3831,6 +3891,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         ]:
             if model is None or weight <= 0:
                 continue
+            effective_weight = weight * ramp_factor
+            # Skip the forward entirely if the ramp factor has zeroed
+            # the contribution (saves the approx forward+backward when
+            # the ramp hasn't engaged yet).
+            if effective_weight == 0.0:
+                logs[f"train/{name}_gen_pred_mean"] = 0.0
+                logs[f"train/{name}_gen_loss_weighted"] = 0.0
+                continue
             # Freeze approx params for this forward — gen-side
             # backward only flows into pred_image, not the approx.
             model.requires_grad_(False)
@@ -3842,14 +3910,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         pred_image.to(pred_image.dtype), gt_lat_det,
                     ).float()
                 pred_mean = pred.mean()
-                loss = loss + sign * weight * pred_mean.to(pred_image.dtype)
+                loss = loss + sign * effective_weight * pred_mean.to(pred_image.dtype)
             finally:
                 model.requires_grad_(True)
             logs[f"train/{name}_gen_pred_mean"] = float(
                 pred_mean.detach().item()
             )
             logs[f"train/{name}_gen_loss_weighted"] = float(
-                (sign * weight * pred_mean).detach().item()
+                (sign * effective_weight * pred_mean).detach().item()
             )
         return loss, logs
 
@@ -4037,6 +4105,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         logs["train/lpips_n_frames"] = float(n_pick)
         return loss.to(pred_image.dtype), logs
 
+    def _gan_warmup_shape_apply(self, t_normalized: float) -> float:
+        """Apply ``self.gan_warmup_shape`` to a normalised ramp position
+        ``t ∈ [0, 1]``. Returns a value in ``[0, 1]`` that the caller
+        multiplies by ``gan_loss_weight`` to get the effective gen-side
+        weight. See ``__init__`` for shape definitions.
+        """
+        t = max(0.0, min(1.0, float(t_normalized)))
+        if self.gan_warmup_shape == "quadratic":
+            return t * t
+        if self.gan_warmup_shape == "cosine":
+            return 0.5 * (1.0 - math.cos(math.pi * t))
+        return t  # "linear"
+
     def _compute_r3gan_losses_distilled(
         self,
         pred_image: torch.Tensor,
@@ -4108,7 +4189,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             and current_step >= self.gan_critic_warmup_steps
         ):
             ramp_steps_in = current_step - self.gan_critic_warmup_steps
-            ramp = ramp_steps_in / max(1, self.gan_warmup_steps)
+            t_norm = ramp_steps_in / max(1, self.gan_warmup_steps)
+            ramp = self._gan_warmup_shape_apply(t_norm)
             gen_gan_weight = ramp * self.gan_loss_weight
         elif current_step >= (
             self.gan_critic_warmup_steps + self.gan_warmup_steps
@@ -4140,11 +4222,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             generator_gan_loss = zero
             d_fake_for_g_value = 0.0
             gen_gan_main_value = 0.0
+        # Capture the GAN-only weighted value BEFORE the perceptual
+        # losses are summed in below. This is what
+        # ``train/r3gan_g_loss_weighted`` should reflect — the actual
+        # gen-side GAN push on the student — without the perceptual-
+        # approx bias term that's been contaminating the metric. The
+        # student's total gradient is unchanged (still the sum), but
+        # the wandb plot now reads cleanly.
+        gan_only_weighted_value = (
+            gen_gan_weight * gen_gan_main_value
+            if (critic_warmup_done and gen_gan_weight > 0)
+            else 0.0
+        )
 
         # Gen-side perceptual loss via the trained approxes. Adds to
         # generator_gan_loss so the same downstream summing path works.
         # Backward flows through the (small) approxes into pred_image
         # — no VAE in autograd graph.
+        perc_loss_weighted_value = 0.0
         if (
             self.mse_approx is not None
             or self.lpips_approx is not None
@@ -4156,17 +4251,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 gt_latents_window=real_lat,
                 current_step=current_step,
             )
+            if (
+                torch.is_tensor(perc_loss)
+                and perc_loss.requires_grad
+            ):
+                perc_loss_weighted_value = float(perc_loss.detach().item())
             generator_gan_loss = generator_gan_loss + perc_loss
             logs.update(perc_logs)
 
         logs.update({
             "train/r3gan_d_fake_for_g": d_fake_for_g_value,
             "train/r3gan_g_loss_raw": gen_gan_main_value,
-            "train/r3gan_g_loss_weighted": (
-                float(generator_gan_loss.detach().item())
-                if torch.is_tensor(generator_gan_loss)
-                and generator_gan_loss.requires_grad
-                else 0.0
+            # GAN-only weighted value (NOT bundled with perceptual
+            # losses any more). Captured pre-summation above so the
+            # plot shows ``gan_loss_weight × gen_gan_main`` cleanly.
+            "train/r3gan_g_loss_weighted": gan_only_weighted_value,
+            # Perceptual-approx weighted contribution (MANIQA + others)
+            # — separate from the GAN-only key. Sum of these two
+            # equals the previous (bundled) r3gan_g_loss_weighted.
+            "train/perc_loss_weighted": perc_loss_weighted_value,
+            "train/gan_plus_perc_loss_weighted": (
+                gan_only_weighted_value + perc_loss_weighted_value
             ),
             "train/r3gan_g_weight": float(gen_gan_weight),
             "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
@@ -4854,7 +4959,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Warmup: ramp G's GAN weight 0 -> gan_loss_weight over
         # gan_warmup_steps steps. D learns from step 0 regardless.
         if self.gan_warmup_steps > 0 and current_step < self.gan_warmup_steps:
-            ramp = current_step / max(1, self.gan_warmup_steps)
+            t_norm = current_step / max(1, self.gan_warmup_steps)
+            ramp = self._gan_warmup_shape_apply(t_norm)
             gen_gan_weight = ramp * self.gan_loss_weight
         else:
             gen_gan_weight = self.gan_loss_weight
@@ -6613,6 +6719,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             max_norm=self.real_teacher_max_grad_norm,
                         )
                         self.real_teacher_optimizer.step()
+                        # Target-network EMA pull after every LoRA
+                        # update inside the teacher_cadence='fake'
+                        # inner loop. With dfake_gen_update_ratio=5
+                        # this fires 5x per outer step. No-op when
+                        # real_score_ema_weight == 0. The rel_l2
+                        # diagnostic only fires on the LAST inner
+                        # iter to avoid 4× redundant per-param sums
+                        # and the GPU→CPU .item() sync; wandb only
+                        # reads the metric once per outer step
+                        # anyway, so only the latest value matters.
+                        self.model.ema_update_real_score_lora(
+                            compute_rel_l2=(i == n_total - 1),
+                        )
                         _fired += 1
                     self.real_teacher_optimizer.zero_grad(set_to_none=True)
                 out["teacher_cadence_steps_fired"] = float(_fired)

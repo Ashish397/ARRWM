@@ -523,6 +523,7 @@ srun torchrun \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
+    sample_fps=20 \
     boundary_vae_roundtrip=true \
     local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
