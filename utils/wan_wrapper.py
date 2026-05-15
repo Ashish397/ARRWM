@@ -208,24 +208,44 @@ class WanDiffusionWrapper(torch.nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
 
+    def _unwrapped_model(self):
+        """Return the underlying nn.Module after stripping a DDP wrap.
+
+        After ``trainer.causal_action_forcing_train`` re-assigns
+        ``model.fake_score.model = DDP(...)``, this wrapper's ``self.model``
+        is the DDP instance, which doesn't proxy arbitrary attribute
+        access (e.g. ``head_alt`` lives on the wrapped ``module``, not
+        on the DDP itself). Use this helper anywhere the wrapper code
+        needs to read attributes of the actual WAN model.
+        """
+        m = self.model
+        try:
+            from torch.nn.parallel import DistributedDataParallel as _DDP
+            if isinstance(m, _DDP):
+                m = m.module
+        except Exception:
+            pass
+        return m
+
     def enable_alt_head(self) -> None:
-        """Build the alt head on the underlying CausalWanModel.
+        """Build the alt head on the underlying WAN model.
 
         After this is called, ``forward(..., compute_alt_head=True)``
         will compute and return both main and alt head outputs in one
         backbone forward.
         """
-        if not hasattr(self.model, "enable_alt_head"):
+        m = self._unwrapped_model()
+        if not hasattr(m, "enable_alt_head"):
             raise RuntimeError(
                 "enable_alt_head: underlying model does not support "
-                "alt heads. Only CausalWanModel-based diffusion "
-                "wrappers can host the v21 fake-alt head."
+                "alt heads. Only WAN-family models can host the v21 "
+                "fake-alt head."
             )
-        self.model.enable_alt_head()
+        m.enable_alt_head()
 
     @property
     def has_alt_head(self) -> bool:
-        return getattr(self.model, "head_alt", None) is not None
+        return getattr(self._unwrapped_model(), "head_alt", None) is not None
 
     def adding_cls_branch(
         self, 
