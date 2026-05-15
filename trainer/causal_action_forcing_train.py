@@ -350,11 +350,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             model.generator.model = self.generator_ddp  # type: ignore
 
             if bool(getattr(self.config, "fake_score_updates_enabled", True)):
+                # v21: fake_alt_head_enabled adds head_alt params that
+                # see no gradient on iters where compute_alt_head=False
+                # (e.g. the DMD gen-step's fake_score call). DDP with
+                # find_unused_parameters=False would hang on this. Flip
+                # the flag to True when alt head is active so the
+                # reducer skips alt-head params that weren't touched.
+                fake_score_fup = debug_fup or bool(
+                    getattr(self.config, "fake_alt_head_enabled", False)
+                )
                 self.fake_score_ddp = DDP(
                     model.fake_score.model,
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
-                    find_unused_parameters=debug_fup,
+                    find_unused_parameters=fake_score_fup,
                     broadcast_buffers=False,
                 )
                 model.fake_score.model = self.fake_score_ddp  # type: ignore
