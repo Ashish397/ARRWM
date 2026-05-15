@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -605,6 +606,16 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
+        # Optional alt head — same architecture as ``self.head`` (a tiny
+        # ~135K-param projection from backbone features to flow-space
+        # output) but learns a different target. Built lazily via
+        # ``enable_alt_head()``. In v21, fake_score's alt head is trained
+        # to predict the EMA-real teacher's x0 estimate (instead of the
+        # student's x0 the main head predicts); at inference time, its
+        # output is the "causal AR GT" estimate used by the aux teacher
+        # pass. Input is detached during forward so its loss never
+        # propagates into the backbone.
+        self.head_alt: Optional[Head] = None
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
@@ -636,6 +647,25 @@ class WanModel(ModelMixin, ConfigMixin):
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
 
+    def enable_alt_head(self) -> None:
+        """Build the alt head (warm-init from main head's weights).
+
+        Idempotent. Should be called AFTER the main head's weights are
+        loaded from a pretrained checkpoint so the alt head starts from
+        the same parameter values, then diverges via its own training.
+        """
+        if self.head_alt is not None:
+            return
+        # Match the main head's class (Head). The args mirror the
+        # __init__ above.
+        # NB: out_dim was multiplied into Head() at construction time
+        # via ``math.prod(patch_size) * out_dim`` already; pass the
+        # raw out_dim per the constructor signature.
+        self.head_alt = Head(self.dim, self.out_dim, self.patch_size, self.eps)
+        sample_param = next(self.head.parameters())
+        self.head_alt.to(device=sample_param.device, dtype=sample_param.dtype)
+        self.head_alt.load_state_dict(self.head.state_dict())
+
     def forward(
         self,
         *args,
@@ -662,6 +692,7 @@ class WanModel(ModelMixin, ConfigMixin):
         num_class_rgs=None,
         clip_fea=None,
         y=None,
+        compute_alt_head: bool = False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -810,18 +841,32 @@ class WanModel(ModelMixin, ConfigMixin):
             batch_size = final_x_rgs.shape[0]
             final_x_rgs = final_x_rgs.view(batch_size, num_frames_rgs, num_class_rgs)
 
-        # head
-        x = self.head(x, e)
-
+        # head (main) + optional alt head sharing backbone features
+        x_feat = x
+        x = self.head(x_feat, e)
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        out_alt = None
+        if compute_alt_head and self.head_alt is not None:
+            # Detach the alt head's input so its loss only updates
+            # alt-head params, never the backbone — preserves
+            # fake_score's existing training contract.
+            x_alt = self.head_alt(x_feat.detach(), e.detach())
+            x_alt = self.unpatchify(x_alt, grid_sizes)
+            out_alt = torch.stack(x_alt)
 
         if classify_mode:
+            if out_alt is not None:
+                return torch.stack(x), final_x, out_alt
             return torch.stack(x), final_x
 
         if regress_mode:
+            if out_alt is not None:
+                return torch.stack(x), final_x_rgs, out_alt
             return torch.stack(x), final_x_rgs
 
+        if out_alt is not None:
+            return torch.stack(x), out_alt
         return torch.stack(x)
 
     def unpatchify(self, x, grid_sizes, c=None):

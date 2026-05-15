@@ -208,6 +208,25 @@ class WanDiffusionWrapper(torch.nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
 
+    def enable_alt_head(self) -> None:
+        """Build the alt head on the underlying CausalWanModel.
+
+        After this is called, ``forward(..., compute_alt_head=True)``
+        will compute and return both main and alt head outputs in one
+        backbone forward.
+        """
+        if not hasattr(self.model, "enable_alt_head"):
+            raise RuntimeError(
+                "enable_alt_head: underlying model does not support "
+                "alt heads. Only CausalWanModel-based diffusion "
+                "wrappers can host the v21 fake-alt head."
+            )
+        self.model.enable_alt_head()
+
+    @property
+    def has_alt_head(self) -> bool:
+        return getattr(self.model, "head_alt", None) is not None
+
     def adding_cls_branch(
         self, 
         atten_dim=1536, 
@@ -448,7 +467,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        compute_alt_head: bool = False,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
         if getattr(self, "_action_patch_applied", False):
@@ -480,6 +500,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         has_probe = getattr(self, "_state_probe", None) is not None
         state_hidden = None
         tapped_features = None
+        # Alt-head output (raw, channels-first). Set by the clean_x / else
+        # branches when ``compute_alt_head=True``; remains None otherwise
+        # (kv_cache / classify_mode / regress_mode don't support alt yet).
+        model_alt_raw = None
 
         # Build state tokens once. Cached inference only supports the noisy-side
         # tokens, while teacher-forcing also threads a clean-side copy.
@@ -535,6 +559,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             else:
                 flow_pred = model_out.permute(0, 2, 1, 3, 4)
         elif clean_x is not None:
+            extra_kwargs = {}
+            if compute_alt_head:
+                extra_kwargs["compute_alt_head"] = True
             model_out = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
@@ -543,7 +570,19 @@ class WanDiffusionWrapper(torch.nn.Module):
                 aug_t=aug_t,
                 **action_mod_kwargs,
                 **state_kwargs,
+                **extra_kwargs,
             )
+            # When compute_alt_head=True, the model APPENDS the alt
+            # output as the final tuple element. Strip it off before
+            # falling through to the existing state_hidden/tapped
+            # unpack logic (which expects the legacy shapes).
+            model_alt_raw = None
+            if compute_alt_head and isinstance(model_out, tuple):
+                model_alt_raw = model_out[-1]
+                if len(model_out) == 2:
+                    model_out = model_out[0]
+                else:
+                    model_out = model_out[:-1]
             if isinstance(model_out, tuple):
                 flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
                 aux = model_out[1]
@@ -582,13 +621,24 @@ class WanDiffusionWrapper(torch.nn.Module):
             )
             flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
         else:
+            extra_kwargs = {}
+            if compute_alt_head:
+                extra_kwargs["compute_alt_head"] = True
             model_out = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
                 **action_mod_kwargs,
                 **state_kwargs,
+                **extra_kwargs,
             )
+            model_alt_raw = None
+            if compute_alt_head and isinstance(model_out, tuple):
+                model_alt_raw = model_out[-1]
+                if len(model_out) == 2:
+                    model_out = model_out[0]
+                else:
+                    model_out = model_out[:-1]
             if isinstance(model_out, tuple):
                 flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
                 aux = model_out[1]
@@ -604,6 +654,19 @@ class WanDiffusionWrapper(torch.nn.Module):
             xt=noisy_image_or_video.flatten(0, 1),
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
+
+        # Alt head conversion (when present). Mirrors the main head's
+        # flow→x0 conversion exactly so downstream code can treat
+        # ``(flow_alt, pred_x0_alt)`` symmetrically with the main pair.
+        flow_pred_alt = None
+        pred_x0_alt = None
+        if model_alt_raw is not None:
+            flow_pred_alt = model_alt_raw.permute(0, 2, 1, 3, 4)
+            pred_x0_alt = self._convert_flow_pred_to_x0(
+                flow_pred=flow_pred_alt.flatten(0, 1),
+                xt=noisy_image_or_video.flatten(0, 1),
+                timestep=timestep.flatten(0, 1),
+            ).unflatten(0, flow_pred_alt.shape[:2])
 
         # Cross-attention probe readout
         if has_probe and tapped_features is not None:
@@ -681,6 +744,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         if logits is not None:
             return flow_pred, pred_x0, logits
 
+        # Alt-head return: when ``compute_alt_head=True`` was passed
+        # and the alt branch fired, return a 4-tuple. Callers know to
+        # unpack ``(flow_pred, pred_x0, flow_pred_alt, pred_x0_alt)``.
+        if pred_x0_alt is not None:
+            return flow_pred, pred_x0, flow_pred_alt, pred_x0_alt
         return flow_pred, pred_x0
 
     def get_scheduler(self) -> SchedulerInterface:

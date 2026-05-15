@@ -479,164 +479,53 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "aux_teacher_send_student_grad", True)
         )
 
-        # ----- AR-noise-augmented teacher training -----
-        #
-        # The AR-noise sample is computed per-iter inside the aux pass
-        # as the residual of the student's rollout against GT:
-        #     ar_noise = (chunk - gt_target).detach()
-        # This is the empirical AR drift the student introduced
-        # relative to GT. It is added to the CLEAN side of the aux
-        # teacher's training input — before noising — so the teacher
-        # sees a state shaped like a real noised student rollout:
-        #     noise_base_ar = gt_target + α(t) * scale * seed_mask
-        #                                * burn_in * ar_normalised
-        #     noisy_input   = add_noise(noise_base_ar, ε, t)
-        # while the FlowPredLoss target stays ``ε - gt_target`` (pure
-        # GT) — teaching the teacher to denoise the perturbed input
-        # toward the unperturbed GT.
-        #
-        # α(t) = (1 - σ_t) / σ_t  (clamped to ``alpha_max``) converts
-        # the x0-space AR residual into the effective magnitude needed
-        # for it to mimic a noised student rollout at the SAME
-        # timestep on the clean side.
-        #
-        # ``aux_teacher_ar_noise_mode``:
-        #   "off"      : Gaussian-only training (legacy behaviour).
-        #   "combined" : single forward per iter; AR added to GT
-        #                before noising. Default for v13+.
-        #   "two_pass" : DEPRECATED — kept for backward compat /
-        #                ablations; runs both Gaussian-only and
-        #                AR-augmented forwards, summing losses.
-        # ``aux_teacher_ar_noise_scale``: float, default 1.0 — overall
-        # magnitude knob for the AR perturbation on top of α(t).
-        # ``aux_teacher_ar_noise_alpha_max``: clamp on (1-σ)/σ to
-        # prevent blow-up at low σ_t (near-clean timesteps).
-        # ``aux_teacher_ar_noise_seed_mask_chunks``: number of chunks
-        # at the START of the scoring window over which the AR
-        # contribution linearly ramps from 0 to 1 (seed-adjacent
-        # frames have ~zero drift; AR there is noise). 0 = uniform 1.
-        # ``aux_teacher_ar_noise_burn_in_steps``: outer-step linear
-        # ramp from 0 (step 0) to 1 (step N) on the AR contribution.
-        # Lets the teacher accumulate Gaussian-only experience before
-        # AR signal kicks in. 0 = AR active from step 0.
-        # ``aux_teacher_ar_noise_variance_renorm``: if True, the raw
-        # AR residual is divided by an EMA of its RMS so the
-        # perturbation magnitude stays bounded as the student drifts.
-        # ``aux_teacher_ar_noise_variance_ema_decay``: EMA decay for
-        # the RMS tracker.
-        self.aux_teacher_ar_noise_mode = str(
-            getattr(args, "aux_teacher_ar_noise_mode", "off")
-        ).lower()
-        if self.aux_teacher_ar_noise_mode not in (
-            "off", "combined", "two_pass",
-        ):
-            raise ValueError(
-                "aux_teacher_ar_noise_mode must be one of 'off' | "
-                "'combined' | 'two_pass'; got "
-                f"{self.aux_teacher_ar_noise_mode!r}."
-            )
-        self.aux_teacher_ar_noise_scale = float(
-            getattr(args, "aux_teacher_ar_noise_scale", 1.0)
-        )
-        self.aux_teacher_ar_noise_alpha_max = float(
-            getattr(args, "aux_teacher_ar_noise_alpha_max", 10.0)
-        )
-        self.aux_teacher_ar_noise_seed_mask_chunks = int(
-            getattr(args, "aux_teacher_ar_noise_seed_mask_chunks", 0)
-        )
-        self.aux_teacher_ar_noise_burn_in_steps = int(
-            getattr(args, "aux_teacher_ar_noise_burn_in_steps", 0)
-        )
-        self.aux_teacher_ar_noise_variance_renorm = bool(
-            getattr(args, "aux_teacher_ar_noise_variance_renorm", True)
-        )
-        self.aux_teacher_ar_noise_variance_ema_decay = float(
-            getattr(args, "aux_teacher_ar_noise_variance_ema_decay", 0.99)
-        )
-        # ``aux_teacher_ar_noise_reference``: source for the residual
-        # used as the AR-noise sample on the noise side of the aux
-        # teacher's training input. Three options:
-        #   "gt"             — chunk - gt_target (cheapest; both in
-        #                      aux-pass scope; "direct drift toward GT")
-        #   "pred_real"      — chunk - pred_real_image (CFG-extrapolated
-        #                      EMA teacher x0 stashed during the gen-step
-        #                      DMD pass). Closest to v11/v12 behaviour.
-        #                      Falls back to no-AR when stash unavailable.
-        #   "pred_real_lora" — chunk - pred_real_lora_x0, where
-        #                      pred_real_lora_x0 is a no-grad LIVE LoRA
-        #                      teacher forward on add_noise(chunk, eps, t)
-        #                      with the SAME eps and t the main aux
-        #                      forward uses. Freshest (no EMA lag) but
-        #                      costs one extra teacher forward per aux
-        #                      iter.
-        self.aux_teacher_ar_noise_reference = str(
-            getattr(args, "aux_teacher_ar_noise_reference", "gt")
-        ).lower()
-        if self.aux_teacher_ar_noise_reference not in (
-            "gt", "pred_real", "pred_real_lora", "noise_aux",
-        ):
-            raise ValueError(
-                "aux_teacher_ar_noise_reference must be one of 'gt' | "
-                "'pred_real' | 'pred_real_lora' | 'noise_aux'; got "
-                f"{self.aux_teacher_ar_noise_reference!r}."
-            )
-        # ----- noise_aux: forward-noising model for AR residual -----
-        # When ``aux_teacher_ar_noise_reference == "noise_aux"``, we
-        # use a separately-trained small ConvNet to predict the AR
-        # noise direction from a clean latent (avoids the time-warp
-        # blur of the pairwise (chunk - reference) residual at
-        # rollout positions where chunk and reference share a
-        # temporal shift relative to GT).
-        # Training contract:
-        #   input  = pred_image (= chunk)
-        #   target = 2 * pred_image - pred_real  (= pred_image + AR_noise)
-        # At inference (aux teacher pass), with no_grad:
-        #   ar_residual = noise_aux(gt_target) - gt_target
-        # ``noise_aux_warmup_steps``: before this step, noise_aux's
-        # output is meaningless (untrained); the aux pass falls back
-        # to no-AR. After warmup, noise_aux output is consumed.
-        self.noise_aux_enabled = bool(
-            getattr(args, "noise_aux_enabled", False)
-        )
-        self.noise_aux_hidden_channels = int(
-            getattr(args, "noise_aux_hidden_channels", 192)
-        )
-        self.noise_aux_num_blocks = int(
-            getattr(args, "noise_aux_num_blocks", 4)
-        )
-        self.noise_aux_warmup_steps = int(
-            getattr(args, "noise_aux_warmup_steps", 50)
-        )
-        self.noise_aux: Optional[nn.Module] = None
-        # Stash for noise_aux training inputs (set during gen step,
-        # consumed by ``compute_noise_aux_loss_streaming``).
-        # v21: target is (ema_real_x0 - fake_x0), so we need both
-        # pred_real_image and pred_fake_image stashed.
-        self._latest_chunk_for_noise_aux: Optional[torch.Tensor] = None
-        self._latest_pred_fake_image: Optional[torch.Tensor] = None
-        # Optional gating: start training noise_aux only after this step
-        # (lets ema_real diverge from real_score first when
-        # ``real_score_ema_weight`` < 1; controls when the
-        # ``ema_real_x0 - fake_x0`` direction becomes meaningful).
-        self.noise_aux_start_step = int(
-            getattr(args, "noise_aux_start_step", 0)
-        )
-        if self.noise_aux_enabled:
-            from model.noise_aux import NoiseAuxLite
-            self.noise_aux = NoiseAuxLite(
-                latent_channels=16,
-                hidden_channels=self.noise_aux_hidden_channels,
-                num_blocks=self.noise_aux_num_blocks,
-            )
-        # Running RMS tracker for the AR residual; initialised lazily
-        # on the first iter that produces a non-trivial residual.
-        self._ar_residual_rms_ema: Optional[float] = None
-        # Stash for the CFG-extrapolated EMA teacher x0 prediction
-        # produced by the gen-step DMD scoring pass — consumed by the
-        # aux pass when ``aux_teacher_ar_noise_reference == "pred_real"``.
+        # Stash for the EMA-swapped CFG-extrapolated teacher x0
+        # prediction produced by the gen-step DMD scoring pass.
         # Detached, overwritten each gen-step DMD pass; None until
-        # first set. Falls back to no-AR for that iter when None.
+        # first set. Consumed by downstream alt-head plumbing.
         self._latest_pred_real_image: Optional[torch.Tensor] = None
+
+        # ===== v21 fake-score alt head =====
+        # When enabled, builds a second small projection head on
+        # ``self.fake_score.model`` (CausalWanModel). The alt head
+        # shares the WAN backbone forward pass but has a separate
+        # output projection trained to predict ``ema_real_x0`` (the
+        # EMA-swapped real_score's x0 estimate) instead of
+        # ``pred_image`` (what the main head predicts).
+        #
+        # Training contract (mirrors fake_score's main critic loss
+        # exactly — same flow-space FlowPredLoss, same noised input):
+        #     flow_alt = fake_score.head_alt(features)
+        #     target = critic_noise - pred_real_EMA   (= ε - ema_real_x0)
+        #     loss   = FlowPredLoss(flow_alt, target)
+        # The alt head's input is detached inside CausalWanModel.forward,
+        # so its loss propagates only into alt-head params — backbone
+        # supervision stays with the main critic loss.
+        #
+        # Application contract (consumed in
+        # ``_compute_aux_teacher_loss_streaming``):
+        #     noisy_gt = add_noise(gt_target, ε_aux, t_aux)
+        #     _, x0_alt = fake_score.alt(noisy_gt, t_aux, cond)   # no_grad
+        #     causal_AR_GT = x0_alt
+        #     noisy_for_real = add_noise(causal_AR_GT, ε_aux, t_aux)
+        #     real_score(noisy_for_real) → flow_pred
+        #     target_flow = ε_aux - gt_target_TRUE  (still true GT)
+        # The teacher learns to denoise AR-noise back to true GT.
+        self.fake_alt_head_enabled = bool(
+            getattr(args, "fake_alt_head_enabled", False)
+        )
+        # Step at which alt-head training begins. Before this step,
+        # alt loss is not computed (waiting for ema_real to diverge
+        # from live real_score so the target is non-trivial).
+        self.fake_alt_head_start_step = int(
+            getattr(args, "fake_alt_head_start_step", 0)
+        )
+        # Step at which the AR-aux application begins consuming the
+        # alt head's output. Before this step, the aux teacher pass
+        # runs as if alt were disabled (clean GT, Gaussian-only noise).
+        self.fake_alt_apply_start_step = int(
+            getattr(args, "fake_alt_apply_start_step", 0)
+        )
 
         # Hard start-step gate for the aux teacher pass. Below this
         # step the aux pass does not fire at all (no real_score
@@ -891,6 +780,36 @@ class ActionForcingDMD(SelfForcingModel):
             except Exception as e:
                 if _is_main():
                     logging.warning("gradient_checkpointing enable failed: %s", e)
+
+        # ===== v21: enable alt head on fake_score =====
+        # Build a parallel projection head on fake_score's WAN backbone
+        # so a single forward can produce both pred_image-style x0 (main
+        # head, trained as usual) and ema_real_x0-style x0 (alt head,
+        # trained to predict the EMA-swapped real_score's output).
+        # Idempotent; warm-inits the alt head from the main head's
+        # weights so it starts equivalent and diverges with training.
+        if self.fake_alt_head_enabled:
+            try:
+                self.fake_score.enable_alt_head()
+                if _is_main():
+                    n_alt = sum(
+                        p.numel()
+                        for p in self.fake_score.model.head_alt.parameters()
+                    )
+                    logging.info(
+                        "[ActionForcingDMD] fake_score alt head ENABLED "
+                        "(%d params, warm-init from main head). "
+                        "train_start_step=%d apply_start_step=%d.",
+                        n_alt,
+                        self.fake_alt_head_start_step,
+                        self.fake_alt_apply_start_step,
+                    )
+            except Exception as e:
+                raise RuntimeError(
+                    "fake_alt_head_enabled=True but enable_alt_head() "
+                    f"failed: {e!r}. The underlying fake_score model "
+                    "must support an alt head."
+                )
 
         # Resize the bidirectional scorer wrappers. ``BaseModel.
         # _initialize_models`` sized them to the staircase batched
@@ -2274,32 +2193,13 @@ class ActionForcingDMD(SelfForcingModel):
         else:
             pred_real_image = pred_real_image_cond
 
-        # Stash pred_real_image for the aux pass when
-        # ``aux_teacher_ar_noise_reference == "pred_real"`` (v11/v12
-        # style: chunk - pred_real residual). pred_real_image here is
-        # the CFG-extrapolated EMA-swapped teacher x0 prediction (or
-        # just cond when real_guidance_scale == 0). Detached so no
-        # autograd connection to the aux pass; overwritten each
-        # gen-step DMD pass. Other references ("gt", "pred_real_lora")
-        # don't need this stash.
-        if (
-            self.aux_teacher_ar_noise_mode != "off"
-            and self.aux_teacher_ar_noise_reference == "pred_real"
-        ):
-            self._latest_pred_real_image = pred_real_image.detach()
-        # noise_aux training (v21) needs pred_image as input AND
-        # the (ema_real_x0 - fake_x0) direction as target. The
-        # pred_real_image stashed here IS the EMA-swapped real_score
-        # output when ``real_score_ema_weight > 0`` (DMD scoring path
-        # runs under ``_real_score_ema_swap``), so it's already
-        # ``ema_real_x0``. Stash all three: pred_image (input),
-        # ema_real_x0 (target component), fake_x0 (target component).
-        if self.noise_aux_enabled and self.noise_aux is not None:
-            self._latest_pred_real_image = pred_real_image.detach()
-            self._latest_pred_fake_image = pred_fake_image.detach()
-            self._latest_chunk_for_noise_aux = (
-                estimated_clean_image_or_video.detach()
-            )
+        # Unconditionally stash pred_real_image for downstream
+        # consumers (alt-head plumbing). The CFG-extrapolated
+        # EMA-swapped teacher x0 prediction (or just cond when
+        # real_guidance_scale == 0). Detached so no autograd
+        # connection to anything that reads the stash; overwritten
+        # each gen-step DMD pass.
+        self._latest_pred_real_image = pred_real_image.detach()
 
         # Step 3: DMD grad = (fake - real). CF normalizes by
         # |x0 - real|.mean() (eq. 8). Gated by ``normalization`` AND
@@ -4936,12 +4836,54 @@ class ActionForcingDMD(SelfForcingModel):
             tf_kwargs["clean_x"] = sc_clean_x
             tf_kwargs["aug_t"] = sc_aug_t
 
-        _, pred_fake_image = self.fake_score(
-            noisy_image_or_video=noisy_chunk,
-            conditional_dict=cond_for_scoring,
-            timestep=critic_timestep,
-            **tf_kwargs,
+        # v21: when fake_alt head is BUILT, run fake_score with
+        # compute_alt_head=True every critic iter so a single forward
+        # produces BOTH the main x0 estimate (for the critic's normal
+        # training loss) and the alt-head x0 estimate (for the alt loss
+        # against pred_real_EMA). The alt-head's input is detached
+        # inside the model, so its gradient never reaches the backbone.
+        #
+        # Why always run when built (not gated on ``start_step``):
+        # fake_score is DDP-wrapped with ``find_unused_parameters=False``
+        # — skipping the alt path on some iters would leave alt-head
+        # params with no gradient and hang the all-reduce. We instead
+        # always run, and gate the LOSS MAGNITUDE on ``start_step`` via
+        # a 0/1 multiplier. Alt-head's params see (zero) gradient every
+        # iter pre-start, and real gradient from start_step onwards.
+        current_step = int(info.get("current_step", 0))
+        alt_head_present = (
+            self.fake_alt_head_enabled
+            and getattr(self.fake_score, "has_alt_head", False)
         )
+        alt_loss_active = (
+            alt_head_present
+            and current_step >= int(self.fake_alt_head_start_step)
+        )
+        if alt_head_present:
+            fs_out = self.fake_score(
+                noisy_image_or_video=noisy_chunk,
+                conditional_dict=cond_for_scoring,
+                timestep=critic_timestep,
+                compute_alt_head=True,
+                **tf_kwargs,
+            )
+            if isinstance(fs_out, tuple) and len(fs_out) >= 4:
+                _flow_main, pred_fake_image, _flow_alt, pred_fake_image_alt = (
+                    fs_out[0], fs_out[1], fs_out[2], fs_out[3]
+                )
+            else:
+                # has_alt_head was True but the model didn't return alt
+                # (shouldn't happen). Fall back to no-alt.
+                _, pred_fake_image = fs_out[:2]
+                pred_fake_image_alt = None
+        else:
+            _, pred_fake_image = self.fake_score(
+                noisy_image_or_video=noisy_chunk,
+                conditional_dict=cond_for_scoring,
+                timestep=critic_timestep,
+                **tf_kwargs,
+            )
+            pred_fake_image_alt = None
 
         if self.args.denoising_loss_type == "flow":
             from utils.wan_wrapper import WanDiffusionWrapper
@@ -4981,6 +4923,12 @@ class ActionForcingDMD(SelfForcingModel):
             # fake_score parameter).
             critic_log["critic_empty_mask"] = 1.0
             zero_loss = (pred_fake_image.double() * 0.0).sum()
+            if pred_fake_image_alt is not None:
+                # Keep alt-head params in the DDP gradient bucket so
+                # find_unused_parameters=False stays happy. Adding a
+                # 0-coefficient term preserves the graph but contributes
+                # no gradient magnitude.
+                zero_loss = zero_loss + (pred_fake_image_alt.double() * 0.0).sum()
             return zero_loss, critic_log
         gradient_mask_flat = gradient_mask.flatten(0, 1)
         denoising_loss = self.denoising_loss_func(
@@ -4993,6 +4941,89 @@ class ActionForcingDMD(SelfForcingModel):
             flow_pred=flow_pred,
             gradient_mask=gradient_mask_flat,
         )
+        # ===== v21 alt-head training =====
+        # Train fake_score's alt head to predict ``ema_real_x0`` from
+        # the same noised input. The target is computed via an EXTRA
+        # no_grad EMA-swapped real_score forward at the SAME critic_
+        # noise/critic_timestep so the alt loss is consistent.
+        # The alt loss flows only into alt-head params (input detached
+        # inside the model); backbone supervision stays with the main
+        # critic denoising loss.
+        # Pre-start: the alt loss is computed but multiplied by 0 to
+        # keep alt-head params in the DDP gradient bucket (zero grad,
+        # but in the bucket — no find_unused hang).
+        if pred_fake_image_alt is not None:
+            # EMA-swapped real_score forward (no_grad). The
+            # ``alt_loss_active`` gate above sets the loss to zero for
+            # iters before ``fake_alt_head_start_step``, which is when
+            # ema_real_x0 has converged with current real_score and
+            # the target is meaningless.
+            with torch.no_grad():
+                with self._real_score_ema_swap():
+                    # Use the SAME clean_x context the fake_score saw —
+                    # tf_kwargs already has the right entries.
+                    _, ema_real_x0 = self.real_score(
+                        noisy_image_or_video=noisy_chunk,
+                        conditional_dict=cond_for_scoring,
+                        timestep=critic_timestep,
+                        **tf_kwargs,
+                    )
+                ema_real_x0_detached = ema_real_x0.detach()
+
+            # Convert alt's x0 prediction to flow space for the
+            # FlowPredLoss. Same conversion as the main head's loss
+            # uses (see denoising_loss_type=="flow" branch above).
+            if self.args.denoising_loss_type == "flow":
+                from utils.wan_wrapper import WanDiffusionWrapper
+                flow_pred_alt = WanDiffusionWrapper._convert_x0_to_flow_pred(
+                    scheduler=self.scheduler,
+                    x0_pred=pred_fake_image_alt.flatten(0, 1),
+                    xt=noisy_chunk.flatten(0, 1),
+                    timestep=critic_timestep.flatten(0, 1),
+                )
+                pred_fake_alt_noise = None
+            else:
+                flow_pred_alt = None
+                pred_fake_alt_noise = self.scheduler.convert_x0_to_noise(
+                    x0=pred_fake_image_alt.flatten(0, 1),
+                    xt=noisy_chunk.flatten(0, 1),
+                    timestep=critic_timestep.flatten(0, 1),
+                ).unflatten(0, chunk.shape[:2])
+            alt_loss = self.denoising_loss_func(
+                x=ema_real_x0_detached.flatten(0, 1),
+                x_pred=pred_fake_image_alt.flatten(0, 1),
+                noise=critic_noise.flatten(0, 1),
+                noise_pred=pred_fake_alt_noise,
+                alphas_cumprod=self.scheduler.alphas_cumprod,
+                timestep=critic_timestep.flatten(0, 1),
+                flow_pred=flow_pred_alt,
+                gradient_mask=gradient_mask_flat,
+            )
+            # Gate via multiplier: pre-start, the loss contributes 0
+            # gradient but the alt-head's params stay in the DDP
+            # gradient bucket (avoids find_unused_parameters hang).
+            alt_loss_coeff = 1.0 if alt_loss_active else 0.0
+            denoising_loss = denoising_loss + alt_loss * alt_loss_coeff
+            with torch.no_grad():
+                critic_log["fake_alt_head_loss"] = float(alt_loss.detach().item())
+                critic_log["fake_alt_loss_active"] = (
+                    1.0 if alt_loss_active else 0.0
+                )
+                # Diagnostic: how far alt's prediction has drifted from
+                # the main head's prediction. Zero at init (warm-start);
+                # grows as the alt head learns its different target.
+                _diff_rms = (
+                    (pred_fake_image_alt.float() - pred_fake_image.float())
+                    .pow(2).mean().sqrt().item()
+                )
+                critic_log["fake_alt_vs_main_rms"] = float(_diff_rms)
+                # Magnitude of the (ema_real_x0 - pred_image) target —
+                # tells you how meaningful the alt's training signal is.
+                _target_rms = (
+                    (ema_real_x0_detached.float() - pred_fake_image.detach().float())
+                    .pow(2).mean().sqrt().item()
+                )
+                critic_log["fake_alt_target_rms"] = float(_target_rms)
         return denoising_loss, critic_log
 
     # ------------------------------------------------------------------
@@ -5254,6 +5285,66 @@ class ActionForcingDMD(SelfForcingModel):
         # current behaviour bit-identically.
         if not self.aux_teacher_send_student_grad:
             noise_base = noise_base.detach()
+
+        # ===== v21 fake_alt application =====
+        # When the alt head is enabled AND past apply_start_step,
+        # shape the clean reference (= noise_base) through fake_score's
+        # alt head BEFORE noising. The alt head predicts what the
+        # EMA-real teacher would estimate as the clean version of a
+        # noised input — i.e. an AR-flavored x0 estimate. Replacing
+        # noise_base with this estimate (= "causal_AR_GT" when input
+        # source is "gt") means the real_score is trained to denoise
+        # AR-shaped noise back to TRUE GT (target stays gt_target
+        # below). The alt forward runs no_grad so neither alt-head nor
+        # backbone params receive gradient from the aux teacher loss;
+        # alt-head training is exclusively driven by the critic step's
+        # alt loss against pred_real_EMA.
+        fake_alt_apply_active = (
+            self.fake_alt_head_enabled
+            and current_step >= int(self.fake_alt_apply_start_step)
+            and getattr(self.fake_score, "has_alt_head", False)
+        )
+        causal_AR_dir_rms = 0.0
+        if fake_alt_apply_active:
+            with torch.no_grad():
+                # Same noised input the real_score will eventually see
+                # (we replicate the add_noise call here so the alt sees
+                # the same t-level data distribution). Use the SAME eps
+                # and t — keeps the alt's prediction temporally aligned
+                # with the teacher's training noise.
+                noisy_for_alt = self.scheduler.add_noise(
+                    noise_base.detach().flatten(0, 1),
+                    eps.flatten(0, 1),
+                    t.flatten(0, 1),
+                ).unflatten(0, chunk.shape[:2])
+                fs_alt_out = self.fake_score(
+                    noisy_image_or_video=noisy_for_alt,
+                    conditional_dict=cond_for_scoring,
+                    timestep=t,
+                    clean_x=clean_x_for_real if clean_x_for_real is not None else None,
+                    aug_t=aug_t_for_real if aug_t_for_real is not None else None,
+                    compute_alt_head=True,
+                )
+                if len(fs_alt_out) == 4:
+                    _, _, _, causal_AR_x0 = fs_alt_out
+                else:
+                    # Defensive: alt-head returned only main (no alt).
+                    causal_AR_x0 = None
+            if causal_AR_x0 is not None:
+                # Diagnostic: how far the alt's x0 estimate has drifted
+                # from the original clean reference. Zero at init
+                # (alt warm-init = main head; aligned at apply_start).
+                with torch.no_grad():
+                    causal_AR_dir_rms = float(
+                        (causal_AR_x0.float() - noise_base.detach().float())
+                        .pow(2).mean().sqrt().item()
+                    )
+                # Replace noise_base with the AR-flavored clean
+                # reference. Detached — no grad to alt_head or
+                # backbone from the aux teacher loss.
+                noise_base = causal_AR_x0.detach().to(
+                    dtype=chunk.dtype, device=chunk.device,
+                )
         # IMPLICIT GRADIENT CHANNEL: the loss flows back to the
         # student generator THROUGH ``noise_base`` when it depends on
         # ``chunk`` (which carries autograd from the rollout). For
@@ -5280,6 +5371,10 @@ class ActionForcingDMD(SelfForcingModel):
                     and float(p_resolved) < 1.0
                 )
             )
+            # When fake_alt application replaces noise_base with the
+            # alt-head's no_grad x0 prediction, the implicit student-
+            # grad path is severed regardless of source mode.
+            and not fake_alt_apply_active
         )
         if chunk_grad_path_live:
             assert chunk.requires_grad, (
@@ -5290,11 +5385,9 @@ class ActionForcingDMD(SelfForcingModel):
                 "streaming."
                 % self.real_teacher_input_source
             )
-        # ``noisy_input`` is built inside the per-pass loop below so
-        # the noise vector used for ``add_noise`` matches the noise
-        # vector used as the FlowPredLoss target ``noise`` arg —
-        # required when ``aux_teacher_ar_noise_mode`` augments the
-        # Gaussian noise with the AR-noise estimate.
+        # ``noisy_input`` is built below; the noise vector used for
+        # ``add_noise`` is the same vector used as the FlowPredLoss
+        # target ``noise`` arg.
 
         # Override clean_x with a stable reference: GT last-seed-chunk
         # concatenated with the first 6 student chunks' post-Step-3.3.5
@@ -5394,262 +5487,40 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t=_aug,
             )
 
-        # ----- AR-noise-augmented teacher training (v17+) -----
-        # Restored noise-side formulation from v11/v12 (the v13-v16
-        # clean-side variant produced fast-forward/mean-collapse).
-        # AR residual is added to the noise SAMPLE (the eps side of
-        # add_noise), and the FlowPredLoss target uses the SAME
-        # combined noise — preserving the rectified-flow contract:
-        #     noise_for_pass = eps + scale * burn * seed_mask * ar_normalised
-        #     noisy_input    = add_noise(gt_target, noise_for_pass, t)
-        #     target         = noise_for_pass - gt_target   (FlowPredLoss)
-        #
-        # Reference for ar_residual is configurable:
-        #   "gt"             — chunk.detach() - gt_target.detach()
-        #   "pred_real"      — chunk.detach() - self._latest_pred_real_image
-        #                      (stashed by _compute_kl_grad). Falls back
-        #                      to no-AR when stash is None or mismatched.
-        #   "pred_real_lora" — extra no-grad LIVE LoRA teacher forward
-        #                      on add_noise(chunk, eps, t) using SAME
-        #                      eps and t as the main aux forward; one
-        #                      extra teacher forward per aux iter.
-        #
-        # Modes:
-        #   "off"      : noise_for_pass = eps (Gaussian-only legacy).
-        #   "combined" : noise_for_pass = eps + ar_perturb (single pass).
-        #   "two_pass" : combined pass + Gaussian pass; losses summed.
-        ar_active_iter = (
-            self.aux_teacher_ar_noise_mode != "off"
-            and self.aux_teacher_ar_noise_scale > 0.0
-        )
-        ar_residual: Optional[torch.Tensor] = None
-        ar_perturbation: Optional[torch.Tensor] = None
-        ar_residual_rms_value = 0.0
-        ar_effective_amp_value = 0.0
-        burn_in_factor_value = 1.0
-        ar_fallback_value = 0.0
-        ref_code_map = {
-            "gt": 0, "pred_real": 1, "pred_real_lora": 2, "noise_aux": 3,
-        }
-        ar_reference_used_value = float(
-            ref_code_map.get(self.aux_teacher_ar_noise_reference, -1)
-        )
-        noise_aux_warmup_active_value = 0.0
-        if ar_active_iter:
-            ref_choice = self.aux_teacher_ar_noise_reference
-            reference_x0: Optional[torch.Tensor] = None
-            # ``noise_aux`` is special: bypasses the (chunk - reference)
-            # pairwise residual and uses noise_aux(gt_target) - gt_target
-            # as the AR direction directly. This avoids the time-warp
-            # blur of the pairwise residual (chunk and reference share
-            # a temporal shift vs GT). Reverts to no-AR until the
-            # noise_aux model has been trained for ``noise_aux_warmup_steps``.
-            noise_aux_direct_residual: Optional[torch.Tensor] = None
-            if ref_choice == "gt":
-                reference_x0 = gt_target.detach().to(
-                    dtype=eps.dtype, device=eps.device,
-                )
-            elif ref_choice == "pred_real":
-                prev = self._latest_pred_real_image
-                if prev is not None and prev.shape == chunk.shape:
-                    reference_x0 = prev.to(dtype=eps.dtype, device=eps.device)
-                else:
-                    # First-iter / shape-mismatch fallback: no AR this iter.
-                    ar_fallback_value = 1.0
-            elif ref_choice == "pred_real_lora":
-                # No-grad probe forward of LIVE LoRA on add_noise(chunk, eps, t).
-                # Same eps and t as the main aux pass so the probe sees
-                # the noise level the teacher will train on. No gradient
-                # checkpointing — backward is not run on this forward.
-                with torch.no_grad():
-                    probe_input = self.scheduler.add_noise(
-                        chunk.detach().flatten(0, 1),
-                        eps.flatten(0, 1),
-                        t.flatten(0, 1),
-                    ).unflatten(0, chunk.shape[:2])
-                    _probe_out = _aux_real_score_fn(probe_input)
-                    if (
-                        isinstance(_probe_out, tuple)
-                        and len(_probe_out) >= 2
-                    ):
-                        _, probe_x0 = _probe_out[0], _probe_out[1]
-                    else:
-                        probe_x0 = _probe_out
-                    reference_x0 = probe_x0.detach().to(
-                        dtype=eps.dtype, device=eps.device,
-                    )
-            elif ref_choice == "noise_aux":
-                if (
-                    self.noise_aux is None
-                    or not self.noise_aux_enabled
-                ):
-                    ar_fallback_value = 1.0  # noise_aux not built
-                elif current_step < int(self.noise_aux_warmup_steps):
-                    # Untrained: fall back to no-AR.
-                    ar_fallback_value = 1.0
-                    noise_aux_warmup_active_value = 1.0
-                else:
-                    # ar_residual = delta(gt_target) directly. We never
-                    # backprop through noise_aux from the aux pass —
-                    # the noise_aux model is trained by its own
-                    # optimizer in ``compute_noise_aux_loss_streaming``.
-                    # Access via ``.module`` when DDP-wrapped to reach
-                    # ``predict_delta``.
-                    _na = self.noise_aux
-                    _na_inner = getattr(_na, "module", _na)
-                    with torch.no_grad():
-                        gt_for_aux = gt_target.detach().to(
-                            dtype=next(_na_inner.parameters()).dtype,
-                            device=eps.device,
-                        )
-                        delta = _na_inner.predict_delta(gt_for_aux)
-                        noise_aux_direct_residual = delta.to(
-                            dtype=eps.dtype, device=eps.device,
-                        )
-            else:
-                ar_fallback_value = 1.0  # defensive (validator should have caught)
-
-            if noise_aux_direct_residual is not None:
-                ar_residual = noise_aux_direct_residual
-            elif reference_x0 is not None:
-                ar_residual = (
-                    chunk.detach().to(dtype=eps.dtype, device=eps.device)
-                    - reference_x0
-                )
-
-            if ar_residual is not None:
-                with torch.no_grad():
-                    ar_residual_rms_value = float(
-                        ar_residual.float().pow(2).mean().sqrt().item()
-                    )
-
-                # Variance renorm: ar_residual / EMA(rms(ar_residual)).
-                # Keeps the magnitude bounded as drift grows during
-                # training; ar_normalised has ~unit RMS by construction.
-                if self.aux_teacher_ar_noise_variance_renorm:
-                    decay = float(self.aux_teacher_ar_noise_variance_ema_decay)
-                    if self._ar_residual_rms_ema is None:
-                        self._ar_residual_rms_ema = ar_residual_rms_value
-                    else:
-                        self._ar_residual_rms_ema = (
-                            decay * float(self._ar_residual_rms_ema)
-                            + (1.0 - decay) * ar_residual_rms_value
-                        )
-                    _denom = max(float(self._ar_residual_rms_ema), 1e-6)
-                    ar_normalised = ar_residual / _denom
-                else:
-                    ar_normalised = ar_residual
-
-                # Per-frame seed mask: linear ramp from 0 (frame 0) to 1
-                # (frame seed_mask_chunks * block). 0 → uniform 1.
-                seed_chunks = int(self.aux_teacher_ar_noise_seed_mask_chunks)
-                if seed_chunks > 0:
-                    F = chunk.shape[1]
-                    block = int(self.num_frame_per_block)
-                    ramp_frames = float(seed_chunks * block)
-                    frame_idx = torch.arange(
-                        F, device=chunk.device, dtype=ar_residual.dtype,
-                    )
-                    seed_mask = (
-                        frame_idx / max(1.0, ramp_frames)
-                    ).clamp(0.0, 1.0)
-                    seed_mask = seed_mask.view(1, F, 1, 1, 1)
-                else:
-                    seed_mask = 1.0
-
-                # Burn-in ramp on the outer-step axis.
-                burn = int(self.aux_teacher_ar_noise_burn_in_steps)
-                if burn > 0:
-                    burn_in_factor_value = min(
-                        1.0, float(current_step) / float(burn)
-                    )
-                else:
-                    burn_in_factor_value = 1.0
-
-                # Noise-side perturbation: scale * burn * seed_mask * ar_normalised.
-                # NOTE: no flow conversion α(t) — that was a v13-v16
-                # artefact of the clean-side formulation; the noise-side
-                # math doesn't need it.
-                ar_perturbation = (
-                    float(self.aux_teacher_ar_noise_scale)
-                    * burn_in_factor_value
-                    * seed_mask
-                    * ar_normalised
-                )
-                with torch.no_grad():
-                    ar_effective_amp_value = float(
-                        ar_perturbation.float().pow(2).mean().sqrt().item()
-                    )
-
-        # Plan passes (NOISE side). Modes:
-        #   off       — [eps]   (Gaussian-only legacy)
-        #   combined  — [eps + ar_perturb]   (single pass; v17 default)
-        #   two_pass  — [eps + ar_perturb, eps]   (AR-augmented + Gaussian)
-        if not ar_active_iter or ar_perturbation is None:
-            noise_passes: List[Tuple[str, torch.Tensor]] = [("gaussian", eps)]
-        elif self.aux_teacher_ar_noise_mode == "combined":
-            noise_passes = [("combined", eps + ar_perturbation)]
-        elif self.aux_teacher_ar_noise_mode == "two_pass":
-            noise_passes = [
-                ("combined", eps + ar_perturbation),
-                ("gaussian", eps),
-            ]
-        else:  # defensive
-            noise_passes = [("gaussian", eps)]
-
-        # ----- Per-pass forward + loss -----
-        # ``noise_passes`` carries the NOISE-side input to ``add_noise``
-        # for each pass — eps for the Gaussian-only forward, or
-        # eps + ar_perturbation for the AR-augmented forward. The clean
-        # side is always ``noise_base`` (= gt_target when input_source=
-        # gt). The FlowPredLoss target uses the SAME noise_for_pass via
-        # the ``noise`` arg so target = noise_for_pass - gt_target.
+        # ----- Single Gaussian-only teacher forward -----
+        # Build the noisy input from ``noise_base`` (= gt_target /
+        # chunk / blend per ``real_teacher_input_source``) and the
+        # Gaussian sample ``eps`` at timestep ``t``. The FlowPredLoss
+        # target uses the SAME ``eps`` so target = eps - gt_target.
         gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
-        loss: Optional[torch.Tensor] = None
-        flow_pred = None
-        _x0 = None
-        lora_state_preds = None
-        ar_active_value = 0.0
-        combined_noise_rms_value = 0.0
-        for _pass_name, noise_for_pass in noise_passes:
-            noisy_input = self.scheduler.add_noise(
-                noise_base.flatten(0, 1),
-                noise_for_pass.flatten(0, 1),
-                t.flatten(0, 1),
-            ).unflatten(0, chunk.shape[:2])
+        noisy_input = self.scheduler.add_noise(
+            noise_base.flatten(0, 1),
+            eps.flatten(0, 1),
+            t.flatten(0, 1),
+        ).unflatten(0, chunk.shape[:2])
 
-            _real_score_out = _ckpt(
-                _aux_real_score_fn, noisy_input, use_reentrant=False,
+        _real_score_out = _ckpt(
+            _aux_real_score_fn, noisy_input, use_reentrant=False,
+        )
+        if isinstance(_real_score_out, tuple) and len(_real_score_out) >= 4:
+            flow_pred, _x0, lora_state_preds, _probe_hidden = (
+                _real_score_out[0], _real_score_out[1],
+                _real_score_out[2], _real_score_out[3],
             )
-            if isinstance(_real_score_out, tuple) and len(_real_score_out) >= 4:
-                flow_pred_p, _x0_p, lora_state_preds_p, _probe_hidden_p = (
-                    _real_score_out[0], _real_score_out[1],
-                    _real_score_out[2], _real_score_out[3],
-                )
-            else:
-                flow_pred_p, _x0_p = _real_score_out
-                lora_state_preds_p = None
+        else:
+            flow_pred, _x0 = _real_score_out
+            lora_state_preds = None
 
-            pass_loss = self.denoising_loss_func(
-                x=gt_target.flatten(0, 1),
-                x_pred=None,
-                noise=noise_for_pass.flatten(0, 1),
-                noise_pred=None,
-                alphas_cumprod=self.scheduler.alphas_cumprod,
-                timestep=t.flatten(0, 1),
-                flow_pred=flow_pred_p.flatten(0, 1),
-                gradient_mask=gradient_mask_flat,
-            )
-            loss = pass_loss if loss is None else loss + pass_loss
-            flow_pred = flow_pred_p
-            _x0 = _x0_p
-            lora_state_preds = lora_state_preds_p
-            if _pass_name == "combined":
-                ar_active_value = 1.0
-                with torch.no_grad():
-                    combined_noise_rms_value = float(
-                        noise_for_pass.float().pow(2).mean().sqrt().item()
-                    )
+        loss = self.denoising_loss_func(
+            x=gt_target.flatten(0, 1),
+            x_pred=None,
+            noise=eps.flatten(0, 1),
+            noise_pred=None,
+            alphas_cumprod=self.scheduler.alphas_cumprod,
+            timestep=t.flatten(0, 1),
+            flow_pred=flow_pred.flatten(0, 1),
+            gradient_mask=gradient_mask_flat,
+        )
 
         # Eval-time stash: surface the LoRA aux teacher's denoised x0
         # estimate for the sample-video logger. The DMD pass already
@@ -5671,13 +5542,10 @@ class ActionForcingDMD(SelfForcingModel):
             )
 
         # Diagnostics: MAE form of FlowPredLoss target, gradient_mask-
-        # weighted. The target matches the noise used on the LAST pass
-        # (the combined pass in two_pass mode, the only pass otherwise),
-        # so target = noise_for_pass - gt_target. ``noise_for_pass`` is
-        # the loop variable from the for loop just above; it carries
-        # the value the teacher's flow_pred is supposed to match.
+        # weighted. The target is ``eps - gt_target`` (FlowPredLoss
+        # contract for the single Gaussian forward).
         with torch.no_grad():
-            target_dbg = (noise_for_pass - gt_target).flatten(0, 1)
+            target_dbg = (eps - gt_target).flatten(0, 1)
             err_dbg = (
                 flow_pred.flatten(0, 1).float() - target_dbg.float()
             ).abs()
@@ -5708,41 +5576,15 @@ class ActionForcingDMD(SelfForcingModel):
             "aux_teacher_send_student_grad": (
                 1.0 if self.aux_teacher_send_student_grad else 0.0
             ),
-            # AR-noise augmentation diagnostics (v17+, noise-side).
-            # ``ar_active``: 1 if AR-augmented pass fired this iter, else 0.
-            # ``ar_n_passes``: 1 (off/combined) or 2 (two_pass).
-            # ``ar_reference_used``: code for the configured reference
-            #                (0=gt, 1=pred_real, 2=pred_real_lora).
-            # ``ar_fallback``: 1.0 if the configured reference was
-            #                unavailable this iter (e.g. pred_real stash
-            #                empty at iter 0) and we fell back to no-AR.
-            # ``ar_residual_rms``: RMS of the raw (chunk - reference)
-            #                residual this iter.
-            # ``ar_residual_rms_ema``: variance-renorm EMA tracker.
-            # ``ar_burn_in_factor``: outer-step burn-in ramp scalar.
-            # ``ar_effective_amp``: RMS of the perturbation actually
-            #                added to eps on the noise side
-            #                (scale × burn × seed_mask × ar_norm).
-            # ``ar_combined_noise_rms``: RMS of the combined noise
-            #                noise_for_pass = eps + ar_perturb. Tells
-            #                you whether AR has swamped eps; values >3
-            #                indicate AR-dominated training.
-            "aux_teacher_ar_active": ar_active_value,
-            "aux_teacher_ar_n_passes": float(len(noise_passes)),
-            "aux_teacher_ar_reference_used": ar_reference_used_value,
-            "aux_teacher_ar_fallback": ar_fallback_value,
-            "aux_teacher_ar_residual_rms": ar_residual_rms_value,
-            "aux_teacher_ar_residual_rms_ema": (
-                float(self._ar_residual_rms_ema)
-                if self._ar_residual_rms_ema is not None
-                else 0.0
+            # v21 fake_alt diagnostics. ``fake_alt_apply_active``: 1.0
+            # this iter if alt was applied; ``causal_AR_dir_rms``: RMS
+            # of (alt_x0 - clean_reference) — measures how much
+            # AR-flavor the alt is injecting. Zero before apply_start
+            # (and at first apply iters before alt has trained).
+            "fake_alt_apply_active": (
+                1.0 if fake_alt_apply_active else 0.0
             ),
-            "aux_teacher_ar_burn_in_factor": burn_in_factor_value,
-            "aux_teacher_ar_effective_amp": ar_effective_amp_value,
-            "aux_teacher_ar_combined_noise_rms": combined_noise_rms_value,
-            "aux_teacher_noise_aux_warmup_active": (
-                noise_aux_warmup_active_value
-            ),
+            "fake_alt_causal_AR_dir_rms": causal_AR_dir_rms,
         }
         # Expose the graph-bearing LoRA-side outputs so the trainer can
         # fold action_critic z-guidance and state_probe supervision into
@@ -5756,89 +5598,6 @@ class ActionForcingDMD(SelfForcingModel):
             "lora_x0": _x0,
             "lora_state_preds": lora_state_preds,
         }
-        return loss, log
-
-    # ------------------------------------------------------------------
-    # noise_aux training: forward-noising model for AR residual.
-    # ------------------------------------------------------------------
-    def compute_noise_aux_loss_streaming(
-        self,
-        current_step: int = 0,
-    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
-        """Train ``self.noise_aux`` to predict the AR-noise direction
-        ``(ema_real_x0 - fake_x0)`` from pred_image (= chunk).
-
-        v21 thesis: the DMD direction ``pred_real - pred_image`` already
-        drives DMD; using it as a noise-shaping target double-counts.
-        The genuine AR-noise direction is the discrepancy between two
-        models' predictions on the SAME noised input — fake_score
-        (which has learned a small amount of AR-denoising from MANIQA/
-        GAN) and ema_real_score (a GT-supervised teacher with no
-        AR-awareness). Their x0-space difference isolates the
-        AR-denoising signal we want to amplify in the teacher's
-        training distribution.
-
-        Training contract:
-            input  = pred_image   (chunk; x0-space)
-            target = ema_real_x0 - fake_x0   (clean-space direction)
-            loss   = MSE(noise_aux.predict_delta(pred_image), target)
-
-        At inference (consumed by ``_compute_aux_teacher_loss_streaming``
-        when ``aux_teacher_ar_noise_reference == "noise_aux"``):
-            ar_residual = noise_aux.predict_delta(gt_target)
-                        ≈ AR-noise direction at the gt position
-
-        ema_real_x0 is the EMA-swapped real_score output produced by
-        the DMD scoring pass (when ``real_score_ema_weight > 0``).
-        fake_x0 is fake_score's prediction from the same pass.
-
-        Gated by ``noise_aux_start_step`` (returns None below this step).
-        """
-        if not self.noise_aux_enabled or self.noise_aux is None:
-            return None, {}
-        if int(current_step) < int(self.noise_aux_start_step):
-            return None, {"noise_aux_skipped_pre_start": 1.0}
-        pred_image = self._latest_chunk_for_noise_aux
-        pred_real = self._latest_pred_real_image
-        pred_fake = self._latest_pred_fake_image
-        if pred_image is None or pred_real is None or pred_fake is None:
-            return None, {"noise_aux_skipped": 1.0}
-        if pred_image.shape != pred_real.shape or pred_image.shape != pred_fake.shape:
-            return None, {"noise_aux_skipped": 1.0}
-
-        param_dtype = next(self.noise_aux.parameters()).dtype
-        param_device = next(self.noise_aux.parameters()).device
-        x_in = pred_image.detach().to(dtype=param_dtype, device=param_device)
-        pred_real_d = pred_real.detach().to(dtype=param_dtype, device=param_device)
-        pred_fake_d = pred_fake.detach().to(dtype=param_dtype, device=param_device)
-        # AR-noise direction: ema_real_x0 - fake_x0.
-        # Sign convention per the v21 derivation: forward noising direction
-        # points FROM the AR-denoised (fake) prediction TOWARD the
-        # AR-blind (ema_real) prediction. Adding this to clean gt
-        # produces an AR-noised gt for the teacher to denoise back.
-        target_dir = pred_real_d - pred_fake_d
-        # Model is structured as forward(x) = x + delta(x); we train
-        # delta(x) directly against the target direction.
-        pred_full = self.noise_aux(x_in)
-        delta = pred_full - x_in
-        loss = F.mse_loss(delta, target_dir)
-
-        with torch.no_grad():
-            log: Dict[str, Any] = {
-                "noise_aux_loss": loss.detach(),
-                "noise_aux_delta_rms": float(
-                    delta.float().pow(2).mean().sqrt().item()
-                ),
-                "noise_aux_target_rms": float(
-                    target_dir.float().pow(2).mean().sqrt().item()
-                ),
-                "noise_aux_pred_real_rms": float(
-                    pred_real_d.float().pow(2).mean().sqrt().item()
-                ),
-                "noise_aux_pred_fake_rms": float(
-                    pred_fake_d.float().pow(2).mean().sqrt().item()
-                ),
-            }
         return loss, log
 
     # ------------------------------------------------------------------

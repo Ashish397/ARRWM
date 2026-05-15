@@ -791,6 +791,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
+        # Optional alt head — built lazily via ``enable_alt_head()``.
+        # Same architecture as ``self.head`` (a tiny ~135K-param
+        # projection that maps backbone features to flow-space output)
+        # but learns a different target. In v21 the alt head is trained
+        # to predict the EMA-real teacher's x0 (instead of the student's
+        # x0 the normal head predicts). At inference time, the alt
+        # output produces a "causal_AR_GT" estimate when fed a noised
+        # GT — used to shape the aux teacher's clean reference so the
+        # online LoRA teacher learns to denoise AR-noise back to true GT.
+        # The alt head's input is detached during forward so its loss
+        # never propagates into the backbone (preserving the existing
+        # fake_score training contract).
+        self.head_alt: Optional[CausalHead] = None
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
@@ -838,6 +851,27 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # separation helpers how many trailing tokens to skip.
         self.action_tokens_per_frame = 0
         self.state_tokens_per_frame = 0
+
+    def enable_alt_head(self) -> None:
+        """Build the alt head (warm-init from the main head's weights).
+
+        Idempotent — calling twice is a no-op. Should be called AFTER
+        the main head's weights are loaded (e.g. from a pretrained
+        checkpoint) so the alt head starts from the same parameter
+        values, then diverges via its own training loss.
+        """
+        if self.head_alt is not None:
+            return
+        self.head_alt = CausalHead(
+            self.dim, self.out_dim, self.patch_size, self.eps,
+        )
+        # Warm-init from main head. Move to the same device/dtype
+        # before copying state_dict so the deep-copy is type-safe.
+        main_state = self.head.state_dict()
+        # Move alt to main's device/dtype first.
+        sample_param = next(self.head.parameters())
+        self.head_alt.to(device=sample_param.device, dtype=sample_param.dtype)
+        self.head_alt.load_state_dict(main_state)
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -1127,6 +1161,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_start: int = 0,
         action_tokens=None,
         state_tokens=None,
+        compute_alt_head: bool = False,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1349,22 +1384,42 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 state_hidden = x_framed[:, :, -s_per_f:].squeeze(2)
             x = x_framed[:, :, :spatial_seqlen].flatten(1, 2)
 
-        # head
-        x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
+        # head (main) + optional alt head sharing backbone features
+        e_head = e.unflatten(dim=0, sizes=t.shape).unsqueeze(2)
+        x_feat = x  # save pre-head features so alt head can read same input
+        x = self.head(x_feat, e_head)
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        out_alt = None
+        if compute_alt_head and self.head_alt is not None:
+            # Detach the alt head's input so its loss only updates
+            # alt-head params, never the backbone — preserves the
+            # existing fake_score training contract.
+            x_alt = self.head_alt(x_feat.detach(), e_head.detach())
+            x_alt = self.unpatchify(x_alt, grid_sizes)
+            out_alt = torch.stack(x_alt)
         # Return contract:
         #   - plain tensor when no extras
         #   - (tensor, state_hidden) when action/state tokens produce hidden
         #   - (tensor, tapped_infer) when only probe taps were collected
         #   - (tensor, state_hidden, tapped_infer) when both are present
-        # The wan_wrapper disambiguates by tuple length / element type.
+        # Alt-head, when present, is APPENDED as the FINAL element of
+        # whatever tuple shape would otherwise be returned. The wrapper
+        # checks `compute_alt_head` to know how to pop it.
         if state_hidden is not None and tapped_infer is not None:
+            if out_alt is not None:
+                return torch.stack(x), state_hidden, tapped_infer, out_alt
             return torch.stack(x), state_hidden, tapped_infer
         if state_hidden is not None:
+            if out_alt is not None:
+                return torch.stack(x), state_hidden, out_alt
             return torch.stack(x), state_hidden
         if tapped_infer is not None:
+            if out_alt is not None:
+                return torch.stack(x), tapped_infer, out_alt
             return torch.stack(x), tapped_infer
+        if out_alt is not None:
+            return torch.stack(x), out_alt
         return torch.stack(x)
 
     def _forward_train(
@@ -1381,6 +1436,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         action_tokens_clean=None,
         state_tokens=None,
         state_tokens_clean=None,
+        compute_alt_head: bool = False,
     ):
         r"""
         Forward pass through the diffusion model.
@@ -1612,18 +1668,32 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             x = x.unflatten(1, (num_frames_local, frame_seqlen))
             x = x[:, :, :spatial_seqlen].flatten(1, 2)
 
-        # head
-        x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
-
+        # head (main) + optional alt head sharing backbone features
+        e_head = e.unflatten(dim=0, sizes=t.shape).unsqueeze(2)
+        x_feat = x
+        x = self.head(x_feat, e_head)
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        out_alt = None
+        if compute_alt_head and self.head_alt is not None:
+            # Detach the alt head's input so its loss only updates
+            # alt-head params, never the backbone.
+            x_alt = self.head_alt(x_feat.detach(), e_head.detach())
+            x_alt = self.unpatchify(x_alt, grid_sizes)
+            out_alt = torch.stack(x_alt)
 
         if state_hidden is not None:
+            if out_alt is not None:
+                return torch.stack(x), state_hidden, out_alt
             return torch.stack(x), state_hidden
 
         if tapped:
+            if out_alt is not None:
+                return torch.stack(x), tapped, out_alt
             return torch.stack(x), tapped
 
+        if out_alt is not None:
+            return torch.stack(x), out_alt
         return torch.stack(x)
 
     def forward(
