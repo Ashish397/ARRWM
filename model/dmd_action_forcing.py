@@ -5303,46 +5303,14 @@ class ActionForcingDMD(SelfForcingModel):
             and getattr(self.fake_score, "has_alt_head", False)
         )
         causal_AR_dir_rms = 0.0
-        if fake_alt_apply_active:
-            with torch.no_grad():
-                # Same noised input the real_score will eventually see
-                # (we replicate the add_noise call here so the alt sees
-                # the same t-level data distribution). Use the SAME eps
-                # and t — keeps the alt's prediction temporally aligned
-                # with the teacher's training noise.
-                noisy_for_alt = self.scheduler.add_noise(
-                    noise_base.detach().flatten(0, 1),
-                    eps.flatten(0, 1),
-                    t.flatten(0, 1),
-                ).unflatten(0, chunk.shape[:2])
-                fs_alt_out = self.fake_score(
-                    noisy_image_or_video=noisy_for_alt,
-                    conditional_dict=cond_for_scoring,
-                    timestep=t,
-                    clean_x=clean_x_for_real if clean_x_for_real is not None else None,
-                    aug_t=aug_t_for_real if aug_t_for_real is not None else None,
-                    compute_alt_head=True,
-                )
-                if len(fs_alt_out) == 4:
-                    _, _, _, causal_AR_x0 = fs_alt_out
-                else:
-                    # Defensive: alt-head returned only main (no alt).
-                    causal_AR_x0 = None
-            if causal_AR_x0 is not None:
-                # Diagnostic: how far the alt's x0 estimate has drifted
-                # from the original clean reference. Zero at init
-                # (alt warm-init = main head; aligned at apply_start).
-                with torch.no_grad():
-                    causal_AR_dir_rms = float(
-                        (causal_AR_x0.float() - noise_base.detach().float())
-                        .pow(2).mean().sqrt().item()
-                    )
-                # Replace noise_base with the AR-flavored clean
-                # reference. Detached — no grad to alt_head or
-                # backbone from the aux teacher loss.
-                noise_base = causal_AR_x0.detach().to(
-                    dtype=chunk.dtype, device=chunk.device,
-                )
+        # NOTE: the fake_alt forward needs ``clean_x_for_real`` /
+        # ``aug_t_for_real`` (the TF context for fake_score) — those
+        # are set further below (~line 5407, including the flash_dmd
+        # _clean_chunk override). The actual no_grad fake_alt forward
+        # is therefore deferred to just before the
+        # ``_aux_real_score_fn`` definition. Here we only commit to
+        # whether the apply path is active so ``chunk_grad_path_live``
+        # below can incorporate that knowledge.
         # IMPLICIT GRADIENT CHANNEL: the loss flows back to the
         # student generator THROUGH ``noise_base`` when it depends on
         # ``chunk`` (which carries autograd from the rollout). For
@@ -5437,6 +5405,51 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t_for_real = torch.zeros(
                     (clean_x_for_real.shape[0], clean_x_for_real.shape[1]),
                     device=chunk.device, dtype=torch.long,
+                )
+
+        # ===== v21 fake_alt forward (deferred) =====
+        # Now that ``clean_x_for_real`` and ``aug_t_for_real`` are
+        # finalised (including the flash-DMD ``_clean_chunk`` override
+        # above), run the no_grad fake_alt forward to shape the
+        # clean reference into a ``causal_AR`` x0 estimate. Replaces
+        # ``noise_base`` so the downstream ``add_noise(noise_base,
+        # eps, t)`` call produces an AR-flavored noised input for the
+        # real_score's training; the FlowPredLoss target stays
+        # ``eps - gt_target`` so the LoRA learns to denoise AR-noise
+        # back to TRUE GT.
+        if fake_alt_apply_active:
+            with torch.no_grad():
+                noisy_for_alt = self.scheduler.add_noise(
+                    noise_base.detach().flatten(0, 1),
+                    eps.flatten(0, 1),
+                    t.flatten(0, 1),
+                ).unflatten(0, chunk.shape[:2])
+                fs_alt_kwargs = {
+                    "noisy_image_or_video": noisy_for_alt,
+                    "conditional_dict": cond_for_scoring,
+                    "timestep": t,
+                    "compute_alt_head": True,
+                }
+                if clean_x_for_real is not None:
+                    fs_alt_kwargs["clean_x"] = clean_x_for_real
+                if aug_t_for_real is not None:
+                    fs_alt_kwargs["aug_t"] = aug_t_for_real
+                fs_alt_out = self.fake_score(**fs_alt_kwargs)
+                if isinstance(fs_alt_out, tuple) and len(fs_alt_out) >= 4:
+                    causal_AR_x0 = fs_alt_out[3]
+                else:
+                    causal_AR_x0 = None
+            if causal_AR_x0 is not None:
+                with torch.no_grad():
+                    causal_AR_dir_rms = float(
+                        (causal_AR_x0.float() - noise_base.detach().float())
+                        .pow(2).mean().sqrt().item()
+                    )
+                # Replace noise_base with the AR-flavored clean
+                # reference. Detached — no grad to alt_head or
+                # backbone from the aux teacher loss.
+                noise_base = causal_AR_x0.detach().to(
+                    dtype=chunk.dtype, device=chunk.device,
                 )
 
         # Teacher forward — full grad on LoRA params (and on chunk
