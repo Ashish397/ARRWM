@@ -4952,11 +4952,13 @@ class ActionForcingDMD(SelfForcingModel):
         # keep alt-head params in the DDP gradient bucket (zero grad,
         # but in the bucket — no find_unused hang).
         if pred_fake_image_alt is not None:
-            # EMA-swapped real_score forward (no_grad). The
-            # ``alt_loss_active`` gate above sets the loss to zero for
-            # iters before ``fake_alt_head_start_step``, which is when
-            # ema_real_x0 has converged with current real_score and
-            # the target is meaningless.
+            # EMA-swapped real_score forward (no_grad). Defrag the
+            # allocator before this forward — the critic step already
+            # holds fake_score's grad-on activations; the upcoming
+            # WAN forward spikes peak by another ~5-7 GB transient
+            # that needs contiguous space.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             with torch.no_grad():
                 with self._real_score_ema_swap():
                     # Use the SAME clean_x context the fake_score saw —
@@ -5418,6 +5420,13 @@ class ActionForcingDMD(SelfForcingModel):
         # ``eps - gt_target`` so the LoRA learns to denoise AR-noise
         # back to TRUE GT.
         if fake_alt_apply_active:
+            # Memory hygiene: the aux teacher pass already holds the
+            # real_score's grad-on activations; the upcoming fake_alt
+            # no_grad forward spikes peak by another WAN-forward's
+            # worth (~5-7 GB transient). Defrag the allocator first
+            # so the spike fits without fragmentation-driven OOM.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             with torch.no_grad():
                 noisy_for_alt = self.scheduler.add_noise(
                     noise_base.detach().flatten(0, 1),

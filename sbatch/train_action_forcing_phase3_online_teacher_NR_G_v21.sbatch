@@ -652,7 +652,7 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    max_gradient_chunks=4 \
+    max_gradient_chunks=3 \
     run_name=action_forcing_phase3_online_teacher_NR_G_v21_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
