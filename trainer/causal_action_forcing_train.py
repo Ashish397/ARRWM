@@ -257,6 +257,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             model.state_probe.to(device=self.device, dtype=self.dtype)
         if getattr(model, "action_critic", None) is not None:
             model.action_critic.to(device=self.device, dtype=self.dtype)
+        # noise_aux: small fp32 ConvNet (~8M params). fp32 keeps the
+        # MSE residual stable across the rectified-flow noise levels.
+        if getattr(model, "noise_aux", None) is not None:
+            model.noise_aux.to(device=self.device, dtype=torch.float32)
         if getattr(model, "vae", None) is not None:
             try:
                 model.vae.to(device=self.device)
@@ -375,6 +379,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 model.real_score.model = self.real_score_ddp  # type: ignore
         else:
             self.real_score_ddp = None
+
+        # ------------------------------------------------------------------
+        # noise_aux DDP wrap. NoiseAuxLite is a small all-rank-trained
+        # ConvNet — wrap with find_unused_parameters=False since every
+        # param sees a gradient on every iter the noise_aux loss fires.
+        # ------------------------------------------------------------------
+        self.noise_aux_ddp: Optional[DDP] = None
+        if (
+            self.world_size > 1
+            and getattr(model, "noise_aux", None) is not None
+        ):
+            self.noise_aux_ddp = DDP(
+                model.noise_aux,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+            # Keep ``model.noise_aux`` pointing at the DDP wrapper so
+            # loss and optim see the same handle. The underlying
+            # NoiseAuxLite is reachable via ``.module``.
+            model.noise_aux = self.noise_aux_ddp  # type: ignore
 
         # ------------------------------------------------------------------
         # Auxiliary action critic (CF-parity ActionCritic, frozen teacher
@@ -1782,6 +1808,51 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.real_teacher_warmup_steps = 0
             self._real_teacher_base_lr = 0.0
 
+        # ------------------------------------------------------------------
+        # noise_aux optimizer (small forward-noising ConvNet). Built only
+        # when ``noise_aux_enabled`` on the model. Trains independently
+        # of the LoRA — its own AdamW + grad clip + zero. Loss is set up
+        # in ``model.compute_noise_aux_loss_streaming``; the trainer
+        # fires it once per gen step after the gen backward.
+        # ------------------------------------------------------------------
+        self.noise_aux_optimizer: Optional[torch.optim.Optimizer] = None
+        self.noise_aux_enabled = bool(
+            getattr(self.model, "noise_aux_enabled", False)
+            and getattr(self.model, "noise_aux", None) is not None
+        )
+        if self.noise_aux_enabled:
+            na_params = [
+                p for p in self.model.noise_aux.parameters() if p.requires_grad
+            ]
+            if not na_params:
+                raise RuntimeError(
+                    "noise_aux_enabled=True but noise_aux has no trainable "
+                    "params — check NoiseAuxLite construction."
+                )
+            na_lr = float(getattr(cfg, "noise_aux_lr", 1.0e-04))
+            na_betas = tuple(getattr(cfg, "noise_aux_betas", [0.9, 0.999]))
+            na_eps = float(getattr(cfg, "noise_aux_eps", 1.0e-08))
+            na_wd = float(getattr(cfg, "noise_aux_weight_decay", 0.0))
+            self.noise_aux_optimizer = torch.optim.AdamW(
+                na_params,
+                lr=na_lr,
+                betas=na_betas,
+                eps=na_eps,
+                weight_decay=na_wd,
+            )
+            self.noise_aux_max_grad_norm = float(
+                getattr(cfg, "noise_aux_max_grad_norm", 1.0)
+            )
+            if self.is_main_process:
+                n_na_params = sum(p.numel() for p in na_params)
+                logging.info(
+                    "[ActionForcing] noise_aux optimizer built: "
+                    "AdamW lr=%.2e betas=%s wd=%.4f params=%.2fM",
+                    na_lr, na_betas, na_wd, n_na_params / 1e6,
+                )
+        else:
+            self.noise_aux_max_grad_norm = 1.0
+
         # ``fake_score_ema_weight`` (0.0 = off, current behavior; e.g.
         # 0.95 = engage). After each generator optimizer.step(), the
         # fake_score's params get EMA-pulled toward the generator's
@@ -2472,6 +2543,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             or self.gan_enabled
             or self.real_teacher_train_online
             or self.state_probe_aux_active
+            or self.noise_aux_enabled
         ):
             return
         path = self._checkpoint_path(self.step)
@@ -2548,6 +2620,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.real_teacher_optimizer.state_dict()
                 )
                 appended.append("real_teacher_optimizer")
+        if self.noise_aux_enabled and self.noise_aux_optimizer is not None:
+            na = self.model.noise_aux
+            na_module = na.module if isinstance(na, DDP) else na
+            if na_module is not None:
+                state["noise_aux"] = na_module.state_dict()
+                appended.append("noise_aux")
+            state["noise_aux_optimizer"] = self.noise_aux_optimizer.state_dict()
+            appended.append("noise_aux_optimizer")
         if not appended:
             return
         torch.save(state, path)
@@ -2563,6 +2643,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             or self.gan_enabled
             or self.real_teacher_train_online
             or self.state_probe_aux_active
+            or self.noise_aux_enabled
         ):
             return
         if not bool(getattr(self.config, "auto_resume", False)):
@@ -2718,6 +2799,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         f"failed: {exc!r}. Refusing to silently start "
                         "from fresh optimizer state."
                     ) from exc
+        if self.noise_aux_enabled:
+            na = self.model.noise_aux
+            na_module = na.module if isinstance(na, DDP) else na
+            if na_module is not None and "noise_aux" in state:
+                na_missing, na_unexpected = na_module.load_state_dict(
+                    state["noise_aux"], strict=False,
+                )
+                if self.is_main_process:
+                    logging.info(
+                        "resume: noise_aux missing=%d unexpected=%d",
+                        len(na_missing), len(na_unexpected),
+                    )
+            if (
+                self.noise_aux_optimizer is not None
+                and "noise_aux_optimizer" in state
+            ):
+                try:
+                    self.noise_aux_optimizer.load_state_dict(
+                        state["noise_aux_optimizer"]
+                    )
+                    if self.is_main_process:
+                        logging.info("resume: noise_aux_optimizer state restored")
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: noise_aux_optimizer load failed: %s. "
+                            "Starting noise_aux optim from fresh state.", exc,
+                        )
 
     # ------------------------------------------------------------------
     # Auxiliary action-critic losses (ported from
@@ -6707,6 +6816,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if gen_should_backward:
             generator_loss.backward(retain_graph=True)
         self._mem_step_snapshot("5_after_gen_backward")
+
+        # ----- noise_aux training step -----
+        # Independent of LoRA/gen optimizers. Uses the gen step's stashes
+        # (pred_image, pred_real) and trains noise_aux to learn the
+        # AR-noise direction. Fires every gen step; tiny model (~8M
+        # params), small memory footprint vs the rest of the graph.
+        # Skipped silently when stashes aren't available (e.g. first
+        # iter) or when noise_aux is disabled.
+        if (
+            self.noise_aux_enabled
+            and self.noise_aux_optimizer is not None
+        ):
+            na_loss, na_log = self.model.compute_noise_aux_loss_streaming()
+            if na_loss is not None and na_loss.requires_grad:
+                na_loss.backward()
+                na_params_with_grad = [
+                    p for p in self.noise_aux_optimizer.param_groups[0]["params"]
+                    if p.grad is not None
+                ]
+                if na_params_with_grad:
+                    nagn = torch.nn.utils.clip_grad_norm_(
+                        na_params_with_grad,
+                        max_norm=self.noise_aux_max_grad_norm,
+                    )
+                    out["noise_aux_grad_norm"] = (
+                        float(nagn.item()) if torch.is_tensor(nagn) else float(nagn)
+                    )
+                    self.noise_aux_optimizer.step()
+                self.noise_aux_optimizer.zero_grad(set_to_none=True)
+            out.update({
+                k: (float(v.detach().float().mean().item())
+                    if torch.is_tensor(v) else v)
+                for k, v in na_log.items()
+                if not isinstance(v, dict)
+            })
+        self._mem_step_snapshot("5b_after_noise_aux")
 
         critic_loss, critic_log = self.model.compute_critic_loss_streaming(
             train_chunk, train_info,

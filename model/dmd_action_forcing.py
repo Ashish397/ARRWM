@@ -5478,12 +5478,16 @@ class ActionForcingDMD(SelfForcingModel):
                     # backprop through noise_aux from the aux pass —
                     # the noise_aux model is trained by its own
                     # optimizer in ``compute_noise_aux_loss_streaming``.
+                    # Access via ``.module`` when DDP-wrapped to reach
+                    # ``predict_delta``.
+                    _na = self.noise_aux
+                    _na_inner = getattr(_na, "module", _na)
                     with torch.no_grad():
                         gt_for_aux = gt_target.detach().to(
-                            dtype=next(self.noise_aux.parameters()).dtype,
+                            dtype=next(_na_inner.parameters()).dtype,
                             device=eps.device,
                         )
-                        delta = self.noise_aux.predict_delta(gt_for_aux)
+                        delta = _na_inner.predict_delta(gt_for_aux)
                         noise_aux_direct_residual = delta.to(
                             dtype=eps.dtype, device=eps.device,
                         )
@@ -5737,6 +5741,60 @@ class ActionForcingDMD(SelfForcingModel):
             "lora_x0": _x0,
             "lora_state_preds": lora_state_preds,
         }
+        return loss, log
+
+    # ------------------------------------------------------------------
+    # noise_aux training: forward-noising model for AR residual.
+    # ------------------------------------------------------------------
+    def compute_noise_aux_loss_streaming(
+        self,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Train ``self.noise_aux`` to map pred_image (= chunk) to
+        pred_image + (pred_image - pred_real) = 2*pred_image - pred_real.
+
+        Uses detached stashes set by ``_compute_kl_grad`` during the
+        gen step:
+          * ``self._latest_chunk_for_noise_aux`` = pred_image (input)
+          * ``self._latest_pred_real_image``     = pred_real (used in target)
+
+        Returns ``(loss, log)`` with a grad-bearing loss whose graph
+        lands only on ``noise_aux`` params. Returns ``(None, log)``
+        when the model isn't built or stashes are missing/mismatched
+        (e.g. first iter, or AR reference choice keeps only one of
+        the two stashes).
+        """
+        if not self.noise_aux_enabled or self.noise_aux is None:
+            return None, {}
+        pred_image = self._latest_chunk_for_noise_aux
+        pred_real = self._latest_pred_real_image
+        if pred_image is None or pred_real is None:
+            return None, {"noise_aux_skipped": 1.0}
+        if pred_image.shape != pred_real.shape:
+            return None, {"noise_aux_skipped": 1.0}
+
+        param_dtype = next(self.noise_aux.parameters()).dtype
+        param_device = next(self.noise_aux.parameters()).device
+        x_in = pred_image.detach().to(dtype=param_dtype, device=param_device)
+        target = (2.0 * x_in
+                  - pred_real.detach().to(dtype=param_dtype, device=param_device))
+        pred = self.noise_aux(x_in)
+        loss = F.mse_loss(pred, target)
+
+        with torch.no_grad():
+            delta = pred - x_in  # learned AR-noise direction
+            target_delta = target - x_in  # = x_in - pred_real (training residual)
+            log: Dict[str, Any] = {
+                "noise_aux_loss": loss.detach(),
+                "noise_aux_pred_rms": float(
+                    pred.float().pow(2).mean().sqrt().item()
+                ),
+                "noise_aux_delta_rms": float(
+                    delta.float().pow(2).mean().sqrt().item()
+                ),
+                "noise_aux_target_delta_rms": float(
+                    target_delta.float().pow(2).mean().sqrt().item()
+                ),
+            }
         return loss, log
 
     # ------------------------------------------------------------------
