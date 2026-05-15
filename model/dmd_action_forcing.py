@@ -4843,21 +4843,20 @@ class ActionForcingDMD(SelfForcingModel):
         # against pred_real_EMA). The alt-head's input is detached
         # inside the model, so its gradient never reaches the backbone.
         #
-        # Why always run when built (not gated on ``start_step``):
-        # fake_score is DDP-wrapped with ``find_unused_parameters=False``
-        # — skipping the alt path on some iters would leave alt-head
-        # params with no gradient and hang the all-reduce. We instead
-        # always run, and gate the LOSS MAGNITUDE on ``start_step`` via
-        # a 0/1 multiplier. Alt-head's params see (zero) gradient every
-        # iter pre-start, and real gradient from start_step onwards.
+        # Why no start_step gating on alt training: the alt's target
+        # (ema_real_x0, the GT-supervised teacher's clean estimate) is
+        # already meaningfully different from the main head's target
+        # (pred_image, the student distribution) FROM STEP 0 — they
+        # don't converge to the same thing. So alt trains from iter 1.
+        # The ``fake_alt_apply_start_step`` knob still gates when the
+        # aux teacher pass CONSUMES the alt's output (that's where
+        # divergence quality matters); alt-head TRAINING is always-on
+        # to keep fake_score's DDP gradient bucket consistent
+        # (``find_unused_parameters=False`` would hang otherwise).
         current_step = int(info.get("current_step", 0))
         alt_head_present = (
             self.fake_alt_head_enabled
             and getattr(self.fake_score, "has_alt_head", False)
-        )
-        alt_loss_active = (
-            alt_head_present
-            and current_step >= int(self.fake_alt_head_start_step)
         )
         if alt_head_present:
             fs_out = self.fake_score(
@@ -4999,16 +4998,15 @@ class ActionForcingDMD(SelfForcingModel):
                 flow_pred=flow_pred_alt,
                 gradient_mask=gradient_mask_flat,
             )
-            # Gate via multiplier: pre-start, the loss contributes 0
-            # gradient but the alt-head's params stay in the DDP
-            # gradient bucket (avoids find_unused_parameters hang).
-            alt_loss_coeff = 1.0 if alt_loss_active else 0.0
-            denoising_loss = denoising_loss + alt_loss * alt_loss_coeff
+            # Always-on training: alt_loss enters the backward graph
+            # every iter, so head_alt's params consistently receive a
+            # gradient (no DDP "unused params" hang). The alt's target
+            # is meaningful from step 0 (ema_real_x0 differs from
+            # pred_image regardless of EMA divergence — they have
+            # different supervision objectives).
+            denoising_loss = denoising_loss + alt_loss
             with torch.no_grad():
                 critic_log["fake_alt_head_loss"] = float(alt_loss.detach().item())
-                critic_log["fake_alt_loss_active"] = (
-                    1.0 if alt_loss_active else 0.0
-                )
                 # Diagnostic: how far alt's prediction has drifted from
                 # the main head's prediction. Zero at init (warm-start);
                 # grows as the alt head learns its different target.
