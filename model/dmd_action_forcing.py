@@ -610,7 +610,17 @@ class ActionForcingDMD(SelfForcingModel):
         self.noise_aux: Optional[nn.Module] = None
         # Stash for noise_aux training inputs (set during gen step,
         # consumed by ``compute_noise_aux_loss_streaming``).
+        # v21: target is (ema_real_x0 - fake_x0), so we need both
+        # pred_real_image and pred_fake_image stashed.
         self._latest_chunk_for_noise_aux: Optional[torch.Tensor] = None
+        self._latest_pred_fake_image: Optional[torch.Tensor] = None
+        # Optional gating: start training noise_aux only after this step
+        # (lets ema_real diverge from real_score first when
+        # ``real_score_ema_weight`` < 1; controls when the
+        # ``ema_real_x0 - fake_x0`` direction becomes meaningful).
+        self.noise_aux_start_step = int(
+            getattr(args, "noise_aux_start_step", 0)
+        )
         if self.noise_aux_enabled:
             from model.noise_aux import NoiseAuxLite
             self.noise_aux = NoiseAuxLite(
@@ -2277,11 +2287,16 @@ class ActionForcingDMD(SelfForcingModel):
             and self.aux_teacher_ar_noise_reference == "pred_real"
         ):
             self._latest_pred_real_image = pred_real_image.detach()
-        # noise_aux training needs BOTH pred_image and pred_real to
-        # form the target (2*chunk - pred_real). Stash both when
-        # noise_aux is enabled, regardless of the AR reference choice.
+        # noise_aux training (v21) needs pred_image as input AND
+        # the (ema_real_x0 - fake_x0) direction as target. The
+        # pred_real_image stashed here IS the EMA-swapped real_score
+        # output when ``real_score_ema_weight > 0`` (DMD scoring path
+        # runs under ``_real_score_ema_swap``), so it's already
+        # ``ema_real_x0``. Stash all three: pred_image (input),
+        # ema_real_x0 (target component), fake_x0 (target component).
         if self.noise_aux_enabled and self.noise_aux is not None:
             self._latest_pred_real_image = pred_real_image.detach()
+            self._latest_pred_fake_image = pred_fake_image.detach()
             self._latest_chunk_for_noise_aux = (
                 estimated_clean_image_or_video.detach()
             )
@@ -5748,51 +5763,80 @@ class ActionForcingDMD(SelfForcingModel):
     # ------------------------------------------------------------------
     def compute_noise_aux_loss_streaming(
         self,
+        current_step: int = 0,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
-        """Train ``self.noise_aux`` to map pred_image (= chunk) to
-        pred_image + (pred_image - pred_real) = 2*pred_image - pred_real.
+        """Train ``self.noise_aux`` to predict the AR-noise direction
+        ``(ema_real_x0 - fake_x0)`` from pred_image (= chunk).
 
-        Uses detached stashes set by ``_compute_kl_grad`` during the
-        gen step:
-          * ``self._latest_chunk_for_noise_aux`` = pred_image (input)
-          * ``self._latest_pred_real_image``     = pred_real (used in target)
+        v21 thesis: the DMD direction ``pred_real - pred_image`` already
+        drives DMD; using it as a noise-shaping target double-counts.
+        The genuine AR-noise direction is the discrepancy between two
+        models' predictions on the SAME noised input — fake_score
+        (which has learned a small amount of AR-denoising from MANIQA/
+        GAN) and ema_real_score (a GT-supervised teacher with no
+        AR-awareness). Their x0-space difference isolates the
+        AR-denoising signal we want to amplify in the teacher's
+        training distribution.
 
-        Returns ``(loss, log)`` with a grad-bearing loss whose graph
-        lands only on ``noise_aux`` params. Returns ``(None, log)``
-        when the model isn't built or stashes are missing/mismatched
-        (e.g. first iter, or AR reference choice keeps only one of
-        the two stashes).
+        Training contract:
+            input  = pred_image   (chunk; x0-space)
+            target = ema_real_x0 - fake_x0   (clean-space direction)
+            loss   = MSE(noise_aux.predict_delta(pred_image), target)
+
+        At inference (consumed by ``_compute_aux_teacher_loss_streaming``
+        when ``aux_teacher_ar_noise_reference == "noise_aux"``):
+            ar_residual = noise_aux.predict_delta(gt_target)
+                        ≈ AR-noise direction at the gt position
+
+        ema_real_x0 is the EMA-swapped real_score output produced by
+        the DMD scoring pass (when ``real_score_ema_weight > 0``).
+        fake_x0 is fake_score's prediction from the same pass.
+
+        Gated by ``noise_aux_start_step`` (returns None below this step).
         """
         if not self.noise_aux_enabled or self.noise_aux is None:
             return None, {}
+        if int(current_step) < int(self.noise_aux_start_step):
+            return None, {"noise_aux_skipped_pre_start": 1.0}
         pred_image = self._latest_chunk_for_noise_aux
         pred_real = self._latest_pred_real_image
-        if pred_image is None or pred_real is None:
+        pred_fake = self._latest_pred_fake_image
+        if pred_image is None or pred_real is None or pred_fake is None:
             return None, {"noise_aux_skipped": 1.0}
-        if pred_image.shape != pred_real.shape:
+        if pred_image.shape != pred_real.shape or pred_image.shape != pred_fake.shape:
             return None, {"noise_aux_skipped": 1.0}
 
         param_dtype = next(self.noise_aux.parameters()).dtype
         param_device = next(self.noise_aux.parameters()).device
         x_in = pred_image.detach().to(dtype=param_dtype, device=param_device)
-        target = (2.0 * x_in
-                  - pred_real.detach().to(dtype=param_dtype, device=param_device))
-        pred = self.noise_aux(x_in)
-        loss = F.mse_loss(pred, target)
+        pred_real_d = pred_real.detach().to(dtype=param_dtype, device=param_device)
+        pred_fake_d = pred_fake.detach().to(dtype=param_dtype, device=param_device)
+        # AR-noise direction: ema_real_x0 - fake_x0.
+        # Sign convention per the v21 derivation: forward noising direction
+        # points FROM the AR-denoised (fake) prediction TOWARD the
+        # AR-blind (ema_real) prediction. Adding this to clean gt
+        # produces an AR-noised gt for the teacher to denoise back.
+        target_dir = pred_real_d - pred_fake_d
+        # Model is structured as forward(x) = x + delta(x); we train
+        # delta(x) directly against the target direction.
+        pred_full = self.noise_aux(x_in)
+        delta = pred_full - x_in
+        loss = F.mse_loss(delta, target_dir)
 
         with torch.no_grad():
-            delta = pred - x_in  # learned AR-noise direction
-            target_delta = target - x_in  # = x_in - pred_real (training residual)
             log: Dict[str, Any] = {
                 "noise_aux_loss": loss.detach(),
-                "noise_aux_pred_rms": float(
-                    pred.float().pow(2).mean().sqrt().item()
-                ),
                 "noise_aux_delta_rms": float(
                     delta.float().pow(2).mean().sqrt().item()
                 ),
-                "noise_aux_target_delta_rms": float(
-                    target_delta.float().pow(2).mean().sqrt().item()
+                "noise_aux_target_rms": float(
+                    target_dir.float().pow(2).mean().sqrt().item()
+                ),
+                "noise_aux_pred_real_rms": float(
+                    pred_real_d.float().pow(2).mean().sqrt().item()
+                ),
+                "noise_aux_pred_fake_rms": float(
+                    pred_fake_d.float().pow(2).mean().sqrt().item()
                 ),
             }
         return loss, log

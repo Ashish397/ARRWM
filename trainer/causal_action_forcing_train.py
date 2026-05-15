@@ -6828,7 +6828,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.noise_aux_enabled
             and self.noise_aux_optimizer is not None
         ):
-            na_loss, na_log = self.model.compute_noise_aux_loss_streaming()
+            na_loss, na_log = self.model.compute_noise_aux_loss_streaming(
+                current_step=int(self.step),
+            )
             if na_loss is not None and na_loss.requires_grad:
                 na_loss.backward()
                 na_params_with_grad = [
