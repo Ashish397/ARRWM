@@ -479,6 +479,155 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "aux_teacher_send_student_grad", True)
         )
 
+        # ----- AR-noise-augmented teacher training -----
+        #
+        # The AR-noise sample is computed per-iter inside the aux pass
+        # as the residual of the student's rollout against GT:
+        #     ar_noise = (chunk - gt_target).detach()
+        # This is the empirical AR drift the student introduced
+        # relative to GT. It is added to the CLEAN side of the aux
+        # teacher's training input — before noising — so the teacher
+        # sees a state shaped like a real noised student rollout:
+        #     noise_base_ar = gt_target + α(t) * scale * seed_mask
+        #                                * burn_in * ar_normalised
+        #     noisy_input   = add_noise(noise_base_ar, ε, t)
+        # while the FlowPredLoss target stays ``ε - gt_target`` (pure
+        # GT) — teaching the teacher to denoise the perturbed input
+        # toward the unperturbed GT.
+        #
+        # α(t) = (1 - σ_t) / σ_t  (clamped to ``alpha_max``) converts
+        # the x0-space AR residual into the effective magnitude needed
+        # for it to mimic a noised student rollout at the SAME
+        # timestep on the clean side.
+        #
+        # ``aux_teacher_ar_noise_mode``:
+        #   "off"      : Gaussian-only training (legacy behaviour).
+        #   "combined" : single forward per iter; AR added to GT
+        #                before noising. Default for v13+.
+        #   "two_pass" : DEPRECATED — kept for backward compat /
+        #                ablations; runs both Gaussian-only and
+        #                AR-augmented forwards, summing losses.
+        # ``aux_teacher_ar_noise_scale``: float, default 1.0 — overall
+        # magnitude knob for the AR perturbation on top of α(t).
+        # ``aux_teacher_ar_noise_alpha_max``: clamp on (1-σ)/σ to
+        # prevent blow-up at low σ_t (near-clean timesteps).
+        # ``aux_teacher_ar_noise_seed_mask_chunks``: number of chunks
+        # at the START of the scoring window over which the AR
+        # contribution linearly ramps from 0 to 1 (seed-adjacent
+        # frames have ~zero drift; AR there is noise). 0 = uniform 1.
+        # ``aux_teacher_ar_noise_burn_in_steps``: outer-step linear
+        # ramp from 0 (step 0) to 1 (step N) on the AR contribution.
+        # Lets the teacher accumulate Gaussian-only experience before
+        # AR signal kicks in. 0 = AR active from step 0.
+        # ``aux_teacher_ar_noise_variance_renorm``: if True, the raw
+        # AR residual is divided by an EMA of its RMS so the
+        # perturbation magnitude stays bounded as the student drifts.
+        # ``aux_teacher_ar_noise_variance_ema_decay``: EMA decay for
+        # the RMS tracker.
+        self.aux_teacher_ar_noise_mode = str(
+            getattr(args, "aux_teacher_ar_noise_mode", "off")
+        ).lower()
+        if self.aux_teacher_ar_noise_mode not in (
+            "off", "combined", "two_pass",
+        ):
+            raise ValueError(
+                "aux_teacher_ar_noise_mode must be one of 'off' | "
+                "'combined' | 'two_pass'; got "
+                f"{self.aux_teacher_ar_noise_mode!r}."
+            )
+        self.aux_teacher_ar_noise_scale = float(
+            getattr(args, "aux_teacher_ar_noise_scale", 1.0)
+        )
+        self.aux_teacher_ar_noise_alpha_max = float(
+            getattr(args, "aux_teacher_ar_noise_alpha_max", 10.0)
+        )
+        self.aux_teacher_ar_noise_seed_mask_chunks = int(
+            getattr(args, "aux_teacher_ar_noise_seed_mask_chunks", 0)
+        )
+        self.aux_teacher_ar_noise_burn_in_steps = int(
+            getattr(args, "aux_teacher_ar_noise_burn_in_steps", 0)
+        )
+        self.aux_teacher_ar_noise_variance_renorm = bool(
+            getattr(args, "aux_teacher_ar_noise_variance_renorm", True)
+        )
+        self.aux_teacher_ar_noise_variance_ema_decay = float(
+            getattr(args, "aux_teacher_ar_noise_variance_ema_decay", 0.99)
+        )
+        # ``aux_teacher_ar_noise_reference``: source for the residual
+        # used as the AR-noise sample on the noise side of the aux
+        # teacher's training input. Three options:
+        #   "gt"             — chunk - gt_target (cheapest; both in
+        #                      aux-pass scope; "direct drift toward GT")
+        #   "pred_real"      — chunk - pred_real_image (CFG-extrapolated
+        #                      EMA teacher x0 stashed during the gen-step
+        #                      DMD pass). Closest to v11/v12 behaviour.
+        #                      Falls back to no-AR when stash unavailable.
+        #   "pred_real_lora" — chunk - pred_real_lora_x0, where
+        #                      pred_real_lora_x0 is a no-grad LIVE LoRA
+        #                      teacher forward on add_noise(chunk, eps, t)
+        #                      with the SAME eps and t the main aux
+        #                      forward uses. Freshest (no EMA lag) but
+        #                      costs one extra teacher forward per aux
+        #                      iter.
+        self.aux_teacher_ar_noise_reference = str(
+            getattr(args, "aux_teacher_ar_noise_reference", "gt")
+        ).lower()
+        if self.aux_teacher_ar_noise_reference not in (
+            "gt", "pred_real", "pred_real_lora", "noise_aux",
+        ):
+            raise ValueError(
+                "aux_teacher_ar_noise_reference must be one of 'gt' | "
+                "'pred_real' | 'pred_real_lora' | 'noise_aux'; got "
+                f"{self.aux_teacher_ar_noise_reference!r}."
+            )
+        # ----- noise_aux: forward-noising model for AR residual -----
+        # When ``aux_teacher_ar_noise_reference == "noise_aux"``, we
+        # use a separately-trained small ConvNet to predict the AR
+        # noise direction from a clean latent (avoids the time-warp
+        # blur of the pairwise (chunk - reference) residual at
+        # rollout positions where chunk and reference share a
+        # temporal shift relative to GT).
+        # Training contract:
+        #   input  = pred_image (= chunk)
+        #   target = 2 * pred_image - pred_real  (= pred_image + AR_noise)
+        # At inference (aux teacher pass), with no_grad:
+        #   ar_residual = noise_aux(gt_target) - gt_target
+        # ``noise_aux_warmup_steps``: before this step, noise_aux's
+        # output is meaningless (untrained); the aux pass falls back
+        # to no-AR. After warmup, noise_aux output is consumed.
+        self.noise_aux_enabled = bool(
+            getattr(args, "noise_aux_enabled", False)
+        )
+        self.noise_aux_hidden_channels = int(
+            getattr(args, "noise_aux_hidden_channels", 192)
+        )
+        self.noise_aux_num_blocks = int(
+            getattr(args, "noise_aux_num_blocks", 4)
+        )
+        self.noise_aux_warmup_steps = int(
+            getattr(args, "noise_aux_warmup_steps", 50)
+        )
+        self.noise_aux: Optional[nn.Module] = None
+        # Stash for noise_aux training inputs (set during gen step,
+        # consumed by ``compute_noise_aux_loss_streaming``).
+        self._latest_chunk_for_noise_aux: Optional[torch.Tensor] = None
+        if self.noise_aux_enabled:
+            from model.noise_aux import NoiseAuxLite
+            self.noise_aux = NoiseAuxLite(
+                latent_channels=16,
+                hidden_channels=self.noise_aux_hidden_channels,
+                num_blocks=self.noise_aux_num_blocks,
+            )
+        # Running RMS tracker for the AR residual; initialised lazily
+        # on the first iter that produces a non-trivial residual.
+        self._ar_residual_rms_ema: Optional[float] = None
+        # Stash for the CFG-extrapolated EMA teacher x0 prediction
+        # produced by the gen-step DMD scoring pass — consumed by the
+        # aux pass when ``aux_teacher_ar_noise_reference == "pred_real"``.
+        # Detached, overwritten each gen-step DMD pass; None until
+        # first set. Falls back to no-AR for that iter when None.
+        self._latest_pred_real_image: Optional[torch.Tensor] = None
+
         # Hard start-step gate for the aux teacher pass. Below this
         # step the aux pass does not fire at all (no real_score
         # forward, no LoRA gradient accumulated). Lets the student
@@ -767,6 +916,53 @@ class ActionForcingDMD(SelfForcingModel):
         self.ts_schedule = bool(getattr(args, "ts_schedule", True))
         self.ts_schedule_max = bool(getattr(args, "ts_schedule_max", False))
         self.min_score_timestep = int(getattr(args, "min_score_timestep", 0))
+        # Upper bound on the DMD timestep sampler. Default = full schedule
+        # (num_train_timestep). Cap to <num_train_timestep to suppress the
+        # very-high-noise regime where x0 estimates from both scorers are
+        # noisy + biased toward the data mean (gray collapse risk).
+        # ``ts_schedule_max`` still takes precedence (pipeline-driven cap
+        # via ``denoised_timestep_from``).
+        self.max_score_timestep = int(
+            getattr(args, "max_score_timestep", self.num_train_timestep)
+        )
+        if not (
+            self.min_score_timestep < self.max_score_timestep
+            <= self.num_train_timestep
+        ):
+            raise ValueError(
+                f"max_score_timestep ({self.max_score_timestep}) must be "
+                f"in ({self.min_score_timestep}, {self.num_train_timestep}]."
+            )
+        # ``dmd_normalization_enabled``: when True (default), the DMD
+        # gradient is divided per-sample by ``|x0 - pred_real|.mean()``
+        # to give CausVid-style scale invariance. Pathology: as the
+        # student approaches the teacher (pred_real -> x0), the
+        # denominator shrinks and the gradient is artificially amplified
+        # at the cusp of convergence. Setting this False uses the raw
+        # ``pred_fake - pred_real`` gradient, so the DMD signal decays
+        # naturally as the teacher agrees with the student — preferred
+        # in v11+ where we want no power when teacher matches student.
+        self.dmd_normalization_enabled = bool(
+            getattr(args, "dmd_normalization_enabled", True)
+        )
+        # ``max_gradient_chunks``: cap on how many of the leading
+        # chunks (each ``num_frame_per_block`` frames) carry gradient
+        # in DMD-score and aux-teacher losses. 0 = no cap (CF default,
+        # only the trailing last-chunk boundary is masked). N>0 means
+        # only chunks [0, N) receive gradient — every chunk at index
+        # N or later is force-masked. Use this to restrict learning
+        # to the seed-adjacent, drift-free rolls and discard the
+        # noise-dominated tail. Applies uniformly to all losses that
+        # route through ``_dmd_score_grad_mask`` (gen DMD score, aux
+        # teacher, critic update, streaming critic).
+        self.max_gradient_chunks = int(
+            getattr(args, "max_gradient_chunks", 0)
+        )
+        if self.max_gradient_chunks < 0:
+            raise ValueError(
+                f"max_gradient_chunks must be >= 0; got "
+                f"{self.max_gradient_chunks}."
+            )
         # ``cfg_uncond_keep_actions``: when True, ``build_action_conditional``
         # zeros only ``prompt_embeds`` in the unconditional dict and
         # keeps the action streams (``_action_modulation`` /
@@ -1893,7 +2089,49 @@ class ActionForcingDMD(SelfForcingModel):
             )
         mask = torch.ones(shape, dtype=torch.bool, device=device)
         mask[:, -block:] = False
+        # ``max_gradient_chunks`` cap: limit gradient to the leading
+        # N chunks of the scoring window. Frames at chunk index >= N
+        # are force-masked. This is composed AFTER the trailing
+        # last-chunk boundary mask (which is always applied for
+        # v14-LoRA RoPE-boundary reasons), so the effective mask is
+        # the INTERSECTION of "first N chunks" and "not last chunk".
+        if self.max_gradient_chunks > 0:
+            cap_frames = int(self.max_gradient_chunks) * block
+            if cap_frames < shape[1]:
+                mask[:, cap_frames:] = False
         return mask
+
+    def _sigma_at_timestep(
+        self, timestep: torch.Tensor, like: torch.Tensor
+    ) -> torch.Tensor:
+        """Look up the scheduler's σ_t for each timestep entry.
+
+        ``timestep`` : long tensor, any shape (typically [B, F]).
+        ``like``     : reference tensor providing target device/dtype
+                       and the desired broadcast shape (e.g. chunk
+                       [B, F, C, H, W]). The returned σ tensor is
+                       broadcast-compatible with ``like`` — same B/F
+                       and singleton trailing dims.
+
+        Mirrors the lookup performed by ``add_noise`` and
+        ``_convert_flow_pred_to_x0`` so the σ used for the AR-noise
+        flow-space scaling is byte-identical to the σ used inside
+        the noising operation.
+        """
+        sched_t = self.scheduler.timesteps.to(timestep.device)
+        sched_s = self.scheduler.sigmas.to(
+            device=like.device, dtype=like.dtype,
+        )
+        flat_t = timestep.reshape(-1)
+        idx = torch.argmin(
+            (sched_t.unsqueeze(0) - flat_t.unsqueeze(1).float()).abs(),
+            dim=1,
+        )
+        sigma = sched_s[idx].reshape(timestep.shape)
+        # Right-pad singleton dims to broadcast against ``like``.
+        while sigma.dim() < like.dim():
+            sigma = sigma.unsqueeze(-1)
+        return sigma
 
     # ------------------------------------------------------------------
     # CF-parity DMD core
@@ -2026,10 +2264,37 @@ class ActionForcingDMD(SelfForcingModel):
         else:
             pred_real_image = pred_real_image_cond
 
+        # Stash pred_real_image for the aux pass when
+        # ``aux_teacher_ar_noise_reference == "pred_real"`` (v11/v12
+        # style: chunk - pred_real residual). pred_real_image here is
+        # the CFG-extrapolated EMA-swapped teacher x0 prediction (or
+        # just cond when real_guidance_scale == 0). Detached so no
+        # autograd connection to the aux pass; overwritten each
+        # gen-step DMD pass. Other references ("gt", "pred_real_lora")
+        # don't need this stash.
+        if (
+            self.aux_teacher_ar_noise_mode != "off"
+            and self.aux_teacher_ar_noise_reference == "pred_real"
+        ):
+            self._latest_pred_real_image = pred_real_image.detach()
+        # noise_aux training needs BOTH pred_image and pred_real to
+        # form the target (2*chunk - pred_real). Stash both when
+        # noise_aux is enabled, regardless of the AR reference choice.
+        if self.noise_aux_enabled and self.noise_aux is not None:
+            self._latest_pred_real_image = pred_real_image.detach()
+            self._latest_chunk_for_noise_aux = (
+                estimated_clean_image_or_video.detach()
+            )
+
         # Step 3: DMD grad = (fake - real). CF normalizes by
-        # |x0 - real|.mean() (eq. 8). Match exactly.
+        # |x0 - real|.mean() (eq. 8). Gated by ``normalization`` AND
+        # ``self.dmd_normalization_enabled`` — the caller flag is the
+        # legacy local override (defaults True), the self-flag is the
+        # config knob that lets a run disable the normaliser globally
+        # (raw ``pred_fake - pred_real`` so the gradient decays
+        # naturally as the teacher converges with the student).
         grad = pred_fake_image - pred_real_image
-        if normalization:
+        if normalization and self.dmd_normalization_enabled:
             p_real = estimated_clean_image_or_video - pred_real_image
             normalizer = torch.abs(p_real).mean(
                 dim=[1, 2, 3, 4], keepdim=True,
@@ -2144,11 +2409,12 @@ class ActionForcingDMD(SelfForcingModel):
             min_timestep = denoised_timestep_to
         else:
             min_timestep = self.min_score_timestep
-        # Upper bound: ts_schedule from-pipeline > config default.
+        # Upper bound: ts_schedule from-pipeline > config default
+        # (``max_score_timestep``, which defaults to num_train_timestep).
         if self.ts_schedule_max and denoised_timestep_from is not None:
             max_timestep = denoised_timestep_from
         else:
-            max_timestep = self.num_train_timestep
+            max_timestep = self.max_score_timestep
         # Same-step-across-frames: one timestep per sample, broadcast.
         timestep = self._get_timestep(
             min_timestep,
@@ -4913,10 +5179,14 @@ class ActionForcingDMD(SelfForcingModel):
         #               the piecewise-linear schedule from
         #               ``_resolved_real_teacher_input_mix_gt_p``
         #               (when ``aux_teacher_p_schedule_enabled``).
+        # ``current_step`` is consumed by both the aux_p fallback and
+        # the AR-noise burn-in factor downstream, so hoist it above
+        # the conditional to keep both code paths well-defined when
+        # the caller passes a pre-resolved ``aux_p``.
+        current_step = int(info.get("current_step", 0))
         if aux_p is not None:
             p_resolved = float(aux_p)
         else:
-            current_step = int(info.get("current_step", 0))
             p_resolved = self._resolved_real_teacher_input_mix_gt_p(current_step)
         if self.real_teacher_input_source == "blend":
             p_blend = float(p_resolved)
@@ -5005,11 +5275,11 @@ class ActionForcingDMD(SelfForcingModel):
                 "streaming."
                 % self.real_teacher_input_source
             )
-        noisy_input = self.scheduler.add_noise(
-            noise_base.flatten(0, 1),
-            eps.flatten(0, 1),
-            t.flatten(0, 1),
-        ).unflatten(0, chunk.shape[:2])
+        # ``noisy_input`` is built inside the per-pass loop below so
+        # the noise vector used for ``add_noise`` matches the noise
+        # vector used as the FlowPredLoss target ``noise`` arg —
+        # required when ``aux_teacher_ar_noise_mode`` augments the
+        # Gaussian noise with the AR-noise estimate.
 
         # Override clean_x with a stable reference: GT last-seed-chunk
         # concatenated with the first 6 student chunks' post-Step-3.3.5
@@ -5109,17 +5379,258 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t=_aug,
             )
 
-        _real_score_out = _ckpt(
-            _aux_real_score_fn, noisy_input, use_reentrant=False,
+        # ----- AR-noise-augmented teacher training (v17+) -----
+        # Restored noise-side formulation from v11/v12 (the v13-v16
+        # clean-side variant produced fast-forward/mean-collapse).
+        # AR residual is added to the noise SAMPLE (the eps side of
+        # add_noise), and the FlowPredLoss target uses the SAME
+        # combined noise — preserving the rectified-flow contract:
+        #     noise_for_pass = eps + scale * burn * seed_mask * ar_normalised
+        #     noisy_input    = add_noise(gt_target, noise_for_pass, t)
+        #     target         = noise_for_pass - gt_target   (FlowPredLoss)
+        #
+        # Reference for ar_residual is configurable:
+        #   "gt"             — chunk.detach() - gt_target.detach()
+        #   "pred_real"      — chunk.detach() - self._latest_pred_real_image
+        #                      (stashed by _compute_kl_grad). Falls back
+        #                      to no-AR when stash is None or mismatched.
+        #   "pred_real_lora" — extra no-grad LIVE LoRA teacher forward
+        #                      on add_noise(chunk, eps, t) using SAME
+        #                      eps and t as the main aux forward; one
+        #                      extra teacher forward per aux iter.
+        #
+        # Modes:
+        #   "off"      : noise_for_pass = eps (Gaussian-only legacy).
+        #   "combined" : noise_for_pass = eps + ar_perturb (single pass).
+        #   "two_pass" : combined pass + Gaussian pass; losses summed.
+        ar_active_iter = (
+            self.aux_teacher_ar_noise_mode != "off"
+            and self.aux_teacher_ar_noise_scale > 0.0
         )
-        if isinstance(_real_score_out, tuple) and len(_real_score_out) >= 4:
-            flow_pred, _x0, lora_state_preds, _probe_hidden = (
-                _real_score_out[0], _real_score_out[1],
-                _real_score_out[2], _real_score_out[3],
+        ar_residual: Optional[torch.Tensor] = None
+        ar_perturbation: Optional[torch.Tensor] = None
+        ar_residual_rms_value = 0.0
+        ar_effective_amp_value = 0.0
+        burn_in_factor_value = 1.0
+        ar_fallback_value = 0.0
+        ref_code_map = {
+            "gt": 0, "pred_real": 1, "pred_real_lora": 2, "noise_aux": 3,
+        }
+        ar_reference_used_value = float(
+            ref_code_map.get(self.aux_teacher_ar_noise_reference, -1)
+        )
+        noise_aux_warmup_active_value = 0.0
+        if ar_active_iter:
+            ref_choice = self.aux_teacher_ar_noise_reference
+            reference_x0: Optional[torch.Tensor] = None
+            # ``noise_aux`` is special: bypasses the (chunk - reference)
+            # pairwise residual and uses noise_aux(gt_target) - gt_target
+            # as the AR direction directly. This avoids the time-warp
+            # blur of the pairwise residual (chunk and reference share
+            # a temporal shift vs GT). Reverts to no-AR until the
+            # noise_aux model has been trained for ``noise_aux_warmup_steps``.
+            noise_aux_direct_residual: Optional[torch.Tensor] = None
+            if ref_choice == "gt":
+                reference_x0 = gt_target.detach().to(
+                    dtype=eps.dtype, device=eps.device,
+                )
+            elif ref_choice == "pred_real":
+                prev = self._latest_pred_real_image
+                if prev is not None and prev.shape == chunk.shape:
+                    reference_x0 = prev.to(dtype=eps.dtype, device=eps.device)
+                else:
+                    # First-iter / shape-mismatch fallback: no AR this iter.
+                    ar_fallback_value = 1.0
+            elif ref_choice == "pred_real_lora":
+                # No-grad probe forward of LIVE LoRA on add_noise(chunk, eps, t).
+                # Same eps and t as the main aux pass so the probe sees
+                # the noise level the teacher will train on. No gradient
+                # checkpointing — backward is not run on this forward.
+                with torch.no_grad():
+                    probe_input = self.scheduler.add_noise(
+                        chunk.detach().flatten(0, 1),
+                        eps.flatten(0, 1),
+                        t.flatten(0, 1),
+                    ).unflatten(0, chunk.shape[:2])
+                    _probe_out = _aux_real_score_fn(probe_input)
+                    if (
+                        isinstance(_probe_out, tuple)
+                        and len(_probe_out) >= 2
+                    ):
+                        _, probe_x0 = _probe_out[0], _probe_out[1]
+                    else:
+                        probe_x0 = _probe_out
+                    reference_x0 = probe_x0.detach().to(
+                        dtype=eps.dtype, device=eps.device,
+                    )
+            elif ref_choice == "noise_aux":
+                if (
+                    self.noise_aux is None
+                    or not self.noise_aux_enabled
+                ):
+                    ar_fallback_value = 1.0  # noise_aux not built
+                elif current_step < int(self.noise_aux_warmup_steps):
+                    # Untrained: fall back to no-AR.
+                    ar_fallback_value = 1.0
+                    noise_aux_warmup_active_value = 1.0
+                else:
+                    # ar_residual = delta(gt_target) directly. We never
+                    # backprop through noise_aux from the aux pass —
+                    # the noise_aux model is trained by its own
+                    # optimizer in ``compute_noise_aux_loss_streaming``.
+                    with torch.no_grad():
+                        gt_for_aux = gt_target.detach().to(
+                            dtype=next(self.noise_aux.parameters()).dtype,
+                            device=eps.device,
+                        )
+                        delta = self.noise_aux.predict_delta(gt_for_aux)
+                        noise_aux_direct_residual = delta.to(
+                            dtype=eps.dtype, device=eps.device,
+                        )
+            else:
+                ar_fallback_value = 1.0  # defensive (validator should have caught)
+
+            if noise_aux_direct_residual is not None:
+                ar_residual = noise_aux_direct_residual
+            elif reference_x0 is not None:
+                ar_residual = (
+                    chunk.detach().to(dtype=eps.dtype, device=eps.device)
+                    - reference_x0
+                )
+
+            if ar_residual is not None:
+                with torch.no_grad():
+                    ar_residual_rms_value = float(
+                        ar_residual.float().pow(2).mean().sqrt().item()
+                    )
+
+                # Variance renorm: ar_residual / EMA(rms(ar_residual)).
+                # Keeps the magnitude bounded as drift grows during
+                # training; ar_normalised has ~unit RMS by construction.
+                if self.aux_teacher_ar_noise_variance_renorm:
+                    decay = float(self.aux_teacher_ar_noise_variance_ema_decay)
+                    if self._ar_residual_rms_ema is None:
+                        self._ar_residual_rms_ema = ar_residual_rms_value
+                    else:
+                        self._ar_residual_rms_ema = (
+                            decay * float(self._ar_residual_rms_ema)
+                            + (1.0 - decay) * ar_residual_rms_value
+                        )
+                    _denom = max(float(self._ar_residual_rms_ema), 1e-6)
+                    ar_normalised = ar_residual / _denom
+                else:
+                    ar_normalised = ar_residual
+
+                # Per-frame seed mask: linear ramp from 0 (frame 0) to 1
+                # (frame seed_mask_chunks * block). 0 → uniform 1.
+                seed_chunks = int(self.aux_teacher_ar_noise_seed_mask_chunks)
+                if seed_chunks > 0:
+                    F = chunk.shape[1]
+                    block = int(self.num_frame_per_block)
+                    ramp_frames = float(seed_chunks * block)
+                    frame_idx = torch.arange(
+                        F, device=chunk.device, dtype=ar_residual.dtype,
+                    )
+                    seed_mask = (
+                        frame_idx / max(1.0, ramp_frames)
+                    ).clamp(0.0, 1.0)
+                    seed_mask = seed_mask.view(1, F, 1, 1, 1)
+                else:
+                    seed_mask = 1.0
+
+                # Burn-in ramp on the outer-step axis.
+                burn = int(self.aux_teacher_ar_noise_burn_in_steps)
+                if burn > 0:
+                    burn_in_factor_value = min(
+                        1.0, float(current_step) / float(burn)
+                    )
+                else:
+                    burn_in_factor_value = 1.0
+
+                # Noise-side perturbation: scale * burn * seed_mask * ar_normalised.
+                # NOTE: no flow conversion α(t) — that was a v13-v16
+                # artefact of the clean-side formulation; the noise-side
+                # math doesn't need it.
+                ar_perturbation = (
+                    float(self.aux_teacher_ar_noise_scale)
+                    * burn_in_factor_value
+                    * seed_mask
+                    * ar_normalised
+                )
+                with torch.no_grad():
+                    ar_effective_amp_value = float(
+                        ar_perturbation.float().pow(2).mean().sqrt().item()
+                    )
+
+        # Plan passes (NOISE side). Modes:
+        #   off       — [eps]   (Gaussian-only legacy)
+        #   combined  — [eps + ar_perturb]   (single pass; v17 default)
+        #   two_pass  — [eps + ar_perturb, eps]   (AR-augmented + Gaussian)
+        if not ar_active_iter or ar_perturbation is None:
+            noise_passes: List[Tuple[str, torch.Tensor]] = [("gaussian", eps)]
+        elif self.aux_teacher_ar_noise_mode == "combined":
+            noise_passes = [("combined", eps + ar_perturbation)]
+        elif self.aux_teacher_ar_noise_mode == "two_pass":
+            noise_passes = [
+                ("combined", eps + ar_perturbation),
+                ("gaussian", eps),
+            ]
+        else:  # defensive
+            noise_passes = [("gaussian", eps)]
+
+        # ----- Per-pass forward + loss -----
+        # ``noise_passes`` carries the NOISE-side input to ``add_noise``
+        # for each pass — eps for the Gaussian-only forward, or
+        # eps + ar_perturbation for the AR-augmented forward. The clean
+        # side is always ``noise_base`` (= gt_target when input_source=
+        # gt). The FlowPredLoss target uses the SAME noise_for_pass via
+        # the ``noise`` arg so target = noise_for_pass - gt_target.
+        gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
+        loss: Optional[torch.Tensor] = None
+        flow_pred = None
+        _x0 = None
+        lora_state_preds = None
+        ar_active_value = 0.0
+        combined_noise_rms_value = 0.0
+        for _pass_name, noise_for_pass in noise_passes:
+            noisy_input = self.scheduler.add_noise(
+                noise_base.flatten(0, 1),
+                noise_for_pass.flatten(0, 1),
+                t.flatten(0, 1),
+            ).unflatten(0, chunk.shape[:2])
+
+            _real_score_out = _ckpt(
+                _aux_real_score_fn, noisy_input, use_reentrant=False,
             )
-        else:
-            flow_pred, _x0 = _real_score_out
-            lora_state_preds = None
+            if isinstance(_real_score_out, tuple) and len(_real_score_out) >= 4:
+                flow_pred_p, _x0_p, lora_state_preds_p, _probe_hidden_p = (
+                    _real_score_out[0], _real_score_out[1],
+                    _real_score_out[2], _real_score_out[3],
+                )
+            else:
+                flow_pred_p, _x0_p = _real_score_out
+                lora_state_preds_p = None
+
+            pass_loss = self.denoising_loss_func(
+                x=gt_target.flatten(0, 1),
+                x_pred=None,
+                noise=noise_for_pass.flatten(0, 1),
+                noise_pred=None,
+                alphas_cumprod=self.scheduler.alphas_cumprod,
+                timestep=t.flatten(0, 1),
+                flow_pred=flow_pred_p.flatten(0, 1),
+                gradient_mask=gradient_mask_flat,
+            )
+            loss = pass_loss if loss is None else loss + pass_loss
+            flow_pred = flow_pred_p
+            _x0 = _x0_p
+            lora_state_preds = lora_state_preds_p
+            if _pass_name == "combined":
+                ar_active_value = 1.0
+                with torch.no_grad():
+                    combined_noise_rms_value = float(
+                        noise_for_pass.float().pow(2).mean().sqrt().item()
+                    )
 
         # Eval-time stash: surface the LoRA aux teacher's denoised x0
         # estimate for the sample-video logger. The DMD pass already
@@ -5127,45 +5638,27 @@ class ActionForcingDMD(SelfForcingModel):
         # x0); this adds ``pred_real_lora`` (= the LoRA aux teacher's
         # raw x0, no CFG since the aux pass runs cond-only). The
         # trainer's video logger iteration list includes both keys so
-        # they decode side-by-side per sample step.
+        # they decode side-by-side per sample step. Uses the LAST
+        # pass's outputs (in two_pass mode this is the AR-augmented
+        # pass, which is the more diagnostic of the two).
         stash = getattr(self, "_dmd_eval_stash", None)
         if isinstance(stash, dict):
             stash["pred_real_lora"] = _x0.detach()
             stash["aux_teacher_timestep"] = int(t.flatten()[0].item())
-            # For "blend" mode the binary use_gt is meaningless (chunk
-            # is always part of the input); set to the resolved p for a
-            # sensible cross-mode wandb plot.
             stash["aux_teacher_input_was_gt"] = (
                 float(p_resolved)
                 if self.real_teacher_input_source == "blend"
                 else (1.0 if use_gt else 0.0)
             )
 
-        gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
-        loss = self.denoising_loss_func(
-            x=gt_target.flatten(0, 1),
-            x_pred=None,
-            noise=eps.flatten(0, 1),
-            noise_pred=None,
-            alphas_cumprod=self.scheduler.alphas_cumprod,
-            timestep=t.flatten(0, 1),
-            flow_pred=flow_pred.flatten(0, 1),
-            gradient_mask=gradient_mask_flat,
-        )
-
         # Diagnostics: MAE form of FlowPredLoss target, gradient_mask-
-        # weighted. Comparable across timesteps in MAE units (loss is
-        # MSE so it's quadratic-biased) and the natural pair to
-        # ``real_score_mae_vs_gt`` on the DMD-side. Also a per-rung
-        # bin so the LoRA's training error and the gen-side DMD push
-        # can be cross-plotted at high (t > 500) vs low (t <= 500)
-        # noise individually — diverging high-rung error while low
-        # stays flat is the leading collapse indicator. NOTE:
-        # ``gradient_mask_flat`` is ALREADY [B*F, C, H, W] (full 5D
-        # mask flattened on the leading two dims), not [B*F]; broadcast
-        # against the per-pixel err is direct.
+        # weighted. The target matches the noise used on the LAST pass
+        # (the combined pass in two_pass mode, the only pass otherwise),
+        # so target = noise_for_pass - gt_target. ``noise_for_pass`` is
+        # the loop variable from the for loop just above; it carries
+        # the value the teacher's flow_pred is supposed to match.
         with torch.no_grad():
-            target_dbg = (eps - gt_target).flatten(0, 1)
+            target_dbg = (noise_for_pass - gt_target).flatten(0, 1)
             err_dbg = (
                 flow_pred.flatten(0, 1).float() - target_dbg.float()
             ).abs()
@@ -5195,6 +5688,41 @@ class ActionForcingDMD(SelfForcingModel):
             "aux_teacher_p_resolved": float(p_resolved),
             "aux_teacher_send_student_grad": (
                 1.0 if self.aux_teacher_send_student_grad else 0.0
+            ),
+            # AR-noise augmentation diagnostics (v17+, noise-side).
+            # ``ar_active``: 1 if AR-augmented pass fired this iter, else 0.
+            # ``ar_n_passes``: 1 (off/combined) or 2 (two_pass).
+            # ``ar_reference_used``: code for the configured reference
+            #                (0=gt, 1=pred_real, 2=pred_real_lora).
+            # ``ar_fallback``: 1.0 if the configured reference was
+            #                unavailable this iter (e.g. pred_real stash
+            #                empty at iter 0) and we fell back to no-AR.
+            # ``ar_residual_rms``: RMS of the raw (chunk - reference)
+            #                residual this iter.
+            # ``ar_residual_rms_ema``: variance-renorm EMA tracker.
+            # ``ar_burn_in_factor``: outer-step burn-in ramp scalar.
+            # ``ar_effective_amp``: RMS of the perturbation actually
+            #                added to eps on the noise side
+            #                (scale × burn × seed_mask × ar_norm).
+            # ``ar_combined_noise_rms``: RMS of the combined noise
+            #                noise_for_pass = eps + ar_perturb. Tells
+            #                you whether AR has swamped eps; values >3
+            #                indicate AR-dominated training.
+            "aux_teacher_ar_active": ar_active_value,
+            "aux_teacher_ar_n_passes": float(len(noise_passes)),
+            "aux_teacher_ar_reference_used": ar_reference_used_value,
+            "aux_teacher_ar_fallback": ar_fallback_value,
+            "aux_teacher_ar_residual_rms": ar_residual_rms_value,
+            "aux_teacher_ar_residual_rms_ema": (
+                float(self._ar_residual_rms_ema)
+                if self._ar_residual_rms_ema is not None
+                else 0.0
+            ),
+            "aux_teacher_ar_burn_in_factor": burn_in_factor_value,
+            "aux_teacher_ar_effective_amp": ar_effective_amp_value,
+            "aux_teacher_ar_combined_noise_rms": combined_noise_rms_value,
+            "aux_teacher_noise_aux_warmup_active": (
+                noise_aux_warmup_active_value
             ),
         }
         # Expose the graph-bearing LoRA-side outputs so the trainer can

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v10
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v13
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,9 +11,51 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v10: identical to v9 except
-# gan_loss_weight = 1.0 (was 0.2 in v9; 0.1 in v7) — GAN 5x stronger
-# than v9, 10x stronger than v7.
+# Phase-3 online_teacher_NR_G_v13: AR-NOISE-AWARE TEACHER + FIRST-2-
+# CHUNKS GRADIENT WINDOW + CFG OFF.
+#
+# v13 vs v10 — three structural changes
+# -------------------------------------
+#  (A) CFG off: real_guidance_scale 1.0 -> 0.0. The teacher's
+#      conditional forward is now used directly with no CFG
+#      extrapolation. Cheaper, simpler, removes the (cond - uncond)
+#      contribution from every teacher output.
+#
+#  (B) gan_loss_weight 0.5 -> 0.2 (lighter GAN). With AR-noise
+#      anchoring the teacher into the student's actual distribution,
+#      we expect to need less raw GAN pressure to stay on-manifold.
+#
+#  (C) AR-noise-aware aux teacher training. The teacher is no longer
+#      trained only on add_noise(GT, ε, t); per iter the aux pass
+#      now also sees a clean-side input perturbed by the empirical
+#      AR-drift of the student rollout:
+#         ar_residual = (chunk - gt_target).detach()        [x0-space]
+#         α(t)        = clamp((1 - σ_t) / σ_t, max=α_max)    [flow conv]
+#         ar_norm     = ar_residual / EMA(rms(ar_residual))  [renorm]
+#         seed_mask   = linear ramp 0->1 over first K chunks  [drift-aware]
+#         burn_in     = min(1, step / N)                      [warmup]
+#         noise_base_ar = gt + scale·burn_in·α(t)·seed_mask·ar_norm
+#         noisy_input   = add_noise(noise_base_ar, ε, t)
+#      Target stays ``ε - gt_target`` (pure GT), so the teacher
+#      learns to denoise drift-perturbed inputs back toward
+#      unperturbed GT. Mode=combined (single forward), scale=1.0,
+#      α_max=10, seed_mask_chunks=1, burn_in_steps=20,
+#      variance_renorm=true (EMA decay 0.99).
+#
+#      Rationale for using (chunk - GT) instead of (chunk - pred_real)
+#      from v11/v12: GT is the actual reference at the seed-adjacent
+#      chunks; the residual is guaranteed to be AR drift there. As
+#      the rollout extends, drift compounds and GT stops being a
+#      faithful predictor of the student — but (D) below restricts
+#      the gradient window to the seed-adjacent rolls anyway, so the
+#      late-rollout-drift concern doesn't bite.
+#
+#  (D) max_gradient_chunks=2. Only the first two rolled chunks
+#      (frames 0..5) get gradient for DMD score, aux teacher, and
+#      critic losses. Later chunks are noise-dominated and discarded.
+#      Composes with the existing v14-LoRA last-chunk boundary mask
+#      (the intersection of "first 2 chunks" and "not last chunk").
+#      Wired via the new ``_dmd_score_grad_mask`` cap.
 #
 # v9 POST-MORTEM — DOUBLED GAN PREVENTED COLLAPSE, RAN 2H FULL TERM
 # ----------------------------------------------------------------
@@ -163,7 +205,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v10
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v13
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -212,17 +254,22 @@ echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-3 online-teacher NR_G v10 (gan_loss_weight=1.0) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v13 (AR-noise teacher + first-2-chunks) on $(date)"
 echo "  * 21-frame iter-1-only student rollout, 250-step max."
 echo "  * max_rolls_per_ride=1 — streaming resets every step (no iter k>=2)."
 echo "  * Teacher: fresh rank-32 LoRA on v14-merged base, EMA(0.99) target."
-echo "  * v9 POST-MORTEM: v9 (gan_loss_weight=0.2) ran the full 2h walltime"
-echo "    to step ~210 without hard collapse. dmd_grad held 0.85-0.99 throughout"
-echo "    (vs v7's drop to 0.66 at step 151). v10 pushes gan_loss_weight 0.2 -> 1.0"
-echo "    (DMD:GAN plateau ratio flips from 2.5:1 to 1:2, GAN now dominates DMD)."
-echo "  * v10 ALSO adds constant-weight latent recon: gt_latent_mse=0.1,"
-echo "    gt_latent_mae=0.05 — direct anti-drift anchor between pred_image and GT,"
-echo "    fires every step (no ramp). Independent of DMD/GAN/MANIQA pipelines."
+echo "  * v13 NEW (vs v10):"
+echo "      - CFG off (real_guidance_scale=0)."
+echo "      - gan_loss_weight 0.5 -> 0.2 (lighter GAN; AR-noise carries weight)."
+echo "      - aux_teacher_ar_noise_mode=combined; AR noise = (chunk-GT) fresh"
+echo "        each iter, added to GT before noising (CLEAN-side perturbation)."
+echo "        Flow-space scaling α(t)=clamp((1-σ)/σ, max=10), seed-mask ramp"
+echo "        over first 1 chunk, 20-step burn-in, EMA-renormalised RMS."
+echo "      - max_gradient_chunks=2: only first 2 rolled chunks (frames 0..5)"
+echo "        carry gradient for DMD score AND aux teacher. Later chunks are"
+echo "        noise-dominated and discarded."
+echo "  * gt_latent_mse=0.1, gt_latent_mae=0.05 — direct anti-drift latent"
+echo "    L1+L2 against GT, every step, no ramp (carried from v10)."
 echo "  * v8 POST-MORTEM: aux_teacher_send_student_grad=true caused deeper"
 echo "    collapse (gen_loss -0.36 at step 101 vs v7's +0.15) — kept false here."
 echo "  * Stage 1 [0, 20): MANIQA ramps in (full at step 15). LoRA"
@@ -267,7 +314,7 @@ srun torchrun \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=1 \
-    dfake_gen_update_ratio=5 \
+    dfake_gen_update_ratio=2 \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
     sample_fps=20 \
@@ -276,7 +323,7 @@ srun torchrun \
     dmd_context=self \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \
-    real_guidance_scale=1.0 \
+    real_guidance_scale=0.0 \
     real_teacher_lr=5e-5 \
     real_teacher_warmup_steps=0 \
     real_teacher_input_source=gt \
@@ -294,7 +341,7 @@ srun torchrun \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     real_score_ema_weight=0.99 \
-    gan_loss_weight=0.5 \
+    gan_loss_weight=0.2 \
     gan_lr=5e-5 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
@@ -323,6 +370,14 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.1 \
     gt_latent_mae_loss_weight=0.05 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v10_j${SLURM_JOB_ID}
+    aux_teacher_ar_noise_mode=combined \
+    aux_teacher_ar_noise_scale=1.0 \
+    aux_teacher_ar_noise_alpha_max=10.0 \
+    aux_teacher_ar_noise_seed_mask_chunks=1 \
+    aux_teacher_ar_noise_burn_in_steps=20 \
+    aux_teacher_ar_noise_variance_renorm=true \
+    aux_teacher_ar_noise_variance_ema_decay=0.99 \
+    max_gradient_chunks=2 \
+    run_name=action_forcing_phase3_online_teacher_NR_G_v13_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

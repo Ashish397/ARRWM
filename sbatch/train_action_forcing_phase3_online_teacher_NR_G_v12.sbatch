@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v10
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v12
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,9 +11,54 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v10: identical to v9 except
-# gan_loss_weight = 1.0 (was 0.2 in v9; 0.1 in v7) — GAN 5x stronger
-# than v9, 10x stronger than v7.
+# Phase-3 online_teacher_NR_G_v12: v10 + AR-NOISE TEACHER AUGMENTATION.
+#
+# v11 NEW IDEA — AR-NOISE-AWARE TEACHER TRAINING
+# ----------------------------------------------
+# All prior runs trained the teacher (LoRA aux pass) on
+# add_noise(GT, ε, t) with ε ~ N(0, I). At deployment, the teacher
+# scores noised STUDENT outputs, and the student's outputs contain
+# autoregressive (AR) noise — a structured non-Gaussian distortion
+# that's WHAT THE TEACHER NEEDS TO REMOVE. Training on pure Gaussian
+# leaves a train/deploy distribution mismatch.
+#
+# v11 closes this gap. On every gen step the DMD scoring computes
+# pred_real = teacher(noised_student_chunk). The difference
+# (chunk - pred_real) is the teacher's empirical estimate of the
+# AR-noise direction in the student's output. We stash this and use
+# it to perturb the teacher's training noise:
+#
+#     noise_for_teacher = ε + scale * (chunk - pred_real).detach()
+#     noisy_input        = (1-t)*GT + t*noise_for_teacher
+#     loss               = (flow_pred - (noise_for_teacher - GT))²
+#
+# The target stays GT (preserves score-matching contract — student's
+# creative latitude is not pinched), and the score-matching identity
+# is approximately preserved because ε remains the dominant component.
+# The teacher learns to denoise inputs that contain BOTH random
+# Gaussian noise AND a structured AR-noise component — exactly what
+# it'll see at deployment.
+#
+# Mode "two_pass" (v11 default): each iter runs TWO teacher forwards:
+#   pass 1 — pure ε (preserves the score-matching identity exactly
+#            for ∇log p_real(x_t), keeping DMD math unbiased)
+#   pass 2 — ε + scale*ar_noise (teaches AR-denoising)
+# Losses summed. Doubles teacher forward+backward cost (~30% wallclock
+# per iter on the LoRA path with teacher_cadence='fake' already
+# running 5 cycles).
+# Switch to "combined" mode (single forward with combined noise) to
+# halve cost at the price of slightly biasing the score-matching
+# identity. "off" reverts to v10 behaviour.
+#
+# scale=1.0 default: AR noise added at its raw magnitude. Track
+# ``aux_teacher_ar_noise_rms`` in wandb to see the typical magnitude
+# and tune scale accordingly.
+#
+# v10 LEGACY — DOUBLED GAN, GT-LATENT ANCHOR (kept for v11)
+# ---------------------------------------------------------
+# v10 changes inherited unchanged: gan_loss_weight=1.0 (5x v9,
+# 10x v7), gt_latent_mse_loss_weight=0.1, gt_latent_mae_loss_weight=
+# 0.05. See v10 sbatch header for the full rationale.
 #
 # v9 POST-MORTEM — DOUBLED GAN PREVENTED COLLAPSE, RAN 2H FULL TERM
 # ----------------------------------------------------------------
@@ -116,6 +161,8 @@
 #   aux_teacher_start_step               0         LoRA trains from 0
 #   aux_teacher_loss_warmup_steps        80        LoRA full at 80
 #   aux_teacher_send_student_grad        false     (v8 collapsed when true)
+#   aux_teacher_ar_noise_mode            two_pass  same as v11
+#   aux_teacher_ar_noise_scale           0.5       v12: half raw AR magnitude (was 1.0)
 #   real_score_ema_weight                0.99      slow EMA target
 #   real_teacher_input_source            gt        proper score match
 #   dmd_context                          self      no GT mix in DMD
@@ -163,7 +210,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v10
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v12
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -212,7 +259,7 @@ echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-3 online-teacher NR_G v10 (gan_loss_weight=1.0) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v11 (AR-noise teacher aug + v10 base) on $(date)"
 echo "  * 21-frame iter-1-only student rollout, 250-step max."
 echo "  * max_rolls_per_ride=1 — streaming resets every step (no iter k>=2)."
 echo "  * Teacher: fresh rank-32 LoRA on v14-merged base, EMA(0.99) target."
@@ -233,6 +280,12 @@ echo "    MANIQA at plateau; LoRA still ramping. GAN still off."
 echo "  * Stage 3 [60, end): GAN engages with QUADRATIC ramp"
 echo "    (gan_warmup_steps=25, shape=quadratic). D-side starts simul-"
 echo "    taneously (no head-start). GAN full at step 85 (plateau 1.0)."
+echo "  * v11 NEW: aux_teacher_ar_noise_mode=two_pass (scale=1.0)."
+echo "    Teacher trains on (pure Gaussian) AND (Gaussian + AR-noise"
+echo "    estimate from chunk - pred_real) — closes the train/deploy"
+echo "    distribution mismatch on the teacher's noise input. Doubles"
+echo "    teacher fwd+bwd cost; track aux_teacher_ar_active /"
+echo "    aux_teacher_ar_noise_rms in wandb."
 echo "  * Aux LoRA: aux_teacher_send_student_grad=false (LoRA aux is"
 echo "    severed from the student; DMD is the sole student-grad path"
 echo "    through the teacher). real_teacher_input_source=gt."
@@ -288,6 +341,8 @@ srun torchrun \
     aux_teacher_loss_warmup_steps=80 \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
+    aux_teacher_ar_noise_mode=two_pass \
+    aux_teacher_ar_noise_scale=0.5 \
     dmd_loss_weight=0.5 \
     dmd_loss_start_step=60 \
     dmd_loss_warmup_steps=150 \
@@ -323,6 +378,6 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.1 \
     gt_latent_mae_loss_weight=0.05 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v10_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v12_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
