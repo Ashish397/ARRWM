@@ -172,9 +172,24 @@ class BaseModel(nn.Module):
         real_k = int(getattr(args, "real_score_num_gt_chunks", 2))
         real_scorer_num_frames = (real_k + 2) * npb
         fake_scorer_num_frames = 4 * npb
-        self.real_score = WanDiffusionWrapper(
-            model_name=self.real_model_name, is_causal=False
-        )
+        # Foreign-size real_score (e.g. Wan2.1-T2V-14B): the wrapper
+        # default ``timestep_shift=8.0`` is wrong for stock Wan2.1-T2V
+        # models, which are canonically used with shift=5.0 (see
+        # Wan-AI docs + Causal-Forcing's reference config). The 1.3B
+        # path is tolerated because the v14 LoRA was tuned around the
+        # 8.0 schedule that the legacy wrapper produced. A foreign
+        # teacher has no equivalent tuning — its scheduler must match
+        # its training schedule. Read from top-level ``timestep_shift``
+        # config (= 5.0 in action_forcing_phase1.yaml) when foreign.
+        real_score_kwargs = {
+            "model_name": self.real_model_name,
+            "is_causal": False,
+        }
+        if self.real_model_name != self.fake_model_name:
+            cfg_shift = getattr(args, "timestep_shift", None)
+            if cfg_shift is not None:
+                real_score_kwargs["timestep_shift"] = float(cfg_shift)
+        self.real_score = WanDiffusionWrapper(**real_score_kwargs)
         # Override the wrapper's spatial-only ``_base_seq_len`` (default
         # 32760 = 21 * 1560) to match the scorer's actual DMD input
         # window. ``adjust_seq_len_for_action_tokens`` reads from

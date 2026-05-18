@@ -2137,12 +2137,23 @@ class ActionForcingDMD(SelfForcingModel):
         if clean_x is not None:
             tf_kwargs_fake["clean_x"] = clean_x
             tf_kwargs_fake["aug_t"] = aug_t
-            tf_kwargs_real["clean_x"] = (
-                clean_x_real if clean_x_real is not None else clean_x
-            )
-            tf_kwargs_real["aug_t"] = (
-                aug_t_real if aug_t_real is not None else aug_t
-            )
+            # Foreign-size real_score (e.g. Wan2.1-T2V-14B with no
+            # v14-style TF fine-tuning) has NEVER been trained on the
+            # mixed-noise-level joint TF layout — its self-attn has no
+            # notion of "first half clean, second half noisy", and
+            # feeding it that layout produces garbage x0 predictions.
+            # Strip clean_x for the foreign-teacher path so it sees
+            # only the 21 uniformly-noised frames (in-distribution for
+            # a stock T2V model). The 1.3B+v14 path keeps clean_x
+            # since the v14 LoRA was specifically tuned for the TF
+            # joint forward.
+            if not getattr(self, "is_foreign_real_teacher", False):
+                tf_kwargs_real["clean_x"] = (
+                    clean_x_real if clean_x_real is not None else clean_x
+                )
+                tf_kwargs_real["aug_t"] = (
+                    aug_t_real if aug_t_real is not None else aug_t
+                )
 
         # Step 1: fake score
         _, pred_fake_image_cond = self.fake_score(
