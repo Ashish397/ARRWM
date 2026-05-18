@@ -810,3 +810,330 @@ def apply_action_patches_critic(generator_wrapper):
         patch_bidirectional_wan_model_for_action(target.model)
     target._action_patch_applied = True  # type: ignore[attr-defined]
     return generator_wrapper
+
+
+# =====================================================================
+# TF-only patch (v21+ — foreign-teacher DMD support)
+# =====================================================================
+# When ``real_model_name != fake_model_name`` (e.g. real_score is
+# Wan2.1-T2V-14B while generator/fake_score are 1.3B), the action
+# patches above cannot be applied to real_score: ``action_projection``
+# is sized for the GENERATOR's hidden dim (1536 for 1.3B), and the
+# concat inside ``_bidir_forward_with_action_tokens`` would crash on
+# the 14B's 5120-dim sequence. The TF-only patch below gives the
+# foreign teacher proper teacher-forcing context support WITHOUT
+# action tokens:
+#
+#   - Linear concat layout: clean_x at RoPE [0..F), noisy at [F..2F).
+#     This is in-distribution for a stock T2V model — it's just a
+#     2F-frame video where the first F are clean past context and the
+#     last F are the noisy chunk being denoised. The 14B's RoPE table
+#     extends to 10000 positions; 42 frames is well within its trained
+#     range (Wan2.1-T2V models trained on up to 81-frame clips).
+#
+#   - No action tokens, no Stream A (action_modulation), no Stream B
+#     (action_tokens) interleaving. The model sees only spatial tokens
+#     at standard frame_seqlen = H*W per frame.
+#
+#   - clean_x and noisy_x must have the same F per the existing
+#     bidirectional self-attn patch's symmetric-half assumption
+#     (``f_half = f_total // 2``).
+#
+# The patch is applied by ``apply_tf_only_patches_critic(wrapper)``
+# which:
+#   - Patches each block's self_attn for tf_rope_offset support (reuses
+#     the existing ``_patch_bidirectional_self_attn_for_action`` which
+#     already handles the ``a_per_f == 0, tf_off > 0`` case).
+#   - Replaces ``model._forward`` with ``_tf_only_forward_for_bidir_wan``
+#     which performs the linear concat TF.
+#   - Sets ``wrapper._action_patch_applied = False`` so the wrapper's
+#     forward does NOT inject action kwargs from conditional_dict
+#     (cosmetic — model wouldn't accept them anyway, but the wrapper
+#     would set them).
+# =====================================================================
+def _tf_only_forward_for_bidir_wan(
+    self,
+    x,
+    t,
+    context,
+    seq_len,
+    clean_x=None,
+    aug_t=None,
+    clip_fea=None,
+    y=None,
+    **kwargs,
+):
+    """Replacement ``_forward`` for a bidirectional WanModel that adds
+    teacher-forcing (clean_x concat) support WITHOUT action tokens.
+
+    ``clean_x is None`` path: passes through to the captured original
+    forward (= stock T2V) — bit-identical to the un-patched model.
+
+    ``clean_x is not None`` path: patch-embeds the clean half, concats
+    [clean, noisy] along the seq dim, runs all transformer blocks on
+    the joint 2F-frame input, strips the clean half before head +
+    unpatchify, returns the noisy half's x0 prediction.
+
+    RoPE positions: clean at [0..F), noisy at [F..2F). The per-block
+    self-attn patch reads ``self_attn.tf_rope_offset`` and applies
+    the shifted RoPE to the noisy half automatically.
+
+    Args:
+      clean_x: list of [C, F, H, W] tensors (same shape contract as
+        ``x``) — the past-context latents (e.g. 21 GT seed frames).
+      aug_t: [B, F] timestep tensor for the clean half. Defaults to
+        zeros (= clean / no noise on the clean half).
+    """
+    # No-TF path: defer to the captured original forward. The TF-only
+    # patch is benign when nobody passes clean_x.
+    if clean_x is None:
+        orig = getattr(self, "_orig_forward_tf_only", None)
+        if orig is None:
+            raise RuntimeError(
+                "_tf_only_forward_for_bidir_wan called without an "
+                "original forward stashed. apply_tf_only_patches_critic "
+                "must run before the model is used."
+            )
+        return orig(x, t, context, seq_len, clip_fea=clip_fea, y=y, **kwargs)
+
+    if self.model_type == "i2v":
+        # Foreign I2V teachers aren't supported here — caller would need
+        # to thread CLIP image features + first-frame y. Fail loud.
+        raise NotImplementedError(
+            "_tf_only_forward_for_bidir_wan: i2v model_type is not "
+            "supported. Use a T2V foreign teacher (e.g. Wan2.1-T2V-14B)."
+        )
+
+    device = self.patch_embedding.weight.device
+    if self.freqs.device != device:
+        self.freqs = self.freqs.to(device)
+
+    if y is not None:
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+    # Patch embedding for the noisy half.
+    x_emb = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+    grid_sizes = torch.stack(
+        [torch.tensor(u.shape[2:], dtype=torch.long) for u in x_emb]
+    )
+    x_flat = [u.flatten(2).transpose(1, 2) for u in x_emb]
+    spatial_seqlen = int(math.prod(grid_sizes[0][1:]).item())
+    num_frames_local = int(grid_sizes[0, 0].item())
+
+    # Patch embedding for the clean half. Must have identical (H, W)
+    # and the same F (the bidirectional self-attn patch assumes
+    # symmetric halves: f_half = f_total // 2).
+    clean_emb = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
+    clean_grid_sizes = torch.stack(
+        [torch.tensor(u.shape[2:], dtype=torch.long) for u in clean_emb]
+    )
+    if int(clean_grid_sizes[0, 0].item()) != num_frames_local:
+        raise RuntimeError(
+            "_tf_only_forward_for_bidir_wan: clean_x has "
+            f"{int(clean_grid_sizes[0, 0].item())} frames but noisy x has "
+            f"{num_frames_local}; the symmetric-halves self-attn patch "
+            "requires them to match."
+        )
+    clean_flat = [u.flatten(2).transpose(1, 2) for u in clean_emb]
+
+    # Concat [clean, noisy] along seq dim per batch.
+    joint = [
+        torch.cat([cu, nu], dim=1) for cu, nu in zip(clean_flat, x_flat)
+    ]
+
+    seq_lens = torch.tensor([u.size(1) for u in joint], dtype=torch.long)
+    # Pad to the exact joint length. No outer padding past the natural
+    # 2*F*spatial_seqlen — keeps the self-attn's grid_sizes-derived
+    # valid_len consistent.
+    natural_joint = num_frames_local * spatial_seqlen * 2
+    if int(seq_lens.max().item()) > natural_joint:
+        raise RuntimeError(
+            f"_tf_only_forward_for_bidir_wan: seq_lens.max()="
+            f"{int(seq_lens.max().item())} exceeds natural_joint="
+            f"{natural_joint}; check clean_x / noisy x shapes."
+        )
+    x_joint = torch.cat(
+        [
+            torch.cat(
+                [u, u.new_zeros(1, natural_joint - u.size(1), u.size(2))],
+                dim=1,
+            )
+            for u in joint
+        ]
+    )
+
+    # Time embedding for the NOISY half (uses t).
+    e_noisy = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x_joint)
+    )
+    e0_noisy = (
+        self.time_projection(e_noisy)
+        .unflatten(1, (6, self.dim))
+        .unflatten(dim=0, sizes=t.shape)
+    )
+    # Time embedding for the CLEAN half (uses aug_t; defaults to zeros).
+    if aug_t is None:
+        aug_t = torch.zeros_like(t)
+    e_clean = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x_joint)
+    )
+    e0_clean = (
+        self.time_projection(e_clean)
+        .unflatten(1, (6, self.dim))
+        .unflatten(dim=0, sizes=aug_t.shape)
+    )
+    # Concat along F (= joint sequence's per-frame modulation).
+    e0 = torch.cat([e0_clean, e0_noisy], dim=1)
+
+    # Text context.
+    context_lens = None
+    context_full = self.text_embedding(
+        torch.stack(
+            [
+                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]
+        )
+    )
+    if clip_fea is not None:
+        context_clip = self.img_emb(clip_fea)
+        context_full = torch.concat([context_clip, context_full], dim=1)
+
+    # Set per-block self_attn TF state: tf_rope_offset = F (noisy half
+    # gets RoPE positions [F..2F)). action_tokens_per_frame stays 0.
+    for block in self.blocks:
+        block.self_attn.action_tokens_per_frame = 0
+        block.self_attn.tf_rope_offset = num_frames_local
+
+    # The self-attn patch derives valid_len from grid_sizes[0,0]. In
+    # this TF-only joint forward F_joint = 2 * F, so we pass a doubled
+    # grid_sizes to keep valid_len = 2*F*spatial_seqlen.
+    block_grid_sizes = grid_sizes.clone()
+    block_grid_sizes[:, 0] = num_frames_local * 2
+
+    block_kwargs = dict(
+        e=e0,
+        seq_lens=seq_lens,
+        grid_sizes=block_grid_sizes,
+        freqs=self.freqs,
+        context=context_full,
+        context_lens=context_lens,
+    )
+
+    def _create_custom_forward(module):
+        def _fwd(*inputs, **kw):
+            return module(*inputs, **kw)
+        return _fwd
+
+    x_joint_ = x_joint
+    for block in self.blocks:
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            x_joint_ = torch.utils.checkpoint.checkpoint(
+                _create_custom_forward(block),
+                x_joint_,
+                **block_kwargs,
+                use_reentrant=False,
+            )
+        else:
+            x_joint_ = block(x_joint_, **block_kwargs)
+
+    # Strip the clean half: keep only the noisy half's seq.
+    clean_len = num_frames_local * spatial_seqlen
+    x_noisy = x_joint_[:, clean_len:]
+    valid_len = num_frames_local * spatial_seqlen
+    x_noisy = x_noisy[:, :valid_len]
+
+    # Head with per-frame modulation (mirrors CausalHead.forward).
+    # Use the NOISY half's e (t-based), not the joint e0.
+    head_mod = getattr(self.head, "modulation")
+    head_norm = getattr(self.head, "norm")
+    head_lin = getattr(self.head, "head")
+    e_per_frame = e_noisy.unflatten(dim=0, sizes=t.shape)  # [B, F, C]
+    mod = head_mod.unsqueeze(1) + e_per_frame.unsqueeze(2)  # [B, F, 2, C]
+    mod_shift, mod_scale = mod.chunk(2, dim=2)  # each [B, F, 1, C]
+    x_framed = head_norm(x_noisy).unflatten(
+        dim=1, sizes=(num_frames_local, spatial_seqlen)
+    )  # [B, F, L1, C]
+    x_framed = x_framed * (1 + mod_scale) + mod_shift
+    x_out = head_lin(x_framed.flatten(1, 2))
+    x_out = self.unpatchify(x_out, grid_sizes)
+    return torch.stack(x_out)
+
+
+def patch_bidirectional_wan_model_for_tf_only(model):
+    """TF-only sibling of ``patch_bidirectional_wan_model_for_action``.
+
+    Patches a bidirectional WanModel to add ``clean_x`` (teacher-forcing
+    context) support WITHOUT action tokens. Idempotent.
+
+    After patching, the model's ``_forward`` accepts ``clean_x`` and
+    ``aug_t`` kwargs. When ``clean_x is not None``, the new forward does
+    linear-concat TF: [clean, noisy] along the seq dim, clean at RoPE
+    [0..F), noisy at [F..2F). When ``clean_x is None``, falls through to
+    the original forward bit-identically.
+
+    Each block's self_attn is patched (reuses
+    ``_patch_bidirectional_self_attn_for_action`` which already handles
+    the ``a_per_f == 0, tf_off > 0`` case for RoPE).
+    """
+    if getattr(model, "_tf_only_patched", False):
+        return model
+    if getattr(model, "_action_bidir_patched", False):
+        # Action patch already installed; the TF-only path would
+        # conflict. Refuse rather than silently overwrite.
+        raise RuntimeError(
+            "patch_bidirectional_wan_model_for_tf_only: model already "
+            "has the action patch installed. The two patches are "
+            "mutually exclusive. Don't call apply_action_patches_critic "
+            "on a foreign-teacher real_score."
+        )
+    if not hasattr(model, "_forward"):
+        raise AttributeError(
+            "Bidirectional Wan model is expected to define `_forward`."
+        )
+
+    # Self-attn TF support. action_tokens_per_frame defaults to 0; the
+    # patched forward reads tf_rope_offset which the new _forward sets
+    # per-call to num_frames_local.
+    if not hasattr(model, "action_tokens_per_frame"):
+        model.action_tokens_per_frame = 0
+    for block in model.blocks:
+        _patch_bidirectional_self_attn_for_action(block.self_attn)
+
+    # Capture the original forward and install ours.
+    model._orig_forward_tf_only = model._forward
+    model._forward = _tf_only_forward_for_bidir_wan.__get__(model, type(model))
+    model._tf_only_patched = True
+    return model
+
+
+def apply_tf_only_patches_critic(generator_wrapper):
+    """Apply the TF-only patch to a critic (bidirectional) wrapper.
+
+    Use this INSTEAD of ``apply_action_patches_critic`` when the wrapper
+    is a foreign-size teacher (e.g. real_score = Wan2.1-T2V-14B while
+    generator/fake_score are 1.3B). The TF-only patch gives the wrapper
+    teacher-forcing support WITHOUT action tokens (which would have the
+    wrong hidden dim for a foreign-size model).
+
+    Sets ``wrapper._action_patch_applied = False`` so the wrapper's
+    forward doesn't try to inject action_modulation / action_tokens
+    kwargs from conditional_dict (which the patched model._forward
+    wouldn't accept anyway).
+
+    Also sets ``wrapper._tf_only_patch_applied = True`` as a marker for
+    downstream code (e.g. dispatch logic in compute_kl_grad).
+    """
+    target = generator_wrapper
+    if FSDP is not None and isinstance(target, FSDP):
+        target = target.module  # type: ignore[attr-defined]
+    if getattr(target, "_tf_only_patch_applied", False):
+        return generator_wrapper
+    if not hasattr(target, "model"):
+        raise AttributeError(
+            "apply_tf_only_patches_critic: wrapper has no .model attribute."
+        )
+    patch_bidirectional_wan_model_for_tf_only(target.model)
+    target._action_patch_applied = False  # type: ignore[attr-defined]
+    target._tf_only_patch_applied = True  # type: ignore[attr-defined]
+    return generator_wrapper

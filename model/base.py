@@ -9,7 +9,10 @@ import torch
 from pipeline import SelfForcingTrainingPipeline, ActionSelfForcingTrainingPipeline
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
-from model.action_model_patch import apply_action_patches, apply_action_patches_critic
+from model.action_model_patch import (
+    apply_action_patches, apply_action_patches_critic,
+    apply_tf_only_patches_critic,
+)
 from model.action_modulation import ActionModulationProjection, ActionTokenProjection
 
 from utils.debug_option import DEBUG
@@ -179,7 +182,25 @@ class BaseModel(nn.Module):
         # top — must happen AFTER this reset.
         self.real_score._base_seq_len = real_scorer_num_frames * 1560
         self.real_score.seq_len = self.real_score._base_seq_len
-        if self._action_patch_enabled:
+        # Dispatch: same-size teacher gets the legacy action patch
+        # (Stream A + B + TF). Foreign-size teacher (e.g. real_score =
+        # Wan2.1-T2V-14B while generator = 1.3B) gets the TF-only
+        # patch — clean_x concat with linear RoPE, NO action tokens
+        # (would have the wrong hidden dim) and NO Stream A modulation
+        # (same reason). The TF-only path keeps the 14B's "21 frames
+        # of past GT context + 21 noisy frames" forward in-distribution
+        # for a stock T2V model. ``self.is_foreign_real_teacher`` is
+        # also surfaced on ``self`` so dmd_action_forcing's
+        # ``_build_dmd_context_kwargs`` can switch sc_clean_x_real to
+        # the past-frame builder when this is True.
+        self.is_foreign_real_teacher = (
+            self.real_model_name != self.fake_model_name
+        )
+        real_action_patch_active = (
+            self._action_patch_enabled
+            and not self.is_foreign_real_teacher
+        )
+        if real_action_patch_active:
             apply_action_patches_critic(self.real_score)
             self.real_score.model.action_tokens_per_frame = 1
             self.real_score.adjust_seq_len_for_action_tokens(
@@ -191,6 +212,10 @@ class BaseModel(nn.Module):
                     "!= 1 after Stream B wiring — the DiT will run at "
                     "1560/frame instead of the trained 1561/frame."
                 )
+        elif self.is_foreign_real_teacher:
+            apply_tf_only_patches_critic(self.real_score)
+            # TF-only path: action_tokens_per_frame stays 0; seq_len
+            # stays at the spatial-only base (no action-token slots).
         self.real_score.model.requires_grad_(False)
 
         self.fake_score = WanDiffusionWrapper(
