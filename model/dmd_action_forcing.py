@@ -526,6 +526,83 @@ class ActionForcingDMD(SelfForcingModel):
         self.fake_alt_apply_start_step = int(
             getattr(args, "fake_alt_apply_start_step", 0)
         )
+        # ===== v24 alt-head target source =====
+        # ``ema_real_x0``  (v23 default): alt head trained to predict
+        #     the EMA-swapped real_score's x0 estimate. Target is built
+        #     via an extra no_grad EMA-real_score forward per critic
+        #     iter. Marks ``_real_score_ema_swap`` and related EMA
+        #     plumbing as live consumers.
+        # ``rollout2_student`` (v24): alt head trained to predict the
+        #     student's x0 from a NOISIER auxiliary rollout that uses
+        #     ``fake_alt_rollout2_num_seed_chunks`` seed chunks (vs the
+        #     normal ``dmd_context_clean_frames/npb`` count). That
+        #     rollout has 1 more AR step of drift, so the alt head
+        #     learns the worst-case causal-AR noise distribution.
+        #     ``real_score_ema`` infrastructure becomes a no-op
+        #     consumer under this mode — marked deprecated.
+        self.fake_alt_target_mode = str(
+            getattr(args, "fake_alt_target_mode", "ema_real_x0")
+        ).lower().strip()
+        if self.fake_alt_target_mode not in (
+            "ema_real_x0", "rollout2_student",
+        ):
+            raise ValueError(
+                "fake_alt_target_mode must be 'ema_real_x0' or "
+                f"'rollout2_student'; got {self.fake_alt_target_mode!r}."
+            )
+        # Number of seed chunks for the v24 rollout-2 prebuild. Must be
+        # < ``dmd_context_clean_frames / num_frame_per_block`` so
+        # rollout 2 has 1 fewer seed chunk than rollout 1 (= 1 extra AR
+        # step of drift). Default 2 (= 6 latent frames seed), matching
+        # the canonical 3-seed-chunks rollout-1 configuration.
+        self.fake_alt_rollout2_num_seed_chunks = int(
+            getattr(args, "fake_alt_rollout2_num_seed_chunks", 2)
+        )
+        if self.fake_alt_rollout2_num_seed_chunks < 1:
+            raise ValueError(
+                "fake_alt_rollout2_num_seed_chunks must be >= 1."
+            )
+        # ===== v25 critic clean_x source =====
+        # ``self`` (default, v23 behavior): fake_score's critic step
+        #     trains on noised STUDENT x0 (``chunk``) with TF context
+        #     drawn from the student's own previous frames. Loss target
+        #     = ``chunk`` (student's own x0).
+        # ``gt_causal_ar``: mirrors the v21 aux-teacher pattern but on
+        #     fake_score's critic step. Per-iter:
+        #       gt_chunk    = ride_latents_window at chunk's abs positions
+        #       noisy_gt    = add_noise(gt_chunk, ε_aux, critic_timestep)
+        #       causal_AR_GT = fake_score.alt(noisy_gt, no_grad)
+        #       noisy_input  = add_noise(causal_AR_GT, ε, critic_timestep)
+        #       clean_x      = causal_AR_GT  (un-noised same source)
+        #       loss target  = true gt_chunk (NOT student chunk)
+        #     Fake_score thus learns to denoise causal-AR-noised GT
+        #     back to true GT. Falls back to ``self`` for iters whose
+        #     chunk abs positions exceed the ride_latents_window range.
+        self.critic_clean_x_source = str(
+            getattr(args, "critic_clean_x_source", "self")
+        ).lower().strip()
+        if self.critic_clean_x_source not in ("self", "gt_causal_ar"):
+            raise ValueError(
+                "critic_clean_x_source must be 'self' or 'gt_causal_ar';"
+                f" got {self.critic_clean_x_source!r}."
+            )
+        # ===== v26 aux-teacher clean_x source =====
+        # ``default``: clean_x_for_real = GT-seed-last + first-6-student-
+        #     chunks snapshot (the existing v21 mixed-context behavior).
+        # ``causal_AR_GT``: clean_x_for_real = causal_AR_x0 (the alt-
+        #     head's no_grad output on noised GT). Pairs the real_score's
+        #     TF context with its noisy_input source (both derived from
+        #     causal_AR_GT), so the LoRA learns "denoise causal-AR-noised
+        #     input -> GT" with a consistent un-noised reference.
+        #     Requires fake_alt_apply_active (else falls back to default).
+        self.aux_real_clean_x_source = str(
+            getattr(args, "aux_real_clean_x_source", "default")
+        ).lower().strip()
+        if self.aux_real_clean_x_source not in ("default", "causal_ar_gt"):
+            raise ValueError(
+                "aux_real_clean_x_source must be 'default' or "
+                f"'causal_AR_GT'; got {self.aux_real_clean_x_source!r}."
+            )
 
         # Hard start-step gate for the aux teacher pass. Below this
         # step the aux pass does not fire at all (no real_score
@@ -2707,62 +2784,96 @@ class ActionForcingDMD(SelfForcingModel):
             reduction="mean",
         )
 
-        # Anti-collapse variance floor. ReLU(gt_std - pred_std)^2 over
-        # per-(batch, frame) latent std. Direct, soft anti-gray-collapse
-        # signal: when the student's pred_x0 contracts below the GT
-        # frame's natural spread (the textbook gray-collapse pixel
-        # signature observed at step ~30-46 of 14B-teacher runs), this
-        # term pushes back. Off by default (weight=0.0).
+        # Anti-collapse: stashed unscaled on ``self`` so the caller adds
+        # it AFTER the dmd_loss_weight multiplication. See helper
+        # ``_compute_anti_collapse_term`` for the math + rationale.
+        self._latest_anti_collapse_total = self._compute_anti_collapse_term(
+            original_latent=original_latent,
+            gt_target=gt_target,
+            log_dict=dmd_log_dict,
+            log_prefix="",
+            ref_dtype=dmd_loss.dtype,
+        )
+
+        return dmd_loss, dmd_log_dict
+
+    def _compute_anti_collapse_term(
+        self,
+        original_latent: torch.Tensor,
+        gt_target: Optional[torch.Tensor],
+        log_dict: Dict[str, Any],
+        log_prefix: str,
+        ref_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Compute the unscaled anti-collapse loss term for one x0
+        chunk. Returns ``None`` when both anti_collapse weights are 0,
+        when ``gt_target`` is missing, or when shapes don't match.
+
+        Used at two sites:
+          * Random-exit rung's x0 (= ``chunk`` consumed by DMD scoring)
+            — called from ``compute_distribution_matching_loss``.
+          * Flash-DMD t=gan_t rung's x0 (= ``flash_dmd_gan_chunk``)
+            — called from ``compute_generator_loss_streaming`` so the
+            same std/mean floors that protect the DMD-supervised rung
+            also protect the GAN-supervised rung. Both rungs feed
+            different grad-on paths into the student; constraining
+            both prevents collapse routes through whichever path the
+            optimizer would otherwise exploit.
+
+        ``log_prefix`` (e.g. ``""`` or ``"flash_"``) disambiguates the
+        log keys so wandb shows both sites' stats side-by-side.
+        """
         anti_collapse_any = (
             self.anti_collapse_loss_weight > 0.0
             or self.anti_collapse_mean_weight > 0.0
         )
-        if anti_collapse_any and gt_target is not None:
-            gt_for_std = gt_target.to(
-                dtype=original_latent.dtype,
-                device=original_latent.device,
+        if not anti_collapse_any or gt_target is None:
+            return None
+        gt_for_std = gt_target.to(
+            dtype=original_latent.dtype,
+            device=original_latent.device,
+        )
+        if gt_for_std.shape != original_latent.shape:
+            return None
+        total: Optional[torch.Tensor] = None
+        if self.anti_collapse_loss_weight > 0.0:
+            s_pred = original_latent.float().std(dim=[2, 3, 4])
+            s_gt = gt_for_std.float().std(dim=[2, 3, 4]).detach()
+            deficit = F.relu(s_gt - s_pred)
+            anti_collapse_loss = deficit.pow(2).mean()
+            log_dict[f"anti_collapse_{log_prefix}loss_raw"] = (
+                anti_collapse_loss.detach()
             )
-            if gt_for_std.shape == original_latent.shape:
-                if self.anti_collapse_loss_weight > 0.0:
-                    s_pred = original_latent.float().std(dim=[2, 3, 4])
-                    s_gt = gt_for_std.float().std(dim=[2, 3, 4]).detach()
-                    deficit = F.relu(s_gt - s_pred)
-                    anti_collapse_loss = deficit.pow(2).mean()
-                    dmd_log_dict["anti_collapse_loss_raw"] = (
-                        anti_collapse_loss.detach()
-                    )
-                    dmd_log_dict["anti_collapse_pred_std_mean"] = (
-                        s_pred.detach().mean()
-                    )
-                    dmd_log_dict["anti_collapse_gt_std_mean"] = s_gt.mean()
-                    dmd_loss = dmd_loss + (
-                        self.anti_collapse_loss_weight
-                        * anti_collapse_loss.to(dmd_loss.dtype)
-                    )
-                if self.anti_collapse_mean_weight > 0.0:
-                    m_pred = original_latent.float().mean(dim=[2, 3, 4])
-                    if self.anti_collapse_mean_target == "gt":
-                        m_gt = gt_for_std.float().mean(
-                            dim=[2, 3, 4]
-                        ).detach()
-                        mean_sq_loss = (m_pred - m_gt).pow(2).mean()
-                        dmd_log_dict["anti_collapse_gt_mean_mean"] = (
-                            m_gt.mean()
-                        )
-                    else:
-                        mean_sq_loss = m_pred.pow(2).mean()
-                    dmd_log_dict["anti_collapse_mean_sq_raw"] = (
-                        mean_sq_loss.detach()
-                    )
-                    dmd_log_dict["anti_collapse_pred_mean_mean"] = (
-                        m_pred.detach().mean()
-                    )
-                    dmd_loss = dmd_loss + (
-                        self.anti_collapse_mean_weight
-                        * mean_sq_loss.to(dmd_loss.dtype)
-                    )
-
-        return dmd_loss, dmd_log_dict
+            log_dict[f"anti_collapse_{log_prefix}pred_std_mean"] = (
+                s_pred.detach().mean()
+            )
+            log_dict[f"anti_collapse_{log_prefix}gt_std_mean"] = s_gt.mean()
+            total = (
+                self.anti_collapse_loss_weight
+                * anti_collapse_loss.to(ref_dtype)
+            )
+        if self.anti_collapse_mean_weight > 0.0:
+            m_pred = original_latent.float().mean(dim=[2, 3, 4])
+            if self.anti_collapse_mean_target == "gt":
+                m_gt = gt_for_std.float().mean(dim=[2, 3, 4]).detach()
+                mean_sq_loss = (m_pred - m_gt).pow(2).mean()
+                log_dict[f"anti_collapse_{log_prefix}gt_mean_mean"] = (
+                    m_gt.mean()
+                )
+            else:
+                mean_sq_loss = m_pred.pow(2).mean()
+            log_dict[f"anti_collapse_{log_prefix}mean_sq_raw"] = (
+                mean_sq_loss.detach()
+            )
+            log_dict[f"anti_collapse_{log_prefix}pred_mean_mean"] = (
+                m_pred.detach().mean()
+            )
+            mean_term = (
+                self.anti_collapse_mean_weight
+                * mean_sq_loss.to(ref_dtype)
+            )
+            total = mean_term if total is None else total + mean_term
+        return total
 
     # ------------------------------------------------------------------
     # Public losses (CF interface)
@@ -3182,6 +3293,12 @@ class ActionForcingDMD(SelfForcingModel):
             gt_z_per_slot=gt_z_per_slot,
         )
         dmd_loss = dmd_loss * self.dmd_loss_weight
+        # v28+: add the anti-collapse term UNSCALED by dmd_loss_weight,
+        # so the user's ``anti_collapse_*_weight`` knobs mean what they
+        # say regardless of where DMD is in its warmup ramp.
+        if getattr(self, "_latest_anti_collapse_total", None) is not None:
+            dmd_loss = dmd_loss + self._latest_anti_collapse_total
+            self._latest_anti_collapse_total = None
 
         # Surface MAE-extension metrics (may be NaN-marked if
         # gt_latents was None or shorter than the baseline rollout).
@@ -3493,6 +3610,28 @@ class ActionForcingDMD(SelfForcingModel):
             :, cf - npb : cf - npb + max_length
         ]
 
+        # v24: pre-roll rollout 2 (no_grad, fewer seed chunks) BEFORE
+        # rollout 1's cache initialization. The prebuild reuses the
+        # SAME pipe.kv_cache1 / crossattn_cache; its finally clause
+        # resets them so the rollout-1 prefill below starts clean.
+        # Result is stashed in streaming_state["rollout2_x0"] for the
+        # critic step's alt-head loss to consume.
+        rollout2_x0 = None
+        rollout2_abs_frame_start = None
+        if (
+            self.fake_alt_head_enabled
+            and self.fake_alt_target_mode == "rollout2_student"
+        ):
+            rollout2_x0, rollout2_abs_frame_start = (
+                self._prebuild_rollout2_for_v24(
+                    seed_latents=seed_latents,
+                    ride_latents_window=ride_latents_window,
+                    ride_actions_window=ride_actions_window,
+                    prompt_embeds=prompt_embeds,
+                    max_length=max_length,
+                )
+            )
+
         # Reset + initialise persistent caches.
         pipe.reset_cache_state()
         pipe._initialize_kv_cache(
@@ -3638,7 +3777,197 @@ class ActionForcingDMD(SelfForcingModel):
             # of GT seed-tail + first 6 student chunks. Reset on
             # streaming reset.
             "aux_clean_x_snapshot": None,
+            # v24: pre-rolled noisier student rollout (fewer seed chunks).
+            # ``None`` when fake_alt_target_mode != "rollout2_student".
+            # When set: tensor [B, n_gen, C, H, W] with abs frame index
+            # ``rollout2_abs_frame_start`` for slot 0.
+            "rollout2_x0": rollout2_x0,
+            "rollout2_abs_frame_start": rollout2_abs_frame_start,
         }
+
+    def _prebuild_rollout2_for_v24(
+        self,
+        seed_latents: torch.Tensor,
+        ride_latents_window: torch.Tensor,
+        ride_actions_window: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        max_length: int,
+    ) -> Tuple[torch.Tensor, int]:
+        """v24 pre-roll: run a SECOND student rollout under no_grad with
+        ``fake_alt_rollout2_num_seed_chunks`` seed chunks (vs rollout 1's
+        ``dmd_context_clean_frames / npb`` count). With 1 fewer seed
+        chunk, rollout 2 carries 1 extra AR step of drift; its x0
+        estimates capture the worst-case causal-AR noise distribution
+        that the fake-score alt head learns to predict as the v24
+        replacement for the v23 ``ema_real_x0`` target.
+
+        Shares ``inference_pipeline.kv_cache1`` / ``crossattn_cache``
+        with rollout 1, so caches are reset in the finally clause to
+        leave the pipeline clean for the rollout-1 prefill that
+        immediately follows in setup_sequence.
+
+        Returns ``(rollout2_x0, abs_frame_start)`` where
+        ``rollout2_x0`` has shape ``[B, n_gen, C, H, W]`` and
+        ``abs_frame_start = num_seed_r2 * npb`` (the absolute ride
+        frame index of slot 0).
+        """
+        pipe = self.inference_pipeline
+        npb = int(self.num_frame_per_block)
+        n_seed_r2 = int(self.fake_alt_rollout2_num_seed_chunks)
+        cf_r2 = n_seed_r2 * npb
+        # Rollout 2 needs 1 extra generated chunk to reach the same end
+        # absolute position as rollout 1 (it started one seed-chunk
+        # earlier in the ride).
+        max_length_r2 = int(max_length) + npb
+        device = seed_latents.device
+        dtype = seed_latents.dtype
+        batch_size = int(seed_latents.shape[0])
+        if ride_latents_window.shape[1] < cf_r2:
+            raise ValueError(
+                f"ride_latents_window has {ride_latents_window.shape[1]} "
+                f"frames; rollout 2 needs >= cf_r2={cf_r2}."
+            )
+
+        seed_r2 = seed_latents[:, :cf_r2]
+        # Temporarily blank streaming_state so generate_next_chunk
+        # operates on rollout 2's transient state (built below).
+        saved_streaming_state = self.streaming_state
+        self.streaming_state = None
+
+        rollout2_chunks: list = []
+        try:
+            with torch.no_grad():
+                # 1) Reset + (re-)init caches for rollout 2.
+                pipe.reset_cache_state()
+                pipe._initialize_kv_cache(
+                    batch_size=batch_size, dtype=dtype, device=device,
+                )
+                pipe._initialize_crossattn_cache(
+                    batch_size=batch_size, dtype=dtype, device=device,
+                )
+
+                # 2) Seed prefill: n_seed_r2 chunks at t=0 + context-noise
+                # commit. Mirrors the rollout-1 seed loop in setup_sequence.
+                seed_cond_dict, _ = self.build_action_conditional(
+                    prompt_embeds=prompt_embeds,
+                    gt_actions=ride_actions_window,
+                )
+                current_start_frame = 0
+                for sc in range(n_seed_r2):
+                    seed_chunk = seed_r2[:, sc * npb : (sc + 1) * npb]
+                    seed_t = torch.zeros(
+                        [batch_size, npb], device=device, dtype=torch.int64,
+                    )
+                    seed_block_cond = _slice_per_frame_streams(
+                        seed_cond_dict,
+                        frame_start=current_start_frame, frame_count=npb,
+                    )
+                    pipe.generator(
+                        noisy_image_or_video=seed_chunk,
+                        conditional_dict=seed_block_cond,
+                        timestep=seed_t,
+                        kv_cache=pipe.kv_cache1,
+                        crossattn_cache=pipe.crossattn_cache,
+                        current_start=current_start_frame * pipe.frame_seq_length,
+                    )
+                    ctx_t = torch.full_like(seed_t, pipe.context_noise)
+                    seed_ctx_in = self.scheduler.add_noise(
+                        seed_chunk.flatten(0, 1),
+                        torch.randn_like(seed_chunk.flatten(0, 1)),
+                        ctx_t.flatten(0, 1),
+                    ).unflatten(0, seed_chunk.shape[:2])
+                    pipe.generator(
+                        noisy_image_or_video=seed_ctx_in,
+                        conditional_dict=seed_block_cond,
+                        timestep=ctx_t,
+                        kv_cache=pipe.kv_cache1,
+                        crossattn_cache=pipe.crossattn_cache,
+                        current_start=current_start_frame * pipe.frame_seq_length,
+                    )
+                    current_start_frame += npb
+                del seed_cond_dict
+
+                # 3) Anchor chunk at cf_r2.
+                anchor_noise = torch.randn(
+                    [batch_size, npb, *seed_latents.shape[2:]],
+                    device=device, dtype=dtype,
+                )
+                anchor_full_cond, _ = self.build_action_conditional(
+                    prompt_embeds=prompt_embeds,
+                    gt_actions=ride_actions_window,
+                )
+                anchor_chunk, _, _ = pipe.generate_chunk_with_cache(
+                    noise=anchor_noise,
+                    current_start_frame=cf_r2,
+                    requires_grad=False,
+                    prefer_cache_pred_in_output=False,
+                    gt_latents=None,
+                    warm_start_init=False,
+                    **anchor_full_cond,
+                )
+                del anchor_full_cond
+                anchor_clean = (
+                    pipe._last_clean_pred.detach()
+                    if getattr(pipe, "_last_clean_pred", None) is not None
+                    else anchor_chunk.detach()
+                )
+                rollout2_chunks.append(anchor_clean)
+
+                # 4) Transient streaming_state for the streaming loop.
+                clean_actions_window_r2 = ride_actions_window[
+                    :, cf_r2 - npb : cf_r2 - npb + max_length_r2
+                ]
+                self.streaming_state = {
+                    "current_length": int(npb),
+                    "max_length": int(max_length_r2),
+                    "chunk_size": int(self.streaming_chunk_size),
+                    "shift": int(npb),
+                    "cf": int(cf_r2),
+                    "seed_latents": seed_r2,
+                    "ride_latents_window": ride_latents_window,
+                    "ride_actions_window": ride_actions_window,
+                    "clean_actions_window": clean_actions_window_r2,
+                    "prompt_embeds": prompt_embeds,
+                    "previous_chunk": None,
+                    "previous_last_rung_chunk": None,
+                    "previous_clean_chunk": anchor_clean,
+                    "abs_frame_after_seed": int(cf_r2),
+                    "anchor_chunk": anchor_chunk.detach(),
+                    "aux_clean_x_snapshot": None,
+                    "rollout2_x0": None,
+                    "rollout2_abs_frame_start": None,
+                }
+
+                # 5) Streaming loop: each iter yields chunk_size frames;
+                # snapshot only the NEW tail (info["new_frames"]).
+                while self.can_generate_more():
+                    full_chunk, info = self.generate_next_chunk(
+                        requires_grad=False,
+                        compute_baseline_mae=False,
+                    )
+                    new_frames_count = int(info.get("new_frames", npb))
+                    rollout2_chunks.append(
+                        full_chunk[:, -new_frames_count:].detach()
+                    )
+        finally:
+            # Leave pipeline caches clean for the caller's rollout-1
+            # prefill. Restore the prior streaming_state (typically None
+            # at this stage of setup_sequence).
+            pipe.reset_cache_state()
+            self.streaming_state = saved_streaming_state
+            # Defrag — prebuild's transient activations leave the heap
+            # fragmented, and the upcoming GAN engage at step 80 spikes
+            # memory by ~35GB. Without this, v24 OOMs where v25 (no
+            # prebuild) fits.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        rollout2_x0 = torch.cat(rollout2_chunks, dim=1)
+        # Park on CPU; critic step ships a per-iter slice back to GPU
+        # via the abs-position lookup. Saves ~5 MB/sample * batch_size
+        # of permanent GPU residency for the duration of the ride.
+        rollout2_x0 = rollout2_x0.detach().cpu()
+        return rollout2_x0, int(cf_r2)
 
     def _streaming_build_cond_dicts(
         self,
@@ -3682,9 +4011,15 @@ class ActionForcingDMD(SelfForcingModel):
         return (s["current_length"] + self.streaming_min_new_frame) <= s["max_length"]
 
     def ema_update_real_score_lora(self, compute_rel_l2: bool = True) -> None:
-        """Update the EMA snapshot of self.real_score's LoRA adapter
-        from the live LoRA params. No-op when
-        ``real_score_ema_weight == 0`` (default).
+        """[DEPRECATED in v24] Update the EMA snapshot of
+        self.real_score's LoRA adapter from the live LoRA params. No-op
+        when ``real_score_ema_weight == 0`` (default).
+
+        DEPRECATION: under ``fake_alt_target_mode == "rollout2_student"``
+        (v24) the EMA-real_score is no longer consumed by the alt-head
+        training path. ``_real_score_ema_swap`` becomes a no-op
+        consumer in that mode. Slated for removal in the next big
+        refactor once v23/v25 are fully retired.
 
         ``compute_rel_l2`` controls whether the diagnostic
         ‖live - ema‖₂ / ‖live‖₂ scalar is computed this call. With
@@ -4607,6 +4942,14 @@ class ActionForcingDMD(SelfForcingModel):
         # by the aux teacher schedule resolver above).
         dmd_weight_resolved = self._resolved_dmd_loss_weight(current_step)
         dmd_loss = dmd_loss * dmd_weight_resolved
+        # v28+: add the anti-collapse term UNSCALED by dmd_weight_resolved,
+        # so the std/mean floors fire at their nominal weight even when
+        # the DMD warmup ramp is still small (e.g. step 60 with 150-step
+        # warmup → 13% effective DMD weight; old code damped anti_collapse
+        # to the same fraction, defeating the gray/black collapse guard).
+        if getattr(self, "_latest_anti_collapse_total", None) is not None:
+            dmd_loss = dmd_loss + self._latest_anti_collapse_total
+            self._latest_anti_collapse_total = None
 
         # Flash-DMD: when enabled, the rolling rollout emitted a
         # per-block t=flash_dmd_gan_t grad-on forward. The chunk_size-
@@ -4629,6 +4972,22 @@ class ActionForcingDMD(SelfForcingModel):
                     "the pipeline emits the t=flash_dmd_gan_t output."
                 )
             info["flash_dmd_gan_x0"] = last_rung_chunk
+            # v29: also anchor std/mean on the flash-DMD t=gan_t rung's
+            # x0. Without this, the GAN-supervised rung is unconstrained
+            # by anti-collapse and provides a degenerate-mode escape
+            # hatch (gen learns to satisfy disc at t=gan_t while letting
+            # the random-exit rung drift toward gray/black). Same loss
+            # math, same weights, unscaled add (parallel to the
+            # random-exit anti_collapse contribution above).
+            flash_anti_collapse_total = self._compute_anti_collapse_term(
+                original_latent=last_rung_chunk,
+                gt_target=gt_target,
+                log_dict=dmd_log,
+                log_prefix="flash_",
+                ref_dtype=dmd_loss.dtype,
+            )
+            if flash_anti_collapse_total is not None:
+                dmd_loss = dmd_loss + flash_anti_collapse_total
 
         # Auxiliary online-teacher pass (option 3 of the dual-teacher
         # design). When ``real_teacher_train_online`` is True we run a
@@ -4947,6 +5306,83 @@ class ActionForcingDMD(SelfForcingModel):
             tf_kwargs["clean_x"] = sc_clean_x
             tf_kwargs["aug_t"] = sc_aug_t
 
+        # ===== v25 GT + causal-AR clean_x source replacement =====
+        # When ``critic_clean_x_source == "gt_causal_ar"``, fake_score's
+        # main critic loss flips from "denoise student x0 -> student x0"
+        # to "denoise causal-AR-noised GT -> true GT". Mirrors the v21
+        # aux-teacher pattern but on fake_score's critic step.
+        #
+        # Requires the fake-score alt head to be present (used in the
+        # auxiliary no_grad forward to produce causal_AR_GT). When alt
+        # head is unavailable OR the chunk's abs positions exceed the
+        # ride_latents_window range, falls back silently to the legacy
+        # self path.
+        critic_use_gt_causal_ar = (
+            self.critic_clean_x_source == "gt_causal_ar"
+            and self.fake_alt_head_enabled
+            and getattr(self.fake_score, "has_alt_head", False)
+        )
+        critic_main_target = chunk
+        if critic_use_gt_causal_ar:
+            abs_new_start = int(info.get("abs_frame_start", 0))
+            overlap_critic = int(info.get("overlap", 0))
+            chunk_abs_start = abs_new_start - overlap_critic
+            chunk_size_critic = int(chunk.shape[1])
+            ride = s["ride_latents_window"]
+            if (
+                chunk_abs_start < 0
+                or chunk_abs_start + chunk_size_critic > int(ride.shape[1])
+            ):
+                critic_use_gt_causal_ar = False
+            else:
+                gt_chunk = ride[
+                    :, chunk_abs_start : chunk_abs_start + chunk_size_critic
+                ].to(dtype=chunk.dtype, device=chunk.device).detach()
+                # Build causal_AR_GT via a no_grad fake_score.alt forward
+                # on noised GT at critic_timestep. Uses the same self-
+                # derived TF context built above (alt head was trained
+                # under that context).
+                aux_noise = torch.randn_like(gt_chunk)
+                noisy_gt_for_alt = self.scheduler.add_noise(
+                    gt_chunk.flatten(0, 1),
+                    aux_noise.flatten(0, 1),
+                    critic_timestep.flatten(0, 1),
+                ).unflatten(0, gt_chunk.shape[:2])
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                with torch.no_grad():
+                    fs_alt_out = self.fake_score(
+                        noisy_image_or_video=noisy_gt_for_alt,
+                        conditional_dict=cond_for_scoring,
+                        timestep=critic_timestep,
+                        compute_alt_head=True,
+                        **tf_kwargs,
+                    )
+                if isinstance(fs_alt_out, tuple) and len(fs_alt_out) >= 4:
+                    causal_AR_GT = fs_alt_out[3].detach()
+                else:
+                    causal_AR_GT = None
+                if causal_AR_GT is None:
+                    critic_use_gt_causal_ar = False
+                else:
+                    # Replace noisy_chunk source: noise(causal_AR_GT).
+                    critic_noise = torch.randn_like(causal_AR_GT)
+                    noisy_chunk = self.scheduler.add_noise(
+                        causal_AR_GT.flatten(0, 1),
+                        critic_noise.flatten(0, 1),
+                        critic_timestep.flatten(0, 1),
+                    ).unflatten(0, causal_AR_GT.shape[:2])
+                    # Replace clean_x with causal_AR_GT (un-noised) and
+                    # zero its aug_t.
+                    tf_kwargs["clean_x"] = causal_AR_GT
+                    tf_kwargs["aug_t"] = torch.zeros(
+                        (causal_AR_GT.shape[0], causal_AR_GT.shape[1]),
+                        device=causal_AR_GT.device, dtype=torch.long,
+                    )
+                    # Flip the main loss target from student chunk to
+                    # true GT.
+                    critic_main_target = gt_chunk
+
         # v21: when fake_alt head is BUILT, run fake_score with
         # compute_alt_head=True every critic iter so a single forward
         # produces BOTH the main x0 estimate (for the critic's normal
@@ -5041,8 +5477,11 @@ class ActionForcingDMD(SelfForcingModel):
                 zero_loss = zero_loss + (pred_fake_image_alt.double() * 0.0).sum()
             return zero_loss, critic_log
         gradient_mask_flat = gradient_mask.flatten(0, 1)
+        # critic_main_target = chunk under default (self mode); = gt_chunk
+        # when ``critic_clean_x_source == "gt_causal_ar"`` and the
+        # auxiliary alt forward succeeded (v25 contract).
         denoising_loss = self.denoising_loss_func(
-            x=chunk.flatten(0, 1),
+            x=critic_main_target.flatten(0, 1),
             x_pred=pred_fake_image.flatten(0, 1),
             noise=critic_noise.flatten(0, 1),
             noise_pred=pred_fake_noise,
@@ -5051,36 +5490,80 @@ class ActionForcingDMD(SelfForcingModel):
             flow_pred=flow_pred,
             gradient_mask=gradient_mask_flat,
         )
-        # ===== v21 alt-head training =====
-        # Train fake_score's alt head to predict ``ema_real_x0`` from
-        # the same noised input. The target is computed via an EXTRA
-        # no_grad EMA-swapped real_score forward at the SAME critic_
-        # noise/critic_timestep so the alt loss is consistent.
+        # ===== v21 alt-head training (v24 target swap) =====
+        # Train fake_score's alt head to predict either:
+        #   v23 ``ema_real_x0``    : EMA-swapped real_score's x0 estimate
+        #                            (computed via an extra no_grad forward
+        #                             at the SAME critic_noise/timestep).
+        #   v24 ``rollout2_student``: the pre-rolled noisier-AR student x0
+        #                            looked up by absolute frame position
+        #                            from streaming_state["rollout2_x0"].
         # The alt loss flows only into alt-head params (input detached
         # inside the model); backbone supervision stays with the main
-        # critic denoising loss.
-        # Pre-start: the alt loss is computed but multiplied by 0 to
-        # keep alt-head params in the DDP gradient bucket (zero grad,
-        # but in the bucket — no find_unused hang).
+        # critic denoising loss. Always-on training keeps head_alt's
+        # params in the DDP gradient bucket.
         if pred_fake_image_alt is not None:
-            # EMA-swapped real_score forward (no_grad). Defrag the
-            # allocator before this forward — the critic step already
-            # holds fake_score's grad-on activations; the upcoming
-            # WAN forward spikes peak by another ~5-7 GB transient
-            # that needs contiguous space.
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            with torch.no_grad():
-                with self._real_score_ema_swap():
-                    # Use the SAME clean_x context the fake_score saw —
-                    # tf_kwargs already has the right entries.
-                    _, ema_real_x0 = self.real_score(
-                        noisy_image_or_video=noisy_chunk,
-                        conditional_dict=cond_for_scoring,
-                        timestep=critic_timestep,
-                        **tf_kwargs,
-                    )
-                ema_real_x0_detached = ema_real_x0.detach()
+            s_state = self.streaming_state
+            use_rollout2_target = (
+                self.fake_alt_target_mode == "rollout2_student"
+                and s_state is not None
+                and s_state.get("rollout2_x0") is not None
+            )
+
+            valid_mask_alt = None
+            if use_rollout2_target:
+                # v24: look up rollout 2's x0 at the same absolute frame
+                # positions as ``chunk``. Skip the EMA-real_score forward.
+                r2_x0 = s_state["rollout2_x0"]
+                r2_abs_start = int(s_state["rollout2_abs_frame_start"])
+                r2_total = int(r2_x0.shape[1])
+                chunk_size_critic = int(chunk.shape[1])
+                # chunk = [previous_chunk[-overlap:], new_frames]; the
+                # NEW frames sit at info["abs_frame_start"], overlap
+                # frames precede them.
+                abs_new_start = int(info.get("abs_frame_start", 0))
+                overlap_critic = int(info.get("overlap", 0))
+                chunk_abs_start = abs_new_start - overlap_critic
+                # Build aligned target tensor + per-frame valid mask.
+                target_aligned = chunk.detach().clone()
+                valid_mask_alt = torch.zeros(
+                    (chunk.shape[0], chunk.shape[1]),
+                    dtype=torch.bool, device=chunk.device,
+                )
+                r2_x0_cast = r2_x0.to(
+                    dtype=chunk.dtype, device=chunk.device,
+                )
+                for f in range(chunk_size_critic):
+                    abs_pos = chunk_abs_start + f
+                    if r2_abs_start <= abs_pos < r2_abs_start + r2_total:
+                        slot = abs_pos - r2_abs_start
+                        target_aligned[:, f] = r2_x0_cast[:, slot]
+                        valid_mask_alt[:, f] = True
+                ema_real_x0_detached = target_aligned.detach()
+                # AND-in the v24 valid-position mask so out-of-coverage
+                # frames contribute zero to the alt loss.
+                gradient_mask_alt = gradient_mask & valid_mask_alt
+                gradient_mask_alt_flat = gradient_mask_alt.flatten(0, 1)
+                target_name_for_log = "rollout2_student"
+            else:
+                # v23: EMA-swapped real_score forward (no_grad). Defrag
+                # the allocator before this forward — the critic step
+                # already holds fake_score's grad-on activations.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                with torch.no_grad():
+                    with self._real_score_ema_swap():
+                        # Use the SAME clean_x context the fake_score
+                        # saw — tf_kwargs already has the right entries.
+                        _, ema_real_x0 = self.real_score(
+                            noisy_image_or_video=noisy_chunk,
+                            conditional_dict=cond_for_scoring,
+                            timestep=critic_timestep,
+                            **tf_kwargs,
+                        )
+                    ema_real_x0_detached = ema_real_x0.detach()
+                gradient_mask_alt_flat = gradient_mask_flat
+                target_name_for_log = "ema_real_x0"
 
             # Convert alt's x0 prediction to flow space for the
             # FlowPredLoss. Same conversion as the main head's loss
@@ -5109,32 +5592,38 @@ class ActionForcingDMD(SelfForcingModel):
                 alphas_cumprod=self.scheduler.alphas_cumprod,
                 timestep=critic_timestep.flatten(0, 1),
                 flow_pred=flow_pred_alt,
-                gradient_mask=gradient_mask_flat,
+                gradient_mask=gradient_mask_alt_flat,
             )
-            # Always-on training: alt_loss enters the backward graph
-            # every iter, so head_alt's params consistently receive a
-            # gradient (no DDP "unused params" hang). The alt's target
-            # is meaningful from step 0 (ema_real_x0 differs from
-            # pred_image regardless of EMA divergence — they have
-            # different supervision objectives).
             denoising_loss = denoising_loss + alt_loss
             with torch.no_grad():
                 critic_log["fake_alt_head_loss"] = float(alt_loss.detach().item())
-                # Diagnostic: how far alt's prediction has drifted from
-                # the main head's prediction. Zero at init (warm-start);
-                # grows as the alt head learns its different target.
                 _diff_rms = (
                     (pred_fake_image_alt.float() - pred_fake_image.float())
                     .pow(2).mean().sqrt().item()
                 )
                 critic_log["fake_alt_vs_main_rms"] = float(_diff_rms)
-                # Magnitude of the (ema_real_x0 - pred_image) target —
-                # tells you how meaningful the alt's training signal is.
                 _target_rms = (
                     (ema_real_x0_detached.float() - pred_fake_image.detach().float())
                     .pow(2).mean().sqrt().item()
                 )
                 critic_log["fake_alt_target_rms"] = float(_target_rms)
+                # v24 telemetry: which target source fed the alt loss,
+                # and what fraction of chunk frames had rollout-2
+                # coverage (1.0 = full overlap; 0.0 = nothing aligned).
+                critic_log["fake_alt_target_is_rollout2"] = (
+                    1.0 if use_rollout2_target else 0.0
+                )
+                if valid_mask_alt is not None:
+                    critic_log["fake_alt_valid_frac"] = float(
+                        valid_mask_alt.float().mean().item()
+                    )
+                else:
+                    critic_log["fake_alt_valid_frac"] = 1.0
+        # v25 telemetry: which clean_x source the critic step used this
+        # iter (1.0 = gt_causal_ar took effect; 0.0 = self path).
+        critic_log["critic_clean_x_is_gt_causal_ar"] = (
+            1.0 if critic_use_gt_causal_ar else 0.0
+        )
         return denoising_loss, critic_log
 
     # ------------------------------------------------------------------
@@ -5571,6 +6060,20 @@ class ActionForcingDMD(SelfForcingModel):
                 noise_base = causal_AR_x0.detach().to(
                     dtype=chunk.dtype, device=chunk.device,
                 )
+                # v26: also use causal_AR_x0 as the real_score's
+                # clean_x TF context, so the teacher's un-noised
+                # reference matches the source the noisy_input was
+                # built from. Aug_t is zeros — causal_AR_x0 is the
+                # alt head's x0 estimate at zero noise.
+                if self.aux_real_clean_x_source == "causal_ar_gt":
+                    clean_x_for_real = causal_AR_x0.detach().to(
+                        dtype=chunk.dtype, device=chunk.device,
+                    )
+                    aug_t_for_real = torch.zeros(
+                        (clean_x_for_real.shape[0],
+                         clean_x_for_real.shape[1]),
+                        device=chunk.device, dtype=torch.long,
+                    )
 
         # Teacher forward — full grad on LoRA params (and on chunk
         # via noisy_input when use_gt=False). When state_probe is
