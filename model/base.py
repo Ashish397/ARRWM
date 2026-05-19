@@ -233,9 +233,23 @@ class BaseModel(nn.Module):
             # stays at the spatial-only base (no action-token slots).
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(
-            model_name=self.fake_model_name, is_causal=False
-        )
+        # Mirror the real-score wrapper-shift fix for fake_score when
+        # the foreign-teacher path is active. The system's noise
+        # schedule (= generator's scheduler at cfg.timestep_shift) is
+        # used by self.scheduler.add_noise everywhere; pred_fake and
+        # pred_real must convert flow↔x0 under the SAME shift or the
+        # DMD gradient direction (pred_fake - pred_real) is
+        # miscalibrated across the two terms. Same cfg.timestep_shift
+        # override as real_score above.
+        fake_score_kwargs = {
+            "model_name": self.fake_model_name,
+            "is_causal": False,
+        }
+        if self.is_foreign_real_teacher:
+            cfg_shift = getattr(args, "timestep_shift", None)
+            if cfg_shift is not None:
+                fake_score_kwargs["timestep_shift"] = float(cfg_shift)
+        self.fake_score = WanDiffusionWrapper(**fake_score_kwargs)
         # See the matching comment on ``real_score`` above — size the
         # fake-score wrapper's seq_len to the DMD batched window.
         self.fake_score._base_seq_len = fake_scorer_num_frames * 1560

@@ -874,6 +874,42 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_normalization_enabled = bool(
             getattr(args, "dmd_normalization_enabled", True)
         )
+        # Anti-collapse variance floor. Penalizes the student's
+        # per-frame latent std falling below the GT frame's std
+        # (one-sided ReLU gap). Counters the loss-shape pull toward
+        # the teacher's gray-biased prior; only active when
+        # ``gt_target`` is available at the DMD call site (it is for
+        # every gen-step loss path that supplies gt_latents). 0.0 = off.
+        self.anti_collapse_loss_weight = float(
+            getattr(args, "anti_collapse_loss_weight", 0.0)
+        )
+        # Anti-collapse mean anchor. Companion to the std floor above:
+        # the std-only term lets the optimizer satisfy the variance
+        # floor by inflating latent magnitude, which the VAE decodes
+        # as saturated/white pixels (white-collapse — the overshoot of
+        # gray-collapse). Penalizes ``pred_mean^2`` per-(batch, frame)
+        # channel-pooled mean, pulling the latent offset toward 0 (the
+        # VAE's zero-centered prior) so std cannot be satisfied by
+        # translation. 0.0 = off (default).
+        self.anti_collapse_mean_weight = float(
+            getattr(args, "anti_collapse_mean_weight", 0.0)
+        )
+        # ``anti_collapse_mean_target``: selects what the mean anchor
+        # pulls pred_x0's per-(batch, frame) channel-pooled mean
+        # toward. "zero" (default, legacy) penalises ``pred_mean^2`` —
+        # assumes the VAE prior is zero-centered. "gt" penalises
+        # ``(pred_mean - gt_mean)^2`` — pulls toward the GT frame's
+        # actual per-(batch, frame) mean, which is the more natural
+        # anchor when GT is not zero-centered in latent space. Only
+        # consulted when ``anti_collapse_mean_weight > 0``.
+        self.anti_collapse_mean_target = str(
+            getattr(args, "anti_collapse_mean_target", "zero")
+        ).strip().lower()
+        if self.anti_collapse_mean_target not in ("zero", "gt"):
+            raise ValueError(
+                f"anti_collapse_mean_target must be 'zero' or 'gt'; "
+                f"got {self.anti_collapse_mean_target!r}."
+            )
         # ``max_gradient_chunks``: cap on how many of the leading
         # chunks (each ``num_frame_per_block`` frames) carry gradient
         # in DMD-score and aux-teacher losses. 0 = no cap (CF default,
@@ -2225,7 +2261,15 @@ class ActionForcingDMD(SelfForcingModel):
             normalizer = torch.abs(p_real).mean(
                 dim=[1, 2, 3, 4], keepdim=True,
             )
-            grad = grad / normalizer.clamp_min(1e-6)
+            # clamp_min bounds the cusp amplification when the student
+            # converges to the teacher: small p_real => big 1/normalizer
+            # => DMD gradient pulled hard toward the teacher's prior
+            # (gray-collapse signature with foreign teachers). 0.05 caps
+            # the per-sample amplification at 20x; 1e-6 was effectively
+            # unbounded (1e6x). Prefer ``dmd_normalization_enabled=false``
+            # for foreign teachers; this clamp is a defensive secondary
+            # guard.
+            grad = grad / normalizer.clamp_min(0.05)
         grad = torch.nan_to_num(grad)
 
         # Diagnostics: pred_real / pred_fake L2 norms (RMS) for the gen
@@ -2662,6 +2706,62 @@ class ActionForcingDMD(SelfForcingModel):
             (original_latent.double() - grad.double()).detach()[gradient_mask],
             reduction="mean",
         )
+
+        # Anti-collapse variance floor. ReLU(gt_std - pred_std)^2 over
+        # per-(batch, frame) latent std. Direct, soft anti-gray-collapse
+        # signal: when the student's pred_x0 contracts below the GT
+        # frame's natural spread (the textbook gray-collapse pixel
+        # signature observed at step ~30-46 of 14B-teacher runs), this
+        # term pushes back. Off by default (weight=0.0).
+        anti_collapse_any = (
+            self.anti_collapse_loss_weight > 0.0
+            or self.anti_collapse_mean_weight > 0.0
+        )
+        if anti_collapse_any and gt_target is not None:
+            gt_for_std = gt_target.to(
+                dtype=original_latent.dtype,
+                device=original_latent.device,
+            )
+            if gt_for_std.shape == original_latent.shape:
+                if self.anti_collapse_loss_weight > 0.0:
+                    s_pred = original_latent.float().std(dim=[2, 3, 4])
+                    s_gt = gt_for_std.float().std(dim=[2, 3, 4]).detach()
+                    deficit = F.relu(s_gt - s_pred)
+                    anti_collapse_loss = deficit.pow(2).mean()
+                    dmd_log_dict["anti_collapse_loss_raw"] = (
+                        anti_collapse_loss.detach()
+                    )
+                    dmd_log_dict["anti_collapse_pred_std_mean"] = (
+                        s_pred.detach().mean()
+                    )
+                    dmd_log_dict["anti_collapse_gt_std_mean"] = s_gt.mean()
+                    dmd_loss = dmd_loss + (
+                        self.anti_collapse_loss_weight
+                        * anti_collapse_loss.to(dmd_loss.dtype)
+                    )
+                if self.anti_collapse_mean_weight > 0.0:
+                    m_pred = original_latent.float().mean(dim=[2, 3, 4])
+                    if self.anti_collapse_mean_target == "gt":
+                        m_gt = gt_for_std.float().mean(
+                            dim=[2, 3, 4]
+                        ).detach()
+                        mean_sq_loss = (m_pred - m_gt).pow(2).mean()
+                        dmd_log_dict["anti_collapse_gt_mean_mean"] = (
+                            m_gt.mean()
+                        )
+                    else:
+                        mean_sq_loss = m_pred.pow(2).mean()
+                    dmd_log_dict["anti_collapse_mean_sq_raw"] = (
+                        mean_sq_loss.detach()
+                    )
+                    dmd_log_dict["anti_collapse_pred_mean_mean"] = (
+                        m_pred.detach().mean()
+                    )
+                    dmd_loss = dmd_loss + (
+                        self.anti_collapse_mean_weight
+                        * mean_sq_loss.to(dmd_loss.dtype)
+                    )
+
         return dmd_loss, dmd_log_dict
 
     # ------------------------------------------------------------------

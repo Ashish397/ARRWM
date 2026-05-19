@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-14B-teacher
+#SBATCH --job-name=action-forcing-phase3-14B-teacher-NR
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -58,7 +58,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher_NR
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -142,9 +142,16 @@ srun torchrun \
     warm_start_init=false \
     gan_enabled=false \
     gan_loss_weight=0.0 \
-    maniqa_approx_loss_weight=0.0 \
+    maniqa_approx_loss_weight=1.0 \
+    maniqa_n_frames=84 \
+    maniqa_n_patches_per_frame=8 \
+    maniqa_metric_name=maniqa-pipal \
+    perceptual_approx_warmup_steps=0 \
+    perceptual_approx_ramp_steps=15 \
+    flash_dmd_enabled=true \
+    flash_dmd_gan_t=60 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_14B_teacher_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_14B_teacher_NR_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

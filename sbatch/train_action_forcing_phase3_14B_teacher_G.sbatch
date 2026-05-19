@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-14B-teacher
+#SBATCH --job-name=action-forcing-phase3-14B-teacher-G
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -57,12 +57,21 @@ set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher
-WANDB_SAVE_DIR=wandb
+# ---- SAM2 paths (required when gan_enabled=true) ----
+GAN_SAM2_CKPT=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_base_plus.pt
+GAN_SAM2_CFG=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_b+.yaml
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
+
+# Pre-flight SAM2 sanity checks (fail-fast on missing prereqs).
+python -c "import sam2" 2>/dev/null || { echo "ERROR: sam2 package not installed."; exit 1; }
+[ -f "$GAN_SAM2_CKPT" ] || { echo "ERROR: SAM2 checkpoint not found at $GAN_SAM2_CKPT"; exit 1; }
+[ -f "$GAN_SAM2_CFG" ] || { echo "ERROR: SAM2 config not found at $GAN_SAM2_CFG"; exit 1; }
+
+CONFIG=configs/action_forcing_phase1_gan.yaml
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher_G
+WANDB_SAVE_DIR=wandb
 
 CACHE_DIR='/scratch/u6ex/as1748.u6ex/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
@@ -140,11 +149,26 @@ srun torchrun \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     warm_start_init=false \
-    gan_enabled=false \
-    gan_loss_weight=0.0 \
+    gan_enabled=true \
+    gan_loss_weight=1.0 \
+    gan_backbone=sam2_pixel \
+    gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
+    gan_sam2_config_path=$GAN_SAM2_CFG \
+    gan_sam2_resolution=512 \
+    gan_sam2_preserve_aspect=false \
+    gan_sam2_pad_to_square=true \
+    gan_sam2_distilled_critic=true \
+    gan_critic_warmup_steps=10 \
+    gan_warmup_steps=80 \
+    gan_sam2_frame_pool=none \
+    gan_sam2_encoder_chunk_size=6 \
+    gan_critic_dense_distillation=true \
+    flash_dmd_enabled=false \
     maniqa_approx_loss_weight=0.0 \
+    dmd_normalization_enabled=false \
+    anti_collapse_loss_weight=1.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_14B_teacher_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_14B_teacher_G_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

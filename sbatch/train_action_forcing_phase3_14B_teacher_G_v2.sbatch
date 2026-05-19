@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-14B-teacher
+#SBATCH --job-name=action-forcing-phase3-14B-teacher-G-v2
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,58 +11,43 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 14B-teacher: replace the 1.3B+v14-LoRA real_score with the
-# frozen Wan2.1-T2V-14B as the DMD target. Same recipe as
-# Causal-Forcing's ``causal_forcing_dmd_chunkwise.yaml`` (which sets
-# ``real_name: Wan2.1-T2V-14B``): the 14B is a drop-in replacement
-# for the bidirectional T2V real_score. Student stays at 1.3B
-# (causal). fake_score stays at 1.3B.
+# Phase-3 14B-teacher G v2: identical to ``train_action_forcing_phase3_14B_teacher_G.sbatch``
+# (j4625936), with the SOLE addition of ``anti_collapse_mean_weight=0.3``.
 #
-# Why T2V-14B (not I2V-14B): bidirectional T2V + teacher-forcing
-# ``clean_x`` provides 9 frames of seed context to the teacher (all
-# 3 seed chunks). I2V-14B was trained on single-frame Y conditioning
-# and would only use 1 of those 9 frames — strictly less context.
-# Multi-frame Y would be OOD for I2V-as-shipped (would need teacher
-# retraining). T2V+TF is the canonical Causal-Forcing recipe.
+# Why: v1 (j4625936) successfully blocked gray-collapse via the
+# ``anti_collapse_loss_weight=1.0`` std floor, but the run then drifted
+# into WHITE-collapse — the std-only term lets the optimizer satisfy
+# the variance floor by inflating latent magnitude, which the VAE
+# decodes as saturated/white pixels. The mean anchor ``pred_mean^2``
+# pulls the per-frame latent offset toward 0 (the VAE's zero-centered
+# prior), so std can no longer be satisfied by translation. Soft,
+# scalar-only (one number per (batch, frame)); does NOT supervise
+# pixel-wise.
 #
-# Pure DMD, no other losses:
-#   GAN:           OFF
-#   MANIQA NR-IQA: OFF
-#   aux teacher:   OFF
-#   online teacher train: OFF (FROZEN 14B; nothing to update)
-#   warm_start:    OFF
-#
-# Model dir: /scratch/u6ex/as1748.u6ex/frodobots/Wan2.1-T2V-14B/
-#   - safetensors: symlinked from
-#     /lus/lfs1aip2/projects/public/u6cl/koichi/Wan-AI/Wan2.1-T2V-14B/
-#   - config.json: downloaded from huggingface.co/Wan-AI/Wan2.1-T2V-14B
-#   - index.json:  downloaded from huggingface.co/Wan-AI/Wan2.1-T2V-14B
-#   - T5 + VAE:    symlinked from Wan2.1-T2V-1.3B (model-agnostic)
-#
-# Memory plan: 14B in bf16 is ~28GB params alone. With gradient
-# checkpointing on real_score (no grad needed since FROZEN; ckpt
-# trades activation memory for recompute), the 21-frame forward
-# should fit alongside the 1.3B student + 1.3B fake_score in the
-# 95GB H100 cap. ``v14_teacher_checkpoint=null`` skips the v14 LoRA
-# load (which was trained against the 1.3B base and is incompatible
-# with the 14B's weight names anyway).
-#
-# Misc:
-#   * 21-frame rollout, 200-step max.
-#   * dfake_gen_update_ratio=5 (Causal-Forcing parity).
-#   * wandb_project=longlive-phase-3.
+# gt_latent_mae_loss_weight / gt_latent_mse_loss_weight remain OFF — we
+# explicitly do NOT want the full pixel-wise GT-supervised path, which
+# would override DMD at meaningful weights.
 # =====================================================================
 
 set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher
-WANDB_SAVE_DIR=wandb
+# ---- SAM2 paths (required when gan_enabled=true) ----
+GAN_SAM2_CKPT=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_base_plus.pt
+GAN_SAM2_CFG=/scratch/u6ex/as1748.u6ex/ARRWM/sam2_checkpoints/sam2.1_hiera_b+.yaml
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
+
+# Pre-flight SAM2 sanity checks (fail-fast on missing prereqs).
+python -c "import sam2" 2>/dev/null || { echo "ERROR: sam2 package not installed."; exit 1; }
+[ -f "$GAN_SAM2_CKPT" ] || { echo "ERROR: SAM2 checkpoint not found at $GAN_SAM2_CKPT"; exit 1; }
+[ -f "$GAN_SAM2_CFG" ] || { echo "ERROR: SAM2 config not found at $GAN_SAM2_CFG"; exit 1; }
+
+CONFIG=configs/action_forcing_phase1_gan.yaml
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher_G_v2
+WANDB_SAVE_DIR=wandb
 
 CACHE_DIR='/scratch/u6ex/as1748.u6ex/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
@@ -86,12 +71,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 14B-TEACHER (pure DMD) on $(date)"
+echo "Starting Phase-3 14B-TEACHER G v2 (DMD + GAN + anti-collapse std+mean) on $(date)"
 echo "  * real_score: Wan2.1-T2V-14B FROZEN (no v14 LoRA)."
 echo "  * fake_score: Wan2.1-T2V-1.3B (default)."
 echo "  * generator: 1.3B causal student (default)."
 echo "  * 21-frame student rollout, 200-step max."
-echo "  * GAN OFF, MANIQA OFF, aux teacher OFF, online teacher OFF."
+echo "  * GAN ON (sam2_pixel, res=512), MANIQA OFF, aux teacher OFF, online teacher OFF."
+echo "  * anti_collapse_loss_weight=1.0 (std floor, gray-collapse guard)."
+echo "  * anti_collapse_mean_weight=1.0 (mean anchor, NEW — white-collapse guard)."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -140,11 +127,27 @@ srun torchrun \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     warm_start_init=false \
-    gan_enabled=false \
-    gan_loss_weight=0.0 \
+    gan_enabled=true \
+    gan_loss_weight=1.0 \
+    gan_backbone=sam2_pixel \
+    gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
+    gan_sam2_config_path=$GAN_SAM2_CFG \
+    gan_sam2_resolution=512 \
+    gan_sam2_preserve_aspect=false \
+    gan_sam2_pad_to_square=true \
+    gan_sam2_distilled_critic=true \
+    gan_critic_warmup_steps=10 \
+    gan_warmup_steps=80 \
+    gan_sam2_frame_pool=none \
+    gan_sam2_encoder_chunk_size=6 \
+    gan_critic_dense_distillation=true \
+    flash_dmd_enabled=false \
     maniqa_approx_loss_weight=0.0 \
+    dmd_normalization_enabled=false \
+    anti_collapse_loss_weight=1.0 \
+    anti_collapse_mean_weight=1.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_14B_teacher_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_14B_teacher_G_v2_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
