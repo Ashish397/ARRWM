@@ -659,6 +659,45 @@ class RollingStaircaseDMDTrainer:
             )
 
         # ------------------------------------------------------------------
+        # v27B ForwardNoiser optimizer. Separate from fake_score so the
+        # noiser has its own LR / grad-clip schedule. The noiser's loss
+        # is added into ``critic_loss`` upstream, so its params share
+        # the same backward call as fake_score — we just need a separate
+        # optimizer to step them.
+        # ------------------------------------------------------------------
+        self.forward_noiser_optimizer = None
+        self.forward_noiser_max_grad_norm = float(
+            getattr(cfg, "forward_noiser_max_grad_norm", self.max_grad_norm)
+        )
+        if (
+            bool(getattr(cfg, "forward_noiser_enabled", False))
+            and getattr(self.model, "forward_noiser", None) is not None
+        ):
+            fn_lr = float(getattr(cfg, "forward_noiser_lr", 5e-5))
+            fn_wd = float(getattr(cfg, "forward_noiser_weight_decay", 0.0))
+            fn_betas = tuple(
+                getattr(cfg, "forward_noiser_betas",
+                        getattr(cfg, "fake_betas",
+                                getattr(cfg, "betas", [0.9, 0.999])))
+            )
+            fn_eps = float(
+                getattr(cfg, "forward_noiser_eps",
+                        getattr(cfg, "eps", 1e-8))
+            )
+            fn_params = [
+                p for p in self.model.forward_noiser.parameters()
+                if p.requires_grad
+            ]
+            if fn_params:
+                self.forward_noiser_optimizer = torch.optim.AdamW(
+                    fn_params,
+                    lr=fn_lr,
+                    betas=fn_betas,
+                    eps=fn_eps,
+                    weight_decay=fn_wd,
+                )
+
+        # ------------------------------------------------------------------
         # Generator EMA (mirrors Causal-Forcing's ``EMA_FSDP`` API but uses
         # a CPU fp32 shadow over the unwrapped DiT's trainable params, since
         # we run DDP and don't need the FSDP summon dance).

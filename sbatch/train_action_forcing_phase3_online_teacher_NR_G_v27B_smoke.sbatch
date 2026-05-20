@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v24
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v27B-smoke
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=02:00:00
+#SBATCH --time=00:35:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
@@ -118,23 +118,22 @@
 #
 # v21 STAGED SCHEDULE
 # -------------------
-#  step 0-19  : EMA-real diverges (real_score_ema_weight=0.95, faster
-#               than v18's 0.99). Alt head is built but its loss is
-#               GATED to zero (multiplier 0) so DDP gradient bucket
-#               stays consistent without find_unused_parameters=True.
-#  step 20    : ``fake_alt_head_start_step`` — alt loss multiplier
-#               flips to 1.0, alt head starts training against
-#               ema_real_x0 every critic iter.
-#  step 40    : ``fake_alt_apply_start_step`` — aux teacher pass
-#               starts consuming alt's output: noise_base for the
-#               real_score forward becomes ``alt(noised_gt) x0``
-#               instead of gt_target. Real_score sees AR-shaped
-#               noised input, target stays true GT.
-#  step 60    : ``dmd_loss_start_step`` — DMD gen-side gradient turns
-#               on, ramps over 150 steps (same as v18).
-#  step 80    : ``gan_disc_start_step`` = ``gan_critic_warmup_steps``
+# v26 SCHEDULE — fronted (no EMA-real warmup needed)
+# --------------------------------------------------
+# v26's alt-head targets rollout2_student (v24 mode), not ema_real_x0,
+# so there's no EMA-real divergence window to wait for. The rollout2
+# target is meaningful from iter 1, so alt training AND aux-teacher
+# consumption start at step 0.
+#  step 0     : ``fake_alt_head_start_step`` AND ``fake_alt_apply_
+#               start_step`` — alt loss trains from iter 1, and the
+#               aux teacher pass starts consuming alt's output as
+#               noise_base immediately. Real_score sees AR-shaped
+#               noised input from step 0; target stays true GT.
+#  step 20    : ``dmd_loss_start_step`` — DMD gen-side gradient turns
+#               on, ramps over 150 steps.
+#  step 40    : ``gan_disc_start_step`` = ``gan_critic_warmup_steps``
 #               — GAN engages, gen-side ramps quadratically over 25
-#               steps (= plateau at step 105).
+#               steps (= plateau at step 65).
 #
 # v21 vs v20 — knob deltas
 # ------------------------
@@ -541,7 +540,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v24
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v27B_smoke
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -671,7 +670,7 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=250 \
+    max_steps=60 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -701,18 +700,26 @@ srun torchrun \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
     dmd_loss_weight=0.5 \
-    dmd_loss_start_step=60 \
+    dmd_loss_start_step=20 \
     fake_alt_head_enabled=true \
-    fake_alt_head_start_step=20 \
-    fake_alt_apply_start_step=40 \
+    fake_alt_head_start_step=0 \
+    fake_alt_apply_start_step=0 \
     fake_alt_target_mode=rollout2_student \
     fake_alt_rollout2_num_seed_chunks=2 \
-    critic_clean_x_source=gt_causal_ar \
+    forward_noiser_enabled=true \
+    forward_noiser_hidden_dim=512 \
+    forward_noiser_num_blocks=4 \
+    forward_noiser_max_carn_step=8 \
+    forward_noiser_loss_weight=1.0 \
+    forward_noiser_apply_in_aux=true \
+    forward_noiser_lr=5e-5 \
+    critic_clean_x_source=self \
+    aux_real_clean_x_source=causal_AR_GT \
     dmd_normalization_enabled=false \
     dmd_loss_warmup_steps=150 \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
-    real_score_ema_weight=0.95 \
+    real_score_ema_weight=0.0 \
     gan_loss_weight=0.2 \
     gan_lr=5e-5 \
     gan_backbone=sam2_pixel \
@@ -722,8 +729,8 @@ srun torchrun \
     gan_sam2_preserve_aspect=false \
     gan_sam2_pad_to_square=true \
     gan_sam2_distilled_critic=true \
-    gan_critic_warmup_steps=80 \
-    gan_disc_start_step=80 \
+    gan_critic_warmup_steps=40 \
+    gan_disc_start_step=40 \
     gan_warmup_steps=25 \
     gan_warmup_shape=quadratic \
     perceptual_approx_warmup_steps=0 \
@@ -742,9 +749,9 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.2 \
+    anti_collapse_loss_weight=0.8 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=3 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v24_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v27B_smoke_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

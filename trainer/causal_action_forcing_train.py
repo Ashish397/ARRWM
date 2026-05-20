@@ -382,8 +382,49 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     broadcast_buffers=False,
                 )
                 model.real_score.model = self.real_score_ddp  # type: ignore
+
+            # v27B: ForwardNoiser DDP wrap. The noiser is a separate
+            # small ConvNet trained on rollout1→rollout2 chunk pairs
+            # with CARN-step conditioning.
+            # find_unused_parameters=True (defensive): the critic-step
+            # loss path has multiple early-return guards (no rollout2
+            # stash, no aligned pairs, chunk alignment edge cases). In
+            # principle these are rank-symmetric, but with =False any
+            # rank-divergent return path would AllReduce-hang. =True
+            # makes DDP traverse the autograd graph to find used params
+            # per iter — small perf cost on a 30M-param noiser, zero
+            # hang risk.
+            self.forward_noiser_ddp: Optional[DDP] = None
+            if (
+                bool(getattr(self.config, "forward_noiser_enabled", False))
+                and getattr(model, "forward_noiser", None) is not None
+            ):
+                # Match the rest of the model's dtype (bf16) so 3D conv
+                # bias matches input dtype. Without this, forward_noiser
+                # stays in fp32 (default nn.Module dtype) while inputs
+                # arrive as bf16 → RuntimeError on Conv3d bias.
+                # Derive the dtype from fake_score's parameters so we
+                # automatically follow whatever precision the run uses.
+                noiser_dtype = torch.float32
+                fs_model = getattr(model.fake_score, "model", None)
+                if fs_model is not None:
+                    fs_param = next(fs_model.parameters(), None)
+                    if fs_param is not None:
+                        noiser_dtype = fs_param.dtype
+                model.forward_noiser = model.forward_noiser.to(
+                    device=self.device, dtype=noiser_dtype,
+                )
+                self.forward_noiser_ddp = DDP(
+                    model.forward_noiser,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=True,
+                    broadcast_buffers=False,
+                )
+                model.forward_noiser = self.forward_noiser_ddp  # type: ignore
         else:
             self.real_score_ddp = None
+            self.forward_noiser_ddp = None
 
         # ------------------------------------------------------------------
         # Auxiliary action critic (CF-parity ActionCritic, frozen teacher
@@ -2066,6 +2107,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.fake_optimizer.step()
                 self.fake_optimizer.zero_grad(set_to_none=True)
 
+            # v27B forward-noiser optimizer step.
+            forward_noiser_grad_norm_val = 0.0
+            if getattr(self, "forward_noiser_optimizer", None) is not None:
+                fn_params_with_grad = [
+                    p for p in
+                    self.forward_noiser_optimizer.param_groups[0]["params"]
+                    if p.grad is not None
+                ]
+                if fn_params_with_grad:
+                    fngn = torch.nn.utils.clip_grad_norm_(
+                        fn_params_with_grad,
+                        max_norm=self.forward_noiser_max_grad_norm,
+                    )
+                    forward_noiser_grad_norm_val = (
+                        float(fngn.item()) if torch.is_tensor(fngn)
+                        else float(fngn)
+                    )
+                    self.forward_noiser_optimizer.step()
+                self.forward_noiser_optimizer.zero_grad(set_to_none=True)
+                # Surface grad norm to wandb via out dict if available.
+                if isinstance(generator_log_dict, dict):
+                    generator_log_dict["forward_noiser_grad_norm"] = (
+                        forward_noiser_grad_norm_val
+                    )
+
             # ----- State-probe optimizer step (LoRA-side aux loss) -----
             # Mirrors the fake/real_teacher pattern: clip → step → zero.
             # Probe gets gradient ONLY when the LoRA aux pass populated
@@ -2368,6 +2434,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         ("pred_fake", "pred_fake", _suffix_real or ""),
                         ("clean_x_fake", "clean_x_fake", "fake_score conditioning"),
                         ("clean_x_real", "clean_x_real", f"real_score conditioning ({_ctx})"),
+                        # v27B: aux-teacher TF context + noisy_input source
+                        ("clean_x_aux", "clean_x_aux",
+                         "aux_teacher TF context (post forward-noiser/alt-head override)"),
+                        ("aux_noise_base", "aux_noise_base",
+                         "aux_teacher noise_base (= causal_AR_GT when fn/alt active, else gt_target)"),
                     ):
                         _t_lat = eval_latents.get(_key)
                         if _t_lat is None or not torch.is_tensor(_t_lat):

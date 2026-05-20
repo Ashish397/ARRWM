@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v26
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v27C
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,10 +11,75 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v23: v22 with the mean anchor DROPPED
-# and the std-floor weight reduced from 1.0 to 0.2. Goal: isolate
-# the gray-collapse guard alone at a softer weight, without the
-# white-collapse mean anchor that was added in v22.
+# Phase-3 online_teacher_NR_G_v27B: v27 + LEARNED FORWARD-NOISER for
+# the CARN (causal-AR-noise) increment, replacing the v21 alt-head's
+# failed application path.
+#
+# v27B vs v27 — knob deltas
+# -------------------------
+#   forward_noiser_enabled               : false -> true  (NEW)
+#   forward_noiser_hidden_dim            : -     -> 512
+#   forward_noiser_num_blocks            : -     -> 4
+#   forward_noiser_max_carn_step         : -     -> 8
+#   forward_noiser_loss_weight           : -     -> 1.0
+#   forward_noiser_apply_in_aux          : -     -> true
+#   forward_noiser_lr                    : -     -> 5e-5
+# All other v27 knobs preserved verbatim.
+#
+# THE PROBLEM v27B SOLVES
+# -----------------------
+# Diagnostic data from v21..v28 wandb showed
+# ``fake_alt_causal_AR_dir_rms = 0.0`` across the entire run history —
+# meaning the alt-head's application output is ≈ GT every iter. The
+# online real_score's LoRA has therefore been training on TRIVIAL GT
+# denoising (input ≈ noise(GT), target = GT), not on the causal-AR-
+# shaped inputs it sees at DMD inference. That's why pred_real_lora
+# always looked sharp (it sees its training distribution) and pred_real
+# was blurry (DMD inference distribution diverges from the LoRA's
+# training).
+#
+# Root cause: the alt-head is a small output projection on the
+# fake_score backbone, trained on noise(student_chunk) and applied to
+# noise(gt_target). Backbone is trained as a student-distribution
+# denoiser; applied to clean GT it produces ≈ denoised(GT) ≈ GT. The
+# small alt-head projection has no capacity to inject AR-drift that
+# isn't already in the backbone's representation.
+#
+# v27B FIX — LEARNED FORWARD-NOISER
+# ---------------------------------
+# Dedicated 3D ConvNet (NOT sharing fake_score's backbone) trained
+# explicitly on the rollout1→rollout2 mapping. Rollout 2 has exactly
+# +1 CARN step at each temporal position vs rollout 1, so learning
+# this mapping = learning one CARN-noise step. Architecture:
+#   * ~30M params @ hidden_dim=512, 4 ResBlocks
+#   * Factorized spatial (1x3x3) + temporal (3x1x1) 3D convs
+#   * FiLM-style CARN-step conditioning (sinusoidal embed + per-block
+#     scale/shift) so the noiser learns step-dependent drift
+#   * Zero-init final projection → starts as identity F(x, n) = x
+#
+# At apply time in the aux-teacher path, F is applied iteratively to
+# GT chunks, each chunk stepped up to its target CARN level. Real_score
+# is then trained on a noisy(causal_AR_GT) input distribution that
+# matches what it sees at DMD inference. Replaces the v21 alt-head
+# causal_AR_x0 path (which is auto-disabled when forward_noiser is
+# applied each iter).
+#
+# AUDIT FIXES BAKED IN (from auditor review of initial v27B impl)
+# --------------------------------------------------------------
+#   1. ForwardNoiser DDP uses find_unused_parameters=True (defensive
+#      against rank-divergent early-return paths in the noiser loss).
+#   2. Explicit CARN_step=0 training pair: rollout 1 seed-last-chunk
+#      (clean GT) → rollout 2 anchor. The streaming critic window
+#      never covers this transition on its own; we inject it per iter
+#      so the noiser's first iteration (every chunk starts at CARN=0
+#      at application time) is well-trained.
+#   3. Visualization: clean_x_aux + aux_noise_base stashed for the
+#      eval video logger so we can visually verify what real_score's
+#      training input looks like each iter (should evolve from
+#      ≈GT toward AR-noisy as the noiser learns).
+#
+# LEGACY v23 CONTEXT (anti-collapse knobs preserved from v27)
+# -----------------------------------------------------------
 #
 # v23 vs v22 — knob deltas
 # ------------------------
@@ -540,7 +605,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v26
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v27C
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -583,7 +648,7 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6,max_split_size_mb:512
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
@@ -706,14 +771,21 @@ srun torchrun \
     fake_alt_apply_start_step=0 \
     fake_alt_target_mode=rollout2_student \
     fake_alt_rollout2_num_seed_chunks=2 \
+    forward_noiser_enabled=true \
+    forward_noiser_hidden_dim=512 \
+    forward_noiser_num_blocks=4 \
+    forward_noiser_max_carn_step=8 \
+    forward_noiser_loss_weight=1.0 \
+    forward_noiser_apply_in_aux=true \
+    forward_noiser_lr=5e-5 \
     critic_clean_x_source=self \
     aux_real_clean_x_source=causal_AR_GT \
     dmd_normalization_enabled=false \
     dmd_loss_warmup_steps=150 \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
-    real_score_ema_weight=0.95 \
-    gan_loss_weight=0.2 \
+    real_score_ema_weight=0.0 \
+    gan_loss_weight=0.05 \
     gan_lr=5e-5 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
@@ -742,9 +814,9 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.2 \
+    anti_collapse_loss_weight=0.8 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=3 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v26_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v27C_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

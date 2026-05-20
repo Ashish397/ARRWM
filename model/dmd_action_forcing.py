@@ -603,6 +603,100 @@ class ActionForcingDMD(SelfForcingModel):
                 "aux_real_clean_x_source must be 'default' or "
                 f"'causal_AR_GT'; got {self.aux_real_clean_x_source!r}."
             )
+        # ===== v29 DMD lookback =====
+        # When > 0, gradients from chunk_k's DMD loss flow back through
+        # chunk_(k-1)'s random-exit forward via the overlap region. This
+        # is truncated BPTT for the AR rollout: chunk N's quality
+        # depends on chunk N-1's KV context, so DMD on chunk N should
+        # also assign credit to chunk N-1's params (via student weights
+        # shared across both forwards).
+        #
+        # Implementation: in generate_next_chunk, the previous_chunk
+        # stash partially detaches — the overlap region (early frames)
+        # is detached to break the cascade past 1 step back, while the
+        # last new_frames region stays un-detached so the next iter's
+        # cat-into-overlap carries chunk_k's exit-rung graph. With
+        # generator_loss.backward(retain_graph=True) already in place,
+        # the previous iter's graph survives long enough for the next
+        # iter's backward to walk through it.
+        #
+        # Memory cost: ~+1 chunk of activations held at any time. With
+        # activation checkpointing already on the exit rung, this is
+        # ~5-7 GB per rank at our settings. Compute cost: ~+30-50% per
+        # gen backward (re-walks chunk_(k-1)'s exit-rung graph each iter).
+        #
+        # 0 = lookback OFF (current/default behavior). 1 = 1-step
+        # lookback. Higher values not yet supported (would require
+        # multi-chunk retain_graph chaining + memory-bound).
+        self.dmd_lookback_chunks = int(
+            getattr(args, "dmd_lookback_chunks", 0)
+        )
+        if self.dmd_lookback_chunks < 0 or self.dmd_lookback_chunks > 1:
+            raise ValueError(
+                "dmd_lookback_chunks must be 0 or 1 (multi-step "
+                "lookback not yet supported); got "
+                f"{self.dmd_lookback_chunks}."
+            )
+        # ===== v27B forward noiser =====
+        # Dedicated small ConvNet trained as a 1-step CARN forward-
+        # noiser (rollout-1 chunk → rollout-2 chunk = +1 CARN step).
+        # At apply time it's iteratively applied to GT chunks (chunkwise,
+        # different CARN levels per chunk position) to synthesize a
+        # CARN-shaped GT video that the online real_score's aux-teacher
+        # pass uses as its noisy_input source. Replaces the v21 alt-head
+        # application path (causal_AR_dir_rms=0 pathology).
+        # 0 = off (default). Requires fake_alt_target_mode=rollout2_student
+        # (or any mode where rollout2 chunks are available in the stash).
+        self.forward_noiser_enabled = bool(
+            getattr(args, "forward_noiser_enabled", False)
+        )
+        self.forward_noiser_hidden_dim = int(
+            getattr(args, "forward_noiser_hidden_dim", 512)
+        )
+        self.forward_noiser_num_blocks = int(
+            getattr(args, "forward_noiser_num_blocks", 4)
+        )
+        self.forward_noiser_max_carn_step = int(
+            getattr(args, "forward_noiser_max_carn_step", 16)
+        )
+        # Loss weight for the forward noiser's training MSE (predicted
+        # rollout2 chunk vs actual rollout2 chunk at +1 CARN level).
+        self.forward_noiser_loss_weight = float(
+            getattr(args, "forward_noiser_loss_weight", 1.0)
+        )
+        # When True, the aux-teacher pass consumes the forward noiser's
+        # iteratively-applied output as its causal_AR_GT source,
+        # overriding the v21 alt-head application path.
+        self.forward_noiser_apply_in_aux = bool(
+            getattr(args, "forward_noiser_apply_in_aux", True)
+        )
+        self.forward_noiser = None
+        if self.forward_noiser_enabled:
+            from model.forward_noiser import ForwardNoiser
+            # Infer latent channels from the wrapped generator's
+            # in_dim; default to 16 (Wan2.1 VAE).
+            latent_ch = int(
+                getattr(getattr(self.generator, "model", None), "in_dim", 16)
+            )
+            self.forward_noiser = ForwardNoiser(
+                latent_channels=latent_ch,
+                hidden_dim=self.forward_noiser_hidden_dim,
+                num_blocks=self.forward_noiser_num_blocks,
+                max_carn_step=self.forward_noiser_max_carn_step,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                logging.info(
+                    "[ActionForcingDMD] ForwardNoiser ENABLED "
+                    "(latent_ch=%d, hidden=%d, blocks=%d, params=%.2fM, "
+                    "max_carn=%d, loss_w=%.2f, apply_in_aux=%s).",
+                    latent_ch,
+                    self.forward_noiser_hidden_dim,
+                    self.forward_noiser_num_blocks,
+                    self.forward_noiser.num_params() / 1e6,
+                    self.forward_noiser_max_carn_step,
+                    self.forward_noiser_loss_weight,
+                    str(self.forward_noiser_apply_in_aux),
+                )
 
         # Hard start-step gate for the aux teacher pass. Below this
         # step the aux pass does not fire at all (no real_score
@@ -3785,6 +3879,199 @@ class ActionForcingDMD(SelfForcingModel):
             "rollout2_abs_frame_start": rollout2_abs_frame_start,
         }
 
+    def _compute_forward_noiser_loss(
+        self,
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+        critic_log: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        """Train the forward noiser: predict rollout-2 chunks (at CARN
+        level n+1) from rollout-1 chunks (at CARN level n) at the same
+        abs frame positions, with per-chunk CARN-step conditioning.
+
+        Returns the unscaled MSE loss (None if no aligned pair was
+        available this iter — e.g. chunk fell entirely outside
+        rollout-2's coverage).
+        """
+        if self.forward_noiser is None:
+            return None
+        s = self.streaming_state
+        if s is None:
+            return None
+        r2_x0 = s.get("rollout2_x0")
+        r2_abs_start = s.get("rollout2_abs_frame_start")
+        if r2_x0 is None or r2_abs_start is None:
+            return None
+        r2_abs_start = int(r2_abs_start)
+        r2_total = int(r2_x0.shape[1])
+
+        npb = int(self.num_frame_per_block)
+        chunk_size_critic = int(chunk.shape[1])
+        if chunk_size_critic % npb != 0:
+            return None
+        n_chunks = chunk_size_critic // npb
+        abs_new_start = int(info.get("abs_frame_start", 0))
+        overlap_critic = int(info.get("overlap", 0))
+        chunk_abs_start = abs_new_start - overlap_critic
+        # Streaming invariant: abs positions are npb-aligned. Floor-div
+        # would silently drop a remainder otherwise, producing wrong
+        # CARN levels. Assert to surface any violation loudly.
+        if chunk_abs_start % npb != 0:
+            raise RuntimeError(
+                f"_compute_forward_noiser_loss: chunk_abs_start="
+                f"{chunk_abs_start} not divisible by npb={npb}. Streaming "
+                "alignment invariant violated — investigate "
+                "abs_frame_start ({abs_new_start}) and overlap "
+                "({overlap_critic}) sources."
+            )
+        num_seed_r1 = int(self.dmd_context_clean_frames // npb)
+
+        # Iterate per chunk in the window. Each chunk has its own CARN
+        # level (based on its abs position) and its own rollout-2
+        # counterpart looked up by abs frame position.
+        losses: list = []
+        for c in range(n_chunks):
+            f_start = c * npb
+            f_end = f_start + npb
+            abs_f_start = chunk_abs_start + f_start
+            abs_f_end = chunk_abs_start + f_end
+            if (abs_f_start < r2_abs_start
+                    or abs_f_end > r2_abs_start + r2_total):
+                continue
+            slot_start = abs_f_start - r2_abs_start
+            slot_end = slot_start + npb
+            target_r2 = r2_x0[:, slot_start:slot_end].to(
+                dtype=chunk.dtype, device=chunk.device,
+            ).detach()
+            input_r1 = chunk[:, f_start:f_end].detach()
+            chunk_abs_idx = abs_f_start // npb
+            carn_r1 = max(0, chunk_abs_idx - (num_seed_r1 - 1))
+            carn_step = torch.full(
+                (chunk.shape[0],), carn_r1,
+                dtype=torch.long, device=chunk.device,
+            )
+            predicted = self.forward_noiser(
+                input_r1, carn_step, residual=True,
+            )
+            losses.append(F.mse_loss(predicted, target_r2))
+
+        # v27B audit-fix #2: explicit CARN_step=0 training pair.
+        # The streaming critic window only covers the ROLLED region
+        # (positions >= cf, chunk_idx >= num_seed_r1). At those
+        # positions rollout 1 has CARN_step ∈ [1, 7] — never 0. But at
+        # application time, every chunk starts at CARN_step=0 (clean
+        # GT input) and gets noised iteratively. Without a CARN_step=0
+        # training pair the noiser's first iteration is uncontrolled.
+        #
+        # Add the missing pair: rollout 1's LAST seed chunk (positions
+        # [cf-npb, cf), clean GT) maps to rollout 2's anchor chunk
+        # (positions [cf_r2, cf_r2+npb) — the first AR-generated chunk
+        # of rollout 2). When cf_r2 = cf - npb (default v24 config with
+        # num_seed_chunks_r1=3, num_seed_chunks_r2=2), the abs positions
+        # align: r1 seed-last @ [6, 9) ↔ r2 anchor @ [6, 9).
+        cf_r1 = int(self.dmd_context_clean_frames)
+        if (
+            r2_abs_start == cf_r1 - npb
+            and r2_total >= npb
+            and "ride_latents_window" in s
+        ):
+            ride_window = s["ride_latents_window"]
+            seed_last_lo = cf_r1 - npb
+            seed_last_hi = cf_r1
+            if int(ride_window.shape[1]) >= seed_last_hi:
+                seed_last_r1 = ride_window[
+                    :, seed_last_lo:seed_last_hi
+                ].to(dtype=chunk.dtype, device=chunk.device).detach()
+                anchor_r2 = r2_x0[:, 0:npb].to(
+                    dtype=chunk.dtype, device=chunk.device,
+                ).detach()
+                carn_step_0 = torch.zeros(
+                    (chunk.shape[0],), dtype=torch.long, device=chunk.device,
+                )
+                predicted_anchor = self.forward_noiser(
+                    seed_last_r1, carn_step_0, residual=True,
+                )
+                losses.append(F.mse_loss(predicted_anchor, anchor_r2))
+
+        if not losses:
+            # v27B audit-fix #1: DDP anchor. With find_unused_parameters
+            # =True the wrap handles missing forward passes, but it
+            # costs a per-iter graph traversal. Returning None here is
+            # still safe under FUP=True; we return None and let the
+            # caller skip the loss add cleanly.
+            return None
+        fn_loss = torch.stack(losses).mean()
+        critic_log["forward_noiser_loss_raw"] = fn_loss.detach()
+        critic_log["forward_noiser_n_pairs"] = float(len(losses))
+        return fn_loss
+
+    def _apply_forward_noiser_to_gt(
+        self,
+        gt_target: torch.Tensor,
+        abs_frame_start_gt: int,
+    ) -> Optional[torch.Tensor]:
+        """Build causal_AR_GT by iteratively applying the forward
+        noiser to gt_target chunks. Each chunk in the window is noised
+        up to its target CARN level (matching the rollout-1 student's
+        CARN level at that abs position).
+
+        Args:
+            gt_target: [B, F, C, H, W] clean GT chunks at consecutive
+                abs frame positions starting at abs_frame_start_gt.
+            abs_frame_start_gt: abs frame index of gt_target[:, 0].
+
+        Returns:
+            [B, F, C, H, W] with each chunk noised to its target CARN
+            level. Returns ``None`` if forward_noiser is unavailable or
+            if shapes are misaligned (caller falls back to non-noised
+            gt_target).
+        """
+        if self.forward_noiser is None:
+            return None
+        B, F_total, C, H, W = gt_target.shape
+        npb = int(self.num_frame_per_block)
+        if F_total % npb != 0:
+            return None
+        # Same npb-alignment invariant as _compute_forward_noiser_loss.
+        if int(abs_frame_start_gt) % npb != 0:
+            raise RuntimeError(
+                f"_apply_forward_noiser_to_gt: abs_frame_start_gt="
+                f"{abs_frame_start_gt} not divisible by npb={npb}. "
+                "Floor-div on chunk_abs_idx would drop a remainder and "
+                "produce incorrect CARN levels."
+            )
+        n_chunks = F_total // npb
+        num_seed_r1 = int(self.dmd_context_clean_frames // npb)
+        device = gt_target.device
+
+        target_carn_per_chunk: list = []
+        for c in range(n_chunks):
+            chunk_abs_idx = (int(abs_frame_start_gt) + c * npb) // npb
+            target_carn = max(0, chunk_abs_idx - (num_seed_r1 - 1))
+            target_carn_per_chunk.append(int(target_carn))
+
+        max_carn = max(target_carn_per_chunk) if target_carn_per_chunk else 0
+        if max_carn == 0:
+            return gt_target
+
+        current = gt_target.clone()
+        with torch.no_grad():
+            for k in range(max_carn):
+                for c, tc in enumerate(target_carn_per_chunk):
+                    if tc <= k:
+                        continue
+                    f_start = c * npb
+                    f_end = f_start + npb
+                    chunk_in = current[:, f_start:f_end].contiguous()
+                    carn_step = torch.full(
+                        (B,), k, dtype=torch.long, device=device,
+                    )
+                    chunk_out = self.forward_noiser(
+                        chunk_in, carn_step, residual=True,
+                    )
+                    current[:, f_start:f_end] = chunk_out
+        return current
+
     def _prebuild_rollout2_for_v24(
         self,
         seed_latents: torch.Tensor,
@@ -4505,8 +4792,28 @@ class ActionForcingDMD(SelfForcingModel):
                     [image_latent, full_chunk[:, 1:]], dim=1,
                 )
 
-        # Save full_chunk as previous_chunk (detached) for the NEXT iter.
-        s["previous_chunk"] = full_chunk.detach()
+        # Save full_chunk as previous_chunk for the NEXT iter.
+        #
+        # Default (dmd_lookback_chunks=0): full detach — the next iter's
+        # overlap region starts from a leaf tensor, no graph crosses
+        # chunks.
+        #
+        # v29 (dmd_lookback_chunks=1): partial detach — the OVERLAP
+        # region (early frames, sourced from PRIOR previous_chunk and
+        # therefore from chunk_(k-2)'s graph) is detached to prevent
+        # cascading. The LAST new_frames region stays un-detached so
+        # chunk_k's exit-rung forward graph is reachable from chunk_
+        # (k+1)'s overlap on the next iter. Combined with
+        # generator_loss.backward(retain_graph=True), chunk_(k+1)'s
+        # DMD backward walks back through chunk_k's exit-rung forward.
+        if int(self.dmd_lookback_chunks) > 0 and overlap > 0:
+            overlap_part = full_chunk[:, :overlap].detach()
+            new_part = full_chunk[:, overlap:]
+            s["previous_chunk"] = torch.cat(
+                [overlap_part, new_part], dim=1,
+            )
+        else:
+            s["previous_chunk"] = full_chunk.detach()
         # Mirror the same stash for the last-rung view so future iters'
         # overlap region carries last-rung pred (paper-aligned semantics
         # — the disc sees an apples-to-apples chunk_size slab of last-
@@ -5624,6 +5931,25 @@ class ActionForcingDMD(SelfForcingModel):
         critic_log["critic_clean_x_is_gt_causal_ar"] = (
             1.0 if critic_use_gt_causal_ar else 0.0
         )
+
+        # v27B: train the forward noiser on aligned (rollout1, rollout2)
+        # chunk pairs. The loss is added to the critic step's loss so
+        # the same backward call lights up both fake_score and
+        # forward_noiser params; the trainer's separate optimizer for
+        # forward_noiser will step the noiser-specific grads. Off when
+        # forward_noiser_enabled=False (default).
+        if (
+            self.forward_noiser_enabled
+            and self.forward_noiser is not None
+        ):
+            fn_loss = self._compute_forward_noiser_loss(
+                chunk=chunk, info=info, critic_log=critic_log,
+            )
+            if fn_loss is not None:
+                denoising_loss = denoising_loss + (
+                    self.forward_noiser_loss_weight
+                    * fn_loss.to(denoising_loss.dtype)
+                )
         return denoising_loss, critic_log
 
     # ------------------------------------------------------------------
@@ -6009,6 +6335,68 @@ class ActionForcingDMD(SelfForcingModel):
                     device=chunk.device, dtype=torch.long,
                 )
 
+        # ===== v27B forward-noiser application =====
+        # When enabled, build causal_AR_GT by iteratively applying the
+        # learned forward noiser to gt_target chunkwise (per-chunk CARN
+        # level matching the student rollout's CARN at that position).
+        # This REPLACES the v21 alt-head's causal_AR_x0 application path
+        # (which had causal_AR_dir_rms=0 across v21-v28 due to the
+        # alt-head's training-vs-application distribution mismatch).
+        fn_applied_this_iter = False
+        if (
+            self.forward_noiser_enabled
+            and self.forward_noiser_apply_in_aux
+            and self.forward_noiser is not None
+        ):
+            # gt_target's abs frame start = chunk_lo (= cf + noisy_start_sdn).
+            # We reconstruct it here to pass to the noiser application
+            # helper (the variable isn't held in scope past gt_target
+            # construction).
+            abs_frame_start_gt = int(cf_state + (
+                s["current_length"] - info["new_frames"] - info["overlap"]
+            ))
+            fn_causal_AR_GT = self._apply_forward_noiser_to_gt(
+                gt_target=noise_base.detach()
+                if isinstance(noise_base, torch.Tensor) else None,
+                abs_frame_start_gt=abs_frame_start_gt,
+            )
+            if fn_causal_AR_GT is not None:
+                # Replace noise_base with the CARN-noised version.
+                # Detached — no autograd flow from real_score loss back
+                # to the noiser (the noiser trains via its own loss in
+                # the critic step).
+                fn_causal_AR_GT_det = fn_causal_AR_GT.detach().to(
+                    dtype=chunk.dtype, device=chunk.device,
+                )
+                noise_base = fn_causal_AR_GT_det
+                # v26/v27B contract: when aux_real_clean_x_source is
+                # "causal_ar_gt", clean_x_for_real should match the
+                # source noise_base was built from (un-noised). For v21
+                # this was causal_AR_x0; for v27B it's fn_causal_AR_GT.
+                # Without this, real_score sees noisy_input from
+                # causal_AR_GT but TF context from sc_clean_x_real —
+                # breaking the "noisy_x and clean_x share source"
+                # contract and meaning the eval video stash's
+                # ``clean_x_aux`` doesn't actually reflect what the
+                # online teacher consumed.
+                if self.aux_real_clean_x_source == "causal_ar_gt":
+                    clean_x_for_real = fn_causal_AR_GT_det
+                    aug_t_for_real = torch.zeros(
+                        (clean_x_for_real.shape[0],
+                         clean_x_for_real.shape[1]),
+                        device=chunk.device, dtype=torch.long,
+                    )
+                fn_applied_this_iter = True
+                # Set causal_AR_dir_rms diagnostic so we can see the
+                # forward noiser's effective shift (vs gt_target).
+                with torch.no_grad():
+                    if isinstance(gt_target, torch.Tensor):
+                        causal_AR_dir_rms = float(
+                            (fn_causal_AR_GT.float()
+                             - gt_target.float())
+                            .pow(2).mean().sqrt().item()
+                        )
+
         # ===== v21 fake_alt forward (deferred) =====
         # Now that ``clean_x_for_real`` and ``aug_t_for_real`` are
         # finalised (including the flash-DMD ``_clean_chunk`` override
@@ -6019,6 +6407,11 @@ class ActionForcingDMD(SelfForcingModel):
         # real_score's training; the FlowPredLoss target stays
         # ``eps - gt_target`` so the LoRA learns to denoise AR-noise
         # back to TRUE GT.
+        # v27B: skip the v21 alt-head application when the forward
+        # noiser already replaced noise_base — they serve the same
+        # purpose, and running both would double-noise the input.
+        if fake_alt_apply_active and fn_applied_this_iter:
+            fake_alt_apply_active = False
         if fake_alt_apply_active:
             # Memory hygiene: the aux teacher pass already holds the
             # real_score's grad-on activations; the upcoming fake_alt
@@ -6174,6 +6567,18 @@ class ActionForcingDMD(SelfForcingModel):
                 if self.real_teacher_input_source == "blend"
                 else (1.0 if use_gt else 0.0)
             )
+            # v27B: clean_x_aux = the TF context fed to real_score in
+            # the aux teacher pass (the value of clean_x_for_real AFTER
+            # any v27B forward-noiser / v21 alt-head override). Lets
+            # the eval video logger decode and visually verify what
+            # context the online teacher's training step actually
+            # consumed each iter.
+            if isinstance(clean_x_for_real, torch.Tensor):
+                stash["clean_x_aux"] = clean_x_for_real.detach()
+            # Also stash the aux noisy_input source (= noise_base) so
+            # the side-by-side comparison shows GT vs causal_AR_GT.
+            if isinstance(noise_base, torch.Tensor):
+                stash["aux_noise_base"] = noise_base.detach()
 
         # Diagnostics: MAE form of FlowPredLoss target, gradient_mask-
         # weighted. The target is ``eps - gt_target`` (FlowPredLoss
