@@ -670,6 +670,85 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_apply_in_aux = bool(
             getattr(args, "forward_noiser_apply_in_aux", True)
         )
+        # v27E: temporal low-freq REPLACEMENT on the FN-noised GT.
+        # After applying the FN we compute the noise FN added
+        #     residual = fn_output - gt_target
+        # then low-pass that residual along the temporal axis with a
+        # length-W boxcar, and REPLACE the FN output with
+        #     boosted = gt_target + alpha * lowpass(residual)
+        # i.e. GT with only the smoothed/low-frequency component of the
+        # FN-added noise. window=0 disables (no-op). Default window=3
+        # nulls f=1/3, 2/3 (one full period of the per-chunk
+        # high-frequency element).
+        self.forward_noiser_lowfreq_smooth_window = int(
+            getattr(args, "forward_noiser_lowfreq_smooth_window", 0)
+        )
+        self.forward_noiser_lowfreq_alpha = float(
+            getattr(args, "forward_noiser_lowfreq_alpha", 1.0)
+        )
+        if self.forward_noiser_lowfreq_smooth_window < 0:
+            raise ValueError(
+                "forward_noiser_lowfreq_smooth_window must be >= 0; got "
+                f"{self.forward_noiser_lowfreq_smooth_window}"
+            )
+        # v27G/v27H: per-pass apply strategy for the iterative FN
+        # application. The base ConvNet FN learns a deterministic +1
+        # CARN-step delta but produces locally-smooth outputs (limited
+        # spatial RF, no high-freq generation path). The blur+noise
+        # operator gives a SHARP-noise + smoothing analog of natural AR
+        # drift in latent space, applied recursively per pass — the
+        # latent-space equivalent of (add Gaussian noise, then Gaussian
+        # blur) operating on pixel frames.
+        #   "learned" (default): FN module only — v27D/E behavior.
+        #   "blur_noise":        replace FN with deterministic
+        #                        blur(chunk + noise) per pass — v27G.
+        #                        Requires only the blur+noise knobs.
+        #                        forward_noiser_enabled can be false.
+        #   "sum":               chunk_out = fn_out + blur_delta where
+        #                        blur_delta = blur(chunk+noise) - chunk.
+        #                        Both deltas are applied. v27H.
+        #   "off":               skip iterative application; aux teacher
+        #                        sees clean GT (debug only).
+        self.forward_noiser_apply_strategy = str(
+            getattr(args, "forward_noiser_apply_strategy", "learned")
+        ).lower()
+        if self.forward_noiser_apply_strategy not in (
+            "learned", "blur_noise", "sum", "off",
+        ):
+            raise ValueError(
+                "forward_noiser_apply_strategy must be one of "
+                "'learned'|'blur_noise'|'sum'|'off'; got "
+                f"{self.forward_noiser_apply_strategy!r}"
+            )
+        # Blur+noise per-pass parameters (used when strategy is
+        # "blur_noise" or "sum"). Defaults tuned for Wan2.1 latents
+        # (std ~ 0.5, latent spatial dim = pixel/8).
+        self.forward_noiser_blur_noise_std = float(
+            getattr(args, "forward_noiser_blur_noise_std", 0.1)
+        )
+        self.forward_noiser_blur_kernel_size = int(
+            getattr(args, "forward_noiser_blur_kernel_size", 3)
+        )
+        self.forward_noiser_blur_sigma = float(
+            getattr(args, "forward_noiser_blur_sigma", 0.7)
+        )
+        if self.forward_noiser_blur_noise_std < 0:
+            raise ValueError(
+                "forward_noiser_blur_noise_std must be >= 0; got "
+                f"{self.forward_noiser_blur_noise_std}"
+            )
+        if self.forward_noiser_blur_kernel_size < 1 or (
+            self.forward_noiser_blur_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "forward_noiser_blur_kernel_size must be odd and >=1; got "
+                f"{self.forward_noiser_blur_kernel_size}"
+            )
+        if self.forward_noiser_blur_sigma <= 0:
+            raise ValueError(
+                "forward_noiser_blur_sigma must be > 0; got "
+                f"{self.forward_noiser_blur_sigma}"
+            )
         self.forward_noiser = None
         if self.forward_noiser_enabled:
             from model.forward_noiser import ForwardNoiser
@@ -688,7 +767,10 @@ class ActionForcingDMD(SelfForcingModel):
                 logging.info(
                     "[ActionForcingDMD] ForwardNoiser ENABLED "
                     "(latent_ch=%d, hidden=%d, blocks=%d, params=%.2fM, "
-                    "max_carn=%d, loss_w=%.2f, apply_in_aux=%s).",
+                    "max_carn=%d, loss_w=%.2f, apply_in_aux=%s, "
+                    "lowfreq_window=%d, lowfreq_alpha=%.2f, "
+                    "strategy=%s, blur_noise_std=%.3f, "
+                    "blur_kernel=%d, blur_sigma=%.2f).",
                     latent_ch,
                     self.forward_noiser_hidden_dim,
                     self.forward_noiser_num_blocks,
@@ -696,6 +778,12 @@ class ActionForcingDMD(SelfForcingModel):
                     self.forward_noiser_max_carn_step,
                     self.forward_noiser_loss_weight,
                     str(self.forward_noiser_apply_in_aux),
+                    self.forward_noiser_lowfreq_smooth_window,
+                    self.forward_noiser_lowfreq_alpha,
+                    self.forward_noiser_apply_strategy,
+                    self.forward_noiser_blur_noise_std,
+                    self.forward_noiser_blur_kernel_size,
+                    self.forward_noiser_blur_sigma,
                 )
 
         # Hard start-step gate for the aux teacher pass. Below this
@@ -4005,6 +4093,73 @@ class ActionForcingDMD(SelfForcingModel):
         critic_log["forward_noiser_n_pairs"] = float(len(losses))
         return fn_loss
 
+    @staticmethod
+    def _gaussian_blur_spatial_5d(
+        x: torch.Tensor, kernel_size: int, sigma: float,
+    ) -> torch.Tensor:
+        """Per-channel separable Gaussian blur over (H, W) for a
+        [B, F, C, H, W] tensor. Reflect-padded to preserve shape.
+
+        Built as a depthwise 2D conv with a 1D Gaussian applied
+        separably along W then H. Pixel-space analog: cv2.GaussianBlur
+        with ksize=(kernel_size, kernel_size), sigmaX=sigma. The
+        per-pass operator in v27G/v27H is blur(chunk + noise).
+        """
+        if kernel_size <= 1:
+            return x
+        B, F_, C, H, W_ = x.shape
+        half = kernel_size // 2
+        grid = torch.arange(
+            kernel_size, device=x.device, dtype=x.dtype,
+        ) - half
+        kernel_1d = torch.exp(-(grid ** 2) / (2.0 * float(sigma) ** 2))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_w = kernel_1d.view(1, 1, 1, kernel_size).expand(
+            C, 1, 1, kernel_size
+        )
+        kernel_h = kernel_1d.view(1, 1, kernel_size, 1).expand(
+            C, 1, kernel_size, 1
+        )
+        x_flat = x.reshape(B * F_, C, H, W_)
+        x_padded = F.pad(
+            x_flat, (half, half, half, half), mode="reflect",
+        )
+        x_blur = F.conv2d(x_padded, kernel_w, groups=C, padding=0)
+        x_blur = F.conv2d(x_blur, kernel_h, groups=C, padding=0)
+        return x_blur.reshape(B, F_, C, H, W_)
+
+    @staticmethod
+    def _temporal_lowpass_5d(
+        x: torch.Tensor, window: int,
+    ) -> torch.Tensor:
+        """Temporal moving-average low-pass along F for [B,F,C,H,W].
+
+        Boxcar of length ``window`` with reflection padding so output F
+        matches input F. Length-W boxcar has nulls at f=k/W, so for
+        period-3 high-freq content, W>=3 nulls it (W=6 nulls it and
+        also strongly attenuates anything with period<6).
+        """
+        if window <= 1:
+            return torch.zeros_like(x)
+        B, F_, C, H, W_ = x.shape
+        # [B*C*H*W, 1, F] for conv1d-style avg_pool1d.
+        x_perm = x.permute(0, 2, 3, 4, 1).contiguous().view(-1, 1, F_)
+        pad_l = (window - 1) // 2
+        pad_r = window - 1 - pad_l
+        # reflect pad requires pad < F_; fall back to replicate when F is
+        # small (rare; defensive).
+        if pad_l >= F_ or pad_r >= F_:
+            x_padded = F.pad(x_perm, (pad_l, pad_r), mode="replicate")
+        else:
+            x_padded = F.pad(x_perm, (pad_l, pad_r), mode="reflect")
+        smoothed = F.avg_pool1d(
+            x_padded, kernel_size=window, stride=1,
+        )
+        smoothed = smoothed.view(B, C, H, W_, F_).permute(
+            0, 4, 1, 2, 3
+        ).contiguous()
+        return smoothed
+
     def _apply_forward_noiser_to_gt(
         self,
         gt_target: torch.Tensor,
@@ -4026,7 +4181,12 @@ class ActionForcingDMD(SelfForcingModel):
             if shapes are misaligned (caller falls back to non-noised
             gt_target).
         """
-        if self.forward_noiser is None:
+        strategy = self.forward_noiser_apply_strategy
+        if strategy == "off":
+            return None
+        # "blur_noise" mode works without a learned FN module; all other
+        # modes require it.
+        if strategy != "blur_noise" and self.forward_noiser is None:
             return None
         B, F_total, C, H, W = gt_target.shape
         npb = int(self.num_frame_per_block)
@@ -4055,6 +4215,9 @@ class ActionForcingDMD(SelfForcingModel):
             return gt_target
 
         current = gt_target.clone()
+        blur_std = float(self.forward_noiser_blur_noise_std)
+        blur_k = int(self.forward_noiser_blur_kernel_size)
+        blur_sig = float(self.forward_noiser_blur_sigma)
         with torch.no_grad():
             for k in range(max_carn):
                 for c, tc in enumerate(target_carn_per_chunk):
@@ -4063,12 +4226,44 @@ class ActionForcingDMD(SelfForcingModel):
                     f_start = c * npb
                     f_end = f_start + npb
                     chunk_in = current[:, f_start:f_end].contiguous()
-                    carn_step = torch.full(
-                        (B,), k, dtype=torch.long, device=device,
-                    )
-                    chunk_out = self.forward_noiser(
-                        chunk_in, carn_step, residual=True,
-                    )
+                    # v27G/v27H per-pass strategy.
+                    #   "learned": just the FN module's increment.
+                    #   "blur_noise": replace FN with blur(chunk+noise)
+                    #                 — recursive AR-noise analog.
+                    #   "sum": chunk_in + fn_delta + blur_delta (both
+                    #          deltas applied additively).
+                    if strategy == "learned":
+                        carn_step = torch.full(
+                            (B,), k, dtype=torch.long, device=device,
+                        )
+                        chunk_out = self.forward_noiser(
+                            chunk_in, carn_step, residual=True,
+                        )
+                    elif strategy == "blur_noise":
+                        noisy = chunk_in + blur_std * torch.randn_like(
+                            chunk_in
+                        )
+                        chunk_out = self._gaussian_blur_spatial_5d(
+                            noisy, kernel_size=blur_k, sigma=blur_sig,
+                        )
+                    elif strategy == "sum":
+                        carn_step = torch.full(
+                            (B,), k, dtype=torch.long, device=device,
+                        )
+                        fn_out = self.forward_noiser(
+                            chunk_in, carn_step, residual=True,
+                        )
+                        noisy = chunk_in + blur_std * torch.randn_like(
+                            chunk_in
+                        )
+                        blur_out = self._gaussian_blur_spatial_5d(
+                            noisy, kernel_size=blur_k, sigma=blur_sig,
+                        )
+                        blur_delta = blur_out - chunk_in
+                        chunk_out = fn_out + blur_delta
+                    else:
+                        # Should not reach here — validated in __init__.
+                        chunk_out = chunk_in
                     current[:, f_start:f_end] = chunk_out
         return current
 
@@ -6343,10 +6538,20 @@ class ActionForcingDMD(SelfForcingModel):
         # (which had causal_AR_dir_rms=0 across v21-v28 due to the
         # alt-head's training-vs-application distribution mismatch).
         fn_applied_this_iter = False
+        # Gate: enter the apply path when the strategy needs to run.
+        # "blur_noise" doesn't require the learned FN module, so we
+        # allow entry even when forward_noiser_enabled is False (v27G).
+        # Strategies "learned" and "sum" require the FN module to be
+        # built (forward_noiser_enabled=True).
+        _strategy = self.forward_noiser_apply_strategy
+        _strategy_needs_fn = _strategy in ("learned", "sum")
+        _strategy_can_run = _strategy != "off" and (
+            (_strategy == "blur_noise")
+            or (self.forward_noiser_enabled and self.forward_noiser is not None)
+        )
         if (
-            self.forward_noiser_enabled
-            and self.forward_noiser_apply_in_aux
-            and self.forward_noiser is not None
+            self.forward_noiser_apply_in_aux
+            and _strategy_can_run
         ):
             # gt_target's abs frame start = chunk_lo (= cf + noisy_start_sdn).
             # We reconstruct it here to pass to the noiser application
@@ -6361,6 +6566,31 @@ class ActionForcingDMD(SelfForcingModel):
                 abs_frame_start_gt=abs_frame_start_gt,
             )
             if fn_causal_AR_GT is not None:
+                # v27E: REPLACE the FN output with GT + low-pass of the
+                # FN-added noise. Length-W boxcar (W=3 nulls f=1/3,
+                # 2/3, removing the per-chunk high-frequency element);
+                # window=0 disables and leaves the FN output alone.
+                fn_window = int(
+                    self.forward_noiser_lowfreq_smooth_window
+                )
+                if (
+                    fn_window > 0
+                    and isinstance(gt_target, torch.Tensor)
+                ):
+                    with torch.no_grad():
+                        residual = (
+                            fn_causal_AR_GT.float()
+                            - gt_target.float()
+                        )
+                        smoothed = self._temporal_lowpass_5d(
+                            residual, window=fn_window,
+                        )
+                        boosted = (
+                            gt_target.float()
+                            + float(self.forward_noiser_lowfreq_alpha)
+                            * smoothed
+                        ).to(dtype=fn_causal_AR_GT.dtype)
+                    fn_causal_AR_GT = boosted
                 # Replace noise_base with the CARN-noised version.
                 # Detached — no autograd flow from real_score loss back
                 # to the noiser (the noiser trains via its own loss in

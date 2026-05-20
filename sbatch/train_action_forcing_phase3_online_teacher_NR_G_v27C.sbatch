@@ -785,7 +785,7 @@ srun torchrun \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     real_score_ema_weight=0.0 \
-    gan_loss_weight=0.05 \
+    gan_loss_weight=0.005 \
     gan_lr=5e-5 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
@@ -797,7 +797,7 @@ srun torchrun \
     gan_critic_warmup_steps=40 \
     gan_disc_start_step=40 \
     gan_warmup_steps=25 \
-    gan_warmup_shape=quadratic \
+    gan_warmup_shape=linear \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     gan_updates_per_step=1 \
@@ -814,7 +814,7 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.8 \
+    anti_collapse_loss_weight=0.02 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=3 \
     run_name=action_forcing_phase3_online_teacher_NR_G_v27C_j${SLURM_JOB_ID}
