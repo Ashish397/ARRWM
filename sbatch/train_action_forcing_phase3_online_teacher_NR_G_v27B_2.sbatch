@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v27H
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v27B-2
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -10,88 +10,12 @@
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
-# =====================================================================
-# Phase-3 online_teacher_NR_G_v27H: v27F base (GAN OFF, grad_chunks=5)
-# + SUM strategy — chunk receives BOTH the learned FN's delta AND the
-# deterministic blur+noise delta per pass.
-#
-# Per pass k for chunk c needing noising:
-#     fn_out     = FN(chunk_in, carn_step=k, residual=True)
-#                                                    # chunk_in + fn_delta
-#     noisy      = chunk_in + blur_noise_std * randn_like(chunk_in)
-#     blur_out   = gaussian_blur_2d(noisy, kernel, sigma)
-#     blur_delta = blur_out - chunk_in
-#     chunk_out  = fn_out + blur_delta
-#                = chunk_in + fn_delta + blur_delta
-#
-# v27H vs v27F — knob deltas
-# --------------------------
-#   forward_noiser_apply_strategy     : -     -> sum (NEW)
-#   forward_noiser_blur_noise_std     : -     -> 0.2
-#   forward_noiser_blur_kernel_size   : -     -> 3
-#   forward_noiser_blur_sigma         : -     -> 0.5
-#   forward_noiser_lowfreq_smooth_window: -   -> 0
-# Learned FN remains ENABLED (still trained against rollout1->rollout2
-# pairs each iter); its delta is ADDED to the blur+noise delta rather
-# than replaced. v27H tests whether the learned increment provides
-# meaningful content beyond the deterministic blur+noise on its own.
-#
-# v27G is the comparison run with blur_noise-only (no learned FN).
-#
-# WHY DISABLE GAN ENTIRELY
-# ------------------------
-# wandb diagnostic from v27D (steps 40-90): the gen-side GAN
-# contribution (g_weighted ≈ -0.0007) was ~800× smaller than
-# perc_loss_weighted (-0.544). The GAN knob has effectively no
-# authority over the student at v27 settings — disabling it costs
-# essentially nothing in gen-side training signal, and recovers
-# substantial memory. The c_corr saturation seen at step 131 of v27D
-# is a ranking-metric artifact of an ineffective disc, not a real
-# collapse driver.
-#
-# v27E POST-PROCESS (RETAINED)
-# ----------------------------
-#   forward_noiser_lowfreq_smooth_window = 3 (length-3 boxcar)
-#   forward_noiser_lowfreq_alpha         = 1.0
-# clean_x_aux = gt + alpha * lowpass(fn - gt). Same as v27E.
-#
-# WHY THE REPLACEMENT
-# -------------------
-# Architecture review of the v27D forward noiser (4 ResBlocks of
-# factorized 3D conv: spatial 1x3x3 + temporal 3x1x1, 9x9 spatial RF,
-# 9-frame temporal RF, no down/upsampling, no attention,
-# residual+zero-init out) concluded:
-#   * High-freq capture: GOOD.
-#   * Spatially-varying / across-many-chunks low-freq drift: WEAK.
-# clean_x_aux looks high-freq-accurate but low-freq is hard to see.
-#
-# v27E POST-PROCESS (no extra params, no autograd path; no_grad block):
-#
-#   residual = fn_causal_AR_GT - gt_target          (FN-added noise)
-#   lowfreq  = temporal_lowpass(residual, window=3) (boxcar along F)
-#   replaced = gt_target + alpha * lowfreq
-#
-# Length-3 boxcar has nulls at f=1/3 and 2/3, exactly nulling the
-# per-chunk period-3 high-frequency element identified by the user
-# while preserving anything period > 3 (the across-chunk drift). The
-# result is GT + smoothed noise only — no FN high-freq passes
-# through. window=0 disables the post-process (no-op).
-#
-# All other v27D content preserved below.
-#
-# =====================================================================
-# LEGACY v27D context: same v27 chain — see v27D/v27B/v27 sbatches for
-# the full architecture motivation (v21 alt-head pathology,
-# rollout1->rollout2 mapping, etc.). v27E only adds the post-process
-# boost on top of v27D's running training contract.
-# =====================================================================
-
 set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v27H
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v27B_2
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -134,18 +58,71 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6,max_split_size_mb:512
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
 echo "GAN_SAM2_CKPT=$GAN_SAM2_CKPT"
 echo "GAN_SAM2_CFG=$GAN_SAM2_CFG"
-echo "Starting Phase-3 online-teacher NR_G v27H (v27F + SUM strategy: FN + blur+noise) on $(date)"
-echo "  * apply_strategy=sum  -- chunk_out = chunk + fn_delta + blur_delta"
-echo "  * Learned FN still trained against rollout1->rollout2 each iter."
-echo "  * blur_noise_std=0.2, blur_kernel_size=3, blur_sigma=0.5."
-echo "  * GAN still OFF (v27F inheritance), max_gradient_chunks=5."
-echo "  * Compare to v27G (blur_noise only, no learned FN)."
+echo "Starting Phase-3 online-teacher NR_G v23 (v22 minus mean anchor, softer std) on $(date)"
+echo "  * v23 = v22 with:"
+echo "      anti_collapse_loss_weight 1.0 -> 0.2 (softer std floor)"
+echo "      anti_collapse_mean_weight 1.0 -> 0.0 (mean anchor OFF)"
+echo "  * Std-floor term still fires from step 0 inside _compute_kl_grad"
+echo "    when gt_target is available: ReLU(std(GT) - std(pred_x0))^2 (one-sided)."
+echo "  * Independent of the alt head — operates on pred_x0 in latent space."
+echo "  * v17/v18/v19 collapsed: pairwise (chunk - reference) residual"
+echo "    suffered from time-warp blur at AR rollout positions."
+echo "  * v20 replaces it with a learned forward-noising ConvNet:"
+echo "      f(pred_image) -> 2*pred_image - pred_real"
+echo "    At aux-teacher time, ar_residual = noise_aux(gt) - gt."
+echo "  * noise_aux warmup_steps=50; before that, AR falls back to no-AR."
+echo "  * ~8M params, fp32 ConvNet, AdamW lr=1e-4. Trained every gen step."
+echo "  * v15 fast-forwarded by step 16 — DMD weight=0 there, so the"
+echo "    teacher is not the cause. Suspects: MANIQA approx, GT-recon, 2x LR."
+echo "  * v16 isolates GT-recon: gt_latent_mse_loss_weight 0.1->0,"
+echo "    gt_latent_mae_loss_weight 0.05->0. All other v15 knobs unchanged."
+echo "  * Prediction: if v16 doesn't fast-forward at step 16, GT-recon was"
+echo "    the culprit. If it still does, v17 will test MANIQA / LR."
+echo "  * Visual obs from v9-v14:"
+echo "      v12 = best (coloured + motion trails); v13 = fast-forward;"
+echo "      v14 = blurry/gray; v11 = blue collapse; v9/v10 = slow blur."
+echo "  * v15 reverts (a) max_gradient_chunks 2->0, (b) dfake_ratio 2->5,"
+echo "    (c) gan_loss_weight 0.3->0.5, (d) aux AR-noise mode combined->off."
+echo "  * v15 keeps: CFG off (real_guidance_scale=0), lr=2e-5,"
+echo "    real_teacher_lr=7.5e-5, dmd_loss_start_step=40, gt_latent recon."
+echo "  * Prediction: if max_gradient_chunks was the dominant cause,"
+echo "    v15 looks like v12 with v14's faster convergence."
+echo "  * 21-frame iter-1-only student rollout, 250-step max."
+echo "  * max_rolls_per_ride=1 — streaming resets every step (no iter k>=2)."
+echo "  * Teacher: fresh rank-32 LoRA on v14-merged base, EMA(0.99) target."
+echo "  * v13 NEW (vs v10):"
+echo "      - CFG off (real_guidance_scale=0)."
+echo "      - gan_loss_weight 0.5 -> 0.2 (lighter GAN; AR-noise carries weight)."
+echo "      - aux_teacher_ar_noise_mode=combined; AR noise = (chunk-GT) fresh"
+echo "        each iter, added to GT before noising (CLEAN-side perturbation)."
+echo "        Flow-space scaling α(t)=clamp((1-σ)/σ, max=10), seed-mask ramp"
+echo "        over first 1 chunk, 20-step burn-in, EMA-renormalised RMS."
+echo "      - max_gradient_chunks=2: only first 2 rolled chunks (frames 0..5)"
+echo "        carry gradient for DMD score AND aux teacher. Later chunks are"
+echo "        noise-dominated and discarded."
+echo "  * gt_latent_mse=0.1, gt_latent_mae=0.05 — direct anti-drift latent"
+echo "    L1+L2 against GT, every step, no ramp (carried from v10)."
+echo "  * v8 POST-MORTEM: aux_teacher_send_student_grad=true caused deeper"
+echo "    collapse (gen_loss -0.36 at step 101 vs v7's +0.15) — kept false here."
+echo "  * Stage 1 [0, 20): MANIQA ramps in (full at step 15). LoRA"
+echo "    aux trains from step 0 (warmup_steps=80, full at step 80)."
+echo "    DMD off, GAN off."
+echo "  * Stage 2 [20, 60): DMD engages (start=20, warmup=150, cap=0.5)."
+echo "    MANIQA at plateau; LoRA still ramping. GAN still off."
+echo "  * Stage 3 [60, end): GAN engages with QUADRATIC ramp"
+echo "    (gan_warmup_steps=25, shape=quadratic). D-side starts simul-"
+echo "    taneously (no head-start). GAN full at step 85 (plateau 1.0)."
+echo "  * Aux LoRA: aux_teacher_send_student_grad=false (LoRA aux is"
+echo "    severed from the student; DMD is the sole student-grad path"
+echo "    through the teacher). real_teacher_input_source=gt."
+echo "    real_score_ema_weight=0.99."
+echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -185,8 +162,8 @@ srun torchrun \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \
     real_guidance_scale=0.0 \
-    lr=2e-5 \
-    real_teacher_lr=7.5e-5 \
+    lr=1e-5 \
+    real_teacher_lr=2.5e-5 \
     real_teacher_warmup_steps=0 \
     real_teacher_input_source=gt \
     teacher_cadence=fake \
@@ -197,13 +174,13 @@ srun torchrun \
     aux_teacher_loss_warmup_steps=80 \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
-    dmd_loss_weight=0.5 \
+    dmd_loss_weight=0.25 \
     dmd_loss_start_step=20 \
     fake_alt_head_enabled=true \
     fake_alt_head_start_step=0 \
     fake_alt_apply_start_step=0 \
     fake_alt_target_mode=rollout2_student \
-    fake_alt_rollout2_num_seed_chunks=1 \
+    fake_alt_rollout2_num_seed_chunks=2 \
     forward_noiser_enabled=true \
     forward_noiser_hidden_dim=512 \
     forward_noiser_num_blocks=4 \
@@ -211,11 +188,6 @@ srun torchrun \
     forward_noiser_loss_weight=1.0 \
     forward_noiser_apply_in_aux=true \
     forward_noiser_lr=5e-5 \
-    forward_noiser_apply_strategy=sum \
-    forward_noiser_blur_noise_std=0.0 \
-    forward_noiser_blur_kernel_size=5 \
-    forward_noiser_blur_sigma=0.5 \
-    forward_noiser_lowfreq_smooth_window=0 \
     critic_clean_x_source=self \
     aux_real_clean_x_source=causal_AR_GT \
     dmd_normalization_enabled=false \
@@ -223,7 +195,7 @@ srun torchrun \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     real_score_ema_weight=0.0 \
-    gan_loss_weight=0.1 \
+    gan_loss_weight=0.2 \
     gan_lr=5e-5 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
@@ -243,7 +215,7 @@ srun torchrun \
     gan_r2_gamma=2.0 \
     gan_sam2_frame_pool=none \
     gan_sam2_encoder_chunk_size=84 \
-    maniqa_approx_loss_weight=1.0 \
+    maniqa_approx_loss_weight=0.25 \
     maniqa_n_frames=84 \
     maniqa_n_patches_per_frame=8 \
     maniqa_metric_name=maniqa-pipal \
@@ -252,9 +224,9 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.0 \
+    anti_collapse_loss_weight=0.8 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=3 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v27H_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v27B_2_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

@@ -886,19 +886,93 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "flash_dmd_gan_t", 60)
         )
 
-        # Warm-start init: subsequent rolling chunks denoise from the
-        # prior chunk's clean pred re-noised at
-        # ``denoising_step_list[warm_start_rung_idx]`` via the shortened
-        # ladder ``denoising_step_list[warm_start_rung_idx:]``. The
-        # very first chunk in a rollout (anchor in streaming mode;
-        # block 0 in non-streaming) uses the standard cold init (pure
-        # noise + full ladder). Default off; flip via config to A/B.
-        # ``warm_start_rung_idx`` defaults to 1 (= second-noisiest
-        # rung in the standard 4-step ladder); move it later in the
-        # ladder for less-aggressive warm-start. Validation against
-        # the actual denoising_step_list length lives in the pipeline.
-        self.warm_start_init = bool(getattr(args, "warm_start_init", True))
-        self.warm_start_rung_idx = int(getattr(args, "warm_start_rung_idx", 1))
+        # ===== LADD adjacent-chunk discriminator (v28) =====
+        # Replaces the SAM2-pixel disc with a teacher-feature one that
+        # taps WAN's intermediate transformer blocks. Adversarial pairs
+        # are adjacent CHUNKS within a single causal rollout
+        # (chunk_i = real-anchor, chunk_{i+1} = fake / push-target).
+        # See ``model/ladd_disc.py`` for the architecture; the loss
+        # math lives in the trainer's
+        # ``_compute_ladd_losses_distilled``. Activated by setting
+        # ``gan_backbone=ladd_teacher_feat`` in config; otherwise the
+        # legacy SAM2 / 3D-conv paths run unchanged.
+        self.ladd_feature_blocks = list(
+            getattr(args, "ladd_feature_blocks", []) or []
+        )
+        self.ladd_proj_dim = int(getattr(args, "ladd_proj_dim", 256))
+        self.ladd_disc_head_kernel = int(
+            getattr(args, "ladd_disc_head_kernel", 9)
+        )
+        self.ladd_use_csm = bool(getattr(args, "ladd_use_csm", True))
+        self.ladd_use_lateral_proj = bool(
+            getattr(args, "ladd_use_lateral_proj", False)
+        )
+        self.ladd_use_prompt_cond = bool(
+            getattr(args, "ladd_use_prompt_cond", True)
+        )
+        self.ladd_cmap_dim = int(getattr(args, "ladd_cmap_dim", 64))
+        self.ladd_disc_loss_weight = float(
+            getattr(args, "ladd_disc_loss_weight", 1.0)
+        )
+        self.ladd_r1_gamma = float(getattr(args, "ladd_r1_gamma", 1.0))
+        # Lazy R1: compute R1 every N disc updates instead of every
+        # update. R1's second-order ``create_graph=True`` backward is
+        # the dominant memory cost of the LADD disc step. Default 1
+        # (every step, original behaviour). Set to e.g. 10 to compute
+        # R1 once every 10 disc updates — saves ~peak memory by ~half
+        # on the off-iters at the cost of slightly noisier R1 signal.
+        self.ladd_r1_every_n_steps = int(
+            getattr(args, "ladd_r1_every_n_steps", 1)
+        )
+        self.ladd_diff_aug_policy = str(
+            getattr(args, "ladd_diff_aug_policy", "flip,cutout,translation")
+        )
+        self.ladd_pair_start_seed_boundary = bool(
+            getattr(args, "ladd_pair_start_seed_boundary", True)
+        )
+        self.ladd_pairs_per_step = int(
+            getattr(args, "ladd_pairs_per_step", 0)
+        )  # 0 = use all pairs
+        # LADD pair-mode toggles. v28A wants only gt_vs_fake; v28B
+        # turns on adjacent_chunks as an additional adversarial term.
+        # Defaults preserve v28 behaviour (adjacent on, gt_vs_fake off).
+        self.ladd_gt_vs_fake_enabled = bool(
+            getattr(args, "ladd_gt_vs_fake_enabled", False)
+        )
+        self.ladd_adjacent_chunks_enabled = bool(
+            getattr(args, "ladd_adjacent_chunks_enabled", True)
+        )
+        # Per-mode gen-side weights (multiplied on top of the standard
+        # gan_loss_weight ramp).
+        self.ladd_gt_vs_fake_weight = float(
+            getattr(args, "ladd_gt_vs_fake_weight", 1.0)
+        )
+        self.ladd_adjacent_chunks_weight = float(
+            getattr(args, "ladd_adjacent_chunks_weight", 1.0)
+        )
+        # Wavelet-HF pre-stage (v28B, WGSR-style frequency-band
+        # restriction). When True, the disc's input latent is passed
+        # through a single-level Haar SWT, LL is dropped, and the
+        # remaining HF sub-bands are channel-adapted back to 16 channels
+        # before the projector forward. This restricts the GAN gradient
+        # to only push HF detail; content anchoring stays DMD's job.
+        # 0 = off (default). See model/wavelet_hf.py.
+        self.ladd_wavelet_hf_enabled = bool(
+            getattr(args, "ladd_wavelet_hf_enabled", False)
+        )
+        self.ladd_wavelet_hf_drop_ll = bool(
+            getattr(args, "ladd_wavelet_hf_drop_ll", True)
+        )
+        self.ladd_wavelet_hf_adapter_init_gain = float(
+            getattr(args, "ladd_wavelet_hf_adapter_init_gain", 0.1)
+        )
+
+        # Warm-start init: REMOVED. Every block now cold-starts from
+        # pure Gaussian noise + the full denoising ladder. The
+        # ``warm_start_init`` / ``warm_start_rung_idx`` knobs and all
+        # carry mechanics (``previous_clean_chunk`` in streaming state,
+        # ``initial_prev_clean`` in pipeline calls, ``_last_clean_pred``
+        # in the pipeline) are no longer consulted.
 
         # Number of leading GT frames that seed the KV cache before the
         # student's rolling rollout starts (= the model's KV-cache size,
@@ -2193,14 +2267,15 @@ class ActionForcingDMD(SelfForcingModel):
             noise_shape, device=self.device, dtype=self.dtype,
         )
 
-        # Flash-DMD: when enabled AND requires_grad=True, the pipeline
-        # adds a per-block t=flash_dmd_gan_t grad-on forward whose
-        # output goes to the GAN / aux losses. The critic step
-        # (requires_grad=False) doesn't need this; pass enabled=False
-        # there to skip the extra forward.
-        flash_dmd_enabled = bool(self.flash_dmd_enabled) and bool(
-            requires_grad
-        )
+        # Flash-DMD: when ``self.flash_dmd_enabled`` is True, the
+        # pipeline adds a per-block t=flash_dmd_gan_t forward. Originally
+        # this was gated on ``requires_grad=True`` so the critic step
+        # could skip the extra forward. v27I onward: flash_dmd is
+        # COMPULSORY whenever the master switch is on — both rollout 1
+        # (gen step, grad-on) AND rollout 2 (prebuild, no_grad) must see
+        # the same 5-forward (4 rungs + t=gan_t) trajectory so the FN
+        # training pairs are symmetric.
+        flash_dmd_enabled = bool(self.flash_dmd_enabled)
         # Warm-start init applies to BOTH gen and critic rollouts so
         # the critic sees the same denoising trajectory shape as the
         # gen (otherwise fake_score would learn a different
@@ -2214,8 +2289,6 @@ class ActionForcingDMD(SelfForcingModel):
                 requires_grad=requires_grad,
                 flash_dmd_enabled=flash_dmd_enabled,
                 flash_dmd_gan_t=int(self.flash_dmd_gan_t),
-                warm_start_init=self.warm_start_init,
-                warm_start_rung_idx=self.warm_start_rung_idx,
                 **conditional_dict,
             )
         )
@@ -3903,30 +3976,11 @@ class ActionForcingDMD(SelfForcingModel):
                 requires_grad=False,
                 prefer_cache_pred_in_output=False,
                 gt_latents=None,  # no MAE on the anchor
-                warm_start_init=False,
+                flash_dmd_enabled=bool(self.flash_dmd_enabled),
                 **anchor_full_cond,
             )
         del anchor_full_cond
         anchor_chunk = anchor_chunk.detach()
-        # Capture the anchor's clean pred to seed iter 1's warm-start
-        # (when warm_start_init is on). The pipeline ALWAYS populates
-        # ``_last_clean_pred`` after a successful rollout call (see
-        # ``generate_chunk_with_cache``'s end-of-call stash); a None
-        # value here signals an upstream contract violation. Failing
-        # loud here prevents iter 1 from silently warm-starting from
-        # the noisy exit-rung pred (anchor_chunk), which would
-        # ``add_noise(noisy_x, ε, warm_start_t)`` and produce a sample
-        # at ~2× the intended noise level — a quiet quality regression.
-        if getattr(pipe, "_last_clean_pred", None) is None:
-            raise RuntimeError(
-                "ActionForcingTrainingPipeline did not populate "
-                "_last_clean_pred after the anchor rollout. The "
-                "warm-start carry would silently fall back to the "
-                "noisy exit-rung pred, producing over-noised seeds "
-                "for iter 1. Check that generate_chunk_with_cache "
-                "stashes _last_clean_pred at end-of-call."
-            )
-        anchor_clean = pipe._last_clean_pred.detach()
 
         self.streaming_state = {
             "current_length": int(npb),  # anchor counts toward the cumulative sdn
@@ -3941,12 +3995,9 @@ class ActionForcingDMD(SelfForcingModel):
             "prompt_embeds": prompt_embeds,
             "previous_chunk": None,  # last full_chunk (chunk_size frames)
             "previous_last_rung_chunk": None,  # last_rung view of full_chunk (Flash-DMD §3.3)
-            # Warm-start carry: the prior call's last block's clean
-            # pred. Initialised to the anchor's clean pred so iter 1
-            # warm-starts from the anchor (when warm_start_init=True).
-            # Updated to ``pipe._last_clean_pred`` after each
-            # ``generate_chunk_with_cache`` call.
-            "previous_clean_chunk": anchor_clean.detach(),
+            # Warm-start removed: ``previous_clean_chunk`` field is no
+            # longer populated or read. Each chunk now cold-starts from
+            # pure noise + the full denoising ladder.
             "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill (anchor adds npb on top)
             "anchor_chunk": anchor_chunk,  # [B, npb, C, H, W] — iter 1's clean_x_self anchor
             # Stable snapshot of the FIRST 6 student chunks' post-
@@ -3993,8 +4044,17 @@ class ActionForcingDMD(SelfForcingModel):
         r2_abs_start = int(r2_abs_start)
         r2_total = int(r2_x0.shape[1])
 
+        # Prefer the t=60 refined chunk for FN's rollout1 input when
+        # available (flash_dmd_enabled). Rollout2's r2_x0 was already
+        # built from the t=60 stash in the prebuild path. Falls back to
+        # the random-rung chunk when flash_dmd is off (legacy parity).
+        flash_chunk = info.get("flash_dmd_gan_x0")
+        fn_input_chunk = (
+            flash_chunk.detach() if flash_chunk is not None else chunk
+        )
+
         npb = int(self.num_frame_per_block)
-        chunk_size_critic = int(chunk.shape[1])
+        chunk_size_critic = int(fn_input_chunk.shape[1])
         if chunk_size_critic % npb != 0:
             return None
         n_chunks = chunk_size_critic // npb
@@ -4029,14 +4089,14 @@ class ActionForcingDMD(SelfForcingModel):
             slot_start = abs_f_start - r2_abs_start
             slot_end = slot_start + npb
             target_r2 = r2_x0[:, slot_start:slot_end].to(
-                dtype=chunk.dtype, device=chunk.device,
+                dtype=fn_input_chunk.dtype, device=fn_input_chunk.device,
             ).detach()
-            input_r1 = chunk[:, f_start:f_end].detach()
+            input_r1 = fn_input_chunk[:, f_start:f_end].detach()
             chunk_abs_idx = abs_f_start // npb
             carn_r1 = max(0, chunk_abs_idx - (num_seed_r1 - 1))
             carn_step = torch.full(
-                (chunk.shape[0],), carn_r1,
-                dtype=torch.long, device=chunk.device,
+                (fn_input_chunk.shape[0],), carn_r1,
+                dtype=torch.long, device=fn_input_chunk.device,
             )
             predicted = self.forward_noiser(
                 input_r1, carn_step, residual=True,
@@ -4384,16 +4444,19 @@ class ActionForcingDMD(SelfForcingModel):
                     requires_grad=False,
                     prefer_cache_pred_in_output=False,
                     gt_latents=None,
-                    warm_start_init=False,
+                    flash_dmd_enabled=bool(self.flash_dmd_enabled),
                     **anchor_full_cond,
                 )
                 del anchor_full_cond
-                anchor_clean = (
-                    pipe._last_clean_pred.detach()
-                    if getattr(pipe, "_last_clean_pred", None) is not None
-                    else anchor_chunk.detach()
-                )
-                rollout2_chunks.append(anchor_clean)
+                # Stash the anchor's t=60 refined slab (= the unified
+                # flash_dmd output, which is what the FN should consume
+                # as its rollout2 target). Falls back to the random-rung
+                # anchor_chunk if flash_dmd is disabled.
+                anchor_flash = getattr(pipe, "_flash_dmd_gan_output", None)
+                if anchor_flash is not None:
+                    rollout2_chunks.append(anchor_flash.detach())
+                else:
+                    rollout2_chunks.append(anchor_chunk.detach())
 
                 # 4) Transient streaming_state for the streaming loop.
                 clean_actions_window_r2 = ride_actions_window[
@@ -4412,7 +4475,6 @@ class ActionForcingDMD(SelfForcingModel):
                     "prompt_embeds": prompt_embeds,
                     "previous_chunk": None,
                     "previous_last_rung_chunk": None,
-                    "previous_clean_chunk": anchor_clean,
                     "abs_frame_after_seed": int(cf_r2),
                     "anchor_chunk": anchor_chunk.detach(),
                     "aux_clean_x_snapshot": None,
@@ -4420,17 +4482,25 @@ class ActionForcingDMD(SelfForcingModel):
                     "rollout2_abs_frame_start": None,
                 }
 
-                # 5) Streaming loop: each iter yields chunk_size frames;
-                # snapshot only the NEW tail (info["new_frames"]).
+                # 5) Streaming loop: each iter yields chunk_size frames.
+                # Snapshot the t=60 refined tail (info["flash_dmd_gan_x0"])
+                # when flash_dmd_enabled; fall back to the random-rung
+                # chunk tail otherwise.
                 while self.can_generate_more():
                     full_chunk, info = self.generate_next_chunk(
                         requires_grad=False,
                         compute_baseline_mae=False,
                     )
                     new_frames_count = int(info.get("new_frames", npb))
-                    rollout2_chunks.append(
-                        full_chunk[:, -new_frames_count:].detach()
-                    )
+                    flash_slab = info.get("flash_dmd_gan_x0")
+                    if flash_slab is not None:
+                        rollout2_chunks.append(
+                            flash_slab[:, -new_frames_count:].detach()
+                        )
+                    else:
+                        rollout2_chunks.append(
+                            full_chunk[:, -new_frames_count:].detach()
+                        )
         finally:
             # Leave pipeline caches clean for the caller's rollout-1
             # prefill. Restore the prior streaming_state (typically None
@@ -4859,19 +4929,18 @@ class ActionForcingDMD(SelfForcingModel):
         # separate context_noise commit). The pipeline stashes the
         # Flash-DMD t=flash_dmd_gan_t pred on ``pipe._flash_dmd_gan_output``;
         # we re-stitch it into a chunk_size-frame slab below for the GAN.
-        flash_dmd_enabled = bool(
-            self.flash_dmd_enabled and requires_grad
-        )
+        # v27I onward: flash_dmd is compulsory whenever the master
+        # switch is on, REGARDLESS of requires_grad. Ensures rollout 2
+        # (no_grad prebuild) runs the same 5-forward trajectory as
+        # rollout 1 (gen step), so the FN training sees symmetric
+        # rollout1/rollout2 chunks.
+        flash_dmd_enabled = bool(self.flash_dmd_enabled)
         # Warm-start init: when on, the iter's first block warm-starts
         # from the prior call's clean pred (= ``previous_clean_chunk``)
         # instead of pure noise. Subsequent blocks within the same
         # call (iter 1's chunk_size>npb path, multiple blocks per call)
         # warm-start from the preceding block's clean pred — handled
         # internally by ``generate_chunk_with_cache``.
-        warm_start_init = bool(self.warm_start_init)
-        initial_prev_clean = (
-            s.get("previous_clean_chunk") if warm_start_init else None
-        )
         new_chunk, denoised_t_from, denoised_t_to = pipe.generate_chunk_with_cache(
             noise=noise_chunk,
             current_start_frame=abs_frame_start,
@@ -4882,25 +4951,17 @@ class ActionForcingDMD(SelfForcingModel):
             force_exit_step=force_exit_step,
             flash_dmd_enabled=flash_dmd_enabled,
             flash_dmd_gan_t=int(self.flash_dmd_gan_t),
-            warm_start_init=warm_start_init,
-            warm_start_rung_idx=self.warm_start_rung_idx,
-            initial_prev_clean=initial_prev_clean,
             **cond_dict,
         )
         # Pull the Flash-DMD t=gan_t output (None when flash_dmd_enabled=False).
         # Shape ``[B, new_frames, C, H, W]`` — the SAME npb-aligned slab
-        # the pipeline rolled this iter.
+        # the pipeline rolled this iter. After Step 3.2.b/3.3.5
+        # unification, this is the single grad-on t=60 forward's output
+        # (consumed by both GAN and — via detach — FN training + eval
+        # logging).
         new_last_rung_chunk = (
             pipe._flash_dmd_gan_output if flash_dmd_enabled else None
         )
-        # Capture this call's last-block clean pred for the NEXT call's
-        # warm-start seed. ``_last_clean_pred`` is the post-finish-
-        # denoise cache_pred of the rollout's final block (already
-        # detached by the pipeline). Always update so flipping
-        # warm_start_init mid-run picks up the latest clean.
-        last_clean = getattr(pipe, "_last_clean_pred", None)
-        if last_clean is not None:
-            s["previous_clean_chunk"] = last_clean.detach()
 
         # Snapshot OLD previous_chunk BEFORE we overwrite — clean_x_self
         # assembly on iter k≥2 needs the iter (k-1) chunk.

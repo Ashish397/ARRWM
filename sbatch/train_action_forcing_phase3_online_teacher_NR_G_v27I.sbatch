@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v27B
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v27I
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,22 +11,35 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v27B: v27 + LEARNED FORWARD-NOISER for
-# the CARN (causal-AR-noise) increment, replacing the v21 alt-head's
-# failed application path.
+# Phase-3 online_teacher_NR_G_v27I: v27B with ALL learning rates and
+# loss weights HALVED. The intent is to defuse the step-60 instability
+# in v27B (c_corr saturation when GAN hit full plateau while DMD was
+# still ramping) by proportionally shrinking every gradient contribution.
 #
-# v27B vs v27 — knob deltas
-# -------------------------
-#   forward_noiser_enabled               : false -> true  (NEW)
-#   forward_noiser_hidden_dim            : -     -> 512
-#   forward_noiser_num_blocks            : -     -> 4
-#   forward_noiser_max_carn_step         : -     -> 8
-#   forward_noiser_loss_weight           : -     -> 1.0
-#   forward_noiser_apply_in_aux          : -     -> true
-#   forward_noiser_lr                    : -     -> 5e-5
-# All other v27 knobs preserved verbatim.
+# v27I vs v27B — knob deltas (all halved, same schedule)
+# -------------------------------------------------------
+#   lr                          : 2e-5    -> 1e-5
+#   real_teacher_lr             : 7.5e-5  -> 3.75e-5
+#   gan_lr                      : 5e-5    -> 2.5e-5
+#   forward_noiser_lr           : 5e-5    -> 2.5e-5
+#   dmd_loss_weight             : 0.5     -> 0.25
+#   aux_teacher_loss_weight     : 1.0     -> 0.5
+#   gan_loss_weight             : 0.2     -> 0.1
+#   maniqa_approx_loss_weight   : 1.0     -> 0.5
+#   forward_noiser_loss_weight  : 1.0     -> 0.5
+#   anti_collapse_loss_weight   : 0.8     -> 0.4
+# All warmup/start_step schedules from v27B preserved verbatim.
 #
-# THE PROBLEM v27B SOLVES
+# Note: halving everything preserves the RATIO between losses, so the
+# GAN/DMD imbalance window (steps 40-95 where GAN at plateau but DMD
+# still ramping) is unchanged in relative terms — just gentler in
+# absolute terms. The step-60 saturation MAY still recur but slower.
+# A more targeted fix would be to delay GAN engage (e.g., 40 -> 70)
+# or lengthen its quadratic ramp (25 -> 50). See discussion below.
+# =====================================================================
+# Legacy v27B context preserved below for full architectural history.
+#
+# THE PROBLEM v27I SOLVES
 # -----------------------
 # Diagnostic data from v21..v28 wandb showed
 # ``fake_alt_causal_AR_dir_rms = 0.0`` across the entire run history —
@@ -45,7 +58,7 @@
 # small alt-head projection has no capacity to inject AR-drift that
 # isn't already in the backbone's representation.
 #
-# v27B FIX — LEARNED FORWARD-NOISER
+# v27I FIX — LEARNED FORWARD-NOISER
 # ---------------------------------
 # Dedicated 3D ConvNet (NOT sharing fake_score's backbone) trained
 # explicitly on the rollout1→rollout2 mapping. Rollout 2 has exactly
@@ -64,7 +77,7 @@
 # causal_AR_x0 path (which is auto-disabled when forward_noiser is
 # applied each iter).
 #
-# AUDIT FIXES BAKED IN (from auditor review of initial v27B impl)
+# AUDIT FIXES BAKED IN (from auditor review of initial v27I impl)
 # --------------------------------------------------------------
 #   1. ForwardNoiser DDP uses find_unused_parameters=True (defensive
 #      against rank-divergent early-return paths in the noiser loss).
@@ -605,7 +618,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v27B
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v27I
 WANDB_SAVE_DIR=wandb
 
 # ---- SAM2 paths (must be set; see PREREQUISITES) ----
@@ -680,7 +693,7 @@ echo "      v14 = blurry/gray; v11 = blue collapse; v9/v10 = slow blur."
 echo "  * v15 reverts (a) max_gradient_chunks 2->0, (b) dfake_ratio 2->5,"
 echo "    (c) gan_loss_weight 0.3->0.5, (d) aux AR-noise mode combined->off."
 echo "  * v15 keeps: CFG off (real_guidance_scale=0), lr=2e-5,"
-echo "    real_teacher_lr=7.5e-5, dmd_loss_start_step=40, gt_latent recon."
+echo "    real_teacher_lr=3.75e-5, dmd_loss_start_step=40, gt_latent recon."
 echo "  * Prediction: if max_gradient_chunks was the dominant cause,"
 echo "    v15 looks like v12 with v14's faster convergence."
 echo "  * 21-frame iter-1-only student rollout, 250-step max."
@@ -752,32 +765,32 @@ srun torchrun \
     real_teacher_train_online=true \
     real_teacher_causal_mask=false \
     real_guidance_scale=0.0 \
-    lr=2e-5 \
-    real_teacher_lr=7.5e-5 \
+    lr=1e-5 \
+    real_teacher_lr=3.75e-5 \
     real_teacher_warmup_steps=0 \
     real_teacher_input_source=gt \
     teacher_cadence=fake \
     aux_teacher_p_schedule_enabled=false \
     aux_teacher_send_student_grad=false \
     aux_teacher_start_step=0 \
-    aux_teacher_loss_weight=1.0 \
+    aux_teacher_loss_weight=0.5 \
     aux_teacher_loss_warmup_steps=80 \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
-    dmd_loss_weight=0.5 \
+    dmd_loss_weight=0.25 \
     dmd_loss_start_step=20 \
     fake_alt_head_enabled=true \
     fake_alt_head_start_step=0 \
     fake_alt_apply_start_step=0 \
     fake_alt_target_mode=rollout2_student \
-    fake_alt_rollout2_num_seed_chunks=2 \
+    fake_alt_rollout2_num_seed_chunks=1 \
     forward_noiser_enabled=true \
     forward_noiser_hidden_dim=512 \
     forward_noiser_num_blocks=4 \
     forward_noiser_max_carn_step=8 \
-    forward_noiser_loss_weight=1.0 \
+    forward_noiser_loss_weight=0.5 \
     forward_noiser_apply_in_aux=true \
-    forward_noiser_lr=5e-5 \
+    forward_noiser_lr=2.5e-5 \
     critic_clean_x_source=self \
     aux_real_clean_x_source=causal_AR_GT \
     dmd_normalization_enabled=false \
@@ -785,8 +798,8 @@ srun torchrun \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
     real_score_ema_weight=0.0 \
-    gan_loss_weight=0.2 \
-    gan_lr=5e-5 \
+    gan_loss_weight=0.1 \
+    gan_lr=2.5e-5 \
     gan_backbone=sam2_pixel \
     gan_sam2_checkpoint_path=$GAN_SAM2_CKPT \
     gan_sam2_config_path=$GAN_SAM2_CFG \
@@ -800,12 +813,14 @@ srun torchrun \
     gan_warmup_shape=quadratic \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
+    perceptual_approx_decay_start_step=20 \
+    perceptual_approx_decay_end_step=40 \
     gan_updates_per_step=1 \
     gan_r1_gamma=2.0 \
     gan_r2_gamma=2.0 \
     gan_sam2_frame_pool=none \
     gan_sam2_encoder_chunk_size=84 \
-    maniqa_approx_loss_weight=1.0 \
+    maniqa_approx_loss_weight=0.5 \
     maniqa_n_frames=84 \
     maniqa_n_patches_per_frame=8 \
     maniqa_metric_name=maniqa-pipal \
@@ -814,9 +829,9 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.8 \
+    anti_collapse_loss_weight=0.4 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=3 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v27B_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v27I_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

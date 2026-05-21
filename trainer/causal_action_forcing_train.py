@@ -609,10 +609,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_backbone = str(
             getattr(self.config, "gan_backbone", "latent_3d_conv")
         )
-        if self.gan_backbone not in ("latent_3d_conv", "sam2_pixel"):
+        if self.gan_backbone not in (
+            "latent_3d_conv", "sam2_pixel", "ladd_teacher_feat",
+        ):
             raise ValueError(
-                f"gan_backbone must be 'latent_3d_conv' or 'sam2_pixel'; "
-                f"got {self.gan_backbone!r}."
+                "gan_backbone must be one of 'latent_3d_conv' | "
+                "'sam2_pixel' | 'ladd_teacher_feat'; got "
+                f"{self.gan_backbone!r}."
             )
         if self.gan_enabled:
             if self.gan_backbone == "latent_3d_conv":
@@ -818,109 +821,279 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             self.latent_critic_ddp is not None,
                         )
 
-                # ----- Dense perceptual approximators (mse / lpips /
-                # gan_d_approx) — all share the PerceptualApprox 3D-CNN
-                # architecture. Each takes (gen_lat, gt_lat) and outputs
-                # a dense per-frame-per-spatial-token field; the three
-                # differ only in their training target (per-token MSE,
-                # per-token LPIPS, per-token disc logit map).
-                # When ``gan_d_approx_loss_weight > 0``, gan_d_approx
-                # REPLACES LatentSAM2Critic in the gen-side path.
-                self.mse_approx = None
-                self.mse_approx_ddp = None
-                self.mse_approx_optimizer = None
-                self.lpips_approx = None
-                self.lpips_approx_ddp = None
-                self.lpips_approx_optimizer = None
-                self.msssim_approx = None
-                self.msssim_approx_ddp = None
-                self.msssim_approx_optimizer = None
-                self.maniqa_approx = None
-                self.maniqa_approx_ddp = None
-                self.maniqa_approx_optimizer = None
-                self.gan_d_approx = None
-                self.gan_d_approx_ddp = None
-                self.gan_d_approx_optimizer = None
-                self._lpips_target_model = None  # lazy-built no_grad LPIPS
-                self._maniqa_target_model = None  # lazy-built no_grad MANIQA
-                # Read directly from cfg here so we avoid the order-of-
-                # init issue (the knob assignments to self happen later
-                # in this same __init__, after the disc/critic build).
-                _approx_d_model = int(
-                    getattr(self.config, "perceptual_approx_d_model", 256)
+            elif self.gan_backbone == "ladd_teacher_feat":
+                # ===== LADD adjacent-chunk discriminator (v28) =====
+                # Frozen WAN-teacher feature taps + trainable CCM/CSM
+                # + 1D SpectralConv heads. See model/ladd_disc.py for
+                # the architecture and the design rationale (LADD,
+                # Projected GAN, ASD-style adjacent-chunk loss).
+                from model.ladd_disc import build_ladd_disc
+                # Tap indices: per-teacher-size defaults if config left
+                # empty. 1.3B has 30 transformer blocks; 14B has 40.
+                ladd_blocks = list(
+                    getattr(self.config, "ladd_feature_blocks", []) or []
                 )
-                _approx_num_blocks = int(
-                    getattr(self.config, "perceptual_approx_num_blocks", 4)
-                )
-                _need_mse_approx = float(
-                    getattr(self.config, "mse_approx_loss_weight", 0.0)
-                ) > 0
-                _need_lpips_approx = float(
-                    getattr(self.config, "lpips_approx_loss_weight", 0.0)
-                ) > 0
-                _need_msssim_approx = float(
-                    getattr(self.config, "msssim_approx_loss_weight", 0.0)
-                ) > 0
-                _need_maniqa_approx = float(
-                    getattr(self.config, "maniqa_approx_loss_weight", 0.0)
-                ) > 0
-                _need_gan_d_approx = False  # gan_d_approx is now LatentSAM2Critic (existing path); PerceptualApprox-as-disc-approx is dropped per user realignment
-                if (
-                    _need_mse_approx or _need_lpips_approx
-                    or _need_msssim_approx or _need_maniqa_approx
-                    or _need_gan_d_approx
+                # Pull the underlying WanModel's transformer blocks from
+                # real_score. Walk all submodules (handles arbitrary
+                # wrap depth: DDP / WanDiffusionWrapper / v14 LoRA /
+                # alt-head plumbing). Pick the first nn.ModuleList of
+                # WAN transformer blocks we find.
+                _real_score = self.model.real_score
+                _blocks_iter = None
+                _wm_for_blocks = _real_score
+                for _candidate in [_real_score] + list(
+                    _real_score.modules()
                 ):
-                    from model.perceptual_approx import PerceptualApprox
+                    for _attr in ("transformer_blocks", "blocks"):
+                        _b = getattr(_candidate, _attr, None)
+                        if (
+                            isinstance(_b, torch.nn.ModuleList)
+                            and len(_b) >= 10  # WAN has 30+ blocks
+                        ):
+                            _blocks_iter = _b
+                            _wm_for_blocks = _candidate
+                            break
+                    if _blocks_iter is not None:
+                        break
+                if _blocks_iter is None:
+                    raise AttributeError(
+                        "LADD: could not find a transformer-block "
+                        "ModuleList anywhere under real_score. real_score "
+                        f"type={type(_real_score).__name__}. Inspect the "
+                        "wrap chain and either patch the search loop or "
+                        "specify ``ladd_feature_blocks`` explicitly."
+                    )
+                _n_blocks = len(_blocks_iter)
+                if not ladd_blocks:
+                    # Span the depth: ~5 taps evenly distributed.
+                    if _n_blocks <= 8:
+                        ladd_blocks = list(range(_n_blocks))
+                    else:
+                        ladd_blocks = [
+                            max(0, int(_n_blocks * f / 5))
+                            for f in (1, 2, 3, 4, 4.95)
+                        ]
+                        # Dedup + sort; trim to <= 5.
+                        ladd_blocks = sorted(set(min(b, _n_blocks - 1) for b in ladd_blocks))[:5]
+                # Infer teacher hidden dim from a tap block. WAN
+                # transformer block has .hidden_size or we read it
+                # from any Linear layer in the block.
+                _tap_block = _blocks_iter[ladd_blocks[0]]
+                _dim_teacher = None
+                for _name in ("hidden_size", "dim", "inner_dim"):
+                    if hasattr(_tap_block, _name):
+                        _dim_teacher = int(getattr(_tap_block, _name))
+                        break
+                if _dim_teacher is None:
+                    # Fallback: scan block's parameters for a square
+                    # weight (linear self-projection often has it).
+                    for _p in _tap_block.parameters():
+                        if _p.dim() == 2 and _p.shape[0] == _p.shape[1]:
+                            _dim_teacher = int(_p.shape[0])
+                            break
+                if _dim_teacher is None:
+                    raise RuntimeError(
+                        "LADD: could not infer dim_teacher from a tap "
+                        f"block at index {ladd_blocks[0]}. Specify "
+                        "ladd_feature_blocks explicitly."
+                    )
+                # Prompt-conditioning dim from real_score's text embed.
+                _prompt_embed_dim = 0
+                if bool(getattr(self.config, "ladd_use_prompt_cond", True)):
+                    _prompt_embed_dim = int(
+                        getattr(self.config, "text_embed_dim", 4096)
+                    )
+                _wavelet_hf_enabled = bool(
+                    getattr(self.config, "ladd_wavelet_hf_enabled", False)
+                )
+                _wavelet_in_channels = int(
+                    getattr(self.config, "gan_disc_in_channels", 16)
+                )
+                disc = build_ladd_disc(
+                    real_score=_real_score,
+                    block_indices=ladd_blocks,
+                    dim_teacher=_dim_teacher,
+                    dim_proj=int(
+                        getattr(self.config, "ladd_proj_dim", 256)
+                    ),
+                    use_csm=bool(
+                        getattr(self.config, "ladd_use_csm", True)
+                    ),
+                    use_lateral_proj=bool(
+                        getattr(self.config, "ladd_use_lateral_proj", False)
+                    ),
+                    head_kernel_size=int(
+                        getattr(self.config, "ladd_disc_head_kernel", 9)
+                    ),
+                    cmap_dim=int(
+                        getattr(self.config, "ladd_cmap_dim", 64)
+                    ) if _prompt_embed_dim > 0 else 0,
+                    prompt_embed_dim=_prompt_embed_dim,
+                    wavelet_hf_enabled=_wavelet_hf_enabled,
+                    wavelet_hf_in_channels=_wavelet_in_channels,
+                    wavelet_hf_drop_ll=bool(
+                        getattr(
+                            self.config,
+                            "ladd_wavelet_hf_drop_ll",
+                            True,
+                        )
+                    ),
+                    wavelet_hf_adapter_init_gain=float(
+                        getattr(
+                            self.config,
+                            "ladd_wavelet_hf_adapter_init_gain",
+                            0.1,
+                        )
+                    ),
+                )
+                # All-fp32 for R1 stability.
+                disc.to(device=self.device, dtype=torch.float32)
+                disc.train()
+                self.r3gan_disc = disc
+                self.ladd_block_indices = ladd_blocks
+                if self.world_size > 1:
+                    # Trainable params = CCM + CSM + heads + cmapper.
+                    # Teacher params are not in disc.parameters() (the
+                    # projector is a plain attribute, not a submodule).
+                    self.r3gan_disc_ddp = DDP(
+                        disc,
+                        device_ids=[self.local_rank],
+                        output_device=self.local_rank,
+                        find_unused_parameters=False,
+                        broadcast_buffers=False,
+                    )
+                if self.is_main_process:
+                    n_total = sum(p.numel() for p in disc.parameters())
+                    n_train = sum(
+                        p.numel() for p in disc.parameters()
+                        if p.requires_grad
+                    )
+                    logging.info(
+                        "[ActionForcing] LADD discriminator built: "
+                        "blocks=%s dim_teacher=%d dim_proj=%d "
+                        "use_csm=%s cmap_dim=%d wavelet_hf=%s "
+                        "params_total=%.2fM params_trainable=%.2fM "
+                        "(DDP=%s)",
+                        ladd_blocks, _dim_teacher,
+                        int(getattr(self.config, "ladd_proj_dim", 256)),
+                        bool(getattr(self.config, "ladd_use_csm", True)),
+                        int(getattr(self.config, "ladd_cmap_dim", 64))
+                        if _prompt_embed_dim > 0 else 0,
+                        bool(_wavelet_hf_enabled),
+                        n_total / 1e6, n_train / 1e6,
+                        self.r3gan_disc_ddp is not None,
+                    )
+                # LADD does not use a separate LatentSAM2Critic — the
+                # disc itself is small/cheap enough to use as both the
+                # critic and the disc. Mark the critic slots None so
+                # the distilled-critic path is skipped.
+                self.latent_critic = None
+                self.latent_critic_ddp = None
+                self.latent_critic_optimizer = None
+                # Force-set the gan_sam2_distilled_critic flag false
+                # so the SAM2-only distillation path doesn't fire.
+                self.gan_sam2_distilled_critic = False
 
-                    def _build_approx(name: str, single_input: bool = False):
-                        m = PerceptualApprox(
-                            in_channels=16,
-                            d_model=_approx_d_model,
-                            num_blocks=_approx_num_blocks,
-                            single_input=single_input,
-                        ).to(device=self.device, dtype=torch.float32)
-                        m.train()
-                        ddp = None
-                        if self.world_size > 1:
-                            ddp = DDP(
-                                m, device_ids=[self.local_rank],
-                                output_device=self.local_rank,
-                                find_unused_parameters=False,
-                                broadcast_buffers=False,
-                            )
-                        if self.is_main_process:
-                            logging.info(
-                                "[ActionForcing] %s built: d_model=%d "
-                                "num_blocks=%d num_params=%.2fM "
-                                "(DDP=%s)",
-                                name,
-                                _approx_d_model,
-                                _approx_num_blocks,
-                                m.num_params / 1e6,
-                                ddp is not None,
-                            )
-                        return m, ddp
 
-                    if _need_mse_approx:
-                        self.mse_approx, self.mse_approx_ddp = _build_approx(
-                            "MSEApprox"
-                        )
-                    if _need_lpips_approx:
-                        self.lpips_approx, self.lpips_approx_ddp = (
-                            _build_approx("LPIPSApprox")
-                        )
-                    if _need_msssim_approx:
-                        (
-                            self.msssim_approx,
-                            self.msssim_approx_ddp,
-                        ) = _build_approx("MSSSIMApprox")
-                    if _need_maniqa_approx:
-                        (
-                            self.maniqa_approx,
-                            self.maniqa_approx_ddp,
-                        ) = _build_approx(
-                            "MANIQAApprox", single_input=True,
-                        )
+        # ===== Dense perceptual approximators (independent of GAN) =====
+        # mse / lpips / msssim / maniqa — all share the PerceptualApprox
+        # 3D-CNN architecture, differ only in their training target.
+        # MOVED out of ``if gan_enabled:`` (v28): the build only depends
+        # on the corresponding ``*_loss_weight > 0`` gate. Previously
+        # this lived inside ``elif gan_backbone == sam2_pixel:`` which
+        # silently disabled MANIQA in no-GAN configs.
+        self.mse_approx = None
+        self.mse_approx_ddp = None
+        self.mse_approx_optimizer = None
+        self.lpips_approx = None
+        self.lpips_approx_ddp = None
+        self.lpips_approx_optimizer = None
+        self.msssim_approx = None
+        self.msssim_approx_ddp = None
+        self.msssim_approx_optimizer = None
+        self.maniqa_approx = None
+        self.maniqa_approx_ddp = None
+        self.maniqa_approx_optimizer = None
+        self.gan_d_approx = None
+        self.gan_d_approx_ddp = None
+        self.gan_d_approx_optimizer = None
+        self._lpips_target_model = None  # lazy-built no_grad LPIPS
+        self._maniqa_target_model = None  # lazy-built no_grad MANIQA
+        _approx_d_model = int(
+            getattr(self.config, "perceptual_approx_d_model", 256)
+        )
+        _approx_num_blocks = int(
+            getattr(self.config, "perceptual_approx_num_blocks", 4)
+        )
+        _need_mse_approx = float(
+            getattr(self.config, "mse_approx_loss_weight", 0.0)
+        ) > 0
+        _need_lpips_approx = float(
+            getattr(self.config, "lpips_approx_loss_weight", 0.0)
+        ) > 0
+        _need_msssim_approx = float(
+            getattr(self.config, "msssim_approx_loss_weight", 0.0)
+        ) > 0
+        _need_maniqa_approx = float(
+            getattr(self.config, "maniqa_approx_loss_weight", 0.0)
+        ) > 0
+        _need_gan_d_approx = False  # gan_d_approx is now LatentSAM2Critic
+        if (
+            _need_mse_approx or _need_lpips_approx
+            or _need_msssim_approx or _need_maniqa_approx
+            or _need_gan_d_approx
+        ):
+            from model.perceptual_approx import PerceptualApprox
+
+            def _build_approx(name: str, single_input: bool = False):
+                m = PerceptualApprox(
+                    in_channels=16,
+                    d_model=_approx_d_model,
+                    num_blocks=_approx_num_blocks,
+                    single_input=single_input,
+                ).to(device=self.device, dtype=torch.float32)
+                m.train()
+                ddp = None
+                if self.world_size > 1:
+                    ddp = DDP(
+                        m, device_ids=[self.local_rank],
+                        output_device=self.local_rank,
+                        find_unused_parameters=False,
+                        broadcast_buffers=False,
+                    )
+                if self.is_main_process:
+                    logging.info(
+                        "[ActionForcing] %s built: d_model=%d "
+                        "num_blocks=%d num_params=%.2fM "
+                        "(DDP=%s)",
+                        name,
+                        _approx_d_model,
+                        _approx_num_blocks,
+                        m.num_params / 1e6,
+                        ddp is not None,
+                    )
+                return m, ddp
+
+            if _need_mse_approx:
+                self.mse_approx, self.mse_approx_ddp = _build_approx(
+                    "MSEApprox"
+                )
+            if _need_lpips_approx:
+                self.lpips_approx, self.lpips_approx_ddp = (
+                    _build_approx("LPIPSApprox")
+                )
+            if _need_msssim_approx:
+                (
+                    self.msssim_approx,
+                    self.msssim_approx_ddp,
+                ) = _build_approx("MSSSIMApprox")
+            if _need_maniqa_approx:
+                (
+                    self.maniqa_approx,
+                    self.maniqa_approx_ddp,
+                ) = _build_approx(
+                    "MANIQAApprox", single_input=True,
+                )
 
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
@@ -1620,6 +1793,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.perceptual_approx_ramp_steps = int(
             getattr(cfg, "perceptual_approx_ramp_steps", 0)
         )
+        # Optional linear DECAY of the perceptual-approx contribution.
+        # When ``perceptual_approx_decay_start_step`` is non-negative,
+        # the ramp_factor (which has already ramped UP to 1.0 via
+        # perceptual_approx_warmup_steps + perceptual_approx_ramp_steps)
+        # is multiplicatively shrunk back toward 0 over the window
+        # [decay_start_step, decay_end_step]. At decay_end_step the
+        # effective weight is 0. Defaults (-1) disable the decay.
+        # Use case: phase out MANIQA after the DMD/GAN signals are
+        # established, so perceptual artifacts don't bias late training.
+        self.perceptual_approx_decay_start_step = int(
+            getattr(cfg, "perceptual_approx_decay_start_step", -1)
+        )
+        self.perceptual_approx_decay_end_step = int(
+            getattr(cfg, "perceptual_approx_decay_end_step", -1)
+        )
+        if (
+            self.perceptual_approx_decay_start_step >= 0
+            and self.perceptual_approx_decay_end_step
+            <= self.perceptual_approx_decay_start_step
+        ):
+            raise ValueError(
+                "perceptual_approx_decay_end_step "
+                f"({self.perceptual_approx_decay_end_step}) must be > "
+                "perceptual_approx_decay_start_step "
+                f"({self.perceptual_approx_decay_start_step}) when decay "
+                "is enabled."
+            )
         # Constant-weight L1 (MAE) and L2 (MSE) between the student's
         # pred_image latent and the GT latent window. Direct anti-drift
         # anchor, applied EVERY step with no ramp or warmup. Default 0
@@ -3976,6 +4176,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
         else:
             ramp_factor = 1.0
+        # Optional linear DECAY on top of the up-ramp. When configured,
+        # multiplicatively shrink ramp_factor toward 0 across
+        # [decay_start_step, decay_end_step]. Past decay_end_step the
+        # contribution is zero. Disabled when decay_start_step < 0.
+        if (
+            self.perceptual_approx_decay_start_step >= 0
+            and current_step >= self.perceptual_approx_decay_start_step
+        ):
+            decay_span = (
+                self.perceptual_approx_decay_end_step
+                - self.perceptual_approx_decay_start_step
+            )
+            if current_step >= self.perceptual_approx_decay_end_step:
+                decay_factor = 0.0
+            else:
+                t = (
+                    current_step - self.perceptual_approx_decay_start_step
+                ) / max(1, decay_span)
+                decay_factor = max(0.0, 1.0 - float(t))
+            ramp_factor = ramp_factor * decay_factor
         loss = zero
         logs: Dict[str, float] = {
             "train/perc_ramp_factor": float(ramp_factor),
@@ -4933,6 +5153,517 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["train/critic_disc_corr"] = critic_disc_corr
         out["train/critic_updates_per_step"] = float(critic_updates)
 
+    # ==================================================================
+    # LADD discriminator (v28)
+    # ==================================================================
+    # Supports two pair construction modes, independently toggleable:
+    #   * "gt_vs_fake" (LADD canonical): real = GT chunks at the same
+    #     temporal positions as the gen output. Standard adversarial
+    #     "student vs teacher's clean data".
+    #   * "adjacent_chunks" (ASD-style): real = chunk_i, fake =
+    #     chunk_{i+1} from the same gen rollout. Pushes
+    #     chunk_{i+1}'s distribution toward chunk_i's.
+    # When both flags are on, two D updates run per iter and both
+    # gen-side losses sum into the generator's total.
+    def _compute_ladd_losses(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+        current_step: int,
+        flash_dmd_gan_x0: Optional[torch.Tensor] = None,
+    ) -> tuple:
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        if not self.gan_enabled or self.r3gan_disc is None:
+            return zero, {}
+
+        # Source latent for the FAKE side (gradient-bearing for the gen).
+        if flash_dmd_gan_x0 is not None:
+            src_grad = flash_dmd_gan_x0.to(torch.float32)
+        else:
+            src_grad = pred_image.to(torch.float32)
+        src_detached = src_grad.detach()
+        # GT latent for the REAL side in gt_vs_fake mode. Always detached.
+        gt_detached = gt_latents_window.detach().to(torch.float32)
+
+        # Mode toggles. Defaults preserve backward compat with v28:
+        # adjacent on by default, gt_vs_fake off by default.
+        gt_vs_fake_enabled = bool(
+            getattr(self.model, "ladd_gt_vs_fake_enabled", False)
+        )
+        adj_enabled = bool(
+            getattr(self.model, "ladd_adjacent_chunks_enabled", True)
+        )
+        if not gt_vs_fake_enabled and not adj_enabled:
+            return zero, {}
+
+        gen_loss_total = zero
+        logs: dict = {}
+
+        if gt_vs_fake_enabled:
+            g_loss, partial_logs = self._ladd_run_pair_mode(
+                real_src=gt_detached,
+                fake_src_grad=src_grad,
+                fake_src_detached=src_detached,
+                pred_image_dtype=pred_image.dtype,
+                pair_mode="gt_vs_fake",
+                current_step=current_step,
+            )
+            w = float(getattr(self.model, "ladd_gt_vs_fake_weight", 1.0))
+            gen_loss_total = gen_loss_total + w * g_loss
+            for k, v in partial_logs.items():
+                logs[k + "_gt"] = v
+
+        if adj_enabled:
+            g_loss, partial_logs = self._ladd_run_pair_mode(
+                real_src=src_detached,
+                fake_src_grad=src_grad,
+                fake_src_detached=src_detached,
+                pred_image_dtype=pred_image.dtype,
+                pair_mode="adjacent_chunks",
+                current_step=current_step,
+            )
+            w = float(getattr(self.model, "ladd_adjacent_chunks_weight", 1.0))
+            gen_loss_total = gen_loss_total + w * g_loss
+            for k, v in partial_logs.items():
+                logs[k + "_adj"] = v
+
+        return gen_loss_total, logs
+
+    def _ladd_run_pair_mode(
+        self,
+        real_src: torch.Tensor,
+        fake_src_grad: torch.Tensor,
+        fake_src_detached: torch.Tensor,
+        pred_image_dtype: torch.dtype,
+        pair_mode: str,
+        current_step: int,
+    ) -> tuple:
+        """Single D-update + gen-side loss for one pair-construction mode.
+
+        Args:
+            real_src: detached tensor that supplies the REAL chunks.
+                For ``gt_vs_fake`` this is the GT latent window; for
+                ``adjacent_chunks`` it is the (detached) source latent.
+            fake_src_grad: gradient-bearing source for the FAKE chunks
+                on the gen-side forward.
+            fake_src_detached: detached source for the FAKE chunks on
+                the D-side forward.
+            pair_mode: ``"gt_vs_fake"`` or ``"adjacent_chunks"``.
+            current_step: training step (for warmup ramp + RNG seed).
+
+        Returns ``(gen_gan_loss, logs)``. ``gen_gan_loss`` is graph-
+        attached through ``fake_src_grad``.
+        """
+        from model.r3gan import rpgan_d_loss, rpgan_g_loss, r1_penalty
+        from model.ladd_disc import latent_diff_augment
+
+        device = fake_src_grad.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        disc_for_update = (
+            self.r3gan_disc_ddp
+            if self.r3gan_disc_ddp is not None
+            else self.r3gan_disc
+        )
+        disc_for_guidance = self.r3gan_disc
+
+        npb = int(getattr(self.model, "num_frame_per_block", 3))
+        F_total = int(fake_src_grad.shape[1])
+        if F_total < npb:
+            return zero, {"train/ladd_n_pairs": 0.0}
+        n_chunks = F_total // npb
+
+        # Per-mode pair index lists. Each pair = (real_idx, fake_idx)
+        # where the indices are chunk positions in real_src / fake_src.
+        if pair_mode == "gt_vs_fake":
+            all_pairs = [(i, i) for i in range(n_chunks)]
+        elif pair_mode == "adjacent_chunks":
+            if n_chunks < 2:
+                return zero, {"train/ladd_n_pairs": 0.0}
+            all_pairs = [(i, i + 1) for i in range(n_chunks - 1)]
+        else:
+            raise ValueError(
+                f"_ladd_run_pair_mode: unknown pair_mode={pair_mode!r}."
+            )
+
+        # Optional pair budget (random subset; same selection on all ranks).
+        ladd_pairs_per_step = int(
+            getattr(self.model, "ladd_pairs_per_step", 0)
+        )
+        if (
+            ladd_pairs_per_step > 0
+            and ladd_pairs_per_step < len(all_pairs)
+        ):
+            g = torch.Generator(device="cpu").manual_seed(int(current_step))
+            idx = torch.randperm(len(all_pairs), generator=g)[
+                :ladd_pairs_per_step
+            ].tolist()
+            pairs = [all_pairs[i] for i in sorted(idx)]
+        else:
+            pairs = all_pairs
+        n_pairs = len(pairs)
+
+        def _slice(t, i):
+            return t[:, i * npb:(i + 1) * npb]
+
+        real_chunks_det = torch.cat(
+            [_slice(real_src, i) for (i, _) in pairs], dim=0,
+        )
+        fake_chunks_det = torch.cat(
+            [_slice(fake_src_detached, j) for (_, j) in pairs], dim=0,
+        )
+        fake_chunks_grad_tensor = torch.cat(
+            [_slice(fake_src_grad, j) for (_, j) in pairs], dim=0,
+        )
+
+        # ----- Disc timestep -----
+        # WAN with action-aware forward expects per-frame timestep
+        # ``[B, F]`` so the time_projection output matches the per-frame
+        # ``_action_modulation``'s ``[B*F, ...]`` reshape. Without F in
+        # the timestep shape, time_projection outputs ``[B, hidden]``
+        # while action_modulation is ``[B*F, hidden]`` and the
+        # ``am_flat != e0`` shape check raises. Match the main DMD
+        # path's convention.
+        flash_on = bool(getattr(self.model, "flash_dmd_enabled", False))
+        flash_t = int(getattr(self.model, "flash_dmd_gan_t", 60))
+        disc_t_int = flash_t if flash_on else 0
+        bsz_eff = real_chunks_det.shape[0]
+        t_disc = torch.full(
+            (bsz_eff, npb), disc_t_int, dtype=torch.long, device=device,
+        )
+
+        def _add_disc_noise(x):
+            if disc_t_int <= 0:
+                return x
+            scheduler = getattr(self.model, "scheduler", None)
+            if scheduler is None or not hasattr(scheduler, "add_noise"):
+                return x
+            eps = torch.randn_like(x)
+            x_flat = x.flatten(0, 1)
+            eps_flat = eps.flatten(0, 1)
+            # t_disc is now [B, F]; flatten matches x_flat's [B*F] axis.
+            t_per_frame = t_disc.flatten(0, 1)
+            noisy_flat = scheduler.add_noise(x_flat, eps_flat, t_per_frame)
+            return noisy_flat.unflatten(0, x.shape[:2])
+
+        real_chunks_det_noisy = _add_disc_noise(real_chunks_det)
+        fake_chunks_det_noisy = _add_disc_noise(fake_chunks_det)
+
+        # DiffAugment — same per-sample randomness on real and fake.
+        # Different seeds per mode so the augmentations decorrelate.
+        diff_aug_policy = str(
+            getattr(self.model, "ladd_diff_aug_policy", "")
+        )
+        seed_offset = 0 if pair_mode == "gt_vs_fake" else 7919
+        if diff_aug_policy:
+            real_chunks_det_noisy, fake_chunks_det_noisy = (
+                latent_diff_augment(
+                    real_chunks_det_noisy,
+                    fake_chunks_det_noisy,
+                    policy=diff_aug_policy,
+                    seed=int(current_step) * 31 + seed_offset,
+                )
+            )
+
+        # ----- Prompt embedding (broadcast across pairs) -----
+        prompt_embeds = None
+        pooled_prompt = None
+        s_state = getattr(self.model, "streaming_state", None)
+        if isinstance(s_state, dict):
+            prompt_embeds = s_state.get("prompt_embeds")
+        if prompt_embeds is None:
+            raise RuntimeError(
+                "_ladd_run_pair_mode: prompt_embeds not in "
+                "streaming_state. setup_sequence must have run before "
+                "the gen step."
+            )
+        if prompt_embeds.shape[0] != bsz_eff:
+            reps = bsz_eff // prompt_embeds.shape[0]
+            prompt_embeds_eff = prompt_embeds.repeat_interleave(reps, dim=0)
+        else:
+            prompt_embeds_eff = prompt_embeds
+        if disc_for_guidance.cmap_dim > 0:
+            pooled_prompt = prompt_embeds_eff.float().mean(dim=1)
+
+        # ----- Action tokens + modulation (action-aware WAN configs) -----
+        # When the WAN model has action_tokens_per_frame > 0, its
+        # forward refuses to run without action_tokens, AND the
+        # transformer blocks use a per-frame ``_action_modulation``
+        # whose frame count MUST match the input's frame count (else
+        # "size of tensor a (X) must match (Y)" in the per-block FiLM
+        # multiply). Build BOTH streams from per-chunk slices of
+        # streaming_state[ride_actions_window].
+        real_action_tokens = None
+        fake_action_tokens = None
+        real_action_modulation = None
+        fake_action_modulation = None
+        a_per_f = 0
+        # Look up the WAN model under real_score to read a_per_f.
+        _rs = self.model.real_score
+        for _cand in [_rs] + list(_rs.modules()):
+            if hasattr(_cand, "action_tokens_per_frame"):
+                a_per_f = int(getattr(_cand, "action_tokens_per_frame", 0))
+                if a_per_f > 0:
+                    break
+        ride_actions = (
+            s_state.get("ride_actions_window")
+            if isinstance(s_state, dict) else None
+        )
+        atp = getattr(self.model, "action_token_projection", None)
+        ap = getattr(self.model, "action_projection", None)
+        if a_per_f > 0 and ride_actions is not None and atp is not None:
+            cf_state = int(s_state.get("cf", 0))
+            # Build per-pair action slices for real and fake sides.
+            real_acts = []
+            fake_acts = []
+            for (i_real, j_fake) in pairs:
+                # ride_actions: [B, cf+rollout, A]. Chunk i covers frames
+                # [cf + i*npb, cf + (i+1)*npb) within the rollout. For
+                # gt_vs_fake, real and fake use the same chunk index
+                # (i_real == j_fake). For adjacent_chunks they differ
+                # by one (j_fake = i_real + 1).
+                lo_r = cf_state + i_real * npb
+                lo_f = cf_state + j_fake * npb
+                real_acts.append(ride_actions[:, lo_r:lo_r + npb])
+                fake_acts.append(ride_actions[:, lo_f:lo_f + npb])
+            real_acts_t = torch.cat(real_acts, dim=0).to(
+                device=device, dtype=prompt_embeds_eff.dtype,
+            )
+            fake_acts_t = torch.cat(fake_acts, dim=0).to(
+                device=device, dtype=prompt_embeds_eff.dtype,
+            )
+            # No_grad: action projections are conditioning-only; we
+            # never backward through them on the disc path, so the
+            # autograd graph they'd build is dead weight (~1-2 GB).
+            with torch.no_grad():
+                real_action_tokens = atp(real_acts_t).detach()
+                fake_action_tokens = atp(fake_acts_t).detach()
+                if ap is not None:
+                    real_action_modulation = ap(
+                        real_acts_t, num_frames=real_acts_t.shape[1],
+                    ).detach()
+                    fake_action_modulation = ap(
+                        fake_acts_t, num_frames=fake_acts_t.shape[1],
+                    ).detach()
+
+        # ----- D-update -----
+        disc_skipped = (
+            current_step < int(getattr(self, "gan_disc_start_step", 0))
+        )
+        n_disc_updates = (
+            0 if disc_skipped else int(self.gan_updates_per_step)
+        )
+        last_d_loss = 0.0
+        last_d_real = 0.0
+        last_d_fake = 0.0
+        last_r1 = 0.0
+        if n_disc_updates > 0 and self.r3gan_optimizer is not None:
+            for _ in range(n_disc_updates):
+                self.r3gan_optimizer.zero_grad(set_to_none=True)
+                # ----- Batched real+fake forward (v28A OOM mitigation) -----
+                # Stack real + fake into ONE disc forward; halves the
+                # teacher-class forwards (2 → 1) for the D-update.
+                # R1 penalty stays correct: ``d_real_logits.sum()`` only
+                # depends on the real rows, so the gradient w.r.t. fake
+                # rows is identically zero.
+                B_pair_d = real_chunks_det_noisy.shape[0]
+                combined_in = torch.cat(
+                    [real_chunks_det_noisy.detach(),
+                     fake_chunks_det_noisy.detach()],
+                    dim=0,
+                ).requires_grad_(True)
+                _disc_t_d = torch.cat([t_disc, t_disc], dim=0)
+                _pe_d = torch.cat([prompt_embeds_eff, prompt_embeds_eff], dim=0)
+                _pp_d = (
+                    torch.cat([pooled_prompt, pooled_prompt], dim=0)
+                    if pooled_prompt is not None else None
+                )
+                _combined_cond_extra = None
+                if real_action_tokens is not None:
+                    _combined_cond_extra = {
+                        "_action_tokens": torch.cat(
+                            [real_action_tokens, fake_action_tokens], dim=0,
+                        ),
+                    }
+                    if real_action_modulation is not None:
+                        _combined_cond_extra["_action_modulation"] = torch.cat(
+                            [real_action_modulation, fake_action_modulation],
+                            dim=0,
+                        )
+                # Lazy R1 (v28A OOM mitigation 5): the R1 second-order
+                # backward (``create_graph=True``) is the dominant
+                # memory cost of the disc step. Compute R1 only every
+                # ``ladd_r1_every_n_steps`` disc updates; on other
+                # iters skip the gradient computation entirely (saves
+                # the second-order graph). When skipped, the disc
+                # forward can drop create_graph=False which lets
+                # PyTorch free per-block activations through the
+                # teacher backward as it normally does.
+                _r1_every_n = max(1, int(
+                    getattr(self.model, "ladd_r1_every_n_steps", 1)
+                ))
+                _do_r1 = (current_step % _r1_every_n == 0)
+                if _do_r1:
+                    combined_logits = disc_for_update(
+                        x_noisy=combined_in,
+                        timestep=_disc_t_d,
+                        prompt_embeds=_pe_d,
+                        pooled_prompt=_pp_d,
+                        conditional_extra=_combined_cond_extra,
+                    )
+                    d_real_logits = combined_logits[:B_pair_d]
+                    d_fake_logits = combined_logits[B_pair_d:]
+                    grads = torch.autograd.grad(
+                        d_real_logits.sum(),
+                        combined_in,
+                        create_graph=True,
+                        retain_graph=True,
+                    )[0]
+                    real_grads_only = grads[:B_pair_d]
+                    _r1_gamma = float(
+                        getattr(self.model, "ladd_r1_gamma", 1.0)
+                    )
+                    r1 = (
+                        0.5 * _r1_gamma
+                        * real_grads_only.flatten(1).pow(2).sum(dim=1).mean()
+                    )
+                else:
+                    # Skip R1: forward without R1's create_graph
+                    # requirement. d_real_logits stays in graph for
+                    # the d_total.backward() (RpGAN d_loss only).
+                    combined_logits = disc_for_update(
+                        x_noisy=combined_in.detach(),
+                        timestep=_disc_t_d,
+                        prompt_embeds=_pe_d,
+                        pooled_prompt=_pp_d,
+                        conditional_extra=_combined_cond_extra,
+                    )
+                    d_real_logits = combined_logits[:B_pair_d]
+                    d_fake_logits = combined_logits[B_pair_d:]
+                    r1 = combined_logits.sum() * 0.0  # graph-connected zero
+                d_rp = rpgan_d_loss(
+                    d_real_logits.mean(dim=1, keepdim=False),
+                    d_fake_logits.mean(dim=1, keepdim=False),
+                )
+                d_total = d_rp + r1
+                d_total.backward()
+                if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.r3gan_disc.parameters()
+                         if p.grad is not None],
+                        self.gan_max_grad_norm,
+                    )
+                self.r3gan_optimizer.step()
+                last_d_loss = float(d_rp.detach().item())
+                last_d_real = float(d_real_logits.detach().mean().item())
+                last_d_fake = float(d_fake_logits.detach().mean().item())
+                last_r1 = float(r1.detach().item())
+
+        # ----- Gen-side -----
+        critic_warmup_done = (
+            current_step >= int(getattr(self, "gan_critic_warmup_steps", 0))
+        )
+        if (
+            self.gan_warmup_steps > 0
+            and current_step < (
+                self.gan_critic_warmup_steps + self.gan_warmup_steps
+            )
+            and current_step >= self.gan_critic_warmup_steps
+        ):
+            ramp_steps_in = current_step - self.gan_critic_warmup_steps
+            t_norm = ramp_steps_in / max(1, self.gan_warmup_steps)
+            ramp = self._gan_warmup_shape_apply(t_norm)
+            gen_gan_weight = ramp * self.gan_loss_weight
+        elif current_step >= (
+            self.gan_critic_warmup_steps + self.gan_warmup_steps
+        ):
+            gen_gan_weight = self.gan_loss_weight
+        else:
+            gen_gan_weight = 0.0
+        gen_gan_weight = gen_gan_weight * float(
+            getattr(self.model, "ladd_disc_loss_weight", 1.0)
+        )
+
+        gen_gan_main_value = 0.0
+        if critic_warmup_done and gen_gan_weight > 0:
+            disc_for_guidance.requires_grad_(False)
+            try:
+                real_chunks_grad_det = real_chunks_det.detach()
+                fake_chunks_grad = fake_chunks_grad_tensor
+                real_g = _add_disc_noise(real_chunks_grad_det)
+                fake_g = _add_disc_noise(fake_chunks_grad)
+                if diff_aug_policy:
+                    real_g, fake_g = latent_diff_augment(
+                        real_g, fake_g,
+                        policy=diff_aug_policy,
+                        seed=int(current_step) * 31 + seed_offset,
+                    )
+                # ----- Batched gen-side forward (v28A OOM mitigation) -----
+                # Stack real (detached anchor) + fake (grad-on) into ONE
+                # disc forward; halves the teacher-class forwards (2 → 1)
+                # on the gen side. d_fake_g still gets its gen-side
+                # gradient via the fake rows.
+                B_pair_g = real_g.shape[0]
+                combined_g = torch.cat([real_g.detach(), fake_g], dim=0)
+                _disc_t_g = torch.cat([t_disc, t_disc], dim=0)
+                _pe_g = torch.cat([prompt_embeds_eff, prompt_embeds_eff], dim=0)
+                _pp_g = (
+                    torch.cat([pooled_prompt, pooled_prompt], dim=0)
+                    if pooled_prompt is not None else None
+                )
+                _gen_combined_cond_extra = None
+                if real_action_tokens is not None:
+                    _gen_combined_cond_extra = {
+                        "_action_tokens": torch.cat(
+                            [real_action_tokens, fake_action_tokens], dim=0,
+                        ),
+                    }
+                    if real_action_modulation is not None:
+                        _gen_combined_cond_extra["_action_modulation"] = (
+                            torch.cat(
+                                [real_action_modulation, fake_action_modulation],
+                                dim=0,
+                            )
+                        )
+                combined_g_logits = disc_for_guidance(
+                    x_noisy=combined_g,
+                    timestep=_disc_t_g,
+                    prompt_embeds=_pe_g,
+                    pooled_prompt=_pp_g,
+                    conditional_extra=_gen_combined_cond_extra,
+                )
+                d_real_g = combined_g_logits[:B_pair_g]
+                d_fake_g = combined_g_logits[B_pair_g:]
+                g_rp = rpgan_g_loss(
+                    d_real_g.detach().mean(dim=1, keepdim=False),
+                    d_fake_g.mean(dim=1, keepdim=False),
+                )
+                generator_gan_loss = (
+                    gen_gan_weight * g_rp.to(pred_image_dtype)
+                )
+                gen_gan_main_value = float(g_rp.detach().item())
+            finally:
+                disc_for_guidance.requires_grad_(True)
+        else:
+            generator_gan_loss = zero
+
+        logs = {
+            "train/r3gan_disc_skipped": 1.0 if disc_skipped else 0.0,
+            "train/r3gan_d_loss": last_d_loss,
+            "train/r3gan_d_real": last_d_real,
+            "train/r3gan_d_fake_detached": last_d_fake,
+            "train/r3gan_r1": last_r1,
+            "train/r3gan_g_loss_raw": gen_gan_main_value,
+            "train/r3gan_g_loss_weighted": (
+                gen_gan_weight * gen_gan_main_value
+            ),
+            "train/r3gan_g_weight": float(gen_gan_weight),
+            "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
+            "train/ladd_n_pairs": float(n_pairs),
+            "train/ladd_disc_t": float(disc_t_int),
+        }
+        return generator_gan_loss, logs
+
     def _compute_r3gan_losses(
         self,
         pred_image: torch.Tensor,
@@ -4967,6 +5698,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         zero = torch.zeros((), device=device, dtype=torch.float32)
         if not self.gan_enabled or self.r3gan_disc is None:
             return zero, {}
+
+        # Dispatch to the LADD adjacent-chunk flow when configured.
+        if self.gan_backbone == "ladd_teacher_feat":
+            return self._compute_ladd_losses(
+                pred_image=pred_image,
+                gt_latents_window=gt_latents_window,
+                current_step=current_step,
+                flash_dmd_gan_x0=flash_dmd_gan_x0,
+            )
 
         # Dispatch to the distilled-critic flow when enabled. Keeps
         # the legacy pixel-disc-in-gen-graph path as the fallback.

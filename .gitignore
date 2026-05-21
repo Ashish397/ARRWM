@@ -54,6 +54,7 @@ testing/**/*.mp4
 # its own ``.git/``, so leaving them untracked risks a future
 # ``git add .`` creating broken gitlinks. They are not maintained as
 # submodules intentionally; re-clone from upstream if you need them.
+references/
 CausVid/
 # Causal Forcing (upstream clone / vendored) — all common path spellings
 Causal-Forcing/

@@ -381,9 +381,6 @@ class ActionForcingTrainingPipeline:
         requires_grad: bool = True,
         flash_dmd_enabled: bool = False,
         flash_dmd_gan_t: int = 60,
-        warm_start_init: bool = False,
-        warm_start_rung_idx: int = 1,
-        initial_prev_clean: Optional[torch.Tensor] = None,
         **conditional_dict,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """Run the Action-Forcing chunkwise rollout.
@@ -442,14 +439,6 @@ class ActionForcingTrainingPipeline:
         # the legacy ``_streaming_build_clean_x_self`` path.
         self._clean_chunk: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (= cache_pred at the
-        # last rung's t after the post-exit finish-denoise chain;
-        # captured BEFORE the standard mode's context_noise commit
-        # overwrites cache_pred). Used by callers as the warm-start
-        # seed for the NEXT rollout call (streaming flow). Populated
-        # whether or not ``warm_start_init=True`` so callers can
-        # always read it; ``None`` only when no rollout block ran.
-        self._last_clean_pred: Optional[torch.Tensor] = None
-
         batch_size, num_frames, num_channels, height, width = noise.shape
 
         # No independent first frame in our setup.
@@ -613,54 +602,12 @@ class ActionForcingTrainingPipeline:
         # the cold init: pure Gaussian noise + full ladder starting
         # at rung 0. See user spec — "first chunk in the rollout:
         # unchanged; second chunk onward warm-starts".
-        if warm_start_init:
-            if num_denoising_steps < 2:
-                raise ValueError(
-                    "warm_start_init=True requires denoising_step_list of "
-                    f"length >= 2; got {num_denoising_steps}."
-                )
-            if not (0 <= warm_start_rung_idx < num_denoising_steps - 1):
-                raise ValueError(
-                    f"warm_start_rung_idx={warm_start_rung_idx} out of valid "
-                    f"range [0, num_denoising_steps - 1) = "
-                    f"[0, {num_denoising_steps - 1}). The warm-start init "
-                    "must seed BEFORE the last rung so at least one "
-                    "denoising step actually runs."
-                )
-        # Sample exit flags. In warm_start mode we sample TWO lists:
-        # ``cold_flags`` (low=0, used by block 0 when it's cold —
-        # i.e. no caller-provided ``initial_prev_clean``) and
-        # ``warm_flags`` (low=warm_start_rung_idx, used by warm-start
-        # blocks since rungs [0..warm_start_rung_idx) are skipped).
-        # When caller provides ``initial_prev_clean`` AND warm_start_init
-        # is on, EVEN block 0 is warm; we use warm_flags for it.
-        if warm_start_init:
-            cold_flags = self.generate_and_sync_list(
-                len(all_num_frames), num_denoising_steps, device=noise.device,
-                exclude_last_rung=False, low=0,
-            )
-            warm_flags = self.generate_and_sync_list(
-                len(all_num_frames), num_denoising_steps, device=noise.device,
-                exclude_last_rung=False,
-                low=warm_start_rung_idx,
-            )
-            block0_is_warm = initial_prev_clean is not None
-            if self.same_step_across_blocks:
-                # Block 0 picks cold[0] or warm[0] based on whether it
-                # has a warm-start seed; blocks 1+ all share warm[0].
-                block0_rung = warm_flags[0] if block0_is_warm else cold_flags[0]
-                exit_flags = (
-                    [block0_rung]
-                    + [warm_flags[0]] * max(0, len(all_num_frames) - 1)
-                )
-            else:
-                block0_rung = warm_flags[0] if block0_is_warm else cold_flags[0]
-                exit_flags = [block0_rung] + warm_flags[1:]
-        else:
-            exit_flags = self.generate_and_sync_list(
-                len(all_num_frames), num_denoising_steps, device=noise.device,
-                exclude_last_rung=False,
-            )
+        # Sample exit flags. Cold-start only — every block uses the
+        # full ladder (low=0). Warm-start removed.
+        exit_flags = self.generate_and_sync_list(
+            len(all_num_frames), num_denoising_steps, device=noise.device,
+            exclude_last_rung=False,
+        )
         # Buffer for accumulating Flash-DMD t=flash_dmd_gan_t grad-active
         # outputs across blocks (one [B, current_num_frames, C, H, W]
         # slab per block, zero-init for warmup blocks where the forward
@@ -721,15 +668,6 @@ class ActionForcingTrainingPipeline:
 
         denoised_pred = None
         timestep = None
-        # Per-block clean-pred carry for warm-start init. Block 0 starts
-        # with ``initial_prev_clean`` (None for the cold path; provided
-        # by caller for the streaming flow's warm-start seed across
-        # ``generate_chunk_with_cache`` calls). After each block's
-        # post-exit chain the loop overwrites this with that block's
-        # cache_pred so block k+1 warm-starts from block k.
-        prev_block_clean: Optional[torch.Tensor] = (
-            initial_prev_clean.detach() if initial_prev_clean is not None else None
-        )
         for block_index, current_num_frames in enumerate(all_num_frames):
             # Slice the noisy input + per-frame conditioning for this block.
             # ``noise`` covers ROLLOUT frames only (no seed, no i2v anchor),
@@ -738,71 +676,21 @@ class ActionForcingTrainingPipeline:
             block_start_in_noise = (
                 current_start_frame - num_input_frames - num_seed_frames
             )
-            # Warm-start init gate: a block is "warm" iff
-            # ``warm_start_init`` is on AND we have a clean pred from
-            # the prior chunk to seed from. Cold blocks (block 0 with
-            # no caller seed) get pure noise + full ladder; warm blocks
-            # get noised-prior-pred at ``denoising_step_list[
-            # warm_start_rung_idx]`` (default rung 1 ≈ second-noisiest)
-            # and run the shortened ladder rungs [warm_start_rung_idx..N-1].
-            is_warm = warm_start_init and prev_block_clean is not None
-            rung_start = warm_start_rung_idx if is_warm else 0
-            if is_warm:
-                if prev_block_clean.shape[1] < current_num_frames:
-                    raise RuntimeError(
-                        f"warm_start_init=True but prev_block_clean has "
-                        f"{prev_block_clean.shape[1]} frames; block "
-                        f"{block_index} needs {current_num_frames}."
-                    )
-                # Re-noise the prior chunk's last ``current_num_frames``
-                # frames at the configured warm-start rung's t. Detach
-                # so the warm-start init doesn't chain autograd graphs
-                # across blocks (the next block's gradient is computed
-                # independently; we want the prior-block's grad graph
-                # released after its own loss is computed).
-                warm_t_value = int(round(float(
-                    self.denoising_step_list[warm_start_rung_idx]
-                )))
-                warm_seed_slab = prev_block_clean[
-                    :, -current_num_frames:
-                ].detach()
-                warm_eps = torch.randn_like(warm_seed_slab)
-                warm_t_long = torch.full(
-                    [batch_size * current_num_frames],
-                    warm_t_value, device=noise.device, dtype=torch.long,
-                )
-                noisy_input = self.scheduler.add_noise(
-                    warm_seed_slab.flatten(0, 1),
-                    warm_eps.flatten(0, 1),
-                    warm_t_long,
-                ).unflatten(0, warm_seed_slab.shape[:2])
-            else:
-                noisy_input = noise[
-                    :,
-                    block_start_in_noise: block_start_in_noise + current_num_frames,
-                ]
+            # Cold-start always: pure noise + full denoising ladder.
+            noisy_input = noise[
+                :,
+                block_start_in_noise: block_start_in_noise + current_num_frames,
+            ]
             block_cond = _slice_per_frame_streams(
                 conditional_dict,
                 frame_start=current_start_frame,
                 frame_count=current_num_frames,
             )
 
-            # Step 3.1: Truncated denoise loop. ``rung_start`` skips
-            # the noisiest rung for warm-start blocks (their input is
-            # already at rung-1's noise level). The rung loop's
-            # ``index`` numbering matches the original ladder so
-            # exit-flag comparisons with ``exit_flags`` stay consistent.
-            for index in range(rung_start, num_denoising_steps):
+            # Step 3.1: Truncated denoise loop over the full ladder.
+            for index in range(0, num_denoising_steps):
                 current_timestep = self.denoising_step_list[index]
-                # In warm_start mode the same_step semantics is encoded
-                # in the per-block exit_flags list (block 0 cold/warm
-                # rung, blocks 1+ warm rung); use ``exit_flags[block_index]``
-                # uniformly. In legacy mode (warm_start_init=False) the
-                # historic same_step_across_blocks branch reads
-                # ``exit_flags[0]`` for all blocks.
-                if warm_start_init:
-                    exit_flag = (index == exit_flags[block_index])
-                elif self.same_step_across_blocks:
+                if self.same_step_across_blocks:
                     exit_flag = (index == exit_flags[0])
                 else:
                     exit_flag = (index == exit_flags[block_index])
@@ -1055,25 +943,17 @@ class ActionForcingTrainingPipeline:
                 current_start_frame: current_start_frame + current_num_frames,
             ] = output_pred
 
-            # Warm-start carry: capture the post-finish-denoise clean
-            # pred for the NEXT block's warm-start init (and as the
-            # rollout's final ``_last_clean_pred`` after the last
-            # block). Detach so subsequent blocks' autograd graphs
-            # don't chain back through this block's gen forwards.
-            # Captured BEFORE Step 3.4's context_noise commit (which
-            # overwrites cache_pred K/V with its re-noised version).
-            prev_block_clean = cache_pred.detach()
-
+            # Step 3.2.b + 3.3.5 UNIFIED: one t=60 forward (Step 3.2.b
+            # above) serves both purposes — its grad-on output goes to
+            # the GAN's adv path AND becomes the new ``cache_pred`` for
+            # downstream consumption (Step 3.4 commit, clean_chunk
+            # stash, etc.). The previously-separate no_grad t=60
+            # refinement (old Step 3.3.5) is removed: the flash forward
+            # already computed at t=60, re-running it would be a wasted
+            # forward. We detach when assigning to ``cache_pred`` so the
+            # cache K/V commit below doesn't carry the gen's autograd
+            # graph into the cache state.
             if flash_dmd_enabled:
-                # Stash the Flash-DMD t=flash_dmd_gan_t pred (grad-active
-                # for in-window blocks, no_grad for warmup blocks) into
-                # the per-rollout ``flash_dmd_gan_output`` buffer at the
-                # same absolute frame indices as ``output`` for the
-                # trainer to pick up on the GAN / aux-loss side. The
-                # rolling cache's K/V written by this forward is
-                # overwritten by the context_noise commit below — the
-                # GAN's grad path lives in ``flash_dmd_gan_output``,
-                # not in the cache.
                 if flash_dmd_pred is None:
                     raise RuntimeError(
                         "flash_dmd_enabled=True but Step 3.2.b did not "
@@ -1083,52 +963,9 @@ class ActionForcingTrainingPipeline:
                     :,
                     current_start_frame: current_start_frame + current_num_frames,
                 ] = flash_dmd_pred
-
-            # Step 3.3.5: Independent t=flash_dmd_gan_t no_grad
-            # refinement of cache_pred. Hardcoded ON when
-            # ``flash_dmd_enabled``. Rationale: the model has been
-            # trained on t=flash_dmd_gan_t inputs (via the grad-on
-            # Step 3.2.b flash forward + GAN/MANIQA supervision), so
-            # one extra forward at that timestep produces a
-            # higher-quality clean x0 estimate than the post-rung
-            # output alone. We extend the K/V chain from
-            # ``[1000, 625, 312.5, 178.6, 0_commit]`` to
-            # ``[1000, 625, 312.5, 178.6, gan_t, 0_commit]``.
-            #
-            # Mechanics: re-noise the post-rung ``cache_pred`` at
-            # t=gan_t, run a SEPARATE no_grad forward (independent
-            # of Step 3.2.b's grad-on flash forward — that one's
-            # output goes to ``flash_dmd_gan_output`` for the GAN/
-            # MANIQA loss). Update ``cache_pred`` to this refined
-            # output; Step 3.4 below uses the refined value as the
-            # input to the t=context_noise commit. The K/V written
-            # at this slot will be overwritten by Step 3.4 anyway,
-            # so the only persistent effect is the refinement of
-            # ``cache_pred`` itself. ``prev_block_clean`` was
-            # captured BEFORE this refinement so warm-start carries
-            # the post-rung pred unchanged (preserves the warm-start
-            # contract).
-            if flash_dmd_enabled:
-                refine_t_value = int(flash_dmd_gan_t)
-                refine_flat = cache_pred.detach().flatten(0, 1)
-                refine_input = self.scheduler.add_noise(
-                    refine_flat,
-                    torch.randn_like(refine_flat),
-                    refine_t_value * torch.ones(
-                        [batch_size * current_num_frames],
-                        device=noise.device, dtype=torch.long,
-                    ),
-                ).unflatten(0, cache_pred.shape[:2])
-                refine_t_step = torch.full_like(timestep, refine_t_value)
-                with torch.no_grad():
-                    _, cache_pred = self.generator(
-                        noisy_image_or_video=refine_input,
-                        conditional_dict=block_cond,
-                        timestep=refine_t_step,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
+                # Unification: cache_pred becomes the t=60 refined
+                # output (detached), avoiding the second forward.
+                cache_pred = flash_dmd_pred.detach()
 
             # Stash the post-Step-3.3.5 ``cache_pred`` (refined when
             # flash_dmd_enabled, post-rung otherwise) into the per-
@@ -1178,19 +1015,11 @@ class ActionForcingTrainingPipeline:
 
         # Step 3.5: Engineering trick — derive the timestep range we
         # supervised in this rollout (used by DMD's ts_schedule clamp).
-        # In warm_start mode, block 0 (cold) and blocks 1+ (warm) can
-        # have different exit rungs. The DMD scoring covers the trailing
-        # ``num_max_frames`` of the rollout — dominated by warm blocks
-        # when ``num_blocks >= 2``. Report the WARM rung in that case
-        # so the DMD's per-frame t distribution is calibrated to the
-        # majority of the scoring window. For ``num_blocks == 1`` (only
-        # block 0 exists) we fall back to that single block's rung.
+        # All blocks cold-start now (warm-start removed) so just report
+        # block 0's exit rung.
         denoised_timestep_from: Optional[int]
         denoised_timestep_to: Optional[int]
-        if warm_start_init and len(exit_flags) >= 2:
-            ts_block_idx = 1
-        else:
-            ts_block_idx = 0
+        ts_block_idx = 0
         if not self.same_step_across_blocks:
             denoised_timestep_from = None
             denoised_timestep_to = None
@@ -1223,17 +1052,15 @@ class ActionForcingTrainingPipeline:
 
         # Stash the Flash-DMD t=flash_dmd_gan_t output on the pipeline
         # instance so the model can read it without a return-tuple
-        # signature change (mirrors ``_last_extension_metrics``).
-        # ``None`` when ``flash_dmd_enabled=False``.
+        # signature change. After Step 3.2.b/3.3.5 unification, this is
+        # the SINGLE t=60 grad-on forward's output used by both the GAN
+        # adv path AND consumers that want a cleaner-than-random-rung
+        # chunk (FN training, eval video logging, KV cache state via
+        # the Step 3.4 context-noise commit). ``None`` when
+        # ``flash_dmd_enabled=False``.
         self._flash_dmd_gan_output = flash_dmd_gan_output
         # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
-
-        # Stash the rollout's final block clean pred for the caller
-        # to use as the next call's ``initial_prev_clean`` (warm-start
-        # seed). Already detached above. ``None`` only when no block
-        # ran (degenerate input).
-        self._last_clean_pred = prev_block_clean
 
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
@@ -1338,9 +1165,6 @@ class ActionForcingTrainingPipeline:
         force_exit_step: Optional[int] = None,
         flash_dmd_enabled: bool = False,
         flash_dmd_gan_t: int = 60,
-        warm_start_init: bool = False,
-        warm_start_rung_idx: int = 1,
-        initial_prev_clean: Optional[torch.Tensor] = None,
         **conditional_dict,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """Streaming variant of ``inference_with_trajectory`` — rolls a
@@ -1391,8 +1215,6 @@ class ActionForcingTrainingPipeline:
         # cache_pred, detached). See ``__init__`` docstring for
         # consumer details.
         self._clean_chunk: Optional[torch.Tensor] = None
-        # Reset per-call last-block clean pred (warm-start carry).
-        self._last_clean_pred: Optional[torch.Tensor] = None
 
         batch_size, num_frames, _, _, _ = noise.shape
         npb = self.num_frame_per_block
@@ -1424,49 +1246,13 @@ class ActionForcingTrainingPipeline:
         )
 
         num_denoising_steps = len(self.denoising_step_list)
-        if warm_start_init:
-            if num_denoising_steps < 2:
-                raise ValueError(
-                    "warm_start_init=True requires denoising_step_list of "
-                    f"length >= 2; got {num_denoising_steps}."
-                )
-            if not (0 <= warm_start_rung_idx < num_denoising_steps - 1):
-                raise ValueError(
-                    f"warm_start_rung_idx={warm_start_rung_idx} out of valid "
-                    f"range [0, {num_denoising_steps - 1})."
-                )
-        # In streaming mode the caller controls whether block 0 is
-        # warm: ``initial_prev_clean=None`` → cold (full ladder, low=0);
-        # supplied → warm (shortened ladder, low=warm_start_rung_idx).
-        # See ``inference_with_trajectory`` for the same logic.
-        if warm_start_init:
-            cold_flags = self.generate_and_sync_list(
-                len(all_num_frames), num_denoising_steps, device=noise.device,
-                sync=sync_exit_flags, force_exit_step=force_exit_step,
-                exclude_last_rung=False, low=0,
-            )
-            warm_flags = self.generate_and_sync_list(
-                len(all_num_frames), num_denoising_steps, device=noise.device,
-                sync=sync_exit_flags, force_exit_step=force_exit_step,
-                exclude_last_rung=False,
-                low=warm_start_rung_idx,
-            )
-            block0_is_warm = initial_prev_clean is not None
-            if self.same_step_across_blocks:
-                block0_rung = warm_flags[0] if block0_is_warm else cold_flags[0]
-                exit_flags = (
-                    [block0_rung]
-                    + [warm_flags[0]] * max(0, len(all_num_frames) - 1)
-                )
-            else:
-                block0_rung = warm_flags[0] if block0_is_warm else cold_flags[0]
-                exit_flags = [block0_rung] + warm_flags[1:]
-        else:
-            exit_flags = self.generate_and_sync_list(
-                len(all_num_frames), num_denoising_steps, device=noise.device,
-                sync=sync_exit_flags, force_exit_step=force_exit_step,
-                exclude_last_rung=False,
-            )
+        # Cold-start only (warm_start removed). Every block uses the
+        # full denoising ladder; exit rung sampled per block.
+        exit_flags = self.generate_and_sync_list(
+            len(all_num_frames), num_denoising_steps, device=noise.device,
+            sync=sync_exit_flags, force_exit_step=force_exit_step,
+            exclude_last_rung=False,
+        )
         # In streaming mode the generator's gradient gate is not the
         # rollout-vs-warmup split — it's a single flag from the caller.
         # ``requires_grad=False`` ⇒ no grad anywhere; True ⇒ grad on the
@@ -1476,12 +1262,6 @@ class ActionForcingTrainingPipeline:
         denoised_pred = None
         timestep = None
         sequence_start = current_start_frame
-        # Per-block warm-start carry. Block 0 starts with caller-supplied
-        # ``initial_prev_clean`` (None for cold-start); subsequent blocks
-        # within the SAME call inherit the prior block's clean pred.
-        prev_block_clean: Optional[torch.Tensor] = (
-            initial_prev_clean.detach() if initial_prev_clean is not None else None
-        )
         for block_index, current_num_frames in enumerate(all_num_frames):
             block_start_in_noise = current_start_frame - sequence_start
             block_cond = _slice_per_frame_streams(
@@ -1490,45 +1270,17 @@ class ActionForcingTrainingPipeline:
                 frame_count=current_num_frames,
             )
 
-            is_warm = warm_start_init and prev_block_clean is not None
-            rung_start = warm_start_rung_idx if is_warm else 0
-            if is_warm:
-                if prev_block_clean.shape[1] < current_num_frames:
-                    raise RuntimeError(
-                        f"warm_start_init=True but prev_block_clean has "
-                        f"{prev_block_clean.shape[1]} frames; block "
-                        f"{block_index} needs {current_num_frames}."
-                    )
-                warm_t_value = int(round(float(
-                    self.denoising_step_list[warm_start_rung_idx]
-                )))
-                warm_seed_slab = prev_block_clean[
-                    :, -current_num_frames:
-                ].detach()
-                warm_eps = torch.randn_like(warm_seed_slab)
-                warm_t_long = torch.full(
-                    [batch_size * current_num_frames],
-                    warm_t_value, device=noise.device, dtype=torch.long,
-                )
-                noisy_input = self.scheduler.add_noise(
-                    warm_seed_slab.flatten(0, 1),
-                    warm_eps.flatten(0, 1),
-                    warm_t_long,
-                ).unflatten(0, warm_seed_slab.shape[:2])
-            else:
-                noisy_input = noise[
-                    :, block_start_in_noise: block_start_in_noise + current_num_frames,
-                ]
+            # Cold-start: pure noise input + full denoising ladder.
+            noisy_input = noise[
+                :, block_start_in_noise: block_start_in_noise + current_num_frames,
+            ]
 
-            # Rolling denoise loop with truncated random exit.
-            # ``rung_start`` skips the noisiest rung for warm-start
-            # blocks (whose input is already at rung-1's noise level).
+            # Rolling denoise loop with truncated random exit, full
+            # ladder.
             exit_index = num_denoising_steps - 1
-            for index in range(rung_start, num_denoising_steps):
+            for index in range(0, num_denoising_steps):
                 current_timestep = self.denoising_step_list[index]
-                if warm_start_init:
-                    exit_flag = (index == exit_flags[block_index])
-                elif self.same_step_across_blocks:
+                if self.same_step_across_blocks:
                     exit_flag = (index == exit_flags[0])
                 else:
                     exit_flag = (index == exit_flags[block_index])
@@ -1734,9 +1486,10 @@ class ActionForcingTrainingPipeline:
                 :, block_start_in_noise: block_start_in_noise + current_num_frames,
             ] = output_pred
 
-            # Warm-start carry — see ``inference_with_trajectory``.
-            prev_block_clean = cache_pred.detach()
-
+            # Step 3.2.b + 3.3.5 UNIFIED: single grad-on t=60 forward
+            # serves both the GAN adv buffer AND the cache_pred state.
+            # No separate no_grad t=60 refinement (one forward saved
+            # per block).
             if flash_dmd_enabled:
                 if flash_dmd_pred is None:
                     raise RuntimeError(
@@ -1746,43 +1499,7 @@ class ActionForcingTrainingPipeline:
                 flash_dmd_gan_output[
                     :, block_start_in_noise: block_start_in_noise + current_num_frames,
                 ] = flash_dmd_pred
-
-            # Step 3.3.5: Independent t=flash_dmd_gan_t no_grad
-            # refinement of cache_pred. Hardcoded ON when
-            # ``flash_dmd_enabled``. See ``inference_with_trajectory``
-            # for the full rationale: extends the K/V chain from
-            # ``[1000, 625, 312.5, 178.6, 0_commit]`` to
-            # ``[1000, 625, 312.5, 178.6, gan_t, 0_commit]`` so the
-            # final commit's input is the model's t=gan_t-refined
-            # clean estimate (the model has been trained at this
-            # timestep via the grad-on Step 3.2.b flash forward +
-            # GAN/MANIQA supervision). Independent of Step 3.2.b's
-            # grad-on forward (that one's output goes to the GAN
-            # buffer; this one only updates ``cache_pred`` for the
-            # subsequent commit). ``prev_block_clean`` was captured
-            # before this point so warm-start carries the post-rung
-            # pred unchanged.
-            if flash_dmd_enabled:
-                refine_t_value = int(flash_dmd_gan_t)
-                refine_flat = cache_pred.detach().flatten(0, 1)
-                refine_input = self.scheduler.add_noise(
-                    refine_flat,
-                    torch.randn_like(refine_flat),
-                    refine_t_value * torch.ones(
-                        [batch_size * current_num_frames],
-                        device=noise.device, dtype=torch.long,
-                    ),
-                ).unflatten(0, cache_pred.shape[:2])
-                refine_t_step = torch.full_like(timestep, refine_t_value)
-                with torch.no_grad():
-                    _, cache_pred = self.generator(
-                        noisy_image_or_video=refine_input,
-                        conditional_dict=block_cond,
-                        timestep=refine_t_step,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
+                cache_pred = flash_dmd_pred.detach()
 
             # Stash post-Step-3.3.5 ``cache_pred`` into the per-rollout
             # ``clean_chunk`` buffer. Detached. Indexing mirrors the
@@ -1820,16 +1537,12 @@ class ActionForcingTrainingPipeline:
 
             current_start_frame += current_num_frames
 
-        # Compute denoised_t_from / denoised_t_to from the exit_flag.
-        # In warm_start mode, prefer the warm rung (block_index=1) when
-        # multiple blocks ran; falls back to block 0 otherwise.
+        # Compute denoised_t_from / denoised_t_to from block 0's
+        # exit_flag (warm_start removed — all blocks cold-start).
         denoised_t_from, denoised_t_to = None, None
         try:
             if self.same_step_across_blocks:
-                ts_block_idx = (
-                    1 if (warm_start_init and len(exit_flags) >= 2) else 0
-                )
-                idx = exit_flags[ts_block_idx]
+                idx = exit_flags[0]
                 from_t = int(round(float(self.denoising_step_list[idx])))
                 to_t = (
                     0
@@ -1840,16 +1553,11 @@ class ActionForcingTrainingPipeline:
         except Exception:
             pass
 
-        # Stash the two-grad-point last-rung output (None when
-        # ``flash_dmd_enabled=False``) so the model can read it.
+        # Stash the unified t=60 flash output (None when
+        # ``flash_dmd_enabled=False``) for downstream consumers.
         self._flash_dmd_gan_output = flash_dmd_gan_output
-        # Stash the aux-teacher clean_chunk buffer (per-block
-        # post-Step-3.3.5 cache_pred, detached). ``None`` when
-        # ``flash_dmd_enabled=False``.
+        # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
-        # Stash the rollout's final block clean pred for the caller's
-        # next-call warm-start init. Already detached above.
-        self._last_clean_pred = prev_block_clean
 
         return output, denoised_t_from, denoised_t_to
 
