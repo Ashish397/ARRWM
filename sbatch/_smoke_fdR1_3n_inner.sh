@@ -1,18 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=v28A-smoke
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gpus-per-node=4
-#SBATCH --exclusive
-#SBATCH --time=00:30:00
-#SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
-#SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
-
-# Smoke test: same code as v28A but tiny scale to reproduce the
-# step-21-31 SIGTERM pattern quickly. 1 node, 4 GPUs, 60 steps, GAN
-# starts at step 10 (vs v28A's step 40) so we hit the disc forward
-# fast. If this dies at step ~21 we've localised the bug.
+# Inner-launch helper for the 3-node FD-R1 smoke when dispatched via
+# `srun --jobid=<alloc> --overlap` onto an existing allocation. The
+# outer srun replicates this script across all 3 nodes (one task per
+# node). Each task runs ``torchrun --nproc_per_node=4`` directly (no
+# nested srun) so the c10d rendezvous endpoint handles cross-node
+# coordination.
+#
+# The override list is byte-identical to the original sbatch's
+# trainer call, just without the outer #SBATCH directives and inner
+# srun. Driven by env vars set in the outer dispatch.
 
 set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
@@ -26,7 +22,7 @@ export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR
 export TRANSFORMERS_CACHE=$CACHE_DIR
 
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v28A_smoke
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v28A_smoke_fdR1_3n
 mkdir -p "$LOGDIR" logs
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
@@ -38,16 +34,16 @@ export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
-# Tighter NCCL collective timeout so we fail fast instead of waiting 30 min.
 export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-echo "=== Smoke for v28A: 1 node, 4 GPUs, 60 steps ==="
-echo "Job ID: $SLURM_JOB_ID, Master: $MASTER_ADDR:$MASTER_PORT"
+echo "[$(hostname)] === FD-R1 smoke (3 nodes, 12 GPUs, 60 steps) ==="
+echo "[$(hostname)] Job=$SLURM_JOB_ID NodeID=$SLURM_NODEID Master=$MASTER_ADDR:$MASTER_PORT"
 
-srun torchrun \
+torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
+  --node_rank=$SLURM_NODEID \
   --rdzv_id=$SLURM_JOB_ID \
   --rdzv_backend=c10d \
   --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
@@ -86,7 +82,7 @@ srun torchrun \
     aux_teacher_loss_warmup_steps=20 \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
-    aux_real_clean_x_source=default \
+    aux_real_clean_x_source=gt \
     dmd_loss_weight=0.5 \
     dmd_loss_start_step=5 \
     dmd_loss_warmup_steps=30 \
@@ -119,7 +115,7 @@ srun torchrun \
     ladd_r1_gamma=1.0 \
     ladd_r1_mode=fd \
     ladd_r1_sigma=0.01 \
-    ladd_r1_every_n_steps=99999 \
+    ladd_r1_every_n_steps=1 \
     memory_audit_enabled=true \
     ladd_diff_aug_policy=off \
     ladd_pairs_per_step=2 \
@@ -139,7 +135,7 @@ srun torchrun \
     gt_latent_mae_loss_weight=0.0 \
     anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
-    max_gradient_chunks=2 \
-    run_name=v28A_smoke_j${SLURM_JOB_ID}
+    max_gradient_chunks=5 \
+    run_name=v28A_smoke_fdR1_3n_j${SLURM_JOB_ID}
 
-echo "Smoke completed on $(date)"
+echo "[$(hostname)] Smoke completed on $(date)"

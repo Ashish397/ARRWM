@@ -62,7 +62,7 @@ gan_max_grad_norm: 10.0
 # below are inert under the default ``gan_backbone: latent_3d_conv``.
 ladd_feature_blocks: []              # empty -> auto-default by teacher size
 ladd_proj_dim: 256                   # CCM/head common channel dim
-ladd_disc_head_kernel: 9             # 1D conv kernel in disc heads
+ladd_disc_head_kernel: 3             # 2D conv kernel in disc heads (k=3 spatial)
 ladd_use_csm: true                   # cross-scale FPN-style fusion
 ladd_use_lateral_proj: false         # lateral 1x1 in CSM (rarely needed)
 ladd_use_prompt_cond: true           # prompt-conditioning in disc heads
@@ -98,10 +98,11 @@ ladd_wavelet_hf_adapter_init_gain: 0.1  # small init -> step-0 in-distribution
 # Online real_teacher (v14 LoRA, trained against GT online).
 # ---------------------------------------------------------------------------
 # Turn on the v14 LoRA's online flow training against GT video. The
-# teacher's training contract: noisy_input source decided by
-# ``real_teacher_input_source`` below; clean_x context = uniform
-# (1-mix_p)*self + mix_p*noised_GT blend (same as DMD scoring); loss
-# target = GT at noisy_x positions; FlowPredLoss
+# teacher's training contract: noisy_input = add_noise(GT, ε, t)
+# (pure GT, set by ``real_teacher_input_source: "gt"`` below);
+# clean_x = pure GT slice covering the chunk's clean-half window
+# (no student / mix anywhere — see ``_compute_aux_teacher_loss_
+# streaming``); loss target = GT at noisy_x positions; FlowPredLoss
 # (= (flow_pred − (ε − GT))²). Trained every iter after the critic
 # step, reusing the critic's chunk + info (no extra
 # generate_next_chunk advance).
@@ -121,17 +122,15 @@ real_teacher_lr: 1.0e-05
 # every frame blends as 0.85*self + 0.15*GT.
 dmd_context_mix_p: 0.15
 
-# Teacher noisy_input source: "mix" splits each iter between an
-# amortized-refinement target (add_noise(student, ε, t)) and a
-# proper-DMD-score target (add_noise(GT, ε, t)) at probability
-# ``real_teacher_input_mix_gt_p``. The first half teaches the
-# teacher to refine wherever the student lands now (curriculum
-# signal); the second half restores the score-matching identity for
-# p_real(x_t). Long-run the teacher learns both a faithful real
-# score AND a refinement bias toward GT given a noised-student
-# input. Logged per-step as ``real_teacher_input_was_gt``.
-real_teacher_input_source: "mix"
-real_teacher_input_mix_gt_p: 0.5
+# Teacher noisy_input source: PURE GT. The "mix" / "student" /
+# "blend" alternatives have been observed to break training by
+# leaking student-distribution structure into the teacher's score.
+# The teacher's canonical contract is: denoise (noised GT, ε, t)
+# back to GT. clean_x_aux for the aux pass is also pure GT (see
+# ``_compute_aux_teacher_loss_streaming``); the noisy half here is
+# the matching pure-GT noisy_input.
+real_teacher_input_source: "gt"
+real_teacher_input_mix_gt_p: 0.0
 
 # Dual-teacher: hold a frozen merged-v14 alongside the LoRA-online
 # teacher. DMD scoring uses the frozen one (proper p_real, no GT

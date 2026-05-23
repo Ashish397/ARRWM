@@ -481,25 +481,14 @@ real_teacher_eps: 1.0e-08
 real_teacher_weight_decay: 0.01
 real_teacher_max_grad_norm: 1.0
 real_teacher_warmup_steps: 0
-# ``real_teacher_input_source`` ∈ {"student", "gt", "mix"} controls
-# what the teacher's noisy_input is built from:
-#   student : add_noise(student_chunk, ε, t) — amortized refinement
-#             target. The historic default. Strictly speaking NOT
-#             score matching for p_real(x_t); the bias decays as
-#             student → GT.
-#   gt      : add_noise(gt_target, ε, t) — proper DMD score matching
-#             for p_real(x_t). Restores the score-matching identity
-#             at the cost of dropping the curriculum/student-bridging
-#             signal.
-#   mix     : per-iter Bernoulli(real_teacher_input_mix_gt_p);
-#             DDP-synced. True → GT, False → student. Halfway between
-#             the two regimes — useful when you want both the
-#             curriculum signal AND a proper score on alternating
-#             iters. Logged per-step as ``real_teacher_input_was_gt``.
-# The LOSS TARGET is always GT regardless of source — the source only
-# changes what the noise is added to.
-real_teacher_input_source: "student"
-real_teacher_input_mix_gt_p: 0.5
+# Teacher noisy_input source: PURE GT. The "student" / "mix" /
+# "blend" alternatives leak student-distribution structure into
+# the teacher's score and were observed to break training. The
+# teacher's canonical contract is: denoise (noised GT, ε, t) back
+# to GT. clean_x for the aux pass is also pure GT (see
+# ``_compute_aux_teacher_loss_streaming``).
+real_teacher_input_source: "gt"
+real_teacher_input_mix_gt_p: 0.0
 
 # ``dmd_frozen_teacher_pass_enabled`` — Dual-teacher mode. When True
 # (default when ``real_teacher_train_online: true``), the model

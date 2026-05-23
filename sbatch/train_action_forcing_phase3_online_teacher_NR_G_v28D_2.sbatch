@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28A
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28D_2
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,40 +11,25 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28A: minimal modern stack.
+# Phase-3 online_teacher_NR_G_v28D: v28C + adjacent-chunk loss.
 #
-# Pieces ON:
-#   * Online DMD (standard, with anti-collapse std-floor guard).
-#   * Aux teacher (online LoRA training of real_score against GT).
-#   * LADD GAN with WAVELET-HF disc input (WGSR-style: disc sees only
-#     HF latent sub-bands; LL drops out so the GAN gradient can only
-#     push HF detail and never pulls content around — DMD handles
-#     content anchoring).
-#   * GAN pair mode: ``gt_vs_fake`` (LADD canonical). The disc sees
-#     gen chunks vs GT chunks at the same temporal positions.
+# v28D vs v28C — knob deltas
+# --------------------------
+#   ladd_adjacent_chunks_enabled    false -> true
+#   ladd_adjacent_chunks_weight     0.0   -> 0.5
+#       (Softer than gt_vs_fake's 1.0 since adjacent is a weaker
+#       distributional signal — chunk_i and chunk_{i+1} are close
+#       by construction. A 2:1 gt:adjacent ratio keeps the GT
+#       anchor dominant while letting adjacent provide a temporal-
+#       consistency push.)
 #
-# Pieces OFF:
-#   * Forward noiser (CAR-noiser of v27B/F/H). DISABLED — we want a
-#     clean baseline where the LADD wavelet GAN is the sole detail
-#     supervisor (besides DMD's content anchor).
-#   * MANIQA NR-IQA perceptual approx. DISABLED — same reasoning.
-#   * fake_alt head + rollout-2 prebuild. DISABLED — no consumer.
-#   * ASD-style adjacent-chunk pair loss. DISABLED — v28B turns it on.
+# Otherwise identical to v28A. Same wavelet HF disc input, same
+# online DMD, same aux-teacher LoRA, no forward noiser, no MANIQA,
+# no alt-head.
 #
-# Knob deltas vs v28 (LADD-with-everything)
-# -----------------------------------------
-#   forward_noiser_enabled           true  -> false
-#   maniqa_approx_loss_weight        1.0   -> 0.0
-#   fake_alt_head_enabled            true  -> false
-#   aux_real_clean_x_source          causal_AR_GT -> self
-#       (causal_AR_GT requires the forward noiser; revert to ``self`` —
-#       use the streaming-state clean ref like v27 and earlier.)
-#   ladd_wavelet_hf_enabled          false -> true   (NEW)
-#   ladd_wavelet_hf_drop_ll          -     -> true   (NEW)
-#   ladd_gt_vs_fake_enabled          false -> true   (NEW pair mode)
-#   ladd_adjacent_chunks_enabled     true  -> false  (NEW pair mode)
-#
-# All other v28 knobs preserved.
+# Two D updates per gen step (one per pair mode); both gen-side
+# losses sum into the generator's total. Disc weights are SHARED —
+# the same disc learns to score both pair distributions.
 # =====================================================================
 
 set -e -o pipefail
@@ -52,7 +37,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28A
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28D
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -80,11 +65,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28A (LADD wavelet-HF + DMD + aux) on $(date)"
-echo "  * GAN: LADD teacher-feature, gt_vs_fake, wavelet HF input."
+echo "Starting Phase-3 online-teacher NR_G v28D (v28C + adjacent-chunk) on $(date)"
+echo "  * GAN: LADD teacher-feature, wavelet HF input."
+echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
 echo "  * DMD: online, anti-collapse on, no forward noiser."
 echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head, adjacent-chunk loss."
+echo "  * OFF: forward noiser, MANIQA, alt-head."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -151,7 +137,7 @@ srun torchrun \
     critic_clean_x_source=self \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
-    gan_loss_weight=0.1 \
+    gan_loss_weight=0.005 \
     gan_lr=2e-5 \
     gan_critic_warmup_steps=40 \
     gan_disc_start_step=40 \
@@ -161,7 +147,7 @@ srun torchrun \
     gan_r1_gamma=2.0 \
     gan_max_grad_norm=10.0 \
     ladd_proj_dim=256 \
-    ladd_use_csm=false \
+    ladd_use_csm=true \
     ladd_use_lateral_proj=false \
     ladd_use_prompt_cond=true \
     ladd_cmap_dim=64 \
@@ -175,8 +161,8 @@ srun torchrun \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
-    ladd_adjacent_chunks_enabled=false \
-    ladd_adjacent_chunks_weight=0.0 \
+    ladd_adjacent_chunks_enabled=true \
+    ladd_adjacent_chunks_weight=0.5 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -187,6 +173,6 @@ srun torchrun \
     anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=5 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28A_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28D_2_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

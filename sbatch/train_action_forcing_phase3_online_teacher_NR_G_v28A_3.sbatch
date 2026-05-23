@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28A
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28A_3
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -187,6 +187,6 @@ srun torchrun \
     anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=5 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28A_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28A_3_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

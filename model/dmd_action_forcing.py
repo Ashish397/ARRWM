@@ -447,8 +447,15 @@ class ActionForcingDMD(SelfForcingModel):
         #               distribution-shift cost.
         # Whatever source is chosen, the LOSS TARGET is always GT —
         # the source only changes what the noise is added to.
+        # Default changed from "student" to "gt" — training the aux
+        # teacher on student-derived noisy inputs leaks the student's
+        # distribution into the teacher's score and was observed to
+        # break training. The teacher's canonical contract is: denoise
+        # (noised GT, ε, t) back to GT. "student" / "mix" / "blend"
+        # are still selectable for experiments but should not be the
+        # default ever again.
         self.real_teacher_input_source = str(
-            getattr(args, "real_teacher_input_source", "student")
+            getattr(args, "real_teacher_input_source", "gt")
         )
         if self.real_teacher_input_source not in (
             "student", "gt", "mix", "blend",
@@ -586,22 +593,54 @@ class ActionForcingDMD(SelfForcingModel):
                 "critic_clean_x_source must be 'self' or 'gt_causal_ar';"
                 f" got {self.critic_clean_x_source!r}."
             )
-        # ===== v26 aux-teacher clean_x source =====
-        # ``default``: clean_x_for_real = GT-seed-last + first-6-student-
-        #     chunks snapshot (the existing v21 mixed-context behavior).
+        # ===== Aux-teacher clean_x source =====
+        # ``gt`` (a.k.a. ``default``): clean_x_for_real = pure GT slice
+        #     covering the chunk's clean-half window in ride coords.
+        #     This is the canonical v14 contract — teacher denoises
+        #     (noisy GT, ε, t) back to GT with a clean GT reference.
+        #     The pre-v29 default was a GT-seed + student-snapshot
+        #     mix, which leaked student-distribution structure into
+        #     the teacher's score and was observed to break training.
         # ``causal_AR_GT``: clean_x_for_real = causal_AR_x0 (the alt-
-        #     head's no_grad output on noised GT). Pairs the real_score's
+        #     head's no_grad output on noised GT) or fn_causal_AR_GT
+        #     (forward noiser's output on GT). Pairs the real_score's
         #     TF context with its noisy_input source (both derived from
         #     causal_AR_GT), so the LoRA learns "denoise causal-AR-noised
         #     input -> GT" with a consistent un-noised reference.
-        #     Requires fake_alt_apply_active (else falls back to default).
-        self.aux_real_clean_x_source = str(
-            getattr(args, "aux_real_clean_x_source", "default")
+        #     Requires fake_alt_apply_active or the forward noiser
+        #     to be active (else falls back to the pure-GT default).
+        _aux_clean_x_raw = str(
+            getattr(args, "aux_real_clean_x_source", "gt")
         ).lower().strip()
-        if self.aux_real_clean_x_source not in ("default", "causal_ar_gt"):
+        # ``default`` is accepted as a legacy alias for ``gt`` so old
+        # configs/sbatches keep working; semantics are identical.
+        if _aux_clean_x_raw == "default":
+            _aux_clean_x_raw = "gt"
+        self.aux_real_clean_x_source = _aux_clean_x_raw
+        if self.aux_real_clean_x_source not in ("gt", "causal_ar_gt"):
             raise ValueError(
-                "aux_real_clean_x_source must be 'default' or "
-                f"'causal_AR_GT'; got {self.aux_real_clean_x_source!r}."
+                "aux_real_clean_x_source must be 'gt' (a.k.a. "
+                "'default') or 'causal_AR_GT'; got "
+                f"{self.aux_real_clean_x_source!r}."
+            )
+        # Upper bound for the per-chunk random renoise applied to
+        # the pure-GT clean_x_aux slice. Each chunk of ``npb`` frames
+        # is renoised at a SINGLE timestep sampled uniformly from
+        # ``[0, clean_x_gt_noise_t]`` via ``scheduler.add_noise``,
+        # then handed to the teacher. Without this the teacher's
+        # task collapses to identity (crisp GT clean_x + noisy GT
+        # noisy_x → trivially recover GT from the clean side).
+        # Default upper bound 60 (roughly 3/10 of the denoising
+        # ladder; the lowest non-zero rung sits at ~178). Set 0 to
+        # disable entirely (teacher sees crisp GT — risks identity-
+        # copy collapse).
+        self.clean_x_gt_noise_t = int(
+            getattr(args, "clean_x_gt_noise_t", 60)
+        )
+        if self.clean_x_gt_noise_t < 0 or self.clean_x_gt_noise_t >= 1000:
+            raise ValueError(
+                "clean_x_gt_noise_t must be in [0, 999]; got "
+                f"{self.clean_x_gt_noise_t}"
             )
         # ===== v29 DMD lookback =====
         # When > 0, gradients from chunk_k's DMD loss flow back through
@@ -691,63 +730,22 @@ class ActionForcingDMD(SelfForcingModel):
                 "forward_noiser_lowfreq_smooth_window must be >= 0; got "
                 f"{self.forward_noiser_lowfreq_smooth_window}"
             )
-        # v27G/v27H: per-pass apply strategy for the iterative FN
-        # application. The base ConvNet FN learns a deterministic +1
-        # CARN-step delta but produces locally-smooth outputs (limited
-        # spatial RF, no high-freq generation path). The blur+noise
-        # operator gives a SHARP-noise + smoothing analog of natural AR
-        # drift in latent space, applied recursively per pass — the
-        # latent-space equivalent of (add Gaussian noise, then Gaussian
-        # blur) operating on pixel frames.
-        #   "learned" (default): FN module only — v27D/E behavior.
-        #   "blur_noise":        replace FN with deterministic
-        #                        blur(chunk + noise) per pass — v27G.
-        #                        Requires only the blur+noise knobs.
-        #                        forward_noiser_enabled can be false.
-        #   "sum":               chunk_out = fn_out + blur_delta where
-        #                        blur_delta = blur(chunk+noise) - chunk.
-        #                        Both deltas are applied. v27H.
+        # Per-pass apply strategy for the iterative FN application.
+        # Only the learned strategy is supported now — the blur_noise
+        # and sum variants depended on a 2D spatial Gaussian blur op
+        # that has been removed from the codebase (it was unsafe / a
+        # source of bugs and is no longer applied anywhere).
+        #   "learned" (default): FN module only.
         #   "off":               skip iterative application; aux teacher
         #                        sees clean GT (debug only).
         self.forward_noiser_apply_strategy = str(
             getattr(args, "forward_noiser_apply_strategy", "learned")
         ).lower()
-        if self.forward_noiser_apply_strategy not in (
-            "learned", "blur_noise", "sum", "off",
-        ):
+        if self.forward_noiser_apply_strategy not in ("learned", "off"):
             raise ValueError(
-                "forward_noiser_apply_strategy must be one of "
-                "'learned'|'blur_noise'|'sum'|'off'; got "
-                f"{self.forward_noiser_apply_strategy!r}"
-            )
-        # Blur+noise per-pass parameters (used when strategy is
-        # "blur_noise" or "sum"). Defaults tuned for Wan2.1 latents
-        # (std ~ 0.5, latent spatial dim = pixel/8).
-        self.forward_noiser_blur_noise_std = float(
-            getattr(args, "forward_noiser_blur_noise_std", 0.1)
-        )
-        self.forward_noiser_blur_kernel_size = int(
-            getattr(args, "forward_noiser_blur_kernel_size", 3)
-        )
-        self.forward_noiser_blur_sigma = float(
-            getattr(args, "forward_noiser_blur_sigma", 0.7)
-        )
-        if self.forward_noiser_blur_noise_std < 0:
-            raise ValueError(
-                "forward_noiser_blur_noise_std must be >= 0; got "
-                f"{self.forward_noiser_blur_noise_std}"
-            )
-        if self.forward_noiser_blur_kernel_size < 1 or (
-            self.forward_noiser_blur_kernel_size % 2 == 0
-        ):
-            raise ValueError(
-                "forward_noiser_blur_kernel_size must be odd and >=1; got "
-                f"{self.forward_noiser_blur_kernel_size}"
-            )
-        if self.forward_noiser_blur_sigma <= 0:
-            raise ValueError(
-                "forward_noiser_blur_sigma must be > 0; got "
-                f"{self.forward_noiser_blur_sigma}"
+                "forward_noiser_apply_strategy must be 'learned' or "
+                f"'off'; got {self.forward_noiser_apply_strategy!r} "
+                "(legacy 'blur_noise' and 'sum' strategies removed)."
             )
         self.forward_noiser = None
         if self.forward_noiser_enabled:
@@ -769,8 +767,7 @@ class ActionForcingDMD(SelfForcingModel):
                     "(latent_ch=%d, hidden=%d, blocks=%d, params=%.2fM, "
                     "max_carn=%d, loss_w=%.2f, apply_in_aux=%s, "
                     "lowfreq_window=%d, lowfreq_alpha=%.2f, "
-                    "strategy=%s, blur_noise_std=%.3f, "
-                    "blur_kernel=%d, blur_sigma=%.2f).",
+                    "strategy=%s).",
                     latent_ch,
                     self.forward_noiser_hidden_dim,
                     self.forward_noiser_num_blocks,
@@ -781,9 +778,6 @@ class ActionForcingDMD(SelfForcingModel):
                     self.forward_noiser_lowfreq_smooth_window,
                     self.forward_noiser_lowfreq_alpha,
                     self.forward_noiser_apply_strategy,
-                    self.forward_noiser_blur_noise_std,
-                    self.forward_noiser_blur_kernel_size,
-                    self.forward_noiser_blur_sigma,
                 )
 
         # Hard start-step gate for the aux teacher pass. Below this
@@ -916,17 +910,50 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.ladd_r1_gamma = float(getattr(args, "ladd_r1_gamma", 1.0))
         # Lazy R1: compute R1 every N disc updates instead of every
-        # update. R1's second-order ``create_graph=True`` backward is
-        # the dominant memory cost of the LADD disc step. Default 1
-        # (every step, original behaviour). Set to e.g. 10 to compute
-        # R1 once every 10 disc updates — saves ~peak memory by ~half
-        # on the off-iters at the cost of slightly noisier R1 signal.
+        # update. Default 1 (every step, original behaviour). Mainly
+        # useful when ``ladd_r1_mode="autograd"`` (the expensive path).
         self.ladd_r1_every_n_steps = int(
             getattr(args, "ladd_r1_every_n_steps", 1)
         )
-        self.ladd_diff_aug_policy = str(
+        # R1 estimator mode:
+        #   "fd"       — finite-difference stochastic estimator
+        #                (Causal-Forcing pattern, references at
+        #                ``Causal-Forcing/model/gan.py:258-271`` and
+        #                ``RollingForcing/model/gan.py``). One extra
+        #                disc forward at ``x + sigma * eps``; no
+        #                second-order autograd graph. ~half the memory
+        #                of the autograd path.
+        #   "autograd" — exact second-order ``torch.autograd.grad(...,
+        #                create_graph=True)`` (legacy). Holds two
+        #                graphs simultaneously and defeats the disc's
+        #                gradient checkpointing — the dominant memory
+        #                cost of the disc step.
+        # Default "fd" (was "autograd" before this knob existed).
+        self.ladd_r1_mode = str(
+            getattr(args, "ladd_r1_mode", "fd")
+        ).lower()
+        if self.ladd_r1_mode not in ("fd", "autograd"):
+            raise ValueError(
+                "ladd_r1_mode must be 'fd' or 'autograd'; got "
+                f"{self.ladd_r1_mode!r}."
+            )
+        # Sigma for finite-difference R1 perturbation. Same default as
+        # Causal-Forcing's r1_sigma (0.01). Small enough that
+        # ``D(x + sigma*eps) - D(x)`` is well-approximated by a
+        # first-order Taylor expansion.
+        self.ladd_r1_sigma = float(
+            getattr(args, "ladd_r1_sigma", 0.01)
+        )
+        _diff_aug_raw = str(
             getattr(args, "ladd_diff_aug_policy", "flip,cutout,translation")
         )
+        # Accept "none" / "off" / "" / "false" as the explicit-disabled
+        # sentinel so command-line overrides (which can't easily pass an
+        # empty string through OmegaConf dotlist syntax) have a clean
+        # opt-out.
+        if _diff_aug_raw.lower() in ("none", "off", "false", ""):
+            _diff_aug_raw = ""
+        self.ladd_diff_aug_policy = _diff_aug_raw
         self.ladd_pair_start_seed_boundary = bool(
             getattr(args, "ladd_pair_start_seed_boundary", True)
         )
@@ -4000,16 +4027,6 @@ class ActionForcingDMD(SelfForcingModel):
             # pure noise + the full denoising ladder.
             "abs_frame_after_seed": cf,  # absolute pipeline frame index after seed prefill (anchor adds npb on top)
             "anchor_chunk": anchor_chunk,  # [B, npb, C, H, W] — iter 1's clean_x_self anchor
-            # Stable snapshot of the FIRST 6 student chunks' post-
-            # Step-3.3.5 refined cache_pred (= ``chunk_size - npb`` =
-            # 18 frames). Captured on iter 1 once the pipeline's
-            # ``_clean_chunk`` buffer is fully populated. Used by
-            # ``_compute_aux_teacher_loss_streaming`` to assemble
-            # ``clean_x_aux = cat(GT_seed_last, snapshot)`` every
-            # iter — gives the LoRA a stable 21-frame clean_x context
-            # of GT seed-tail + first 6 student chunks. Reset on
-            # streaming reset.
-            "aux_clean_x_snapshot": None,
             # v24: pre-rolled noisier student rollout (fewer seed chunks).
             # ``None`` when fake_alt_target_mode != "rollout2_student".
             # When set: tensor [B, n_gen, C, H, W] with abs frame index
@@ -4154,41 +4171,6 @@ class ActionForcingDMD(SelfForcingModel):
         return fn_loss
 
     @staticmethod
-    def _gaussian_blur_spatial_5d(
-        x: torch.Tensor, kernel_size: int, sigma: float,
-    ) -> torch.Tensor:
-        """Per-channel separable Gaussian blur over (H, W) for a
-        [B, F, C, H, W] tensor. Reflect-padded to preserve shape.
-
-        Built as a depthwise 2D conv with a 1D Gaussian applied
-        separably along W then H. Pixel-space analog: cv2.GaussianBlur
-        with ksize=(kernel_size, kernel_size), sigmaX=sigma. The
-        per-pass operator in v27G/v27H is blur(chunk + noise).
-        """
-        if kernel_size <= 1:
-            return x
-        B, F_, C, H, W_ = x.shape
-        half = kernel_size // 2
-        grid = torch.arange(
-            kernel_size, device=x.device, dtype=x.dtype,
-        ) - half
-        kernel_1d = torch.exp(-(grid ** 2) / (2.0 * float(sigma) ** 2))
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        kernel_w = kernel_1d.view(1, 1, 1, kernel_size).expand(
-            C, 1, 1, kernel_size
-        )
-        kernel_h = kernel_1d.view(1, 1, kernel_size, 1).expand(
-            C, 1, kernel_size, 1
-        )
-        x_flat = x.reshape(B * F_, C, H, W_)
-        x_padded = F.pad(
-            x_flat, (half, half, half, half), mode="reflect",
-        )
-        x_blur = F.conv2d(x_padded, kernel_w, groups=C, padding=0)
-        x_blur = F.conv2d(x_blur, kernel_h, groups=C, padding=0)
-        return x_blur.reshape(B, F_, C, H, W_)
-
-    @staticmethod
     def _temporal_lowpass_5d(
         x: torch.Tensor, window: int,
     ) -> torch.Tensor:
@@ -4244,9 +4226,7 @@ class ActionForcingDMD(SelfForcingModel):
         strategy = self.forward_noiser_apply_strategy
         if strategy == "off":
             return None
-        # "blur_noise" mode works without a learned FN module; all other
-        # modes require it.
-        if strategy != "blur_noise" and self.forward_noiser is None:
+        if self.forward_noiser is None:
             return None
         B, F_total, C, H, W = gt_target.shape
         npb = int(self.num_frame_per_block)
@@ -4275,9 +4255,6 @@ class ActionForcingDMD(SelfForcingModel):
             return gt_target
 
         current = gt_target.clone()
-        blur_std = float(self.forward_noiser_blur_noise_std)
-        blur_k = int(self.forward_noiser_blur_kernel_size)
-        blur_sig = float(self.forward_noiser_blur_sigma)
         with torch.no_grad():
             for k in range(max_carn):
                 for c, tc in enumerate(target_carn_per_chunk):
@@ -4286,44 +4263,16 @@ class ActionForcingDMD(SelfForcingModel):
                     f_start = c * npb
                     f_end = f_start + npb
                     chunk_in = current[:, f_start:f_end].contiguous()
-                    # v27G/v27H per-pass strategy.
-                    #   "learned": just the FN module's increment.
-                    #   "blur_noise": replace FN with blur(chunk+noise)
-                    #                 — recursive AR-noise analog.
-                    #   "sum": chunk_in + fn_delta + blur_delta (both
-                    #          deltas applied additively).
-                    if strategy == "learned":
-                        carn_step = torch.full(
-                            (B,), k, dtype=torch.long, device=device,
-                        )
-                        chunk_out = self.forward_noiser(
-                            chunk_in, carn_step, residual=True,
-                        )
-                    elif strategy == "blur_noise":
-                        noisy = chunk_in + blur_std * torch.randn_like(
-                            chunk_in
-                        )
-                        chunk_out = self._gaussian_blur_spatial_5d(
-                            noisy, kernel_size=blur_k, sigma=blur_sig,
-                        )
-                    elif strategy == "sum":
-                        carn_step = torch.full(
-                            (B,), k, dtype=torch.long, device=device,
-                        )
-                        fn_out = self.forward_noiser(
-                            chunk_in, carn_step, residual=True,
-                        )
-                        noisy = chunk_in + blur_std * torch.randn_like(
-                            chunk_in
-                        )
-                        blur_out = self._gaussian_blur_spatial_5d(
-                            noisy, kernel_size=blur_k, sigma=blur_sig,
-                        )
-                        blur_delta = blur_out - chunk_in
-                        chunk_out = fn_out + blur_delta
-                    else:
-                        # Should not reach here — validated in __init__.
-                        chunk_out = chunk_in
+                    # Only the learned FN strategy is supported. The
+                    # blur_noise and sum strategies have been removed —
+                    # they depended on a 2D spatial Gaussian blur op
+                    # that is no longer in the codebase.
+                    carn_step = torch.full(
+                        (B,), k, dtype=torch.long, device=device,
+                    )
+                    chunk_out = self.forward_noiser(
+                        chunk_in, carn_step, residual=True,
+                    )
                     current[:, f_start:f_end] = chunk_out
         return current
 
@@ -4477,7 +4426,6 @@ class ActionForcingDMD(SelfForcingModel):
                     "previous_last_rung_chunk": None,
                     "abs_frame_after_seed": int(cf_r2),
                     "anchor_chunk": anchor_chunk.detach(),
-                    "aux_clean_x_snapshot": None,
                     "rollout2_x0": None,
                     "rollout2_abs_frame_start": None,
                 }
@@ -6489,8 +6437,8 @@ class ActionForcingDMD(SelfForcingModel):
         causal_AR_dir_rms = 0.0
         # NOTE: the fake_alt forward needs ``clean_x_for_real`` /
         # ``aug_t_for_real`` (the TF context for fake_score) — those
-        # are set further below (~line 5407, including the flash_dmd
-        # _clean_chunk override). The actual no_grad fake_alt forward
+        # are set further below (pure-GT clean_x slice + optional
+        # causal_AR_GT override). The actual no_grad fake_alt forward
         # is therefore deferred to just before the
         # ``_aux_real_score_fn`` definition. Here we only commit to
         # whether the apply path is active so ``chunk_grad_path_live``
@@ -6539,57 +6487,82 @@ class ActionForcingDMD(SelfForcingModel):
         # ``add_noise`` is the same vector used as the FlowPredLoss
         # target ``noise`` arg.
 
-        # Override clean_x with a stable reference: GT last-seed-chunk
-        # concatenated with the first 6 student chunks' post-Step-3.3.5
-        # refined cache_pred (detached). The pipeline writes per-block
-        # refined cache_pred into ``self.inference_pipeline._clean_chunk``
-        # during the rollout. On iter 1 the buffer holds the full
-        # ``chunk_size``-frame view; we snapshot the first
-        # ``chunk_size - npb`` frames into ``streaming_state`` so
-        # subsequent iters reuse the same stable reference (matches
-        # the user's "first 6 student chunks" semantics — fixed
-        # reference per streaming sequence; reset on
-        # ``reset_streaming_state``).
+        # clean_x for the aux teacher: ALWAYS the pure GT slice
+        # covering the chunk's clean-half window. The aux teacher is
+        # trained to denoise (noisy GT, ε, t) back to GT — the v14
+        # contract — and any student or student/GT-mixed clean_x leaks
+        # student-distribution structure into the teacher's
+        # conditioning, which was observed to break training (chunk
+        # discontinuities in clean_x_aux videos, teacher drift). The
+        # only sanctioned non-GT clean_x is ``causal_AR_GT`` (GT with
+        # learned forward-noise / alt-head AR shaping), handled
+        # downstream when ``aux_real_clean_x_source == "causal_ar_gt"``
+        # and the noiser is active.
         #
-        # When ``flash_dmd_enabled=False`` the pipeline leaves
-        # ``_clean_chunk = None`` and we fall back to the legacy
-        # ``sc_clean_x_real``/``sc_aug_t_real`` (the existing
-        # ``_streaming_build_clean_x_self``-derived view) so flash-
-        # off baselines remain bit-identical to before this change.
-        clean_x_for_real = sc_clean_x_real
-        aug_t_for_real = sc_aug_t_real
+        # clean_x_GT slice math: covers ride frames
+        # ``[cf + noisy_start_sdn - shift, cf + noisy_start_sdn -
+        # shift + chunk_size)`` — same window
+        # ``_streaming_build_clean_x_GT`` returns. We inline it here
+        # to avoid an extra info-dict round-trip; identical math.
         npb = int(s["shift"])
         cf_state = int(s["cf"])
-        pipe = getattr(self, "inference_pipeline", None)
-        clean_chunk_buf = (
-            getattr(pipe, "_clean_chunk", None) if pipe is not None else None
-        )
-        if clean_chunk_buf is not None:
-            # Snapshot on iter 1 (or after a streaming reset) once
-            # the buffer holds at least ``chunk_size - npb`` frames.
-            need_frames = chunk_size - npb
-            if s.get("aux_clean_x_snapshot") is None:
-                if int(clean_chunk_buf.shape[1]) >= need_frames:
-                    s["aux_clean_x_snapshot"] = (
-                        clean_chunk_buf[:, :need_frames].detach().clone()
-                    )
-            snapshot = s.get("aux_clean_x_snapshot")
-            if snapshot is not None:
-                # GT last-seed-chunk: ride frames [cf-npb : cf] —
-                # the chunk immediately preceding the rollout's
-                # first frame. Detached, no grad.
-                seed_last = ride_window[:, cf_state - npb: cf_state].to(
-                    dtype=chunk.dtype, device=chunk.device,
-                ).detach()
-                clean_x_for_real = torch.cat(
-                    [seed_last, snapshot.to(dtype=chunk.dtype, device=chunk.device)],
-                    dim=1,
-                ).detach()
-                # v14's clean half is at zero noise.
-                aug_t_for_real = torch.zeros(
-                    (clean_x_for_real.shape[0], clean_x_for_real.shape[1]),
-                    device=chunk.device, dtype=torch.long,
+        _clean_start = cf_state + noisy_start_sdn - npb
+        _clean_end = _clean_start + chunk_size
+        if _clean_end > ride_window.shape[1]:
+            # Defensive: if the ride window is too short for the clean
+            # slice this iter, skip the aux pass. Shouldn't fire in
+            # practice (the noisy gt_target slice above already
+            # all-reduce-skips on short rides), but guard anyway.
+            return None, {"aux_teacher_skipped_short_clean_ride": 1.0}
+        clean_x_for_real = ride_window[
+            :, _clean_start:_clean_end,
+        ].to(dtype=chunk.dtype, device=chunk.device).detach()
+        # Renoise the pure-GT clean_x via the scheduler. Each chunk
+        # of ``npb`` frames gets a SINGLE random timestep sampled
+        # uniformly from ``[0, clean_x_gt_noise_t]`` (default upper
+        # bound 60 — strength ~3/10 of the ladder, lowest rung ~178).
+        # Per-chunk random (not per-frame, not progressive) so the
+        # teacher sees a noise level that varies stochastically along
+        # the rollout, preventing identity collapse without baking in
+        # a position-dependent prior. Skipped when
+        # ``clean_x_gt_noise_t <= 0``.
+        clean_x_noise_t = int(getattr(self, "clean_x_gt_noise_t", 0))
+        if clean_x_noise_t > 0:
+            B_eff = clean_x_for_real.shape[0]
+            F_eff = clean_x_for_real.shape[1]
+            npb_local = int(self.num_frame_per_block)
+            if F_eff % npb_local != 0:
+                raise RuntimeError(
+                    "_compute_aux_teacher_loss_streaming: clean_x_for_real "
+                    f"has {F_eff} frames which is not divisible by npb="
+                    f"{npb_local}. Per-chunk random noise sampling "
+                    "requires npb-aligned frame count."
                 )
+            n_chunks_local = F_eff // npb_local
+            t_per_chunk = torch.randint(
+                low=0,
+                high=clean_x_noise_t + 1,
+                size=(B_eff, n_chunks_local),
+                device=chunk.device,
+                dtype=torch.long,
+            )
+            _t = t_per_chunk.repeat_interleave(npb_local, dim=1)
+            _eps = torch.randn_like(clean_x_for_real)
+            _noised = self.scheduler.add_noise(
+                clean_x_for_real.flatten(0, 1),
+                _eps.flatten(0, 1),
+                _t.flatten(0, 1),
+            ).unflatten(0, clean_x_for_real.shape[:2]).to(
+                dtype=clean_x_for_real.dtype,
+            )
+            clean_x_for_real = _noised.detach()
+            aug_t_for_real = _t
+        else:
+            # v14's clean half is at zero noise.
+            aug_t_for_real = torch.zeros(
+                (clean_x_for_real.shape[0], clean_x_for_real.shape[1]),
+                device=chunk.device, dtype=torch.long,
+            )
 
         # ===== v27B forward-noiser application =====
         # When enabled, build causal_AR_GT by iteratively applying the
@@ -6599,16 +6572,15 @@ class ActionForcingDMD(SelfForcingModel):
         # (which had causal_AR_dir_rms=0 across v21-v28 due to the
         # alt-head's training-vs-application distribution mismatch).
         fn_applied_this_iter = False
-        # Gate: enter the apply path when the strategy needs to run.
-        # "blur_noise" doesn't require the learned FN module, so we
-        # allow entry even when forward_noiser_enabled is False (v27G).
-        # Strategies "learned" and "sum" require the FN module to be
-        # built (forward_noiser_enabled=True).
+        # Gate: enter the apply path only when the learned FN module
+        # is built and the strategy is not 'off'. (The legacy
+        # 'blur_noise' and 'sum' strategies depended on a 2D Gaussian
+        # blur op that has been removed.)
         _strategy = self.forward_noiser_apply_strategy
-        _strategy_needs_fn = _strategy in ("learned", "sum")
-        _strategy_can_run = _strategy != "off" and (
-            (_strategy == "blur_noise")
-            or (self.forward_noiser_enabled and self.forward_noiser is not None)
+        _strategy_can_run = (
+            _strategy != "off"
+            and self.forward_noiser_enabled
+            and self.forward_noiser is not None
         )
         if (
             self.forward_noiser_apply_in_aux
@@ -6690,9 +6662,10 @@ class ActionForcingDMD(SelfForcingModel):
 
         # ===== v21 fake_alt forward (deferred) =====
         # Now that ``clean_x_for_real`` and ``aug_t_for_real`` are
-        # finalised (including the flash-DMD ``_clean_chunk`` override
-        # above), run the no_grad fake_alt forward to shape the
-        # clean reference into a ``causal_AR`` x0 estimate. Replaces
+        # finalised (pure-GT clean_x slice, optionally replaced with
+        # causal_AR_GT when the forward noiser is active), run the
+        # no_grad fake_alt forward to shape the clean reference into
+        # a ``causal_AR`` x0 estimate. Replaces
         # ``noise_base`` so the downstream ``add_noise(noise_base,
         # eps, t)`` call produces an AR-flavored noised input for the
         # real_score's training; the FlowPredLoss target stays

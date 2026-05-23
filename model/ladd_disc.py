@@ -102,9 +102,14 @@ class WanFeatureProjector:
     ):
         self.real_score = real_score
         self.block_indices = sorted(set(int(i) for i in block_indices))
-        self._features: Dict[int, torch.Tensor] = {}
-        self._handles: List = []
-        self._install_hooks()
+        # NOTE: no persistent forward hooks are installed. Every call
+        # to ``real_score`` from elsewhere in the trainer (DMD scoring,
+        # aux LoRA pass, real_teacher train, gen rollout) would fire
+        # persistent hooks and pin graph-attached block outputs across
+        # hundreds of teacher forwards per step. ``__call__`` installs
+        # LOCAL hooks scoped to the disc's own teacher forward and
+        # removes them in ``finally``.
+        self._validate_block_indices()
 
     # ------------------------------------------------------------------
     def _find_blocks(self) -> nn.ModuleList:
@@ -131,7 +136,7 @@ class WanFeatureProjector:
             "some submodule with >=10 entries."
         )
 
-    def _install_hooks(self) -> None:
+    def _validate_block_indices(self) -> None:
         blocks = self._find_blocks()
         n_blocks = len(blocks)
         for idx in self.block_indices:
@@ -140,27 +145,6 @@ class WanFeatureProjector:
                     f"WanFeatureProjector: block index {idx} out of range "
                     f"for {n_blocks}-block teacher."
                 )
-
-            # Closure factory so each hook captures its own ``idx``.
-            def make_hook(block_idx: int):
-                def _hook(_module, _input, output):
-                    # Block output may be a tensor or a tuple. WAN's
-                    # block returns a Tensor directly; defensive
-                    # unwrap just in case.
-                    if isinstance(output, tuple):
-                        feat = output[0]
-                    else:
-                        feat = output
-                    self._features[block_idx] = feat
-                return _hook
-
-            handle = blocks[idx].register_forward_hook(make_hook(idx))
-            self._handles.append(handle)
-
-    def remove_hooks(self) -> None:
-        for h in self._handles:
-            h.remove()
-        self._handles.clear()
 
     # ------------------------------------------------------------------
     def __call__(
@@ -185,7 +169,6 @@ class WanFeatureProjector:
         to ``real_score`` — used to inject ``_action_tokens`` /
         ``_action_modulation`` for action-aware WAN configurations.
         """
-        self._features.clear()
         # The disc (CCM/CSM/heads) is built in fp32 for R1 stability,
         # so x_noisy and the conditional tensors arrive here in fp32.
         # The WAN teacher's weights are in bf16; passing fp32 inputs
@@ -233,32 +216,17 @@ class WanFeatureProjector:
         # forward (v28A OOM mitigation 4). Wraps the entire teacher call
         # in ``torch.utils.checkpoint.checkpoint(use_reentrant=False)``
         # so the per-block intermediate activations are recomputed on
-        # backward instead of held. With R1's ``create_graph=True``
-        # second-order pass, this is a substantial save (the teacher
-        # forward's activation footprint is the dominant memory cost
-        # of the disc-step backward).
+        # backward instead of held.
         #
-        # Hook complication: the standard hook pattern writes captured
-        # features into ``self._features`` (a mutable dict on the
-        # projector). Under checkpoint, the forward runs once, the
-        # backward replays the forward, and the hooks fire AGAIN —
-        # overwriting the dict with re-computed features. The
-        # autograd graph for the gradient computation rooted in the
-        # ORIGINAL captured features is then broken because the
-        # downstream code is using values that no longer connect to
-        # the live graph.
-        #
-        # Fix: return the captured features as a TUPLE from the
-        # checkpointed function so they're tracked as outputs.
-        # ``use_reentrant=False`` keeps autograd's connection.
+        # The hooks are installed locally for this call only and
+        # removed in ``finally`` so the next teacher forward (from
+        # anywhere else in the trainer) is not affected. Captured
+        # features are returned as a tuple from the checkpointed
+        # function so they're tracked as outputs and ``use_reentrant=
+        # False`` keeps autograd's connection through replay.
         block_indices_sorted = sorted(self.block_indices)
         local_feats: Dict[int, torch.Tensor] = {}
         hook_handles = []
-        # Reach the WAN model and re-register hooks into the local dict
-        # for this call. (The self-level hooks installed in __init__
-        # also fire; we ignore those captures and rely on the local
-        # ones.)
-        wan_model = self._find_blocks().__class__  # noqa: F841 (just sanity)
         blocks = self._find_blocks()
 
         def _make_local_hook(block_idx: int):
@@ -273,14 +241,9 @@ class WanFeatureProjector:
             )
 
         def _run_teacher(x):
-            # Replace the noisy input in kwargs with the (possibly-grad-
-            # tracked) arg passed by checkpoint, so autograd sees the
-            # connection from ``x`` to the teacher forward.
             kwargs_local = dict(kwargs)
             kwargs_local["noisy_image_or_video"] = x
             _ = self.real_score(**kwargs_local)
-            # Return features as a tuple — checkpoint will track them
-            # as outputs that participate in backward.
             return tuple(local_feats[i] for i in block_indices_sorted)
 
         try:
@@ -295,13 +258,10 @@ class WanFeatureProjector:
         finally:
             for h in hook_handles:
                 h.remove()
-        # Clean the self._features dict so the __init__-installed hooks
-        # don't leave stale state for later callers.
-        self._features.clear()
-        out = {
+            local_feats.clear()
+        return {
             idx: feat_tuple[i] for i, idx in enumerate(block_indices_sorted)
         }
-        return out
 
 
 # ============================================================================
@@ -416,30 +376,30 @@ class LADDFeatureFusion(nn.Module):
 # ============================================================================
 
 
-def _spectral_conv1d(
+def _spectral_conv2d(
     in_ch: int, out_ch: int, kernel_size: int, padding: int = 0,
-) -> nn.Conv1d:
-    """1D conv with SpectralNorm applied — D-stability standard."""
-    conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=padding)
+) -> nn.Conv2d:
+    """2D conv with SpectralNorm applied — D-stability standard."""
+    conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding=padding)
     return spectral_norm(conv, n_power_iterations=1)
 
 
-class _ResBlock1D(nn.Module):
-    """Residual block: GroupNorm → LeakyReLU → SpectralConv1d (k=K) →
-    GroupNorm → LeakyReLU → SpectralConv1d (k=1)."""
+class _ResBlock2D(nn.Module):
+    """Residual block: GroupNorm → LeakyReLU → SpectralConv2d (k=K) →
+    GroupNorm → LeakyReLU → SpectralConv2d (k=1)."""
 
-    def __init__(self, channels: int, kernel_size: int = 9):
+    def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
         self.norm1 = nn.GroupNorm(8, channels)
-        self.conv1 = _spectral_conv1d(
+        self.conv1 = _spectral_conv2d(
             channels, channels, kernel_size=kernel_size,
             padding=kernel_size // 2,
         )
         self.norm2 = nn.GroupNorm(8, channels)
-        self.conv2 = _spectral_conv1d(channels, channels, kernel_size=1)
+        self.conv2 = _spectral_conv2d(channels, channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, N]
+        # x: [B, C, H, W]
         h = self.norm1(x)
         h = F.leaky_relu(h, 0.2, inplace=True)
         h = self.conv1(h)
@@ -450,17 +410,20 @@ class _ResBlock1D(nn.Module):
 
 
 class LADDDiscHead(nn.Module):
-    """Single-scale disc head operating on flattened token sequences.
+    """Single-scale disc head operating on 2D patch-grid features.
 
-    Input shape: ``[B, N_tokens, dim_proj]``
-    Output shape: ``[B, N_tokens_out, 1]`` — per-token scalar logit
-        (caller reduces or concatenates with other scales).
+    Input shape: ``[B*T', dim_proj, H', W']`` — spatial map per
+    (sample, frame). Caller is responsible for stripping action
+    tokens and reshaping the token sequence into this 2D layout.
+
+    Output shape: ``[B*T', cmap_dim or 1, H', W']``. Caller flattens
+    + concatenates across scales for the final logit vector.
     """
 
     def __init__(
         self,
         dim_proj: int,
-        kernel_size: int = 9,
+        kernel_size: int = 3,
         cmap_dim: int = 0,
     ):
         super().__init__()
@@ -469,25 +432,23 @@ class LADDDiscHead(nn.Module):
         self.in_block = nn.Sequential(
             nn.GroupNorm(8, self.dim_proj),
             nn.LeakyReLU(0.2, inplace=True),
-            _spectral_conv1d(self.dim_proj, self.dim_proj, kernel_size=1),
+            _spectral_conv2d(self.dim_proj, self.dim_proj, kernel_size=1),
         )
-        self.res_block = _ResBlock1D(self.dim_proj, kernel_size=kernel_size)
+        self.res_block = _ResBlock2D(self.dim_proj, kernel_size=kernel_size)
         if self.cmap_dim > 0:
-            # Prompt-conditioned head (StyleGAN-T projection style).
-            self.cls = _spectral_conv1d(
+            self.cls = _spectral_conv2d(
                 self.dim_proj, self.cmap_dim, kernel_size=1,
             )
         else:
-            self.cls = _spectral_conv1d(self.dim_proj, 1, kernel_size=1)
+            self.cls = _spectral_conv2d(self.dim_proj, 1, kernel_size=1)
 
     def forward(
         self,
         feat: torch.Tensor,
         cmap: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # feat: [B, N, dim_proj] → [B, dim_proj, N] for 1D convs
-        x = feat.transpose(1, 2).contiguous()
-        x = self.in_block(x)
+        # feat: [B*T', dim_proj, H', W']
+        x = self.in_block(feat)
         x = self.res_block(x)
         out = self.cls(x)
         if self.cmap_dim > 0:
@@ -496,8 +457,17 @@ class LADDDiscHead(nn.Module):
                     "LADDDiscHead built with cmap_dim>0 but no cmap "
                     "argument provided to forward()."
                 )
-            # cmap: [B, cmap_dim] → broadcast inner product over tokens.
-            cmap_b = cmap.unsqueeze(-1)  # [B, cmap_dim, 1]
+            # cmap: [B, cmap_dim] needs broadcasting over T'. The
+            # caller passes the [B, cmap_dim] form; we must expand by
+            # the temporal-fold factor (T' = first_dim // B) to match
+            # the [B*T', cmap_dim, ...] activation. Recover T' from
+            # the activation's batch axis: B_eff = first_dim, T' =
+            # B_eff // cmap.shape[0].
+            B_eff = out.shape[0]
+            B_cmap = cmap.shape[0]
+            t_frames = max(1, B_eff // B_cmap)
+            cmap_expanded = cmap.repeat_interleave(t_frames, dim=0)
+            cmap_b = cmap_expanded.unsqueeze(-1).unsqueeze(-1)  # [B*T', cmap_dim, 1, 1]
             out = (out * cmap_b).sum(1, keepdim=True) * (
                 1.0 / math.sqrt(self.cmap_dim)
             )
@@ -550,13 +520,15 @@ class LADDDiscriminator(nn.Module):
         dim_proj: int = 256,
         use_csm: bool = True,
         use_lateral_proj: bool = False,
-        head_kernel_size: int = 9,
+        head_kernel_size: int = 3,
         cmap_dim: int = 0,
         prompt_embed_dim: int = 0,
         wavelet_hf_enabled: bool = False,
         wavelet_hf_in_channels: int = 16,
         wavelet_hf_drop_ll: bool = True,
         wavelet_hf_adapter_init_gain: float = 0.1,
+        patch_size: Tuple[int, int, int] = (1, 2, 2),
+        action_tokens_per_frame: int = 0,
     ):
         super().__init__()
         self.projector = projector  # stored as plain attribute, not nn submodule
@@ -566,6 +538,12 @@ class LADDDiscriminator(nn.Module):
         self.use_csm = bool(use_csm)
         self.cmap_dim = int(cmap_dim)
         self.wavelet_hf_enabled = bool(wavelet_hf_enabled)
+        # WAN patch_size + per-frame action-token count; needed to
+        # reshape the captured token sequence back to the 2D
+        # patch-grid layout (T', H', W') + a_per_f-per-frame action
+        # tokens, which we strip before running 2D heads.
+        self.patch_size = tuple(int(p) for p in patch_size)
+        self.action_tokens_per_frame = int(action_tokens_per_frame)
         if self.wavelet_hf_enabled:
             from model.wavelet_hf import LatentWaveletHF
             self.wavelet_hf = LatentWaveletHF(
@@ -667,10 +645,55 @@ class LADDDiscriminator(nn.Module):
                     "pooled_prompt not provided."
                 )
             cmap = self.cmapper(pooled_prompt.float())
+
+        # Reshape each tap's token sequence to a 2D patch grid so the
+        # heads can run 2D SpectralConvs (matches LADD's per-tap 2D
+        # head design + Projected-GAN's spatial CNN heads).
+        #
+        # Token layout from WAN's causal model (causal_model.py:672):
+        # for each of T' frames, the per-frame chunk is
+        #   [spatial_0..spatial_{H'*W'-1}, action_0..action_{a-1}]
+        # so total real tokens = T' * (H'*W' + a_per_f). Beyond that
+        # the sequence is zero-padded to ``seq_len``. We slice off
+        # the padding AND the per-frame action tokens before the
+        # 2D reshape.
+        B, F_in, _C_in, H_in, W_in = x_noisy.shape
+        pt, ph, pw = self.patch_size
+        T_prime = F_in // pt
+        H_prime = H_in // ph
+        W_prime = W_in // pw
+        a_per_f = int(self.action_tokens_per_frame)
+        frame_seqlen = H_prime * W_prime + a_per_f
+        real_tokens = T_prime * frame_seqlen
+
+        proj_2d: Dict[int, torch.Tensor] = {}
+        for idx in self.block_indices:
+            feat = proj[idx]  # [B, seq_len, dim_proj]
+            if feat.shape[1] < real_tokens:
+                raise RuntimeError(
+                    "LADDDiscriminator: captured feature length "
+                    f"{feat.shape[1]} < expected real_tokens "
+                    f"{real_tokens} (T'={T_prime}, H'={H_prime}, "
+                    f"W'={W_prime}, a_per_f={a_per_f})."
+                )
+            # Strip zero-padding past the real-content region.
+            feat = feat[:, :real_tokens]
+            # Per-frame split + strip action tokens.
+            feat = feat.reshape(B, T_prime, frame_seqlen, self.dim_proj)
+            if a_per_f > 0:
+                feat = feat[:, :, :H_prime * W_prime]
+            # [B, T', H', W', dim_proj] -> [B*T', dim_proj, H', W']
+            feat = feat.reshape(B, T_prime, H_prime, W_prime, self.dim_proj)
+            feat = feat.permute(0, 1, 4, 2, 3).contiguous()
+            feat = feat.reshape(B * T_prime, self.dim_proj, H_prime, W_prime)
+            proj_2d[idx] = feat
+
         logits_per_scale = []
         for idx in self.block_indices:
-            l = self.heads[str(idx)](proj[idx], cmap=cmap)
-            logits_per_scale.append(l.reshape(l.shape[0], -1))
+            l = self.heads[str(idx)](proj_2d[idx], cmap=cmap)
+            # l: [B*T', cmap_dim_or_1, H', W'] -> per-sample flat.
+            l = l.reshape(B, -1)
+            logits_per_scale.append(l)
         return torch.cat(logits_per_scale, dim=1)
 
 
@@ -858,19 +881,25 @@ def build_ladd_disc(
     dim_proj: int = 256,
     use_csm: bool = True,
     use_lateral_proj: bool = False,
-    head_kernel_size: int = 9,
+    head_kernel_size: int = 3,
     cmap_dim: int = 0,
     prompt_embed_dim: int = 0,
     wavelet_hf_enabled: bool = False,
     wavelet_hf_in_channels: int = 16,
     wavelet_hf_drop_ll: bool = True,
     wavelet_hf_adapter_init_gain: float = 0.1,
+    patch_size: Tuple[int, int, int] = (1, 2, 2),
+    action_tokens_per_frame: int = 0,
 ) -> LADDDiscriminator:
     """Build a LADD discriminator wired to the existing teacher.
 
     Caller is responsible for moving the returned module to the right
     device + dtype, and for DDP-wrapping it. The teacher (real_score)
     is captured by reference; no parameters are copied.
+
+    ``patch_size`` + ``action_tokens_per_frame`` describe how the WAN
+    teacher tokenises its input — needed so the heads can fold the
+    captured token sequence back to a 2D (H'×W') patch grid per frame.
     """
     projector = WanFeatureProjector(
         real_score=real_score,
@@ -890,5 +919,7 @@ def build_ladd_disc(
         wavelet_hf_in_channels=wavelet_hf_in_channels,
         wavelet_hf_drop_ll=wavelet_hf_drop_ll,
         wavelet_hf_adapter_init_gain=wavelet_hf_adapter_init_gain,
+        patch_size=patch_size,
+        action_tokens_per_frame=action_tokens_per_frame,
     )
     return disc

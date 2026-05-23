@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28A
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28A_2
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -151,11 +151,11 @@ srun torchrun \
     critic_clean_x_source=self \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
-    gan_loss_weight=0.1 \
+    gan_loss_weight=0.2 \
     gan_lr=2e-5 \
     gan_critic_warmup_steps=40 \
     gan_disc_start_step=40 \
-    gan_warmup_steps=50 \
+    gan_warmup_steps=25 \
     gan_warmup_shape=quadratic \
     gan_updates_per_step=1 \
     gan_r1_gamma=2.0 \
@@ -184,9 +184,9 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.0 \
+    anti_collapse_loss_weight=0.8 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=5 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28A_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28A_2_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

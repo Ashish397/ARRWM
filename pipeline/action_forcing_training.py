@@ -988,9 +988,10 @@ class ActionForcingTrainingPipeline:
             #     overwrites the grad-attached K/V slots written by
             #     the t=flash_dmd_gan_t grad-on forward with graph-free
             #     K/V at t=context_noise so the next block's exit-rung
-            #     (DMD-grad) forward reads detached K/V. The input
-            #     ``cache_pred`` here has been refined by Step 3.3.5
-            #     when ``flash_dmd_enabled``.
+            #     (DMD-grad) forward reads detached K/V. ``cache_pred``
+            #     here is the t=60 refined output (reassigned at the
+            #     ``flash_dmd_enabled`` branch above) — the KV cache
+            #     therefore carries the cleaner t=60 x0 estimate forward.
             # The input is always detached (cache_pred came from a
             # no_grad chain anyway, but the explicit detach releases
             # any autograd nodes early — memory hygiene).

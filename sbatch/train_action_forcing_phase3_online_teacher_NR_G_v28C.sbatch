@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28A
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28C
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,7 +11,7 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28A: minimal modern stack.
+# Phase-3 online_teacher_NR_G_v28C: minimal modern stack.
 #
 # Pieces ON:
 #   * Online DMD (standard, with anti-collapse std-floor guard).
@@ -52,7 +52,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28A
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28C
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -80,7 +80,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28A (LADD wavelet-HF + DMD + aux) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v28C (LADD wavelet-HF + DMD + aux) on $(date)"
 echo "  * GAN: LADD teacher-feature, gt_vs_fake, wavelet HF input."
 echo "  * DMD: online, anti-collapse on, no forward noiser."
 echo "  * Aux teacher: online LoRA training of real_score against GT."
@@ -161,7 +161,7 @@ srun torchrun \
     gan_r1_gamma=2.0 \
     gan_max_grad_norm=10.0 \
     ladd_proj_dim=256 \
-    ladd_use_csm=false \
+    ladd_use_csm=true \
     ladd_use_lateral_proj=false \
     ladd_use_prompt_cond=true \
     ladd_cmap_dim=64 \
@@ -187,6 +187,6 @@ srun torchrun \
     anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=5 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28A_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28C_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
