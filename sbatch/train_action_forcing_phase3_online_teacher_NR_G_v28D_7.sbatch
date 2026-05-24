@@ -124,7 +124,7 @@ srun torchrun \
     aux_teacher_lora_alpha=64 \
     aux_real_clean_x_source=gt \
     dmd_loss_weight=0.25 \
-    dmd_loss_start_step=20 \
+    dmd_loss_start_step=10 \
     dmd_loss_warmup_steps=150 \
     dmd_normalization_enabled=false \
     dmd_frozen_teacher_pass_enabled=false \
@@ -155,7 +155,7 @@ srun torchrun \
     ladd_r1_gamma=0.001 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=6 \
+    ladd_pairs_per_step=2 \
     ladd_wavelet_hf_enabled=false \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \

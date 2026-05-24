@@ -1310,17 +1310,29 @@ class ActionForcingDMD(SelfForcingModel):
                 f"anti_collapse_mean_target must be 'zero' or 'gt'; "
                 f"got {self.anti_collapse_mean_target!r}."
             )
-        # ``anti_collapse_type``: select between the legacy std-floor
-        # penalty ("std_floor", default) and the new bidirectional
-        # log-ratio corridor + chunk-drift penalty ("std_corridor").
-        # See ``model/anti_collapse.py`` for the corridor math.
+        # ``anti_collapse_type``: select the anti-collapse formulation.
+        #   "std_floor" (default): legacy one-sided
+        #       ``ReLU(floor_ratio * s_gt - s_pred)^2`` — penalises
+        #       only shrinkage, never overshoot. Anchored at a fraction
+        #       of GT std.
+        #   "std_corridor": bidirectional log-ratio bands on std + RMS
+        #       + mean, plus chunk-to-chunk drift penalty. More
+        #       structured than std_mse but more knobs to tune.
+        #   "std_mse": simplest possible — symmetric
+        #       ``(s_pred - s_gt)^2``, per-frame averaged. Pulls the
+        #       student std to *match* GT (both up and down), no
+        #       corridor, no log space. Weight via
+        #       ``anti_collapse_loss_weight``.
+        # See ``model/anti_collapse.py`` for all three formulations.
         self.anti_collapse_type = str(
             getattr(args, "anti_collapse_type", "std_floor")
         ).strip().lower()
-        if self.anti_collapse_type not in ("std_floor", "std_corridor"):
+        if self.anti_collapse_type not in (
+            "std_floor", "std_corridor", "std_mse",
+        ):
             raise ValueError(
-                "anti_collapse_type must be 'std_floor' or "
-                f"'std_corridor'; got {self.anti_collapse_type!r}."
+                "anti_collapse_type must be 'std_floor', 'std_corridor', "
+                f"or 'std_mse'; got {self.anti_collapse_type!r}."
             )
         # Corridor-mode weights (consulted only when
         # ``anti_collapse_type == "std_corridor"``). Defaults match the
@@ -3239,6 +3251,33 @@ class ActionForcingDMD(SelfForcingModel):
                 )
                 log_dict[f"anti_collapse_{log_prefix}gt_std_mean"] = s_gt.mean()
             return total_corridor.to(ref_dtype)
+
+        # ----- std_mse: simplest possible (s_pred - s_gt)^2 -----
+        if self.anti_collapse_type == "std_mse":
+            if self.anti_collapse_loss_weight <= 0.0:
+                return None
+            from model.anti_collapse import latent_std_mse_loss
+            # fp32 reductions for numerical stability — gen path keeps
+            # the bf16 cast at the caller boundary.
+            loss_std_mse = latent_std_mse_loss(
+                pred_x0=original_latent.float(),
+                gt_target=gt_for_std.float(),
+            )
+            log_dict[f"anti_collapse_{log_prefix}std_mse_raw"] = (
+                loss_std_mse.detach()
+            )
+            # Telemetry parity with std_floor / std_corridor.
+            with torch.no_grad():
+                s_pred = original_latent.float().std(dim=[2, 3, 4])
+                s_gt = gt_for_std.float().std(dim=[2, 3, 4])
+                log_dict[f"anti_collapse_{log_prefix}pred_std_mean"] = (
+                    s_pred.mean()
+                )
+                log_dict[f"anti_collapse_{log_prefix}gt_std_mean"] = s_gt.mean()
+            return (
+                self.anti_collapse_loss_weight
+                * loss_std_mse.to(ref_dtype)
+            )
 
         # ----- legacy std_floor + optional mean anchor -----
         anti_collapse_any = (

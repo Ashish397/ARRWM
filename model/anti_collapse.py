@@ -158,6 +158,37 @@ def latent_contrast_drift_loss(
     return (F.relu(drift.abs() - drift_tol) ** 2).mean()
 
 
+def latent_std_mse_loss(
+    pred_x0: torch.Tensor,
+    gt_target: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Simple MSE between per-frame std of pred_x0 and GT.
+
+    No corridor, no log-ratio, no chunk drift — just
+    ``(s_pred - s_gt) ** 2`` averaged over (batch, frame). Pulls the
+    student's per-frame latent std to *match* GT, both up and down.
+    Symmetric by construction: shrinking under GT and ballooning over
+    GT are penalised the same way. The simplest possible anti-collapse
+    signal.
+
+    Args:
+        pred_x0:   ``[B, F, C, H, W]`` student rollout (graph-attached).
+        gt_target: ``[B, F, C, H, W]`` GT at matching positions
+            (detached internally).
+        eps: numerical floor — currently unused on the difference but
+            kept for parity with the corridor helpers.
+
+    Returns:
+        scalar tensor ``[]``.
+    """
+    gt = gt_target.detach()
+    reduce_dims = [2, 3, 4]
+    s_pred = pred_x0.std(dim=reduce_dims, unbiased=False)
+    s_gt = gt.std(dim=reduce_dims, unbiased=False)
+    return (s_pred - s_gt).pow(2).mean()
+
+
 def compute_std_corridor_anti_collapse(
     pred_x0: torch.Tensor,
     gt_target: torch.Tensor,

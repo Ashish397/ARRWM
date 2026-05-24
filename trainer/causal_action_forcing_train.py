@@ -5293,6 +5293,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             for k, v in partial_logs.items():
                 logs[k + suffix] = v
 
+        # Top-level (non-suffixed) R1 traces so the wandb plot is
+        # findable as ``train/r3gan_r1*`` without the ``_gt`` / ``_adj``
+        # suffix dance. Aggregate via mean across pair modes — both
+        # modes share the same disc weights so their R1 estimates
+        # should be comparable. The fired flag is OR'd (firing on EITHER
+        # mode is enough to count this iter as "R1 fired"). ``grad_sq``
+        # uses nan-aware mean so a non-firing mode doesn't pull the
+        # combined value to ~half.
+        import math as _math
+        r1_keys = [k for k in logs if "r3gan_r1_grad_sq_" in k]
+        if r1_keys:
+            valid_vals = [
+                logs[k] for k in r1_keys
+                if isinstance(logs[k], float) and not _math.isnan(logs[k])
+            ]
+            if valid_vals:
+                logs["train/r3gan_r1_grad_sq"] = sum(valid_vals) / len(valid_vals)
+            else:
+                logs["train/r3gan_r1_grad_sq"] = float("nan")
+        fired_keys = [k for k in logs if "r3gan_r1_fired_" in k]
+        if fired_keys:
+            logs["train/r3gan_r1_fired"] = max(logs[k] for k in fired_keys)
+        # Top-level r3gan_r1 = mean of the γ-weighted per-mode losses.
+        r1_loss_keys = [
+            k for k in logs
+            if k in ("train/r3gan_r1_gt", "train/r3gan_r1_adj")
+        ]
+        if r1_loss_keys:
+            logs["train/r3gan_r1"] = sum(logs[k] for k in r1_loss_keys) / len(r1_loss_keys)
         return gen_loss_total, logs
 
     def _ladd_run_pair_mode(
@@ -5556,6 +5585,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         last_d_real = 0.0
         last_d_fake = 0.0
         last_r1 = 0.0
+        # Diagnostic R1 stats (independent of γ + lazy schedule):
+        #   * ``last_r1_grad_sq``: raw ‖∇_x Σ_i D_i‖² estimate from the
+        #     finite-difference or autograd path. This is the quantity
+        #     γ multiplies — log it separately so the gradient norm
+        #     itself is visible regardless of how small γ is. NaN on
+        #     iters where R1 didn't fire (lazy schedule skip or disc
+        #     warmup) so wandb plots gaps rather than misleading 0s.
+        #   * ``last_r1_fired``: 1.0 if R1 was actually computed this
+        #     iter, 0.0 otherwise. Lets the user filter the trace to
+        #     only the iters where R1 has a real value.
+        last_r1_grad_sq = float("nan")
+        last_r1_fired = 0.0
         if n_disc_updates > 0 and self.r3gan_optimizer is not None:
             for _ in range(n_disc_updates):
                 self.r3gan_optimizer.zero_grad(set_to_none=True)
@@ -5629,10 +5670,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         retain_graph=True,
                     )[0]
                     real_grads_only = grads[:B_pair_d]
-                    r1 = (
-                        0.5 * _r1_gamma
-                        * real_grads_only.flatten(1).pow(2).sum(dim=1).mean()
+                    # Raw ‖∇_x Σ_i D_i‖² (per-sample, then averaged) —
+                    # the quantity γ multiplies. Captured BEFORE the
+                    # 0.5·γ scaling so wandb shows the gradient norm
+                    # independent of the γ knob.
+                    _r1_grad_sq_raw = (
+                        real_grads_only.flatten(1).pow(2).sum(dim=1).mean()
                     )
+                    r1 = 0.5 * _r1_gamma * _r1_grad_sq_raw
+                    last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
+                    last_r1_fired = 1.0
                 elif _do_r1 and _r1_mode == "fd":
                     # Finite-difference R1. Detach inputs (no second-
                     # order graph). Build the perturbed version of
@@ -5705,7 +5752,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     r1_grad_fd = (
                         (d_real_pert_sum - d_real_sum) / _r1_sigma
                     )
-                    r1 = 0.5 * _r1_gamma * r1_grad_fd.pow(2).mean()
+                    # Raw ‖∇_x Σ_i D_i‖² estimate (per-sample squared
+                    # FD, then averaged) — γ-free. Logged separately so
+                    # the gradient norm is visible regardless of γ.
+                    _r1_grad_sq_raw = r1_grad_fd.pow(2).mean()
+                    r1 = 0.5 * _r1_gamma * _r1_grad_sq_raw
+                    last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
+                    last_r1_fired = 1.0
                 else:
                     # R1 skipped this iter (lazy). Detached forward
                     # for stability + memory.
@@ -5862,7 +5915,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/r3gan_d_loss": last_d_loss,
             "train/r3gan_d_real": last_d_real,
             "train/r3gan_d_fake_detached": last_d_fake,
+            # γ-weighted R1 penalty actually added to d_total. NOTE: on
+            # lazy-skipped iters this is 0.0 (the graph-connected zero);
+            # the trace will look almost-flat with γ=0.001. Use the
+            # ``r3gan_r1_grad_sq`` key below to see the underlying
+            # gradient norm regardless of γ + lazy schedule.
             "train/r3gan_r1": last_r1,
+            # Raw ‖∇_x Σ_i D_i‖² estimate — γ-free, lazy-aware (NaN on
+            # iters where R1 didn't actually fire so wandb plots gaps).
+            # This is the right knob to watch when calibrating
+            # ``ladd_r1_gamma``: if it stays ~0, R1 has nothing to bite
+            # on; if it climbs into the thousands, the disc is becoming
+            # sharp and γ should go up.
+            "train/r3gan_r1_grad_sq": last_r1_grad_sq,
+            # 1.0 iff R1 was actually computed this disc-update iter
+            # (i.e. ``current_step % ladd_r1_every_n_steps == 0`` AND
+            # the disc isn't in warmup). Lets the user filter the
+            # ``r3gan_r1`` / ``r3gan_r1_grad_sq`` traces to only the
+            # iters where the values are meaningful.
+            "train/r3gan_r1_fired": last_r1_fired,
+            "train/r3gan_r1_gamma": float(_r1_gamma) if "_r1_gamma" in locals() else float(getattr(self.model, "ladd_r1_gamma", 1.0)),
             "train/r3gan_g_loss_raw": gen_gan_main_value,
             "train/r3gan_g_loss_weighted": (
                 gen_gan_weight * gen_gan_main_value

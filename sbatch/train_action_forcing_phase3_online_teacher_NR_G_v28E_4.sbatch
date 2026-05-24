@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-2
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-4
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -81,6 +81,16 @@ echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
+# Clear stale NCCL/CUDA shm segments left by prior killed jobs on each node.
+# Only removes files we own — cannot affect other tenants' live segments.
+srun --ntasks-per-node=1 bash -c '
+  echo "=== $(hostname) /dev/shm before cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+  rm -f /dev/shm/nccl-* /dev/shm/cuda.* /dev/shm/sem.nccl-* 2>/dev/null || true
+  echo "=== $(hostname) /dev/shm after cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+' || true
+
 srun torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
@@ -161,11 +171,12 @@ srun torchrun \
     ladd_use_prompt_cond=true \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
-    ladd_r1_gamma=0.001 \
+    ladd_r1_gamma=0.01 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=2 \
-    ladd_wavelet_hf_enabled=false \
+    ladd_wavelet_hf_enabled=true \
+    ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
@@ -178,10 +189,10 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
+    anti_collapse_type=std_mse \
     anti_collapse_loss_weight=1.0 \
-    anti_collapse_std_floor_ratio=0.5 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=3 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_2_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_4_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

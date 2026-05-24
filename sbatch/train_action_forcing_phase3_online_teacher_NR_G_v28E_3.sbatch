@@ -103,7 +103,7 @@ srun torchrun \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
-    sample_fps=20 \
+    sample_fps=16 \
     boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
@@ -124,7 +124,7 @@ srun torchrun \
     aux_teacher_lora_alpha=64 \
     aux_real_clean_x_source=causal_AR_GT \
     dmd_loss_weight=0.25 \
-    dmd_loss_start_step=20 \
+    dmd_loss_start_step=10 \
     dmd_loss_warmup_steps=150 \
     dmd_normalization_enabled=false \
     dmd_frozen_teacher_pass_enabled=false \
@@ -161,10 +161,10 @@ srun torchrun \
     ladd_use_prompt_cond=true \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
-    ladd_r1_gamma=0.001 \
+    ladd_r1_gamma=0.01 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=4 \
+    ladd_pairs_per_step=2 \
     ladd_wavelet_hf_enabled=false \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
@@ -178,10 +178,10 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
+    anti_collapse_type=std_mse \
     anti_collapse_loss_weight=1.0 \
-    anti_collapse_std_floor_ratio=0.5 \
     anti_collapse_mean_weight=0.0 \
-    max_gradient_chunks=3 \
+    max_gradient_chunks=4 \
     run_name=action_forcing_phase3_online_teacher_NR_G_v28E_3_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
