@@ -961,6 +961,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             0.1,
                         )
                     ),
+                    wavelet_hf_ll_weight=float(
+                        getattr(
+                            self.config,
+                            "ladd_wavelet_hf_ll_weight",
+                            1.0,
+                        )
+                    ),
                     patch_size=_patch_size,
                     action_tokens_per_frame=_a_per_f,
                 )
@@ -4376,18 +4383,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             raise RuntimeError(
                 "_vae_decode_grad requires self.model.vae."
             )
-        dummy = latent[:, 0:1]
-        lat_pad = torch.cat([dummy, latent], dim=1)
+        # Cached-decode path: avoids the init-frame brightness anomaly
+        # that plain decode injects at every call (see ``_decode_no_grad``
+        # docstring above for the full rationale).
         if use_checkpoint:
             from torch.utils.checkpoint import checkpoint as _ckpt
 
             def _decode(z):
-                return vae.decode_to_pixel(z)
+                return vae.decode_to_pixel(z, use_cache=True)
 
-            pix = _ckpt(_decode, lat_pad, use_reentrant=False)
+            pix = _ckpt(_decode, latent, use_reentrant=False)
         else:
-            pix = vae.decode_to_pixel(lat_pad)
-        return pix[:, 1:, ...]
+            pix = vae.decode_to_pixel(latent, use_cache=True)
+        return pix
 
     def _compute_pixel_perceptual_losses(
         self,
@@ -4736,42 +4744,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         device = real_lat.device
 
         def _decode_no_grad(lat: torch.Tensor) -> torch.Tensor:
-            """VAE decode with the dummy-leading-frame trick. Caller
-            controls grad context (this fn assumes torch.no_grad).
+            """VAE decode via ``cached_decode``. Caller controls grad
+            context (this fn assumes torch.no_grad).
 
-            We chunk the input temporally and run the single-shot
-            ``decode`` per chunk to bound peak workspace. The WAN VAE
-            ``decode`` has a special "first latent" behavior (1
-            output frame) and 4× expansion for the rest; the
-            dummy-leading-frame trick + ``[:, 1:]`` slice is
-            calibrated for that. ``cached_decode`` has different
-            temporal semantics (4× per latent, no special-first) so
-            we don't use it here.
-
-            Chunk size: ``decode_chunk_size`` latent frames. Each
-            chunk after the first prepends one frame from the prior
-            chunk's tail to seed the temporal Conv3d's left-context
-            (single-shot decode's first frame is the special
-            short-output one). The first chunk's first latent is
-            our dummy frame, so the left-context bootstrap matches
-            the original full-clip decode semantics byte-for-byte.
+            Why cached_decode (not plain decode): the WAN VAE's plain
+            ``decode`` does an unconditioned init at the first latent
+            of every call — that init frame has a brightness anomaly
+            that, although produced as pixel 0, also propagates
+            through the Conv3d's temporal feat_map state and contaminates
+            the subsequent frames in subtle ways (visible as a per-
+            chunk brightness spike that compounds over rollouts). The
+            old "prepend a dummy first latent, slice [:, 1:]" trick
+            tried to absorb this — but the polluted cache state still
+            leaks past the slice. ``cached_decode`` keeps the WAN
+            VAE's feat_map populated across calls so the init pixel
+            is encoded at most once and subsequent decodes flow
+            through smooth left-context; no per-call brightness
+            anomaly.
             """
-            dummy = lat[:, 0:1]
-            lat_pad = torch.cat([dummy, lat], dim=1)
-            pix = vae.decode_to_pixel(lat_pad)  # use_cache=False
-            return pix[:, 1:, ...]
+            pix = vae.decode_to_pixel(lat, use_cache=True)
+            return pix
 
         def _decode_grad(lat: torch.Tensor) -> torch.Tensor:
             """VAE decode that PRESERVES the autograd graph through
             ``lat`` for the gradient-distillation target. Caller
             should keep input small (subset = 3 frames) to bound
-            workspace. Same single-shot ``decode`` path as
-            ``_decode_no_grad`` for consistent output shape.
+            workspace. ``cached_decode`` path matches ``_decode_no_
+            grad`` for consistent output shape.
             """
-            dummy = lat[:, 0:1]
-            lat_pad = torch.cat([dummy, lat], dim=1)
-            pix = vae.decode_to_pixel(lat_pad)
-            return pix[:, 1:, ...]
+            pix = vae.decode_to_pixel(lat, use_cache=True)
+            return pix
 
         # ===== Path 1: D-update (no_grad V+SAM2; R1/R2 on features) =====
         with torch.no_grad():
@@ -5390,7 +5392,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # path's convention.
         flash_on = bool(getattr(self.model, "flash_dmd_enabled", False))
         flash_t = int(getattr(self.model, "flash_dmd_gan_t", 60))
-        disc_t_int = flash_t if flash_on else 0
+        # When the wavelet-HF stage is enabled, force the disc to
+        # operate on CLEAN latents (disc_t_int=0). The wavelet step
+        # decomposes its input into LL+LH+HL+HH sub-bands; if we noise
+        # the input first, the diffusion noise leaks broadband into
+        # the HF sub-bands and the disc ends up partly discriminating
+        # noise rather than student-vs-GT HF structure (the WGSR
+        # frequency-band restriction we're trying to enforce becomes
+        # noise-band restriction). Match the original WGSR setup by
+        # keeping the wavelet input clean.
+        wavelet_on = bool(
+            getattr(self.r3gan_disc, "wavelet_hf_enabled", False)
+        )
+        if wavelet_on:
+            disc_t_int = 0
+        else:
+            disc_t_int = flash_t if flash_on else 0
         bsz_eff = real_chunks_det.shape[0]
         t_disc = torch.full(
             (bsz_eff, npb), disc_t_int, dtype=torch.long, device=device,
@@ -5401,7 +5418,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 return x
             scheduler = getattr(self.model, "scheduler", None)
             if scheduler is None or not hasattr(scheduler, "add_noise"):
-                return x
+                raise RuntimeError(
+                    "_add_disc_noise: disc_t_int > 0 but the model has "
+                    "no scheduler with ``add_noise`` available. Either "
+                    "set ``self.model.scheduler`` to a usable scheduler "
+                    "or set disc_t_int=0 (e.g. ``flash_dmd_enabled="
+                    "False``) so the disc operates on clean inputs. "
+                    "Silent fallback removed — this used to return ``x`` "
+                    "unchanged and mask a misconfigured model."
+                )
             eps = torch.randn_like(x)
             x_flat = x.flatten(0, 1)
             eps_flat = eps.flatten(0, 1)
@@ -5660,13 +5685,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     d_real_logits = combined_logits[:B_pair_d]
                     d_fake_logits = combined_logits[B_pair_d:2 * B_pair_d]
                     d_real_perturbed = combined_logits[2 * B_pair_d:]
-                    # Finite-difference gradient estimator. Per-element
-                    # squared (sum over logits = D output) approximates
-                    # ‖∇_x D(x)‖² when eps ~ N(0,I).
+                    # Finite-difference R1 — calibrated to match the
+                    # autograd path: ``(γ/2) · E_x[‖∇_x Σ_i D_i‖²]``.
+                    # We SUM the per-token logits per batch element
+                    # FIRST (→ scalar D_sum per sample), then take the
+                    # finite difference. ``(D_sum(x+σε) − D_sum(x))/σ
+                    # ≈ ∇_x D_sum · ε`` with ε~N(0,I); squaring and
+                    # taking expectation gives ``‖∇_x D_sum‖² = ‖Σ_i
+                    # ∇_x D_i‖²`` — the same quantity the autograd
+                    # path penalises. Without the sum (mean over per-
+                    # logit FD squares), the penalty becomes ``γ · E
+                    # [mean_i ‖∇_x D_i‖²]`` — a different magnitude by
+                    # roughly N_out (= total logits per sample,
+                    # thousands with token-level RpGAN). The 0.5
+                    # factor mirrors the autograd path so γ tunes
+                    # uniformly across modes.
+                    d_real_sum = d_real_logits.sum(dim=1)
+                    d_real_pert_sum = d_real_perturbed.sum(dim=1)
                     r1_grad_fd = (
-                        (d_real_perturbed - d_real_logits) / _r1_sigma
+                        (d_real_pert_sum - d_real_sum) / _r1_sigma
                     )
-                    r1 = _r1_gamma * r1_grad_fd.pow(2).mean()
+                    r1 = 0.5 * _r1_gamma * r1_grad_fd.pow(2).mean()
                 else:
                     # R1 skipped this iter (lazy). Detached forward
                     # for stability + memory.
@@ -5947,12 +5986,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
 
             def _decode(lat: torch.Tensor) -> torch.Tensor:
-                # ``lat`` is [B, F, C, H, W] in fp32. Apply the
-                # dummy-leading-frame trick (matches video logger).
-                dummy = lat[:, 0:1]
-                lat_pad = torch.cat([dummy, lat], dim=1)
-                pix = vae.decode_to_pixel(lat_pad)
-                return pix[:, 1:, ...]
+                # ``lat`` is [B, F, C, H, W] in fp32. Cached-decode
+                # path avoids the init-frame brightness anomaly that
+                # plain ``decode`` injects every call.
+                return vae.decode_to_pixel(lat, use_cache=True)
 
             real_detached = _decode(real_detached_lat)
             fake_detached = _decode(fake_detached_lat)
@@ -6196,9 +6233,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 if F_total > self.sample_max_frames:
                     latents = latents[:, -self.sample_max_frames:]
             lat = latents[0:1]
-            dummy = lat[:, 0:1]
-            lat_wd = torch.cat([dummy, lat], dim=1)
-            pixels = vae.decode_to_pixel(lat_wd)[:, 1:, ...]
+            # Cached-decode path: WAN VAE's plain ``decode`` re-runs
+            # its unconditioned init at the first latent of every
+            # call, leaving a brightness anomaly in the rendered
+            # video. ``cached_decode`` keeps the temporal-conv
+            # feat_map populated across calls so the init is encoded
+            # at most once per streaming sequence. The cache is
+            # cleared at ``setup_sequence`` time (= when a new ride
+            # / video is loaded) — within the same sequence, calls
+            # SHARE cache so successive renders / boundary decodes
+            # of the same video flow smoothly through one another's
+            # left-context.
+            pixels = vae.decode_to_pixel(lat, use_cache=True)
             video = (0.5 * (pixels.float() + 1.0)).clamp(0.0, 1.0)
             vid_np = (video[0].cpu().numpy() * 255.0).astype(np.uint8)
             if vid_np.ndim != 4:

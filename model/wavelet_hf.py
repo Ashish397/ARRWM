@@ -73,10 +73,18 @@ class LatentWaveletHF(nn.Module):
         in_channels: int = 16,
         drop_ll: bool = True,
         adapter_init_gain: float = 0.1,
+        ll_weight: float = 1.0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.drop_ll = bool(drop_ll)
+        # Relative weight on the LL band vs the HF bands. Only consulted
+        # when ``drop_ll=False`` (otherwise LL is absent entirely).
+        # Implemented by scaling the LL Haar kernel — equivalent to
+        # post-conv rescaling but with no per-forward overhead. Setting
+        # ll_weight < 1.0 makes LL a softer input to the adapter so the
+        # disc weighs HF detail more heavily than luminance content.
+        self.ll_weight = float(ll_weight)
         out_bands = 3 if self.drop_ll else 4
 
         # Stack sub-band kernels; drop LL if requested.
@@ -84,7 +92,8 @@ class LatentWaveletHF(nn.Module):
             kernels = torch.stack([_HAAR_LH, _HAAR_HL, _HAAR_HH], dim=0)
         else:
             kernels = torch.stack(
-                [_HAAR_LL, _HAAR_LH, _HAAR_HL, _HAAR_HH], dim=0,
+                [_HAAR_LL * self.ll_weight, _HAAR_LH, _HAAR_HL, _HAAR_HH],
+                dim=0,
             )
         # kernels: [out_per_group, 2, 2] -> [out_per_group, 1, 2, 2]
         kernels = kernels.unsqueeze(1)

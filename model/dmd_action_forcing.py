@@ -689,6 +689,29 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_enabled = bool(
             getattr(args, "forward_noiser_enabled", False)
         )
+        # Validate ``aux_real_clean_x_source=causal_ar_gt`` has a
+        # source available. The override only fires inside the
+        # ``_strategy_can_run`` block of
+        # ``_compute_aux_teacher_loss_streaming`` (= when the forward
+        # noiser actually applied a CARN-GT) or inside the analogous
+        # ``fake_alt_apply_active`` block. With both off, clean_x
+        # silently falls back to the gaussian-renoised pure GT (the
+        # "gt" path) — a footgun for the user who thinks they're
+        # getting CARN-GT clean_x. Raise here so misconfig fails fast.
+        if self.aux_real_clean_x_source == "causal_ar_gt":
+            if not (
+                self.forward_noiser_enabled or self.fake_alt_head_enabled
+            ):
+                raise ValueError(
+                    "aux_real_clean_x_source='causal_ar_gt' requires "
+                    "either ``forward_noiser_enabled=True`` or "
+                    "``fake_alt_head_enabled=True`` (to produce the "
+                    "causal_AR_GT signal). With both off, clean_x "
+                    "would silently fall back to pure-GT — this used "
+                    "to be a silent footgun. Either enable one of "
+                    "those producers or set ``aux_real_clean_x_source"
+                    "='gt'`` explicitly."
+                )
         self.forward_noiser_hidden_dim = int(
             getattr(args, "forward_noiser_hidden_dim", 512)
         )
@@ -1243,6 +1266,23 @@ class ActionForcingDMD(SelfForcingModel):
         self.anti_collapse_loss_weight = float(
             getattr(args, "anti_collapse_loss_weight", 0.0)
         )
+        # ``anti_collapse_std_floor_ratio``: scales the GT std before
+        # the floor compare. The penalty becomes
+        # ``ReLU(s_gt * ratio - s_pred)^2`` so it only fires when the
+        # student's per-frame std drops below ``ratio * s_gt``, not
+        # all the way up to ``s_gt``. Default 0.5 → student is free
+        # to settle anywhere in ``[0.5 * s_gt, +inf]`` without the
+        # floor pulling on it. Catches dramatic gray-collapse without
+        # constantly pushing variance upward (which combined with the
+        # one-sided floor was driving exponential std growth).
+        self.anti_collapse_std_floor_ratio = float(
+            getattr(args, "anti_collapse_std_floor_ratio", 0.5)
+        )
+        if self.anti_collapse_std_floor_ratio < 0.0:
+            raise ValueError(
+                "anti_collapse_std_floor_ratio must be >= 0.0; got "
+                f"{self.anti_collapse_std_floor_ratio}"
+            )
         # Anti-collapse mean anchor. Companion to the std floor above:
         # the std-only term lets the optimizer satisfy the variance
         # floor by inflating latent magnitude, which the VAE decodes
@@ -1270,6 +1310,49 @@ class ActionForcingDMD(SelfForcingModel):
                 f"anti_collapse_mean_target must be 'zero' or 'gt'; "
                 f"got {self.anti_collapse_mean_target!r}."
             )
+        # ``anti_collapse_type``: select between the legacy std-floor
+        # penalty ("std_floor", default) and the new bidirectional
+        # log-ratio corridor + chunk-drift penalty ("std_corridor").
+        # See ``model/anti_collapse.py`` for the corridor math.
+        self.anti_collapse_type = str(
+            getattr(args, "anti_collapse_type", "std_floor")
+        ).strip().lower()
+        if self.anti_collapse_type not in ("std_floor", "std_corridor"):
+            raise ValueError(
+                "anti_collapse_type must be 'std_floor' or "
+                f"'std_corridor'; got {self.anti_collapse_type!r}."
+            )
+        # Corridor-mode weights (consulted only when
+        # ``anti_collapse_type == "std_corridor"``). Defaults match the
+        # discussion: moment=0.1 (per-frame std/RMS/mean corridor),
+        # drift=0.03 (chunk-to-chunk std-ratio drift). The corridor
+        # bounds are slightly wider than the original spec
+        # (0.85/1.15 vs 0.90/1.10) to avoid spurious early-training
+        # firing while still anchoring the steady-state distribution.
+        self.latent_moment_corridor_loss_weight = float(
+            getattr(args, "latent_moment_corridor_loss_weight", 0.1)
+        )
+        self.latent_contrast_drift_loss_weight = float(
+            getattr(args, "latent_contrast_drift_loss_weight", 0.03)
+        )
+        self.latent_moment_corridor_std_low = float(
+            getattr(args, "latent_moment_corridor_std_low", 0.85)
+        )
+        self.latent_moment_corridor_std_high = float(
+            getattr(args, "latent_moment_corridor_std_high", 1.15)
+        )
+        self.latent_moment_corridor_rms_low = float(
+            getattr(args, "latent_moment_corridor_rms_low", 0.85)
+        )
+        self.latent_moment_corridor_rms_high = float(
+            getattr(args, "latent_moment_corridor_rms_high", 1.15)
+        )
+        self.latent_moment_corridor_mean_tol_ratio = float(
+            getattr(args, "latent_moment_corridor_mean_tol_ratio", 0.05)
+        )
+        self.latent_contrast_drift_tol = float(
+            getattr(args, "latent_contrast_drift_tol", 0.02)
+        )
         # ``max_gradient_chunks``: cap on how many of the leading
         # chunks (each ``num_frame_per_block`` frames) carry gradient
         # in DMD-score and aux-teacher losses. 0 = no cap (CF default,
@@ -3105,11 +3188,7 @@ class ActionForcingDMD(SelfForcingModel):
         ``log_prefix`` (e.g. ``""`` or ``"flash_"``) disambiguates the
         log keys so wandb shows both sites' stats side-by-side.
         """
-        anti_collapse_any = (
-            self.anti_collapse_loss_weight > 0.0
-            or self.anti_collapse_mean_weight > 0.0
-        )
-        if not anti_collapse_any or gt_target is None:
+        if gt_target is None:
             return None
         gt_for_std = gt_target.to(
             dtype=original_latent.dtype,
@@ -3117,11 +3196,68 @@ class ActionForcingDMD(SelfForcingModel):
         )
         if gt_for_std.shape != original_latent.shape:
             return None
+
+        # Dispatch on ``anti_collapse_type``. ``std_floor`` keeps the
+        # legacy one-sided std-deficit (+ optional mean anchor) below.
+        # ``std_corridor`` uses the new bidirectional log-ratio
+        # corridor + chunk-drift penalty from ``model.anti_collapse``.
+        if self.anti_collapse_type == "std_corridor":
+            moment_w = float(self.latent_moment_corridor_loss_weight)
+            drift_w = float(self.latent_contrast_drift_loss_weight)
+            if moment_w <= 0.0 and drift_w <= 0.0:
+                return None
+            from model.anti_collapse import compute_std_corridor_anti_collapse
+            # The corridor helper expects fp32 inputs for stable log-
+            # ratio + reduction stats. Up-cast both tensors locally
+            # (gen path's bf16 cast stays at the caller boundary).
+            total_corridor, corridor_logs = (
+                compute_std_corridor_anti_collapse(
+                    pred_x0=original_latent.float(),
+                    gt_target=gt_for_std.float(),
+                    num_frame_per_block=int(self.num_frame_per_block),
+                    moment_weight=moment_w,
+                    drift_weight=drift_w,
+                    corridor_std_low=self.latent_moment_corridor_std_low,
+                    corridor_std_high=self.latent_moment_corridor_std_high,
+                    corridor_rms_low=self.latent_moment_corridor_rms_low,
+                    corridor_rms_high=self.latent_moment_corridor_rms_high,
+                    corridor_mean_tol_ratio=(
+                        self.latent_moment_corridor_mean_tol_ratio
+                    ),
+                    drift_tol=self.latent_contrast_drift_tol,
+                )
+            )
+            for k, v in corridor_logs.items():
+                log_dict[f"{k}_{log_prefix}"] = v
+            # Telemetry: also log pred/gt std-mean so dashboards keep
+            # the same plot keys as the std_floor path.
+            with torch.no_grad():
+                s_pred = original_latent.float().std(dim=[2, 3, 4])
+                s_gt = gt_for_std.float().std(dim=[2, 3, 4])
+                log_dict[f"anti_collapse_{log_prefix}pred_std_mean"] = (
+                    s_pred.mean()
+                )
+                log_dict[f"anti_collapse_{log_prefix}gt_std_mean"] = s_gt.mean()
+            return total_corridor.to(ref_dtype)
+
+        # ----- legacy std_floor + optional mean anchor -----
+        anti_collapse_any = (
+            self.anti_collapse_loss_weight > 0.0
+            or self.anti_collapse_mean_weight > 0.0
+        )
+        if not anti_collapse_any:
+            return None
         total: Optional[torch.Tensor] = None
         if self.anti_collapse_loss_weight > 0.0:
             s_pred = original_latent.float().std(dim=[2, 3, 4])
             s_gt = gt_for_std.float().std(dim=[2, 3, 4]).detach()
-            deficit = F.relu(s_gt - s_pred)
+            # Relaxed floor: only penalise when student std drops
+            # below ``ratio * s_gt`` (default ratio=0.5). Leaves a
+            # wider band where the floor is silent so it doesn't keep
+            # pulling variance up toward GT once the student is
+            # already in a reasonable range.
+            floor_ratio = float(self.anti_collapse_std_floor_ratio)
+            deficit = F.relu(s_gt * floor_ratio - s_pred)
             anti_collapse_loss = deficit.pow(2).mean()
             log_dict[f"anti_collapse_{log_prefix}loss_raw"] = (
                 anti_collapse_loss.detach()
@@ -3847,6 +3983,21 @@ class ActionForcingDMD(SelfForcingModel):
                 "set ``model.inference_pipeline = ActionForcingTrainingPipeline(...)``"
                 " before opening a sequence."
             )
+        # New streaming sequence = new ride / new video. Clear the
+        # WAN VAE's temporal feat_map so the first decode of this
+        # sequence doesn't inherit the previous sequence's tail as
+        # left-context (would corrupt this video's first frame).
+        # Within the same sequence, subsequent decodes (sample-video
+        # render, boundary roundtrip, perceptual loss decodes, ...)
+        # SHARE the cache so they flow smoothly through each other's
+        # left-context — no per-call init-frame brightness anomaly.
+        if (
+            hasattr(self, "vae")
+            and getattr(self, "vae", None) is not None
+            and hasattr(self.vae, "model")
+            and hasattr(self.vae.model, "clear_cache")
+        ):
+            self.vae.model.clear_cache()
         cf = int(seed_latents.shape[1])
         if cf != self.dmd_context_clean_frames:
             raise ValueError(
@@ -4984,7 +5135,14 @@ class ActionForcingDMD(SelfForcingModel):
                 ctx_latents = torch.cat(
                     [prev_chunk_for_clean, full_chunk[:, 0:1]], dim=1,
                 ).to(torch.float32)
-                pixels = self.vae.decode_to_pixel(ctx_latents)
+                # Cached-decode path: keeps the WAN VAE's temporal
+                # feat_map populated across calls so the unconditioned
+                # init-frame brightness anomaly isn't re-injected
+                # every iter (would otherwise leak into the boundary
+                # latent via the re-encode and compound across iters).
+                pixels = self.vae.decode_to_pixel(
+                    ctx_latents, use_cache=True,
+                )
                 last_frame_btchw = pixels[:, -1:, ...].to(torch.float32)
                 last_frame_bcthw = _rearrange(
                     last_frame_btchw, "b t c h w -> b c t h w",

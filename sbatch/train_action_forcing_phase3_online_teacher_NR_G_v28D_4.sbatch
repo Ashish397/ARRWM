@@ -170,8 +170,11 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_loss_weight=0.1 \
+    anti_collapse_type=std_corridor \
+    anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
+    latent_moment_corridor_loss_weight=0.1 \
+    latent_contrast_drift_loss_weight=0.03 \
     max_gradient_chunks=5 \
     run_name=action_forcing_phase3_online_teacher_NR_G_v28D_4_j${SLURM_JOB_ID}
 

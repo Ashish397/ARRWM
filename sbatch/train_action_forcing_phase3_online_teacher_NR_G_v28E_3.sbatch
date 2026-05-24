@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-3
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -104,7 +104,7 @@ srun torchrun \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
     sample_fps=20 \
-    boundary_vae_roundtrip=true \
+    boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
     dmd_context=self \
     real_teacher_train_online=true \
@@ -148,8 +148,8 @@ srun torchrun \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=0.01 \
     gan_lr=2e-5 \
-    gan_critic_warmup_steps=40 \
-    gan_disc_start_step=40 \
+    gan_critic_warmup_steps=20 \
+    gan_disc_start_step=20 \
     gan_warmup_steps=100 \
     gan_warmup_shape=quadratic \
     gan_updates_per_step=1 \
@@ -161,17 +161,16 @@ srun torchrun \
     ladd_use_prompt_cond=true \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
-    ladd_r1_gamma=1.0 \
+    ladd_r1_gamma=0.001 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=2 \
-    ladd_wavelet_hf_enabled=true \
-    ladd_wavelet_hf_drop_ll=true \
+    ladd_pairs_per_step=4 \
+    ladd_wavelet_hf_enabled=false \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=true \
-    ladd_adjacent_chunks_weight=0.5 \
+    ladd_adjacent_chunks_weight=1.0 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -179,12 +178,10 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_type=std_corridor \
-    anti_collapse_loss_weight=0.0 \
+    anti_collapse_loss_weight=1.0 \
+    anti_collapse_std_floor_ratio=0.5 \
     anti_collapse_mean_weight=0.0 \
-    latent_moment_corridor_loss_weight=0.1 \
-    latent_contrast_drift_loss_weight=0.03 \
-    max_gradient_chunks=5 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_j${SLURM_JOB_ID}
+    max_gradient_chunks=3 \
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_3_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

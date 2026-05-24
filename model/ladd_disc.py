@@ -510,6 +510,10 @@ class LADDDiscriminator(nn.Module):
         wavelet_hf_adapter_init_gain: Xavier gain for the wavelet
             adapter's weight init. Small (~0.1) keeps the projector
             in-distribution at step 0.
+        wavelet_hf_ll_weight: relative weight on the LL band when
+            ``wavelet_hf_drop_ll=False`` (default 1.0 = LL equal to
+            HF bands). Lower to soften LL's contribution if the disc
+            starts over-prioritising luminance over HF detail.
     """
 
     def __init__(
@@ -527,6 +531,7 @@ class LADDDiscriminator(nn.Module):
         wavelet_hf_in_channels: int = 16,
         wavelet_hf_drop_ll: bool = True,
         wavelet_hf_adapter_init_gain: float = 0.1,
+        wavelet_hf_ll_weight: float = 1.0,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         action_tokens_per_frame: int = 0,
     ):
@@ -550,6 +555,7 @@ class LADDDiscriminator(nn.Module):
                 in_channels=int(wavelet_hf_in_channels),
                 drop_ll=bool(wavelet_hf_drop_ll),
                 adapter_init_gain=float(wavelet_hf_adapter_init_gain),
+                ll_weight=float(wavelet_hf_ll_weight),
             )
         else:
             self.wavelet_hf = None
@@ -888,6 +894,7 @@ def build_ladd_disc(
     wavelet_hf_in_channels: int = 16,
     wavelet_hf_drop_ll: bool = True,
     wavelet_hf_adapter_init_gain: float = 0.1,
+    wavelet_hf_ll_weight: float = 1.0,
     patch_size: Tuple[int, int, int] = (1, 2, 2),
     action_tokens_per_frame: int = 0,
 ) -> LADDDiscriminator:
@@ -919,6 +926,7 @@ def build_ladd_disc(
         wavelet_hf_in_channels=wavelet_hf_in_channels,
         wavelet_hf_drop_ll=wavelet_hf_drop_ll,
         wavelet_hf_adapter_init_gain=wavelet_hf_adapter_init_gain,
+        wavelet_hf_ll_weight=wavelet_hf_ll_weight,
         patch_size=patch_size,
         action_tokens_per_frame=action_tokens_per_frame,
     )
