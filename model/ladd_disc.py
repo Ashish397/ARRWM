@@ -501,19 +501,22 @@ class LADDDiscriminator(nn.Module):
         prompt_embed_dim: input prompt embedding dim (required when
             cmap_dim>0).
         wavelet_hf_enabled: prepend a SWT-based wavelet HF stage so
-            the projector only sees high-frequency latent content
-            (WGSR-style frequency-band restriction). Default False.
+            the projector sees a wavelet-decomposed view of the input
+            (WGSR-style frequency-band conditioning). Default False.
         wavelet_hf_in_channels: input latent channel count for the
             wavelet stage (16 for Wan VAE).
         wavelet_hf_drop_ll: drop the LL band in the wavelet stage.
-            Default True (standard WGSR setting).
+            Default False — LL carries low-frequency content the disc
+            should see, downweighted via ``wavelet_hf_ll_weight``.
         wavelet_hf_adapter_init_gain: Xavier gain for the wavelet
             adapter's weight init. Small (~0.1) keeps the projector
             in-distribution at step 0.
         wavelet_hf_ll_weight: relative weight on the LL band when
-            ``wavelet_hf_drop_ll=False`` (default 1.0 = LL equal to
-            HF bands). Lower to soften LL's contribution if the disc
-            starts over-prioritising luminance over HF detail.
+            ``wavelet_hf_drop_ll=False``. Default 0.15 — LL has ~4×
+            the magnitude of HF bands on smoothed WAN latents; 0.15
+            balances all 4 bands at the adapter input. Setting this
+            too high (≥0.5) lets LL swamp the disc heads' spectral_norm
+            and causes silent NCCL hangs (per-rank ``_u`` drift).
     """
 
     def __init__(
@@ -529,9 +532,9 @@ class LADDDiscriminator(nn.Module):
         prompt_embed_dim: int = 0,
         wavelet_hf_enabled: bool = False,
         wavelet_hf_in_channels: int = 16,
-        wavelet_hf_drop_ll: bool = True,
+        wavelet_hf_drop_ll: bool = False,
         wavelet_hf_adapter_init_gain: float = 0.1,
-        wavelet_hf_ll_weight: float = 1.0,
+        wavelet_hf_ll_weight: float = 0.15,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         action_tokens_per_frame: int = 0,
     ):
@@ -892,9 +895,9 @@ def build_ladd_disc(
     prompt_embed_dim: int = 0,
     wavelet_hf_enabled: bool = False,
     wavelet_hf_in_channels: int = 16,
-    wavelet_hf_drop_ll: bool = True,
+    wavelet_hf_drop_ll: bool = False,
     wavelet_hf_adapter_init_gain: float = 0.1,
-    wavelet_hf_ll_weight: float = 1.0,
+    wavelet_hf_ll_weight: float = 0.15,
     patch_size: Tuple[int, int, int] = (1, 2, 2),
     action_tokens_per_frame: int = 0,
 ) -> LADDDiscriminator:
@@ -931,3 +934,194 @@ def build_ladd_disc(
         action_tokens_per_frame=action_tokens_per_frame,
     )
     return disc
+
+
+# ============================================================================
+# Moment-GAN discriminator (distribution-matching alternative to anti-collapse
+# MSE). Operates on per-frame std (+ optional mean / RMS) of a [B, F, C, H, W]
+# latent tensor, producing one logit per frame. Trained with the same RpGAN +
+# R1 recipe as the wavelet LADD disc; the G-side gradient pulls the student's
+# per-frame moment *distribution* toward GT's, instead of pulling per-frame
+# values to point-wise GT targets (which ``latent_std_mse_loss`` does).
+# ============================================================================
+
+
+class MomentDiscriminator(nn.Module):
+    """Distribution-matching discriminator on per-frame latent moments.
+
+    The conventional anti-collapse loss (``latent_std_mse_loss``) is a
+    *point-wise* match — for each frame, pull ``s_pred`` toward ``s_gt``.
+    That's a strong signal but disallows natural per-frame variance in
+    the student. A discriminator instead matches the *distribution* of
+    per-frame moments between real (GT) and fake (student) — the student
+    is free to find its own per-frame moments as long as the marginal
+    distribution matches.
+
+    Architecture: per-frame MLP with spectral-norm on linear layers.
+    Frames are processed independently (no temporal mixing) so the
+    disc learns a frame-level marginal decision. Input is a per-frame
+    moment vector of size ``C * n_moments``; output is one logit per
+    frame.
+
+    When ``clip_logit_enabled=True`` an auxiliary clip-level head is
+    added that pools moments over the F dimension (concat of mean
+    and stdev across frames -> ``2 * C * n_moments`` features) and
+    emits ONE scalar logit per sample, concatenated onto the per-frame
+    logits to give a ``[B, F+1]`` output. This captures scene-level
+    statistics (e.g. "bright clip vs dark clip" std distributions)
+    that per-frame independence by itself cannot reach. RpGAN softplus
+    mean is elementwise so the extra logit per sample blends in
+    cleanly with the per-frame logits — no separate weighting.
+
+    Args:
+        in_channels: latent channel count C (16 for Wan VAE).
+        hidden_dim: MLP hidden dim. Default 128.
+        num_blocks: number of (Linear+LeakyReLU) blocks in the trunk.
+            Default 2 (i.e. 3 linears total counting the final logit head).
+        include_mean: include per-frame mean as an input moment.
+        include_rms: include per-frame RMS as an input moment.
+        clip_logit_enabled: when True, append a clip-level logit head
+            that sees pooled (mean + stdev across F) per-clip moments
+            and produces one extra logit per sample. Forward returns
+            ``[B, F+1]`` instead of ``[B, F]``.
+        clip_hidden_dim: hidden dim for the clip-level head. Default
+            128 (same as ``hidden_dim``). Only consulted when
+            ``clip_logit_enabled=True``.
+
+    Input/output shapes:
+        forward: ``[B, F, C, H, W]`` -> ``[B, F]`` (or ``[B, F+1]``
+            when ``clip_logit_enabled=True``).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 16,
+        hidden_dim: int = 128,
+        num_blocks: int = 2,
+        include_mean: bool = True,
+        include_rms: bool = True,
+        clip_logit_enabled: bool = False,
+        clip_hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.num_blocks = max(1, int(num_blocks))
+        self.include_mean = bool(include_mean)
+        self.include_rms = bool(include_rms)
+        self.clip_logit_enabled = bool(clip_logit_enabled)
+        self.clip_hidden_dim = int(clip_hidden_dim)
+
+        n_moments = 1 + int(self.include_mean) + int(self.include_rms)
+        self._n_moments = int(n_moments)
+        in_dim = self.in_channels * n_moments
+
+        layers: List[nn.Module] = []
+        prev = in_dim
+        for _ in range(self.num_blocks):
+            layers.append(spectral_norm(nn.Linear(prev, self.hidden_dim)))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            prev = self.hidden_dim
+        layers.append(spectral_norm(nn.Linear(prev, 1)))
+        self.mlp = nn.Sequential(*layers)
+
+        # Clip-level head: input is (mean over F) ++ (stdev over F) of
+        # per-frame moment vectors. Stdev-across-F captures temporal
+        # spread within a clip (e.g. flicker), mean-across-F captures
+        # the clip's central moment magnitude. Together: enough signal
+        # for the head to distinguish bright/static-std clips from
+        # dynamic/dim ones.
+        if self.clip_logit_enabled:
+            clip_in_dim = 2 * in_dim
+            clip_layers: List[nn.Module] = []
+            prev_c = clip_in_dim
+            for _ in range(self.num_blocks):
+                clip_layers.append(
+                    spectral_norm(nn.Linear(prev_c, self.clip_hidden_dim))
+                )
+                clip_layers.append(nn.LeakyReLU(0.2, inplace=True))
+                prev_c = self.clip_hidden_dim
+            clip_layers.append(
+                spectral_norm(nn.Linear(prev_c, 1))
+            )
+            self.clip_mlp = nn.Sequential(*clip_layers)
+        else:
+            self.clip_mlp = None
+
+    @staticmethod
+    def extract_moments(
+        x: torch.Tensor,
+        include_mean: bool,
+        include_rms: bool,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Per-frame moments from ``[B, F, C, H, W]`` -> ``[B, F, C*k]``.
+
+        Differentiable w.r.t. ``x`` through the std/mean/RMS reductions,
+        so the gen-side gradient back-propagates from logits to every
+        pixel of the input latent. ``unbiased=False`` matches the
+        standard moment convention used elsewhere in ``anti_collapse``.
+        """
+        reduce_dims = [3, 4]
+        s = x.std(dim=reduce_dims, unbiased=False)  # [B, F, C]
+        parts = [s]
+        if include_mean:
+            parts.append(x.mean(dim=reduce_dims))  # [B, F, C]
+        if include_rms:
+            rms = torch.sqrt((x ** 2).mean(dim=reduce_dims) + eps)
+            parts.append(rms)
+        return torch.cat(parts, dim=-1)  # [B, F, C * n_moments]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(
+                f"MomentDiscriminator expects [B, F, C, H, W]; got "
+                f"{tuple(x.shape)}"
+            )
+        moments = self.extract_moments(
+            x, self.include_mean, self.include_rms,
+        )  # [B, F, C*k]
+        B, F_, D = moments.shape
+        # Match MLP weight dtype (the disc lives in fp32 for R1 stability;
+        # ``pred_image`` may arrive as bf16 from the student forward).
+        in_dtype = self.mlp[0].weight.dtype
+        moments_cast = moments.to(in_dtype)
+        flat = moments_cast.reshape(B * F_, -1)
+        per_frame_logits = self.mlp(flat).reshape(B, F_)
+        if self.clip_mlp is None:
+            return per_frame_logits
+        # Clip-level: pool moments over F via (mean, stdev) — the
+        # stdev term gives the head a flicker / temporal-spread signal
+        # that the per-frame head cannot see by construction. F may be
+        # 1 (single-frame chunks) — in that case stdev is zero, which
+        # is benign (the head simply gets less signal that step).
+        clip_mean = moments_cast.mean(dim=1)
+        if F_ > 1:
+            clip_std = moments_cast.std(dim=1, unbiased=False)
+        else:
+            clip_std = torch.zeros_like(clip_mean)
+        clip_feat = torch.cat([clip_mean, clip_std], dim=1)  # [B, 2D]
+        clip_logit = self.clip_mlp(clip_feat).reshape(B, 1)  # [B, 1]
+        return torch.cat([per_frame_logits, clip_logit], dim=1)  # [B, F+1]
+
+
+def build_moment_disc(
+    in_channels: int = 16,
+    hidden_dim: int = 128,
+    num_blocks: int = 2,
+    include_mean: bool = True,
+    include_rms: bool = True,
+    clip_logit_enabled: bool = False,
+    clip_hidden_dim: int = 128,
+) -> MomentDiscriminator:
+    """Builder for ``MomentDiscriminator``. Mirrors ``build_ladd_disc``'s
+    pattern so the trainer can pick one or the other (or both)."""
+    return MomentDiscriminator(
+        in_channels=in_channels,
+        hidden_dim=hidden_dim,
+        num_blocks=num_blocks,
+        include_mean=include_mean,
+        include_rms=include_rms,
+        clip_logit_enabled=clip_logit_enabled,
+        clip_hidden_dim=clip_hidden_dim,
+    )

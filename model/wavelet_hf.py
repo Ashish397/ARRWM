@@ -3,10 +3,14 @@
 Implements WGSR's "disc sees only HF" principle in latent space.
 Single-level Haar Stationary Wavelet Transform (SWT) preserves spatial
 resolution: each of the 16 latent channels produces 4 same-size sub-
-bands (LL, LH, HL, HH). We drop LL by default and feed [LH, HL, HH]
-(= 48 channels) to a small learned 1x1 conv adapter that re-maps back
-to 16 channels at full resolution so the downstream WAN-teacher
-projector sees an in-distribution shape.
+bands (LL, LH, HL, HH). By default we keep ALL four bands with the
+LL band downweighted by ``ll_weight=0.15`` (empirically the LL/HF
+magnitude ratio on smoothed WAN latents is ~4×; 0.15 brings LL into
+the same range as HF). The combined 64 channels feed a small learned
+1x1 conv adapter that re-maps back to 16 channels at full resolution
+so the downstream WAN-teacher projector sees an in-distribution shape.
+Set ``drop_ll=true`` to discard LL entirely (legacy WGSR setting,
+HF-only disc).
 
 Why SWT (not DWT): DWT decimates by 2 so sub-bands are H/2 x W/2.
 That's OOD for the projector and halves the token count visible to
@@ -56,13 +60,24 @@ class LatentWaveletHF(nn.Module):
 
     Args:
         in_channels: number of input latent channels (16 for Wan VAE).
-        drop_ll: when True (default), the LL sub-band is dropped so
-            the disc only sees the 3 HF sub-bands (LH, HL, HH) per
-            channel. Set False to keep all 4 (mostly diagnostic).
+        drop_ll: when True, the LL sub-band is dropped and the disc
+            only sees the 3 HF sub-bands (LH, HL, HH) per channel.
+            Default False — LL carries low-frequency content the disc
+            should see, downweighted via ``ll_weight``.
         adapter_init_gain: Xavier-uniform gain for the adapter's
             weight init. Small (default 0.1) so the projector sees
-            roughly-zero HF for the first few steps; the adapter
-            learns to amplify HF channels over training.
+            roughly-zero output for the first few steps; the adapter
+            learns to amplify informative channels over training.
+        ll_weight: relative weight on the LL band when ``drop_ll=False``.
+            Default 0.15 — LL has roughly 4× the magnitude of the HF
+            bands on smoothed WAN latents; weighting by 0.15 brings LL
+            into the same range as HF so the adapter input is balanced
+            across the 4 bands. Higher values (≥0.5) make LL dominate
+            the adapter, which empirically pushes the disc's
+            spectral_norm power-iter estimate into oscillation (per-rank
+            ``_u`` buffers drift since DDP doesn't broadcast them) and
+            silently hangs the next collective. Keep ≤ 0.3 unless you
+            know what you're doing.
 
     Input/output shape: ``[B, F, C, H, W]`` -> ``[B, F, C, H, W]``.
     Spatial resolution is preserved.
@@ -71,9 +86,9 @@ class LatentWaveletHF(nn.Module):
     def __init__(
         self,
         in_channels: int = 16,
-        drop_ll: bool = True,
+        drop_ll: bool = False,
         adapter_init_gain: float = 0.1,
-        ll_weight: float = 1.0,
+        ll_weight: float = 0.15,
     ):
         super().__init__()
         self.in_channels = int(in_channels)

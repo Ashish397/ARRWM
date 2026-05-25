@@ -1459,6 +1459,31 @@ class RollingStaircaseDMDTrainer:
             state["ema_start_step"] = self.ema_start_step
         torch.save(state, path)
         logging.info("Saved checkpoint: %s", path)
+        # Retention: by default keep only the most-recent checkpoint to
+        # avoid eating disk (each phase1_step*.pt is multi-GB and the
+        # default 30-step cadence accumulates them fast). Configurable
+        # via ``keep_last_n_checkpoints`` (default 1). Set to a larger
+        # value to keep a rolling window; set to 0 to disable pruning
+        # entirely (keep all). Runs on rank-0 only since the save is
+        # rank-0 only.
+        keep_last = int(getattr(self.config, "keep_last_n_checkpoints", 1))
+        if keep_last > 0:
+            existing = sorted(self.log_dir.glob("phase1_step*.pt"))
+            # Exclude the just-saved file so we never delete it (e.g. if
+            # ``path`` rounds to the same name on resume). The sort is
+            # by filename which encodes step zero-padded -> chronological.
+            stale = [p for p in existing if p.resolve() != path.resolve()]
+            # Keep the (keep_last - 1) newest stale entries (so total
+            # retained including current = keep_last).
+            to_delete = stale[: max(0, len(stale) - (keep_last - 1))]
+            for p in to_delete:
+                try:
+                    p.unlink()
+                    logging.info("Pruned old checkpoint: %s", p)
+                except OSError as exc:
+                    logging.warning(
+                        "Failed to prune old checkpoint %s: %s", p, exc,
+                    )
 
     def _maybe_resume(self) -> None:
         if not bool(getattr(self.config, "auto_resume", False)):

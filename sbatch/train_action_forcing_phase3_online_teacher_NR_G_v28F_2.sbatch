@@ -1,35 +1,37 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-5
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28F-2
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28D: v28C + adjacent-chunk loss.
+# Phase-3 online_teacher_NR_G_v28F-2: v28F-1 + hybrid clip-level logit.
 #
-# v28D vs v28C — knob deltas
-# --------------------------
-#   ladd_adjacent_chunks_enabled    false -> true
-#   ladd_adjacent_chunks_weight     0.0   -> 0.5
-#       (Softer than gt_vs_fake's 1.0 since adjacent is a weaker
-#       distributional signal — chunk_i and chunk_{i+1} are close
-#       by construction. A 2:1 gt:adjacent ratio keeps the GT
-#       anchor dominant while letting adjacent provide a temporal-
-#       consistency push.)
+# v28F-2 vs v28F-1 — knob deltas
+# ------------------------------
+#   moment_gan_clip_logit_enabled false -> true
+#   moment_gan_clip_hidden_dim    n/a   -> 128
 #
-# Otherwise identical to v28A. Same wavelet HF disc input, same
-# online DMD, same aux-teacher LoRA, no forward noiser, no MANIQA,
-# no alt-head.
+# Why: address the per-frame-independence limitation of v28F-1. The
+# MomentDiscriminator now adds an auxiliary clip-level head that pools
+# moments over F (concat of mean + stdev across frames -> [B, 2*C*k]),
+# then a small MLP -> [B, 1] clip logit, concatenated onto the
+# per-frame logits -> [B, F+1]. RpGAN softplus mean is elementwise so
+# the clip logit blends in with the per-frame ones at the same weight.
 #
-# Two D updates per gen step (one per pair mode); both gen-side
-# losses sum into the generator's total. Disc weights are SHARED —
-# the same disc learns to score both pair distributions.
+# The clip head captures scene-level statistics — e.g. "bright clips
+# tend to have higher per-frame std" or "static scenes have low
+# temporal std-of-std" — that the per-frame-only v28F-1 cannot reach
+# by construction. Disc params: 23K -> 52K (still <<1% of the wavelet
+# LADD disc's 5.9M).
+#
+# Otherwise identical to v28F-1 (same warmup, weights, R1 schedule).
 # =====================================================================
 
 set -e -o pipefail
@@ -37,7 +39,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28D
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28F
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -65,12 +67,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28D (v28C + adjacent-chunk) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v28F-2 (v28F-1 + clip-level logit) on $(date)"
 echo "  * GAN: LADD teacher-feature, wavelet HF input."
-echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
-echo "  * DMD: online, anti-collapse on, no forward noiser."
+echo "  * Moment-GAN: enabled, lw=0.01, std+mean+RMS, clip-logit ON, warmup 20+100."
+echo "  * anti_collapse: std_mse, reduced lw=0.3 (moment-GAN takes over)."
+echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=1.0)."
+echo "  * DMD: online, forward noiser ON, alt-head ON."
 echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -80,6 +83,16 @@ echo "Nodes: $SLURM_NNODES"
 echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
+
+# Clear stale NCCL/CUDA shm segments left by prior killed jobs on each node.
+# Only removes files we own — cannot affect other tenants' live segments.
+srun --ntasks-per-node=1 bash -c '
+  echo "=== $(hostname) /dev/shm before cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+  rm -f /dev/shm/nccl-* /dev/shm/cuda.* /dev/shm/sem.nccl-* 2>/dev/null || true
+  echo "=== $(hostname) /dev/shm after cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+' || true
 
 srun torchrun \
   --nnodes=$SLURM_NNODES \
@@ -173,6 +186,20 @@ srun torchrun \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=true \
     ladd_adjacent_chunks_weight=1.0 \
+    moment_gan_enabled=true \
+    moment_gan_loss_weight=0.01 \
+    moment_gan_lr=2e-5 \
+    moment_gan_r1_gamma=0.01 \
+    moment_gan_r1_every_n_steps=10 \
+    moment_gan_disc_start_step=20 \
+    moment_gan_critic_warmup_steps=20 \
+    moment_gan_warmup_steps=100 \
+    moment_gan_hidden_dim=128 \
+    moment_gan_num_blocks=2 \
+    moment_gan_include_mean=true \
+    moment_gan_include_rms=true \
+    moment_gan_clip_logit_enabled=true \
+    moment_gan_clip_hidden_dim=128 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -181,9 +208,9 @@ srun torchrun \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
     anti_collapse_type=std_mse \
-    anti_collapse_loss_weight=0.5 \
+    anti_collapse_loss_weight=0.3 \
     anti_collapse_mean_weight=0.0 \
-    max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_5_j${SLURM_JOB_ID}
+    max_gradient_chunks=3 \
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28F_2_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

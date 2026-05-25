@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-5
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28F-1
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,25 +11,35 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28D: v28C + adjacent-chunk loss.
+# Phase-3 online_teacher_NR_G_v28F-1: v28E-4 + Moment-GAN.
 #
-# v28D vs v28C — knob deltas
-# --------------------------
-#   ladd_adjacent_chunks_enabled    false -> true
-#   ladd_adjacent_chunks_weight     0.0   -> 0.5
-#       (Softer than gt_vs_fake's 1.0 since adjacent is a weaker
-#       distributional signal — chunk_i and chunk_{i+1} are close
-#       by construction. A 2:1 gt:adjacent ratio keeps the GT
-#       anchor dominant while letting adjacent provide a temporal-
-#       consistency push.)
+# v28F-1 vs v28E-4 — knob deltas
+# ------------------------------
+#   moment_gan_enabled            false -> true
+#   moment_gan_loss_weight        n/a   -> 0.01     (matches gan_loss_weight)
+#   moment_gan_lr                 n/a   -> 2e-5     (matches gan_lr)
+#   moment_gan_r1_gamma           n/a   -> 0.01     (small disc => small γ)
+#   moment_gan_r1_every_n_steps   n/a   -> 10
+#   moment_gan_disc_start_step    n/a   -> 20       (matches gan_disc_start_step)
+#   moment_gan_critic_warmup_steps n/a  -> 20
+#   moment_gan_warmup_steps       n/a   -> 100
+#   moment_gan_include_mean       n/a   -> true
+#   moment_gan_include_rms        n/a   -> true
 #
-# Otherwise identical to v28A. Same wavelet HF disc input, same
-# online DMD, same aux-teacher LoRA, no forward noiser, no MANIQA,
-# no alt-head.
+#   anti_collapse_loss_weight     1.0   -> 0.3
+#       (Soft-keep the MSE std-floor as an early-training safety net
+#       while the moment-GAN trains its disc. Once gen_warmup ends
+#       (step 120), the moment-GAN should be the dominant std signal.)
 #
-# Two D updates per gen step (one per pair mode); both gen-side
-# losses sum into the generator's total. Disc weights are SHARED —
-# the same disc learns to score both pair distributions.
+# Why: replace point-wise std MSE with distribution-matching GAN on
+# per-frame moments (std + mean + RMS). The moment-disc is a 23K-param
+# MLP (spectral_norm + RpGAN softplus + FD-R1), trained on the same
+# schedule conventions as the main wavelet LADD disc. Backprops a
+# per-frame logit gradient via std/mean/RMS reductions to every pixel
+# of pred_image, so the student learns to match GT's marginal moment
+# *distribution* rather than its per-frame std *values*.
+#
+# Otherwise identical to v28E-4.
 # =====================================================================
 
 set -e -o pipefail
@@ -37,7 +47,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28D
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28F
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -65,12 +75,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28D (v28C + adjacent-chunk) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v28F-1 (v28E-4 + Moment-GAN) on $(date)"
 echo "  * GAN: LADD teacher-feature, wavelet HF input."
-echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
-echo "  * DMD: online, anti-collapse on, no forward noiser."
+echo "  * Moment-GAN: enabled, lw=0.01, std+mean+RMS, warmup 20+100."
+echo "  * anti_collapse: std_mse, reduced lw=0.3 (moment-GAN takes over)."
+echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=1.0)."
+echo "  * DMD: online, forward noiser ON, alt-head ON."
 echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -80,6 +91,16 @@ echo "Nodes: $SLURM_NNODES"
 echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
+
+# Clear stale NCCL/CUDA shm segments left by prior killed jobs on each node.
+# Only removes files we own — cannot affect other tenants' live segments.
+srun --ntasks-per-node=1 bash -c '
+  echo "=== $(hostname) /dev/shm before cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+  rm -f /dev/shm/nccl-* /dev/shm/cuda.* /dev/shm/sem.nccl-* 2>/dev/null || true
+  echo "=== $(hostname) /dev/shm after cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+' || true
 
 srun torchrun \
   --nnodes=$SLURM_NNODES \
@@ -157,7 +178,7 @@ srun torchrun \
     gan_max_grad_norm=10.0 \
     ladd_proj_dim=256 \
     ladd_use_csm=true \
-    ladd_use_lateral_proj=false \
+    ladd_use_lateral_proj=true \
     ladd_use_prompt_cond=true \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
@@ -173,6 +194,18 @@ srun torchrun \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=true \
     ladd_adjacent_chunks_weight=1.0 \
+    moment_gan_enabled=true \
+    moment_gan_loss_weight=0.01 \
+    moment_gan_lr=2e-5 \
+    moment_gan_r1_gamma=0.01 \
+    moment_gan_r1_every_n_steps=10 \
+    moment_gan_disc_start_step=20 \
+    moment_gan_critic_warmup_steps=20 \
+    moment_gan_warmup_steps=100 \
+    moment_gan_hidden_dim=128 \
+    moment_gan_num_blocks=2 \
+    moment_gan_include_mean=true \
+    moment_gan_include_rms=true \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -181,9 +214,9 @@ srun torchrun \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
     anti_collapse_type=std_mse \
-    anti_collapse_loss_weight=0.5 \
+    anti_collapse_loss_weight=0.3 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_5_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28F_1_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

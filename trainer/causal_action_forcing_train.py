@@ -951,7 +951,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         getattr(
                             self.config,
                             "ladd_wavelet_hf_drop_ll",
-                            True,
+                            False,
                         )
                     ),
                     wavelet_hf_adapter_init_gain=float(
@@ -965,7 +965,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         getattr(
                             self.config,
                             "ladd_wavelet_hf_ll_weight",
-                            1.0,
+                            0.15,
                         )
                     ),
                     patch_size=_patch_size,
@@ -1018,6 +1018,76 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # Force-set the gan_sam2_distilled_critic flag false
                 # so the SAM2-only distillation path doesn't fire.
                 self.gan_sam2_distilled_critic = False
+
+
+        # ------------------------------------------------------------------
+        # Moment-GAN — distribution-matching alternative to the std-MSE
+        # anti-collapse loss. Trained independently of the main wavelet
+        # LADD disc (own optimizer, own warmup schedule) but uses the same
+        # R3GAN softplus + FD-R1 recipe. See model/ladd_disc.py for the
+        # MomentDiscriminator architecture. Built in fp32 for R1 stability.
+        # ------------------------------------------------------------------
+        self.moment_disc: Optional[torch.nn.Module] = None
+        self.moment_disc_ddp: Optional[DDP] = None
+        self.moment_disc_optimizer: Optional[torch.optim.Optimizer] = None
+        self.moment_gan_enabled = bool(
+            getattr(self.config, "moment_gan_enabled", False)
+        )
+        if self.moment_gan_enabled:
+            from model.ladd_disc import build_moment_disc
+            mdisc = build_moment_disc(
+                in_channels=int(
+                    getattr(self.config, "moment_gan_in_channels", 16)
+                ),
+                hidden_dim=int(
+                    getattr(self.config, "moment_gan_hidden_dim", 128)
+                ),
+                num_blocks=int(
+                    getattr(self.config, "moment_gan_num_blocks", 2)
+                ),
+                include_mean=bool(
+                    getattr(self.config, "moment_gan_include_mean", True)
+                ),
+                include_rms=bool(
+                    getattr(self.config, "moment_gan_include_rms", True)
+                ),
+                clip_logit_enabled=bool(
+                    getattr(
+                        self.config,
+                        "moment_gan_clip_logit_enabled",
+                        False,
+                    )
+                ),
+                clip_hidden_dim=int(
+                    getattr(
+                        self.config,
+                        "moment_gan_clip_hidden_dim",
+                        128,
+                    )
+                ),
+            )
+            mdisc.to(device=self.device, dtype=torch.float32)
+            mdisc.train()
+            self.moment_disc = mdisc
+            if self.world_size > 1:
+                self.moment_disc_ddp = DDP(
+                    mdisc,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=False,
+                    broadcast_buffers=False,
+                )
+            if self.is_main_process:
+                n_total = sum(p.numel() for p in mdisc.parameters())
+                logging.info(
+                    "[ActionForcing] MomentDiscriminator built: "
+                    "in_ch=%d hidden=%d blocks=%d include_mean=%s "
+                    "include_rms=%s clip_logit=%s params=%.2fK (DDP=%s)",
+                    mdisc.in_channels, mdisc.hidden_dim, mdisc.num_blocks,
+                    mdisc.include_mean, mdisc.include_rms,
+                    mdisc.clip_logit_enabled,
+                    n_total / 1e3, self.moment_disc_ddp is not None,
+                )
 
 
         # ===== Dense perceptual approximators (independent of GAN) =====
@@ -1627,6 +1697,74 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.gan_loss_weight, self.gan_r1_gamma,
                     self.gan_r2_gamma, self.gan_warmup_steps,
                     self.gan_updates_per_step,
+                )
+
+        # Moment-GAN hyperparams + optimizer. Independent of the main
+        # GAN/wavelet disc — has its own loss weight, lr, warmup
+        # schedule and R1 cadence. All knobs default to safe values
+        # that mirror the wavelet LADD disc's defaults so the moment
+        # disc engages on a similar timeline.
+        self.moment_gan_loss_weight = float(
+            getattr(cfg, "moment_gan_loss_weight", 0.01)
+        )
+        self.moment_gan_r1_gamma = float(
+            getattr(cfg, "moment_gan_r1_gamma", 0.01)
+        )
+        self.moment_gan_r1_every_n_steps = max(
+            1, int(getattr(cfg, "moment_gan_r1_every_n_steps", 10))
+        )
+        self.moment_gan_r1_sigma = float(
+            getattr(cfg, "moment_gan_r1_sigma", 0.01)
+        )
+        self.moment_gan_disc_start_step = int(
+            getattr(cfg, "moment_gan_disc_start_step", 20)
+        )
+        self.moment_gan_critic_warmup_steps = int(
+            getattr(cfg, "moment_gan_critic_warmup_steps", 20)
+        )
+        self.moment_gan_warmup_steps = int(
+            getattr(cfg, "moment_gan_warmup_steps", 100)
+        )
+        self.moment_gan_updates_per_step = int(
+            getattr(cfg, "moment_gan_updates_per_step", 1)
+        )
+        self.moment_gan_max_grad_norm = float(
+            getattr(cfg, "moment_gan_max_grad_norm", self.max_grad_norm)
+        )
+        if self.moment_gan_enabled and self.moment_disc is not None:
+            mdisc_lr = float(getattr(cfg, "moment_gan_lr", 2e-5))
+            mdisc_betas = tuple(
+                getattr(cfg, "moment_gan_betas", [0.0, 0.9])
+            )
+            mdisc_eps = float(getattr(cfg, "moment_gan_eps", 1e-8))
+            mdisc_wd = float(getattr(cfg, "moment_gan_weight_decay", 0.0))
+            mdisc_params = [
+                p for p in self.moment_disc.parameters() if p.requires_grad
+            ]
+            if not mdisc_params:
+                raise RuntimeError(
+                    "moment_disc has no trainable parameters; check the "
+                    "MomentDiscriminator constructor."
+                )
+            self.moment_disc_optimizer = torch.optim.AdamW(
+                mdisc_params,
+                lr=mdisc_lr,
+                betas=mdisc_betas,
+                eps=mdisc_eps,
+                weight_decay=mdisc_wd,
+            )
+            if self.is_main_process:
+                n_params = sum(p.numel() for p in mdisc_params)
+                logging.info(
+                    "[ActionForcing] MomentGAN optimizer built: AdamW "
+                    "lr=%.2e betas=%s wd=%.4f params=%.2fK "
+                    "(loss_weight=%.4f, R1_gamma=%.4f, warmup_steps=%d, "
+                    "critic_warmup=%d, disc_start=%d)",
+                    mdisc_lr, mdisc_betas, mdisc_wd, n_params / 1e3,
+                    self.moment_gan_loss_weight, self.moment_gan_r1_gamma,
+                    self.moment_gan_warmup_steps,
+                    self.moment_gan_critic_warmup_steps,
+                    self.moment_gan_disc_start_step,
                 )
 
         # Distilled-critic config + optimizer (only when the disc was
@@ -2841,6 +2979,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if self.r3gan_optimizer is not None:
                 state["r3gan_optimizer"] = self.r3gan_optimizer.state_dict()
                 appended.append("r3gan_optimizer")
+        if self.moment_gan_enabled and self.moment_disc is not None:
+            md_module = (
+                self.moment_disc_ddp.module
+                if self.moment_disc_ddp is not None
+                else self.moment_disc
+            )
+            state["moment_discriminator"] = md_module.state_dict()
+            appended.append("moment_discriminator")
+            if self.moment_disc_optimizer is not None:
+                state["moment_disc_optimizer"] = (
+                    self.moment_disc_optimizer.state_dict()
+                )
+                appended.append("moment_disc_optimizer")
         if self.real_teacher_train_online:
             # FAIL-LOUD on save: silently dropping the LoRA state from
             # the checkpoint pairs with the resume path's silent
@@ -2980,6 +3131,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         logging.warning(
                             "resume: r3gan_optimizer load failed: %s. "
                             "Starting r3gan optim from fresh state.", exc,
+                        )
+        if self.moment_gan_enabled and self.moment_disc is not None:
+            md_module = (
+                self.moment_disc_ddp.module
+                if self.moment_disc_ddp is not None
+                else self.moment_disc
+            )
+            if "moment_discriminator" in state:
+                md_missing, md_unexpected = md_module.load_state_dict(
+                    state["moment_discriminator"], strict=False,
+                )
+                if self.is_main_process:
+                    logging.info(
+                        "resume: moment_discriminator missing=%d unexpected=%d",
+                        len(md_missing), len(md_unexpected),
+                    )
+            if (
+                self.moment_disc_optimizer is not None
+                and "moment_disc_optimizer" in state
+            ):
+                try:
+                    self.moment_disc_optimizer.load_state_dict(
+                        state["moment_disc_optimizer"]
+                    )
+                    if self.is_main_process:
+                        logging.info(
+                            "resume: moment_disc_optimizer state restored"
+                        )
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: moment_disc_optimizer load failed: %s. "
+                            "Starting moment_disc optim from fresh state.",
+                            exc,
                         )
         if self.real_teacher_train_online:
             # FAIL-LOUD on resume: silently rolling the LoRA back to
@@ -5199,6 +5384,199 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # Supports two pair construction modes, independently toggleable:
     #   * "gt_vs_fake" (LADD canonical): real = GT chunks at the same
     #     temporal positions as the gen output. Standard adversarial
+    def _compute_moment_gan_losses(
+        self,
+        pred_image: torch.Tensor,
+        gt_latents_window: torch.Tensor,
+        current_step: int,
+    ) -> tuple:
+        """Distribution-matching GAN on per-frame latent moments.
+
+        Trains a tiny MLP discriminator (``self.moment_disc``) to tell
+        GT per-frame moment vectors apart from the student's, then
+        backprops the symmetric RpGAN gen loss into ``pred_image``.
+
+        The semantic shift vs ``latent_std_mse_loss``: that loss pulls
+        ``s_pred`` toward ``s_gt`` *per frame* (point-wise match); this
+        loss pulls the student's *distribution* of per-frame moments
+        toward GT's, leaving room for natural per-frame variation. See
+        ``model.ladd_disc.MomentDiscriminator`` for the architecture.
+
+        Mirrors ``_ladd_run_pair_mode``'s recipe: combined real+fake
+        D-update forward, FD-R1 calibrated to the autograd magnitude
+        (``0.5 · γ · ‖∇_x Σ_i D_i‖²``), gen-side forward in disc.eval()
+        to silence spectral_norm power-iter mutation.
+
+        Returns ``(generator_gan_loss, logs)``. ``generator_gan_loss``
+        is graph-attached through ``pred_image``.
+        """
+        device = pred_image.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        if (
+            not self.moment_gan_enabled
+            or self.moment_disc is None
+        ):
+            return zero, {}
+
+        # Shape parity is assumed downstream — both sides feed the same
+        # disc forward and pair their logits 1-to-1. A mismatched
+        # window slice would fail deep inside ``extract_moments`` with
+        # a confusing reshape error; fail loud at the boundary instead.
+        if pred_image.shape != gt_latents_window.shape:
+            raise ValueError(
+                "_compute_moment_gan_losses: pred_image and "
+                "gt_latents_window must have identical shapes; got "
+                f"pred_image={tuple(pred_image.shape)} vs "
+                f"gt_latents_window={tuple(gt_latents_window.shape)}."
+            )
+
+        fake_grad = pred_image.to(torch.float32)
+        fake_det = fake_grad.detach()
+        real_det = gt_latents_window.detach().to(torch.float32)
+
+        disc_for_update = (
+            self.moment_disc_ddp
+            if self.moment_disc_ddp is not None
+            else self.moment_disc
+        )
+        disc_for_guidance = self.moment_disc
+
+        # ----- D-update -----
+        disc_skipped = (
+            current_step < int(self.moment_gan_disc_start_step)
+        )
+        last_d_loss = 0.0
+        last_d_real = 0.0
+        last_d_fake = 0.0
+        last_r1 = 0.0
+        last_r1_grad_sq = float("nan")
+        last_r1_fired = 0.0
+        if not disc_skipped and self.moment_disc_optimizer is not None:
+            for _ in range(int(self.moment_gan_updates_per_step)):
+                self.moment_disc_optimizer.zero_grad(set_to_none=True)
+                _do_r1 = (
+                    current_step % self.moment_gan_r1_every_n_steps == 0
+                )
+                B_d = real_det.shape[0]
+                if _do_r1:
+                    # FD-R1: perturb real only, batch [real, fake,
+                    # real_perturbed] through a single disc forward.
+                    sigma = float(self.moment_gan_r1_sigma)
+                    real_part = real_det.detach()
+                    fake_part = fake_det.detach()
+                    eps_real = sigma * torch.randn_like(real_part)
+                    real_perturbed = real_part + eps_real
+                    combined = torch.cat(
+                        [real_part, fake_part, real_perturbed], dim=0,
+                    ).requires_grad_(False)
+                    logits = disc_for_update(combined)
+                    d_real = logits[:B_d]
+                    d_fake = logits[B_d:2 * B_d]
+                    d_real_pert = logits[2 * B_d:]
+                    # Match the LADD FD-R1 calibration: sum the per-token
+                    # logits per sample BEFORE FD so the penalty
+                    # magnitude tracks ``‖∇_x Σ_i D_i‖²`` (same as
+                    # autograd). Here per-frame logits are [B, F]; sum
+                    # over F to get one scalar per sample.
+                    d_real_sum = d_real.sum(dim=1)
+                    d_real_pert_sum = d_real_pert.sum(dim=1)
+                    r1_grad_fd = (d_real_pert_sum - d_real_sum) / sigma
+                    _r1_grad_sq_raw = r1_grad_fd.pow(2).mean()
+                    r1 = 0.5 * self.moment_gan_r1_gamma * _r1_grad_sq_raw
+                    last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
+                    last_r1_fired = 1.0
+                else:
+                    combined = torch.cat([real_det, fake_det], dim=0)
+                    logits = disc_for_update(combined)
+                    d_real = logits[:B_d]
+                    d_fake = logits[B_d:]
+                    # Graph-connected zero so backward is safe.
+                    r1 = logits.sum() * 0.0
+                d_rp = rpgan_d_loss(d_real, d_fake)
+                d_total = d_rp + r1
+                d_total.backward()
+                if (
+                    self.moment_gan_max_grad_norm
+                    and self.moment_gan_max_grad_norm > 0
+                ):
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.moment_disc.parameters()
+                         if p.grad is not None],
+                        self.moment_gan_max_grad_norm,
+                    )
+                self.moment_disc_optimizer.step()
+                last_d_loss = float(d_rp.detach().item())
+                last_d_real = float(d_real.detach().mean().item())
+                last_d_fake = float(d_fake.detach().mean().item())
+                last_r1 = float(r1.detach().item())
+
+        # ----- Gen-side -----
+        critic_warmup_done = (
+            current_step >= int(self.moment_gan_critic_warmup_steps)
+        )
+        if (
+            self.moment_gan_warmup_steps > 0
+            and current_step < (
+                self.moment_gan_critic_warmup_steps
+                + self.moment_gan_warmup_steps
+            )
+            and current_step >= self.moment_gan_critic_warmup_steps
+        ):
+            ramp_steps_in = current_step - self.moment_gan_critic_warmup_steps
+            t_norm = ramp_steps_in / max(1, self.moment_gan_warmup_steps)
+            ramp = self._gan_warmup_shape_apply(t_norm)
+            gen_gan_weight = ramp * self.moment_gan_loss_weight
+        elif current_step >= (
+            self.moment_gan_critic_warmup_steps
+            + self.moment_gan_warmup_steps
+        ):
+            gen_gan_weight = self.moment_gan_loss_weight
+        else:
+            gen_gan_weight = 0.0
+
+        gen_gan_main_value = 0.0
+        if critic_warmup_done and gen_gan_weight > 0:
+            disc_for_guidance.requires_grad_(False)
+            disc_was_training = disc_for_guidance.training
+            disc_for_guidance.eval()
+            try:
+                B_g = real_det.shape[0]
+                combined_g = torch.cat([real_det, fake_grad], dim=0)
+                g_logits = disc_for_guidance(combined_g)
+                d_real_g = g_logits[:B_g]
+                d_fake_g = g_logits[B_g:]
+                g_rp = rpgan_g_loss(d_real_g.detach(), d_fake_g)
+                generator_gan_loss = (
+                    gen_gan_weight * g_rp.to(pred_image.dtype)
+                )
+                gen_gan_main_value = float(g_rp.detach().item())
+            finally:
+                disc_for_guidance.requires_grad_(True)
+                if disc_was_training:
+                    disc_for_guidance.train()
+        else:
+            generator_gan_loss = zero
+
+        logs = {
+            "train/moment_gan_disc_skipped": 1.0 if disc_skipped else 0.0,
+            "train/moment_gan_d_loss": last_d_loss,
+            "train/moment_gan_d_real": last_d_real,
+            "train/moment_gan_d_fake_detached": last_d_fake,
+            "train/moment_gan_r1": last_r1,
+            "train/moment_gan_r1_grad_sq": last_r1_grad_sq,
+            "train/moment_gan_r1_fired": last_r1_fired,
+            "train/moment_gan_r1_gamma": float(self.moment_gan_r1_gamma),
+            "train/moment_gan_g_loss_raw": gen_gan_main_value,
+            "train/moment_gan_g_loss_weighted": (
+                gen_gan_weight * gen_gan_main_value
+            ),
+            "train/moment_gan_g_weight": float(gen_gan_weight),
+            "train/moment_gan_critic_warmup_done": (
+                1.0 if critic_warmup_done else 0.0
+            ),
+        }
+        return generator_gan_loss, logs
+
     #     "student vs teacher's clean data".
     #   * "adjacent_chunks" (ASD-style): real = chunk_i, fake =
     #     chunk_{i+1} from the same gen rollout. Pushes
@@ -7810,6 +8188,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out.update(gan_logs)
             self._mem_step_snapshot("4_after_gan_pre_backward")
 
+        # Moment-GAN runs independently of the main GAN gate (its own
+        # ``moment_gan_enabled`` flag). Trained against GT moments
+        # (always available); supplies a distribution-matching signal
+        # on per-frame std (+ optional mean / RMS) that replaces the
+        # point-wise ``latent_std_mse_loss`` anti-collapse signal.
+        if self.moment_gan_enabled and self.moment_disc is not None:
+            _mgt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
+            moment_gen_loss, moment_logs = self._compute_moment_gan_losses(
+                pred_image=train_chunk,
+                gt_latents_window=_mgt_window,
+                current_step=int(self.step),
+            )
+            generator_loss = generator_loss + moment_gen_loss
+            out.update(moment_logs)
+
         # Pixel-space perceptual losses (LPIPS + pixel reconstruction).
         # Direct anti-blur + anti-drift signals on a graph-on decoded
         # frame subset. Independent of the GAN distillation chain
@@ -8514,6 +8907,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                     generator_loss = generator_loss + gen_gan_loss
                     merged.update(gan_logs)
+
+                # Moment-GAN runs independently of the main GAN gate
+                # (own ``moment_gan_enabled`` flag). Same idea as the
+                # streaming path above.
+                if self.moment_gan_enabled and self.moment_disc is not None:
+                    _mgt_window = latents[
+                        :, gen_window_start:gen_window_end
+                    ]
+                    moment_gen_loss, moment_logs = (
+                        self._compute_moment_gan_losses(
+                            pred_image=pred_image,
+                            gt_latents_window=_mgt_window,
+                            current_step=int(self.step),
+                        )
+                    )
+                    generator_loss = generator_loss + moment_gen_loss
+                    merged.update(moment_logs)
 
                 if sc_dmd_active:
                     sc_loss_raw, sc_logs = self.model.sc_dmd_loss(

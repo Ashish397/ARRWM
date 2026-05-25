@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-5
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-7
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,25 +11,7 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28D: v28C + adjacent-chunk loss.
-#
-# v28D vs v28C — knob deltas
-# --------------------------
-#   ladd_adjacent_chunks_enabled    false -> true
-#   ladd_adjacent_chunks_weight     0.0   -> 0.5
-#       (Softer than gt_vs_fake's 1.0 since adjacent is a weaker
-#       distributional signal — chunk_i and chunk_{i+1} are close
-#       by construction. A 2:1 gt:adjacent ratio keeps the GT
-#       anchor dominant while letting adjacent provide a temporal-
-#       consistency push.)
-#
-# Otherwise identical to v28A. Same wavelet HF disc input, same
-# online DMD, same aux-teacher LoRA, no forward noiser, no MANIQA,
-# no alt-head.
-#
-# Two D updates per gen step (one per pair mode); both gen-side
-# losses sum into the generator's total. Disc weights are SHARED —
-# the same disc learns to score both pair distributions.
+# Phase-3 online_teacher_NR_G_v28E-6
 # =====================================================================
 
 set -e -o pipefail
@@ -65,7 +47,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28D (v28C + adjacent-chunk) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v28E-6 (v28C + adjacent-chunk) on $(date)"
 echo "  * GAN: LADD teacher-feature, wavelet HF input."
 echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
 echo "  * DMD: online, anti-collapse on, no forward noiser."
@@ -167,12 +149,12 @@ srun torchrun \
     ladd_pairs_per_step=2 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
-    ladd_wavelet_hf_ll_weight=0.15 \
+    ladd_wavelet_hf_ll_weight=0.25 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
-    ladd_adjacent_chunks_enabled=true \
-    ladd_adjacent_chunks_weight=1.0 \
+    ladd_adjacent_chunks_enabled=false \
+    ladd_adjacent_chunks_weight=0.0 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -181,9 +163,9 @@ srun torchrun \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
     anti_collapse_type=std_mse \
-    anti_collapse_loss_weight=0.5 \
+    anti_collapse_loss_weight=1.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_5_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_7_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
