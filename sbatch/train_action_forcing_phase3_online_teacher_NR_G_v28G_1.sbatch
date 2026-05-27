@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-7
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28G-1
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -146,15 +146,17 @@ srun torchrun \
     ladd_r1_gamma=0.01 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=2 \
+    ladd_pairs_per_step=1 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
     ladd_wavelet_hf_ll_weight=0.25 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
-    ladd_adjacent_chunks_enabled=true \
-    ladd_adjacent_chunks_weight=0.5 \
+    ladd_adjacent_chunks_enabled=false \
+    ladd_adjacent_chunks_weight=0.0 \
+    ladd_gt_transition_enabled=true \
+    ladd_gt_transition_weight=1.0 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -166,6 +168,6 @@ srun torchrun \
     anti_collapse_loss_weight=1.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_7_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28G_1_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

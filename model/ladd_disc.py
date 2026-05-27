@@ -475,6 +475,133 @@ class LADDDiscHead(nn.Module):
 
 
 # ============================================================================
+# Parallel "stat head" — distribution-match per-frame / per-channel /
+# spatiotemporal stds adversarially (sideband to the visual disc).
+# ============================================================================
+
+
+class LADDStatHead(nn.Module):
+    """Parallel adversarial branch on latent std statistics.
+
+    Computes three std reductions from the raw input latent and routes
+    them through a small MLP to produce a per-sample scalar logit that
+    sits ALONGSIDE the visual disc's per-token logits at the RpGAN loss
+    site. The visual disc and the stat head share only the loss
+    function — no teacher involvement, no shared weights.
+
+    The three reductions (axes KEPT, the rest are std'd over):
+      * ``[B, F, C]``       — non-spatial std (over H, W).
+          Catches grey collapse + channel imbalance.
+      * ``[B, F, P, P]``    — std over channels, then avg-pool spatial
+                              to ``P × P``. Catches spatial-contrast.
+      * ``[B, C, P, P]``    — std over frames, then avg-pool spatial
+                              to ``P × P``. Catches temporal stability
+                              (AR drift / flicker signature).
+    Total input dim to the MLP: ``F·C + F·P² + C·P²``.
+
+    The head emits a single scalar logit per sample (shape ``[B, 1]``).
+    Stat-side strength relative to the visual disc is controlled at
+    the loss-aggregation level via ``ladd_stat_head_loss_weight`` —
+    the trainer reduces the visual and stat sides via separate RpGAN
+    means and sums them with that weight. This is the right knob;
+    broadcasting the scalar logit K times before concat would only
+    fight the per-token visual dilution and is not how to control
+    stat-side strength.
+
+    Args:
+        frames_per_window: F = npb (or 2·npb if disc-window upgrade is
+            on). Set at build time; must match runtime input.
+        in_channels: latent channel count (16 for Wan VAE).
+        pool_size: spatial pool target P (default 4 → 16 dims per map).
+        hidden_dim: MLP hidden dim. Default 256.
+        eps: numerical floor for ``.std()``.
+
+    The MLP layers are spectral-normed for stability (mirrors the
+    visual heads' D-side regularisation).
+    """
+
+    def __init__(
+        self,
+        frames_per_window: int = 3,
+        in_channels: int = 16,
+        pool_size: int = 4,
+        hidden_dim: int = 256,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.frames = int(frames_per_window)
+        self.in_channels = int(in_channels)
+        self.pool_size = int(pool_size)
+        self.hidden_dim = int(hidden_dim)
+        self.eps = float(eps)
+        # Total stat vector dim.
+        dim_bfc = self.frames * self.in_channels
+        dim_bfhw = self.frames * self.pool_size * self.pool_size
+        dim_bchw = self.in_channels * self.pool_size * self.pool_size
+        self.stat_dim = dim_bfc + dim_bfhw + dim_bchw
+        self.fc1 = spectral_norm(nn.Linear(self.stat_dim, self.hidden_dim))
+        self.fc2 = spectral_norm(nn.Linear(self.hidden_dim, 1))
+
+    # ------------------------------------------------------------------
+    def compute_stats(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the concatenated std-stat vector from ``[B, F, C, H, W]``.
+
+        Returns ``[B, stat_dim]`` (fp32 for numerical stability).
+        Differentiable wrt ``x`` — gen-side gradient flows back through
+        each std reduction.
+        """
+        if x.dim() != 5:
+            raise ValueError(
+                f"LADDStatHead.compute_stats expects [B,F,C,H,W]; got "
+                f"{tuple(x.shape)}."
+            )
+        B, F_in, C_in, H_in, W_in = x.shape
+        if F_in != self.frames:
+            raise RuntimeError(
+                "LADDStatHead frames_per_window mismatch: built for "
+                f"frames={self.frames}, got input F={F_in}. Rebuild the "
+                "disc with the correct ``ladd_stat_head_frames_per_window``."
+            )
+        if C_in != self.in_channels:
+            raise RuntimeError(
+                "LADDStatHead in_channels mismatch: built for "
+                f"in_channels={self.in_channels}, got input C={C_in}."
+            )
+        x32 = x.float()
+        # [B, F, C] — std over (H, W). Catches grey collapse.
+        s_bfc = x32.std(dim=[3, 4], unbiased=False)
+        # [B, F, H, W] — std over C, then avg-pool spatial → [B, F, P, P].
+        s_bfhw = x32.std(dim=2, unbiased=False)
+        # F.adaptive_avg_pool2d expects [N, C, H, W] — fold F into the
+        # batch axis temporarily.
+        s_bfhw_pooled = F.adaptive_avg_pool2d(
+            s_bfhw.reshape(B * F_in, 1, H_in, W_in),
+            self.pool_size,
+        ).reshape(B, F_in, self.pool_size, self.pool_size)
+        # [B, C, H, W] — std over F, then avg-pool spatial → [B, C, P, P].
+        s_bchw = x32.std(dim=1, unbiased=False)
+        s_bchw_pooled = F.adaptive_avg_pool2d(s_bchw, self.pool_size)
+        # Concat flat.
+        v = torch.cat(
+            [
+                s_bfc.reshape(B, -1),
+                s_bfhw_pooled.reshape(B, -1),
+                s_bchw_pooled.reshape(B, -1),
+            ],
+            dim=1,
+        )
+        return v
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``[B, F, C, H, W]`` → ``[B, 1]`` per-sample stat logit."""
+        v = self.compute_stats(x)
+        h = F.gelu(self.fc1(v))
+        logit = self.fc2(h)  # [B, 1]
+        return logit
+
+
+# ============================================================================
 # Full LADD discriminator
 # ============================================================================
 
@@ -517,6 +644,20 @@ class LADDDiscriminator(nn.Module):
             balances all 4 bands at the adapter input. Setting this
             too high (≥0.5) lets LL swamp the disc heads' spectral_norm
             and causes silent NCCL hangs (per-rank ``_u`` drift).
+        stat_head_enabled: opt-in parallel ``LADDStatHead`` that
+            distribution-matches latent std statistics adversarially.
+            Computes 3 std reductions on the RAW input latent (before
+            wavelet HF), routes them through a small MLP, and emits a
+            per-sample scalar logit that gets concatenated to the
+            per-token visual logits at the RpGAN loss site. Default
+            False.
+        stat_head_frames_per_window: F dimension the stat head expects
+            at runtime (must match ``ladd_pairs_per_step``'s slice
+            size; npb=3 with single-chunk pairs, 2·npb=6 with the
+            2-chunk-window upgrade).
+        stat_head_pool_size: spatial pool target P. Default 4 → 16
+            elements per spatial-map reduction.
+        stat_head_hidden_dim: stat MLP hidden width. Default 256.
     """
 
     def __init__(
@@ -537,6 +678,10 @@ class LADDDiscriminator(nn.Module):
         wavelet_hf_ll_weight: float = 0.15,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         action_tokens_per_frame: int = 0,
+        stat_head_enabled: bool = False,
+        stat_head_frames_per_window: int = 3,
+        stat_head_pool_size: int = 4,
+        stat_head_hidden_dim: int = 256,
     ):
         super().__init__()
         self.projector = projector  # stored as plain attribute, not nn submodule
@@ -593,10 +738,39 @@ class LADDDiscriminator(nn.Module):
         else:
             self.cmapper = None
 
+        # Parallel stat head — distribution-match std statistics
+        # adversarially. Operates on the RAW input latent, NOT on the
+        # wavelet-HF output. The two branches share only the RpGAN
+        # loss; their gradients combine at the gen side.
+        self.stat_head_enabled = bool(stat_head_enabled)
+        if self.stat_head_enabled:
+            self.stat_head = LADDStatHead(
+                frames_per_window=int(stat_head_frames_per_window),
+                in_channels=int(wavelet_hf_in_channels),
+                pool_size=int(stat_head_pool_size),
+                hidden_dim=int(stat_head_hidden_dim),
+            )
+        else:
+            self.stat_head = None
+
     # ------------------------------------------------------------------
     @property
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    @property
+    def stat_logit_count(self) -> int:
+        """Number of stat-head logits appended at the END of ``forward``'s
+        output (always 1 when stat head is enabled, 0 otherwise). Used
+        by the trainer to split the concatenated logit tensor into the
+        visual section (first ``-stat_logit_count`` columns) and the
+        stat section (last column) so each side can be reduced by its
+        own RpGAN mean — preventing the per-token visual logits from
+        drowning out the per-sample stat logit at the loss level. The
+        stat-side strength is then controlled by
+        ``ladd_stat_head_loss_weight``.
+        """
+        return 1 if self.stat_head is not None else 0
 
     # ------------------------------------------------------------------
     def forward(
@@ -613,12 +787,21 @@ class LADDDiscriminator(nn.Module):
     ) -> torch.Tensor:
         """Forward through projector → CCM → optional CSM → heads.
 
-        Returns flattened per-token logits concatenated across taps:
-            ``[B, total_tokens_across_scales]``
+        Returns flattened per-token logits concatenated across taps,
+        with the optional stat head's per-sample logit appended:
+            ``[B, total_visual_tokens (+ 1)]``
 
-        The caller reduces (mean or sum) over the second axis to get a
-        scalar loss.
+        The trainer splits the visual side from the stat side (last
+        column when ``stat_head_enabled``) and reduces each through
+        its own RpGAN mean. See ``LADDStatHead`` and the trainer's
+        ``_ladd_run_pair_mode`` for the loss-aggregation logic.
         """
+        # Capture the raw input BEFORE the wavelet transform — the stat
+        # head operates on the raw latent statistics, not the
+        # wavelet-HF representation. Both branches see the same noised
+        # latent (same disc_t_int) and the same DiffAugment.
+        x_noisy_raw = x_noisy
+
         # Optional wavelet-HF pre-stage: restrict the projector to the
         # HF sub-bands of the input latent so the GAN gradient can
         # only push HF detail (content stays DMD's job). Spatial
@@ -703,7 +886,21 @@ class LADDDiscriminator(nn.Module):
             # l: [B*T', cmap_dim_or_1, H', W'] -> per-sample flat.
             l = l.reshape(B, -1)
             logits_per_scale.append(l)
-        return torch.cat(logits_per_scale, dim=1)
+        visual_logits = torch.cat(logits_per_scale, dim=1)
+
+        # Append the parallel stat-head logit. The stat head
+        # discriminates std distribution on the RAW input latent
+        # (``x_noisy_raw``), bypassing the wavelet HF stage and the
+        # WAN teacher. Output is a single per-sample scalar ([B, 1]).
+        # The trainer splits visual / stat at the RpGAN site and
+        # reduces each via its own mean — stat-side strength is
+        # controlled by ``ladd_stat_head_loss_weight`` (not by token-
+        # axis broadcasting, which would only fight per-token visual
+        # dilution).
+        if self.stat_head is not None:
+            stat_logit = self.stat_head(x_noisy_raw)
+            visual_logits = torch.cat([visual_logits, stat_logit], dim=1)
+        return visual_logits
 
 
 # ============================================================================
@@ -900,6 +1097,10 @@ def build_ladd_disc(
     wavelet_hf_ll_weight: float = 0.15,
     patch_size: Tuple[int, int, int] = (1, 2, 2),
     action_tokens_per_frame: int = 0,
+    stat_head_enabled: bool = False,
+    stat_head_frames_per_window: int = 3,
+    stat_head_pool_size: int = 4,
+    stat_head_hidden_dim: int = 256,
 ) -> LADDDiscriminator:
     """Build a LADD discriminator wired to the existing teacher.
 
@@ -932,6 +1133,10 @@ def build_ladd_disc(
         wavelet_hf_ll_weight=wavelet_hf_ll_weight,
         patch_size=patch_size,
         action_tokens_per_frame=action_tokens_per_frame,
+        stat_head_enabled=stat_head_enabled,
+        stat_head_frames_per_window=stat_head_frames_per_window,
+        stat_head_pool_size=stat_head_pool_size,
+        stat_head_hidden_dim=stat_head_hidden_dim,
     )
     return disc
 

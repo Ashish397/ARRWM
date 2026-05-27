@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-7
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28F-3
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -47,7 +47,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28E-6 (v28C + adjacent-chunk) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v28E-9 (v28C + adjacent-chunk) on $(date)"
 echo "  * GAN: LADD teacher-feature, wavelet HF input."
 echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
 echo "  * DMD: online, anti-collapse on, no forward noiser."
@@ -155,6 +155,8 @@ srun torchrun \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=true \
     ladd_adjacent_chunks_weight=0.5 \
+    ladd_stat_head_enabled=true \
+    ladd_stat_head_loss_weight=1.0 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -163,9 +165,9 @@ srun torchrun \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
     anti_collapse_type=std_mse \
-    anti_collapse_loss_weight=1.0 \
+    anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_7_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28F_3_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

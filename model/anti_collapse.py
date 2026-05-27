@@ -23,7 +23,7 @@ trainer can sum into ``generator_loss`` directly.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -187,6 +187,285 @@ def latent_std_mse_loss(
     s_pred = pred_x0.std(dim=reduce_dims, unbiased=False)
     s_gt = gt.std(dim=reduce_dims, unbiased=False)
     return (s_pred - s_gt).pow(2).mean()
+
+
+def latent_std_graded_mse_constant_loss(
+    pred_x0: torch.Tensor,
+    target_std: float = 0.875,
+    mse_floor: float = 0.015,
+) -> torch.Tensor:
+    """MSE between per-frame std and a fixed scalar target, with a
+    minimum-floor clamp that zeroes the gradient once the student is
+    close enough.
+
+    Loss = ``clamp(mean((s_pred - target_std) ** 2), min=mse_floor)``
+
+    The clamp is the key part: once the running MSE drops below
+    ``mse_floor`` the loss becomes the constant ``mse_floor`` (no input
+    dependency, so the gradient is exactly zero). The student is free
+    to roam inside the implicit ``|s_pred - target_std| < sqrt(floor)``
+    band; only attempts to drift further get pulled back.
+
+    Compared to ``latent_std_mse_loss`` (MSE vs GT std), this:
+      * Doesn't track GT's natural per-step variation — it's a
+        regulariser pinned to a chosen value.
+      * Has a "close enough" zone via the floor — prevents the loss
+        from fighting micro-deviations once the student is in the
+        target band.
+      * Acts as a barrier against BOTH zero-power collapse (gray)
+        AND infinite-power collapse, since deviation in either
+        direction grows the MSE quadratically.
+
+    Args:
+        pred_x0: ``[B, F, C, H, W]`` student rollout (graph-attached).
+        target_std: scalar target for the per-frame std (default 0.875,
+            empirically near GT's typical per-frame std mean of ~0.85
+            on Wan latents).
+        mse_floor: minimum loss value below which the gradient is
+            clamped to zero. Default 0.015 = student is "close enough"
+            when the per-frame std mean is within ~sqrt(0.015) = 0.12
+            of the target.
+
+    Returns:
+        scalar tensor ``[]``.
+    """
+    reduce_dims = [2, 3, 4]
+    s_pred = pred_x0.std(dim=reduce_dims, unbiased=False)
+    mse = (s_pred - float(target_std)).pow(2).mean()
+    return torch.clamp(mse, min=float(mse_floor))
+
+
+def _causal_cumulative_mean(x: torch.Tensor) -> torch.Tensor:
+    """Cumulative-mean along dim=1. ``x: [B, F]`` -> ``[B, F]`` where
+    ``out[:, t] = x[:, :t+1].mean(dim=1)``. Equivalent to a causal
+    rolling mean with W >= F (the window covers everything seen so far).
+    """
+    cs = x.cumsum(dim=1)
+    weights = torch.arange(
+        1, x.shape[1] + 1, device=x.device, dtype=x.dtype,
+    )
+    return cs / weights
+
+
+def _per_frame_M2(x: torch.Tensor) -> torch.Tensor:
+    """Per-frame M2 = ``Σ_c σ_c²`` over spatial (H, W).
+    ``x: [B, F, C, H, W]`` -> ``[B, F]``."""
+    sigma = x.std(dim=[3, 4], unbiased=False)        # [B, F, C]
+    return (sigma ** 2).sum(dim=-1)                   # [B, F]
+
+
+def _per_frame_TV(x: torch.Tensor) -> torch.Tensor:
+    """Per-frame total-variation (latent space).
+
+    Defined as the per-channel mean of |Δx| along W *and* H, summed
+    over channels:
+
+        TV(x) = Σ_c [ mean_{H,W} |x[c,h,w] - x[c,h,w-1]|
+                   + mean_{H,W} |x[c,h,w] - x[c,h-1,w]| ]
+
+    ``x: [B, F, C, H, W]`` -> ``[B, F]``.
+    """
+    dx_w = (x[..., 1:] - x[..., :-1]).abs().mean(dim=[3, 4])      # [B, F, C]
+    dx_h = (x[..., 1:, :] - x[..., :-1, :]).abs().mean(dim=[3, 4])  # [B, F, C]
+    return (dx_w + dx_h).sum(dim=-1)                                  # [B, F]
+
+
+def _per_frame_STD(x: torch.Tensor) -> torch.Tensor:
+    """Per-frame global std over C, H, W. ``x: [B, F, C, H, W]`` -> ``[B, F]``.
+    Matches ``latent_std_graded_mse_constant_loss`` semantics: a single
+    scalar per frame measuring overall latent variance (all channels and
+    spatial positions treated as samples).
+    """
+    return x.std(dim=[2, 3, 4], unbiased=False)
+
+
+def compute_stat_anchor_loss(
+    pred_x0: torch.Tensor,
+    seed_latents: Optional[torch.Tensor] = None,
+    *,
+    seed_STD_anchor: Optional[torch.Tensor] = None,
+    seed_M2_anchor: Optional[torch.Tensor] = None,
+    seed_TV_anchor: Optional[torch.Tensor] = None,
+    STD_short_weight: float = 0.1,
+    STD_long_weight: float = 0.1,
+    M2_short_weight: float = 0.1,
+    M2_long_weight: float = 0.1,
+    TV_short_weight: float = 0.1,
+    TV_long_weight: float = 0.1,
+    rel_tol_short: float = 0.20,
+    rel_tol_long: float = 0.10,
+) -> Tuple[torch.Tensor, dict]:
+    """Seed-anchored, MSE-with-floor regulariser on three latent summary
+    stats — per-frame STD, M2 (= Σ_c σ_c²) and TV (= Σ_c mean|Δx|) —
+    measured at two horizons (per-frame short + causal cumulative-mean
+    long). Replacement for the v11 ``std_graded_mse_constant`` and the
+    v12 hinge-style ``compute_stat_anchor_loss``.
+
+    For each stat ``S`` with seed-derived per-batch anchor ``A``:
+      * ``mse_short = mean_{B,F} (S_pf - A)^2``
+      * ``mse_long  = mean_{B,F} (cumavg_t(S_pf) - A)^2``
+      * ``floor_X   = (rel_tol_X * mean_b(A))^2``  (one scalar per stat)
+      * ``loss_X    = clamp(mse_X - floor_X, min=0)`` — equivalent to
+        ``clamp(mse, min=floor) - floor``; same gradient as
+        ``clamp(mse, min=floor)`` but a zero baseline when in-band so
+        the gen-loss curve is clean.
+
+    The floor is sized so deviations within ``rel_tol * anchor`` (e.g.
+    20% of the anchor) produce zero gradient. Beyond that, the loss
+    behaves like a standard MSE pulling the per-frame stat back toward
+    the anchor — symmetric (both upward and downward drift penalised).
+    Long horizon uses a tighter ``rel_tol_long`` because cumulative
+    averaging smooths out per-frame noise.
+
+    The anchor comes from the cf-prefix seed the student was conditioned
+    on (so it changes per ride/prompt — there is no fixed global target).
+
+    Args:
+        pred_x0: ``[B, F, C, H, W]`` student rollout (graph-attached).
+        seed_latents: ``[B, F_seed, C, H, W]`` seed-window latents. If
+            provided, per-stat anchors are the mean of the seed's
+            per-frame stat values. Mutually exclusive with the explicit
+            ``seed_*_anchor`` kwargs.
+        seed_STD_anchor, seed_M2_anchor, seed_TV_anchor: precomputed
+            ``[B]`` anchors. Use these if computed once upstream.
+        STD_short_weight, STD_long_weight, M2_short_weight, M2_long_weight,
+        TV_short_weight, TV_long_weight: per-stat per-horizon multipliers
+            on the floor-clamped MSE. Outer ``stat_anchor_loss_weight``
+            multiplies the total.
+        rel_tol_short, rel_tol_long: tolerance band as a fraction of
+            anchor. Drift within ``rel_tol * anchor`` produces zero
+            gradient (see floor formula above). Default 0.20 / 0.10.
+
+    Returns:
+        ``(loss_scalar, log_dict)`` where ``loss_scalar`` is a scalar
+        tensor graph-attached to ``pred_x0`` (zero when fully in-band)
+        and ``log_dict`` is a flat ``str -> detached-tensor`` mapping
+        for wandb.
+    """
+    if pred_x0.dim() != 5:
+        raise ValueError(
+            f"compute_stat_anchor_loss expects [B, F, C, H, W]; got "
+            f"{tuple(pred_x0.shape)}"
+        )
+
+    if seed_latents is not None:
+        if seed_latents.dim() != 5:
+            raise ValueError(
+                "compute_stat_anchor_loss: seed_latents must be "
+                f"[B, F_seed, C, H, W]; got {tuple(seed_latents.shape)}"
+            )
+        with torch.no_grad():
+            seed = seed_latents.detach()
+            STD_anchor = _per_frame_STD(seed).mean(dim=1)      # [B]
+            M2_anchor = _per_frame_M2(seed).mean(dim=1)        # [B]
+            TV_anchor = _per_frame_TV(seed).mean(dim=1)        # [B]
+    else:
+        if (
+            seed_STD_anchor is None
+            or seed_M2_anchor is None
+            or seed_TV_anchor is None
+        ):
+            raise ValueError(
+                "compute_stat_anchor_loss: must provide either "
+                "seed_latents OR all three precomputed seed_*_anchor "
+                "tensors (STD, M2, TV)."
+            )
+        STD_anchor = seed_STD_anchor.detach()
+        M2_anchor = seed_M2_anchor.detach()
+        TV_anchor = seed_TV_anchor.detach()
+
+    # Per-frame stats on pred (graph-attached).
+    STD_pf = _per_frame_STD(pred_x0)                   # [B, F]
+    M2_pf = _per_frame_M2(pred_x0)
+    TV_pf = _per_frame_TV(pred_x0)
+
+    # Causal cumulative mean for long-horizon signal.
+    STD_long = _causal_cumulative_mean(STD_pf)
+    M2_long = _causal_cumulative_mean(M2_pf)
+    TV_long = _causal_cumulative_mean(TV_pf)
+
+    # Anchor broadcast.
+    a_STD = STD_anchor.unsqueeze(1).to(STD_pf.dtype)   # [B, 1]
+    a_M2 = M2_anchor.unsqueeze(1).to(M2_pf.dtype)
+    a_TV = TV_anchor.unsqueeze(1).to(TV_pf.dtype)
+
+    # Raw MSE values (scalar each).
+    mse_STD_short = (STD_pf - a_STD).pow(2).mean()
+    mse_STD_long = (STD_long - a_STD).pow(2).mean()
+    mse_M2_short = (M2_pf - a_M2).pow(2).mean()
+    mse_M2_long = (M2_long - a_M2).pow(2).mean()
+    mse_TV_short = (TV_pf - a_TV).pow(2).mean()
+    mse_TV_long = (TV_long - a_TV).pow(2).mean()
+
+    # Floors. ``(rel_tol * anchor_mean)^2`` — one scalar per stat per
+    # horizon. Computed on the detached anchor so the floor itself does
+    # not carry gradient.
+    rs2 = float(rel_tol_short) ** 2
+    rl2 = float(rel_tol_long) ** 2
+    STD_a2 = float(STD_anchor.detach().mean().pow(2).item())
+    M2_a2 = float(M2_anchor.detach().mean().pow(2).item())
+    TV_a2 = float(TV_anchor.detach().mean().pow(2).item())
+    floor_STD_short = rs2 * STD_a2
+    floor_STD_long = rl2 * STD_a2
+    floor_M2_short = rs2 * M2_a2
+    floor_M2_long = rl2 * M2_a2
+    floor_TV_short = rs2 * TV_a2
+    floor_TV_long = rl2 * TV_a2
+
+    # MSE-with-floor (subtraction form for clean baseline; gradient is
+    # identical to ``clamp(mse, min=floor)``).
+    loss_STD_short = (mse_STD_short - floor_STD_short).clamp(min=0)
+    loss_STD_long = (mse_STD_long - floor_STD_long).clamp(min=0)
+    loss_M2_short = (mse_M2_short - floor_M2_short).clamp(min=0)
+    loss_M2_long = (mse_M2_long - floor_M2_long).clamp(min=0)
+    loss_TV_short = (mse_TV_short - floor_TV_short).clamp(min=0)
+    loss_TV_long = (mse_TV_long - floor_TV_long).clamp(min=0)
+
+    loss = (
+        float(STD_short_weight) * loss_STD_short
+        + float(STD_long_weight) * loss_STD_long
+        + float(M2_short_weight) * loss_M2_short
+        + float(M2_long_weight) * loss_M2_long
+        + float(TV_short_weight) * loss_TV_short
+        + float(TV_long_weight) * loss_TV_long
+    )
+
+    dev = pred_x0.device
+    def _t(v: float) -> torch.Tensor:
+        return torch.tensor(float(v), device=dev)
+
+    logs = {
+        # Anchors
+        "stat/STD_anchor": STD_anchor.mean().detach(),
+        "stat/M2_anchor": M2_anchor.mean().detach(),
+        "stat/TV_anchor": TV_anchor.mean().detach(),
+        # Per-frame pred means
+        "stat/STD_pred_mean": STD_pf.mean().detach(),
+        "stat/M2_pred_mean": M2_pf.mean().detach(),
+        "stat/TV_pred_mean": TV_pf.mean().detach(),
+        # Raw MSEs
+        "stat/STD_mse_short": mse_STD_short.detach(),
+        "stat/STD_mse_long": mse_STD_long.detach(),
+        "stat/M2_mse_short": mse_M2_short.detach(),
+        "stat/M2_mse_long": mse_M2_long.detach(),
+        "stat/TV_mse_short": mse_TV_short.detach(),
+        "stat/TV_mse_long": mse_TV_long.detach(),
+        # Floors (constant within batch)
+        "stat/STD_floor_short": _t(floor_STD_short),
+        "stat/STD_floor_long": _t(floor_STD_long),
+        "stat/M2_floor_short": _t(floor_M2_short),
+        "stat/M2_floor_long": _t(floor_M2_long),
+        "stat/TV_floor_short": _t(floor_TV_short),
+        "stat/TV_floor_long": _t(floor_TV_long),
+        # Active loss above floor — what actually contributes gradient
+        "stat/STD_active_short": loss_STD_short.detach(),
+        "stat/STD_active_long": loss_STD_long.detach(),
+        "stat/M2_active_short": loss_M2_short.detach(),
+        "stat/M2_active_long": loss_M2_long.detach(),
+        "stat/TV_active_short": loss_TV_short.detach(),
+        "stat/TV_active_long": loss_TV_long.detach(),
+    }
+    return loss, logs
 
 
 def compute_std_corridor_anti_collapse(

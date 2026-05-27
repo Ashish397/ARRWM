@@ -1329,11 +1329,84 @@ class ActionForcingDMD(SelfForcingModel):
         ).strip().lower()
         if self.anti_collapse_type not in (
             "std_floor", "std_corridor", "std_mse",
+            "std_graded_mse_constant",
         ):
             raise ValueError(
                 "anti_collapse_type must be 'std_floor', 'std_corridor', "
-                f"or 'std_mse'; got {self.anti_collapse_type!r}."
+                "'std_mse', or 'std_graded_mse_constant'; got "
+                f"{self.anti_collapse_type!r}."
             )
+        # std_graded_mse_constant knobs — fixed scalar target + MSE
+        # floor that zeroes the gradient once close enough.
+        self.anti_collapse_std_target = float(
+            getattr(args, "anti_collapse_std_target", 0.875)
+        )
+        self.anti_collapse_std_mse_floor = float(
+            getattr(args, "anti_collapse_std_mse_floor", 0.015)
+        )
+        # Per-rung gating for the anti-collapse term. Two independent
+        # call sites exist:
+        #   * DMD random-exit rung (``_compute_kl_grad``) — the rung the
+        #     pipeline sampled this step. Always graph-attached to gen.
+        #   * Flash-DMD t=gan_t rung (``info["flash_dmd_gan_chunk"]``) —
+        #     the near-clean rung the GAN supervises. Only exists when
+        #     ``flash_dmd_enabled=True``; without anti-collapse here the
+        #     GAN-supervised rung is unconstrained and provides a
+        #     degenerate-mode escape hatch (gen satisfies disc at gan_t
+        #     while letting the random-exit rung drift toward gray).
+        # Both default True to preserve historical behaviour. Set to
+        # False to skip the corresponding rung's anti-collapse add.
+        self.anti_collapse_apply_to_dmd_rung = bool(
+            getattr(args, "anti_collapse_apply_to_dmd_rung", True)
+        )
+        self.anti_collapse_apply_to_flash_rung = bool(
+            getattr(args, "anti_collapse_apply_to_flash_rung", True)
+        )
+
+        # v28E_12+: multi-horizon stat-anchor hinge loss config. Pins
+        # M2 (Σ σ²) and TV (total variation) per-frame stats against
+        # the seed window's stat values. Hinge bounds come from GT
+        # rolling-band analysis (rolling_bands.json W=16 p95). Only
+        # fires when the student's drift exceeds the GT p95 budget,
+        # which DMD's per-pixel MSE cannot see (the per-pixel
+        # ``fake - real`` cancels the marginal). See
+        # ``model.anti_collapse.compute_stat_anchor_loss`` for the
+        # implementation. Default OFF (weight=0) so existing v28E
+        # configs are unaffected.
+        self.stat_anchor_loss_weight = float(
+            getattr(args, "stat_anchor_loss_weight", 0.0)
+        )
+        # Per-stat per-horizon weights for the MSE-with-floor regulariser
+        # against the seed anchor (STD, M2, TV) × (short = per-frame,
+        # long = causal cumavg). See ``compute_stat_anchor_loss``.
+        self.stat_anchor_STD_short_weight = float(
+            getattr(args, "stat_anchor_STD_short_weight", 0.1)
+        )
+        self.stat_anchor_STD_long_weight = float(
+            getattr(args, "stat_anchor_STD_long_weight", 0.1)
+        )
+        self.stat_anchor_M2_short_weight = float(
+            getattr(args, "stat_anchor_M2_short_weight", 0.1)
+        )
+        self.stat_anchor_M2_long_weight = float(
+            getattr(args, "stat_anchor_M2_long_weight", 0.1)
+        )
+        self.stat_anchor_TV_short_weight = float(
+            getattr(args, "stat_anchor_TV_short_weight", 0.1)
+        )
+        self.stat_anchor_TV_long_weight = float(
+            getattr(args, "stat_anchor_TV_long_weight", 0.1)
+        )
+        # Tolerance band as a fraction of the anchor. Deviations inside
+        # the band produce zero gradient (floor = (rel_tol * anchor)^2).
+        # Long horizon uses a tighter tolerance because cumulative
+        # averaging smooths out per-frame noise.
+        self.stat_anchor_rel_tol_short = float(
+            getattr(args, "stat_anchor_rel_tol_short", 0.20)
+        )
+        self.stat_anchor_rel_tol_long = float(
+            getattr(args, "stat_anchor_rel_tol_long", 0.10)
+        )
         # Corridor-mode weights (consulted only when
         # ``anti_collapse_type == "std_corridor"``). Defaults match the
         # discussion: moment=0.1 (per-frame std/RMS/mean corridor),
@@ -3164,13 +3237,19 @@ class ActionForcingDMD(SelfForcingModel):
         # Anti-collapse: stashed unscaled on ``self`` so the caller adds
         # it AFTER the dmd_loss_weight multiplication. See helper
         # ``_compute_anti_collapse_term`` for the math + rationale.
-        self._latest_anti_collapse_total = self._compute_anti_collapse_term(
-            original_latent=original_latent,
-            gt_target=gt_target,
-            log_dict=dmd_log_dict,
-            log_prefix="",
-            ref_dtype=dmd_loss.dtype,
-        )
+        # Gated by ``anti_collapse_apply_to_dmd_rung`` (default True) so
+        # the random-exit rung's anti-collapse contribution can be
+        # disabled independently of the flash-DMD rung's.
+        if self.anti_collapse_apply_to_dmd_rung:
+            self._latest_anti_collapse_total = self._compute_anti_collapse_term(
+                original_latent=original_latent,
+                gt_target=gt_target,
+                log_dict=dmd_log_dict,
+                log_prefix="",
+                ref_dtype=dmd_loss.dtype,
+            )
+        else:
+            self._latest_anti_collapse_total = None
 
         return dmd_loss, dmd_log_dict
 
@@ -3251,6 +3330,45 @@ class ActionForcingDMD(SelfForcingModel):
                 )
                 log_dict[f"anti_collapse_{log_prefix}gt_std_mean"] = s_gt.mean()
             return total_corridor.to(ref_dtype)
+
+        # ----- std_graded_mse_constant: MSE vs fixed target with floor -----
+        # Pulls per-frame std toward ``anti_collapse_std_target`` until
+        # the mean MSE drops below ``anti_collapse_std_mse_floor`` — at
+        # that point the loss clamps to the floor (gradient zero) and
+        # stops fighting micro-deviations. Acts as a barrier against
+        # both zero-power collapse (gray) and infinite-power collapse;
+        # does NOT track GT's natural step-to-step variation.
+        if self.anti_collapse_type == "std_graded_mse_constant":
+            if self.anti_collapse_loss_weight <= 0.0:
+                return None
+            from model.anti_collapse import (
+                latent_std_graded_mse_constant_loss,
+            )
+            loss_std_graded = latent_std_graded_mse_constant_loss(
+                pred_x0=original_latent.float(),
+                target_std=self.anti_collapse_std_target,
+                mse_floor=self.anti_collapse_std_mse_floor,
+            )
+            log_dict[f"anti_collapse_{log_prefix}std_graded_mse_raw"] = (
+                loss_std_graded.detach()
+            )
+            log_dict[f"anti_collapse_{log_prefix}std_target"] = float(
+                self.anti_collapse_std_target
+            )
+            log_dict[f"anti_collapse_{log_prefix}std_mse_floor"] = float(
+                self.anti_collapse_std_mse_floor
+            )
+            with torch.no_grad():
+                s_pred = original_latent.float().std(dim=[2, 3, 4])
+                s_gt = gt_for_std.float().std(dim=[2, 3, 4])
+                log_dict[f"anti_collapse_{log_prefix}pred_std_mean"] = (
+                    s_pred.mean()
+                )
+                log_dict[f"anti_collapse_{log_prefix}gt_std_mean"] = s_gt.mean()
+            return (
+                self.anti_collapse_loss_weight
+                * loss_std_graded.to(ref_dtype)
+            )
 
         # ----- std_mse: simplest possible (s_pred - s_gt)^2 -----
         if self.anti_collapse_type == "std_mse":
@@ -3756,6 +3874,48 @@ class ActionForcingDMD(SelfForcingModel):
         if getattr(self, "_latest_anti_collapse_total", None) is not None:
             dmd_loss = dmd_loss + self._latest_anti_collapse_total
             self._latest_anti_collapse_total = None
+
+        # v28E_12+: multi-horizon stat-anchor hinge loss. Pins per-frame
+        # M2 (Σ σ²) and TV (total variation) against the seed window's
+        # stat values, with hinge bounds derived from GT analysis
+        # (rolling_bands.json W=16 p95). Only fires when the student's
+        # drift exceeds the GT p95 budget. See
+        # ``model.anti_collapse.compute_stat_anchor_loss`` for details.
+        if (
+            getattr(self, "stat_anchor_loss_weight", 0.0) > 0.0
+            and seed_latents is not None
+            and pred_image is not None
+        ):
+            from model.anti_collapse import compute_stat_anchor_loss
+            try:
+                stat_loss, stat_logs = compute_stat_anchor_loss(
+                    pred_x0=pred_image.float(),
+                    seed_latents=seed_latents.float(),
+                    STD_short_weight=self.stat_anchor_STD_short_weight,
+                    STD_long_weight=self.stat_anchor_STD_long_weight,
+                    M2_short_weight=self.stat_anchor_M2_short_weight,
+                    M2_long_weight=self.stat_anchor_M2_long_weight,
+                    TV_short_weight=self.stat_anchor_TV_short_weight,
+                    TV_long_weight=self.stat_anchor_TV_long_weight,
+                    rel_tol_short=self.stat_anchor_rel_tol_short,
+                    rel_tol_long=self.stat_anchor_rel_tol_long,
+                )
+                stat_loss = (
+                    self.stat_anchor_loss_weight * stat_loss.to(dmd_loss.dtype)
+                )
+                dmd_loss = dmd_loss + stat_loss
+                dmd_log_dict["stat_anchor_total"] = stat_loss.detach()
+                for k, v in stat_logs.items():
+                    dmd_log_dict[k] = v
+            except Exception as exc:
+                # Fail-soft: log and continue. If the loss is genuinely
+                # broken the operator will see the wandb key go away.
+                if _is_main():
+                    import logging as _logging
+                    _logging.warning(
+                        "[ActionForcingDMD] stat_anchor_loss failed (%s); "
+                        "skipping this iteration.", exc,
+                    )
 
         # Surface MAE-extension metrics (may be NaN-marked if
         # gt_latents was None or shorter than the baseline rollout).
@@ -5659,6 +5819,48 @@ class ActionForcingDMD(SelfForcingModel):
             dmd_loss = dmd_loss + self._latest_anti_collapse_total
             self._latest_anti_collapse_total = None
 
+        # v28E_12+: multi-horizon stat-anchor hinge (M2 + TV against
+        # the cf-prefix seed window). See ``compute_stat_anchor_loss``
+        # in model.anti_collapse for the math. Streaming twin of the
+        # equivalent block in ``generator_loss``. Seed window is the
+        # first ``cf_state`` frames of ``ride_latents_window``; pred is
+        # the streaming chunk (= the rolled student x0 for this iter).
+        if (
+            getattr(self, "stat_anchor_loss_weight", 0.0) > 0.0
+            and cf_state > 0
+            and ride_window.shape[1] >= cf_state
+        ):
+            from model.anti_collapse import compute_stat_anchor_loss
+            try:
+                seed_latents_stream = ride_window[:, :cf_state].detach()
+                stat_loss, stat_logs = compute_stat_anchor_loss(
+                    pred_x0=chunk.float(),
+                    seed_latents=seed_latents_stream.float(),
+                    STD_short_weight=self.stat_anchor_STD_short_weight,
+                    STD_long_weight=self.stat_anchor_STD_long_weight,
+                    M2_short_weight=self.stat_anchor_M2_short_weight,
+                    M2_long_weight=self.stat_anchor_M2_long_weight,
+                    TV_short_weight=self.stat_anchor_TV_short_weight,
+                    TV_long_weight=self.stat_anchor_TV_long_weight,
+                    rel_tol_short=self.stat_anchor_rel_tol_short,
+                    rel_tol_long=self.stat_anchor_rel_tol_long,
+                )
+                stat_loss = (
+                    self.stat_anchor_loss_weight * stat_loss.to(dmd_loss.dtype)
+                )
+                dmd_loss = dmd_loss + stat_loss
+                dmd_log["stat_anchor_total"] = stat_loss.detach()
+                for k, v in stat_logs.items():
+                    dmd_log[k] = v
+            except Exception as exc:
+                if _is_main():
+                    import logging as _logging
+                    _logging.warning(
+                        "[ActionForcingDMD] stat_anchor_loss "
+                        "(streaming) failed (%s); skipping this "
+                        "iteration.", exc,
+                    )
+
         # Flash-DMD: when enabled, the rolling rollout emitted a
         # per-block t=flash_dmd_gan_t grad-on forward. The chunk_size-
         # aligned slab (overlap from prior iter's t=gan_t pred + this
@@ -5687,15 +5889,19 @@ class ActionForcingDMD(SelfForcingModel):
             # the random-exit rung drift toward gray/black). Same loss
             # math, same weights, unscaled add (parallel to the
             # random-exit anti_collapse contribution above).
-            flash_anti_collapse_total = self._compute_anti_collapse_term(
-                original_latent=last_rung_chunk,
-                gt_target=gt_target,
-                log_dict=dmd_log,
-                log_prefix="flash_",
-                ref_dtype=dmd_loss.dtype,
-            )
-            if flash_anti_collapse_total is not None:
-                dmd_loss = dmd_loss + flash_anti_collapse_total
+            # Gated by ``anti_collapse_apply_to_flash_rung`` (default
+            # True) so the flash-rung contribution can be disabled
+            # independently of the DMD random-exit rung's.
+            if self.anti_collapse_apply_to_flash_rung:
+                flash_anti_collapse_total = self._compute_anti_collapse_term(
+                    original_latent=last_rung_chunk,
+                    gt_target=gt_target,
+                    log_dict=dmd_log,
+                    log_prefix="flash_",
+                    ref_dtype=dmd_loss.dtype,
+                )
+                if flash_anti_collapse_total is not None:
+                    dmd_loss = dmd_loss + flash_anti_collapse_total
 
         # Auxiliary online-teacher pass (option 3 of the dual-teacher
         # design). When ``real_teacher_train_online`` is True we run a

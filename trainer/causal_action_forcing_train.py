@@ -970,6 +970,37 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     ),
                     patch_size=_patch_size,
                     action_tokens_per_frame=_a_per_f,
+                    # Parallel stat-head sideband: distribution-match
+                    # std statistics adversarially. Opt-in; default
+                    # OFF so existing runs are unaffected.
+                    stat_head_enabled=bool(
+                        getattr(
+                            self.config,
+                            "ladd_stat_head_enabled",
+                            False,
+                        )
+                    ),
+                    stat_head_frames_per_window=int(
+                        getattr(
+                            self.config,
+                            "ladd_stat_head_frames_per_window",
+                            int(getattr(self.config, "num_frame_per_block", 3)),
+                        )
+                    ),
+                    stat_head_pool_size=int(
+                        getattr(
+                            self.config,
+                            "ladd_stat_head_pool_size",
+                            4,
+                        )
+                    ),
+                    stat_head_hidden_dim=int(
+                        getattr(
+                            self.config,
+                            "ladd_stat_head_hidden_dim",
+                            256,
+                        )
+                    ),
                 )
                 # All-fp32 for R1 stability.
                 disc.to(device=self.device, dtype=torch.float32)
@@ -5612,7 +5643,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         adj_enabled = bool(
             getattr(self.model, "ladd_adjacent_chunks_enabled", True)
         )
-        if not gt_vs_fake_enabled and not adj_enabled:
+        # gt_transition (v28G): action-conditioned GT-supervised adjacent-
+        # chunk transition matching. Concatenates (chunk_n, chunk_{n+1})
+        # along the F dim, feeds GT on the real side and student on the
+        # fake side. The WAN teacher projector already conditions on per-
+        # frame action_modulation, so the disc sees the action context
+        # naturally — no extra action-projector needed in the disc.
+        # Strictly more informative than adjacent_chunks (which is
+        # student-vs-student, action-blind); typically run with
+        # adjacent_chunks disabled.
+        gt_xn_enabled = bool(
+            getattr(self.model, "ladd_gt_transition_enabled", False)
+        )
+        if not (gt_vs_fake_enabled or adj_enabled or gt_xn_enabled):
             return zero, {}
 
         gen_loss_total = zero
@@ -5635,6 +5678,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             enabled_modes.append(("gt_vs_fake", gt_detached, "_gt"))
         if adj_enabled:
             enabled_modes.append(("adjacent_chunks", src_detached, "_adj"))
+        if gt_xn_enabled:
+            # Real source is GT for gt_transition (the whole point).
+            enabled_modes.append(("gt_transition", gt_detached, "_gtxn"))
 
         two_phase = len(enabled_modes) > 1
 
@@ -5665,6 +5711,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             if mode_name == "gt_vs_fake":
                 w = float(getattr(self.model, "ladd_gt_vs_fake_weight", 1.0))
+            elif mode_name == "gt_transition":
+                w = float(
+                    getattr(self.model, "ladd_gt_transition_weight", 1.0)
+                )
             else:
                 w = float(getattr(self.model, "ladd_adjacent_chunks_weight", 1.0))
             gen_loss_total = gen_loss_total + w * g_loss
@@ -5696,7 +5746,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Top-level r3gan_r1 = mean of the γ-weighted per-mode losses.
         r1_loss_keys = [
             k for k in logs
-            if k in ("train/r3gan_r1_gt", "train/r3gan_r1_adj")
+            if k in (
+                "train/r3gan_r1_gt",
+                "train/r3gan_r1_adj",
+                "train/r3gan_r1_gtxn",
+            )
         ]
         if r1_loss_keys:
             logs["train/r3gan_r1"] = sum(logs[k] for k in r1_loss_keys) / len(r1_loss_keys)
@@ -5748,12 +5802,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         # Per-mode pair index lists. Each pair = (real_idx, fake_idx)
         # where the indices are chunk positions in real_src / fake_src.
+        # ``chunks_per_pair`` controls whether the disc sees one chunk
+        # (gt_vs_fake / adjacent_chunks) or a pair-of-chunks concatenated
+        # along F (gt_transition).
+        chunks_per_pair = 1
         if pair_mode == "gt_vs_fake":
             all_pairs = [(i, i) for i in range(n_chunks)]
         elif pair_mode == "adjacent_chunks":
             if n_chunks < 2:
                 return zero, {"train/ladd_n_pairs": 0.0}
             all_pairs = [(i, i + 1) for i in range(n_chunks - 1)]
+        elif pair_mode == "gt_transition":
+            # Action-conditioned GT-supervised adjacent-chunk matching.
+            # Each "pair" is the chunk-pair (i, i+1); the disc input is
+            # concat(chunk_i, chunk_{i+1}) along the F dim, doubling the
+            # frames-per-sample from npb to 2*npb. Real side uses GT,
+            # fake side uses student. The pair indices store (i, i+1)
+            # so the action-token slicing below can use the same lo_r /
+            # lo_f layout (and we cover both chunks per pair).
+            if n_chunks < 2:
+                return zero, {"train/ladd_n_pairs": 0.0}
+            all_pairs = [(i, i + 1) for i in range(n_chunks - 1)]
+            chunks_per_pair = 2
         else:
             raise ValueError(
                 f"_ladd_run_pair_mode: unknown pair_mode={pair_mode!r}."
@@ -5779,15 +5849,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         def _slice(t, i):
             return t[:, i * npb:(i + 1) * npb]
 
-        real_chunks_det = torch.cat(
-            [_slice(real_src, i) for (i, _) in pairs], dim=0,
-        )
-        fake_chunks_det = torch.cat(
-            [_slice(fake_src_detached, j) for (_, j) in pairs], dim=0,
-        )
-        fake_chunks_grad_tensor = torch.cat(
-            [_slice(fake_src_grad, j) for (_, j) in pairs], dim=0,
-        )
+        def _slice_pair(t, i, j):
+            # F-concat both indices: [B, 2*npb, C, H, W].
+            return torch.cat([_slice(t, i), _slice(t, j)], dim=1)
+
+        if chunks_per_pair == 2:
+            # gt_transition: real and fake BOTH cover the chunk-pair
+            # (i, i+1). Real uses GT (real_src=gt_detached), fake uses
+            # student (fake_src_*). Same i,j indices on both sides — the
+            # disc compares "GT's chunk pair" vs "student's chunk pair".
+            real_chunks_det = torch.cat(
+                [_slice_pair(real_src, i, j) for (i, j) in pairs], dim=0,
+            )
+            fake_chunks_det = torch.cat(
+                [_slice_pair(fake_src_detached, i, j) for (i, j) in pairs],
+                dim=0,
+            )
+            fake_chunks_grad_tensor = torch.cat(
+                [_slice_pair(fake_src_grad, i, j) for (i, j) in pairs],
+                dim=0,
+            )
+        else:
+            real_chunks_det = torch.cat(
+                [_slice(real_src, i) for (i, _) in pairs], dim=0,
+            )
+            fake_chunks_det = torch.cat(
+                [_slice(fake_src_detached, j) for (_, j) in pairs], dim=0,
+            )
+            fake_chunks_grad_tensor = torch.cat(
+                [_slice(fake_src_grad, j) for (_, j) in pairs], dim=0,
+            )
 
         # ----- Disc timestep -----
         # WAN with action-aware forward expects per-frame timestep
@@ -5816,8 +5907,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             disc_t_int = flash_t if flash_on else 0
         bsz_eff = real_chunks_det.shape[0]
+        # Per-frame timestep matches the disc input's F dim — which is
+        # ``npb`` for single-chunk modes and ``2 * npb`` for gt_transition.
+        t_frames = chunks_per_pair * npb
         t_disc = torch.full(
-            (bsz_eff, npb), disc_t_int, dtype=torch.long, device=device,
+            (bsz_eff, t_frames), disc_t_int, dtype=torch.long, device=device,
         )
 
         def _add_disc_noise(x):
@@ -5920,8 +6014,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # by one (j_fake = i_real + 1).
                 lo_r = cf_state + i_real * npb
                 lo_f = cf_state + j_fake * npb
-                real_acts.append(ride_actions[:, lo_r:lo_r + npb])
-                fake_acts.append(ride_actions[:, lo_f:lo_f + npb])
+                if chunks_per_pair == 2:
+                    # gt_transition: both sides cover the (i, i+1)
+                    # chunk-pair. Concat the two consecutive action
+                    # slices so the WAN teacher's per-frame action
+                    # modulation has a slice for every one of the
+                    # 2*npb input frames. Real and fake actions are
+                    # identical (same time positions, same actions —
+                    # only the latents differ).
+                    real_acts.append(torch.cat([
+                        ride_actions[:, lo_r:lo_r + npb],
+                        ride_actions[:, lo_f:lo_f + npb],
+                    ], dim=1))
+                    fake_acts.append(torch.cat([
+                        ride_actions[:, lo_r:lo_r + npb],
+                        ride_actions[:, lo_f:lo_f + npb],
+                    ], dim=1))
+                else:
+                    real_acts.append(ride_actions[:, lo_r:lo_r + npb])
+                    fake_acts.append(ride_actions[:, lo_f:lo_f + npb])
             real_acts_t = torch.cat(real_acts, dim=0).to(
                 device=device, dtype=prompt_embeds_eff.dtype,
             )
@@ -5941,6 +6052,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     fake_action_modulation = ap(
                         fake_acts_t, num_frames=fake_acts_t.shape[1],
                     ).detach()
+
+        # v28G_2: action-blind variant of gt_transition. Zeroes out the
+        # action tokens and modulation BEFORE they hit the disc forward,
+        # while preserving tensor shapes so the WAN teacher (which
+        # requires action_tokens when ``a_per_f > 0``) still runs. The
+        # disc then learns "GT chunk-pair transitions look like this
+        # distribution" *independent of which action drove the
+        # transition* — useful when the action signal is noisy or when
+        # you want to ablate the action-conditioning contribution.
+        # Only applies to gt_transition; gt_vs_fake / adjacent_chunks
+        # keep their full action conditioning.
+        if (
+            pair_mode == "gt_transition"
+            and bool(getattr(
+                self.model, "ladd_gt_transition_action_blind", False,
+            ))
+        ):
+            if real_action_tokens is not None:
+                real_action_tokens = torch.zeros_like(real_action_tokens)
+            if fake_action_tokens is not None:
+                fake_action_tokens = torch.zeros_like(fake_action_tokens)
+            if real_action_modulation is not None:
+                real_action_modulation = torch.zeros_like(
+                    real_action_modulation
+                )
+            if fake_action_modulation is not None:
+                fake_action_modulation = torch.zeros_like(
+                    fake_action_modulation
+                )
 
         self._mem_step_snapshot(f"ladd_{pair_mode}_a_cond_built")
 
@@ -5963,6 +6103,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         last_d_real = 0.0
         last_d_fake = 0.0
         last_r1 = 0.0
+        # Stat-head diagnostic accumulators — non-zero only when
+        # ``stat_head_enabled``. Separate D-side stat loss + per-sample
+        # real / fake logit means so the user can see the stat side's
+        # behaviour independently of the per-token visual side. 0 when
+        # stat head is off OR ``ladd_stat_head_loss_weight`` is 0.
+        last_d_loss_stat = 0.0
+        last_d_real_stat = 0.0
+        last_d_fake_stat = 0.0
         # Diagnostic R1 stats (independent of γ + lazy schedule):
         #   * ``last_r1_grad_sq``: raw ‖∇_x Σ_i D_i‖² estimate from the
         #     finite-difference or autograd path. This is the quantity
@@ -6161,7 +6309,37 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # scalar per sample BEFORE the softplus, which made
                 # the disc see one global score per sample and
                 # erased per-position discrimination.
-                d_rp = rpgan_d_loss(d_real_logits, d_fake_logits)
+                #
+                # Visual / stat split (when ``stat_head_enabled``):
+                # the disc forward appends K stat-logits at the END
+                # of the per-token visual logits. With ~thousands of
+                # visual tokens vs K stat-logits, lumping them into
+                # one ``.mean()`` reduction would drown the stat side
+                # (contribution K / (N_visual + K)). Instead we split,
+                # reduce each side independently (each mean is O(1)),
+                # and combine with ``ladd_stat_head_loss_weight``.
+                # Default weight 1.0 → ~50/50 stat:visual at the
+                # gradient level. Set weight=0 to neuter the stat side.
+                _K_stat = int(getattr(self.r3gan_disc, "stat_logit_count", 0))
+                _W_stat = float(getattr(
+                    self.model, "ladd_stat_head_loss_weight", 1.0,
+                ))
+                if _K_stat > 0 and _W_stat > 0.0:
+                    d_real_v = d_real_logits[:, :-_K_stat]
+                    d_fake_v = d_fake_logits[:, :-_K_stat]
+                    d_real_s = d_real_logits[:, -_K_stat:]
+                    d_fake_s = d_fake_logits[:, -_K_stat:]
+                    d_rp_visual = rpgan_d_loss(d_real_v, d_fake_v)
+                    d_rp_stat = rpgan_d_loss(d_real_s, d_fake_s)
+                    d_rp = d_rp_visual + _W_stat * d_rp_stat
+                    last_d_loss_stat = float(d_rp_stat.detach().item())
+                    last_d_real_stat = float(d_real_s.detach().mean().item())
+                    last_d_fake_stat = float(d_fake_s.detach().mean().item())
+                else:
+                    d_rp = rpgan_d_loss(d_real_logits, d_fake_logits)
+                    last_d_loss_stat = 0.0
+                    last_d_real_stat = 0.0
+                    last_d_fake_stat = 0.0
                 d_total = d_rp + r1
                 d_total.backward()
                 if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
@@ -6203,6 +6381,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
 
         gen_gan_main_value = 0.0
+        gen_gan_stat_value = 0.0
         if critic_warmup_done and gen_gan_weight > 0 and not skip_g:
             # Eval mode disables spectral_norm's power-iter mutation
             # of the ``_u`` / ``_sigma`` buffers during this forward.
@@ -6275,7 +6454,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # delivers per-frame-per-spatial-position-per-tap
                 # signal back to the generator instead of a single
                 # uniformly-magnitude'd scalar gradient per sample.
-                g_rp = rpgan_g_loss(d_real_g.detach(), d_fake_g)
+                #
+                # Visual / stat split — same logic as the D-side: the
+                # stat head's K appended logits get their own RpGAN
+                # mean reduction, then sum with ``ladd_stat_head_loss
+                # _weight``. Default 1.0 → stat side at parity with
+                # visual side at the gen-gradient level. Without this
+                # split, the stat side's contribution to the gen
+                # gradient would be K / (N_visual + K) ≈ 0.
+                _K_stat_g = int(getattr(self.r3gan_disc, "stat_logit_count", 0))
+                _W_stat_g = float(getattr(
+                    self.model, "ladd_stat_head_loss_weight", 1.0,
+                ))
+                if _K_stat_g > 0 and _W_stat_g > 0.0:
+                    d_real_g_v = d_real_g[:, :-_K_stat_g]
+                    d_fake_g_v = d_fake_g[:, :-_K_stat_g]
+                    d_real_g_s = d_real_g[:, -_K_stat_g:]
+                    d_fake_g_s = d_fake_g[:, -_K_stat_g:]
+                    g_rp_visual = rpgan_g_loss(d_real_g_v.detach(), d_fake_g_v)
+                    g_rp_stat = rpgan_g_loss(d_real_g_s.detach(), d_fake_g_s)
+                    g_rp = g_rp_visual + _W_stat_g * g_rp_stat
+                    gen_gan_stat_value = float(g_rp_stat.detach().item())
+                else:
+                    g_rp = rpgan_g_loss(d_real_g.detach(), d_fake_g)
+                    gen_gan_stat_value = 0.0
                 generator_gan_loss = (
                     gen_gan_weight * g_rp.to(pred_image_dtype)
                 )
@@ -6321,6 +6523,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
             "train/ladd_n_pairs": float(n_pairs),
             "train/ladd_disc_t": float(disc_t_int),
+            # Stat-head diagnostics (0.0 when stat head is off or
+            # ``ladd_stat_head_loss_weight=0``). The "_stat" suffix lets
+            # the user compare stat-side and visual-side dynamics
+            # independently in wandb.
+            "train/r3gan_d_loss_stat": last_d_loss_stat,
+            "train/r3gan_d_real_stat": last_d_real_stat,
+            "train/r3gan_d_fake_detached_stat": last_d_fake_stat,
+            "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
+            "train/r3gan_stat_loss_weight": float(
+                getattr(self.model, "ladd_stat_head_loss_weight", 1.0)
+            ),
         }
         return generator_gan_loss, logs
 

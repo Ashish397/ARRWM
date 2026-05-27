@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-7
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-13
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,7 +11,7 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28E-6
+# Phase-3 online_teacher_NR_G_v28E-13
 # =====================================================================
 
 set -e -o pipefail
@@ -47,12 +47,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28E-6 (v28C + adjacent-chunk) on $(date)"
+echo "Starting Phase-3 online-teacher NR_G v28E-13 (stat_anchor v2) on $(date)"
 echo "  * GAN: LADD teacher-feature, wavelet HF input."
 echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
-echo "  * DMD: online, anti-collapse on, no forward noiser."
+echo "  * Anti-collapse: OLD anti_collapse OFF. New stat_anchor ON:"
+echo "      - seed-derived anchors for STD, M2, TV"
+echo "      - MSE-with-floor (rel_tol short=0.20, long=0.10)"
+echo "      - short (per-frame) + long (causal cumavg) horizons"
+echo "      - per-stat per-horizon weight = 0.1; outer weight = 1.0"
+echo "  * DMD: online, no forward noiser."
 echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head."
+echo "  * OFF: forward noiser, MANIQA, alt-head, anti_collapse_std_mse."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -162,10 +167,21 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_type=std_mse \
-    anti_collapse_loss_weight=1.0 \
+    anti_collapse_type=std_graded_mse_constant \
+    anti_collapse_loss_weight=0.0 \
+    anti_collapse_std_target=0.875 \
+    anti_collapse_std_mse_floor=0.015 \
     anti_collapse_mean_weight=0.0 \
+    stat_anchor_loss_weight=1.0 \
+    stat_anchor_STD_short_weight=0.1 \
+    stat_anchor_STD_long_weight=0.1 \
+    stat_anchor_M2_short_weight=0.1 \
+    stat_anchor_M2_long_weight=0.1 \
+    stat_anchor_TV_short_weight=0.1 \
+    stat_anchor_TV_long_weight=0.1 \
+    stat_anchor_rel_tol_short=0.20 \
+    stat_anchor_rel_tol_long=0.10 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_7_j${SLURM_JOB_ID}
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_13_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

@@ -1,17 +1,29 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-7
-#SBATCH --nodes=8
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-13-smoke
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=04:00:00
+#SBATCH --time=00:45:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28E-6
+# v28E-13 SMOKE - verify stat_anchor_loss fires in the streaming path.
+#
+# v28E_12 silently failed to apply stat_anchor (the block lived only
+# in ``generator_loss`` but trainer uses ``compute_generator_loss_streaming``
+# under ``streaming_mode=true``). This smoke confirms the streaming-path
+# patch wires the loss into ``dmd_loss`` and exposes
+# ``gen/stat_anchor_total``, ``gen/stat/M2_*``, ``gen/stat/TV_*`` in wandb.
+#
+# PASS criteria (auto-checked by submit script):
+#   * 30 steps complete
+#   * ``stat_anchor_total`` key present in wandb summary
+#   * ``stat/M2_anchor`` / ``stat/TV_anchor`` keys present (non-zero anchor)
+# Otherwise identical to v28E_13 production knobs.
 # =====================================================================
 
 set -e -o pipefail
@@ -19,8 +31,15 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28D
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v28E_13_smoke
 WANDB_SAVE_DIR=wandb
+
+CANONICAL_MANIFEST=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_14B_teacher/.ride_manifest.pt
+mkdir -p "$LOGDIR"
+if [ ! -e "$LOGDIR/.ride_manifest.pt" ] && [ -f "$CANONICAL_MANIFEST" ]; then
+  ln -s "$CANONICAL_MANIFEST" "$LOGDIR/.ride_manifest.pt"
+  echo "Linked manifest: $LOGDIR/.ride_manifest.pt -> $CANONICAL_MANIFEST"
+fi
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
@@ -47,12 +66,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28E-6 (v28C + adjacent-chunk) on $(date)"
-echo "  * GAN: LADD teacher-feature, wavelet HF input."
-echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
-echo "  * DMD: online, anti-collapse on, no forward noiser."
-echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head."
+echo "Starting v28E-13 SMOKE (stat_anchor streaming-path fix verification) on $(date)"
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -62,6 +76,14 @@ echo "Nodes: $SLURM_NNODES"
 echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
+
+srun --ntasks-per-node=1 bash -c '
+  echo "=== $(hostname) /dev/shm before cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+  rm -f /dev/shm/nccl-* /dev/shm/cuda.* /dev/shm/sem.nccl-* 2>/dev/null || true
+  echo "=== $(hostname) /dev/shm after cleanup ==="
+  df -h /dev/shm 2>/dev/null || true
+' || true
 
 srun torchrun \
   --nnodes=$SLURM_NNODES \
@@ -74,8 +96,9 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    wandb_project=longlive-phase-3 \
-    max_steps=250 \
+    wandb_project=longlive-phase-3-smoke \
+    max_steps=30 \
+    max_rides=20 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -162,10 +185,19 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_type=std_mse \
+    anti_collapse_type=std_graded_mse_constant \
     anti_collapse_loss_weight=1.0 \
+    anti_collapse_std_target=0.875 \
+    anti_collapse_std_mse_floor=0.015 \
     anti_collapse_mean_weight=0.0 \
+    stat_anchor_loss_weight=0.1 \
+    stat_anchor_M2_weight=0.1 \
+    stat_anchor_TV_short_weight=0.5 \
+    stat_anchor_TV_long_weight=0.5 \
+    stat_anchor_M2_bound_long=2.83 \
+    stat_anchor_TV_bound_short=1.0 \
+    stat_anchor_TV_bound_long=0.5 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_7_j${SLURM_JOB_ID}
+    run_name=v28E_13_smoke_j${SLURM_JOB_ID}
 
-echo "Training completed on $(date)"
+echo "Smoke completed on $(date)"

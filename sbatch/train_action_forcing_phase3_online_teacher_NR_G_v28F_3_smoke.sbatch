@@ -1,17 +1,35 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-7
-#SBATCH --nodes=8
+#SBATCH --job-name=v28F_3-smoke
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=04:00:00
-#SBATCH --requeue
+#SBATCH --time=00:45:00
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28E-6
+# Smoke for v28F_3: parallel stat head (LADDStatHead) NEW IN THIS BUILD.
+#
+# Goals:
+#   * Build the disc with ``ladd_stat_head_enabled=true`` and confirm it
+#     constructs (LADDStatHead module, stat_logit_count == 1).
+#   * Run >= 30 steps so the GAN warmup (start step 10) crosses into
+#     the active D-update window and the stat-head loss split fires
+#     end-to-end (both D-side and G-side).
+#   * Detect any silent NaN/OOM/shape mismatch in the std-reduction
+#     path or the visual/stat loss split logic.
+#   * Cheap pass: 1 node, 4 GPUs, 60 steps wallclock < 30 min.
+#
+# What's exercised vs the main 28F_3:
+#   * SAME: stat_head_enabled, stat_head_loss_weight=1.0, fake_alt_head,
+#           forward_noiser, ladd_wavelet_hf, ladd_gt_vs_fake +
+#           ladd_adjacent_chunks (both modes on).
+#   * SCALED DOWN: max_steps 250 -> 60; gan_disc_start_step 20 -> 10;
+#                  gan_warmup_steps 100 -> 5; dmd_loss_start_step 10 -> 5
+#                  so DMD + GAN + stat-head all engage by step ~15.
+#   * Memory audit ON so leaks / spike sources are logged.
 # =====================================================================
 
 set -e -o pipefail
@@ -19,7 +37,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_online_teacher_NR_G_v28D
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v28F_3_smoke
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -44,24 +62,13 @@ export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+# Tighter NCCL timeout so we fail fast rather than waiting 30 min.
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-echo "CONFIG=$CONFIG"
-echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28E-6 (v28C + adjacent-chunk) on $(date)"
-echo "  * GAN: LADD teacher-feature, wavelet HF input."
-echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
-echo "  * DMD: online, anti-collapse on, no forward noiser."
-echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head."
-
-srun --ntasks-per-node=1 bash -c \
-  'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
-  || true
-echo "Job ID: $SLURM_JOB_ID"
-echo "Nodes: $SLURM_NNODES"
-echo "GPUs per node: $SLURM_GPUS_ON_NODE"
-echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
-echo "Master: $MASTER_ADDR:$MASTER_PORT"
+echo "=== Smoke for v28F_3 (parallel stat head): 1 node, 4 GPUs, 60 steps ==="
+echo "Job ID: $SLURM_JOB_ID, Master: $MASTER_ADDR:$MASTER_PORT"
+nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || true
 
 srun torchrun \
   --nnodes=$SLURM_NNODES \
@@ -74,8 +81,8 @@ srun torchrun \
   --override \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
-    wandb_project=longlive-phase-3 \
-    max_steps=250 \
+    wandb_project=longlive-phase-3-smoke \
+    max_steps=60 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -106,8 +113,8 @@ srun torchrun \
     aux_teacher_lora_alpha=64 \
     aux_real_clean_x_source=causal_AR_GT \
     dmd_loss_weight=0.25 \
-    dmd_loss_start_step=10 \
-    dmd_loss_warmup_steps=150 \
+    dmd_loss_start_step=5 \
+    dmd_loss_warmup_steps=20 \
     dmd_normalization_enabled=false \
     dmd_frozen_teacher_pass_enabled=false \
     fake_score_ema_weight=0.95 \
@@ -130,9 +137,9 @@ srun torchrun \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=0.01 \
     gan_lr=2e-5 \
-    gan_critic_warmup_steps=20 \
-    gan_disc_start_step=20 \
-    gan_warmup_steps=100 \
+    gan_critic_warmup_steps=10 \
+    gan_disc_start_step=10 \
+    gan_warmup_steps=5 \
     gan_warmup_shape=quadratic \
     gan_updates_per_step=1 \
     gan_r1_gamma=2.0 \
@@ -144,7 +151,7 @@ srun torchrun \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.01 \
-    ladd_r1_every_n_steps=10 \
+    ladd_r1_every_n_steps=5 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=2 \
     ladd_wavelet_hf_enabled=true \
@@ -155,6 +162,8 @@ srun torchrun \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=true \
     ladd_adjacent_chunks_weight=0.5 \
+    ladd_stat_head_enabled=true \
+    ladd_stat_head_loss_weight=1.0 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -163,9 +172,10 @@ srun torchrun \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
     anti_collapse_type=std_mse \
-    anti_collapse_loss_weight=1.0 \
+    anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
     max_gradient_chunks=2 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_7_j${SLURM_JOB_ID}
+    memory_audit_enabled=true \
+    run_name=v28F_3_smoke_j${SLURM_JOB_ID}
 
-echo "Training completed on $(date)"
+echo "Smoke completed on $(date)"
