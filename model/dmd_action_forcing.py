@@ -4273,12 +4273,16 @@ class ActionForcingDMD(SelfForcingModel):
             batch_size=batch_size, dtype=dtype, device=device,
         )
 
-        # Seed prefill: cf GT frames at t=0 + context-noise commit
-        # (mirrors the seed-prefill block inside inference_with_trajectory).
-        # All seed-prefill forwards run inside ``with torch.no_grad():``,
-        # so the temporary cond_dict's grad_fn is orphaned and GC'd
-        # once setup_sequence returns. action_projection.weight.grad
-        # is unaffected — these no_grad forwards never backward through it.
+        # Seed prefill: cf GT frames through the model's denoise→commit
+        # sequence (via ``pipe._seed_prefill_chunk``) so the KV cache
+        # ends up populated with model-style cache_pred traces matching
+        # what training rollouts produce. The legacy raw-GT-at-t=0
+        # prefill placed OOD attention traces into the cache, causing
+        # the first generated chunk to start at a low-energy boundary
+        # state. See ``_seed_prefill_chunk`` for the rationale.
+        # All forwards run under no_grad inside the helper, so the
+        # temporary cond_dict's grad_fn is orphaned and GC'd once
+        # setup_sequence returns.
         with torch.no_grad():
             seed_cond_dict, _ = self.build_action_conditional(
                 prompt_embeds=prompt_embeds,
@@ -4288,38 +4292,14 @@ class ActionForcingDMD(SelfForcingModel):
         current_start_frame = 0
         for sc in range(num_seed_chunks):
             seed_chunk = seed_latents[:, sc * npb : (sc + 1) * npb]
-            seed_t = torch.zeros(
-                [batch_size, npb], device=device, dtype=torch.int64,
-            )
             seed_block_cond = _slice_per_frame_streams(
                 seed_cond_dict, frame_start=current_start_frame, frame_count=npb,
             )
-            with torch.no_grad():
-                pipe.generator(
-                    noisy_image_or_video=seed_chunk,
-                    conditional_dict=seed_block_cond,
-                    timestep=seed_t,
-                    kv_cache=pipe.kv_cache1,
-                    crossattn_cache=pipe.crossattn_cache,
-                    current_start=current_start_frame * pipe.frame_seq_length,
-                )
-            # Context-noise commit (LongLive parity: keeps seed K/V at
-            # the same noise level as rollout chunks').
-            ctx_t = torch.full_like(seed_t, pipe.context_noise)
-            seed_ctx_in = self.scheduler.add_noise(
-                seed_chunk.flatten(0, 1),
-                torch.randn_like(seed_chunk.flatten(0, 1)),
-                ctx_t.flatten(0, 1),
-            ).unflatten(0, seed_chunk.shape[:2])
-            with torch.no_grad():
-                pipe.generator(
-                    noisy_image_or_video=seed_ctx_in,
-                    conditional_dict=seed_block_cond,
-                    timestep=ctx_t,
-                    kv_cache=pipe.kv_cache1,
-                    crossattn_cache=pipe.crossattn_cache,
-                    current_start=current_start_frame * pipe.frame_seq_length,
-                )
+            pipe._seed_prefill_chunk(
+                seed_chunk=seed_chunk,
+                seed_block_cond=seed_block_cond,
+                current_start_frame=current_start_frame,
+            )
             current_start_frame += npb
         del seed_cond_dict  # release the no_grad cond dict before iter 1
 
@@ -4687,8 +4667,11 @@ class ActionForcingDMD(SelfForcingModel):
                     batch_size=batch_size, dtype=dtype, device=device,
                 )
 
-                # 2) Seed prefill: n_seed_r2 chunks at t=0 + context-noise
-                # commit. Mirrors the rollout-1 seed loop in setup_sequence.
+                # 2) Seed prefill: n_seed_r2 chunks via the model's
+                # denoise→commit sequence (helper). Same fix as the
+                # rollout-1 seed loop in setup_sequence — replaces the
+                # legacy raw-GT-at-t=0 prefill with model-style
+                # cache_pred KV traces.
                 seed_cond_dict, _ = self.build_action_conditional(
                     prompt_embeds=prompt_embeds,
                     gt_actions=ride_actions_window,
@@ -4696,34 +4679,14 @@ class ActionForcingDMD(SelfForcingModel):
                 current_start_frame = 0
                 for sc in range(n_seed_r2):
                     seed_chunk = seed_r2[:, sc * npb : (sc + 1) * npb]
-                    seed_t = torch.zeros(
-                        [batch_size, npb], device=device, dtype=torch.int64,
-                    )
                     seed_block_cond = _slice_per_frame_streams(
                         seed_cond_dict,
                         frame_start=current_start_frame, frame_count=npb,
                     )
-                    pipe.generator(
-                        noisy_image_or_video=seed_chunk,
-                        conditional_dict=seed_block_cond,
-                        timestep=seed_t,
-                        kv_cache=pipe.kv_cache1,
-                        crossattn_cache=pipe.crossattn_cache,
-                        current_start=current_start_frame * pipe.frame_seq_length,
-                    )
-                    ctx_t = torch.full_like(seed_t, pipe.context_noise)
-                    seed_ctx_in = self.scheduler.add_noise(
-                        seed_chunk.flatten(0, 1),
-                        torch.randn_like(seed_chunk.flatten(0, 1)),
-                        ctx_t.flatten(0, 1),
-                    ).unflatten(0, seed_chunk.shape[:2])
-                    pipe.generator(
-                        noisy_image_or_video=seed_ctx_in,
-                        conditional_dict=seed_block_cond,
-                        timestep=ctx_t,
-                        kv_cache=pipe.kv_cache1,
-                        crossattn_cache=pipe.crossattn_cache,
-                        current_start=current_start_frame * pipe.frame_seq_length,
+                    pipe._seed_prefill_chunk(
+                        seed_chunk=seed_chunk,
+                        seed_block_cond=seed_block_cond,
+                        current_start_frame=current_start_frame,
                     )
                     current_start_frame += npb
                 del seed_cond_dict

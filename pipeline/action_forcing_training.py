@@ -367,6 +367,84 @@ class ActionForcingTrainingPipeline:
         return indices.tolist()
 
     # -----------------------------------------------------------------
+    # Seed prefill helper (shared across all three call sites)
+    # -----------------------------------------------------------------
+    def _seed_prefill_chunk(
+        self,
+        seed_chunk: torch.Tensor,
+        seed_block_cond: dict,
+        current_start_frame: int,
+    ) -> None:
+        """KV-cache prefill one seed chunk through the model's denoise
+        process. Replaces the legacy "raw GT at t=0" prefill, which put
+        OOD attention traces into the cache (the model is trained on its
+        own cache_pred outputs, not on raw GT, so a raw-GT t=0 forward
+        wrote KV the model had never seen during training — producing a
+        low-energy boundary state at the first generated chunk that
+        recovered only as recency-biased attention shifted onto
+        self-rolled cache_pred KV from subsequent chunks).
+
+        New sequence (matches training rollouts' per-block KV pattern):
+          1. Noise the seed at the cleanest training rung
+             (``denoising_step_list[-1]``) and forward the generator —
+             yields ``cache_pred`` = the model's x0 estimate of the seed,
+             which sits in the same representation space as every
+             training rollout's per-chunk cache_pred.
+          2. Commit ``cache_pred`` at ``t=context_noise`` — the same
+             commit forward the rollout's Step 3.4 uses. The KV cache
+             now contains model-style x0 traces, eliminating the
+             seed→rollout boundary OOD effect.
+
+        All forwards run under ``no_grad``. The seed chunk itself
+        (raw GT) remains written to the OUTPUT buffer at the seed
+        positions by the caller — only the KV cache content changes.
+        """
+        batch_size, npb = seed_chunk.shape[:2]
+        device = seed_chunk.device
+
+        with torch.no_grad():
+            seed_t_int = int(round(float(self.denoising_step_list[-1])))
+            seed_t = torch.full(
+                [batch_size, npb], seed_t_int,
+                device=device, dtype=torch.int64,
+            )
+            seed_chunk_flat = seed_chunk.detach().flatten(0, 1)
+            seed_noised = self.scheduler.add_noise(
+                seed_chunk_flat,
+                torch.randn_like(seed_chunk_flat),
+                seed_t.flatten(0, 1),
+            ).unflatten(0, seed_chunk.shape[:2])
+            _, cache_pred = self.generator(
+                noisy_image_or_video=seed_noised,
+                conditional_dict=seed_block_cond,
+                timestep=seed_t,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+            )
+            del seed_noised, seed_chunk_flat
+
+            commit_input_clean = cache_pred.detach()
+            del cache_pred
+            ctx_t = torch.full_like(seed_t, self.context_noise)
+            commit_input_flat = commit_input_clean.flatten(0, 1)
+            cache_commit_input = self.scheduler.add_noise(
+                commit_input_flat,
+                torch.randn_like(commit_input_flat),
+                ctx_t.flatten(0, 1),
+            ).unflatten(0, commit_input_clean.shape[:2])
+            del commit_input_clean, commit_input_flat
+            self.generator(
+                noisy_image_or_video=cache_commit_input,
+                conditional_dict=seed_block_cond,
+                timestep=ctx_t,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+            )
+            del cache_commit_input
+
+    # -----------------------------------------------------------------
     # Main entry: inference_with_trajectory
     # -----------------------------------------------------------------
     def inference_with_trajectory(
@@ -511,14 +589,14 @@ class ActionForcingTrainingPipeline:
 
         # Step 2b: KV-cache prefill from seed_latents. The seed is the
         # leading ``cf`` frames of the ride (= dmd_context_clean_frames),
-        # = clean GT context that the ODE student was trained to see as
+        # = clean GT context the ODE student was trained to see as
         # ``clean_x``. Without this prefill the rolling rollout starts
-        # cold and the ODE student (trained ONLY teacher-forced) produces
-        # garbage. We seed in chunks of ``npb`` frames each, with one
-        # forward at ``timestep=0`` per chunk plus the standard
-        # ``context_noise`` cache-update forward — same shape as the
-        # regular per-block path so the KV cache state ends up identical
-        # to "rolling at clean GT input" through the seed window.
+        # cold and produces garbage. We seed in chunks of ``npb`` frames
+        # each via ``_seed_prefill_chunk``, which runs the model's
+        # denoise→commit sequence on each seed chunk so the KV cache
+        # ends up in the SAME representation regime as the rollout's
+        # per-block commits (= model-style cache_pred, not raw GT). See
+        # ``_seed_prefill_chunk`` for the rationale.
         if seed_latents is not None:
             cf = int(seed_latents.shape[1])
             if cf <= 0:
@@ -532,48 +610,16 @@ class ActionForcingTrainingPipeline:
             for sc in range(num_seed_chunks):
                 seed_start = sc * npb
                 seed_chunk = seed_latents[:, seed_start: seed_start + npb]
-                seed_t = torch.zeros(
-                    [batch_size, npb], device=noise.device, dtype=torch.int64,
-                )
                 seed_block_cond = _slice_per_frame_streams(
                     conditional_dict,
                     frame_start=current_start_frame,
                     frame_count=npb,
                 )
-                with torch.no_grad():
-                    self.generator(
-                        noisy_image_or_video=seed_chunk,
-                        conditional_dict=seed_block_cond,
-                        timestep=seed_t,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
-                # Context-noise commit forward, mirroring the rollout
-                # loop's unconditional commit at line ~635 so the seed
-                # window's K/V ends up at the same noise level as every
-                # rollout chunk's K/V. At ``context_noise=0`` this is a
-                # no-op repetition (``add_noise(seed, n, 0) == seed``,
-                # so the t=0 forward writes the same K/V already
-                # produced by the line-491 forward) — kept unconditional
-                # for parity with the rollout, so bumping
-                # ``context_noise > 0`` later doesn't silently leave the
-                # seed's K/V at t=0 while the rollout's is at t=context_noise.
-                ctx_t = torch.full_like(seed_t, self.context_noise)
-                seed_ctx_in = self.scheduler.add_noise(
-                    seed_chunk.flatten(0, 1),
-                    torch.randn_like(seed_chunk.flatten(0, 1)),
-                    ctx_t.flatten(0, 1),
-                ).unflatten(0, seed_chunk.shape[:2])
-                with torch.no_grad():
-                    self.generator(
-                        noisy_image_or_video=seed_ctx_in,
-                        conditional_dict=seed_block_cond,
-                        timestep=ctx_t,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
+                self._seed_prefill_chunk(
+                    seed_chunk=seed_chunk,
+                    seed_block_cond=seed_block_cond,
+                    current_start_frame=current_start_frame,
+                )
                 current_start_frame += npb
 
         # Step 3: Per-rolling-step denoise loop with truncated random-exit.
