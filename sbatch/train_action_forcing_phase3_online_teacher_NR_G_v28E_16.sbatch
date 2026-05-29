@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-14
+#SBATCH --job-name=action-forcing-phase3-online-teacher-NR-G-v28E-16
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,7 +11,7 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 online_teacher_NR_G_v28E-14
+# Phase-3 online_teacher_NR_G_v28E-6
 # =====================================================================
 
 set -e -o pipefail
@@ -47,23 +47,49 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 online-teacher NR_G v28E-14 (v13 + seed-prefill fix) on $(date)"
-echo "  * SEED PREFILL FIX: pipe._seed_prefill_chunk replaces raw-GT-at-t=0"
-echo "    forward with model's denoise->commit sequence (cache_pred KV)."
-echo "    Eliminates seed->rollout boundary OOD effect (M2/M1/TV starting"
-echo "    low and recovering - see evaluation/rollouts_overview_all.png)."
-echo "    Applies to 3 seed-prefill sites: inference, setup_sequence,"
-echo "    fake_alt_head rollout 2."
+echo "Starting Phase-3 online-teacher NR_G v28E-15 (E-series w/ fake_score LoRA) on $(date)"
+echo "  * FAKE_SCORE LoRA: enabled, rank=32, alpha=64."
+echo "    Replaces fake_score's full fine-tune with a thin LoRA on"
+echo "    QKV/O attention projections. ~15 GB optimizer + DDP grad"
+echo "    memory freed per rank. head_alt re-enabled to keep alt loss"
+echo "    gradient flowing."
+echo "  * Memory bumps from prior submission backed off — pairs_per_step=2,"
+echo "    max_gradient_chunks=3 (v28G_5 baseline). fake_score LoRA savings"
+echo "    confirmed real (peak 42 GB at step 11) but the bumps still OOMed"
+echo "    at LADD disc backward."
+echo "  * E-SERIES PAIR MODES: gt_vs_fake (w=1.0) + adjacent_chunks (w=0.5)."
+echo "    gt_transition is OFF (E-series convention; that's the G-series"
+echo "    add-on)."
+echo "  * STAT_ANCHOR LONG-HORIZON EMA: enabled, weight=0.99."
+echo "    Per-frame (short) anchor stays per-batch seed-derived."
+echo "    Long-horizon anchor uses a cross-rank EMA of seed stats,"
+echo "    converging to GT-population mean over ~100 steps."
+echo "    Frees the rollout to drift back toward population mean"
+echo "    from an edge-seed start (fixes rel_tol_long lock-in)."
+echo "  * AUX NOISY DECOUPLED FROM CARN: aux_noisy_from_raw_gt=true."
+echo "    Aux teacher's noisy_input is now built from RAW gt_target +"
+echo "    Gaussian noise (instead of CARN-noised gt_target + Gaussian"
+echo "    noise as in G_3). Aux clean_x_for_real keeps its CARN-noised"
+echo "    value (aux_real_clean_x_source=causal_AR_GT). LoRA's task"
+echo "    becomes: given CARN-noised GT as clean TF context, denoise a"
+echo "    Gaussian-noised raw GT back to raw GT."
+echo "  * FLASH-DMD DISABLED: no extra t=60 grad-on forward per block."
+echo "    GAN gen-side adv path falls back to pred_image (random-exit"
+echo "    rung) instead of flash_dmd_gan_x0. Disc input stays clean"
+echo "    (wavelet_hf forces disc_t_int=0)."
+echo "    With recent pipeline changes (clean_chunk unconditional +"
+echo "    fake_alt rollout-2 prefer_cache_pred_in_output=True), aux"
+echo "    teacher and fake_alt rollout-2 still receive the cleanest"
+echo "    available x0 estimate (t~178.6 finish-denoised cache_pred)."
+echo "  * AUX TEACHER DISC SIGNAL: DISABLED."
+echo "    aux_teacher_disc_adv_weight = aux_teacher_disc_feat_weight = 0.0."
+echo "    LoRA is trained purely by its flow-MSE loss (no disc-borrowed"
+echo "    adv/feature signal). Main GAN still supervises the generator"
+echo "    normally; only the aux-teacher coupling is severed."
 echo "  * GAN: LADD teacher-feature, wavelet HF input."
-echo "  * Pair modes: gt_vs_fake (w=1.0) AND adjacent_chunks (w=0.5)."
-echo "  * Anti-collapse: OLD anti_collapse OFF. New stat_anchor ON:"
-echo "      - seed-derived anchors for STD, M2, TV"
-echo "      - MSE-with-floor (rel_tol short=0.20, long=0.10)"
-echo "      - short (per-frame) + long (causal cumavg) horizons"
-echo "      - per-stat per-horizon weight = 0.1; outer weight = 1.0"
-echo "  * DMD: online, no forward noiser."
+echo "  * Pair modes: gt_vs_fake (w=1.0) AND gt_transition (w=1.0)."
+echo "  * DMD: online, anti-collapse on, no forward noiser."
 echo "  * Aux teacher: online LoRA training of real_score against GT."
-echo "  * OFF: forward noiser, MANIQA, alt-head, anti_collapse_std_mse."
 
 srun --ntasks-per-node=1 bash -c \
   'echo "=== $(hostname) GPU memory ==="; nvidia-smi --query-gpu=index,memory.total,memory.free,memory.used --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"' \
@@ -75,9 +101,8 @@ echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
 # Clear stale NCCL/CUDA shm segments left by prior killed jobs on each node.
-# Only removes files we own — cannot affect other tenants' live segments.
-# Without this, /dev/shm can fill up and NCCL fails with
-# "No space left on device" at process group init.
+# Only removes files we own. Without this, /dev/shm can fill up and
+# NCCL fails with "No space left on device" at process group init.
 srun --ntasks-per-node=1 bash -c '
   echo "=== $(hostname) /dev/shm before cleanup ==="
   df -h /dev/shm 2>/dev/null || true
@@ -127,19 +152,25 @@ srun torchrun \
     aux_teacher_loss_warmup_steps=80 \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
+    fake_score_lora_enabled=false \
+    aux_teacher_disc_adv_weight=0.0 \
+    aux_teacher_disc_feat_weight=0.0 \
+    aux_teacher_disc_warmup_steps=100 \
     aux_real_clean_x_source=causal_AR_GT \
+    aux_noisy_from_raw_gt=false \
     dmd_loss_weight=0.25 \
     dmd_loss_start_step=10 \
     dmd_loss_warmup_steps=150 \
     dmd_normalization_enabled=false \
     dmd_frozen_teacher_pass_enabled=false \
+    flash_dmd_enabled=false \
     fake_score_ema_weight=0.95 \
     real_score_ema_weight=0.0 \
-    fake_alt_head_enabled=false \
+    fake_alt_head_enabled=true \
     fake_alt_head_start_step=0 \
     fake_alt_apply_start_step=0 \
     fake_alt_target_mode=rollout2_student \
-    fake_alt_rollout2_num_seed_chunks=1 \
+    fake_alt_rollout2_num_seed_chunks=2 \
     forward_noiser_enabled=true \
     forward_noiser_hidden_dim=512 \
     forward_noiser_num_blocks=4 \
@@ -163,23 +194,23 @@ srun torchrun \
     ladd_proj_dim=256 \
     ladd_use_csm=true \
     ladd_use_lateral_proj=false \
-    ladd_use_prompt_cond=true \
+    ladd_use_prompt_cond=false \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.01 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=1 \
+    ladd_pairs_per_step=2 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
-    ladd_wavelet_hf_ll_weight=0.25 \
+    ladd_wavelet_hf_ll_weight=0.15 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=false \
-    ladd_adjacent_chunks_weight=0.0 \
+    ladd_adjacent_chunks_weight=0.5 \
     ladd_gt_transition_enabled=true \
-    ladd_gt_transition_weight=1.0 \
+    ladd_gt_transition_weight=0.5 \
     perceptual_approx_warmup_steps=0 \
     perceptual_approx_ramp_steps=15 \
     maniqa_approx_loss_weight=0.0 \
@@ -190,16 +221,19 @@ srun torchrun \
     anti_collapse_type=std_mse \
     anti_collapse_loss_weight=0.0 \
     anti_collapse_mean_weight=0.0 \
-    stat_anchor_loss_weight=0.0 \
-    stat_anchor_STD_short_weight=0.0 \
-    stat_anchor_STD_long_weight=0.0 \
+    stat_anchor_loss_weight=1.0 \
+    stat_anchor_STD_short_weight=0.1 \
+    stat_anchor_STD_long_weight=0.1 \
     stat_anchor_M2_short_weight=0.0 \
     stat_anchor_M2_long_weight=0.0 \
-    stat_anchor_TV_short_weight=0.0 \
-    stat_anchor_TV_long_weight=0.0 \
-    stat_anchor_rel_tol_short=0.0 \
-    stat_anchor_rel_tol_long=0.0 \
-    max_gradient_chunks=1 \
-    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_14_j${SLURM_JOB_ID}
+    stat_anchor_TV_short_weight=0.1 \
+    stat_anchor_TV_long_weight=0.1 \
+    stat_anchor_rel_tol_short=0.15 \
+    stat_anchor_rel_tol_long=0.15 \
+    stat_anchor_rampdown_start_step=0 \
+    stat_anchor_rampdown_steps=0 \
+    stat_anchor_long_ema_enabled=false \
+    max_gradient_chunks=3 \
+    run_name=action_forcing_phase3_online_teacher_NR_G_v28E_16_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

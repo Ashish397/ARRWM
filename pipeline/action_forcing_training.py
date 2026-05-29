@@ -668,21 +668,24 @@ class ActionForcingTrainingPipeline:
         else:
             flash_dmd_gan_output = None
         # Aux-teacher clean_x buffer: per-block post-Step-3.3.5
-        # cache_pred (refined when flash_dmd_enabled, else post-rung).
-        # Detached, no autograd graph. Sized to num_output_frames so
-        # block writes use absolute current_start_frame indexing.
-        # Allocated only when ``flash_dmd_enabled`` (the regime where
-        # the aux pass consumes it); ``None`` otherwise lets the aux
-        # pass fall back to the legacy ``_streaming_build_clean_x_self``
-        # path on baselines without flash.
-        if flash_dmd_enabled:
-            clean_chunk = torch.zeros(
-                [batch_size, num_output_frames, num_channels, height, width],
-                device=noise.device,
-                dtype=noise.dtype,
-            )
-        else:
-            clean_chunk = None
+        # cache_pred. Detached, no autograd graph. Sized to
+        # num_output_frames so block writes use absolute
+        # current_start_frame indexing. Allocated UNCONDITIONALLY so
+        # downstream consumers (aux teacher, fake_alt_head) always
+        # receive the cleanest available x0 estimate:
+        #   * flash_dmd_enabled=True  → t=flash_dmd_gan_t refined
+        #     ``cache_pred`` (Step 3.2.b reassigns ``cache_pred`` to
+        #     the t=60 grad-on output)
+        #   * flash_dmd_enabled=False → t=denoising_step_list[-1]
+        #     (~178.6) finish-denoised ``cache_pred`` from Step 3.2
+        # Either way the per-block stash at the end of the rollout
+        # loop fills this buffer with the cleanest x0 estimate we have
+        # without spending an extra forward.
+        clean_chunk = torch.zeros(
+            [batch_size, num_output_frames, num_channels, height, width],
+            device=noise.device,
+            dtype=noise.dtype,
+        )
         # CF-parity #11: gradient-window gate. CF hardcodes a literal
         # 21 here (``Causal-Forcing/pipeline/self_forcing_training.py:
         # 120``: ``start_gradient_frame_index = num_output_frames - 21``)
@@ -1286,11 +1289,13 @@ class ActionForcingTrainingPipeline:
         flash_dmd_gan_output = (
             torch.zeros_like(noise) if flash_dmd_enabled else None
         )
-        # Aux-teacher clean_x buffer (per-block post-Step-3.3.5 cache_pred,
-        # detached). See ``inference_with_trajectory`` for rationale.
-        clean_chunk = (
-            torch.zeros_like(noise) if flash_dmd_enabled else None
-        )
+        # Aux-teacher clean_x buffer (per-block post-Step-3.3.5
+        # cache_pred, detached). Allocated UNCONDITIONALLY — see
+        # ``inference_with_trajectory`` for rationale: the rollout
+        # always denoises to the last rung (~t=178.6) to populate the
+        # KV cache, so exposing that ``cache_pred`` to downstream
+        # consumers is free.
+        clean_chunk = torch.zeros_like(noise)
 
         num_denoising_steps = len(self.denoising_step_list)
         # Cold-start only (warm_start removed). Every block uses the

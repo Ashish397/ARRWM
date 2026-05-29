@@ -115,13 +115,14 @@ srun torchrun \
     dmd_loss_warmup_steps=150 \
     dmd_normalization_enabled=false \
     dmd_frozen_teacher_pass_enabled=false \
+    flash_dmd_enabled=false \
     fake_score_ema_weight=0.95 \
     real_score_ema_weight=0.0 \
     fake_alt_head_enabled=true \
     fake_alt_head_start_step=0 \
     fake_alt_apply_start_step=0 \
     fake_alt_target_mode=rollout2_student \
-    fake_alt_rollout2_num_seed_chunks=1 \
+    fake_alt_rollout2_num_seed_chunks=2 \
     forward_noiser_enabled=true \
     forward_noiser_hidden_dim=512 \
     forward_noiser_num_blocks=4 \
@@ -145,7 +146,7 @@ srun torchrun \
     ladd_proj_dim=256 \
     ladd_use_csm=true \
     ladd_use_lateral_proj=false \
-    ladd_use_prompt_cond=true \
+    ladd_use_prompt_cond=false \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.01 \
@@ -154,7 +155,7 @@ srun torchrun \
     ladd_pairs_per_step=2 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
-    ladd_wavelet_hf_ll_weight=0.25 \
+    ladd_wavelet_hf_ll_weight=0.15 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
     ladd_gt_vs_fake_weight=1.0 \
@@ -167,21 +168,23 @@ srun torchrun \
     fake_score_gradient_checkpointing=true \
     gt_latent_mse_loss_weight=0.0 \
     gt_latent_mae_loss_weight=0.0 \
-    anti_collapse_type=std_graded_mse_constant \
+    anti_collapse_type=std_mse \
     anti_collapse_loss_weight=0.0 \
-    anti_collapse_std_target=0.875 \
-    anti_collapse_std_mse_floor=0.015 \
     anti_collapse_mean_weight=0.0 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.1 \
     stat_anchor_STD_long_weight=0.1 \
-    stat_anchor_M2_short_weight=0.1 \
-    stat_anchor_M2_long_weight=0.1 \
+    stat_anchor_M2_short_weight=0.0 \
+    stat_anchor_M2_long_weight=0.0 \
     stat_anchor_TV_short_weight=0.1 \
     stat_anchor_TV_long_weight=0.1 \
     stat_anchor_rel_tol_short=0.20 \
     stat_anchor_rel_tol_long=0.10 \
-    max_gradient_chunks=2 \
+    stat_anchor_rampdown_start_step=0 \
+    stat_anchor_rampdown_steps=0 \
+    stat_anchor_long_ema_enabled=true \
+    stat_anchor_long_ema_weight=0.99 \
+    max_gradient_chunks=3 \
     run_name=action_forcing_phase3_online_teacher_NR_G_v28E_13_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

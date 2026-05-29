@@ -3528,6 +3528,325 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # treated as trainable here (the probe gets its only gradient from
     # this loss, since gen-side currently has no probe loss).
     # ------------------------------------------------------------------
+    def _compute_aux_teacher_disc_losses(
+        self,
+        *,
+        lora_x0: Optional[torch.Tensor],
+        gt_target: Optional[torch.Tensor],
+        chunk_lo: int,
+        current_step: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        """Borrow the GAN disc's signal as a regulariser on the LoRA
+        aux teacher's x0 estimate.
+
+        Two paths, each gated by its own weight knob on the model:
+
+          * ``aux_teacher_disc_adv_weight`` > 0 — RpGAN gen-loss style.
+            Concat ``[gt_target, lora_x0]`` along batch, forward the
+            LADD disc once, split the logits, apply
+            ``rpgan_g_loss(d_real.detach(), d_fake)`` to push lora_x0
+            toward "real" from the disc's perspective. Disc params
+            are detached for this forward (we use the disc as a critic;
+            it's still trained on the main gen-side path).
+
+          * ``aux_teacher_disc_feat_weight`` > 0 — feature matching.
+            Run the disc's projector (only) on both lora_x0 (grad-on)
+            and gt_target (no_grad), L2 between per-block teacher
+            features. LPIPS-style signal — no adversarial framing.
+
+        Both default to 0 (off). When both > 0, both signals are
+        summed. Gated on top of the aux teacher's own start gate by
+        ``aux_teacher_disc_warmup_steps`` so the disc has had enough
+        D-updates to be a useful critic before we read its score.
+
+        The disc forward operates on a SINGLE per-block (npb-frame)
+        chunk slice (``lora_x0[:, :npb]``) — keeps the forward at the
+        disc's training distribution (it trains on per-chunk slices,
+        not the full aux teacher window). One slice per iter is enough
+        to give the LoRA a useful gradient.
+
+        ``chunk_lo`` is the absolute ride-window frame index of
+        ``lora_x0[:, 0]``, used to slice the matching action tokens.
+        The aux teacher computes ``gt_target = ride_window[:, chunk_lo:
+        chunk_lo + chunk_size]`` so ``lora_x0[:, :npb]`` corresponds
+        to ride frames ``[chunk_lo, chunk_lo + npb)``. Caller MUST
+        pass the chunk_lo it computed for this iter — reading the
+        ``streaming_state["last_chunk_lo_in_ride_window"]`` stash
+        would race with the main GAN path (set after this helper
+        runs, so we'd see the PREVIOUS iter's value → action tokens
+        misaligned with lora_x0's actual ride position).
+
+        Returns ``(total_loss, logs)`` where ``total_loss`` is a
+        graph-bearing scalar (gradient flows to LoRA params via
+        ``lora_x0``), or ``None`` when the path is fully gated off.
+        """
+        # DDP-safety note: all early-return paths below are derivable
+        # from globally-consistent state — config knobs (weights,
+        # warmup), aux-teacher's own DDP-synced skip (which makes
+        # lora_x0 / gt_target None on ALL ranks together when the
+        # ride is too short), or deterministic shape/state derived
+        # from those. Ride-actions length is tied to ride-window
+        # length (same loader output), so its shape check inherits
+        # the aux-teacher's sync. So every rank reaches the disc
+        # forward together, or none do — no explicit all_reduce
+        # needed here. If any of these conditions ever DOES diverge
+        # per-rank in a future code change, the LoRA's DDP allreduce
+        # at backward will detect the unused-param mismatch.
+        adv_w = float(getattr(self.model, "aux_teacher_disc_adv_weight", 0.0))
+        feat_w = float(
+            getattr(self.model, "aux_teacher_disc_feat_weight", 0.0)
+        )
+        if adv_w == 0.0 and feat_w == 0.0:
+            return None, {}
+        if (
+            not getattr(self, "gan_enabled", False)
+            or self.r3gan_disc is None
+        ):
+            return None, {}
+        if lora_x0 is None or gt_target is None:
+            return None, {}
+        warmup = int(
+            getattr(self.model, "aux_teacher_disc_warmup_steps", 100)
+        )
+        if current_step < warmup:
+            return None, {"train/aux_disc_skipped_warmup": 1.0}
+
+        device = lora_x0.device
+        disc = self.r3gan_disc
+        npb = int(getattr(self.model, "num_frame_per_block", 3))
+        if lora_x0.shape[1] < npb:
+            return None, {"train/aux_disc_skipped_too_short": 1.0}
+
+        # First npb frames — deterministic across ranks (DDP-safe).
+        lora_chunk = lora_x0[:, :npb].to(torch.float32)
+        gt_chunk = gt_target[:, :npb].to(torch.float32).detach()
+        B = lora_chunk.shape[0]
+
+        # Disc at t=0 (wavelet_hf path keeps clean inputs; mirrors
+        # what ``_ladd_run_pair_mode`` does when wavelet_on).
+        t_disc = torch.zeros((B, npb), dtype=torch.long, device=device)
+
+        # ----- Prompt embeddings + pooled prompt -----
+        s_state = getattr(self.model, "streaming_state", None) or {}
+        prompt_embeds = (
+            s_state.get("prompt_embeds")
+            if isinstance(s_state, dict) else None
+        )
+        if prompt_embeds is None:
+            return None, {"train/aux_disc_skipped_no_prompt": 1.0}
+        # Batch broadcast. In practice the aux teacher and the ride
+        # share the same B, so the shapes match. If they ever don't
+        # (e.g. multi-prompt ride), require a clean integer ratio so
+        # we don't silently produce a misaligned slice.
+        if prompt_embeds.shape[0] != B:
+            if B % max(1, prompt_embeds.shape[0]) != 0:
+                return None, {"train/aux_disc_skipped_prompt_shape": 1.0}
+            reps = B // prompt_embeds.shape[0]
+            prompt_embeds = prompt_embeds.repeat_interleave(reps, dim=0)
+        pooled_prompt = (
+            prompt_embeds.float().mean(dim=1)
+            if getattr(disc, "cmap_dim", 0) > 0 else None
+        )
+
+        # ----- Per-chunk action conditioning -----
+        # ``chunk_lo`` is passed by the caller — it's the absolute
+        # ride frame index of ``lora_x0[:, 0]``. Slicing the action
+        # window at ``[chunk_lo : chunk_lo + npb)`` matches the
+        # frames lora_x0[:, :npb] cover; the disc's action-aware
+        # WAN forward then sees actions consistent with the latents.
+        a_per_f = 0
+        _rs = self.model.real_score
+        for _cand in [_rs] + list(_rs.modules()):
+            if hasattr(_cand, "action_tokens_per_frame"):
+                a_per_f = int(getattr(_cand, "action_tokens_per_frame", 0))
+                if a_per_f > 0:
+                    break
+        cond_extra: Optional[Dict[str, torch.Tensor]] = None
+        if a_per_f > 0:
+            ride_actions = (
+                s_state.get("ride_actions_window")
+                if isinstance(s_state, dict) else None
+            )
+            atp = getattr(self.model, "action_token_projection", None)
+            ap = getattr(self.model, "action_projection", None)
+            if (
+                ride_actions is None
+                or atp is None
+            ):
+                return None, {"train/aux_disc_skipped_no_actions": 1.0}
+            lo, hi = int(chunk_lo), int(chunk_lo) + npb
+            if lo < 0 or ride_actions.shape[1] < hi:
+                return None, {"train/aux_disc_skipped_no_actions": 1.0}
+            acts = ride_actions[:, lo:hi].to(
+                device=device, dtype=prompt_embeds.dtype,
+            )
+            with torch.no_grad():
+                act_tokens = atp(acts).detach()
+                act_mod = (
+                    ap(acts, num_frames=npb).detach()
+                    if ap is not None else None
+                )
+            cond_extra = {"_action_tokens": act_tokens}
+            if act_mod is not None:
+                cond_extra["_action_modulation"] = act_mod
+
+        logs: Dict[str, float] = {}
+        total_loss: Optional[torch.Tensor] = None
+
+        # Disc in eval (no spectral_norm buffer mutation), params
+        # detached (critic mode — not trained on this signal).
+        disc_was_training = disc.training
+        disc.eval()
+        disc.requires_grad_(False)
+        # CRITICAL: the LADD disc's WanFeatureProjector holds
+        # ``self.real_score`` as a plain Python attribute, not as an
+        # nn.Module submodule (model/ladd_disc.py:99). So
+        # ``disc.requires_grad_(False)`` above does NOT touch the
+        # LoRA params inside real_score. Without freezing them
+        # explicitly here, the disc/projector forward on ``lora_chunk``
+        # would open a feedback path:
+        #   disc_loss → projector's real_score(lora_chunk) → LoRA params
+        # which is anti-correlated with the wanted signal: instead of
+        # making ``lora_chunk`` closer to GT, it would tune the LoRA
+        # so the FEATURE EXTRACTOR maps any input to GT-like features.
+        # For the FM path this is especially toxic (no adversarial
+        # counterbalance). Freezing the LoRA params for the duration
+        # of the disc forward kills the feedback loop while
+        # preserving the wanted path (disc_loss → lora_chunk → aux
+        # teacher's autograd graph → LoRA params).
+        # Memory bonus: the projector's activation checkpoint no
+        # longer needs to save LoRA-bearing layer activations for a
+        # backward that will never reach those params.
+        _rs = self.model.real_score
+        _lora_params_to_restore = [
+            p for p in _rs.parameters() if p.requires_grad
+        ]
+        for _p in _lora_params_to_restore:
+            _p.requires_grad_(False)
+        try:
+            if adv_w > 0.0:
+                from model.r3gan import rpgan_g_loss
+                combined = torch.cat([gt_chunk, lora_chunk], dim=0)
+                _t = torch.cat([t_disc, t_disc], dim=0)
+                _pe = torch.cat([prompt_embeds, prompt_embeds], dim=0)
+                _pp = (
+                    torch.cat([pooled_prompt, pooled_prompt], dim=0)
+                    if pooled_prompt is not None else None
+                )
+                _ce = None
+                if cond_extra is not None:
+                    _ce = {
+                        k: torch.cat([v, v], dim=0)
+                        for k, v in cond_extra.items()
+                    }
+                combined_logits = disc(
+                    x_noisy=combined,
+                    timestep=_t,
+                    prompt_embeds=_pe,
+                    pooled_prompt=_pp,
+                    conditional_extra=_ce,
+                )
+                d_real = combined_logits[:B]
+                d_fake = combined_logits[B:]
+                K_stat = int(getattr(disc, "stat_logit_count", 0))
+                W_stat = float(getattr(
+                    self.model, "ladd_stat_head_loss_weight", 1.0,
+                ))
+                if K_stat > 0 and W_stat > 0.0:
+                    g_visual = rpgan_g_loss(
+                        d_real[:, :-K_stat].detach(),
+                        d_fake[:, :-K_stat],
+                    )
+                    g_stat = rpgan_g_loss(
+                        d_real[:, -K_stat:].detach(),
+                        d_fake[:, -K_stat:],
+                    )
+                    g_rp = g_visual + W_stat * g_stat
+                else:
+                    g_rp = rpgan_g_loss(d_real.detach(), d_fake)
+                adv_loss = adv_w * g_rp.to(lora_x0.dtype)
+                total_loss = (
+                    adv_loss if total_loss is None
+                    else total_loss + adv_loss
+                )
+                logs["train/aux_disc_adv_raw"] = float(
+                    g_rp.detach().item()
+                )
+                logs["train/aux_disc_adv_weighted"] = float(
+                    adv_loss.detach().item()
+                )
+
+            if feat_w > 0.0:
+                projector = disc.projector
+                # IMPORTANT: ``LADDDiscriminator.forward`` applies
+                # ``self.wavelet_hf`` to x_noisy BEFORE the projector
+                # call (model/ladd_disc.py:810-811). The projector was
+                # trained to receive wavelet-HF-transformed inputs.
+                # Mirror that pre-stage manually here — feeding raw
+                # latents to the projector would be OOD relative to
+                # the disc's training distribution.
+                wavelet_hf = getattr(disc, "wavelet_hf", None)
+                if wavelet_hf is not None:
+                    lora_for_proj = wavelet_hf(lora_chunk)
+                    with torch.no_grad():
+                        gt_for_proj = wavelet_hf(gt_chunk)
+                else:
+                    lora_for_proj = lora_chunk
+                    gt_for_proj = gt_chunk
+                feats_fake = projector(
+                    x_noisy=lora_for_proj,
+                    timestep=t_disc,
+                    prompt_embeds=prompt_embeds,
+                    conditional_extra=cond_extra,
+                )
+                with torch.no_grad():
+                    feats_real = projector(
+                        x_noisy=gt_for_proj,
+                        timestep=t_disc,
+                        prompt_embeds=prompt_embeds,
+                        conditional_extra=cond_extra,
+                    )
+                feat_l2 = None
+                n_blocks = 0
+                for idx in feats_fake:
+                    diff_sq = (
+                        feats_fake[idx]
+                        - feats_real[idx].detach()
+                    ).pow(2).mean()
+                    feat_l2 = (
+                        diff_sq if feat_l2 is None
+                        else feat_l2 + diff_sq
+                    )
+                    n_blocks += 1
+                if feat_l2 is not None and n_blocks > 0:
+                    feat_l2 = feat_l2 / float(n_blocks)
+                    feat_loss = feat_w * feat_l2.to(lora_x0.dtype)
+                    total_loss = (
+                        feat_loss if total_loss is None
+                        else total_loss + feat_loss
+                    )
+                    logs["train/aux_disc_feat_raw"] = float(
+                        feat_l2.detach().item()
+                    )
+                    logs["train/aux_disc_feat_weighted"] = float(
+                        feat_loss.detach().item()
+                    )
+        finally:
+            disc.requires_grad_(True)
+            if disc_was_training:
+                disc.train()
+            # Restore the LoRA params' requires_grad state. The aux
+            # teacher's autograd graph (recorded BEFORE this disc
+            # forward) is independent of this restore — its backward
+            # path through real_score still works because the
+            # recorded ops captured grad-state at forward time.
+            for _p in _lora_params_to_restore:
+                _p.requires_grad_(True)
+
+        if total_loss is not None:
+            logs["train/aux_disc_total"] = float(total_loss.detach().item())
+        return total_loss, logs
+
     def _compute_lora_action_losses(
         self,
         lora_x0: Optional[torch.Tensor],
@@ -8360,6 +8679,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     generator_loss = generator_loss + lora_state_probe_loss
                 out.update(lora_logs)
                 self._mem_step_snapshot("3_after_lora_action")
+
+                # Disc-borrowed regulariser on the LoRA's aux x0.
+                # See ``_compute_aux_teacher_disc_losses`` for the two
+                # variants (RpGAN adv vs feature matching). Both are
+                # off when their weight knobs are 0 — no-op otherwise.
+                # Pass this iter's ``chunk_lo`` directly (rather than
+                # reading the streaming_state stash) — the stash is
+                # set further down by the main GAN block and would
+                # carry the PREVIOUS iter's value at this call site.
+                aux_disc_loss, aux_disc_logs = (
+                    self._compute_aux_teacher_disc_losses(
+                        lora_x0=aux_tensors.get("lora_x0"),
+                        gt_target=aux_tensors.get("gt_target"),
+                        chunk_lo=int(chunk_lo),
+                        current_step=int(self.step),
+                    )
+                )
+                if aux_disc_loss is not None:
+                    generator_loss = generator_loss + aux_disc_loss
+                out.update(aux_disc_logs)
+                self._mem_step_snapshot("3b_after_aux_disc")
 
         # Constant-weight latent-space MAE + MSE between student's
         # pred_image (= ``train_chunk``) and the GT latent window. Fires

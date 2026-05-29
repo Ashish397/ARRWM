@@ -307,6 +307,37 @@ class ActionForcingDMD(SelfForcingModel):
                 f"aux_teacher_lora_rank={self.aux_teacher_lora_rank} "
                 f"must be > 0"
             )
+
+        # v28G_6+: optional LoRA wrap on fake_score.model. Default OFF
+        # = legacy full-fine-tune of fake_score (all params trainable).
+        # When enabled, peft wraps fake_score.model with the
+        # ``fake_score_lora_*`` adapter config; only LoRA params are
+        # marked trainable, the base WAN stays frozen. This collapses
+        # fake_score's per-rank optimizer + gradient memory from
+        # ~15 GB (full bf16 params + grad + Adam state on 1.3B WAN)
+        # down to ~3 GB (frozen base + thin LoRA), freeing memory for
+        # larger LADD pair budgets / gradient-chunk windows.
+        # ``head_alt`` (v21 fake_alt) is explicitly re-enabled to
+        # requires_grad=True after the peft wrap so the alt loss
+        # gradient still flows; LoRA itself sits on QKV/O attention
+        # projections only, separate from head_alt's CausalHead.
+        self.fake_score_lora_enabled = bool(
+            getattr(args, "fake_score_lora_enabled", False)
+        )
+        self.fake_score_lora_rank = int(
+            getattr(args, "fake_score_lora_rank", 32)
+        )
+        self.fake_score_lora_alpha = float(
+            getattr(args, "fake_score_lora_alpha", self.fake_score_lora_rank)
+        )
+        self.fake_score_lora_dropout = float(
+            getattr(args, "fake_score_lora_dropout", 0.0)
+        )
+        if self.fake_score_lora_rank <= 0:
+            raise ValueError(
+                f"fake_score_lora_rank={self.fake_score_lora_rank} "
+                f"must be > 0"
+            )
         # Causal mask flag on the joint [clean | noisy] TF sequence
         # (v14 parity = True). When False, the inner CausalWanModel's
         # ``_prepare_teacher_forcing_mask`` returns a full-bidirectional
@@ -623,6 +654,26 @@ class ActionForcingDMD(SelfForcingModel):
                 "'default') or 'causal_AR_GT'; got "
                 f"{self.aux_real_clean_x_source!r}."
             )
+        # Decouple ``noisy_input`` from any CARN / alt-head shaping
+        # applied to ``noise_base``. When True, the aux teacher's
+        # ``noisy_input = scheduler.add_noise(<base>, ε, t)`` is built
+        # from the **raw** ``gt_target`` instead of the (potentially
+        # CARN-noised / alt-head-shaped) ``noise_base``.
+        # ``clean_x_for_real`` (the LoRA's TF context) keeps whatever
+        # the ``aux_real_clean_x_source`` setting put there — so this
+        # knob lets you have an asymmetric setup:
+        #   * clean_x = CARN-noised GT (current causal_AR_GT regime)
+        #   * noisy_input = raw GT + Gaussian noise
+        # The LoRA then learns "given a clean reference that's CARN-
+        # noised GT, denoise a Gaussian-noised version of the TRUE GT
+        # back to the TRUE GT". Useful when you want to keep CARN
+        # shaping the conditioning while training the score on
+        # vanilla (Gaussian-noise-only) inputs.
+        # Default False = current behaviour (noisy_input built from
+        # noise_base, which CARN / alt_head may have replaced).
+        self.aux_noisy_from_raw_gt = bool(
+            getattr(args, "aux_noisy_from_raw_gt", False)
+        )
         # Upper bound for the per-chunk random renoise applied to
         # the pure-GT clean_x_aux slice. Each chunk of ``npb`` frames
         # is renoised at a SINGLE timestep sampled uniformly from
@@ -835,6 +886,43 @@ class ActionForcingDMD(SelfForcingModel):
                 f"aux_teacher_loss_warmup_steps="
                 f"{self.aux_teacher_loss_warmup_steps} must be >= 0"
             )
+
+        # GAN-disc-borrowed regularisers on the LoRA aux teacher's x0
+        # estimate. The disc already encodes a high-quality "what does
+        # real look like" judgement against the student; reusing it as
+        # a second supervision channel for the LoRA gives a stronger
+        # gradient than the flow-MSE alone, which struggles under
+        # data-dependent CARN/forward-noiser noise. Two variants:
+        #
+        #   * ``aux_teacher_disc_adv_weight`` > 0: feed lora_x0 + gt
+        #     through the same LADD disc the gen-side uses, take
+        #     RpGAN gen-loss ``softplus(d_real - d_fake).mean()`` to
+        #     push lora_x0 toward "real". Disc params detached — used
+        #     as a critic, not trained on this signal.
+        #
+        #   * ``aux_teacher_disc_feat_weight`` > 0: intermediate-feature
+        #     matching. Run the disc's projector on lora_x0 (grad)
+        #     and gt (no_grad), compute per-block L2 of the captured
+        #     teacher features. Smaller-risk LPIPS-style signal — no
+        #     adversarial framing, no disc-collapse feedback concern.
+        #
+        # Both default to 0 (off). Independent — you can enable both.
+        # Gated on top of the aux-teacher start gate by
+        # ``aux_teacher_disc_warmup_steps`` so the disc has converged
+        # before we trust its signal.
+        self.aux_teacher_disc_adv_weight = float(
+            getattr(args, "aux_teacher_disc_adv_weight", 0.0)
+        )
+        self.aux_teacher_disc_feat_weight = float(
+            getattr(args, "aux_teacher_disc_feat_weight", 0.0)
+        )
+        # Default matches ``gan_critic_warmup_steps`` (~100) so the
+        # disc has had enough D-updates to be a useful critic before
+        # we read its score for the aux LoRA gradient. Set explicitly
+        # higher when the gen-side adv path starts firing later.
+        self.aux_teacher_disc_warmup_steps = int(
+            getattr(args, "aux_teacher_disc_warmup_steps", 100)
+        )
 
         # Optional piecewise-linear schedule for
         # ``real_teacher_input_mix_gt_p`` so the LoRA starts seeing
@@ -1407,6 +1495,113 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_rel_tol_long = float(
             getattr(args, "stat_anchor_rel_tol_long", 0.10)
         )
+        # Optional linear ramp-down on ``stat_anchor_loss_weight``.
+        # When ``stat_anchor_rampdown_steps > 0``: starting at step
+        # ``stat_anchor_rampdown_start_step``, the effective weight
+        # ramps linearly from the static knob value down to 0 over
+        # ``stat_anchor_rampdown_steps`` steps, then stays at 0.
+        # Used to anchor early-training stats while letting the
+        # student find its natural distribution later.
+        # ``rampdown_steps == 0`` (default) disables the schedule.
+        self.stat_anchor_rampdown_start_step = int(
+            getattr(args, "stat_anchor_rampdown_start_step", 0)
+        )
+        self.stat_anchor_rampdown_steps = int(
+            getattr(args, "stat_anchor_rampdown_steps", 0)
+        )
+        # v28G_5+: optional EMA on the LONG-HORIZON stat_anchor.
+        # Short-horizon (per-frame) anchor keeps the per-batch seed
+        # value so rollouts stay pinned to the ride they started in.
+        # Long-horizon anchor uses a running EMA of cross-rank-averaged
+        # seed anchors, converging to GT-population stats over ~100
+        # steps at ema_weight=0.99. Eliminates the "edge-seed lock-in"
+        # failure where a single seed at the tail of the GT
+        # distribution blocks long-horizon self-correction toward
+        # the population mean (rel_tol_long forces the rollout to
+        # match the seed indefinitely, even when the seed is an
+        # edge sample).
+        # Default OFF; flip on via sbatch.
+        self.stat_anchor_long_ema_enabled = bool(
+            getattr(args, "stat_anchor_long_ema_enabled", False)
+        )
+        self.stat_anchor_long_ema_weight = float(
+            getattr(args, "stat_anchor_long_ema_weight", 0.99)
+        )
+        # Running-EMA state. ``None`` until the first stat_anchor
+        # call populates them with the first step's cross-rank mean
+        # (cold start). Identical across ranks by construction
+        # (the helper all-reduces before the EMA update). Held as
+        # plain Tensor attributes (not registered buffers) so
+        # checkpoint resumes cold-start; that's acceptable given
+        # the EMA converges in ~100 steps at w=0.99.
+        self._stat_anchor_STD_long_ema: Optional[torch.Tensor] = None
+        self._stat_anchor_M2_long_ema: Optional[torch.Tensor] = None
+        self._stat_anchor_TV_long_ema: Optional[torch.Tensor] = None
+
+        # v28E_17+: stat_anchor mode dispatch.
+        # ``seed_anchor`` (default): the original MSE-with-floor
+        #     comparison against per-batch seed anchors (optionally
+        #     EMA-driven for the long horizon).
+        # ``target_matching``: fixed per-stat targets + pass-through
+        #     dead-bands derived from offline GT analysis. No seed
+        #     anchor, no EMA. Active stats: M2 (= ``Σ_c σ_c²``;
+        #     user calls this "STD" externally), TV, stable_rank.
+        #     See ``compute_stat_anchor_target_matching_loss`` for
+        #     the math.
+        self.stat_anchor_mode = str(
+            getattr(args, "stat_anchor_mode", "seed_anchor")
+        ).lower().strip()
+        if self.stat_anchor_mode not in ("seed_anchor", "target_matching"):
+            raise ValueError(
+                "stat_anchor_mode must be 'seed_anchor' or "
+                f"'target_matching'; got {self.stat_anchor_mode!r}."
+            )
+        # Target-matching knobs (consulted only when mode ==
+        # ``target_matching``). M2 target / band correspond to the
+        # user's externally-named "STD" (Σ σ², typical Wan range 6-9).
+        self.stat_anchor_target_M2 = float(
+            getattr(args, "stat_anchor_target_M2", 9.0)
+        )
+        self.stat_anchor_target_M2_band_low = float(
+            getattr(args, "stat_anchor_target_M2_band_low", 5.0)
+        )
+        self.stat_anchor_target_M2_band_high = float(
+            getattr(args, "stat_anchor_target_M2_band_high", 13.0)
+        )
+        self.stat_anchor_target_M2_weight = float(
+            getattr(args, "stat_anchor_target_M2_weight", 0.1)
+        )
+        self.stat_anchor_target_TV = float(
+            getattr(args, "stat_anchor_target_TV", 7.8)
+        )
+        self.stat_anchor_target_TV_band_low = float(
+            getattr(args, "stat_anchor_target_TV_band_low", 6.0)
+        )
+        self.stat_anchor_target_TV_band_high = float(
+            getattr(args, "stat_anchor_target_TV_band_high", 9.0)
+        )
+        self.stat_anchor_target_TV_weight = float(
+            getattr(args, "stat_anchor_target_TV_weight", 0.1)
+        )
+        self.stat_anchor_target_rank = float(
+            getattr(args, "stat_anchor_target_rank", 1.5)
+        )
+        self.stat_anchor_target_rank_band_high = float(
+            getattr(args, "stat_anchor_target_rank_band_high", 2.25)
+        )
+        # Optional lower bound for stable rank. -1 (or 0/negative) =
+        # use the user-spec upper-only gate (default contract).
+        # Set positive to enable a two-sided gate.
+        _rank_low_raw = float(
+            getattr(args, "stat_anchor_target_rank_band_low", -1.0)
+        )
+        self.stat_anchor_target_rank_band_low = (
+            _rank_low_raw if _rank_low_raw > 0.0 else None
+        )
+        self.stat_anchor_target_rank_weight = float(
+            getattr(args, "stat_anchor_target_rank_weight", 0.1)
+        )
+
         # Corridor-mode weights (consulted only when
         # ``anti_collapse_type == "std_corridor"``). Defaults match the
         # discussion: moment=0.1 (per-frame std/RMS/mean corridor),
@@ -1538,6 +1733,12 @@ class ActionForcingDMD(SelfForcingModel):
         self._load_generator_from_ode_checkpoint(args, device)
         self._load_real_score_with_v14_lora(args, device)
         self._mirror_generator_into_fake_score()
+        # v28G_6+: optional LoRA wrap on fake_score. Default OFF
+        # (full-FT). MUST run AFTER the mirror (mirror loads
+        # state_dict directly into the bare WAN; peft wrap on top
+        # would intercept the load path). See ``_apply_fake_score_lora``
+        # for the memory-savings rationale and head_alt handling.
+        self._apply_fake_score_lora(device)
 
         # Attach the (now weight-loaded) state_probe to the real_score
         # wrapper too. Must run AFTER the v14 LoRA peft wrap so the
@@ -2284,6 +2485,85 @@ class ActionForcingDMD(SelfForcingModel):
         except Exception as e:
             if _is_main():
                 logging.warning("[ActionForcingDMD] fake_score mirror failed: %s", e)
+
+    def _apply_fake_score_lora(self, device) -> None:
+        """Wrap ``fake_score.model`` with peft LoRA when
+        ``fake_score_lora_enabled``. Marks LoRA params trainable,
+        freezes the base WAN, and re-enables ``head_alt`` (v21 alt
+        head, NOT an attention LoRA target) so the alt loss can
+        still train it via the critic step.
+
+        Memory effect: full-FT fake_score holds ~15 GB of optimizer
+        state (params + grad + Adam m/v at bf16/fp32 mix on a 1.3B
+        WAN); LoRA at rank 32 drops that to ~3 GB (frozen base +
+        thin adapter). The DDP gradient buffer also shrinks
+        proportionally. Frees ~10-12 GB per rank for other uses
+        (larger ladd_pairs_per_step, max_gradient_chunks, etc.).
+
+        Must run AFTER ``_mirror_generator_into_fake_score`` (the
+        mirror loads state_dict directly into the bare WAN; peft
+        wrap on top would break the direct attribute access) and
+        AFTER ``enable_alt_head`` (so head_alt is present in the
+        base WAN before peft wraps it).
+        """
+        if not self.fake_score_lora_enabled:
+            return
+        if not _HAS_PEFT:
+            raise RuntimeError(
+                "fake_score_lora_enabled=True but peft is not installed."
+            )
+        rank = int(self.fake_score_lora_rank)
+        alpha = float(self.fake_score_lora_alpha)
+        dropout = float(self.fake_score_lora_dropout)
+        target_modules = self._collect_target_modules(self.fake_score.model)
+        if not target_modules:
+            target_modules = ["q", "k", "v", "o"]
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        peft_model = peft.get_peft_model(self.fake_score.model, lora_config)
+        self.fake_score.model = peft_model.to(
+            device=device, dtype=self.dtype,
+        )
+        trainable_lora = 0
+        for name, p in self.fake_score.model.named_parameters():
+            if "lora_" in name:
+                p.requires_grad = True
+                trainable_lora += 1
+            else:
+                p.requires_grad = False
+        # Re-enable head_alt (v21 fake_alt) — NOT a LoRA target, but
+        # must remain trainable so the alt loss in the critic step
+        # has a gradient path. Use the wrapper's ``_unwrapped_model``
+        # to walk past peft + any other wrapping to the bare WAN
+        # that holds the actual head_alt submodule.
+        alt_head_params = 0
+        try:
+            base = self.fake_score._unwrapped_model()
+            head_alt = getattr(base, "head_alt", None)
+            if head_alt is not None:
+                for p in head_alt.parameters():
+                    p.requires_grad = True
+                    alt_head_params += 1
+        except Exception as exc:
+            if _is_main():
+                logging.warning(
+                    "[ActionForcingDMD] fake_score LoRA: failed to "
+                    "re-enable head_alt grad (%s); alt loss may not "
+                    "train.", exc,
+                )
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] fake_score LoRA wrapped "
+                "(rank=%d alpha=%s drop=%s). %d LoRA params "
+                "trainable; %d head_alt params re-enabled.",
+                rank, alpha, dropout,
+                trainable_lora, alt_head_params,
+            )
 
     # ------------------------------------------------------------------
     # Action conditioning helpers
@@ -3881,8 +4161,16 @@ class ActionForcingDMD(SelfForcingModel):
         # (rolling_bands.json W=16 p95). Only fires when the student's
         # drift exceeds the GT p95 budget. See
         # ``model.anti_collapse.compute_stat_anchor_loss`` for details.
+        # Non-streaming generator_loss path doesn't carry ``current_step``
+        # in its signature. Resolver returns the full static weight when
+        # called with step 0 (rampdown hasn't started yet), so safe
+        # fallback. Streaming-mode runs use the resolver-with-step at the
+        # streaming application site.
+        stat_anchor_w_resolved = self._resolved_stat_anchor_loss_weight(
+            int(getattr(self, "_last_current_step", 0))
+        )
         if (
-            getattr(self, "stat_anchor_loss_weight", 0.0) > 0.0
+            stat_anchor_w_resolved > 0.0
             and seed_latents is not None
             and pred_image is not None
         ):
@@ -3901,10 +4189,13 @@ class ActionForcingDMD(SelfForcingModel):
                     rel_tol_long=self.stat_anchor_rel_tol_long,
                 )
                 stat_loss = (
-                    self.stat_anchor_loss_weight * stat_loss.to(dmd_loss.dtype)
+                    stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
                 )
                 dmd_loss = dmd_loss + stat_loss
                 dmd_log_dict["stat_anchor_total"] = stat_loss.detach()
+                dmd_log_dict["stat_anchor_weight_resolved"] = float(
+                    stat_anchor_w_resolved
+                )
                 for k, v in stat_logs.items():
                     dmd_log_dict[k] = v
             except Exception as exc:
@@ -4704,21 +4995,28 @@ class ActionForcingDMD(SelfForcingModel):
                     noise=anchor_noise,
                     current_start_frame=cf_r2,
                     requires_grad=False,
-                    prefer_cache_pred_in_output=False,
+                    # Return the t=denoising_step_list[-1] (~178.6)
+                    # finish-denoised cache_pred instead of the random-
+                    # exit-rung output. The rollout already denoises
+                    # all the way to populate the KV cache, so the
+                    # cleanest x0 estimate is free to surface here.
+                    # When flash_dmd_enabled is True, Step 3.2.b
+                    # reassigns cache_pred to the t=60 refined output,
+                    # so anchor_chunk is the t=60 version in that
+                    # branch — matches the previous flash-on behavior.
+                    prefer_cache_pred_in_output=True,
                     gt_latents=None,
                     flash_dmd_enabled=bool(self.flash_dmd_enabled),
                     **anchor_full_cond,
                 )
                 del anchor_full_cond
-                # Stash the anchor's t=60 refined slab (= the unified
-                # flash_dmd output, which is what the FN should consume
-                # as its rollout2 target). Falls back to the random-rung
-                # anchor_chunk if flash_dmd is disabled.
-                anchor_flash = getattr(pipe, "_flash_dmd_gan_output", None)
-                if anchor_flash is not None:
-                    rollout2_chunks.append(anchor_flash.detach())
-                else:
-                    rollout2_chunks.append(anchor_chunk.detach())
+                # ``anchor_chunk`` is now the cleanest x0 estimate
+                # the rollout produced (t=60 refined when flash on,
+                # t=~178.6 finish-denoised when flash off). No need
+                # to override via ``_flash_dmd_gan_output`` — it would
+                # be the same tensor when flash is on, and a no-op
+                # fallback when flash is off.
+                rollout2_chunks.append(anchor_chunk.detach())
 
                 # 4) Transient streaming_state for the streaming loop.
                 clean_actions_window_r2 = ride_actions_window[
@@ -5551,6 +5849,13 @@ class ActionForcingDMD(SelfForcingModel):
         # safe even though step doesn't change within an iter; clearer
         # invariant).
         current_step = int(info.get("current_step", 0))
+        # Stash for the non-streaming ``generator_loss`` fallback —
+        # that path doesn't carry ``current_step`` in its signature,
+        # so any step-dependent resolver it touches (e.g.
+        # ``_resolved_stat_anchor_loss_weight``) reads this stash.
+        # Streaming path passes ``current_step`` explicitly so this
+        # stash is purely a safety net for the non-streaming path.
+        self._last_current_step = current_step
         aux_p = self._resolved_real_teacher_input_mix_gt_p(current_step)
 
         # Build clean_x_GT for every gen-step iter when EITHER:
@@ -5788,31 +6093,87 @@ class ActionForcingDMD(SelfForcingModel):
         # equivalent block in ``generator_loss``. Seed window is the
         # first ``cf_state`` frames of ``ride_latents_window``; pred is
         # the streaming chunk (= the rolled student x0 for this iter).
+        stat_anchor_w_resolved = self._resolved_stat_anchor_loss_weight(
+            current_step
+        )
+        dmd_log["stat_anchor_weight_resolved"] = float(stat_anchor_w_resolved)
+        # ``target_matching`` mode does not require seed_latents; we
+        # only need cf_state > 0 / ride_window check in the seed_anchor
+        # branch. The mode dispatch lives inside the gate so the call
+        # sequence stays identical (one ``compute_*`` call, same total
+        # add to dmd_loss).
+        _mode = getattr(self, "stat_anchor_mode", "seed_anchor")
         if (
-            getattr(self, "stat_anchor_loss_weight", 0.0) > 0.0
-            and cf_state > 0
-            and ride_window.shape[1] >= cf_state
+            stat_anchor_w_resolved > 0.0
+            and (
+                _mode == "target_matching"
+                or (cf_state > 0 and ride_window.shape[1] >= cf_state)
+            )
         ):
-            from model.anti_collapse import compute_stat_anchor_loss
             try:
-                seed_latents_stream = ride_window[:, :cf_state].detach()
-                stat_loss, stat_logs = compute_stat_anchor_loss(
-                    pred_x0=chunk.float(),
-                    seed_latents=seed_latents_stream.float(),
-                    STD_short_weight=self.stat_anchor_STD_short_weight,
-                    STD_long_weight=self.stat_anchor_STD_long_weight,
-                    M2_short_weight=self.stat_anchor_M2_short_weight,
-                    M2_long_weight=self.stat_anchor_M2_long_weight,
-                    TV_short_weight=self.stat_anchor_TV_short_weight,
-                    TV_long_weight=self.stat_anchor_TV_long_weight,
-                    rel_tol_short=self.stat_anchor_rel_tol_short,
-                    rel_tol_long=self.stat_anchor_rel_tol_long,
-                )
+                if _mode == "target_matching":
+                    from model.anti_collapse import (
+                        compute_stat_anchor_target_matching_loss,
+                    )
+                    stat_loss, stat_logs = (
+                        compute_stat_anchor_target_matching_loss(
+                            pred_x0=chunk.float(),
+                            M2_target=self.stat_anchor_target_M2,
+                            M2_band_low=self.stat_anchor_target_M2_band_low,
+                            M2_band_high=self.stat_anchor_target_M2_band_high,
+                            M2_weight=self.stat_anchor_target_M2_weight,
+                            TV_target=self.stat_anchor_target_TV,
+                            TV_band_low=self.stat_anchor_target_TV_band_low,
+                            TV_band_high=self.stat_anchor_target_TV_band_high,
+                            TV_weight=self.stat_anchor_target_TV_weight,
+                            rank_target=self.stat_anchor_target_rank,
+                            rank_band_high=(
+                                self.stat_anchor_target_rank_band_high
+                            ),
+                            rank_band_low=(
+                                self.stat_anchor_target_rank_band_low
+                            ),
+                            rank_weight=self.stat_anchor_target_rank_weight,
+                        )
+                    )
+                else:
+                    from model.anti_collapse import compute_stat_anchor_loss
+                    seed_latents_stream = ride_window[:, :cf_state].detach()
+                    # Long-horizon EMA anchor when enabled — see
+                    # ``_update_stat_anchor_long_ema`` for the
+                    # cross-rank averaging + running-mean rationale.
+                    long_STD_ov = long_M2_ov = long_TV_ov = None
+                    if self.stat_anchor_long_ema_enabled:
+                        (
+                            long_STD_ov,
+                            long_M2_ov,
+                            long_TV_ov,
+                        ) = self._update_stat_anchor_long_ema(
+                            seed_latents_stream
+                        )
+                    stat_loss, stat_logs = compute_stat_anchor_loss(
+                        pred_x0=chunk.float(),
+                        seed_latents=seed_latents_stream.float(),
+                        STD_short_weight=self.stat_anchor_STD_short_weight,
+                        STD_long_weight=self.stat_anchor_STD_long_weight,
+                        M2_short_weight=self.stat_anchor_M2_short_weight,
+                        M2_long_weight=self.stat_anchor_M2_long_weight,
+                        TV_short_weight=self.stat_anchor_TV_short_weight,
+                        TV_long_weight=self.stat_anchor_TV_long_weight,
+                        rel_tol_short=self.stat_anchor_rel_tol_short,
+                        rel_tol_long=self.stat_anchor_rel_tol_long,
+                        long_STD_anchor_override=long_STD_ov,
+                        long_M2_anchor_override=long_M2_ov,
+                        long_TV_anchor_override=long_TV_ov,
+                    )
                 stat_loss = (
-                    self.stat_anchor_loss_weight * stat_loss.to(dmd_loss.dtype)
+                    stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
                 )
                 dmd_loss = dmd_loss + stat_loss
                 dmd_log["stat_anchor_total"] = stat_loss.detach()
+                dmd_log["stat_anchor_mode"] = float(
+                    1.0 if _mode == "target_matching" else 0.0
+                )
                 for k, v in stat_logs.items():
                     dmd_log[k] = v
             except Exception as exc:
@@ -6533,6 +6894,99 @@ class ActionForcingDMD(SelfForcingModel):
     # LoRA training cadence; this function provides the every-gen-iter
     # student-gradient channel.
     # ------------------------------------------------------------------
+    def _update_stat_anchor_long_ema(
+        self, seed_latents: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cross-rank-average the current step's seed anchors and EMA-
+        update the long-horizon anchor buffers. Returns the current
+        EMA values as scalar tensors (detached) for use as the
+        long-horizon anchor in ``compute_stat_anchor_loss``.
+
+        The EMA buffer state is kept identical across ranks by
+        ``all_reduce``-ing the per-rank seed scalars before the EMA
+        update. Cold-start initialises buffers to the first step's
+        cross-rank mean.
+
+        Only called when ``stat_anchor_long_ema_enabled`` is True;
+        the caller is responsible for the gate.
+        """
+        from model.anti_collapse import (
+            _per_frame_STD, _per_frame_M2, _per_frame_TV,
+        )
+        with torch.no_grad():
+            seed = seed_latents.detach().float()
+            # Mean across (B, F_seed) → scalar per stat (one rank).
+            STD_step = _per_frame_STD(seed).mean()
+            M2_step = _per_frame_M2(seed).mean()
+            TV_step = _per_frame_TV(seed).mean()
+            # Cross-rank average so every rank holds the same EMA
+            # buffer state (loss computations must be identical).
+            if (
+                dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
+            ):
+                ws = float(dist.get_world_size())
+                STD_step = STD_step.clone()
+                M2_step = M2_step.clone()
+                TV_step = TV_step.clone()
+                dist.all_reduce(STD_step, op=dist.ReduceOp.SUM)
+                dist.all_reduce(M2_step, op=dist.ReduceOp.SUM)
+                dist.all_reduce(TV_step, op=dist.ReduceOp.SUM)
+                STD_step.div_(ws)
+                M2_step.div_(ws)
+                TV_step.div_(ws)
+            # EMA update. First call cold-starts the buffer at the
+            # current step's cross-rank mean (1-sample estimate).
+            w = float(self.stat_anchor_long_ema_weight)
+            if self._stat_anchor_STD_long_ema is None:
+                self._stat_anchor_STD_long_ema = STD_step.detach().clone()
+                self._stat_anchor_M2_long_ema = M2_step.detach().clone()
+                self._stat_anchor_TV_long_ema = TV_step.detach().clone()
+            else:
+                self._stat_anchor_STD_long_ema = (
+                    w * self._stat_anchor_STD_long_ema
+                    + (1.0 - w) * STD_step
+                ).detach()
+                self._stat_anchor_M2_long_ema = (
+                    w * self._stat_anchor_M2_long_ema
+                    + (1.0 - w) * M2_step
+                ).detach()
+                self._stat_anchor_TV_long_ema = (
+                    w * self._stat_anchor_TV_long_ema
+                    + (1.0 - w) * TV_step
+                ).detach()
+        return (
+            self._stat_anchor_STD_long_ema,
+            self._stat_anchor_M2_long_ema,
+            self._stat_anchor_TV_long_ema,
+        )
+
+    def _resolved_stat_anchor_loss_weight(self, current_step: int) -> float:
+        """Return the effective stat_anchor loss weight at this step.
+
+        Below ``stat_anchor_rampdown_start_step``: full weight.
+        In ``[start, start + rampdown_steps)``: linear ramp from full
+        weight down to 0.
+        From ``start + rampdown_steps`` onward: 0.
+
+        Defaults (``rampdown_steps=0``) collapse to a constant
+        ``stat_anchor_loss_weight`` for backward compatibility.
+        """
+        full = float(self.stat_anchor_loss_weight)
+        rampdown_steps = int(self.stat_anchor_rampdown_steps)
+        if rampdown_steps <= 0 or full == 0.0:
+            return full
+        s = int(current_step)
+        start = int(self.stat_anchor_rampdown_start_step)
+        if s < start:
+            return full
+        if s >= start + rampdown_steps:
+            return 0.0
+        # Linear ramp from full at s=start to 0 at s=start+rampdown_steps.
+        progress = float(s - start) / float(rampdown_steps)
+        return full * (1.0 - progress)
+
     def _resolved_dmd_loss_weight(self, current_step: int) -> float:
         """Return the effective DMD loss weight at this step.
 
@@ -7149,9 +7603,20 @@ class ActionForcingDMD(SelfForcingModel):
         # chunk / blend per ``real_teacher_input_source``) and the
         # Gaussian sample ``eps`` at timestep ``t``. The FlowPredLoss
         # target uses the SAME ``eps`` so target = eps - gt_target.
+        # ``aux_noisy_from_raw_gt=True`` overrides this and uses the
+        # raw ``gt_target`` instead of the (CARN-noised / alt-head-
+        # shaped) ``noise_base``, decoupling the noisy_input from any
+        # shaping applied to ``clean_x_for_real`` upstream. The clean
+        # reference (``clean_x_for_real``) keeps its CARN/alt-head
+        # shaping per ``aux_real_clean_x_source``. See the knob's
+        # registration in ``__init__`` for the full rationale.
         gradient_mask_flat = gradient_mask_eff.flatten(0, 1)
+        _noisy_base = (
+            gt_target if getattr(self, "aux_noisy_from_raw_gt", False)
+            else noise_base
+        )
         noisy_input = self.scheduler.add_noise(
-            noise_base.flatten(0, 1),
+            _noisy_base.flatten(0, 1),
             eps.flatten(0, 1),
             t.flatten(0, 1),
         ).unflatten(0, chunk.shape[:2])
@@ -7266,6 +7731,12 @@ class ActionForcingDMD(SelfForcingModel):
         log["_aux_teacher_tensors"] = {
             "lora_x0": _x0,
             "lora_state_preds": lora_state_preds,
+            # Detached GT slice the LoRA was trained to predict this
+            # iter. Surfaced so the trainer can compute disc-borrowed
+            # regularisers (``aux_teacher_disc_adv_weight`` /
+            # ``aux_teacher_disc_feat_weight``) on (lora_x0, gt_target)
+            # without re-slicing the ride window.
+            "gt_target": gt_target.detach(),
         }
         return loss, log
 
