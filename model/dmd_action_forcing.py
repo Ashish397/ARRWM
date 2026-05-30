@@ -237,6 +237,27 @@ class ActionForcingDMD(SelfForcingModel):
         # 1-chunk 42f hit (gradient taken at the unreliable last slot).
         # Only consulted when ``dmd_42f_enabled`` is True.
         self.dmd_42f_2chunk = bool(getattr(args, "dmd_42f_2chunk", False))
+        # ``dmd_42f_num_chunks`` (>=1): roll this many student chunks into
+        # the noisy half and supervise all but the newest (which is masked
+        # at the OOD slot). 1 = original 42f; 2 = the 2-chunk fix (supervise
+        # 1); 3 = supervise 2 reliable chunks (denser DMD signal). Overrides
+        # ``dmd_42f_2chunk`` when > 0.
+        self.dmd_42f_num_chunks = int(getattr(args, "dmd_42f_num_chunks", 0))
+        # ``dmd_42f_seed_last``: replace the masked (newest) STUDENT
+        # chunk(s) in the noisy half with GT, so the supervised student
+        # chunk is scaffolded by clean GT on BOTH temporal sides (GT
+        # context before + GT after) instead of a drifted student chunk
+        # after it. e.g. ns=2 -> noisy = [5 GT | student | 1 GT].
+        self.dmd_42f_seed_last = bool(getattr(args, "dmd_42f_seed_last", False))
+        # ``dmd_42f_gt_after_chunks`` (>0, requires seed_last): number of GT
+        # chunks placed AFTER the supervised student chunk, overriding the
+        # default (ns - num_sup). Moves the supervised chunk further from
+        # the structurally-OOD newest slot RoPE [21,24). e.g. with one
+        # supervised chunk, =1 -> 2nd-from-last (RoPE [18,21)); =2 ->
+        # 3rd-from-last (RoPE [15,18)), noisy = [4 GT | student | 2 GT].
+        self.dmd_42f_gt_after_chunks = int(
+            getattr(args, "dmd_42f_gt_after_chunks", 0)
+        )
 
         # ``dmd_only_first_chunk_per_ride``: pair with
         # ``max_rolls_per_ride > 1`` to roll the student N causal
@@ -5286,10 +5307,43 @@ class ActionForcingDMD(SelfForcingModel):
         s = self.streaming_state
         npb = int(self.num_frame_per_block)
         N = int(self.num_training_frames)          # 21
-        two_chunk = bool(getattr(self, "dmd_42f_2chunk", False))
-        ns = 2 if two_chunk else 1                 # rolled student chunks
-        student_frames = ns * npb                  # 6 (2-chunk) or 3
-        n_ctx = N - student_frames                 # 15 (2-chunk) or 18 GT ctx
+        # ``ns`` = number of student chunks rolled into the noisy half.
+        # ``dmd_42f_num_chunks`` (>=1) takes precedence; the legacy
+        # ``dmd_42f_2chunk`` boolean maps to ns=2.
+        ns = int(getattr(self, "dmd_42f_num_chunks", 0))
+        if ns <= 0:
+            ns = 2 if bool(getattr(self, "dmd_42f_2chunk", False)) else 1
+        ns = max(1, ns)
+        # Supervise ALL student chunks EXCEPT the newest (which lands at
+        # the structurally-OOD slot RoPE [21,24) and is masked). For ns=1
+        # there is only one chunk, so it IS supervised (the original 42f).
+        num_sup = 1 if ns == 1 else (ns - 1)
+        sup_frames = num_sup * npb
+        student_frames = ns * npb                  # rolled student frames
+        seed_last = bool(getattr(self, "dmd_42f_seed_last", False))
+        # Number of GT chunks placed AFTER the supervised student block.
+        # Default: the (ns - num_sup) newest chunks (masked, or GT under
+        # seed_last). ``dmd_42f_gt_after_chunks`` (>0) overrides this to
+        # move the supervised chunk further from the structurally-OOD
+        # newest slot RoPE [21,24): e.g. =2 places the single student
+        # chunk 3rd-from-last (RoPE [15,18)) with TWO GT chunks after it.
+        gt_after_override = int(getattr(self, "dmd_42f_gt_after_chunks", 0))
+        if gt_after_override > 0:
+            if not seed_last:
+                raise RuntimeError(
+                    "42f DMD: dmd_42f_gt_after_chunks requires "
+                    "dmd_42f_seed_last=true (the after-block must be GT)."
+                )
+            gt_after_frames = gt_after_override * npb
+        else:
+            gt_after_frames = student_frames - sup_frames
+        n_ctx = N - sup_frames - gt_after_frames   # GT context frames
+        if n_ctx < 0:
+            raise RuntimeError(
+                f"42f DMD: n_ctx={n_ctx} < 0 (sup_frames={sup_frames}, "
+                f"gt_after_frames={gt_after_frames}, N={N}). Reduce "
+                f"dmd_42f_gt_after_chunks or num_chunks."
+            )
         cf = int(s["cf"])
         noisy_start_sdn = int(
             s["current_length"] - info["new_frames"] - info["overlap"]
@@ -5297,10 +5351,10 @@ class ActionForcingDMD(SelfForcingModel):
         chunk_lo = cf + noisy_start_sdn            # first student chunk's abs pos
         ride_lat = s["ride_latents_window"]
         ride_act = s["ride_actions_window"]
-        # noisy half abs span [chunk_lo - n_ctx, chunk_lo + student_frames)
-        # (21 frames); clean half shifted back npb from noisy.
+        # noisy half abs span [chunk_lo - n_ctx, chunk_lo + sup_frames +
+        # gt_after_frames) (21 frames); clean half shifted back npb.
         noisy_lo = chunk_lo - n_ctx
-        noisy_hi = chunk_lo + student_frames
+        noisy_hi = chunk_lo + sup_frames + gt_after_frames
         clean_lo = noisy_lo - npb                  # = chunk_lo - n_ctx - npb
         if clean_lo < 0:
             raise RuntimeError(
@@ -5313,15 +5367,38 @@ class ActionForcingDMD(SelfForcingModel):
                 f"42f DMD: ride window too short — need >= {need} frames, "
                 f"have lat={int(ride_lat.shape[1])} act={int(ride_act.shape[1])}."
             )
-        # noisy_x: n_ctx GT context (detached) + ns student chunks. ONLY
-        # the FIRST student chunk (chunk[:, :npb]) is graph-on (supervised);
-        # the rest (the newest, masked) are detached context.
+        # The student ``chunk`` must supply the supervised frames, plus the
+        # detached tail frames when NOT seed_last (seed_last sources its
+        # after-block from GT ``ride_lat`` instead). Guard explicitly so a
+        # mis-set num_chunks / short rollout fails loud, not via an opaque
+        # out-of-bounds slice below.
+        chunk_need = sup_frames if seed_last else (sup_frames + gt_after_frames)
+        if int(chunk.shape[1]) < chunk_need:
+            raise RuntimeError(
+                f"42f DMD: student chunk has {int(chunk.shape[1])} frames "
+                f"but {chunk_need} required (sup_frames={sup_frames}, "
+                f"seed_last={seed_last}, gt_after_frames={gt_after_frames})."
+            )
+        # noisy_x: n_ctx GT context (detached) + the first ``sup_frames``
+        # student frames (graph-on, supervised) + the newest chunk(s)
+        # (detached, masked context). The supervised chunks sit at the
+        # reliable mid-window slots; the newest is at [21,24) (masked).
         gt_ctx = ride_lat[:, noisy_lo:chunk_lo].to(
             dtype=chunk.dtype, device=chunk.device,
         ).detach()
-        parts = [gt_ctx, chunk[:, :npb]]
-        if ns >= 2:
-            parts.append(chunk[:, npb:student_frames].detach())
+        parts = [gt_ctx, chunk[:, :sup_frames]]
+        if gt_after_frames > 0:
+            if seed_last:
+                # GT scaffold AFTER the supervised chunk (clean both
+                # sides) instead of the masked newest STUDENT chunk(s).
+                gt_after = ride_lat[
+                    :, chunk_lo + sup_frames : chunk_lo + sup_frames + gt_after_frames,
+                ].to(dtype=chunk.dtype, device=chunk.device).detach()
+                parts.append(gt_after)
+            else:
+                parts.append(
+                    chunk[:, sup_frames:sup_frames + gt_after_frames].detach()
+                )
         noisy_x = torch.cat(parts, dim=1)          # [B, 21, ...]
         clean_x = ride_lat[:, clean_lo:clean_lo + N].to(
             dtype=chunk.dtype, device=chunk.device,
@@ -5345,11 +5422,11 @@ class ActionForcingDMD(SelfForcingModel):
         aug_t = torch.zeros(
             (clean_x.shape[0], N), device=chunk.device, dtype=torch.long,
         )
-        # Gradient ONLY on the supervised (first) student chunk, which is
-        # at noisy positions [n_ctx, n_ctx+npb): the LAST npb for ns=1, the
-        # SECOND-TO-LAST npb for ns=2.
+        # Gradient on the supervised student frames only (noisy positions
+        # [n_ctx, n_ctx + sup_frames)): the single chunk for ns=1, the
+        # first (ns-1) chunks for ns>=2 (the newest is masked).
         gradient_mask = torch.zeros_like(noisy_x, dtype=torch.bool)
-        gradient_mask[:, n_ctx:n_ctx + npb] = True
+        gradient_mask[:, n_ctx:n_ctx + sup_frames] = True
         return {
             "noisy_x": noisy_x,
             "clean_x": clean_x,
