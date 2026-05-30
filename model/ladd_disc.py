@@ -25,8 +25,7 @@ References (cloned in ``references/``):
 
 Overall flow per gen-step iter:
     1. Build adjacent-chunk pairs from the gen-side rollout output
-       (``pred_image`` or ``flash_dmd_gan_x0``; same source as the
-       existing R3GAN SAM2 path).
+       (``pred_image`` or ``flash_dmd_gan_x0``).
     2. Re-noise each chunk member at ``flash_dmd_gan_t`` (when
        flash-DMD is enabled) or at the DMD step's ``t`` (otherwise).
     3. ``WanFeatureProjector`` runs a single ``no_grad``-on-teacher

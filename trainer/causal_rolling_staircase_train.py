@@ -51,7 +51,9 @@ except Exception:  # pragma: no cover
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from model.dmd2b2blam_staircase import DMD2B2BLAM_Staircase
+# Legacy DMD2B2BLAM_Staircase model removed. Subclasses (ActionForcingDMDTrainer
+# being the only live one) override ``_build_model`` to instantiate their own
+# DMD class (e.g. ``ActionForcingDMD``).
 from pipeline.rolling_staircase_training import (
     RollingStaircaseTrainingPipeline,
     RollingStepOutput,
@@ -351,95 +353,12 @@ class RollingStaircaseDMDTrainer:
             )
 
     def _build_model(self) -> None:
-        # Alias a few config fields expected by the DMD model's `__init__`
-        # (derived from BaseModel). The base model reads `args` via attribute
-        # access, and OmegaConf's DictConfig supports that pattern.
-        args = self.config
-        if not hasattr(args, "text_pre_encoded"):
-            OmegaConf.update(args, "text_pre_encoded", True, merge=True)
-        if not hasattr(args, "mixed_precision"):
-            OmegaConf.update(args, "mixed_precision", self.use_mixed_precision, merge=True)
-
-        model = DMD2B2BLAM_Staircase(args=args, device=self.device)
-        # Ensure the modules and projection are on device+dtype.
-        model.generator.model.to(device=self.device, dtype=self.dtype)
-        model.fake_score.model.to(device=self.device, dtype=self.dtype)
-        model.real_score.model.to(device=self.device, dtype=self.dtype)
-        if model.action_projection is not None:
-            model.action_projection.to(device=self.device, dtype=self.dtype)
-        # Auxiliary probe / critic live on the generator wrapper (not on
-        # ``generator.model``), so the .to(dtype) above does not touch them.
-        # Their LayerNorm / Linear weights stay at the default dtype (fp32)
-        # and crash with "expected scalar type BFloat16 but found Float"
-        # when called inside the bf16 autocast context during training.
-        # Cast explicitly here to match the DiT's dtype.
-        if getattr(model, "state_probe", None) is not None:
-            model.state_probe.to(device=self.device, dtype=self.dtype)
-        if getattr(model, "action_critic", None) is not None:
-            model.action_critic.to(device=self.device, dtype=self.dtype)
-        # The VAE is used only by the action teacher and the visualizer —
-        # neither path does a manual .to(). Keep it in fp32 (it's loaded
-        # that way and has fp32 conv biases; casting to bf16 breaks the
-        # upstream VAE decoder), but ensure it's on the correct GPU.
-        if getattr(model, "vae", None) is not None:
-            try:
-                model.vae.to(device=self.device)
-            except AttributeError:
-                # Some VAE wrappers expose ``.model`` instead of being nn.Modules.
-                inner_vae = getattr(model.vae, "model", None)
-                if inner_vae is not None:
-                    inner_vae.to(device=self.device)
-        self.model = model
-
-        # Wrap generator's inner DiT with DDP for data-parallel training.
-        # `debug_find_unused_parameters` is a dev-only flag; when True, DDP
-        # walks the graph each backward and errors on rank-asymmetric
-        # parameter touches — useful for catching conditional branches
-        # that silently break the `no_sync` accumulation pattern. Flip
-        # back to False for production throughput once clean.
-        debug_fup = bool(getattr(self.config, "debug_find_unused_parameters", False))
-        self.generator_ddp: Optional[DDP] = None
-        self.fake_score_ddp: Optional[DDP] = None
-        if self.world_size > 1:
-            self.generator_ddp = DDP(
-                model.generator.model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=debug_fup,
-                broadcast_buffers=False,
-            )
-            if debug_fup and self.is_main_process:
-                logging.warning(
-                    "DDP find_unused_parameters=True (debug mode). "
-                    "Expect ~5-15%% slower backwards; disable for prod."
-                )
-            # Swap: the pipeline needs to call model.generator(...) (the wrapper),
-            # which in turn calls `model.generator.model` — so we redirect that
-            # attribute to the DDP-wrapped module. Since the wrapper uses
-            # `self.model(...)` internally, we need to point the wrapper's
-            # `.model` attribute to the DDP wrapper. WanDiffusionWrapper
-            # treats `self.model` as the inner module directly.
-            model.generator.model = self.generator_ddp  # type: ignore
-
-            # Fake-score DDP: only wrap if fake-score updates are enabled
-            # for this remit. When frozen we save the allreduce cost by
-            # skipping DDP entirely (params have requires_grad=False and
-            # no grads would be produced).
-            if bool(getattr(self.config, "fake_score_updates_enabled", False)):
-                # Fake-score forward touches DIFFERENT parameters depending
-                # on which slot (and whether CFG is on) — we enable
-                # find_unused_parameters to be safe here, gated on the
-                # same debug flag. With shared forward (Option A) all
-                # params are in a single forward → no unused-param issue
-                # in practice; this is belt-and-braces.
-                self.fake_score_ddp = DDP(
-                    model.fake_score.model,
-                    device_ids=[self.local_rank],
-                    output_device=self.local_rank,
-                    find_unused_parameters=debug_fup,
-                    broadcast_buffers=False,
-                )
-                model.fake_score.model = self.fake_score_ddp  # type: ignore
+        raise NotImplementedError(
+            "RollingStaircaseDMDTrainer._build_model is abstract — the "
+            "legacy DMD2B2BLAM_Staircase model has been removed. Subclasses "
+            "must override _build_model and set self.model to their own "
+            "DMD class (e.g. ActionForcingDMD)."
+        )
 
     def _build_pipeline(self) -> None:
         cfg = self.config

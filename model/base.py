@@ -11,7 +11,6 @@ from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from model.action_model_patch import (
     apply_action_patches, apply_action_patches_critic,
-    apply_tf_only_patches_critic,
 )
 from model.action_modulation import ActionModulationProjection, ActionTokenProjection
 
@@ -172,24 +171,19 @@ class BaseModel(nn.Module):
         real_k = int(getattr(args, "real_score_num_gt_chunks", 2))
         real_scorer_num_frames = (real_k + 2) * npb
         fake_scorer_num_frames = 4 * npb
-        # Foreign-size real_score (e.g. Wan2.1-T2V-14B): the wrapper
-        # default ``timestep_shift=8.0`` is wrong for stock Wan2.1-T2V
-        # models, which are canonically used with shift=5.0 (see
-        # Wan-AI docs + Causal-Forcing's reference config). The 1.3B
-        # path is tolerated because the v14 LoRA was tuned around the
-        # 8.0 schedule that the legacy wrapper produced. A foreign
-        # teacher has no equivalent tuning — its scheduler must match
-        # its training schedule. Read from top-level ``timestep_shift``
-        # config (= 5.0 in action_forcing_phase1.yaml) when foreign.
-        real_score_kwargs = {
-            "model_name": self.real_model_name,
-            "is_causal": False,
-        }
+        # Same-size teacher only (Wan2.1-T2V-1.3B + v14 LoRA). The
+        # foreign-size (14B) path that used apply_tf_only_patches_critic
+        # has been removed — both wrappers use the 1.3B model.
         if self.real_model_name != self.fake_model_name:
-            cfg_shift = getattr(args, "timestep_shift", None)
-            if cfg_shift is not None:
-                real_score_kwargs["timestep_shift"] = float(cfg_shift)
-        self.real_score = WanDiffusionWrapper(**real_score_kwargs)
+            raise RuntimeError(
+                f"real_score / fake_score must be the same model "
+                f"(foreign-teacher path removed); got "
+                f"real={self.real_model_name!r} fake={self.fake_model_name!r}."
+            )
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name,
+            is_causal=False,
+        )
         # Override the wrapper's spatial-only ``_base_seq_len`` (default
         # 32760 = 21 * 1560) to match the scorer's actual DMD input
         # window. ``adjust_seq_len_for_action_tokens`` reads from
@@ -197,25 +191,7 @@ class BaseModel(nn.Module):
         # top — must happen AFTER this reset.
         self.real_score._base_seq_len = real_scorer_num_frames * 1560
         self.real_score.seq_len = self.real_score._base_seq_len
-        # Dispatch: same-size teacher gets the legacy action patch
-        # (Stream A + B + TF). Foreign-size teacher (e.g. real_score =
-        # Wan2.1-T2V-14B while generator = 1.3B) gets the TF-only
-        # patch — clean_x concat with linear RoPE, NO action tokens
-        # (would have the wrong hidden dim) and NO Stream A modulation
-        # (same reason). The TF-only path keeps the 14B's "21 frames
-        # of past GT context + 21 noisy frames" forward in-distribution
-        # for a stock T2V model. ``self.is_foreign_real_teacher`` is
-        # also surfaced on ``self`` so dmd_action_forcing's
-        # ``_build_dmd_context_kwargs`` can switch sc_clean_x_real to
-        # the past-frame builder when this is True.
-        self.is_foreign_real_teacher = (
-            self.real_model_name != self.fake_model_name
-        )
-        real_action_patch_active = (
-            self._action_patch_enabled
-            and not self.is_foreign_real_teacher
-        )
-        if real_action_patch_active:
+        if self._action_patch_enabled:
             apply_action_patches_critic(self.real_score)
             self.real_score.model.action_tokens_per_frame = 1
             self.real_score.adjust_seq_len_for_action_tokens(
@@ -227,29 +203,12 @@ class BaseModel(nn.Module):
                     "!= 1 after Stream B wiring — the DiT will run at "
                     "1560/frame instead of the trained 1561/frame."
                 )
-        elif self.is_foreign_real_teacher:
-            apply_tf_only_patches_critic(self.real_score)
-            # TF-only path: action_tokens_per_frame stays 0; seq_len
-            # stays at the spatial-only base (no action-token slots).
         self.real_score.model.requires_grad_(False)
 
-        # Mirror the real-score wrapper-shift fix for fake_score when
-        # the foreign-teacher path is active. The system's noise
-        # schedule (= generator's scheduler at cfg.timestep_shift) is
-        # used by self.scheduler.add_noise everywhere; pred_fake and
-        # pred_real must convert flow↔x0 under the SAME shift or the
-        # DMD gradient direction (pred_fake - pred_real) is
-        # miscalibrated across the two terms. Same cfg.timestep_shift
-        # override as real_score above.
-        fake_score_kwargs = {
-            "model_name": self.fake_model_name,
-            "is_causal": False,
-        }
-        if self.is_foreign_real_teacher:
-            cfg_shift = getattr(args, "timestep_shift", None)
-            if cfg_shift is not None:
-                fake_score_kwargs["timestep_shift"] = float(cfg_shift)
-        self.fake_score = WanDiffusionWrapper(**fake_score_kwargs)
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name,
+            is_causal=False,
+        )
         # See the matching comment on ``real_score`` above — size the
         # fake-score wrapper's seq_len to the DMD batched window.
         self.fake_score._base_seq_len = fake_scorer_num_frames * 1560

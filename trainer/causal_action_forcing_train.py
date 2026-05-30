@@ -228,8 +228,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # (their forwards are detached at the gen-grad path).
         # Configurable per knob below.
         gen_grad_ckpt = bool(
-            getattr(args, "gen_gradient_checkpointing",
-                    bool(getattr(args, "gan_sam2_distilled_critic", False)))
+            getattr(args, "gen_gradient_checkpointing", False)
         )
         rs_grad_ckpt = bool(
             getattr(args, "real_score_gradient_checkpointing", False)
@@ -592,29 +591,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_enabled = bool(getattr(self.config, "gan_enabled", False))
         self.r3gan_disc: Optional[torch.nn.Module] = None
         self.r3gan_disc_ddp: Optional[DDP] = None
-        # Distilled-critic mode wraps ``disc.heads_module`` instead of
-        # the full disc to give DDP a clean, fully-trainable submodule
-        # (the frozen SAM2 encoder is left un-wrapped). Only set when
-        # ``gan_sam2_distilled_critic=True`` and world_size > 1.
-        self.r3gan_heads_ddp: Optional[DDP] = None
         # ``gan_backbone`` selects the discriminator architecture:
         #   * "latent_3d_conv" (default, legacy) — 3D ConvNet on the
         #     student's latent video. Cheap, no VAE decode required.
-        #   * "sam2_pixel" — Flash-DMD-style frozen SAM2 image encoder
-        #     on VAE-decoded pixel video, with multiple trainable
-        #     heads on the Hiera FPN. Paper-aligned, video-aware via
-        #     SAM2's segmentation pretraining; catches structural
-        #     failure modes (road edges, vehicle outlines, lane
-        #     markings) the latent disc misses.
+        #   * "ladd_teacher_feat" — LADD adjacent-chunk discriminator
+        #     on WAN teacher intermediate features.
         self.gan_backbone = str(
             getattr(self.config, "gan_backbone", "latent_3d_conv")
         )
         if self.gan_backbone not in (
-            "latent_3d_conv", "sam2_pixel", "ladd_teacher_feat",
+            "latent_3d_conv", "ladd_teacher_feat",
         ):
             raise ValueError(
                 "gan_backbone must be one of 'latent_3d_conv' | "
-                "'sam2_pixel' | 'ladd_teacher_feat'; got "
+                "'ladd_teacher_feat'; got "
                 f"{self.gan_backbone!r}."
             )
         if self.gan_enabled:
@@ -654,173 +644,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         n_params / 1e6,
                         self.r3gan_disc_ddp is not None,
                     )
-            elif self.gan_backbone == "sam2_pixel":
-                from model.r3gan_sam2 import R3GANDiscriminatorSAM2Pixel
-                sam2_ckpt = getattr(
-                    self.config, "gan_sam2_checkpoint_path", None,
-                )
-                sam2_cfg = getattr(
-                    self.config, "gan_sam2_config_path", None,
-                )
-                if sam2_ckpt is None or sam2_cfg is None:
-                    raise ValueError(
-                        "gan_backbone=sam2_pixel requires "
-                        "gan_sam2_checkpoint_path and gan_sam2_config_path "
-                        "to be set in the config."
-                    )
-                resolution = int(
-                    getattr(self.config, "gan_sam2_resolution", 512)
-                )
-                # All-fp32 SAM2 path: R1/R2 second-order penalties are
-                # numerically unstable under bf16 (the original latent
-                # disc was explicitly all-fp32 for the same reason).
-                # Memory cost is +~80 MB params + ~2× activation vs
-                # bf16 — comfortably within budget on Hiera-B+.
-                preserve_aspect = bool(
-                    getattr(self.config, "gan_sam2_preserve_aspect", True)
-                )
-                pad_to_square = bool(
-                    getattr(self.config, "gan_sam2_pad_to_square", False)
-                )
-                frame_pool = str(
-                    getattr(self.config, "gan_sam2_frame_pool", "mean")
-                )
-                frame_pool_topk = int(
-                    getattr(self.config, "gan_sam2_frame_pool_topk", 4)
-                )
-                # Per-frame chunking of the SAM2 encoder forward. With
-                # 84 pixel frames per gen step at 512×512 input, the
-                # encoder's transient activations were the largest
-                # contributor to the GAN distilled-critic peak segment.
-                # Splitting into ``encoder_chunk_size``-sized chunks
-                # along the batched-frame axis cuts that transient
-                # ~84/chunk×; semantically transparent (SAM2 encoder
-                # is per-frame only). Default 0 = no chunking.
-                encoder_chunk_size = int(
-                    getattr(self.config, "gan_sam2_encoder_chunk_size", 0)
-                )
-                disc = R3GANDiscriminatorSAM2Pixel(
-                    sam2_checkpoint_path=str(sam2_ckpt),
-                    sam2_config_path=str(sam2_cfg),
-                    image_resolution=resolution,
-                    device=self.device,
-                    dtype=torch.float32,
-                    preserve_aspect=preserve_aspect,
-                    pad_to_square=pad_to_square,
-                    frame_pool=frame_pool,
-                    frame_pool_topk=frame_pool_topk,
-                    encoder_chunk_size=encoder_chunk_size,
-                )
-                disc.train()  # heads → train; encoder pinned to eval
-                              # via overridden train() in the class
-                self.r3gan_disc = disc
-                # Distilled-critic mode determines DDP-wrap topology:
-                #   * Legacy mode (False): wrap the FULL disc with
-                #     find_unused_parameters=True (frozen SAM2 encoder
-                #     has no grad → "unused").
-                #   * Distilled mode (True): the distilled D-update
-                #     calls heads-only forward; if we wrapped the full
-                #     disc, the heads forward would bypass the wrapper's
-                #     forward-tracking and DDP all-reduce would NOT
-                #     fire on backward (silent rank divergence). Wrap
-                #     ONLY ``heads_module`` instead. The frozen encoder
-                #     stays un-wrapped; no DDP needed (no trainable
-                #     params).
-                self.gan_sam2_distilled_critic = bool(
-                    getattr(self.config, "gan_sam2_distilled_critic", False)
-                )
-                self.r3gan_heads_ddp = None
-                if self.world_size > 1:
-                    if self.gan_sam2_distilled_critic:
-                        # Heads-only DDP wrap. find_unused_parameters
-                        # can be False here because every head is
-                        # always exercised in the distilled D-update.
-                        self.r3gan_heads_ddp = DDP(
-                            disc.heads_module,
-                            device_ids=[self.local_rank],
-                            output_device=self.local_rank,
-                            find_unused_parameters=False,
-                            broadcast_buffers=False,
-                        )
-                    else:
-                        # Legacy: full-disc DDP wrap (frozen encoder
-                        # forces find_unused_parameters=True).
-                        self.r3gan_disc_ddp = DDP(
-                            disc,
-                            device_ids=[self.local_rank],
-                            output_device=self.local_rank,
-                            find_unused_parameters=True,
-                            broadcast_buffers=False,
-                        )
-                if self.is_main_process:
-                    n_total = sum(p.numel() for p in disc.parameters())
-                    n_train = sum(
-                        p.numel() for p in disc.parameters()
-                        if p.requires_grad
-                    )
-                    ddp_kind = (
-                        "heads-only"
-                        if self.r3gan_heads_ddp is not None
-                        else (
-                            "full-disc"
-                            if self.r3gan_disc_ddp is not None
-                            else "no"
-                        )
-                    )
-                    logging.info(
-                        "[ActionForcing] R3GAN-SAM2 discriminator built (ADM 2D heads): "
-                        "ckpt=%s cfg=%s resolution=%d "
-                        "params_total=%.2fM params_trainable=%.2fM (DDP=%s)",
-                        sam2_ckpt, sam2_cfg, resolution,
-                        n_total / 1e6, n_train / 1e6, ddp_kind,
-                    )
-
-                # SAM2-distilled latent critic (Sobolev-style value+gradient
-                # distillation). When enabled, the pixel-space disc is no
-                # longer in the gen's autograd graph — instead this small
-                # latent-space critic is trained to match BOTH the disc's
-                # logit values AND its gradient field w.r.t. the input
-                # latent, and the gen gets its GAN gradient from the critic.
-                # See ``model/latent_sam2_critic.py`` for the architecture.
-                self.latent_critic = None
-                self.latent_critic_ddp = None
-                self.latent_critic_optimizer = None
-                if self.gan_sam2_distilled_critic:
-                    from model.latent_sam2_critic import LatentSAM2Critic
-                    critic_hidden = int(
-                        getattr(self.config, "gan_critic_hidden", 512)
-                    )
-                    critic_num_blocks = int(
-                        getattr(self.config, "gan_critic_num_blocks", 4)
-                    )
-                    critic_in_channels = 16  # WAN VAE latent channel count
-                    self.latent_critic = LatentSAM2Critic(
-                        in_channels=critic_in_channels,
-                        d_model=critic_hidden,
-                        num_blocks=critic_num_blocks,
-                        frame_pool=frame_pool,
-                        frame_pool_topk=frame_pool_topk,
-                    ).to(device=self.device, dtype=torch.float32)
-                    self.latent_critic.train()
-                    if self.world_size > 1:
-                        self.latent_critic_ddp = DDP(
-                            self.latent_critic,
-                            device_ids=[self.local_rank],
-                            output_device=self.local_rank,
-                            find_unused_parameters=False,
-                            broadcast_buffers=False,
-                        )
-                    if self.is_main_process:
-                        n_critic = self.latent_critic.num_params
-                        logging.info(
-                            "[ActionForcing] LatentSAM2Critic built: "
-                            "d_model=%d num_blocks=%d num_params=%.2fM "
-                            "frame_pool=%s (DDP=%s)",
-                            critic_hidden, critic_num_blocks,
-                            n_critic / 1e6, frame_pool,
-                            self.latent_critic_ddp is not None,
-                        )
-
             elif self.gan_backbone == "ladd_teacher_feat":
                 # ===== LADD adjacent-chunk discriminator (v28) =====
                 # Frozen WAN-teacher feature taps + trainable CCM/CSM
@@ -1039,16 +862,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         n_total / 1e6, n_train / 1e6,
                         self.r3gan_disc_ddp is not None,
                     )
-                # LADD does not use a separate LatentSAM2Critic — the
-                # disc itself is small/cheap enough to use as both the
-                # critic and the disc. Mark the critic slots None so
-                # the distilled-critic path is skipped.
-                self.latent_critic = None
-                self.latent_critic_ddp = None
-                self.latent_critic_optimizer = None
-                # Force-set the gan_sam2_distilled_critic flag false
-                # so the SAM2-only distillation path doesn't fire.
-                self.gan_sam2_distilled_critic = False
 
 
         # ------------------------------------------------------------------
@@ -1121,106 +934,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
 
 
-        # ===== Dense perceptual approximators (independent of GAN) =====
-        # mse / lpips / msssim / maniqa — all share the PerceptualApprox
-        # 3D-CNN architecture, differ only in their training target.
-        # MOVED out of ``if gan_enabled:`` (v28): the build only depends
-        # on the corresponding ``*_loss_weight > 0`` gate. Previously
-        # this lived inside ``elif gan_backbone == sam2_pixel:`` which
-        # silently disabled MANIQA in no-GAN configs.
-        self.mse_approx = None
-        self.mse_approx_ddp = None
-        self.mse_approx_optimizer = None
-        self.lpips_approx = None
-        self.lpips_approx_ddp = None
-        self.lpips_approx_optimizer = None
-        self.msssim_approx = None
-        self.msssim_approx_ddp = None
-        self.msssim_approx_optimizer = None
-        self.maniqa_approx = None
-        self.maniqa_approx_ddp = None
-        self.maniqa_approx_optimizer = None
-        self.gan_d_approx = None
-        self.gan_d_approx_ddp = None
-        self.gan_d_approx_optimizer = None
-        self._lpips_target_model = None  # lazy-built no_grad LPIPS
-        self._maniqa_target_model = None  # lazy-built no_grad MANIQA
-        _approx_d_model = int(
-            getattr(self.config, "perceptual_approx_d_model", 256)
-        )
-        _approx_num_blocks = int(
-            getattr(self.config, "perceptual_approx_num_blocks", 4)
-        )
-        _need_mse_approx = float(
-            getattr(self.config, "mse_approx_loss_weight", 0.0)
-        ) > 0
-        _need_lpips_approx = float(
-            getattr(self.config, "lpips_approx_loss_weight", 0.0)
-        ) > 0
-        _need_msssim_approx = float(
-            getattr(self.config, "msssim_approx_loss_weight", 0.0)
-        ) > 0
-        _need_maniqa_approx = float(
-            getattr(self.config, "maniqa_approx_loss_weight", 0.0)
-        ) > 0
-        _need_gan_d_approx = False  # gan_d_approx is now LatentSAM2Critic
-        if (
-            _need_mse_approx or _need_lpips_approx
-            or _need_msssim_approx or _need_maniqa_approx
-            or _need_gan_d_approx
-        ):
-            from model.perceptual_approx import PerceptualApprox
-
-            def _build_approx(name: str, single_input: bool = False):
-                m = PerceptualApprox(
-                    in_channels=16,
-                    d_model=_approx_d_model,
-                    num_blocks=_approx_num_blocks,
-                    single_input=single_input,
-                ).to(device=self.device, dtype=torch.float32)
-                m.train()
-                ddp = None
-                if self.world_size > 1:
-                    ddp = DDP(
-                        m, device_ids=[self.local_rank],
-                        output_device=self.local_rank,
-                        find_unused_parameters=False,
-                        broadcast_buffers=False,
-                    )
-                if self.is_main_process:
-                    logging.info(
-                        "[ActionForcing] %s built: d_model=%d "
-                        "num_blocks=%d num_params=%.2fM "
-                        "(DDP=%s)",
-                        name,
-                        _approx_d_model,
-                        _approx_num_blocks,
-                        m.num_params / 1e6,
-                        ddp is not None,
-                    )
-                return m, ddp
-
-            if _need_mse_approx:
-                self.mse_approx, self.mse_approx_ddp = _build_approx(
-                    "MSEApprox"
-                )
-            if _need_lpips_approx:
-                self.lpips_approx, self.lpips_approx_ddp = (
-                    _build_approx("LPIPSApprox")
-                )
-            if _need_msssim_approx:
-                (
-                    self.msssim_approx,
-                    self.msssim_approx_ddp,
-                ) = _build_approx("MSSSIMApprox")
-            if _need_maniqa_approx:
-                (
-                    self.maniqa_approx,
-                    self.maniqa_approx_ddp,
-                ) = _build_approx(
-                    "MANIQAApprox", single_input=True,
-                )
-
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
         # No new modules / optimizers needed; the SC pass shares the
@@ -1251,111 +964,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.sc_dmd_warmup_steps,
             )
 
-        # dmd_context_mix_p schedule — linear ramp from the config-time
-        # start to ``dmd_context_mix_p_target`` over the first
-        # ``dmd_context_mix_p_ramp_steps`` outer steps. With ramp_steps
-        # <= 0 (default), the knob is held at the start value forever.
-        # Mutates ``self.model.dmd_context_mix_p`` once per iter via
-        # ``_apply_dmd_context_mix_p_schedule``.
-        self._dmd_context_mix_p_start = float(
-            getattr(self.config, "dmd_context_mix_p", 0.5)
-        )
-        self._dmd_context_mix_p_target = float(
-            getattr(
-                self.config,
-                "dmd_context_mix_p_target",
-                self._dmd_context_mix_p_start,
-            )
-        )
-        self._dmd_context_mix_p_ramp_steps = int(
-            getattr(self.config, "dmd_context_mix_p_ramp_steps", 0)
-        )
-        if (
-            self._dmd_context_mix_p_ramp_steps > 0
-            and self._dmd_context_mix_p_start != self._dmd_context_mix_p_target
-            and self.is_main_process
-        ):
-            logging.info(
-                "[ActionForcing] dmd_context_mix_p schedule active: "
-                "linear ramp %.3f -> %.3f over the first %d outer steps.",
-                self._dmd_context_mix_p_start,
-                self._dmd_context_mix_p_target,
-                self._dmd_context_mix_p_ramp_steps,
-            )
-
-        # dmd_context_mix_p sensor-gate — overrides the linear ramp when
-        # ``dmd_context_mix_p_sensor_enabled=true``. Reads the most
-        # recent ``gen/dmd_pf_minus_pr_mae`` value (= |pred_fake -
-        # pred_real|, the unnormalised DMD push direction). When this
-        # drops below ``dmd_context_mix_p_sensor_threshold`` the
-        # scorers are converging — student is catching up to teacher
-        # and the LoRA needs more GT context to remain meaningful as a
-        # supervisory target. The sensor flips ``model.dmd_context_
-        # mix_p`` from ``_low`` to ``_high`` until the metric rises
-        # back above the threshold, then flips back. Stateless gate
-        # (no hysteresis), reads previous gen-iter's metric. Mutates
-        # ``self.model.dmd_context_mix_p`` once per outer iter via
-        # ``_apply_dmd_context_mix_p_schedule``.
-        self._dmd_context_mix_p_sensor_enabled = bool(
-            getattr(self.config, "dmd_context_mix_p_sensor_enabled", False)
-        )
-        self._dmd_context_mix_p_sensor_threshold = float(
-            getattr(self.config, "dmd_context_mix_p_sensor_threshold", 0.1)
-        )
-        self._dmd_context_mix_p_sensor_low = float(
-            getattr(self.config, "dmd_context_mix_p_sensor_low", 0.15)
-        )
-        self._dmd_context_mix_p_sensor_high = float(
-            getattr(self.config, "dmd_context_mix_p_sensor_high", 0.7)
-        )
-        # State updated after each gen step. ``None`` until the first
-        # gen step has produced a metric — sensor falls back to
-        # ``_low`` while None to avoid spuriously flipping high before
-        # we have a real reading.
-        self._latest_dmd_pf_minus_pr_mae: Optional[float] = None
-        if (
-            self._dmd_context_mix_p_sensor_enabled
-            and self.is_main_process
-        ):
-            logging.info(
-                "[ActionForcing] dmd_context_mix_p sensor active: "
-                "threshold=%.3f, low=%.3f, high=%.3f. Reads "
-                "gen/dmd_pf_minus_pr_mae each gen iter; flips mix_p "
-                "high when below threshold, low when above. Overrides "
-                "linear ramp.",
-                self._dmd_context_mix_p_sensor_threshold,
-                self._dmd_context_mix_p_sensor_low,
-                self._dmd_context_mix_p_sensor_high,
-            )
-
-        # dmd_context_mix_p HARD step-switch — fires once at outer
-        # ``self.step == dmd_context_mix_p_step_switch_at`` and stays
-        # at ``_target`` thereafter. Default 0 = disabled (legacy
-        # behavior: ramp + optional sensor). When > 0, this overrides
-        # the linear ramp (but is still overridden by the sensor when
-        # ``_sensor_enabled``). Use case: pre-warmup with low GT
-        # context, then step-switch to high GT once the LoRA has
-        # stabilized — discrete, no interpolation.
-        self._dmd_context_mix_p_step_switch_at = int(
-            getattr(self.config, "dmd_context_mix_p_step_switch_at", 0)
-        )
-        if (
-            self._dmd_context_mix_p_step_switch_at > 0
-            and not self._dmd_context_mix_p_sensor_enabled
-            and self.is_main_process
-        ):
-            logging.info(
-                "[ActionForcing] dmd_context_mix_p step-switch active: "
-                "step < %d -> %.3f, step >= %d -> %.3f (overrides "
-                "linear ramp).",
-                self._dmd_context_mix_p_step_switch_at,
-                self._dmd_context_mix_p_start,
-                self._dmd_context_mix_p_step_switch_at,
-                self._dmd_context_mix_p_target,
-            )
-
         # ------------------------------------------------------------------
-        # dmd_context (v14 teacher-forcing parity) — single source of truth
+        # dmd_context (hardcoded "self") — single source of truth
         # is the model. ``self.model.dmd_context_clean_frames`` is the
         # KV-cache seed prefill size (= 9 by default, configurable via
         # the ``dmd_context_clean_frames`` knob the model reads from
@@ -1390,6 +1000,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.sample_max_frames = int(
             getattr(self.config, "sample_max_frames", 0) or 0
         )
+        # pred_image_7_chunk eval video: seed the student with 7 GT
+        # context chunks, roll 7 more, log the full 14-chunk rollout.
+        # Default ON; disable via ``sample_7chunk_enabled=false`` if the
+        # all-ranks inference rollout ever misbehaves on the cluster.
+        self.sample_7chunk_enabled = bool(
+            getattr(self.config, "sample_7chunk_enabled", True)
+        )
+        self._sample_7chunk_ride: Optional[Dict[str, torch.Tensor]] = None
         # Optional explicit step list (in addition to the periodic interval).
         # Semantics: each entry fires on the FIRST eligible step at or
         # after that value. Necessary because dfake_gen_update_ratio>1
@@ -1798,41 +1416,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.moment_gan_disc_start_step,
                 )
 
-        # Distilled-critic config + optimizer (only when the disc was
-        # built with ``gan_sam2_distilled_critic=True``). Read knobs
-        # unconditionally so they're available for log surfacing even
-        # when the critic isn't built.
+        # GAN warmup / disc-start schedule (used by the LADD path).
+        # ``gan_critic_warmup_steps``: defers the gen-side GAN gradient
+        # until this outer step; D trains from step 0 (or from
+        # ``gan_disc_start_step`` if non-zero). ``gan_disc_start_step``:
+        # defers the entire D-side pass until this step.
         self.gan_critic_warmup_steps = int(
             getattr(cfg, "gan_critic_warmup_steps", 500)
         )
-        # Defers D-side training (the SAM2 disc heads + LatentSAM2Critic
-        # value-distillation step) until this outer step. Pre-start the
-        # entire D pass (forwards, R1/R2 penalty, D backward, D optimizer
-        # step) is skipped — no D activations live, no D gradient, no
-        # D-side compute. Decouples from ``gan_critic_warmup_steps``,
-        # which gates only the GEN-side gradient (Path 3). Default 0
-        # preserves the original behaviour (D trains every iter from
-        # step 0). DDP-safe: the gate reads ``current_step`` which is
-        # rank-invariant, so every rank skips/runs in lockstep — no
-        # NCCL collective count mismatch.
         self.gan_disc_start_step = int(
             getattr(cfg, "gan_disc_start_step", 0)
-        )
-        # Multi-step critic training (mirrors action_critic's
-        # ``critic_updates_per_step``): step the critic optimizer K_c
-        # times per gen step. Default 1 = legacy single-step behavior.
-        self.gan_critic_updates_per_step = int(
-            getattr(cfg, "gan_critic_updates_per_step", 1)
-        )
-        # Dense per-token value distillation. When True, Path 2's
-        # value-distillation MSE matches the critic's PER-TOKEN logit
-        # map (LatentSAM2Critic.forward(dense=True)) against the disc's
-        # PER-TOKEN logit map (forward_dense_heads, pooled 4-pix-frames
-        # → 1-latent-frame). 8x13 ≈ 104x more constraints per sample
-        # than the scalar/per-frame MSE the legacy path used. Default
-        # False = legacy scalar MSE (for back-compat).
-        self.gan_critic_dense_distillation = bool(
-            getattr(cfg, "gan_critic_dense_distillation", False)
         )
         # ---------- Pixel-space perceptual losses (v13) ----------
         # LPIPS (Zhang et al., CVPR 2018) — VGG-based perceptual
@@ -1862,305 +1455,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.lpips_crop_size = int(
             getattr(cfg, "lpips_crop_size", 0)
         )
-
-        # ---------- Dense perceptual approximators (v13 redesign) ---------
-        # Train cheap latent-space approximators that predict the
-        # per-token MSE / LPIPS distance between gen and GT pixels —
-        # gen-side loss flows gradient through these (no VAE backprop)
-        # so we get pixel-level supervision without OOM. The approxes
-        # are trained on dense per-token targets computed via no_grad
-        # VAE decode (which the disc training path already does), so
-        # the only extra cost per iter is the LPIPS forward + per-token
-        # mean-pool. See ``model/perceptual_approx.py`` for design.
-        self.mse_approx_loss_weight = float(
-            getattr(cfg, "mse_approx_loss_weight", 0.0)
-        )
-        # The "MSE" approx actually predicts a per-token combined
-        # ``l2_w * (gen-gt)² + l1_w * |gen-gt|`` field. Both terms are
-        # GRANULAR (per-pixel reduced to per-latent-token by mean-pool),
-        # not just per-frame scalars. Setting ``l1_w=0`` recovers the
-        # legacy pure-MSE target.
-        self.mse_approx_l2_weight = float(
-            getattr(cfg, "mse_approx_l2_weight", 1.0)
-        )
-        self.mse_approx_l1_weight = float(
-            getattr(cfg, "mse_approx_l1_weight", 0.0)
-        )
-        self.lpips_approx_loss_weight = float(
-            getattr(cfg, "lpips_approx_loss_weight", 0.0)
-        )
-        # MS-SSIM approx — per-frame MS-SSIM scalar broadcast across
-        # the latent token grid. Gen-side loss is sign-flipped (gen
-        # wants MS-SSIM HIGH = "looks similar to GT in structure").
-        # Less blur-prone than MSE because MS-SSIM preserves local
-        # structure / edges instead of penalizing pixel-wise diffs.
-        self.msssim_approx_loss_weight = float(
-            getattr(cfg, "msssim_approx_loss_weight", 0.0)
-        )
-        # MS-SSIM input domain. Default ``image`` matches the standard
-        # pytorch_msssim contract (raw normalised pixels). Setting to
-        # ``edges`` runs MS-SSIM on per-channel Sobel gradient
-        # magnitudes — defeats the gray-collapse failure mode where
-        # uniformly-low-contrast outputs still match locally on raw
-        # pixel windows but fail on edge maps. See
-        # ``_compute_dense_perceptual_targets`` for the implementation.
-        self.msssim_target_domain = str(
-            getattr(cfg, "msssim_target_domain", "image")
-        ).lower().strip()
-        if self.msssim_target_domain not in ("image", "edges"):
-            raise ValueError(
-                f"msssim_target_domain must be 'image' or 'edges'; got "
-                f"{self.msssim_target_domain!r}."
-            )
-        # MANIQA NR-IQA approx (no GT — gen-only). Predicts a sparse
-        # per-token quality score map. Targets are built every iter by:
-        #   1. VAE-decoding the gen latents (no_grad) → pixel frames.
-        #   2. Sampling N random 224×224 patches from selected frames
-        #      (DDP-synced offsets, ``maniqa_n_patches_per_frame``).
-        #   3. Forwarding each patch through a frozen pretrained
-        #      MANIQA model → per-patch scalar quality score in [0, 1].
-        #   4. Mapping each patch's pixel region to the latent-token
-        #      coordinates it covers; assigning the score there. All
-        #      other tokens NaN → masked from the approx training loss.
-        # Gen-side loss is sign-flipped (gen wants quality HIGH).
-        # ``maniqa_n_frames``: number of latent frames per iter to
-        # supervise (rest of frames carry NaN this iter; supervised on
-        # later iters via random subsampling). Default 4 (matches LPIPS-
-        # pixel pattern). Set equal to F_lat to supervise every frame
-        # every iter ("option 1" — slower target build).
-        # ``maniqa_n_patches_per_frame``: random 224×224 patches per
-        # selected frame. Default 1.
-        self.maniqa_approx_loss_weight = float(
-            getattr(cfg, "maniqa_approx_loss_weight", 0.0)
-        )
-        self.maniqa_n_frames = int(
-            getattr(cfg, "maniqa_n_frames", 4)
-        )
-        self.maniqa_n_patches_per_frame = int(
-            getattr(cfg, "maniqa_n_patches_per_frame", 1)
-        )
-        # Pretrained MANIQA variant (pyiqa metric_name). 'maniqa-pipal'
-        # was trained on PIPAL (which includes GAN-distortion images);
-        # the default 'maniqa' is KonIQ-10k-trained.
-        self.maniqa_metric_name = str(
-            getattr(cfg, "maniqa_metric_name", "maniqa-pipal")
-        )
-        # gan_d_approx replaces LatentSAM2Critic when > 0. Same arch
-        # (PerceptualApprox), takes (gen_lat, gt_lat), trained against
-        # the pixel-disc's DENSE per-token output map for the gen
-        # latent. Gen-side loss = -gan_d_approx(gen, gt).mean() (same
-        # sign convention as the legacy ``-critic(fake).mean()``).
-        self.gan_d_approx_loss_weight = float(
-            getattr(cfg, "gan_d_approx_loss_weight", 0.0)
-        )
-        # Dense target supervision (the "(2)" in user's spec): the
-        # approxes are trained on per-token MSE/LPIPS targets PLUS
-        # a scalar mean-alignment term. ``mean_align_weight`` weights
-        # the second term in the approx training loss; default 0.1
-        # (mean is a soft constraint relative to the dense target).
-        self.perceptual_approx_mean_align_weight = float(
-            getattr(cfg, "perceptual_approx_mean_align_weight", 0.1)
-        )
-        # Approx model architecture knobs.
-        self.perceptual_approx_d_model = int(
-            getattr(cfg, "perceptual_approx_d_model", 256)
-        )
-        self.perceptual_approx_num_blocks = int(
-            getattr(cfg, "perceptual_approx_num_blocks", 4)
-        )
-        self.perceptual_approx_lr = float(
-            getattr(cfg, "perceptual_approx_lr", 2e-4)
-        )
-        self.perceptual_approx_warmup_steps = int(
-            getattr(cfg, "perceptual_approx_warmup_steps", 25)
-        )
-        # Optional linear ramp on the perceptual-approx gen-side
-        # contribution AFTER the warmup gate fires. Default 0 = hard
-        # switch at warmup_steps (legacy behaviour). When > 0, the
-        # combined ramp_factor multiplies every per-approx weight in
-        # _compute_gen_side_perceptual_loss, growing linearly from 0
-        # to 1.0 over ``perceptual_approx_ramp_steps`` outer steps
-        # starting at ``perceptual_approx_warmup_steps``. Useful when
-        # MANIQA's full-weight onset would otherwise destabilise
-        # nearby losses (the additive "bias" effect on the bundled
-        # r3gan_g_loss_weighted seen in v3/v4 runs).
-        self.perceptual_approx_ramp_steps = int(
-            getattr(cfg, "perceptual_approx_ramp_steps", 0)
-        )
-        # Optional linear DECAY of the perceptual-approx contribution.
-        # When ``perceptual_approx_decay_start_step`` is non-negative,
-        # the ramp_factor (which has already ramped UP to 1.0 via
-        # perceptual_approx_warmup_steps + perceptual_approx_ramp_steps)
-        # is multiplicatively shrunk back toward 0 over the window
-        # [decay_start_step, decay_end_step]. At decay_end_step the
-        # effective weight is 0. Defaults (-1) disable the decay.
-        # Use case: phase out MANIQA after the DMD/GAN signals are
-        # established, so perceptual artifacts don't bias late training.
-        self.perceptual_approx_decay_start_step = int(
-            getattr(cfg, "perceptual_approx_decay_start_step", -1)
-        )
-        self.perceptual_approx_decay_end_step = int(
-            getattr(cfg, "perceptual_approx_decay_end_step", -1)
-        )
-        if (
-            self.perceptual_approx_decay_start_step >= 0
-            and self.perceptual_approx_decay_end_step
-            <= self.perceptual_approx_decay_start_step
-        ):
-            raise ValueError(
-                "perceptual_approx_decay_end_step "
-                f"({self.perceptual_approx_decay_end_step}) must be > "
-                "perceptual_approx_decay_start_step "
-                f"({self.perceptual_approx_decay_start_step}) when decay "
-                "is enabled."
-            )
-        # Constant-weight L1 (MAE) and L2 (MSE) between the student's
-        # pred_image latent and the GT latent window. Direct anti-drift
-        # anchor, applied EVERY step with no ramp or warmup. Default 0
-        # for both keeps earlier configs unchanged. Used by v10 onwards
-        # as a small constant pull toward GT to complement DMD+GAN.
-        self.gt_latent_mae_loss_weight = float(
-            getattr(cfg, "gt_latent_mae_loss_weight", 0.0)
-        )
-        self.gt_latent_mse_loss_weight = float(
-            getattr(cfg, "gt_latent_mse_loss_weight", 0.0)
-        )
-        # ----- v11-style multi-noise (Lipschitz-by-density) -----
-        # When > 0, sample K interpolation points between
-        # ``fake_lat`` and ``real_lat`` each iter, compute the dense
-        # per-token target metrics on each, and add their MSE to each
-        # approx's training loss. The denser supervision constrains
-        # the approx's value field across the (fake → real) line so
-        # its gradient (what the gen consumes via ``.mean()``) is
-        # meaningful by Lipschitz interpolation.
-        # Each interpolation costs: 1 no_grad VAE decode + (optionally)
-        # 1 SAM2 forward + 1 LPIPS forward + K small approx forwards.
-        # Sequential per-alpha processing bounds peak memory.
-        self.perceptual_approx_n_interp_samples = int(
-            getattr(cfg, "perceptual_approx_n_interp_samples", 0)
-        )
-        if (
-            self.gan_enabled
-            and getattr(self, "latent_critic", None) is not None
-        ):
-            critic_lr = float(getattr(cfg, "gan_critic_lr", 2e-4))
-            critic_betas = tuple(
-                getattr(cfg, "gan_critic_betas", [0.0, 0.9])
-            )
-            critic_eps = float(getattr(cfg, "gan_critic_eps", 1e-8))
-            critic_wd = float(getattr(cfg, "gan_critic_weight_decay", 0.0))
-            critic_params = [
-                p for p in self.latent_critic.parameters()
-                if p.requires_grad
-            ]
-            if not critic_params:
-                raise RuntimeError(
-                    "latent_critic has no trainable parameters."
-                )
-            self.latent_critic_optimizer = torch.optim.AdamW(
-                critic_params,
-                lr=critic_lr,
-                betas=critic_betas,
-                eps=critic_eps,
-                weight_decay=critic_wd,
-            )
-            if self.is_main_process:
-                n_params = sum(p.numel() for p in critic_params)
-                logging.info(
-                    "[ActionForcing] LatentSAM2Critic optimizer built: "
-                    "AdamW lr=%.2e betas=%s wd=%.4f params=%.2fM "
-                    "(warmup=%d, updates_per_step=%d, dense=%s)",
-                    critic_lr, critic_betas, critic_wd, n_params / 1e6,
-                    self.gan_critic_warmup_steps,
-                    self.gan_critic_updates_per_step,
-                    self.gan_critic_dense_distillation,
-                )
-
-        # ----- Perceptual approx optimizers (mse / lpips) -----
-        if getattr(self, "mse_approx", None) is not None:
-            self.mse_approx_optimizer = torch.optim.AdamW(
-                [p for p in self.mse_approx.parameters() if p.requires_grad],
-                lr=self.perceptual_approx_lr,
-                betas=(0.0, 0.9),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-            if self.is_main_process:
-                logging.info(
-                    "[ActionForcing] MSEApprox optimizer built: "
-                    "AdamW lr=%.2e weight=%.3f warmup=%d "
-                    "mean_align_w=%.3f",
-                    self.perceptual_approx_lr,
-                    self.mse_approx_loss_weight,
-                    self.perceptual_approx_warmup_steps,
-                    self.perceptual_approx_mean_align_weight,
-                )
-        if getattr(self, "lpips_approx", None) is not None:
-            self.lpips_approx_optimizer = torch.optim.AdamW(
-                [
-                    p for p in self.lpips_approx.parameters()
-                    if p.requires_grad
-                ],
-                lr=self.perceptual_approx_lr,
-                betas=(0.0, 0.9),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-            if self.is_main_process:
-                logging.info(
-                    "[ActionForcing] LPIPSApprox optimizer built: "
-                    "AdamW lr=%.2e weight=%.3f warmup=%d "
-                    "mean_align_w=%.3f",
-                    self.perceptual_approx_lr,
-                    self.lpips_approx_loss_weight,
-                    self.perceptual_approx_warmup_steps,
-                    self.perceptual_approx_mean_align_weight,
-                )
-        if getattr(self, "msssim_approx", None) is not None:
-            self.msssim_approx_optimizer = torch.optim.AdamW(
-                [
-                    p for p in self.msssim_approx.parameters()
-                    if p.requires_grad
-                ],
-                lr=self.perceptual_approx_lr,
-                betas=(0.0, 0.9),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-            if self.is_main_process:
-                logging.info(
-                    "[ActionForcing] MSSSIMApprox optimizer built: "
-                    "AdamW lr=%.2e weight=%.3f warmup=%d "
-                    "(gen-side sign FLIPPED — gen wants MS-SSIM HIGH)",
-                    self.perceptual_approx_lr,
-                    self.msssim_approx_loss_weight,
-                    self.perceptual_approx_warmup_steps,
-                )
-        if getattr(self, "maniqa_approx", None) is not None:
-            self.maniqa_approx_optimizer = torch.optim.AdamW(
-                [
-                    p for p in self.maniqa_approx.parameters()
-                    if p.requires_grad
-                ],
-                lr=self.perceptual_approx_lr,
-                betas=(0.0, 0.9),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-            if self.is_main_process:
-                logging.info(
-                    "[ActionForcing] MANIQAApprox optimizer built: "
-                    "AdamW lr=%.2e weight=%.3f warmup=%d "
-                    "n_frames=%d n_patches/frame=%d metric=%s "
-                    "(NR-IQA, single-input, sign FLIPPED — gen wants "
-                    "quality HIGH)",
-                    self.perceptual_approx_lr,
-                    self.maniqa_approx_loss_weight,
-                    self.perceptual_approx_warmup_steps,
-                    self.maniqa_n_frames,
-                    self.maniqa_n_patches_per_frame,
-                    self.maniqa_metric_name,
-                )
 
         # ------------------------------------------------------------------
         # Online real_teacher (v14-LoRA flow training vs GT).
@@ -2432,11 +1726,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # closes the open streaming sequence so the next sequence
             # re-allocates the KV cache at the new size.
             self._apply_attn_size_if_changed()
-            # Linear ramp on ``dmd_context_mix_p`` (no-op when the
-            # target == start or ramp_steps <= 0). Mutates
-            # ``self.model.dmd_context_mix_p`` so the next forward
-            # picks up the new value without further plumbing.
-            _dmd_ctx_mix_p_now = self._apply_dmd_context_mix_p_schedule()
             # Decide whether this iter trains the generator or the critic.
             train_generator = (self.step % dfake_gen_update_ratio == 0)
 
@@ -2447,21 +1736,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     max_total_rollout_frames=max_total_rollout_frames,
                     cf_dmdctx=cf_dmdctx,
                 )
-                # Cache the most recent ``dmd_pf_minus_pr_mae`` so the
-                # NEXT iter's schedule call can read it. Sensor-gated
-                # mix_p mode (``dmd_context_mix_p_sensor_enabled``)
-                # uses this value to decide whether to flip mix_p
-                # high (scorers converging → bolster teacher with GT
-                # context) or low (scorers disagreeing → standard).
-                if (
-                    isinstance(generator_log_dict, dict)
-                    and "dmd_pf_minus_pr_mae" in generator_log_dict
-                ):
-                    _v = generator_log_dict["dmd_pf_minus_pr_mae"]
-                    try:
-                        self._latest_dmd_pf_minus_pr_mae = float(_v)
-                    except (TypeError, ValueError):
-                        pass
 
             # Always run the critic step (CF parity).
             critic_log_dict = self._fwdbwd_one_step(
@@ -4002,855 +3276,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             dist.broadcast(idx, src=0)
         return idx.tolist()
 
-    def _get_maniqa_target_model(self) -> Optional["torch.nn.Module"]:
-        """Lazy-build a pyiqa MANIQA NR-IQA metric for use as a frozen
-        no_grad target. Forward signature: ``model(x) -> [B, 1]``
-        scalar quality score in [0, 1] (higher = better) per image.
-        Input ``x`` ``[B, 3, H, W]`` in [0, 1].
-
-        We force ``test_sample=1`` on the inner net so MANIQA returns
-        the score from ONE crop. With our pre-cropped 224×224 input,
-        the crop is an identity (uniform_crop with crop_num=1 picks
-        offset (0, 0) on a 224×224 image = pass-through). This gives
-        us a per-patch score we can map back to specific latent token
-        regions, which is the whole point of patch-sampled NR-IQA.
-        """
-        cached = getattr(self, "_maniqa_target_model", None)
-        if cached is not None:
-            return cached
-        try:
-            import pyiqa as _pyiqa
-        except ImportError as e:
-            raise RuntimeError(
-                "maniqa_approx_loss_weight>0 requires pyiqa: pip "
-                f"install pyiqa. Original error: {e}"
-            )
-        metric_name = self.maniqa_metric_name
-        model = _pyiqa.create_metric(
-            metric_name, as_loss=False, device=self.device,
-        )
-        # Force single-crop forward; default test_sample=20 averages
-        # 20 uniform crops which (a) is wasteful when our input is
-        # already 224×224 and (b) destroys the per-patch granularity
-        # we need for spatial token mapping.
-        try:
-            model.net.test_sample = 1
-        except Exception:
-            pass
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad_(False)
-        self._maniqa_target_model = model
-        if self.is_main_process:
-            n_params = sum(p.numel() for p in model.parameters())
-            logging.info(
-                "[ActionForcing] MANIQA-target lazy-built: metric=%s "
-                "params=%.2fM (used for no_grad target only; "
-                "test_sample forced to 1)",
-                metric_name, n_params / 1e6,
-            )
-        return model
-
-    def _compute_dense_maniqa_target(
-        self,
-        gen_pix: torch.Tensor,
-        F_lat: int,
-        target_h: int,
-        target_w: int,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], float]:
-        """Build a sparse per-token MANIQA quality target.
-
-        Args:
-            gen_pix: ``[B, F_pix, 3, H_pix, W_pix]`` in [-1, 1] (VAE
-                output range). F_pix = pix_per_lat * F_lat.
-            F_lat: latent temporal length.
-            target_h, target_w: approx-output token grid spatial dims.
-
-        Returns:
-            ``(target, valid_mask, target_build_ms)`` where:
-              * ``target`` ``[B, F_lat, target_h, target_w]`` float32:
-                MANIQA score in [0, 1] for tokens covered by a
-                sampled patch this iter; NaN elsewhere.
-              * ``valid_mask`` ``[B, F_lat, target_h, target_w]``
-                bool: True where target is valid (not NaN).
-              * ``target_build_ms``: wall-clock for the target build
-                (for the 4-vs-84 frame timing diagnostic).
-
-        Returns ``(None, None, 0.0)`` when MANIQA approx weight is 0.
-
-        Patch sampling: per iter, picks ``maniqa_n_frames`` random
-        latent frames (DDP-synced), and per selected frame, samples
-        ``maniqa_n_patches_per_frame`` random 224×224 patches at
-        DDP-synced offsets. Each patch gets one MANIQA score, and the
-        score is broadcast to all approx-tokens whose pixel coverage
-        overlaps the patch.
-        """
-        if self.maniqa_approx_loss_weight <= 0:
-            return None, None, 0.0
-        if (
-            self.maniqa_approx is None
-            or self.maniqa_approx_optimizer is None
-        ):
-            return None, None, 0.0
-
-        import time as _time
-        t0 = _time.time()
-
-        device = gen_pix.device
-        B, F_pix, C, H_pix, W_pix = gen_pix.shape
-        if F_pix % F_lat != 0:
-            raise RuntimeError(
-                f"_compute_dense_maniqa_target: F_pix={F_pix} not "
-                f"divisible by F_lat={F_lat}."
-            )
-        pix_per_lat = F_pix // F_lat
-        crop = 224
-        if H_pix < crop or W_pix < crop:
-            raise RuntimeError(
-                f"_compute_dense_maniqa_target: pixel resolution "
-                f"({H_pix}, {W_pix}) smaller than MANIQA crop {crop}."
-            )
-
-        # Pick latent-frame indices (DDP-synced).
-        n_frames = max(1, min(int(self.maniqa_n_frames), int(F_lat)))
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0:
-            frame_idx = torch.randperm(
-                F_lat, device=device,
-            )[:n_frames].sort().values
-        else:
-            frame_idx = torch.empty(
-                n_frames, dtype=torch.long, device=device,
-            )
-        if dist.is_initialized():
-            dist.broadcast(frame_idx, src=0)
-        frame_list = frame_idx.tolist()
-
-        # Pick a representative pixel-frame per selected latent — the
-        # CENTER pixel of the 4-frame group (index pix_per_lat // 2 of
-        # each group). Avoids averaging across pixel-frames (which
-        # would smear motion artefacts) while still being representative.
-        pix_center_offset = pix_per_lat // 2
-        pix_indices = [
-            f * pix_per_lat + pix_center_offset for f in frame_list
-        ]
-        # Patch offsets — DETERMINISTIC ORDERED tiling that covers the
-        # whole image. Random placement was previously used here; it's
-        # been removed because random patches sample the same regions
-        # repeatedly across iters (and miss other regions entirely),
-        # producing a more variable / less complete approx target.
-        # Ordered tiling guarantees that every iter the approximator
-        # sees the SAME spatial coverage, so its dense per-token
-        # supervision is uniform.
-        #
-        # Layout: factor n_patches into (rows, cols) closest to the
-        # image's aspect ratio (H_pix / W_pix). For our 480×832 input
-        # at n_patches=8, that picks (2, 4) — 2 rows × 4 cols. Each
-        # axis uses even spacing from offset=0 to offset=L-P with
-        # ``stride = (L-P)/(n-1)``, so the corner patches sit exactly
-        # at (0, 0) and (H-P, W-P).
-        # Coverage at 480×832 / n=8 / patch=224:
-        #   * rows: 2 patches at h=0, h=256 cover 0..223 ∪ 256..479
-        #     — a 32-row gap at 224..255 (rows alone = 93.3%).
-        #   * cols: 4 patches at w=0, 203, 405, 608 overlap into full
-        #     coverage of 0..831 (100% width).
-        # Net area coverage ≈ 93.3% — matches the "~90%" target.
-        n_patches = max(1, int(self.maniqa_n_patches_per_frame))
-
-        def _factor_grid(n: int, h: int, w: int):
-            target = float(h) / float(w)
-            best_rc = (1, n)
-            best_diff = abs((1.0 / n) - target)
-            for r in range(1, n + 1):
-                if n % r == 0:
-                    c = n // r
-                    diff = abs((r / c) - target)
-                    if diff < best_diff:
-                        best_rc, best_diff = (r, c), diff
-            return best_rc
-
-        def _tile_positions(L: int, P: int, n: int):
-            if n <= 1:
-                return [(L - P) // 2]
-            stride = (L - P) / (n - 1)
-            return [int(round(i * stride)) for i in range(n)]
-
-        rows, cols = _factor_grid(n_patches, H_pix, W_pix)
-        h_pos = _tile_positions(H_pix, crop, rows)
-        w_pos = _tile_positions(W_pix, crop, cols)
-        # Build per-(frame, patch) (h_o, w_o) lists; same offsets for
-        # every selected frame and every batch sample. Deterministic →
-        # no DDP broadcast needed.
-        h_offsets: list = []
-        w_offsets: list = []
-        for _ in range(n_frames):
-            for r in range(rows):
-                for c in range(cols):
-                    h_offsets.append(h_pos[r])
-                    w_offsets.append(w_pos[c])
-        n_total_patches = len(h_offsets)
-
-        # Crop all patches into a single batch for MANIQA forward.
-        # Shape: [B * n_total_patches, 3, 224, 224].
-        # Convert [-1, 1] → [0, 1] (clamp first).
-        patches = []
-        patch_meta = []  # (frame_in_F_lat, h_o, w_o)
-        for k_p, f_lat_idx in enumerate(frame_list):
-            pix_f = pix_indices[k_p]
-            for q in range(n_patches):
-                p_idx = k_p * n_patches + q
-                h_o = h_offsets[p_idx]
-                w_o = w_offsets[p_idx]
-                # All B samples at this frame, this patch position.
-                pix_slice = gen_pix[
-                    :, pix_f, :, h_o:h_o + crop, w_o:w_o + crop,
-                ]
-                patches.append(pix_slice)  # [B, 3, 224, 224]
-                patch_meta.append((f_lat_idx, h_o, w_o))
-        # Stack: [n_total_patches, B, 3, 224, 224] → [B, n_total, ...]
-        patches_t = torch.stack(patches, dim=1).contiguous()
-        patches_t = patches_t.view(
-            B * n_total_patches, 3, crop, crop,
-        )
-        patches_t = (patches_t.clamp(-1.0, 1.0) * 0.5 + 0.5).float()
-
-        # MANIQA forward (no_grad).
-        model = self._get_maniqa_target_model()
-        with torch.no_grad():
-            scores = model(patches_t).float()  # [B * n_total, 1]
-        scores = scores.view(B, n_total_patches)
-
-        # Build sparse target. NaN-init, fill the patch-covered tokens.
-        target = torch.full(
-            (B, F_lat, target_h, target_w),
-            float("nan"), device=device, dtype=torch.float32,
-        )
-        pix_per_token_h = H_pix / float(target_h)
-        pix_per_token_w = W_pix / float(target_w)
-        for q_idx, (f_lat_idx, h_o, w_o) in enumerate(patch_meta):
-            t_row_lo = int(max(0, h_o // pix_per_token_h))
-            t_row_hi = int(min(
-                target_h,
-                int((h_o + crop - 1) // pix_per_token_h) + 1,
-            ))
-            t_col_lo = int(max(0, w_o // pix_per_token_w))
-            t_col_hi = int(min(
-                target_w,
-                int((w_o + crop - 1) // pix_per_token_w) + 1,
-            ))
-            score_q = scores[:, q_idx]  # [B]
-            target[
-                :, f_lat_idx, t_row_lo:t_row_hi, t_col_lo:t_col_hi,
-            ] = score_q.view(B, 1, 1)
-
-        valid_mask = ~torch.isnan(target)
-        # Replace NaN in target with 0 so the approx training step
-        # can do a masked-MSE without NaN propagation. Actual target
-        # values at masked-out positions are ignored via valid_mask.
-        target = torch.where(
-            valid_mask, target, torch.zeros_like(target),
-        )
-        target_build_ms = (_time.time() - t0) * 1000.0
-        return target, valid_mask, target_build_ms
-
-    def _get_lpips_target_model(self) -> Optional["torch.nn.Module"]:
-        """Lazy-build the LPIPS model used to compute DENSE TARGETS for
-        the LPIPS approx (no_grad, never trained). Spatial=True returns
-        per-position distance maps so we can mean-pool to a per-token
-        target grid for the approx.
-
-        Separate from ``_get_lpips_model`` (which would have been used
-        for direct LPIPS-as-loss; that path was abandoned due to OOM
-        from VAE backprop). This one always sets ``spatial=True``.
-        """
-        cached = getattr(self, "_lpips_target_model", None)
-        if cached is not None:
-            return cached
-        try:
-            import lpips as _lpips
-        except ImportError as e:
-            raise RuntimeError(
-                "lpips_approx_loss_weight>0 requires the 'lpips' "
-                f"package: pip install lpips. Original error: {e}"
-            )
-        model = _lpips.LPIPS(
-            net="vgg", verbose=False, spatial=True,
-        )
-        model = model.to(device=self.device, dtype=torch.float32)
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad_(False)
-        self._lpips_target_model = model
-        if self.is_main_process:
-            n_params = sum(p.numel() for p in model.parameters())
-            logging.info(
-                "[ActionForcing] LPIPS-target(vgg, spatial) lazy-built: "
-                "params=%.2fM (used for no_grad target only)",
-                n_params / 1e6,
-            )
-        return model
-
-    def _compute_dense_perceptual_targets(
-        self,
-        gen_pix: torch.Tensor,
-        gt_pix: torch.Tensor,
-        F_lat: int,
-        target_h: int,
-        target_w: int,
-    ) -> Tuple[
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        """Build per-token MSE-or-MSE+MAE / LPIPS / MS-SSIM dense
-        targets from VAE-decoded pixel pairs.
-
-        Args:
-            gen_pix / gt_pix: ``[B, F_pix, 3, H_pix, W_pix]`` in [-1, 1].
-                F_pix = 4 * F_lat (WAN VAE temporal expansion).
-            F_lat: latent temporal length (target frame axis).
-            target_h, target_w: token grid spatial dims (=8 by default,
-                matching the approx's post-stem output).
-
-        Returns:
-            ``(target_mse, target_lpips, target_msssim)`` each
-            ``[B, F_lat, target_h, target_w]``. Any may be None when
-            its weight is 0 (skip compute).
-
-        ``target_mse`` is actually a combined ``l2_w * (gen-gt)² +
-        l1_w * |gen-gt|`` per-token field — both terms are per-pixel
-        and granular (mean-pooled to the latent token grid). Set
-        ``mse_approx_l1_weight=0`` for legacy pure-MSE.
-
-        ``target_msssim`` is per-frame MS-SSIM (computed on each
-        pixel frame, then averaged across the 4 pixel-frames-per-
-        latent) BROADCAST across all (target_h * target_w) tokens.
-        Per-frame scalar supervision but dense approx output, so
-        the approx learns its own spatial pattern.
-        """
-        B, F_pix, C, H_pix, W_pix = gen_pix.shape
-        if F_pix % F_lat != 0:
-            raise RuntimeError(
-                f"_compute_dense_perceptual_targets: F_pix={F_pix} "
-                f"not divisible by F_lat={F_lat}."
-            )
-        pix_per_lat = F_pix // F_lat
-        target_mse: Optional[torch.Tensor] = None
-        target_lpips: Optional[torch.Tensor] = None
-        target_msssim: Optional[torch.Tensor] = None
-
-        with torch.no_grad():
-            if self.mse_approx_loss_weight > 0:
-                # Combined L2 + L1 per-token target.
-                # Per-pixel l2 = (gen - gt)², l1 = |gen - gt|.
-                diff = gen_pix - gt_pix  # [B, F_pix, 3, H, W]
-                l2_w = float(self.mse_approx_l2_weight)
-                l1_w = float(self.mse_approx_l1_weight)
-                combined = l2_w * (diff ** 2)
-                if l1_w > 0:
-                    combined = combined + l1_w * diff.abs()
-                del diff
-                # Reshape to [B, F_lat, pix_per_lat, 3, H, W] then mean
-                # over (pix_per_lat, 3) → [B, F_lat, H_pix, W_pix].
-                combined = combined.view(
-                    B, F_lat, pix_per_lat, C, H_pix, W_pix,
-                )
-                combined = combined.mean(dim=(2, 3))
-                # Spatial mean-pool to token grid.
-                combined = combined.reshape(
-                    B * F_lat, 1, H_pix, W_pix,
-                )
-                target_mse = torch.nn.functional.adaptive_avg_pool2d(
-                    combined, (target_h, target_w),
-                ).reshape(B, F_lat, target_h, target_w).float()
-                del combined
-            if self.lpips_approx_loss_weight > 0:
-                lpips_model = self._get_lpips_target_model()
-                # LPIPS expects [N, 3, H, W] in [-1, 1]. Forward on
-                # all 84 frames at 480×832 blows ~8 GB activation
-                # workspace. Process in small chunks (4 frames each)
-                # and accumulate the spatial-pooled distance.
-                gen_flat = gen_pix.reshape(B * F_pix, C, H_pix, W_pix)
-                gt_flat = gt_pix.reshape(B * F_pix, C, H_pix, W_pix)
-                chunk = 4
-                pooled_chunks = []
-                for s in range(0, gen_flat.shape[0], chunk):
-                    e = min(s + chunk, gen_flat.shape[0])
-                    d_chunk = lpips_model(
-                        gen_flat[s:e], gt_flat[s:e],
-                    ).float()  # [chunk, 1, h_d, w_d]
-                    d_chunk = torch.nn.functional.adaptive_avg_pool2d(
-                        d_chunk, (target_h, target_w),
-                    )
-                    pooled_chunks.append(d_chunk)
-                dist = torch.cat(pooled_chunks, dim=0)
-                dist = dist.reshape(
-                    B, F_lat, pix_per_lat, target_h, target_w,
-                )
-                target_lpips = dist.mean(dim=2).float()
-            if self.msssim_approx_loss_weight > 0:
-                # MS-SSIM expects [N, C, H, W] in non-negative range
-                # (default data_range=1.0). Our pixels are in
-                # [-1, 1] so shift to [0, 1] and use data_range=1.
-                # Per-frame scalar (size_average=False), then average
-                # over the 4 pixel-frames per latent → [B, F_lat].
-                from pytorch_msssim import ms_ssim as _ms_ssim_fn
-                gen_norm = (
-                    gen_pix.reshape(
-                        B * F_pix, C, H_pix, W_pix,
-                    ).float().clamp(-1, 1) + 1.0
-                ) * 0.5
-                gt_norm = (
-                    gt_pix.reshape(
-                        B * F_pix, C, H_pix, W_pix,
-                    ).float().clamp(-1, 1) + 1.0
-                ) * 0.5
-                # Edge-domain switch: when ``msssim_target_domain ==
-                # 'edges'`` the MS-SSIM input is the per-pixel Sobel
-                # gradient magnitude rather than the raw image. Defeats
-                # the gray-collapse failure mode where standard MS-SSIM
-                # stays high on a uniformly low-contrast image (the
-                # "gray attack": local-window contrast statistics still
-                # match the GT's locally-low-contrast statistics, even
-                # though the image has lost all detail). On gradient
-                # maps, gray pred ⇒ near-zero edges; GT ⇒ rich edges;
-                # the SSIM crashes to ~0 and the gen receives a strong
-                # push to recover detail. Output is renormalised to
-                # [0, 1] and clamped so MS-SSIM's data_range=1.0
-                # contract is preserved.
-                if self.msssim_target_domain == "edges":
-                    # 3×3 Sobel kernels, applied per-channel via grouped
-                    # conv so the gradient stays per-channel (no cross-
-                    # channel coupling). Reflection pad keeps shape.
-                    sobel_kx = torch.tensor(
-                        [[1.0, 0.0, -1.0],
-                         [2.0, 0.0, -2.0],
-                         [1.0, 0.0, -1.0]],
-                        dtype=gen_norm.dtype, device=gen_norm.device,
-                    ).view(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
-                    sobel_ky = torch.tensor(
-                        [[1.0, 2.0, 1.0],
-                         [0.0, 0.0, 0.0],
-                         [-1.0, -2.0, -1.0]],
-                        dtype=gen_norm.dtype, device=gen_norm.device,
-                    ).view(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
-
-                    def _grad_mag(x: torch.Tensor) -> torch.Tensor:
-                        x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
-                        gx = F.conv2d(x_pad, sobel_kx, groups=C)
-                        gy = F.conv2d(x_pad, sobel_ky, groups=C)
-                        # Magnitude in [0, ~4*sqrt(2)*max_pixel] before
-                        # normalisation. Sobel max-response on a step
-                        # edge from 0→1 is 4 per kernel, so |grad| ∈
-                        # [0, ~5.66]. Divide by 5.66 to roughly land in
-                        # [0, 1], then clamp for data_range=1.0.
-                        mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
-                        return (mag / 5.66).clamp(0.0, 1.0)
-
-                    gen_norm = _grad_mag(gen_norm)
-                    gt_norm = _grad_mag(gt_norm)
-                # Chunk to bound memory (MS-SSIM does multi-scale
-                # Gaussian filtering — ~1-2 GB transient per 4-frame
-                # batch at 480x832).
-                chunk = 4
-                msssim_chunks = []
-                for s in range(0, gen_norm.shape[0], chunk):
-                    e = min(s + chunk, gen_norm.shape[0])
-                    msssim_chunks.append(
-                        _ms_ssim_fn(
-                            gen_norm[s:e],
-                            gt_norm[s:e],
-                            data_range=1.0,
-                            size_average=False,
-                        ).float()
-                    )
-                msssim_per_pix_frame = torch.cat(msssim_chunks, dim=0)
-                # [B*F_pix] → [B, F_lat] (mean over pix_per_lat).
-                msssim_per_lat = msssim_per_pix_frame.view(
-                    B, F_lat, pix_per_lat,
-                ).mean(dim=2)
-                # Broadcast to dense token grid.
-                target_msssim = (
-                    msssim_per_lat
-                    .unsqueeze(-1).unsqueeze(-1)
-                    .expand(B, F_lat, target_h, target_w)
-                    .contiguous()
-                    .float()
-                )
-                del gen_norm, gt_norm, msssim_per_pix_frame
-        return target_mse, target_lpips, target_msssim
-
-    def _run_perceptual_approx_update(
-        self,
-        gen_lat: torch.Tensor,
-        gt_lat: torch.Tensor,
-        target_mse: Optional[torch.Tensor],
-        target_lpips: Optional[torch.Tensor],
-        target_msssim: Optional[torch.Tensor] = None,
-        target_maniqa: Optional[torch.Tensor] = None,
-        target_maniqa_mask: Optional[torch.Tensor] = None,
-        interp_data: Optional[List[Dict[str, torch.Tensor]]] = None,
-        out: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Train all dense per-token approxes against their targets.
-
-        All approxes operate on ``(input_lat, gt_lat)`` (detached) and
-        produce ``[B, F_lat, target_h, target_w]`` predictions. Loss is
-        per-token MSE + scalar mean-alignment. Mutates ``out`` in place.
-
-        ``gan_d_approx`` is trained on TWO forward passes per iter:
-        ``(gen_lat, gt_lat) → target_disc_fake`` and
-        ``(gt_lat, gt_lat) → target_disc_real``. The two-sided training
-        forces the approx to USE its gt_lat input (otherwise the same
-        input gives two different targets, contradicting). This
-        anchors the gt-conditioning so the approx learns "how the disc
-        would score this CANDIDATE given this REFERENCE", which is
-        what the gen actually wants in Path 3.
-        """
-        if out is None:
-            out = {}
-        gen_lat_d = gen_lat.detach()
-        gt_lat_d = gt_lat.detach()
-
-        # Paired-input approxes (mse / lpips / msssim). Each takes
-        # ``(candidate=gen_lat, reference=gt_lat)`` and predicts the
-        # per-token metric value. The reference is essential — these
-        # metrics are inherently comparative; without it the score
-        # is unanchored.
-        for (
-            name, model_ddp, model, optim, target,
-            interp_key, weight,
-        ) in [
-            (
-                "mse_approx",
-                self.mse_approx_ddp,
-                self.mse_approx,
-                self.mse_approx_optimizer,
-                target_mse,
-                "mse",
-                self.mse_approx_loss_weight,
-            ),
-            (
-                "lpips_approx",
-                self.lpips_approx_ddp,
-                self.lpips_approx,
-                self.lpips_approx_optimizer,
-                target_lpips,
-                "lpips",
-                self.lpips_approx_loss_weight,
-            ),
-            (
-                "msssim_approx",
-                self.msssim_approx_ddp,
-                self.msssim_approx,
-                self.msssim_approx_optimizer,
-                target_msssim,
-                "msssim",
-                self.msssim_approx_loss_weight,
-            ),
-        ]:
-            if model is None or optim is None or target is None or weight <= 0:
-                continue
-            optim.zero_grad(set_to_none=True)
-            model_for_update = model_ddp if model_ddp is not None else model
-            pred = model_for_update(gen_lat_d, gt_lat_d).float()
-            # Dense per-token loss on the original (gen, gt) anchor.
-            L_dense = ((pred - target) ** 2).mean()
-            L_mean_align = (pred.mean() - target.mean()) ** 2
-            L_total = (
-                L_dense
-                + self.perceptual_approx_mean_align_weight * L_mean_align
-            )
-            # v11-style multi-noise: extra anchor points along the
-            # (fake → real) line. Each contributes a per-token MSE
-            # term to the same training loss. Densifies the value
-            # field so the approx's gradient (what gen consumes) is
-            # meaningful by Lipschitz interpolation across anchors.
-            L_interp_value = 0.0
-            if interp_data is not None and len(interp_data) > 0:
-                interp_terms = []
-                for d in interp_data:
-                    interp_target = d.get(interp_key)
-                    if interp_target is None:
-                        continue
-                    interp_pred = model_for_update(
-                        d["lat"], gt_lat_d,
-                    ).float()
-                    interp_terms.append(
-                        ((interp_pred - interp_target) ** 2).mean()
-                    )
-                if interp_terms:
-                    L_interp = sum(interp_terms) / len(interp_terms)
-                    L_total = L_total + L_interp
-                    L_interp_value = float(L_interp.detach().item())
-            L_total.backward()
-            if (
-                self.gan_max_grad_norm is not None
-                and self.gan_max_grad_norm > 0
-            ):
-                params_iter = (
-                    model_ddp.parameters() if model_ddp is not None
-                    else model.parameters()
-                )
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in params_iter if p.grad is not None],
-                    self.gan_max_grad_norm,
-                )
-            optim.step()
-            out[f"train/{name}_dense_loss"] = float(L_dense.detach().item())
-            out[f"train/{name}_mean_align_loss"] = float(
-                L_mean_align.detach().item()
-            )
-            out[f"train/{name}_pred_mean"] = float(pred.detach().mean().item())
-            out[f"train/{name}_target_mean"] = float(target.mean().item())
-            out[f"train/{name}_interp_loss"] = L_interp_value
-
-        # ----- maniqa_approx training -----
-        # Single-input (NR-IQA, no GT). The target is sparse — only
-        # tokens covered by a sampled MANIQA patch this iter have a
-        # valid target; others are NaN-masked via ``target_maniqa_mask``.
-        # Loss = masked-MSE + masked-mean-align (over valid positions
-        # only). The mean-align term anchors the approx's average
-        # prediction to the sampled patches' mean quality so the model
-        # learns the correct absolute scale even though dense MSE only
-        # covers a fraction of tokens per iter.
-        if (
-            self.maniqa_approx is not None
-            and self.maniqa_approx_optimizer is not None
-            and target_maniqa is not None
-            and target_maniqa_mask is not None
-            and self.maniqa_approx_loss_weight > 0
-        ):
-            optim = self.maniqa_approx_optimizer
-            optim.zero_grad(set_to_none=True)
-            model_for_update = (
-                self.maniqa_approx_ddp if self.maniqa_approx_ddp is not None
-                else self.maniqa_approx
-            )
-            pred = model_for_update(gen_lat_d).float()
-            mask_f = target_maniqa_mask.float()
-            mask_sum = mask_f.sum().clamp_min(1.0)
-            sq = (pred - target_maniqa) ** 2 * mask_f
-            L_dense = sq.sum() / mask_sum
-            # Masked mean-align: align mean over VALID tokens only.
-            pred_masked_mean = (
-                (pred * mask_f).sum() / mask_sum
-            )
-            target_masked_mean = (
-                (target_maniqa * mask_f).sum() / mask_sum
-            )
-            L_mean_align = (pred_masked_mean - target_masked_mean) ** 2
-            L_total = (
-                L_dense
-                + self.perceptual_approx_mean_align_weight * L_mean_align
-            )
-            L_total.backward()
-            if (
-                self.gan_max_grad_norm is not None
-                and self.gan_max_grad_norm > 0
-            ):
-                params_iter = (
-                    self.maniqa_approx_ddp.parameters()
-                    if self.maniqa_approx_ddp is not None
-                    else self.maniqa_approx.parameters()
-                )
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in params_iter if p.grad is not None],
-                    self.gan_max_grad_norm,
-                )
-            optim.step()
-            out["train/maniqa_approx_dense_loss"] = float(
-                L_dense.detach().item()
-            )
-            out["train/maniqa_approx_mean_align_loss"] = float(
-                L_mean_align.detach().item()
-            )
-            out["train/maniqa_approx_pred_mean"] = float(
-                pred_masked_mean.detach().item()
-            )
-            out["train/maniqa_approx_target_mean"] = float(
-                target_masked_mean.detach().item()
-            )
-            out["train/maniqa_approx_n_valid_tokens"] = float(
-                mask_sum.item()
-            )
-
-        # ----- gan_d_approx training -----
-        # gan_d_approx training was here (paired PerceptualApprox-based
-        # disc approximator). REMOVED — replaced by the existing
-        # LatentSAM2Critic (single-input) whose distillation runs in
-        # ``_run_distilled_disc_critic_update`` Path 2 with multi-noise
-        # via ``gan_critic_n_interp_samples``. ``self.latent_critic``
-        # IS the gan_d_approx now.
-
-    def _compute_gt_latent_recon_loss(
-        self,
-        pred_image: torch.Tensor,
-        gt_latents_window: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Direct latent-space MAE+MSE between pred_image and GT.
-
-        Gated by ``gt_latent_mae_loss_weight`` and
-        ``gt_latent_mse_loss_weight``. Both apply at constant weight
-        every step — no warmup, no ramp. Returns ``(loss, logs)``;
-        ``loss`` is a graph-attached scalar to add to ``generator_loss``.
-        Zero scalar + empty logs when both weights are 0.
-        """
-        device = pred_image.device
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        w_mae = self.gt_latent_mae_loss_weight
-        w_mse = self.gt_latent_mse_loss_weight
-        if w_mae <= 0.0 and w_mse <= 0.0:
-            return zero, {}
-        gt_det = gt_latents_window.detach().to(pred_image.dtype)
-        diff = pred_image - gt_det
-        loss = zero
-        logs: Dict[str, float] = {}
-        if w_mae > 0.0:
-            mae_raw = diff.abs().mean()
-            loss = loss + w_mae * mae_raw.to(pred_image.dtype)
-            logs["train/gt_latent_mae_raw"] = float(mae_raw.detach().item())
-            logs["train/gt_latent_mae_weighted"] = float(
-                (w_mae * mae_raw).detach().item()
-            )
-        if w_mse > 0.0:
-            mse_raw = diff.pow(2).mean()
-            loss = loss + w_mse * mse_raw.to(pred_image.dtype)
-            logs["train/gt_latent_mse_raw"] = float(mse_raw.detach().item())
-            logs["train/gt_latent_mse_weighted"] = float(
-                (w_mse * mse_raw).detach().item()
-            )
-        return loss, logs
-
-    def _compute_gen_side_perceptual_loss(
-        self,
-        pred_image: torch.Tensor,
-        gt_latents_window: torch.Tensor,
-        current_step: int,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Gen-side perceptual loss via the trained approxes.
-
-        ``pred_image``: graph-on gen latent ``[B, F, C, H, W]``.
-        ``gt_latents_window``: GT latent (detached).
-
-        Returns ``(loss, logs)`` where ``loss`` is a graph-attached
-        scalar to add to gen_loss; backward flows through the small
-        approxes (no VAE) into the gen.
-
-        Gated by warmup and per-approx weights. Returns zero scalar
-        + empty logs when nothing fires.
-        """
-        device = pred_image.device
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        if current_step < self.perceptual_approx_warmup_steps:
-            return zero, {}
-        # Linear ramp factor after the warmup gate opens. Multiplies
-        # every per-approx weight uniformly so MANIQA/LPIPS/MS-SSIM/MSE
-        # all share the same on-ramp shape. ramp_steps == 0 preserves
-        # the legacy hard-switch behaviour.
-        if self.perceptual_approx_ramp_steps > 0:
-            ramp_in = current_step - self.perceptual_approx_warmup_steps
-            ramp_factor = min(
-                1.0,
-                max(0.0, float(ramp_in) / float(self.perceptual_approx_ramp_steps)),
-            )
-        else:
-            ramp_factor = 1.0
-        # Optional linear DECAY on top of the up-ramp. When configured,
-        # multiplicatively shrink ramp_factor toward 0 across
-        # [decay_start_step, decay_end_step]. Past decay_end_step the
-        # contribution is zero. Disabled when decay_start_step < 0.
-        if (
-            self.perceptual_approx_decay_start_step >= 0
-            and current_step >= self.perceptual_approx_decay_start_step
-        ):
-            decay_span = (
-                self.perceptual_approx_decay_end_step
-                - self.perceptual_approx_decay_start_step
-            )
-            if current_step >= self.perceptual_approx_decay_end_step:
-                decay_factor = 0.0
-            else:
-                t = (
-                    current_step - self.perceptual_approx_decay_start_step
-                ) / max(1, decay_span)
-                decay_factor = max(0.0, 1.0 - float(t))
-            ramp_factor = ramp_factor * decay_factor
-        loss = zero
-        logs: Dict[str, float] = {
-            "train/perc_ramp_factor": float(ramp_factor),
-        }
-        gt_lat_det = gt_latents_window.detach().to(pred_image.dtype)
-        # ``sign``: +1 for distance approxes (gen wants pred LOW); -1
-        # for similarity / GAN approxes (gen wants pred HIGH).
-        # MS-SSIM is in [0, 1] with 1 = identical → sign = -1 so the
-        # gen MAXIMIZES it.
-        for name, model, weight, sign, single_input in [
-            (
-                "mse_approx",
-                self.mse_approx,
-                self.mse_approx_loss_weight,
-                +1.0,
-                False,
-            ),
-            (
-                "lpips_approx",
-                self.lpips_approx,
-                self.lpips_approx_loss_weight,
-                +1.0,
-                False,
-            ),
-            (
-                "msssim_approx",
-                self.msssim_approx,
-                self.msssim_approx_loss_weight,
-                -1.0,
-                False,
-            ),
-            (
-                "maniqa_approx",
-                self.maniqa_approx,
-                self.maniqa_approx_loss_weight,
-                -1.0,  # gen wants MANIQA quality HIGH
-                True,  # NR-IQA → no GT input
-            ),
-            # NOTE: gan_d_approx (PerceptualApprox-based) entry removed.
-            # The disc-side gradient is delivered to gen via
-            # ``self.latent_critic`` (LatentSAM2Critic) in the existing
-            # Path 3 of ``_compute_r3gan_losses_distilled``.
-        ]:
-            if model is None or weight <= 0:
-                continue
-            effective_weight = weight * ramp_factor
-            # Skip the forward entirely if the ramp factor has zeroed
-            # the contribution (saves the approx forward+backward when
-            # the ramp hasn't engaged yet).
-            if effective_weight == 0.0:
-                logs[f"train/{name}_gen_pred_mean"] = 0.0
-                logs[f"train/{name}_gen_loss_weighted"] = 0.0
-                continue
-            # Freeze approx params for this forward — gen-side
-            # backward only flows into pred_image, not the approx.
-            model.requires_grad_(False)
-            try:
-                if single_input:
-                    pred = model(pred_image.to(pred_image.dtype)).float()
-                else:
-                    pred = model(
-                        pred_image.to(pred_image.dtype), gt_lat_det,
-                    ).float()
-                pred_mean = pred.mean()
-                loss = loss + sign * effective_weight * pred_mean.to(pred_image.dtype)
-            finally:
-                model.requires_grad_(True)
-            logs[f"train/{name}_gen_pred_mean"] = float(
-                pred_mean.detach().item()
-            )
-            logs[f"train/{name}_gen_loss_weighted"] = float(
-                (sign * effective_weight * pred_mean).detach().item()
-            )
-        return loss, logs
-
     def _get_lpips_model(self) -> Optional["torch.nn.Module"]:
         """Lazy-build (and cache) the LPIPS-VGG perceptual distance
         model. Returns None when ``lpips_loss_weight == 0``.
@@ -5048,685 +3473,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if self.gan_warmup_shape == "cosine":
             return 0.5 * (1.0 - math.cos(math.pi * t))
         return t  # "linear"
-
-    def _compute_r3gan_losses_distilled(
-        self,
-        pred_image: torch.Tensor,
-        gt_latents_window: torch.Tensor,
-        current_step: int,
-        flash_dmd_gan_x0: Optional[torch.Tensor] = None,
-    ) -> tuple:
-        """Distilled-critic R3GAN flow with action_critic-style boosts.
-
-        Order of operations (mirrors ``_compute_action_critic_losses``):
-
-          1. Path 1 (D-update on heads + R1/R2) — trains the SAM2 disc
-             heads on this iter's (real, fake) features.
-          2. Path 2 (critic value/grad distillation) — trains the
-             ``LatentSAM2Critic`` to match the freshly-updated disc.
-          3. Path 3 (gen-side ``-critic(fake_lat_grad)``) — uses the
-             FRESHLY-UPDATED critic so the generator sees current
-             gradients, not the previous iter's stale critic.
-
-        This mirrors the action-critic pattern: train the critic just
-        before the generator consumes it. Paths 1+2 run INLINE up-front
-        so Path 3 sees the freshly-updated critic.
-        """
-        device = pred_image.device
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-
-        critic = self.latent_critic
-
-        # ----- Latents (fp32 for R1/R2 stability — Paths 1 + 2 both fp32).
-        real_lat = gt_latents_window.detach().to(torch.float32)
-        # G-side fake latent: Flash-DMD = flash_dmd_gan_x0 (paper §3.3
-        # Eq. 9); else the rolling rollout's pred_image. Path 3 uses
-        # the GRAD-attached version; Paths 1+2 use detached.
-        if flash_dmd_gan_x0 is not None:
-            fake_lat_grad = flash_dmd_gan_x0.to(torch.float32)
-        else:
-            fake_lat_grad = pred_image.to(torch.float32)
-        fake_lat = fake_lat_grad.detach()
-
-        logs: Dict[str, float] = {}
-
-        # ===== Paths 1+2: D-update + critic value-distillation =======
-        # Gated by ``gan_disc_start_step`` (default 0 = train from step
-        # 0). When deferred, the entire D pass is skipped — no D
-        # activations live, no D backward, no D optim step. Surfaces a
-        # ``train/r3gan_disc_skipped`` flag so wandb can mark the gap.
-        if current_step >= self.gan_disc_start_step:
-            self._run_distilled_disc_critic_update(
-                real_lat=real_lat,
-                fake_lat=fake_lat,
-                current_step=current_step,
-                out=logs,
-            )
-            logs["train/r3gan_disc_skipped"] = 0.0
-        else:
-            logs["train/r3gan_disc_skipped"] = 1.0
-
-        # ===== Path 3: Gen-side via critic (after warmup) =============
-        critic_warmup_done = (
-            current_step >= self.gan_critic_warmup_steps
-        )
-        # Gen GAN weight ramp: 0 until critic warmup, then linear
-        # 0 → gan_loss_weight over the next ``gan_warmup_steps``.
-        if (
-            self.gan_warmup_steps > 0
-            and current_step < (
-                self.gan_critic_warmup_steps + self.gan_warmup_steps
-            )
-            and current_step >= self.gan_critic_warmup_steps
-        ):
-            ramp_steps_in = current_step - self.gan_critic_warmup_steps
-            t_norm = ramp_steps_in / max(1, self.gan_warmup_steps)
-            ramp = self._gan_warmup_shape_apply(t_norm)
-            gen_gan_weight = ramp * self.gan_loss_weight
-        elif current_step >= (
-            self.gan_critic_warmup_steps + self.gan_warmup_steps
-        ):
-            gen_gan_weight = self.gan_loss_weight
-        else:
-            gen_gan_weight = 0.0
-
-        if critic_warmup_done and gen_gan_weight > 0:
-            # Freeze critic params so the gen backward doesn't write
-            # critic-side gradients into the critic optim (the critic
-            # has already been updated above for this iter, OR will be
-            # updated in the deferred step for Sobolev). Mirrors the
-            # legacy ``disc_for_guidance.requires_grad_(False)`` pattern
-            # and matches ``_compute_action_critic_losses``'s
-            # ``critic_for_guidance.requires_grad_(False)`` block.
-            critic.requires_grad_(False)
-            try:
-                gen_critic_logit = critic(fake_lat_grad).float()
-                gen_gan_main = -gen_critic_logit.mean()
-                generator_gan_loss = (
-                    gen_gan_weight * gen_gan_main.to(pred_image.dtype)
-                )
-            finally:
-                critic.requires_grad_(True)
-            d_fake_for_g_value = float(gen_critic_logit.detach().mean().item())
-            gen_gan_main_value = float(gen_gan_main.detach().item())
-        else:
-            generator_gan_loss = zero
-            d_fake_for_g_value = 0.0
-            gen_gan_main_value = 0.0
-        # Capture the GAN-only weighted value BEFORE the perceptual
-        # losses are summed in below. This is what
-        # ``train/r3gan_g_loss_weighted`` should reflect — the actual
-        # gen-side GAN push on the student — without the perceptual-
-        # approx bias term that's been contaminating the metric. The
-        # student's total gradient is unchanged (still the sum), but
-        # the wandb plot now reads cleanly.
-        gan_only_weighted_value = (
-            gen_gan_weight * gen_gan_main_value
-            if (critic_warmup_done and gen_gan_weight > 0)
-            else 0.0
-        )
-
-        # Gen-side perceptual loss via the trained approxes. Adds to
-        # generator_gan_loss so the same downstream summing path works.
-        # Backward flows through the (small) approxes into pred_image
-        # — no VAE in autograd graph.
-        perc_loss_weighted_value = 0.0
-        if (
-            self.mse_approx is not None
-            or self.lpips_approx is not None
-            or self.msssim_approx is not None
-            or self.maniqa_approx is not None
-        ):
-            perc_loss, perc_logs = self._compute_gen_side_perceptual_loss(
-                pred_image=fake_lat_grad,
-                gt_latents_window=real_lat,
-                current_step=current_step,
-            )
-            if (
-                torch.is_tensor(perc_loss)
-                and perc_loss.requires_grad
-            ):
-                perc_loss_weighted_value = float(perc_loss.detach().item())
-            generator_gan_loss = generator_gan_loss + perc_loss
-            logs.update(perc_logs)
-
-        logs.update({
-            "train/r3gan_d_fake_for_g": d_fake_for_g_value,
-            "train/r3gan_g_loss_raw": gen_gan_main_value,
-            # GAN-only weighted value (NOT bundled with perceptual
-            # losses any more). Captured pre-summation above so the
-            # plot shows ``gan_loss_weight × gen_gan_main`` cleanly.
-            "train/r3gan_g_loss_weighted": gan_only_weighted_value,
-            # Perceptual-approx weighted contribution (MANIQA + others)
-            # — separate from the GAN-only key. Sum of these two
-            # equals the previous (bundled) r3gan_g_loss_weighted.
-            "train/perc_loss_weighted": perc_loss_weighted_value,
-            "train/gan_plus_perc_loss_weighted": (
-                gan_only_weighted_value + perc_loss_weighted_value
-            ),
-            "train/r3gan_g_weight": float(gen_gan_weight),
-            "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
-        })
-        return generator_gan_loss, logs
-
-    def _run_distilled_disc_critic_update(
-        self,
-        real_lat: torch.Tensor,
-        fake_lat: torch.Tensor,
-        current_step: int,
-        out: Dict[str, Any],
-    ) -> None:
-        """Train the SAM2 disc heads (Path 1) + LatentSAM2Critic (Path 2).
-
-        Operates on detached real/fake latents. Mutates ``out`` in
-        place with Path 1 + Path 2 diagnostics. Runs INLINE before
-        Path 3 so the gen consumes a freshly-trained critic.
-        """
-        from model.r3gan import rpgan_d_loss
-
-        # R1/R2 gradient penalty on the SAM2-feature manifold (Option A).
-        # The ADM 2D heads end with ``GAP → Linear(C → 1)`` so the
-        # gradient at each input feature element is shrunk by the head's
-        # spatial averaging factor: ``∂D / ∂feat[c, h, w] ≈ w[c] / (H*W)``
-        # at the post-conv stage. The naive penalty
-        # ``mean_batch(||∇D||²)`` therefore SHRINKS with feature spatial
-        # size: per scale, ``Σ |∂D/∂feat|² ≈ HW * (1/HW)² = 1/HW``. With
-        # 3 SAM2 scales of {128², 64², 32²}, the 32² scale dominates by
-        # ~16x while the 128² scale contributes ~1/16 as much, and the
-        # absolute magnitude is so small (~1e-3 to 1e-5 with γ=1) that
-        # the penalty is effectively zero — disc saturates unconstrained.
-        #
-        # We restore paper-faithful magnitude by multiplying each scale's
-        # per-sample squared-norm by its own ``H*W`` (undoing the GAP
-        # shrinkage) before averaging across scales. With this, γ=1 puts
-        # the penalty at the same scale as the paper's pixel-manifold
-        # γ=1 result and the disc is properly regularized.
-        def _gap_unscaled_grad_penalty(grads):
-            terms = []
-            for g in grads:
-                # ``g.shape == [B*F, C, H, W]`` — multi-scale features
-                # come out of SAM2 at different spatial dims per scale.
-                spatial_size = g.shape[-2] * g.shape[-1]
-                per_sample_sq = (g.flatten(1) ** 2).sum(dim=1)  # [B*F]
-                terms.append((per_sample_sq * spatial_size).mean())
-            return sum(terms) / max(1, len(terms))
-
-        disc = self.r3gan_disc
-        # Heads-only DDP wrap (or un-wrapped fallback). Routing the
-        # heads forward through this wrapper is critical for DDP
-        # all-reduce to fire on the heads' params (see
-        # ``model/r3gan_sam2.py:_R3GANDiscHeads`` docstring).
-        heads_for_update = (
-            self.r3gan_heads_ddp
-            if self.r3gan_heads_ddp is not None else disc.heads_module
-        )
-        critic = self.latent_critic
-        critic_for_update = (
-            self.latent_critic_ddp
-            if self.latent_critic_ddp is not None else critic
-        )
-
-        vae = getattr(self.model, "vae", None)
-        if vae is None:
-            raise RuntimeError(
-                "gan_sam2_distilled_critic=True requires self.model.vae."
-            )
-
-        # ``real_lat`` and ``fake_lat`` come from the gen-step's
-        # stash. Both are detached (no graph from the gen rollout
-        # remains since gen.backward already ran).
-        B, F_, _, _, _ = real_lat.shape
-        device = real_lat.device
-
-        def _decode_no_grad(lat: torch.Tensor) -> torch.Tensor:
-            """VAE decode via ``cached_decode``. Caller controls grad
-            context (this fn assumes torch.no_grad).
-
-            Why cached_decode (not plain decode): the WAN VAE's plain
-            ``decode`` does an unconditioned init at the first latent
-            of every call — that init frame has a brightness anomaly
-            that, although produced as pixel 0, also propagates
-            through the Conv3d's temporal feat_map state and contaminates
-            the subsequent frames in subtle ways (visible as a per-
-            chunk brightness spike that compounds over rollouts). The
-            old "prepend a dummy first latent, slice [:, 1:]" trick
-            tried to absorb this — but the polluted cache state still
-            leaks past the slice. ``cached_decode`` keeps the WAN
-            VAE's feat_map populated across calls so the init pixel
-            is encoded at most once and subsequent decodes flow
-            through smooth left-context; no per-call brightness
-            anomaly.
-            """
-            pix = vae.decode_to_pixel(lat, use_cache=True)
-            return pix
-
-        def _decode_grad(lat: torch.Tensor) -> torch.Tensor:
-            """VAE decode that PRESERVES the autograd graph through
-            ``lat`` for the gradient-distillation target. Caller
-            should keep input small (subset = 3 frames) to bound
-            workspace. ``cached_decode`` path matches ``_decode_no_
-            grad`` for consistent output shape.
-            """
-            pix = vae.decode_to_pixel(lat, use_cache=True)
-            return pix
-
-        # ===== Path 1: D-update (no_grad V+SAM2; R1/R2 on features) =====
-        with torch.no_grad():
-            # GT pixels: prefer the pre-decoded uint8 cache (loaded once
-            # per sequence in ``_streaming_setup_sequence_from_ride``)
-            # to skip the WAN VAE decode of GT every iter. Cached
-            # tensor is uint8 [1, F_pix_window, 3, H, W] at the WAN VAE's
-            # native pixel resolution (480x832); slice to the active
-            # chunk window via the chunk_lo stash, dequantize to fp32
-            # in [-1, 1] (matches ``_decode_no_grad`` output range).
-            ss = getattr(self.model, "streaming_state", None) or {}
-            cached_pixels_uint8 = ss.get("ride_pixels_window_uint8")
-            chunk_lo_in_ride = ss.get("last_chunk_lo_in_ride_window")
-            chunk_size_for_pix = ss.get("last_chunk_size")
-            real_pixel_d: Optional[torch.Tensor] = None
-            if (
-                cached_pixels_uint8 is not None
-                and chunk_lo_in_ride is not None
-                and chunk_size_for_pix is not None
-            ):
-                pix_lo = int(chunk_lo_in_ride) * 4
-                pix_hi = (int(chunk_lo_in_ride) + int(chunk_size_for_pix)) * 4
-                if pix_hi <= cached_pixels_uint8.shape[1]:
-                    sl = cached_pixels_uint8[:, pix_lo:pix_hi].to(
-                        device=device, non_blocking=True,
-                    )
-                    real_pixel_d = (
-                        sl.to(torch.float32) / 127.5 - 1.0
-                    ).clamp_(-1.0, 1.0)
-                    if not getattr(self, "_gt_pixel_cache_hit_logged", False):
-                        logging.info(
-                            "[gt-pixel-cache] using cached GT pixels "
-                            "(chunk_lo=%d, %d→%d frames)",
-                            int(chunk_lo_in_ride), pix_lo, pix_hi,
-                        )
-                        self._gt_pixel_cache_hit_logged = True
-            if real_pixel_d is None:
-                real_pixel_d = _decode_no_grad(real_lat).to(torch.float32)
-            fake_pixel_d = _decode_no_grad(fake_lat).to(torch.float32)
-            # The WAN VAE has 4× temporal expansion + the dummy-frame
-            # trick produces ``F_pix = 4 * F_lat``. SAM2 features are
-            # batched at the PIXEL frame count, so heads.forward needs
-            # F_pix (not F_=21 from the latent shape).
-            B_pix, F_pix = real_pixel_d.shape[0], real_pixel_d.shape[1]
-            real_feats_raw = disc.forward_features(real_pixel_d)
-            fake_feats_raw = disc.forward_features(fake_pixel_d)
-
-        # ===== Path 1.5: Train dense per-token approxes (mse / lpips /
-        # gan_d_approx). Reuses the no_grad pixel decodes above. Targets
-        # are dense per-token at the latent-token grid (matches each
-        # approx's post-stem output shape). Approxes train against
-        # ``MSE(approx_pred, target)`` + ``β * MSE(approx_pred.mean(),
-        # target.mean())``. Gen-side loss flows gradient through the
-        # small approxes (no VAE in autograd graph) — see
-        # ``_compute_gen_side_perceptual_loss``.
-        if (
-            self.mse_approx is not None
-            or self.lpips_approx is not None
-            or self.msssim_approx is not None
-            or self.maniqa_approx is not None
-        ):
-            # Target token grid: latent spatial dim ceil-divided by 8
-            # (matches the approx's post-stem shape — 3× stride-2
-            # conv with padding=1 produces ``ceil(H/8)`` tokens, not
-            # ``floor`` — e.g. H=60 → 30 → 15 → 8, not 7).
-            target_h = max(1, (real_lat.shape[-2] + 7) // 8)
-            target_w = max(1, (real_lat.shape[-1] + 7) // 8)
-            (
-                target_mse,
-                target_lpips,
-                target_msssim,
-            ) = self._compute_dense_perceptual_targets(
-                gen_pix=fake_pixel_d,
-                gt_pix=real_pixel_d,
-                F_lat=int(F_),
-                target_h=target_h,
-                target_w=target_w,
-            )
-            # MANIQA target — sparse spatial (only patch-covered
-            # tokens). NaN at unsupervised positions; approx training
-            # masks them out. Built no_grad on the gen pixels alone
-            # (no GT — NR-IQA). Wall-clock recorded for the timing
-            # smoke (option 1 vs middle option).
-            (
-                target_maniqa,
-                target_maniqa_mask,
-                maniqa_target_build_ms,
-            ) = self._compute_dense_maniqa_target(
-                gen_pix=fake_pixel_d,
-                F_lat=int(F_),
-                target_h=target_h,
-                target_w=target_w,
-            )
-            if maniqa_target_build_ms > 0:
-                out["train/maniqa_target_build_ms"] = float(
-                    maniqa_target_build_ms
-                )
-            # NOTE: disc dense target computation removed — the
-            # PerceptualApprox-based gan_d_approx is gone. The
-            # LatentSAM2Critic distillation in Path 2 below uses
-            # per-frame disc logit targets (its existing API).
-
-            # ----- (2) Diagnostic quality logs (no_grad, lightweight).
-            # Reuse the dense targets we already computed so .mean() is
-            # essentially free — we don't need to recompute heavy
-            # pixel-space subtractions.
-            with torch.no_grad():
-                if target_mse is not None:
-                    out["diag/pixel_mse"] = float(target_mse.mean().item())
-                if target_lpips is not None:
-                    out["diag/pixel_lpips"] = float(
-                        target_lpips.mean().item()
-                    )
-                if target_msssim is not None:
-                    out["diag/pixel_msssim"] = float(
-                        target_msssim.mean().item()
-                    )
-            # ----- v11-style multi-noise interpolations (Lipschitz). -----
-            # Sample K interpolation points along the (fake_lat → real_lat)
-            # line. For each, compute dense per-token targets via the
-            # no_grad pipeline (VAE decode + LPIPS + SAM2/disc-dense
-            # if needed). Process sequentially so peak transient
-            # memory is bounded to one interpolation's no_grad cost.
-            # Approxes train on these K extra anchor points in addition
-            # to the original (fake, gt) pair — the densified value-
-            # field supervision is what makes the approx's gradient
-            # (gen-side ``-approx.mean()``) actually meaningful.
-            n_interp = max(0, int(self.perceptual_approx_n_interp_samples))
-            interp_data: List[Dict[str, torch.Tensor]] = []
-            if n_interp > 0:
-                alphas = torch.linspace(
-                    0.0, 1.0, n_interp + 2, device=device,
-                )[1:-1]
-                for alpha_t in alphas:
-                    a = float(alpha_t.item())
-                    interp_lat = (1.0 - a) * fake_lat + a * real_lat
-                    with torch.no_grad():
-                        interp_pixel = _decode_no_grad(interp_lat).to(
-                            torch.float32,
-                        )
-                        (
-                            i_target_mse,
-                            i_target_lpips,
-                            i_target_msssim,
-                        ) = self._compute_dense_perceptual_targets(
-                            gen_pix=interp_pixel,
-                            gt_pix=real_pixel_d,
-                            F_lat=int(F_),
-                            target_h=target_h,
-                            target_w=target_w,
-                        )
-                        del interp_pixel
-                    interp_data.append({
-                        "lat": interp_lat.detach(),
-                        "mse": i_target_mse,
-                        "lpips": i_target_lpips,
-                        "msssim": i_target_msssim,
-                    })
-            self._run_perceptual_approx_update(
-                gen_lat=fake_lat,
-                gt_lat=real_lat,
-                target_mse=target_mse,
-                target_lpips=target_lpips,
-                target_msssim=target_msssim,
-                target_maniqa=target_maniqa,
-                target_maniqa_mask=target_maniqa_mask,
-                interp_data=interp_data,
-                out=out,
-            )
-        # Detach-and-leaf the features for R1/R2 (Option A: penalty on
-        # the feature manifold, not pixel manifold).
-        real_feats = [
-            f.detach().requires_grad_(True) for f in real_feats_raw
-        ]
-        fake_feats = [
-            f.detach().requires_grad_(True) for f in fake_feats_raw
-        ]
-        d_loss_value = 0.0
-        d_real_value = 0.0
-        d_fake_detached_value = 0.0
-        r1_value = 0.0
-        r2_value = 0.0
-        for _k in range(max(1, self.gan_updates_per_step)):
-            self.r3gan_optimizer.zero_grad(set_to_none=True)
-            # Re-detach + re-leaf each iter so R1/R2 grads chain only
-            # through the current iter's heads forward.
-            real_feats_iter = [
-                f.detach().requires_grad_(True) for f in real_feats
-            ]
-            fake_feats_iter = [
-                f.detach().requires_grad_(True) for f in fake_feats
-            ]
-            # Route through the heads-DDP wrapper so DDP's forward-time
-            # tracking fires (essential — if we routed through the
-            # un-wrapped ``disc.heads_module`` here, the backward
-            # below would NOT trigger DDP all-reduce on the heads'
-            # params and ranks would silently diverge).
-            # Use PIXEL frame count (B_pix, F_pix) — features are
-            # batched at the post-VAE-decode pixel rate, not the
-            # latent rate.
-            d_real = heads_for_update(
-                real_feats_iter, B_pix, F_pix,
-            )
-            r1_grads = torch.autograd.grad(
-                d_real.sum(), real_feats_iter,
-                create_graph=True, retain_graph=True,
-            )
-            r1 = self.gan_r1_gamma * _gap_unscaled_grad_penalty(r1_grads)
-            d_fake_d = heads_for_update(
-                fake_feats_iter, B_pix, F_pix,
-            )
-            r2_grads = torch.autograd.grad(
-                d_fake_d.sum(), fake_feats_iter,
-                create_graph=True, retain_graph=True,
-            )
-            r2 = self.gan_r2_gamma * _gap_unscaled_grad_penalty(r2_grads)
-            d_main = rpgan_d_loss(d_real, d_fake_d)
-            d_total = d_main + r1 + r2
-            d_total.backward()
-            if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
-                # In distilled mode the only trainable disc params are
-                # the heads (the SAM2 encoder is frozen). Clip those.
-                heads_params_iter = (
-                    self.r3gan_heads_ddp.parameters()
-                    if self.r3gan_heads_ddp is not None
-                    else disc.heads_module.parameters()
-                )
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in heads_params_iter if p.grad is not None],
-                    self.gan_max_grad_norm,
-                )
-            self.r3gan_optimizer.step()
-            d_loss_value = float(d_main.detach().item())
-            d_real_value = float(d_real.detach().mean().item())
-            d_fake_detached_value = float(d_fake_d.detach().mean().item())
-            r1_value = float(r1.detach().item())
-            r2_value = float(r2.detach().item())
-
-        # ===== Path 2: Latent critic value+grad distillation ==========
-        # Value targets — full-frame, no_grad teacher forward. Reuse
-        # Path 1's already-computed features (avoids two redundant
-        # SAM2 forwards per iter, saving ~6 GB transient workspace).
-        # When dense distillation is enabled, additionally compute the
-        # per-token logit maps (forward_dense_heads at the critic's
-        # post-stem grid) and pool 4 pixel-frames → 1 latent-frame.
-        from model.latent_sam2_critic import LatentSAM2Critic as _LSAM2C
-        dense_distill = bool(self.gan_critic_dense_distillation)
-        # Compute the post-stem grid the critic will produce so we can
-        # ask the disc for a matching dense target. Defensive fallback
-        # to the latent's spatial dims floor-divided by 8 (which is what
-        # the critic's stem produces by construction).
-        target_h, target_w = _LSAM2C.post_stem_grid(
-            int(real_lat.shape[-2]), int(real_lat.shape[-1]),
-        )
-        with torch.no_grad():
-            teacher_val_real = disc.forward_heads(
-                real_feats_raw, batch_size=B_pix, num_frames=F_pix,
-            ).float()
-            teacher_val_fake = disc.forward_heads(
-                fake_feats_raw, batch_size=B_pix, num_frames=F_pix,
-            ).float()
-            if dense_distill:
-                teacher_dense_real = disc.forward_dense_heads(
-                    real_feats_raw,
-                    batch_size=B_pix,
-                    num_frames=F_pix,
-                    target_h=target_h,
-                    target_w=target_w,
-                ).float()  # [B, F_pix, target_h, target_w]
-                teacher_dense_fake = disc.forward_dense_heads(
-                    fake_feats_raw,
-                    batch_size=B_pix,
-                    num_frames=F_pix,
-                    target_h=target_h,
-                    target_w=target_w,
-                ).float()
-                # Pool F_pix → F_lat by averaging 4 pixel-frames per
-                # latent (WAN VAE temporal expansion). Result:
-                # [B, F_lat, target_h, target_w].
-                pix_per_lat = F_pix // int(F_)
-                if pix_per_lat * int(F_) != F_pix:
-                    raise RuntimeError(
-                        f"Dense distillation: F_pix={F_pix} not "
-                        f"divisible by F_lat={F_}."
-                    )
-                teacher_dense_real = teacher_dense_real.view(
-                    B, int(F_), pix_per_lat, target_h, target_w,
-                ).mean(dim=2)
-                teacher_dense_fake = teacher_dense_fake.view(
-                    B, int(F_), pix_per_lat, target_h, target_w,
-                ).mean(dim=2)
-            else:
-                teacher_dense_real = None
-                teacher_dense_fake = None
-
-        # ----- Frame-rate alignment for distillation -----
-        # In ``frame_pool=none`` mode the disc returns ``[B*F_pix]``
-        # per-pixel-frame logits and the critic returns ``[B*F_lat]``
-        # per-latent-frame logits — different rates because the WAN
-        # VAE has 4× temporal expansion (F_pix = 4·F_lat). To match
-        # them for the value-distillation MSE, we average each latent's
-        # 4 pixel-frame teacher logits down to a single per-latent
-        # logit. Other pool modes already produce ``[B]`` per clip
-        # so no alignment needed.
-        def _align_teacher_to_critic(t: torch.Tensor) -> torch.Tensor:
-            if t.dim() == 1 and t.shape[0] == B * F_pix:
-                # Per-pixel-frame → per-latent-frame averaging.
-                pix_per_lat = F_pix // int(F_)
-                if pix_per_lat * int(F_) != F_pix:
-                    raise RuntimeError(
-                        f"Cannot align disc teacher: F_pix={F_pix} not "
-                        f"divisible by F_lat={F_}."
-                    )
-                return t.view(B, F_, pix_per_lat).mean(dim=2).reshape(
-                    B * F_,
-                )
-            return t
-
-        teacher_val_real = _align_teacher_to_critic(teacher_val_real)
-        teacher_val_fake = _align_teacher_to_critic(teacher_val_fake)
-
-        # ----- Multi-step critic update loop. -----
-        # Mirrors action_critic's ``critic_updates_per_step`` pattern:
-        # step the critic optimizer K_c times per gen step so the
-        # critic actually converges to the disc within one outer iter.
-        # Default K_c=1 is the legacy single-step behavior.
-        critic_updates = max(1, int(self.gan_critic_updates_per_step))
-        # Track only the LAST iter's diagnostics for logging.
-        L_value_value = 0.0
-        L_value_dense_value = 0.0
-        critic_val_real_last: Optional[torch.Tensor] = None
-        critic_val_fake_last: Optional[torch.Tensor] = None
-        for _kc in range(critic_updates):
-            if self.latent_critic_optimizer is not None:
-                self.latent_critic_optimizer.zero_grad(set_to_none=True)
-            # Critic forward on FULL clip — value-only distillation.
-            real_lat_critic_in = real_lat.clone().detach()
-            fake_lat_critic_in = fake_lat.clone().detach()
-            critic_val_real = critic_for_update(real_lat_critic_in).float()
-            critic_val_fake = critic_for_update(fake_lat_critic_in).float()
-            # Value loss on (real, fake) — scalar/per-frame MSE.
-            L_value = (
-                ((critic_val_real - teacher_val_real.detach()) ** 2).mean()
-                + ((critic_val_fake - teacher_val_fake.detach()) ** 2).mean()
-            )
-            # Dense per-token value loss. Routes through ``forward``
-            # with the ``dense=True`` kwarg so DDP intercepts the call
-            # correctly (calling ``critic.forward_dense`` directly on
-            # the DDP wrapper would skip grad-sync hooks and silently
-            # break param synchronization).
-            if dense_distill and teacher_dense_real is not None:
-                critic_val_real_dense = critic_for_update(
-                    real_lat_critic_in, dense=True,
-                ).float()  # [B, F_lat, target_h, target_w]
-                critic_val_fake_dense = critic_for_update(
-                    fake_lat_critic_in, dense=True,
-                ).float()
-                L_value_dense = (
-                    (
-                        (critic_val_real_dense - teacher_dense_real.detach())
-                        ** 2
-                    ).mean()
-                    + (
-                        (critic_val_fake_dense - teacher_dense_fake.detach())
-                        ** 2
-                    ).mean()
-                )
-                L_value = L_value + L_value_dense
-                L_value_dense_value = float(L_value_dense.detach().item())
-                del critic_val_real_dense, critic_val_fake_dense
-            if self.latent_critic_optimizer is not None:
-                L_value.backward()
-                if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
-                    critic_params_iter = (
-                        self.latent_critic_ddp.parameters()
-                        if self.latent_critic_ddp is not None
-                        else critic.parameters()
-                    )
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in critic_params_iter if p.grad is not None],
-                        self.gan_max_grad_norm,
-                    )
-                self.latent_critic_optimizer.step()
-            L_value_value = float(L_value.detach().item())
-            critic_val_real_last = critic_val_real.detach()
-            critic_val_fake_last = critic_val_fake.detach()
-        # Diagnostic: critic↔disc value correlation on (real, fake).
-        with torch.no_grad():
-            cv_all = torch.cat([critic_val_real_last, critic_val_fake_last], dim=0)
-            tv_all = torch.cat([teacher_val_real, teacher_val_fake], dim=0)
-            if cv_all.numel() >= 2:
-                cv_c = cv_all - cv_all.mean()
-                tv_c = tv_all - tv_all.mean()
-                denom = (cv_c.norm() * tv_c.norm()).clamp_min(1e-8)
-                critic_disc_corr = float((cv_c * tv_c).sum() / denom)
-            else:
-                critic_disc_corr = 0.0
-
-        # Diagnostics for ``out``.
-        out["train/r3gan_d_loss"] = d_loss_value
-        out["train/r3gan_r1"] = r1_value
-        out["train/r3gan_r2"] = r2_value
-        out["train/r3gan_d_real"] = d_real_value
-        out["train/r3gan_d_fake_detached"] = d_fake_detached_value
-        out["train/critic_value_loss"] = L_value_value
-        out["train/critic_value_dense_loss"] = L_value_dense_value
-        out["train/critic_logit_mean"] = float(
-            (
-                (critic_val_real_last.mean() + critic_val_fake_last.mean())
-                / 2.0
-            ).item()
-        ) if critic_val_real_last is not None else 0.0
-        out["train/disc_logit_mean"] = float(
-            ((teacher_val_real.mean() + teacher_val_fake.mean()) / 2.0)
-            .detach().item()
-        )
-        out["train/critic_disc_corr"] = critic_disc_corr
-        out["train/critic_updates_per_step"] = float(critic_updates)
 
     # ==================================================================
     # LADD discriminator (v28)
@@ -6900,20 +4646,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 flash_dmd_gan_x0=flash_dmd_gan_x0,
             )
 
-        # Dispatch to the distilled-critic flow when enabled. Keeps
-        # the legacy pixel-disc-in-gen-graph path as the fallback.
-        if (
-            getattr(self, "gan_sam2_distilled_critic", False)
-            and self.latent_critic is not None
-            and self.gan_backbone == "sam2_pixel"
-        ):
-            return self._compute_r3gan_losses_distilled(
-                pred_image=pred_image,
-                gt_latents_window=gt_latents_window,
-                current_step=current_step,
-                flash_dmd_gan_x0=flash_dmd_gan_x0,
-            )
-
         disc_for_update = (
             self.r3gan_disc_ddp if self.r3gan_disc_ddp is not None else self.r3gan_disc
         )
@@ -6936,54 +4668,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             pred_image_for_g_lat = pred_image.to(torch.float32)
         skip_g_side = False
 
-        if self.gan_backbone == "sam2_pixel":
-            # Pixel-space discriminator: decode the latent video to
-            # pixels via the WAN VAE. The decode runs in fp32 (the
-            # VAE's internal Conv3d kernels require fp32) and mirrors
-            # the dummy-frame trick from ``_log_pred_image_video`` to
-            # avoid the WAN VAE's first-frame artifact. Two D-side
-            # decodes per iter (real + fake) ALWAYS fire; the third
-            # G-side decode is skipped on Flash-DMD high-noise iters
-            # (where the gen GAN loss would be discarded anyway).
-            #
-            # Deviation from paper §4.1 (auditor's #11): the paper
-            # feeds RAW pixel reals directly (x_real ∼ D_real) and
-            # only fakes go through V (V(z_fake)). Our dataset is
-            # preprocessed to latent — no raw pixel videos on disk —
-            # so real = V(encode(real_pixel)) goes through the same
-            # VAE roundtrip as fake. Both real and fake live on the
-            # V-decode manifold (no V-roundtrip artifacts to detect,
-            # which is good), but the disc learns distinguishing on
-            # the V-decode manifold rather than natural images (mild
-            # distribution shift). Acceptable trade-off given data
-            # constraints; would require a parallel pixel-video data
-            # path to fix paper-faithfully.
-            vae = getattr(self.model, "vae", None)
-            if vae is None:
-                raise RuntimeError(
-                    "gan_backbone=sam2_pixel requires self.model.vae "
-                    "to be set; the WAN VAE wrapper is built by the "
-                    "parent SelfForcingModel init. Check the model "
-                    "construction path."
-                )
-
-            def _decode(lat: torch.Tensor) -> torch.Tensor:
-                # ``lat`` is [B, F, C, H, W] in fp32. Cached-decode
-                # path avoids the init-frame brightness anomaly that
-                # plain ``decode`` injects every call.
-                return vae.decode_to_pixel(lat, use_cache=True)
-
-            real_detached = _decode(real_detached_lat)
-            fake_detached = _decode(fake_detached_lat)
-            pred_image_for_g = (
-                None if skip_g_side else _decode(pred_image_for_g_lat)
-            )
-        else:
-            real_detached = real_detached_lat
-            fake_detached = fake_detached_lat
-            pred_image_for_g = (
-                None if skip_g_side else pred_image_for_g_lat
-            )
+        real_detached = real_detached_lat
+        fake_detached = fake_detached_lat
+        pred_image_for_g = (
+            None if skip_g_side else pred_image_for_g_lat
+        )
 
         # --- D-update (multi-step) -----------------------------------
         d_loss_value = 0.0
@@ -7026,10 +4715,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             gen_gan_weight = self.gan_loss_weight
 
         if gen_gan_weight > 0 and not skip_g_side:
-            # Freeze the disc for the G-side path. On the SAM2
-            # backbone the encoder stays frozen at all times — we
-            # restore ``requires_grad=True`` only on the trainable
-            # heads after the G-update.
+            # Freeze the disc for the G-side path.
             disc_for_guidance.requires_grad_(False)
             try:
                 d_real_for_g = disc_for_guidance(real_detached).detach()
@@ -7037,17 +4723,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 gen_gan_main = rpgan_g_loss(d_real_for_g, d_fake_for_g)
                 generator_gan_loss = gen_gan_weight * gen_gan_main.to(pred_image.dtype)
             finally:
-                # Restore trainability on the trainable params only.
-                # For SAM2 backbone, the frozen encoder must stay
-                # frozen — flip ALL params back to True then re-freeze
-                # the encoder. For latent backbone, all params are
-                # trainable so True everywhere is correct.
                 disc_for_guidance.requires_grad_(True)
-                if self.gan_backbone == "sam2_pixel":
-                    enc = getattr(disc_for_guidance, "image_encoder", None)
-                    if enc is not None:
-                        for p in enc.parameters():
-                            p.requires_grad_(False)
             d_fake_for_g_value = float(d_fake_for_g.detach().mean().item())
             gen_gan_main_value = float(gen_gan_main.detach().item())
         else:
@@ -7151,6 +4827,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         caption_suffix: str = "",
         action_overlay: Optional[torch.Tensor] = None,
         index_overlay: Optional[Tuple[int, int, int]] = None,
+        cap_frames: bool = True,
     ) -> None:
         """Decode ``pred_image`` (a student rollout in latent space) to
         pixel mp4 bytes and upload to wandb under ``sample/<name>``.
@@ -7210,7 +4887,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             latents = pred_image.detach().to(torch.float32)
             if latents.dim() != 5:
                 return
-            if self.sample_max_frames > 0:
+            if cap_frames and self.sample_max_frames > 0:
                 F_total = latents.shape[1]
                 if F_total > self.sample_max_frames:
                     latents = latents[:, -self.sample_max_frames:]
@@ -7340,6 +5017,89 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    @torch.no_grad()
+    def _log_pred_image_7chunk_sample(self, step: int) -> None:
+        """Eval rollout: seed the causal student with 7 GT-context chunks
+        (21 latent frames) and roll out 7 more chunks (21 frames), then
+        log the full 14-chunk (42-frame) video at ``sample_fps`` under
+        ``sample/pred_image_7_chunk``. GT actions drive the whole window.
+
+        Runs on ALL ranks (the underlying ``inference_with_trajectory``
+        does a cross-rank exit-flag broadcast, so every rank must call it
+        to stay collective-balanced) but only the main rank decodes and
+        uploads its own ride's video. A readiness MIN-reduce guarantees
+        all ranks agree to run-or-skip together, so the broadcast never
+        deadlocks. The training gen+critic backward for this step is
+        already complete and ``max_rolls_per_ride=1`` re-seeds next step,
+        so transiently overwriting the inference KV cache here is safe.
+        """
+        rd = getattr(self, "_sample_7chunk_ride", None)
+        ready_local = 1 if rd is not None else 0
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            flag = torch.tensor(
+                [ready_local], device=self.device, dtype=torch.long,
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            if int(flag.item()) == 0:
+                if self.is_main_process:
+                    logging.info(
+                        "[ActionForcing] 7chunk SKIP at step=%d: a rank had "
+                        "no stashed ride (local_ready=%d).",
+                        int(step), ready_local,
+                    )
+                return
+        elif not ready_local:
+            return
+        if self.is_main_process:
+            logging.info(
+                "[ActionForcing] 7chunk RUN at step=%d: rolling 7 GT ctx + "
+                "7 student chunks.", int(step),
+            )
+
+        npb = int(getattr(self.config, "num_frame_per_block", 3))
+        seed_frames = 7 * npb
+        roll_frames = 7 * npb
+        gt = rd["latents"].to(device=self.device, dtype=self.dtype)
+        act = rd["z_actions"].to(device=self.device)
+        prompt = rd["prompt_embeds"].to(device=self.device)
+        seed = gt[:, :seed_frames]
+        B, _, C, H, W = gt.shape
+        noise = torch.randn(
+            B, roll_frames, C, H, W, device=self.device, dtype=self.dtype,
+        )
+        # cond must cover seed (cf) + rollout frames, seed first.
+        cond, _uncond = self.model.build_action_conditional(
+            prompt_embeds=prompt,
+            gt_actions=act[:, : seed_frames + roll_frames],
+        )
+        pipe = self.model.inference_pipeline
+        pipe.reset_cache_state()
+        out, _, _ = pipe.inference_with_trajectory(
+            noise=noise,
+            seed_latents=seed,
+            requires_grad=False,
+            **cond,
+        )
+        pipe.reset_cache_state()
+        # The training ride's persistent streaming KV state was just
+        # clobbered by the inference rollout above; force a fresh setup
+        # on the next step rather than reusing a now-inconsistent cache.
+        self.model.reset_streaming_state()
+
+        if self.is_main_process:
+            try:
+                video_latents = torch.cat([seed.to(out.dtype), out], dim=1)
+                self._log_pred_image_video(
+                    video_latents, int(step), name="pred_image_7_chunk",
+                    caption_suffix="7 GT ctx + 7 student rolled (GT actions)",
+                    cap_frames=False,
+                )
+            except Exception as exc:  # pragma: no cover - logging only
+                logging.warning(
+                    "[ActionForcing] pred_image_7_chunk log failed at "
+                    "step=%d: %s", int(step), exc,
+                )
 
     @staticmethod
     def _draw_action_overlay(
@@ -7497,20 +5257,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     def _dump_module_inventory(self) -> None:
         """Print a one-shot startup inventory of which trainer-side
         modules + optimizers are actually built (vs ``None``). Reveals
-        whether any feature the operator believes is off (e.g. SAM2
-        disc, MANIQA approx, forward_noiser, alt_head, state_probe)
-        is in fact allocating GPU memory. Only main process logs.
+        whether any feature the operator believes is off (e.g.
+        forward_noiser, alt_head, state_probe) is in fact allocating
+        GPU memory. Only main process logs.
         """
         if not getattr(self, "is_main_process", True):
             return
         m = getattr(self, "model", None)
         names_trainer = [
             "r3gan_disc", "r3gan_disc_ddp", "r3gan_optimizer",
-            "r3gan_heads_ddp", "latent_critic", "latent_critic_ddp",
-            "latent_critic_optimizer",
-            "mse_approx", "lpips_approx", "msssim_approx",
-            "maniqa_approx", "gan_d_approx",
-            "_lpips_target_model", "_maniqa_target_model",
             "forward_noiser_optimizer", "state_probe_optimizer",
             "real_teacher_optimizer", "critic_optimizer",
             "fake_optimizer", "optimizer",
@@ -7543,7 +5298,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
             # Booleans / config-derived flags that toggle subsystems
             flags = [
-                "gan_enabled", "gan_backbone", "gan_sam2_distilled_critic",
+                "gan_enabled", "gan_backbone",
                 "flash_dmd_enabled", "boundary_vae_roundtrip",
                 "dmd_frozen_teacher_pass_enabled",
                 "real_teacher_train_online",
@@ -7679,10 +5434,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _bucket("action_token_projection", getattr(m, "action_token_projection", None))
             _bucket("action_critic", getattr(m, "action_critic", None))
             _bucket("state_probe", getattr(m, "state_probe", None))
-            _bucket("mse_approx", getattr(self, "mse_approx", None))
-            _bucket("lpips_approx", getattr(self, "lpips_approx", None))
-            _bucket("msssim_approx", getattr(self, "msssim_approx", None))
-            _bucket("latent_critic", getattr(self, "latent_critic", None))
             _bucket("r3gan_disc", getattr(self, "r3gan_disc", None))
             _bucket(
                 "_frozen_cotracker",
@@ -7754,76 +5505,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             logging.warning(
                 "[mem-audit %s] failed: %s", label, exc,
             )
-
-    def _apply_dmd_context_mix_p_schedule(self) -> float:
-        """Compute and apply ``dmd_context_mix_p`` for this outer iter.
-
-        Three modes; sensor takes priority, then step-switch, then
-        linear ramp:
-
-        1. **Sensor-gated** (``dmd_context_mix_p_sensor_enabled=True``):
-           Reads the most recent ``gen/dmd_pf_minus_pr_mae`` value
-           cached on ``self._latest_dmd_pf_minus_pr_mae`` (updated by
-           ``_streaming_train_one_chunk`` after each gen step). When
-           the metric is below ``..._sensor_threshold``, sets mix_p to
-           ``..._sensor_high`` (more GT context — bolster the teacher
-           when it's about to be insufficient as a target). When above,
-           sets to ``..._sensor_low``. Stateless single-threshold gate.
-           No-op until the first gen iter has produced a reading;
-           defaults to ``..._sensor_low`` until then.
-
-        2. **Hard step-switch** (sensor off,
-           ``dmd_context_mix_p_step_switch_at>0``): mix_p = start when
-           ``self.step < step_switch_at``; mix_p = target thereafter.
-           No interpolation — a single discrete flip at that step.
-
-        3. **Linear ramp** (sensor off, step_switch_at<=0): from the
-           config-time start (= ``dmd_context_mix_p``) to ``..._target``
-           over the first ``..._ramp_steps`` outer steps. With
-           ramp_steps <= 0 the knob is held at start (legacy behavior).
-
-        Mutates ``self.model.dmd_context_mix_p`` directly. The model
-        reads it every iter inside ``_build_dmd_context_kwargs`` so the
-        next forward picks up the new value without any other plumbing.
-        Returns the value applied this iter so callers can log it.
-        """
-        if self._dmd_context_mix_p_sensor_enabled:
-            sensor_low = float(self._dmd_context_mix_p_sensor_low)
-            sensor_high = float(self._dmd_context_mix_p_sensor_high)
-            sensor_thr = float(self._dmd_context_mix_p_sensor_threshold)
-            latest = self._latest_dmd_pf_minus_pr_mae
-            if latest is None:
-                p = sensor_low
-            elif latest < sensor_thr:
-                p = sensor_high
-            else:
-                p = sensor_low
-        elif self._dmd_context_mix_p_step_switch_at > 0:
-            start = float(self._dmd_context_mix_p_start)
-            target = float(self._dmd_context_mix_p_target)
-            if self.step < self._dmd_context_mix_p_step_switch_at:
-                p = start
-            else:
-                p = target
-        else:
-            start = float(self._dmd_context_mix_p_start)
-            target = float(self._dmd_context_mix_p_target)
-            ramp_steps = int(self._dmd_context_mix_p_ramp_steps)
-            if ramp_steps <= 0 or start == target:
-                p = start
-            elif self.step >= ramp_steps:
-                p = target
-            else:
-                frac = float(self.step) / float(ramp_steps)
-                p = start + (target - start) * frac
-        # Clamp to [0, 1] defensively (the model raises on out-of-range
-        # values at init; mirror the same bound here so a bad config
-        # doesn't surface mid-run).
-        p = max(0.0, min(1.0, p))
-        default_for_compare = float(self._dmd_context_mix_p_start)
-        if p != float(getattr(self.model, "dmd_context_mix_p", default_for_compare)):
-            self.model.dmd_context_mix_p = p
-        return p
 
     def _apply_attn_size_if_changed(self) -> bool:
         """If the schedule says the active ``local_attn_size`` differs
@@ -8552,6 +6233,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # without separately threading the step through the call
         # signature.
         train_info["current_step"] = int(self.step)
+        # 1-indexed roll counter within the current ride. Read by the
+        # dmd_one_step "first chunk only" gate inside
+        # compute_generator_loss_streaming.
+        train_info["chunks_in_current_ride"] = int(
+            getattr(self, "_chunks_in_current_ride", 1)
+        )
         gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
             train_chunk, train_info,
         )
@@ -8700,23 +6387,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     generator_loss = generator_loss + aux_disc_loss
                 out.update(aux_disc_logs)
                 self._mem_step_snapshot("3b_after_aux_disc")
-
-        # Constant-weight latent-space MAE + MSE between student's
-        # pred_image (= ``train_chunk``) and the GT latent window. Fires
-        # every step when the weights are set, no warmup/ramp.
-        if (
-            self.gt_latent_mae_loss_weight > 0.0
-            or self.gt_latent_mse_loss_weight > 0.0
-        ):
-            _gt_window_for_recon = (
-                state["ride_latents_window"][:, chunk_lo:chunk_hi]
-            )
-            recon_loss, recon_logs = self._compute_gt_latent_recon_loss(
-                pred_image=train_chunk,
-                gt_latents_window=_gt_window_for_recon,
-            )
-            generator_loss = generator_loss + recon_loss
-            out.update(recon_logs)
 
         if gan_active:
             gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
@@ -8925,14 +6595,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 out["teacher_cadence_steps_fired"] = float(_fired)
                 self._mem_step_snapshot("7_after_teacher_cadence_fake_loop")
 
-        # Distilled-critic deferred step. Path 1 (D-update) + Path 2
-        # (critic value+grad distillation) were stashed by the gen
-        # step's ``_compute_r3gan_losses_distilled``. Run them here
-        # AFTER both gen and action-critic backwards. Note: the gen
-        # backward uses ``retain_graph=True`` (so the action-critic
-        # backward can walk the shared cond_dict / action_projection
-        # subgraph) which keeps gen activations alive even after the
-        # action-critic backward completes. Explicitly empty the
+        # pred_image_7_chunk eval video (all ranks; balanced collective).
+        # Fires on the sample cadence AFTER this step's gen+critic
+        # backward. Seeds the student with 7 GT-context chunks and rolls
+        # 7 more, logging the full 14-chunk video on the main rank. The
+        # inference rollout clobbers the KV cache + streaming state, but
+        # ``max_rolls_per_ride=1`` re-seeds next step, so it is reset
+        # inside the helper. Gated on a pure-step condition so every
+        # rank takes the same branch (collective-safe).
+        # Fire the pred_image_7_chunk eval video on the SAME cadence as
+        # the existing pred_image sample (``_sample_due_now``, computed
+        # at the top of this method). That signal is main-rank-only
+        # (``_video_sample_due`` returns False off-rank), so broadcast it
+        # from rank 0 to keep the downstream all-ranks inference rollout
+        # collective-balanced. Tying to ``_sample_due_now`` (rather than
+        # a pure-step gate) is necessary because this gen step only runs
+        # once every ``dfake_gen_update_ratio`` steps, so a raw
+        # ``step % interval`` rarely aligns with the gen cadence.
+        _do7 = bool(getattr(self, "sample_7chunk_enabled", True))
+        if _do7:
+            _due_flag = torch.tensor(
+                [1 if _sample_due_now else 0],
+                device=self.device, dtype=torch.long,
+            )
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.broadcast(_due_flag, src=0)
+            _do7 = bool(int(_due_flag.item()) > 0)
+        if self.is_main_process:
+            logging.info(
+                "[ActionForcing] 7chunk gate: step=%d sample_due=%s fire=%s "
+                "ride_stashed=%s",
+                int(self.step), bool(_sample_due_now), _do7,
+                getattr(self, "_sample_7chunk_ride", None) is not None,
+            )
+        if _do7:
+            self._log_pred_image_7chunk_sample(int(self.step) + 1)
+
         self._mem_step_snapshot("8_exit")
 
     # ------------------------------------------------------------------
@@ -9010,6 +6708,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Window covers seed + rollout: ride_*[s : s + cf + actual_cap].
         ride_lat_window = ride["latents"][:, s : s + cf_dmdctx + actual_cap].contiguous()
         ride_act_window = ride["z_actions"][:, s : s + cf_dmdctx + actual_cap].contiguous()
+
+        # Stash a 42-frame (14-chunk) GT slice for the pred_image_7_chunk
+        # eval video (7 GT-context chunks + 7 student-rolled chunks).
+        # Stashed on EVERY rank (min_ride_frames guarantees >= 42 so the
+        # later all-ranks sample rollout stays collective-balanced). The
+        # 7-chunk context starts at the ride origin (not the motion-aware
+        # ``s``) so the slice is guaranteed in-bounds. Cheap (~tens of MB)
+        # and overwritten each ride.
+        _need7 = 14 * npb
+        if int(ride["latents"].shape[1]) >= _need7:
+            self._sample_7chunk_ride = {
+                "latents": ride["latents"][:, :_need7].detach().clone(),
+                "z_actions": ride["z_actions"][:, :_need7].detach().clone(),
+                "prompt_embeds": prompt_embeds,
+            }
+        else:
+            self._sample_7chunk_ride = None
 
         self.model.setup_sequence(
             seed_latents=seed_latents,
@@ -9435,22 +7150,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # Constant-weight latent-space MAE + MSE between
                 # pred_image and the GT latent window. Fires every step
                 # when the weights are set, no warmup/ramp.
-                if (
-                    self.gt_latent_mae_loss_weight > 0.0
-                    or self.gt_latent_mse_loss_weight > 0.0
-                ):
-                    _gt_window_for_recon = (
-                        latents[:, gen_window_start:gen_window_end]
-                    )
-                    recon_loss, recon_logs = (
-                        self._compute_gt_latent_recon_loss(
-                            pred_image=pred_image,
-                            gt_latents_window=_gt_window_for_recon,
-                        )
-                    )
-                    generator_loss = generator_loss + recon_loss
-                    merged.update(recon_logs)
-
                 if gan_active:
                     gt_window = latents[:, gen_window_start:gen_window_end]
                     gen_gan_loss, gan_logs = self._compute_r3gan_losses(

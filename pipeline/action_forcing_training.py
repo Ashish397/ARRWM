@@ -629,7 +629,7 @@ class ActionForcingTrainingPipeline:
         # timestep) AFTER the standard denoise chain finishes. The extra
         # forward's output (= ``flash_dmd_gan_pred`` per block, assembled
         # into ``flash_dmd_gan_output``) is consumed by the GAN adv loss
-        # and the gen-side aux losses (LPIPS / MS-SSIM / MANIQA /
+        # and the gen-side aux losses (LPIPS / MS-SSIM /
         # action_critic). DMD scoring continues to use the random-exit-
         # rung output (= ``denoised_pred``). The K/V slots written by
         # the flash_dmd forward are overwritten by Step 3.4's context-
@@ -637,19 +637,7 @@ class ActionForcingTrainingPipeline:
         # graph-free K/V (paper §3.3 cross-timestep decoupling).
         # The random exit pool now spans ALL rungs (including the last)
         # since GAN no longer reserves the last rung.
-        # ``warm_start_init=True``: blocks that have a prior chunk's
-        # clean pred (block_index >= 1 within this call, OR block 0
-        # when ``initial_prev_clean`` is supplied by the caller) skip
-        # rung 0 (= the noisiest level, t≈1000). Their initial state
-        # is built by re-noising the prior chunk's clean pred at rung
-        # 1's t (= second-noisiest, t≈625) and they denoise via the
-        # shortened ladder rungs [1..N-1]. The very first block in
-        # the rollout (block 0 with no caller-provided seed) keeps
-        # the cold init: pure Gaussian noise + full ladder starting
-        # at rung 0. See user spec — "first chunk in the rollout:
-        # unchanged; second chunk onward warm-starts".
-        # Sample exit flags. Cold-start only — every block uses the
-        # full ladder (low=0). Warm-start removed.
+        # Cold-start only. Every block uses the full ladder (low=0).
         exit_flags = self.generate_and_sync_list(
             len(all_num_frames), num_denoising_steps, device=noise.device,
             exclude_last_rung=False,

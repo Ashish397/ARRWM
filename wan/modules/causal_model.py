@@ -177,17 +177,57 @@ class CausalWanSelfAttention(nn.Module):
                    rope_apply(k_c, gs, freqs, temporal_offset=offset)
 
         if kv_cache is None:
-            # if it is teacher forcing training?
-            is_tf = (s == seq_lens[0].item() * 2)
+            # Asymmetric-aware TF detection. ``tf_num_clean_frames`` and
+            # ``tf_num_noisy_frames`` are set by ``_forward_train`` before
+            # the blocks are called whenever clean_x is supplied. When
+            # the two are equal we are in v14's symmetric training contract
+            # (clean + noisy of the same size); the split logic below
+            # collapses to the legacy ``torch.chunk(q, 2)``. When they
+            # differ we are in the asymmetric scoring path (e.g. the
+            # dmd_one_step "21 GT clean + 3 student noisy" layout); the
+            # split happens at ``clean_seqlen`` rather than the midpoint.
+            nc = getattr(self, "tf_num_clean_frames", None)
+            nn_ = getattr(self, "tf_num_noisy_frames", None)
+            if nc is not None and nn_ is not None and (nc + nn_) > 0:
+                # ``frame_seqlen`` here is inferred from the joint
+                # length ``s`` and the explicit frame counts — the
+                # attention block doesn't otherwise carry frame_seqlen.
+                # When ``a_per_f > 0`` the per-frame extra tokens were
+                # already absorbed into ``s`` by _forward_train, so the
+                # inferred ``frame_seqlen`` includes them automatically.
+                frame_seqlen_local = s // (nc + nn_)
+                clean_seqlen = nc * frame_seqlen_local
+                noisy_seqlen = nn_ * frame_seqlen_local
+                is_tf = (
+                    s == clean_seqlen + noisy_seqlen
+                    and clean_seqlen > 0 and noisy_seqlen > 0
+                )
+            else:
+                # Legacy: assume symmetric halves and infer F from
+                # seq_lens. ``grid_sizes[0, 0]`` is also F (= noisy
+                # frame count), and we treat clean F = noisy F here.
+                is_tf = (s == seq_lens[0].item() * 2)
+                clean_seqlen = s // 2
+                noisy_seqlen = s - clean_seqlen
+                if is_tf:
+                    nc = int(grid_sizes[0, 0].item())
+                    nn_ = nc
             if is_tf:
-                q_chunk = torch.chunk(q, 2, dim=1)
-                k_chunk = torch.chunk(k, 2, dim=1)
+                q_chunk = (q[:, :clean_seqlen], q[:, clean_seqlen:])
+                k_chunk = (k[:, :clean_seqlen], k[:, clean_seqlen:])
+                # Per-half grid_sizes — same spatial dims, different F.
+                # In the symmetric case both clones equal ``grid_sizes``.
+                gs_clean = grid_sizes.clone()
+                gs_clean[:, 0] = int(nc)
+                gs_noisy = grid_sizes.clone()
+                gs_noisy[:, 0] = int(nn_)
+                gs_per_half = (gs_clean, gs_noisy)
                 roped_query = []
                 roped_key = []
                 # ii=0 → clean (positions 0..F-1), ii=1 → noisy (offset by tf_rope_offset)
                 for ii in range(2):
                     offset = self.tf_rope_offset if ii == 1 else 0
-                    rq, rk = _rope_one_chunk(q_chunk[ii], k_chunk[ii], grid_sizes, offset)
+                    rq, rk = _rope_one_chunk(q_chunk[ii], k_chunk[ii], gs_per_half[ii], offset)
                     roped_query.append(rq.type_as(v))
                     roped_key.append(rk.type_as(v))
 
@@ -925,11 +965,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         frame_seqlen: int = 1560, num_frame_per_block=1,
         context_shift: int = 0,
         causal: bool = True,
+        num_noisy_frames: Optional[int] = None,
     ) -> BlockMask:
         """
-        we will divide the token sequence into the following format
-        [1 latent frame] [1 latent frame] ... [1 latent frame]
-        We use flexattention to construct the attention mask
+        Joint-TF attention mask over ``[clean | noisy]``. When
+        ``num_noisy_frames`` is ``None`` the noisy half is the same
+        size as the clean half (v14's symmetric training contract).
+        Pass an explicit ``num_noisy_frames`` (< ``num_frames``) to
+        score a smaller noisy slab against a full clean context — the
+        dmd_one_step path uses this for "1 noisy chunk vs 7 GT clean
+        chunks". In that asymmetric case the noisy half is placed
+        AFTER the clean range in sequence; the bidirectional mask
+        still has the noisy chunk attend to all clean.
 
         When ``causal=True`` (default; v14 parity) the mask is
         block-causal on the joint [clean | noisy] sequence: clean
@@ -939,18 +986,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         When ``causal=False`` the mask is FULLY BIDIRECTIONAL — every
         position attends to every other position across the joint
         sequence. Padding is still respected via ``total_length``.
-        Used by the online real_teacher feature when its yaml flag
-        ``real_teacher_causal_mask: false`` (rare; v14 was trained with
-        the mask, so warm-starting without it produces a step-1
-        distribution mismatch).
         """
-        # # debug
-        # DEBUG = False
-        # if DEBUG:
-        #     num_frames = 9
-        #     frame_seqlen = 256
+        num_clean_frames = num_frames
+        if num_noisy_frames is None:
+            num_noisy_frames = num_clean_frames
 
-        total_length = num_frames * frame_seqlen * 2
+        total_length = (num_clean_frames + num_noisy_frames) * frame_seqlen
 
         # we do right padding to get to a multiple of 128
         padded_length = math.ceil(total_length / 128) * 128 - total_length
@@ -959,7 +1000,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # needed by create_block_mask (~4 GiB dense intermediate).
         torch.cuda.empty_cache()
 
-        clean_ends = num_frames * frame_seqlen
+        clean_ends = num_clean_frames * frame_seqlen
         # for clean context frames, we can construct their flex attention mask based on a [start, end] interval
         context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
         # for noisy frames, we need two intervals to construct the flex attention mask [context_start, context_end] [noisy_start, noisy_end]
@@ -972,7 +1013,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         attention_block_size = frame_seqlen * num_frame_per_block
         frame_indices = torch.arange(
             start=0,
-            end=num_frames * frame_seqlen,
+            end=clean_ends,
             step=attention_block_size,
             device=device, dtype=torch.long
         )
@@ -982,20 +1023,32 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context_ends[start:start + attention_block_size] = start + attention_block_size
 
         noisy_image_start_list = torch.arange(
-            num_frames * frame_seqlen, total_length,
+            clean_ends, total_length,
             step=attention_block_size,
             device=device, dtype=torch.long
         )
         noisy_image_end_list = noisy_image_start_list + attention_block_size
 
-        # attention for noisy frames
+        # attention for noisy frames. In the asymmetric case the
+        # noisy slab is conceptually anchored to the END of v14's
+        # 7-chunk noisy layout (i.e. the "last noisy chunk" position).
+        # Shift the block_index by ``(num_clean_chunks - num_noisy_chunks)``
+        # so a single noisy chunk sees all 7 clean chunks via the
+        # ``(block_index + context_shift) * attention_block_size``
+        # upper bound. When ``num_noisy_frames == num_clean_frames``
+        # the shift is zero and the formula collapses to v14's
+        # symmetric training contract.
+        num_clean_chunks = num_clean_frames // num_frame_per_block
+        num_noisy_chunks = num_noisy_frames // num_frame_per_block
+        noisy_block_offset = num_clean_chunks - num_noisy_chunks
         for block_index, (start, end) in enumerate(zip(noisy_image_start_list, noisy_image_end_list)):
             # attend to noisy tokens within the same block
             noise_noise_starts[start:end] = start
             noise_noise_ends[start:end] = end
             # attend to context tokens in previous blocks
             # noise_context_starts[start:end] = 0
-            noise_context_ends[start:end] = (block_index + context_shift) * attention_block_size
+            effective_block_index = block_index + noisy_block_offset
+            noise_context_ends[start:end] = (effective_block_index + context_shift) * attention_block_size
 
         if causal:
             def attention_mask(b, h, q_idx, kv_idx):
@@ -1504,6 +1557,44 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         spatial_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
         frame_seqlen = spatial_seqlen + a_per_f
 
+        # Frame counts for the TF joint sequence. In v14's training
+        # contract clean and noisy halves had the same number of frames
+        # (default 21). The dmd_one_step path drives this asymmetric —
+        # full GT clean window (21 frames) vs a single student chunk
+        # (3 frames) — to give v14 an in-distribution clean context
+        # while scoring only the new student chunk on the noisy side.
+        if clean_x is not None:
+            num_noisy_frames = int(x.shape[2])
+            # ``clean_x`` is a list of [C, F_clean, H, W] tensors at
+            # this point; F_clean lives on dim 1 of each element.
+            num_clean_frames = int(clean_x[0].shape[1])
+            for block in self.blocks:
+                block.self_attn.tf_num_clean_frames = num_clean_frames
+                block.self_attn.tf_num_noisy_frames = num_noisy_frames
+        else:
+            num_clean_frames = 0
+            num_noisy_frames = int(x.shape[2])
+            # Clear any stale TF-frame attributes from a prior TF call
+            # so non-TF forwards on the same module don't pick up the
+            # asymmetric-aware branch in the attention layer.
+            for block in self.blocks:
+                block.self_attn.tf_num_clean_frames = None
+                block.self_attn.tf_num_noisy_frames = None
+
+        # Invalidate a cached TF block_mask when the clean/noisy frame
+        # counts change (e.g. switching between v14's symmetric 21+21
+        # layout and the dmd_one_step asymmetric 21+3 layout). The mask
+        # geometry depends on (num_clean_frames, num_noisy_frames,
+        # frame_seqlen); reusing a stale mask across a dim change would
+        # silently mis-attend. Keyed cache rebuilds only on change, so
+        # steady-state (all-asymmetric or all-symmetric) pays no per-
+        # call rebuild cost.
+        if clean_x is not None:
+            _tf_sig = (int(num_clean_frames), int(num_noisy_frames), int(frame_seqlen))
+            if getattr(self, "_tf_mask_sig", None) != _tf_sig:
+                self.block_mask = None
+                self._tf_mask_sig = _tf_sig
+
         # Construct blockwise causal attn mask (invalidate if frame_seqlen changed)
         if self.block_mask is None:
             if clean_x is not None:
@@ -1511,11 +1602,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     raise NotImplementedError()
                 else:
                     self.block_mask = self._prepare_teacher_forcing_mask(
-                        device, num_frames=x.shape[2],
+                        device, num_frames=num_clean_frames,
                         frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block,
                         context_shift=self.context_shift,
                         causal=bool(getattr(self, "tf_use_causal_mask", True)),
+                        num_noisy_frames=num_noisy_frames,
                     )
             else:
                 if self.independent_first_frame:
@@ -1595,10 +1687,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 torch.cat([u, u.new_zeros(1, seq_lens_clean[0] - u.size(1), u.size(2))], dim=1) for u in clean_x
             ])
 
-            # Insert clean extra tokens (action + state)
+            # Insert clean extra tokens (action + state). Clean half's
+            # F may differ from the noisy half's (``num_frames_local``)
+            # under the asymmetric scoring path — drive the reshape
+            # with the clean half's own frame count.
+            num_clean_frames_local = num_clean_frames
             if a_per_f > 0:
-                clean_x = clean_x[:, :num_frames_local * spatial_seqlen]
-                clean_x = clean_x.unflatten(1, (num_frames_local, spatial_seqlen))
+                clean_x = clean_x[:, :num_clean_frames_local * spatial_seqlen]
+                clean_x = clean_x.unflatten(1, (num_clean_frames_local, spatial_seqlen))
                 extras_clean = []
                 if action_tokens_clean is not None:
                     extras_clean.append(action_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device))
@@ -1610,8 +1706,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     clean_x = clean_x.flatten(1, 2)
 
             x = torch.cat([clean_x, x], dim=1)
-            # Update seq_lens for TF detection (should be half of total)
-            seq_lens = torch.tensor([x.shape[1] // 2], dtype=torch.long).expand(x.shape[0])
+            # seq_lens here is informational for downstream blocks.
+            # The attention layer's TF detection prefers
+            # ``tf_num_clean_frames`` / ``tf_num_noisy_frames`` set
+            # above; for legacy callers (no asymmetric attributes) it
+            # falls back to ``seq_lens[0] * 2`` which assumes symmetric
+            # halves. Set seq_lens to the noisy slab's length so the
+            # symmetric fallback still works when clean == noisy.
+            noisy_total_seqlen = x.shape[1] - clean_x.shape[1]
+            seq_lens = torch.tensor([noisy_total_seqlen], dtype=torch.long).expand(x.shape[0])
 
             if aug_t is None:
                 aug_t = torch.zeros_like(t)
@@ -1619,8 +1722,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             self._action_modulation = getattr(self, '_action_modulation_clean', None)
             e_clean = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
+            # Reshape with ``aug_t.shape`` (the CLEAN half's per-frame
+            # timestep grid), NOT ``t.shape`` (the noisy half). Under the
+            # asymmetric layout the clean half has 21 frames while the
+            # noisy half has 3, so ``t.shape`` would demand B*3 rows from
+            # a B*21 tensor and crash. In the symmetric path
+            # aug_t.shape == t.shape so this is unchanged.
             e0_clean = self.time_projection(e_clean).unflatten(
-                1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+                1, (6, self.dim)).unflatten(dim=0, sizes=aug_t.shape)
             self._action_modulation = saved_am
             e0 = torch.cat([e0_clean, e0], dim=1)
 

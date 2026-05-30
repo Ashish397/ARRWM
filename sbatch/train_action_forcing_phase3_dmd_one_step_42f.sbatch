@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-baseline-NR-W
+#SBATCH --job-name=af-p3-dmd-42f
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,34 +11,33 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 baseline_NR_W: baseline + MANIQA NR-IQA + warm_start_init.
+# Phase-3 DMD one-step — single frozen teacher, no aux pass.
 #
-#   GAN:           OFF  (gan_enabled=false, gan_loss_weight=0.0)
-#   MANIQA NR-IQA: ON   (maniqa_approx_loss_weight=1.0, n_frames=84,
-#                        n_patches_per_frame=8, maniqa-pipal)
-#   warm_start:    ON   (warm_start_init=true)
+# Cleanup pass on top of phase_3_refactor (dmd_one_step branch):
+#   * dmd_context hardcoded to "self".
+#   * Single teacher (merged v14, frozen). No online LoRA training,
+#     no aux pass, no dual-teacher.
+#   * SAM-pixel GAN + LatentSAM2Critic removed.
+#   * MANIQA + perceptual approx surrogates removed.
+#   * 14B foreign_real_teacher path removed.
+#   * warm_start_init removed.
+#   * teacher_freeze_detect removed.
 #
-# Six-cell A/B grid (NR = NR-IQA / MANIQA, G = GAN, W = warm-start):
-#   baseline       — none
-#   baseline_W     — warm-start
-#   baseline_G     — GAN
-#   baseline_G_W   — GAN + warm-start
-#   baseline_NR    — MANIQA
-#   baseline_NR_W  — MANIQA + warm-start  (this file)
+# GAN OFF, 21-frame window, 200-step max.
 # =====================================================================
 
 set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_baseline_NR_W
+CONFIG=configs/action_forcing_phase3_dmd.yaml
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_dmd_one_step
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
 
-# GAN OFF → no SAM2 prereq checks needed.
+# GAN OFF -> no SAM2 prereq checks needed.
 
 CACHE_DIR='/scratch/u6ex/as1748.u6ex/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
@@ -62,10 +61,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 BASELINE_NR_W (MANIQA + warm_start ON) on $(date)"
-echo "  * GAN: OFF, MANIQA: ON, warm_start: ON"
-echo "  * 21-frame student rollout, 200-step max."
-echo "  * Teacher: v14 LoRA merged into base WAN, FROZEN."
+echo "Starting Phase-3 DMD ONE-STEP (v14-faithful asymmetric) on $(date)"
+echo "  * dmd_asymmetric_scoring: ON (clean=21 GT chunks, noisy=1 student chunk)"
+echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed),"
+echo "    teacher clean context = GT[0:21] (7 chunks); rope_offset=21."
+echo "  * 1 roll per ride (fresh seed each step)."
+echo "  * GAN: OFF"
+echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -95,28 +97,29 @@ srun torchrun \
     state_probe_aux_enabled=false \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
-    max_rolls_per_ride=300 \
+    max_rolls_per_ride=1 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
+    sample_fps=16 \
     boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
-    dmd_context=self \
-    real_teacher_train_online=false \
     real_teacher_causal_mask=false \
-    real_guidance_scale=1.0 \
-    aux_teacher_loss_weight=0.0 \
-    dmd_frozen_teacher_pass_enabled=false \
+    real_guidance_scale=0.0 \
+    dmd_context_clean_frames=18 \
+    dmd_loss_weight=1.0 \
+    dmd_loss_start_step=0 \
+    dmd_loss_warmup_steps=20 \
+    dmd_normalization_enabled=true \
+    dmd_asymmetric_scoring_enabled=false \
+    dmd_42f_enabled=true \
+    dmd_only_first_chunk_per_ride=true \
+    flash_dmd_enabled=false \
     fake_score_ema_weight=0.95 \
-    warm_start_init=true \
     gan_enabled=false \
     gan_loss_weight=0.0 \
-    maniqa_approx_loss_weight=1.0 \
-    maniqa_n_frames=84 \
-    maniqa_n_patches_per_frame=8 \
-    maniqa_metric_name=maniqa-pipal \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_baseline_NR_W_j${SLURM_JOB_ID}
+    run_name=dmd_one_step_42f_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

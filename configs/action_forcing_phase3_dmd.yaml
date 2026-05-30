@@ -1,0 +1,92 @@
+# Phase-3 Action-Forcing DMD — overlay on top of action_forcing_phase1.yaml.
+#
+# Single-teacher (frozen merged-v14) DMD. The student sees ONE teacher
+# pass: ``self.real_score`` = merged v14 LoRA, frozen. No online LoRA
+# training, no aux pass, no dual-teacher.
+#
+# Optional R3GAN / LADD discriminator knobs are kept here so the gan
+# path can be re-enabled via override without editing this file.
+
+_extends: action_forcing_phase1.yaml
+
+config_name: action-forcing-phase3-dmd
+run_name: action_forcing_phase3_dmd
+
+# 21-frame KV cache window — covers a single rolled chunk
+# (rollout_frames = num_max_frames = 21).
+local_attn_size_schedule: [[0, 21]]
+
+# ---------------------------------------------------------------------------
+# R3GAN — RpGAN + R1 + R2 discriminator on GT vs student latent video.
+# Inert unless gan_enabled=true at run time.
+# ---------------------------------------------------------------------------
+gan_enabled: true
+gan_disc_in_channels: 16
+gan_disc_base_channels: 64
+gan_disc_num_blocks: 4
+gan_loss_weight: 0.05         # G-side RpGAN weight (~5% of DMD magnitude)
+gan_r1_gamma: 1.0             # zero-centered grad penalty on real samples
+gan_r2_gamma: 1.0             # zero-centered grad penalty on fake samples
+gan_warmup_steps: 500         # linear ramp 0 → gan_loss_weight on G side
+gan_updates_per_step: 1       # 1:1 D:G ratio
+gan_lr: 2.0e-04
+gan_betas: [0.0, 0.9]
+gan_eps: 1.0e-08
+gan_weight_decay: 0.0
+gan_max_grad_norm: 10.0
+
+# ---------------------------------------------------------------------------
+# LADD adjacent-chunk discriminator (v28) — opt-in via gan_backbone.
+# ---------------------------------------------------------------------------
+# Frozen WAN-teacher feature taps + trainable CCM/CSM + 1D SpectralConv
+# heads. Adjacent chunks within a single causal rollout are the
+# adversarial pair (chunk_i = real-anchor, chunk_{i+1} = fake / push-
+# target). Activated by ``gan_backbone: ladd_teacher_feat``. All knobs
+# below are inert under the default ``gan_backbone: latent_3d_conv``.
+ladd_feature_blocks: []              # empty -> auto-default by teacher size
+ladd_proj_dim: 256                   # CCM/head common channel dim
+ladd_disc_head_kernel: 3             # 2D conv kernel in disc heads (k=3 spatial)
+ladd_use_csm: true                   # cross-scale FPN-style fusion
+ladd_use_lateral_proj: false         # lateral 1x1 in CSM (rarely needed)
+ladd_use_prompt_cond: true           # prompt-conditioning in disc heads
+ladd_cmap_dim: 64                    # inner-product cmap dim (StyleGAN-T)
+ladd_disc_loss_weight: 1.0           # additional G-side multiplier on top of gan_loss_weight ramp
+ladd_r1_gamma: 1.0                   # R1 on chunk_i (real-anchor)
+ladd_r1_every_n_steps: 1             # lazy R1: compute every N disc updates (1=every step)
+ladd_diff_aug_policy: "flip,cutout,translation"  # latent-space DiffAugment
+ladd_pair_start_seed_boundary: true  # include (last_seed, first_AR) pair
+ladd_pairs_per_step: 0               # 0 = all pairs; >0 = random subset
+# Pair-construction modes (mutually composable; sums on the gen side):
+#   gt_vs_fake (LADD canonical): real = GT chunk, fake = gen chunk.
+#   adjacent_chunks (ASD-style): real = chunk_i, fake = chunk_{i+1}
+#       (both from the same gen rollout). Pushes chunk_{i+1} toward
+#       chunk_i's distribution.
+# Defaults preserve v28 behaviour (adjacent on, gt_vs_fake off).
+ladd_gt_vs_fake_enabled: false
+ladd_adjacent_chunks_enabled: true
+ladd_gt_vs_fake_weight: 1.0          # extra G-side multiplier (gt_vs_fake)
+ladd_adjacent_chunks_weight: 1.0     # extra G-side multiplier (adjacent)
+
+# Wavelet-HF disc input (v28B, WGSR-style frequency-band restriction).
+ladd_wavelet_hf_enabled: false       # opt-in; default off for parity
+ladd_wavelet_hf_drop_ll: true        # drop LL (HF-only disc input)
+ladd_wavelet_hf_adapter_init_gain: 0.1  # small init -> step-0 in-distribution
+
+# ---------------------------------------------------------------------------
+# Teacher — frozen v14 LoRA merged into base Wan. ONE pass only.
+# ---------------------------------------------------------------------------
+# Online v14 LoRA training is OFF: the LoRA load merges the adapter
+# into the base weights and the teacher is held frozen throughout
+# training. There is no aux pass and no dual-teacher (frozen teacher
+# IS the only teacher — no second copy to hold).
+real_teacher_train_online: false
+aux_teacher_loss_weight: 0.0
+dmd_frozen_teacher_pass_enabled: false
+
+# Disable the chunk-boundary VAE roundtrip. The VAE Conv3d kernels are
+# fp32 while the streaming latents are bf16 — the call site casts
+# input to ``dtype`` (= bf16) and crashes on ``F.conv3d`` with
+# "Input type (BFloat16) and bias type (float) should be the same".
+# Re-enable as a quality-tuning task once the VAE call wraps the
+# input/output in proper fp32↔bf16 casts.
+boundary_vae_roundtrip: false

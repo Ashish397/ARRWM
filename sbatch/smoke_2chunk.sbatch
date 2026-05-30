@@ -1,45 +1,43 @@
 #!/bin/bash
-#SBATCH --job-name=action-forcing-phase3-baseline-W
-#SBATCH --nodes=8
+#SBATCH --job-name=af-p3-2chunk-SMOKE
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=01:30:00
+#SBATCH --time=00:30:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 baseline_W: baseline + warm_start_init.
+# Phase-3 DMD one-step — single frozen teacher, no aux pass.
 #
-#   GAN:           OFF  (gan_enabled=false, gan_loss_weight=0.0)
-#   MANIQA NR-IQA: OFF  (maniqa_approx_loss_weight=0.0)
-#   warm_start:    ON   (warm_start_init=true; chunk K warm-starts
-#                        from chunk K-1's clean x0 re-noised at rung
-#                        ``warm_start_rung_idx`` (default 1 ≈ second-
-#                        noisiest), shortened ladder rungs
-#                        ``[warm_start_rung_idx..N-1]``)
+# Cleanup pass on top of phase_3_refactor (dmd_one_step branch):
+#   * dmd_context hardcoded to "self".
+#   * Single teacher (merged v14, frozen). No online LoRA training,
+#     no aux pass, no dual-teacher.
+#   * SAM-pixel GAN + LatentSAM2Critic removed.
+#   * MANIQA + perceptual approx surrogates removed.
+#   * 14B foreign_real_teacher path removed.
+#   * warm_start_init removed.
+#   * teacher_freeze_detect removed.
 #
-# A/B grid for the four-cell ablation:
-#   baseline       — no GAN, no warm-start
-#   baseline_W     — no GAN, warm-start  (this file)
-#   baseline_G     — GAN,    no warm-start
-#   baseline_G_W   — GAN,    warm-start
+# GAN OFF, 21-frame window, 200-step max.
 # =====================================================================
 
 set -e -o pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-CONFIG=configs/action_forcing_phase1_gan.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_baseline_W
+CONFIG=configs/action_forcing_phase3_dmd.yaml
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/action_forcing_phase3_dmd_one_step
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
 
-# GAN OFF → no SAM2 prereq checks needed.
+# GAN OFF -> no SAM2 prereq checks needed.
 
 CACHE_DIR='/scratch/u6ex/as1748.u6ex/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
@@ -63,10 +61,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 BASELINE_W (warm_start ON) on $(date)"
-echo "  * GAN: OFF, MANIQA: OFF, warm_start: ON"
-echo "  * 21-frame student rollout, 200-step max."
-echo "  * Teacher: v14 LoRA merged into base WAN, FROZEN."
+echo "Starting Phase-3 DMD ONE-STEP (v14-faithful asymmetric) on $(date)"
+echo "  * dmd_asymmetric_scoring: ON (clean=21 GT chunks, noisy=1 student chunk)"
+echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed),"
+echo "    teacher clean context = GT[0:21] (7 chunks); rope_offset=21."
+echo "  * 1 roll per ride (fresh seed each step)."
+echo "  * GAN: OFF"
+echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -90,31 +91,37 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=200 \
+    max_steps=4 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
-    max_rolls_per_ride=300 \
+    max_rolls_per_ride=1 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=21 \
     num_workers=0 \
+    sample_fps=16 \
     boundary_vae_roundtrip=false \
     local_attn_size_schedule=[[0,21]] \
-    dmd_context=self \
-    real_teacher_train_online=false \
     real_teacher_causal_mask=false \
-    real_guidance_scale=1.0 \
-    aux_teacher_loss_weight=0.0 \
-    dmd_frozen_teacher_pass_enabled=false \
+    real_guidance_scale=0.0 \
+    dmd_context_clean_frames=18 \
+    dmd_loss_weight=1.0 \
+    dmd_loss_start_step=0 \
+    dmd_loss_warmup_steps=20 \
+    dmd_normalization_enabled=true \
+    dmd_asymmetric_scoring_enabled=false \
+    dmd_42f_enabled=true \
+    dmd_42f_2chunk=true \
+    dmd_only_first_chunk_per_ride=true \
+    flash_dmd_enabled=false \
     fake_score_ema_weight=0.95 \
-    warm_start_init=true \
     gan_enabled=false \
     gan_loss_weight=0.0 \
-    maniqa_approx_loss_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=action_forcing_phase3_baseline_W_j${SLURM_JOB_ID}
+    sample_interval=2 \
+    run_name=af_p3_2chunk_smoke_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

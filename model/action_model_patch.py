@@ -253,45 +253,61 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
         k_valid, k_tail = k[:, :valid_len], k[:, valid_len:]
 
         if tf_off > 0:
-            # Teacher-forcing: joint sequence is [clean_half, noisy_half],
-            # each F_half = f_total // 2 frames long. Clean gets RoPE
-            # positions [0, F_half); noisy gets [tf_off, tf_off + F_half).
-            if f_total % 2 != 0:
-                raise RuntimeError(
-                    f"Bidir self_attn TF mode requires even f_total; got {f_total}."
-                )
-            f_half = f_total // 2
-            half_valid = f_half * frame_seq
-            half_grid = grid_sizes.clone()
-            half_grid[:, 0] = f_half
-            q_clean, q_noisy = q_valid[:, :half_valid], q_valid[:, half_valid:]
-            k_clean, k_noisy = k_valid[:, :half_valid], k_valid[:, half_valid:]
+            # Teacher-forcing: joint sequence is [clean_half, noisy_half].
+            # Symmetric (v14): each half = f_total // 2. Asymmetric
+            # (dmd_one_step): clean = tf_num_clean_frames, noisy =
+            # tf_num_noisy_frames (read from the attn, set by the outer
+            # bidir forward). Clean gets RoPE positions [0, F_clean);
+            # noisy gets [tf_off, tf_off + F_noisy).
+            _nc = getattr(self_attn, "tf_num_clean_frames", None)
+            _nn = getattr(self_attn, "tf_num_noisy_frames", None)
+            if _nc is not None and _nn is not None:
+                f_clean = int(_nc)
+                f_noisy = int(_nn)
+                if f_clean + f_noisy != f_total:
+                    raise RuntimeError(
+                        f"Bidir self_attn asymmetric TF: f_clean({f_clean}) + "
+                        f"f_noisy({f_noisy}) != f_total({f_total})."
+                    )
+            else:
+                if f_total % 2 != 0:
+                    raise RuntimeError(
+                        f"Bidir self_attn TF mode requires even f_total; got {f_total}."
+                    )
+                f_clean = f_noisy = f_total // 2
+            clean_valid = f_clean * frame_seq
+            clean_grid = grid_sizes.clone()
+            clean_grid[:, 0] = f_clean
+            noisy_grid = grid_sizes.clone()
+            noisy_grid[:, 0] = f_noisy
+            q_clean, q_noisy = q_valid[:, :clean_valid], q_valid[:, clean_valid:]
+            k_clean, k_noisy = k_valid[:, :clean_valid], k_valid[:, clean_valid:]
             if a_per_f > 0:
-                qc_sp, qc_act = _separate_action_tokens(q_clean, half_grid, a_per_f)
-                kc_sp, kc_act = _separate_action_tokens(k_clean, half_grid, a_per_f)
-                qn_sp, qn_act = _separate_action_tokens(q_noisy, half_grid, a_per_f)
-                kn_sp, kn_act = _separate_action_tokens(k_noisy, half_grid, a_per_f)
+                qc_sp, qc_act = _separate_action_tokens(q_clean, clean_grid, a_per_f)
+                kc_sp, kc_act = _separate_action_tokens(k_clean, clean_grid, a_per_f)
+                qn_sp, qn_act = _separate_action_tokens(q_noisy, noisy_grid, a_per_f)
+                kn_sp, kn_act = _separate_action_tokens(k_noisy, noisy_grid, a_per_f)
                 rq_clean = _merge_action_tokens(
-                    rope_apply(qc_sp, half_grid, freqs, temporal_offset=0),
-                    qc_act, half_grid, a_per_f,
+                    rope_apply(qc_sp, clean_grid, freqs, temporal_offset=0),
+                    qc_act, clean_grid, a_per_f,
                 )
                 rk_clean = _merge_action_tokens(
-                    rope_apply(kc_sp, half_grid, freqs, temporal_offset=0),
-                    kc_act, half_grid, a_per_f,
+                    rope_apply(kc_sp, clean_grid, freqs, temporal_offset=0),
+                    kc_act, clean_grid, a_per_f,
                 )
                 rq_noisy = _merge_action_tokens(
-                    rope_apply(qn_sp, half_grid, freqs, temporal_offset=tf_off),
-                    qn_act, half_grid, a_per_f,
+                    rope_apply(qn_sp, noisy_grid, freqs, temporal_offset=tf_off),
+                    qn_act, noisy_grid, a_per_f,
                 )
                 rk_noisy = _merge_action_tokens(
-                    rope_apply(kn_sp, half_grid, freqs, temporal_offset=tf_off),
-                    kn_act, half_grid, a_per_f,
+                    rope_apply(kn_sp, noisy_grid, freqs, temporal_offset=tf_off),
+                    kn_act, noisy_grid, a_per_f,
                 )
             else:
-                rq_clean = rope_apply(q_clean, half_grid, freqs, temporal_offset=0)
-                rk_clean = rope_apply(k_clean, half_grid, freqs, temporal_offset=0)
-                rq_noisy = rope_apply(q_noisy, half_grid, freqs, temporal_offset=tf_off)
-                rk_noisy = rope_apply(k_noisy, half_grid, freqs, temporal_offset=tf_off)
+                rq_clean = rope_apply(q_clean, clean_grid, freqs, temporal_offset=0)
+                rk_clean = rope_apply(k_clean, clean_grid, freqs, temporal_offset=0)
+                rq_noisy = rope_apply(q_noisy, noisy_grid, freqs, temporal_offset=tf_off)
+                rk_noisy = rope_apply(k_noisy, noisy_grid, freqs, temporal_offset=tf_off)
             rq_valid = torch.cat([rq_clean, rq_noisy], dim=1)
             rk_valid = torch.cat([rk_clean, rk_noisy], dim=1)
         else:
@@ -463,28 +479,29 @@ def _bidir_forward_with_action_tokens(
     # (same H, W per frame; same num_frames in our usage — clean and
     # noisy halves are both num_training_frames long, just at different
     # absolute time positions in the ride).
+    # Clean/noisy frame counts. v14's symmetric contract has both halves
+    # = num_frames_local. The dmd_one_step asymmetric path scores a single
+    # student chunk (noisy = num_frames_local, typically 3) against a full
+    # GT clean window (clean = num_clean_frames, typically 21). They may
+    # differ; ``num_clean_frames`` is derived from clean_x's own grid.
+    num_clean_frames = num_frames_local
     if clean_x is not None:
         clean_x_emb = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
         clean_grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in clean_x_emb]
         )
-        if int(clean_grid_sizes[0, 0].item()) != num_frames_local:
-            raise RuntimeError(
-                f"clean_x has {int(clean_grid_sizes[0, 0].item())} frames "
-                f"but noisy x has {num_frames_local}; both halves must have "
-                "the same number of frames in this bidirectional TF path."
-            )
+        num_clean_frames = int(clean_grid_sizes[0, 0].item())
         clean_x_emb = [u.flatten(2).transpose(1, 2) for u in clean_x_emb]
         clean_at_frames = action_tokens_clean.shape[1]
-        if clean_at_frames != num_frames_local:
+        if clean_at_frames != num_clean_frames:
             raise RuntimeError(
                 f"action_tokens_clean has {clean_at_frames} frames but "
-                f"clean_x has {num_frames_local} frames; they must match."
+                f"clean_x has {num_clean_frames} frames; they must match."
             )
         clean_x_interleaved = []
         for batch_idx, u in enumerate(clean_x_emb):
-            u = u[:, : num_frames_local * spatial_seqlen].unflatten(
-                1, (num_frames_local, spatial_seqlen)
+            u = u[:, : num_clean_frames * spatial_seqlen].unflatten(
+                1, (num_clean_frames, spatial_seqlen)
             )
             extras_c = [action_tokens_clean[batch_idx : batch_idx + 1].unsqueeze(2).to(
                 dtype=u.dtype, device=u.device,
@@ -511,10 +528,13 @@ def _bidir_forward_with_action_tokens(
     # In non-TF mode we keep the historical padding (caller's seq_len
     # tracks the spatial-only capacity, and we still add the per-frame
     # action-token slots on top).
-    natural_joint = num_frames_local * frame_seqlen_local * (2 if clean_x is not None else 1)
+    # Joint length = (clean + noisy) frames; in the symmetric case this is
+    # 2*F, in the asymmetric case (num_clean_frames + num_frames_local).
     if clean_x is not None:
+        natural_joint = (num_clean_frames + num_frames_local) * frame_seqlen_local
         pad_target = natural_joint
     else:
+        natural_joint = num_frames_local * frame_seqlen_local
         half_pad = seq_len + num_frames_local * a_per_f
         pad_target = half_pad
     if int(seq_lens.max().item()) > pad_target:
@@ -619,16 +639,26 @@ def _bidir_forward_with_action_tokens(
     for block in self.blocks:
         block.self_attn.action_tokens_per_frame = a_per_f
         block.self_attn.tf_rope_offset = tf_rope_offset
+        # Per-block clean/noisy frame counts so the bidir self-attn can
+        # split the joint sequence at the CLEAN boundary (not the
+        # midpoint) and RoPE each half with its own frame count. Set to
+        # None outside TF mode so the attn falls back to its plain path.
+        if clean_x is not None:
+            block.self_attn.tf_num_clean_frames = num_clean_frames
+            block.self_attn.tf_num_noisy_frames = num_frames_local
+        else:
+            block.self_attn.tf_num_clean_frames = None
+            block.self_attn.tf_num_noisy_frames = None
 
     # The self-attn patch reads grid_sizes to compute valid_len for the
-    # interleaved layout; in TF mode the joint sequence has 2*F frames.
-    # We pass a doubled-F grid_sizes so the patch sees the full joint
-    # length (otherwise it'd treat the clean half as padding and skip
-    # RoPE on the noisy half's first F frames).
+    # interleaved layout; in TF mode the joint sequence has
+    # (clean + noisy) frames. We pass a joint-F grid_sizes so the patch
+    # sees the full joint length (otherwise it'd treat the clean half as
+    # padding and skip RoPE on the noisy half's first frames).
     block_grid_sizes = grid_sizes
     if clean_x is not None:
         block_grid_sizes = grid_sizes.clone()
-        block_grid_sizes[:, 0] = num_frames_local * 2
+        block_grid_sizes[:, 0] = num_clean_frames + num_frames_local
 
     block_kwargs = dict(
         e=e0,
