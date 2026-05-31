@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-dmd-3chunk-seedlast
+#SBATCH --job-name=af-p3-dmd-3chunk-doubleseedlast
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -113,8 +113,9 @@ srun torchrun \
     dmd_normalization_enabled=true \
     dmd_asymmetric_scoring_enabled=false \
     dmd_42f_enabled=true \
-    dmd_42f_num_chunks=3 \
+    dmd_42f_2chunk=true \
     dmd_42f_seed_last=true \
+    dmd_42f_gt_after_chunks=2 \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=false \
     fake_score_ema_weight=0.95 \
@@ -122,6 +123,6 @@ srun torchrun \
     gan_loss_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=dmd_one_step_3chunk_seedlast_j${SLURM_JOB_ID}
+    run_name=dmd_one_step_3chunk_doubleseed_last_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

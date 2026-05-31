@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-dmd-seedlast-sq
-#SBATCH --nodes=8
+#SBATCH --job-name=af-p3-2cv2-SMOKE
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=01:30:00
+#SBATCH --time=00:30:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
@@ -79,7 +79,8 @@ echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
-srun torchrun \
+export ARRWM_ROPE_DEBUG=1
+srun --export=ALL torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
   --rdzv_id=$SLURM_JOB_ID \
@@ -91,7 +92,7 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=200 \
+    max_steps=1 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -114,8 +115,7 @@ srun torchrun \
     dmd_asymmetric_scoring_enabled=false \
     dmd_42f_enabled=true \
     dmd_42f_2chunk=true \
-    dmd_42f_seed_last=true \
-    dmd_42f_gt_after_chunks=2 \
+    dmd_42f_fix_clean_counterpart=true \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=false \
     fake_score_ema_weight=0.95 \
@@ -123,6 +123,6 @@ srun torchrun \
     gan_loss_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=dmd_one_step_2chunk_seedlast_sq_j${SLURM_JOB_ID}
+    run_name=af_p3_2cv2_smoke_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

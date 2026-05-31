@@ -327,6 +327,24 @@ def patched_forward(
 
     num_cache_frames = local_end_index // frame_seqlen
 
+    import os as _os
+    if _os.environ.get("ARRWM_ROPE_DEBUG") and torch.is_grad_enabled():
+        try:
+            _c = getattr(patched_forward, "_rope_dbg_gen", 0)
+            if _c < 8:
+                patched_forward._rope_dbg_gen = _c + 1
+                print(
+                    f"[ROPE-DBG gen] rolled={rolled} "
+                    f"num_new_frames={num_new_frames} "
+                    f"q_rel={query_rel_indices.tolist()} "
+                    f"num_cache_frames={int(num_cache_frames)} "
+                    f"local_start_frame={int(local_start_index // frame_seqlen)} "
+                    f"local_attn_size={int(self.local_attn_size)}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
     # The per-module prefix cache (``_rot_prefix_k`` /
     # ``_rot_prefix_local_start``) memoises the rotated prefix across the
     # 4 ODE denoise rungs of a single chunk so the prefix RoPE is only

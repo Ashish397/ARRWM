@@ -3894,19 +3894,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 f"_ladd_run_pair_mode: unknown pair_mode={pair_mode!r}."
             )
 
-        # Optional pair budget (random subset; same selection on all ranks).
+        # Optional pair budget. ``ladd_pair_selection`` decides which pairs
+        # when capped: "first" = the first N rolled chunks (deterministic,
+        # lowest drift); "random" = random subset seeded by the step (same
+        # on all ranks, varies each step). all_pairs is ordered by chunk
+        # index, so all_pairs[:N] == the first N rolled chunks.
         ladd_pairs_per_step = int(
             getattr(self.model, "ladd_pairs_per_step", 0)
         )
+        pair_selection = str(
+            getattr(self.model, "ladd_pair_selection", "random")
+        ).lower()
         if (
             ladd_pairs_per_step > 0
             and ladd_pairs_per_step < len(all_pairs)
         ):
-            g = torch.Generator(device="cpu").manual_seed(int(current_step))
-            idx = torch.randperm(len(all_pairs), generator=g)[
-                :ladd_pairs_per_step
-            ].tolist()
-            pairs = [all_pairs[i] for i in sorted(idx)]
+            if pair_selection == "first":
+                pairs = all_pairs[:ladd_pairs_per_step]
+            else:
+                g = torch.Generator(device="cpu").manual_seed(int(current_step))
+                idx = torch.randperm(len(all_pairs), generator=g)[
+                    :ladd_pairs_per_step
+                ].tolist()
+                pairs = [all_pairs[i] for i in sorted(idx)]
         else:
             pairs = all_pairs
         n_pairs = len(pairs)

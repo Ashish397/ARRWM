@@ -249,14 +249,50 @@ class ActionForcingDMD(SelfForcingModel):
         # context before + GT after) instead of a drifted student chunk
         # after it. e.g. ns=2 -> noisy = [5 GT | student | 1 GT].
         self.dmd_42f_seed_last = bool(getattr(args, "dmd_42f_seed_last", False))
-        # ``dmd_42f_gt_after_chunks`` (>0, requires seed_last): number of GT
-        # chunks placed AFTER the supervised student chunk, overriding the
-        # default (ns - num_sup). Moves the supervised chunk further from
-        # the structurally-OOD newest slot RoPE [21,24). e.g. with one
+        # ``dmd_42f_gt_after_chunks`` (>0): number of chunks placed AFTER
+        # the supervised student chunk, overriding the default (ns -
+        # num_sup). Moves the supervised chunk further from the
+        # structurally-OOD newest slot RoPE [21,24). e.g. with one
         # supervised chunk, =1 -> 2nd-from-last (RoPE [18,21)); =2 ->
-        # 3rd-from-last (RoPE [15,18)), noisy = [4 GT | student | 2 GT].
+        # 3rd-from-last (RoPE [15,18)). ``seed_last`` sets the after-block
+        # CONTENT: True -> GT scaffold (noisy = [4 GT | S | 2 GT]); False
+        # -> the student's own rolled chunks (noisy = [4 GT | S | s s]).
         self.dmd_42f_gt_after_chunks = int(
             getattr(args, "dmd_42f_gt_after_chunks", 0)
+        )
+        # ``dmd_42f_fix_clean_counterpart``: replace the GT clean-half
+        # counterpart of each STUDENT noisy chunk with the student content
+        # (detached) so the teacher's bidirectional clean/noisy halves
+        # AGREE at each world position (v14's contract). Kills the
+        # GT-vs-student conflict the bidir scorer otherwise sees. See
+        # ``_build_42f_scoring_inputs``.
+        self.dmd_42f_fix_clean_counterpart = bool(
+            getattr(args, "dmd_42f_fix_clean_counterpart", False)
+        )
+        # ``dmd_42f_clean_self``: fill the clean-half AFTER-region (the
+        # supervised chunk's clean counterpart + the gt_after slots, i.e.
+        # clean[n_ctx+npb : N]) with the student's OWN rolled chunks taken
+        # straight from ``chunk`` (detached) — independent of whether the
+        # NOISY after-region is GT (seed_last) or student. Unlike
+        # ``fix_clean_counterpart`` (which copies the noisy half's content
+        # for the supervised counterpart only), this always sources the
+        # student rollout and covers the whole after-region. Used for the
+        # clean_self / all_self OOD-ablation configs.
+        self.dmd_42f_clean_self = bool(
+            getattr(args, "dmd_42f_clean_self", False)
+        )
+        # ``dmd_42f_rand_sup_slot`` (seed_last=false only): instead of
+        # always grading the FIRST after-student chunk (the slot right
+        # after the GT context), randomly pick WHICH student chunk carries
+        # the DMD gradient among those that still have a clean counterpart
+        # (every noisy slot except the last, counterpart-less one). The
+        # chosen chunk is graph-on; the rest of the student region stays
+        # detached context, exactly like the fixed-slot path. Step-seeded
+        # so all ranks agree and the choice sweeps over training. Spreads
+        # the supervision across rollout depth (slots 4/5/6 for the midp
+        # gt_after=3 layout). See ``_build_42f_scoring_inputs``.
+        self.dmd_42f_rand_sup_slot = bool(
+            getattr(args, "dmd_42f_rand_sup_slot", False)
         )
 
         # ``dmd_only_first_chunk_per_ride``: pair with
@@ -965,6 +1001,20 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_pairs_per_step = int(
             getattr(args, "ladd_pairs_per_step", 0)
         )  # 0 = use all pairs
+        # ``ladd_pair_selection``: when ladd_pairs_per_step caps the pairs,
+        # how to pick them. "random" (default) = random subset seeded by
+        # the step (varies each step, same on all ranks). "first" = the
+        # FIRST N pairs = the first N student-rolled chunks (lowest drift,
+        # deterministic) — so pairs=2 supervises the first 2 rolled chunks,
+        # pairs=3 the first 3, etc.
+        self.ladd_pair_selection = str(
+            getattr(args, "ladd_pair_selection", "random")
+        ).lower()
+        if self.ladd_pair_selection not in ("random", "first"):
+            raise ValueError(
+                f"ladd_pair_selection must be 'random' or 'first', got "
+                f"{self.ladd_pair_selection!r}."
+            )
         # LADD pair-mode toggles. v28A wants only gt_vs_fake; v28B
         # turns on adjacent_chunks as an additional adversarial term.
         # Defaults preserve v28 behaviour (adjacent on, gt_vs_fake off).
@@ -3329,11 +3379,20 @@ class ActionForcingDMD(SelfForcingModel):
                 "_build_dmd_context_kwargs requires clean_x_self (the "
                 "21-frame self-view assembled by the trainer)."
             )
-        if clean_x_self.shape[1] != self.num_training_frames:
-            raise RuntimeError(
-                f"clean_x_self.shape[1]={clean_x_self.shape[1]} must "
-                f"equal num_training_frames={self.num_training_frames}."
-            )
+        # The 42f path OVERRIDES every output of this function with its own
+        # GT-built clean_x/noisy_x/gt_target (see compute_*_loss_streaming),
+        # so clean_x_self is dead here. That lets streaming_chunk_size (the
+        # student's causal-roll count) be DECOUPLED from num_training_frames
+        # (the 21-frame teacher window) — e.g. roll 3 chunks (chunk_size=9)
+        # while the teacher still scores a 21-frame window filled from GT +
+        # the 1 supervised chunk. Only enforce the ==N shape when NOT 42f
+        # (symmetric / asymmetric paths genuinely consume clean_x_self).
+        if not bool(getattr(self, "dmd_42f_enabled", False)):
+            if clean_x_self.shape[1] != self.num_training_frames:
+                raise RuntimeError(
+                    f"clean_x_self.shape[1]={clean_x_self.shape[1]} must "
+                    f"equal num_training_frames={self.num_training_frames}."
+                )
 
         sc_clean_x = clean_x_self.to(dtype=dtype, device=device)
         sc_aug_t = torch.zeros(
@@ -5321,19 +5380,20 @@ class ActionForcingDMD(SelfForcingModel):
         sup_frames = num_sup * npb
         student_frames = ns * npb                  # rolled student frames
         seed_last = bool(getattr(self, "dmd_42f_seed_last", False))
-        # Number of GT chunks placed AFTER the supervised student block.
-        # Default: the (ns - num_sup) newest chunks (masked, or GT under
-        # seed_last). ``dmd_42f_gt_after_chunks`` (>0) overrides this to
-        # move the supervised chunk further from the structurally-OOD
-        # newest slot RoPE [21,24): e.g. =2 places the single student
-        # chunk 3rd-from-last (RoPE [15,18)) with TWO GT chunks after it.
+        # Number of chunks placed AFTER the supervised student block.
+        # Default: the (ns - num_sup) newest chunks (masked context).
+        # ``dmd_42f_gt_after_chunks`` (>0) overrides the COUNT, moving the
+        # supervised chunk further from the structurally-OOD newest slot
+        # RoPE [21,24): e.g. =2 places the single student chunk
+        # 3rd-from-last (RoPE [15,18)) with TWO chunks after it.
+        #
+        # ``seed_last`` decides the CONTENT of the after-block (handled in
+        # the parts assembly below): True -> detached GT scaffold; False ->
+        # the student's OWN rolled chunks (detached, masked context). So
+        # ``gt_after_chunks=2`` + ``seed_last=false`` = [4 GT | S | s s],
+        # leaving the student rollout in instead of GT.
         gt_after_override = int(getattr(self, "dmd_42f_gt_after_chunks", 0))
         if gt_after_override > 0:
-            if not seed_last:
-                raise RuntimeError(
-                    "42f DMD: dmd_42f_gt_after_chunks requires "
-                    "dmd_42f_seed_last=true (the after-block must be GT)."
-                )
             gt_after_frames = gt_after_override * npb
         else:
             gt_after_frames = student_frames - sup_frames
@@ -5369,10 +5429,18 @@ class ActionForcingDMD(SelfForcingModel):
             )
         # The student ``chunk`` must supply the supervised frames, plus the
         # detached tail frames when NOT seed_last (seed_last sources its
-        # after-block from GT ``ride_lat`` instead). Guard explicitly so a
-        # mis-set num_chunks / short rollout fails loud, not via an opaque
+        # after-block from GT ``ride_lat`` instead). With rand_sup_slot the
+        # supervised chunk can be drawn from any after-offset (up to the
+        # last counterpart slot), so the rollout must cover the whole
+        # after-region even when seed_last. Guard explicitly so a mis-set
+        # num_chunks / short rollout fails loud, not via an opaque
         # out-of-bounds slice below.
-        chunk_need = sup_frames if seed_last else (sup_frames + gt_after_frames)
+        _rand_need = bool(getattr(self, "dmd_42f_rand_sup_slot", False))
+        chunk_need = (
+            sup_frames
+            if (seed_last and not _rand_need)
+            else (sup_frames + gt_after_frames)
+        )
         if int(chunk.shape[1]) < chunk_need:
             raise RuntimeError(
                 f"42f DMD: student chunk has {int(chunk.shape[1])} frames "
@@ -5386,23 +5454,110 @@ class ActionForcingDMD(SelfForcingModel):
         gt_ctx = ride_lat[:, noisy_lo:chunk_lo].to(
             dtype=chunk.dtype, device=chunk.device,
         ).detach()
-        parts = [gt_ctx, chunk[:, :sup_frames]]
-        if gt_after_frames > 0:
-            if seed_last:
-                # GT scaffold AFTER the supervised chunk (clean both
-                # sides) instead of the masked newest STUDENT chunk(s).
-                gt_after = ride_lat[
-                    :, chunk_lo + sup_frames : chunk_lo + sup_frames + gt_after_frames,
-                ].to(dtype=chunk.dtype, device=chunk.device).detach()
-                parts.append(gt_after)
-            else:
-                parts.append(
-                    chunk[:, sup_frames:sup_frames + gt_after_frames].detach()
-                )
+        # Random supervised slot (rand_sup_slot): pick WHICH after-slot
+        # carries the DMD gradient. Valid slots are those whose noisy frames
+        # still have a clean counterpart — every slot except the last
+        # ([N-npb, N)). The chosen chunk is graph-on student content; the
+        # rest of the after-region is detached context (GT when seed_last —
+        # a scaffold on both sides — else the student rollout). Step-seeded
+        # -> all ranks agree and r sweeps over training. World-consistent:
+        # after-slot at frame-offset o aligns with ride world [chunk_lo+o,…],
+        # so the supervised slot holds chunk[:, o:o+npb] (the o//npb-th roll).
+        sup_offset = 0
+        _rand_slot = bool(getattr(self, "dmd_42f_rand_sup_slot", False))
+        if _rand_slot:
+            n_after = (sup_frames + gt_after_frames) // npb
+            max_r = min(n_after - 1, ((N - npb) - n_ctx) // npb - 1)
+            if max_r >= 1:
+                _step = int(info.get("current_step", 0))
+                _g = torch.Generator(device="cpu").manual_seed(int(_step))
+                sup_offset = int(
+                    torch.randint(0, max_r + 1, (1,), generator=_g).item()
+                ) * npb
+        if seed_last and _rand_slot:
+            # GT scaffold for the WHOLE after-region, with the supervised
+            # student chunk inserted at the random slot (sup_offset). Only
+            # that slot is student (graph-on); every other after-slot is GT.
+            after_parts = []
+            n_after = (sup_frames + gt_after_frames) // npb
+            for _o_idx in range(n_after):
+                _o = _o_idx * npb
+                if _o == sup_offset:
+                    after_parts.append(chunk[:, _o:_o + sup_frames])
+                else:
+                    _w = chunk_lo + _o
+                    after_parts.append(
+                        ride_lat[:, _w:_w + npb].to(
+                            dtype=chunk.dtype, device=chunk.device,
+                        ).detach()
+                    )
+            parts = [gt_ctx] + after_parts
+        elif (not seed_last) and sup_offset > 0:
+            # seed_last=false + random: student after-region with ONE
+            # graph-on chunk at sup_offset; rest detached student context.
+            stu_tot = sup_frames + gt_after_frames
+            parts = [
+                gt_ctx,
+                chunk[:, :sup_offset].detach(),
+                chunk[:, sup_offset:sup_offset + sup_frames],
+                chunk[:, sup_offset + sup_frames:stu_tot].detach(),
+            ]
+        else:
+            parts = [gt_ctx, chunk[:, :sup_frames]]
+            if gt_after_frames > 0:
+                if seed_last:
+                    # GT scaffold AFTER the supervised chunk (clean both
+                    # sides) instead of the masked newest STUDENT chunk(s).
+                    gt_after = ride_lat[
+                        :, chunk_lo + sup_frames : chunk_lo + sup_frames + gt_after_frames,
+                    ].to(dtype=chunk.dtype, device=chunk.device).detach()
+                    parts.append(gt_after)
+                else:
+                    parts.append(
+                        chunk[:, sup_frames:sup_frames + gt_after_frames].detach()
+                    )
         noisy_x = torch.cat(parts, dim=1)          # [B, 21, ...]
         clean_x = ride_lat[:, clean_lo:clean_lo + N].to(
             dtype=chunk.dtype, device=chunk.device,
         ).detach()
+        # Clean-counterpart fix: in v14's joint TF, clean frame at array
+        # index (a+npb) is the SAME world frame as noisy frame at index a
+        # (clean shifted back npb). Where the noisy half holds a STUDENT
+        # chunk but its clean counterpart is GT, the teacher's full
+        # bidirectional attention sees a GT "what it should have been" that
+        # disagrees with the student noisy frame -> OOD (v14 was trained
+        # with the two halves identical at each world position). Replace
+        # each such clean counterpart with the student content (detached)
+        # so clean and noisy AGREE -> kills the conflict, keeps all N clean
+        # frames (more v14-faithful than dropping a key, which the flash
+        # kernel can't do for a mid-sequence frame anyway).
+        if bool(getattr(self, "dmd_42f_fix_clean_counterpart", False)):
+            stu_lo = n_ctx
+            # Student frames in noisy_x = supervised block, plus the
+            # after-block when it is student-rolled (not seed_last GT).
+            stu_hi = n_ctx + sup_frames + (
+                0 if seed_last else gt_after_frames
+            )
+            dst_lo = stu_lo + npb
+            dst_hi = min(stu_hi + npb, N)
+            n_rep = dst_hi - dst_lo
+            if n_rep > 0:
+                clean_x = clean_x.clone()
+                clean_x[:, dst_lo:dst_hi] = (
+                    noisy_x[:, stu_lo:stu_lo + n_rep].detach()
+                )
+        # Clean-self: put the student's OWN rolled chunks into the clean
+        # after-region (clean[n_ctx+npb : N] = supervised chunk's clean
+        # counterpart + the gt_after slots), sourced from ``chunk`` directly
+        # so it works whether the noisy after-region is GT (seed_last=true)
+        # or student (seed_last=false). OOD ablation: makes the clean half
+        # follow the rollout in its later slots.
+        if bool(getattr(self, "dmd_42f_clean_self", False)):
+            cs_lo = n_ctx + npb
+            cs_n = N - cs_lo
+            if cs_n > 0 and int(chunk.shape[1]) >= cs_n:
+                clean_x = clean_x.clone()
+                clean_x[:, cs_lo:N] = chunk[:, :cs_n].detach()
         gt_target = ride_lat[:, noisy_lo:noisy_hi].to(
             dtype=chunk.dtype, device=chunk.device,
         )
@@ -5426,7 +5581,74 @@ class ActionForcingDMD(SelfForcingModel):
         # [n_ctx, n_ctx + sup_frames)): the single chunk for ns=1, the
         # first (ns-1) chunks for ns>=2 (the newest is masked).
         gradient_mask = torch.zeros_like(noisy_x, dtype=torch.bool)
-        gradient_mask[:, n_ctx:n_ctx + sup_frames] = True
+        gradient_mask[
+            :, n_ctx + sup_offset : n_ctx + sup_offset + sup_frames
+        ] = True
+        import os as _os
+        if _os.environ.get("ARRWM_ROPE_DEBUG"):
+            try:
+                _c = getattr(self, "_rope_dbg_42f", 0)
+                if _c < 3:
+                    self._rope_dbg_42f = _c + 1
+                    ntot = N // npb
+                    ncc = n_ctx // npb
+                    supc = sup_frames // npb
+                    # Per noisy chunk-slot label: G=GT, S=sup-student,
+                    # s=ctx-student (masked).
+                    _supc0 = ncc + (sup_offset // npb)   # supervised slot
+                    nlab = []
+                    for _sl in range(ntot):
+                        if _sl < ncc:
+                            nlab.append("G")
+                        elif _supc0 <= _sl < _supc0 + supc:
+                            nlab.append("S")
+                        else:
+                            nlab.append("G" if seed_last else "s")
+                    # Bidir counterpart: noisy slot k <-> clean slot k+1
+                    # (clean shifted back npb). A student noisy chunk whose
+                    # clean counterpart slot exists+is GT = the OOD conflict
+                    # the teacher's bidir attention sees.
+                    conflict = [
+                        _sl + 1 for _sl, _l in enumerate(nlab)
+                        if _l in ("S", "s") and (_sl + 1) < ntot
+                    ]
+                    _fix = bool(getattr(
+                        self, "dmd_42f_fix_clean_counterpart", False))
+                    clab = ["G"] * ntot
+                    if _fix:
+                        for _cs in conflict:
+                            clab[_cs] = "S"  # replaced with student content
+                    if bool(getattr(self, "dmd_42f_clean_self", False)):
+                        _cs_slot_lo = (n_ctx + npb) // npb
+                        for _cs in range(_cs_slot_lo, ntot):
+                            clab[_cs] = "S"  # clean_self: student content
+                    print(
+                        f"[ROPE-DBG 42f] seed_last={seed_last} n_ctx={n_ctx} "
+                        f"sup_frames={sup_frames} gt_after={gt_after_frames} "
+                        f"fix_clean_counterpart={_fix}\n"
+                        f"  noisy slots[0..{ntot-1}]: {nlab}  "
+                        f"(S=sup-student, s=ctx-student, G=GT)\n"
+                        f"  clean slots[0..{ntot-1}]: {clab}  "
+                        f"(S=student-replaced)\n"
+                        f"  supervised chunk: sup_offset={sup_offset} "
+                        f"slot={_supc0} noisy_array=[{n_ctx + sup_offset},"
+                        f"{n_ctx + sup_offset + sup_frames}) -> scoring_rope="
+                        f"[{n_ctx + sup_offset + npb},"
+                        f"{n_ctx + sup_offset + sup_frames + npb})\n"
+                        f"  CONFLICT clean slots (GT counterpart of a student "
+                        f"noisy chunk): {conflict}  "
+                        f"-> {'REPLACED w/ student' if _fix else 'left GT (OOD)'}\n"
+                        f"  SHAPES: chunk={tuple(chunk.shape[:2])} "
+                        f"clean_x={tuple(clean_x.shape[:2])} "
+                        f"noisy_x={tuple(noisy_x.shape[:2])} | "
+                        f"WORLD: chunk_lo={chunk_lo} noisy_lo={noisy_lo} "
+                        f"clean_lo={clean_lo} N={N} npb={npb} "
+                        f"streaming_chunk_size={int(s['chunk_size'])} "
+                        f"sup_chunk_world=[{chunk_lo},{chunk_lo + sup_frames})",
+                        flush=True,
+                    )
+            except Exception:
+                pass
         return {
             "noisy_x": noisy_x,
             "clean_x": clean_x,

@@ -280,6 +280,25 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
             clean_grid[:, 0] = f_clean
             noisy_grid = grid_sizes.clone()
             noisy_grid[:, 0] = f_noisy
+            import os as _os
+            if _os.environ.get("ARRWM_ROPE_DEBUG"):
+                try:
+                    # Module-global counter: ``forward_with_action`` is
+                    # re-wrapped per DMD inner-step, so a function attribute
+                    # resets and the probe floods. A global persists.
+                    global _ROPE_DBG_SCORE_COUNT
+                    _c = globals().get("_ROPE_DBG_SCORE_COUNT", 0)
+                    if _c < 4:
+                        _ROPE_DBG_SCORE_COUNT = _c + 1
+                        print(
+                            f"[ROPE-DBG score] tf_off={tf_off} f_clean={f_clean} "
+                            f"f_noisy={f_noisy} clean_rope=[0,{f_clean}) "
+                            f"noisy_rope=[{tf_off},{tf_off + f_noisy}) "
+                            f"grad={torch.is_grad_enabled()}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
             q_clean, q_noisy = q_valid[:, :clean_valid], q_valid[:, clean_valid:]
             k_clean, k_noisy = k_valid[:, :clean_valid], k_valid[:, clean_valid:]
             if a_per_f > 0:
