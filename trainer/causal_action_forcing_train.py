@@ -3720,6 +3720,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         gt_xn_enabled = bool(
             getattr(self.model, "ladd_gt_transition_enabled", False)
         )
+        if getattr(self, "_ladd_diag_n", 0) < 4:
+            self._ladd_diag_n = getattr(self, "_ladd_diag_n", 0) + 1
+            import sys as _sys
+            print(
+                f"[LADD-DIAG] _compute_ladd_losses REACHED: gt_vs_fake={gt_vs_fake_enabled} "
+                f"adj={adj_enabled} gt_xn={gt_xn_enabled} "
+                f"(model.ladd_gt_transition_enabled="
+                f"{getattr(self.model, 'ladd_gt_transition_enabled', 'MISSING')})",
+                file=_sys.stderr, flush=True,
+            )
         if not (gt_vs_fake_enabled or adj_enabled or gt_xn_enabled):
             return zero, {}
 
@@ -3831,6 +3841,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         current_step: int,
         phase: str = "both",
     ) -> tuple:
+        if getattr(self, "_carn_diag_n", 0) < 6:
+            self._carn_diag_n = getattr(self, "_carn_diag_n", 0) + 1
+            import sys as _sys
+            print(
+                f"[CARN-DIAG] _ladd_run_pair_mode mode={pair_mode!r} phase={phase} "
+                f"carn_knob_model={getattr(self.model, 'ladd_gt_transition_carn_former', 'MISSING')} "
+                f"carn_knob_cfg={getattr(self.config, 'ladd_gt_transition_carn_former', 'MISSING')} "
+                f"fn={getattr(self.model, 'forward_noiser', None) is not None}",
+                file=_sys.stderr, flush=True,
+            )
         """Single D-update + gen-side loss for one pair-construction mode.
 
         Args:
@@ -3928,13 +3948,55 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # F-concat both indices: [B, 2*npb, C, H, W].
             return torch.cat([_slice(t, i), _slice(t, j)], dim=1)
 
+        # CARN-former (ladd_gt_transition_carn_former): degrade the FORMER
+        # chunk of each GT transition pair through the trained forward
+        # noiser, leaving the latter clean -> the disc sees REAL as a
+        # "CARN-degraded -> clean" (self-correcting) transition. Applied
+        # under no_grad on the detached real side (does NOT train the FN
+        # here; the FN trains via the rollout2 critic loss). Identity until
+        # the FN has trained (zero-init), so the effect ramps in.
+        # Robust knob read: prefer self.model, fall back to self.config
+        # (the override lives on the config object; self.model may not
+        # surface every arg).
+        _carn_knob = bool(
+            getattr(self.model, "ladd_gt_transition_carn_former", None)
+            or getattr(self.config, "ladd_gt_transition_carn_former", False)
+        )
+        _carn_former_on = (
+            pair_mode == "gt_transition"
+            and _carn_knob
+            and getattr(self.model, "forward_noiser", None) is not None
+        )
+        if _carn_former_on and getattr(self, "_carn_former_dbg", 0) < 2:
+            self._carn_former_dbg = getattr(self, "_carn_former_dbg", 0) + 1
+            import sys as _sys
+            print(
+                f"[CARN-FORMER] ON: gt_transition GT former chunk pushed "
+                f"through forward_noiser ({getattr(self.model, 'ladd_gt_transition_carn_steps', 1)} step)",
+                file=_sys.stderr, flush=True,
+            )
+
+        def _carn_former(x):
+            n_steps = int(getattr(self.model, "ladd_gt_transition_carn_steps", 1))
+            with torch.no_grad():
+                for _s in range(max(1, n_steps)):
+                    cs = torch.full(
+                        (x.shape[0],), _s, dtype=torch.long, device=x.device,
+                    )
+                    x = self.model.forward_noiser(x, cs, residual=True)
+            return x.detach()
+
+        def _slice_pair_carn(t, i, j):
+            return torch.cat([_carn_former(_slice(t, i)), _slice(t, j)], dim=1)
+
         if chunks_per_pair == 2:
             # gt_transition: real and fake BOTH cover the chunk-pair
             # (i, i+1). Real uses GT (real_src=gt_detached), fake uses
             # student (fake_src_*). Same i,j indices on both sides — the
             # disc compares "GT's chunk pair" vs "student's chunk pair".
+            _real_pair_fn = _slice_pair_carn if _carn_former_on else _slice_pair
             real_chunks_det = torch.cat(
-                [_slice_pair(real_src, i, j) for (i, j) in pairs], dim=0,
+                [_real_pair_fn(real_src, i, j) for (i, j) in pairs], dim=0,
             )
             fake_chunks_det = torch.cat(
                 [_slice_pair(fake_src_detached, i, j) for (i, j) in pairs],

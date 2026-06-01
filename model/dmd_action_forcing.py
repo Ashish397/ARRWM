@@ -294,6 +294,14 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_42f_rand_sup_slot = bool(
             getattr(args, "dmd_42f_rand_sup_slot", False)
         )
+        # ``dmd_42f_allsup`` (seed_last=false only): DMD-supervise EVERY
+        # student after-chunk that has a clean counterpart (noisy slots
+        # [n_ctx, N-npb)) instead of one (fixed/random) slot — e.g. slots
+        # 4,5,6 for gt_after=3. The last slot (no counterpart) stays
+        # detached. See ``_build_42f_scoring_inputs``.
+        self.dmd_42f_allsup = bool(
+            getattr(args, "dmd_42f_allsup", False)
+        )
 
         # ``dmd_only_first_chunk_per_ride``: pair with
         # ``max_rolls_per_ride > 1`` to roll the student N causal
@@ -798,6 +806,20 @@ class ActionForcingDMD(SelfForcingModel):
                 f"'off'; got {self.forward_noiser_apply_strategy!r} "
                 "(legacy 'blur_noise' and 'sum' strategies removed)."
             )
+        # ``ladd_gt_transition_carn_former``: in the transition GAN's GT
+        # pairs (former_chunk, latter_chunk), push the FORMER through the
+        # (trained) forward noiser so the disc sees REAL = "CARN-degraded ->
+        # clean" (a self-correcting transition). The student, fooling the
+        # disc, learns to clean up its own causal-AR drift each step. Does
+        # NOT touch the real teacher (unlike the aux-pass CARN path) —
+        # shapes the GAN target distribution instead. ``carn_steps`` = how
+        # many FN steps to apply to the former (more = more degraded).
+        self.ladd_gt_transition_carn_former = bool(
+            getattr(args, "ladd_gt_transition_carn_former", False)
+        )
+        self.ladd_gt_transition_carn_steps = int(
+            getattr(args, "ladd_gt_transition_carn_steps", 1)
+        )
         self.forward_noiser = None
         if self.forward_noiser_enabled:
             from model.forward_noiser import ForwardNoiser
@@ -1024,6 +1046,14 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_adjacent_chunks_enabled = bool(
             getattr(args, "ladd_adjacent_chunks_enabled", True)
         )
+        # gt_transition mode enable flag — was MISSING from the model
+        # (the trainer's _compute_ladd_losses reads
+        # getattr(self.model, "ladd_gt_transition_enabled", False), so
+        # without this it ALWAYS resolved False and the gt_transition GAN
+        # mode never ran). Wire it through here like the other modes.
+        self.ladd_gt_transition_enabled = bool(
+            getattr(args, "ladd_gt_transition_enabled", False)
+        )
         # Per-mode gen-side weights (multiplied on top of the standard
         # gan_loss_weight ramp).
         self.ladd_gt_vs_fake_weight = float(
@@ -1031,6 +1061,9 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.ladd_adjacent_chunks_weight = float(
             getattr(args, "ladd_adjacent_chunks_weight", 1.0)
+        )
+        self.ladd_gt_transition_weight = float(
+            getattr(args, "ladd_gt_transition_weight", 1.0)
         )
         # Wavelet-HF pre-stage (v28B, WGSR-style frequency-band
         # restriction). When True, the disc's input latent is passed
@@ -1357,6 +1390,21 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.stat_anchor_TV_long_weight = float(
             getattr(args, "stat_anchor_TV_long_weight", 0.1)
+        )
+        # SOS (raw Σ_{C,H,W} x²) and M1 (per-channel Σ_{H,W} x²) anchors.
+        # Default OFF (0.0) — these are raw second moments with large
+        # magnitudes, so set small weights relative to STD/TV.
+        self.stat_anchor_SOS_short_weight = float(
+            getattr(args, "stat_anchor_SOS_short_weight", 0.0)
+        )
+        self.stat_anchor_SOS_long_weight = float(
+            getattr(args, "stat_anchor_SOS_long_weight", 0.0)
+        )
+        self.stat_anchor_M1_short_weight = float(
+            getattr(args, "stat_anchor_M1_short_weight", 0.0)
+        )
+        self.stat_anchor_M1_long_weight = float(
+            getattr(args, "stat_anchor_M1_long_weight", 0.0)
         )
         # Tolerance band as a fraction of the anchor. Deviations inside
         # the band produce zero gradient (floor = (rel_tol * anchor)^2).
@@ -3627,6 +3675,10 @@ class ActionForcingDMD(SelfForcingModel):
                     M2_long_weight=self.stat_anchor_M2_long_weight,
                     TV_short_weight=self.stat_anchor_TV_short_weight,
                     TV_long_weight=self.stat_anchor_TV_long_weight,
+                    SOS_short_weight=self.stat_anchor_SOS_short_weight,
+                    SOS_long_weight=self.stat_anchor_SOS_long_weight,
+                    M1_short_weight=self.stat_anchor_M1_short_weight,
+                    M1_long_weight=self.stat_anchor_M1_long_weight,
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
                 )
@@ -4095,6 +4147,30 @@ class ActionForcingDMD(SelfForcingModel):
             "rollout2_abs_frame_start": rollout2_abs_frame_start,
         }
 
+    def _forward_noiser_ddp_anchor(
+        self, src: torch.Tensor, npb: int,
+    ) -> torch.Tensor:
+        """Zero-valued FN loss that STILL routes through ``self.forward_noiser``.
+
+        Used at every data-dependent bail in ``_compute_forward_noiser_loss``
+        so the forward_noiser module participates in the critic backward on
+        EVERY rank, even when this rank's ride yielded no aligned (rollout1,
+        rollout2) pairs. Without it, the FN grad-bucket all-reduce fires on a
+        per-rank-data-dependent subset of ranks -> the others block forever ->
+        silent DDP hang (no NCCL error, no OOM). The ``* 0.0`` keeps the loss
+        value zero (no spurious signal) while giving the DDP reducer identical
+        participation across ranks. ``find_unused_parameters=True`` does not
+        suffice — it only reconciles params unused within a forward that ran,
+        not a forward that was skipped entirely.
+        """
+        carn0 = torch.zeros(
+            (src.shape[0],), dtype=torch.long, device=src.device,
+        )
+        pred = self.forward_noiser(
+            src[:, :npb].detach(), carn0, residual=True,
+        )
+        return pred.sum() * 0.0
+
     def _compute_forward_noiser_loss(
         self,
         chunk: torch.Tensor,
@@ -4111,13 +4187,23 @@ class ActionForcingDMD(SelfForcingModel):
         """
         if self.forward_noiser is None:
             return None
+        npb = int(self.num_frame_per_block)
+        # DDP anchor on every data-dependent bail: each of the 32 ranks
+        # rides a DIFFERENT video, so the aligned-pair count below is
+        # per-rank. If a rank returns None here, self.forward_noiser never
+        # enters its critic backward graph, so its grad-bucket all-reduce
+        # never fires while other ranks' does -> silent DDP hang (no NCCL
+        # error, no OOM). ``_forward_noiser_ddp_anchor`` returns a zero loss
+        # that STILL routes through forward_noiser, keeping participation
+        # identical across ranks. (find_unused_parameters=True does NOT
+        # cover a skipped-forward; only a real forward does.)
         s = self.streaming_state
         if s is None:
-            return None
+            return self._forward_noiser_ddp_anchor(chunk, npb)
         r2_x0 = s.get("rollout2_x0")
         r2_abs_start = s.get("rollout2_abs_frame_start")
         if r2_x0 is None or r2_abs_start is None:
-            return None
+            return self._forward_noiser_ddp_anchor(chunk, npb)
         r2_abs_start = int(r2_abs_start)
         r2_total = int(r2_x0.shape[1])
 
@@ -4130,10 +4216,9 @@ class ActionForcingDMD(SelfForcingModel):
             flash_chunk.detach() if flash_chunk is not None else chunk
         )
 
-        npb = int(self.num_frame_per_block)
         chunk_size_critic = int(fn_input_chunk.shape[1])
         if chunk_size_critic % npb != 0:
-            return None
+            return self._forward_noiser_ddp_anchor(fn_input_chunk, npb)
         n_chunks = chunk_size_critic // npb
         abs_new_start = int(info.get("abs_frame_start", 0))
         overlap_critic = int(info.get("overlap", 0))
@@ -4219,15 +4304,26 @@ class ActionForcingDMD(SelfForcingModel):
                 losses.append(F.mse_loss(predicted_anchor, anchor_r2))
 
         if not losses:
-            # v27B audit-fix #1: DDP anchor. With find_unused_parameters
-            # =True the wrap handles missing forward passes, but it
-            # costs a per-iter graph traversal. Returning None here is
-            # still safe under FUP=True; we return None and let the
-            # caller skip the loss add cleanly.
-            return None
+            # No aligned pair for THIS rank's ride this step. Do NOT return
+            # None — that skips the forward_noiser forward and desyncs the
+            # FN grad-bucket all-reduce across ranks (silent DDP hang). Run
+            # the zero-anchor so participation is identical on every rank.
+            return self._forward_noiser_ddp_anchor(fn_input_chunk, npb)
         fn_loss = torch.stack(losses).mean()
         critic_log["forward_noiser_loss_raw"] = fn_loss.detach()
         critic_log["forward_noiser_n_pairs"] = float(len(losses))
+        # One-time stderr confirmation that the forward noiser is actually
+        # TRAINING (n_pairs>0 + non-trivial loss). The wandb-only metrics
+        # don't reach .err, so this gives an offline FN-alive signal.
+        _fc = getattr(self, "_fn_train_dbg", 0)
+        if _fc < 2:
+            self._fn_train_dbg = _fc + 1
+            import sys as _sys
+            print(
+                f"[FN-TRAIN] forward_noiser ALIVE: n_pairs={len(losses)} "
+                f"loss_raw={float(fn_loss.detach().item()):.5f}",
+                file=_sys.stderr, flush=True,
+            )
         return fn_loss
 
     @staticmethod
@@ -5474,7 +5570,28 @@ class ActionForcingDMD(SelfForcingModel):
                 sup_offset = int(
                     torch.randint(0, max_r + 1, (1,), generator=_g).item()
                 ) * npb
-        if seed_last and _rand_slot:
+        # allsup: supervise ALL student after-chunks that have a clean
+        # counterpart — noisy slots [n_ctx, N-npb) (every after-chunk
+        # except the last, counterpart-less one). Those frames are graph-on
+        # and the gradient_mask covers all of them (vs one slot). Only for
+        # seed_last=false (student after-region). sup_span spans the
+        # supervised chunks; the single-slot path keeps sup_span=sup_frames.
+        _allsup = (not seed_last) and bool(
+            getattr(self, "dmd_42f_allsup", False)
+        )
+        if _allsup:
+            sup_span = (N - npb) - n_ctx
+            sup_offset = 0
+        else:
+            sup_span = sup_frames
+        if _allsup:
+            stu_tot = sup_frames + gt_after_frames
+            parts = [
+                gt_ctx,
+                chunk[:, :sup_span],                   # slots [n_ctx..N-npb): graph-on
+                chunk[:, sup_span:stu_tot].detach(),   # last slot: no counterpart
+            ]
+        elif seed_last and _rand_slot:
             # GT scaffold for the WHOLE after-region, with the supervised
             # student chunk inserted at the random slot (sup_offset). Only
             # that slot is student (graph-on); every other after-slot is GT.
@@ -5582,7 +5699,7 @@ class ActionForcingDMD(SelfForcingModel):
         # first (ns-1) chunks for ns>=2 (the newest is masked).
         gradient_mask = torch.zeros_like(noisy_x, dtype=torch.bool)
         gradient_mask[
-            :, n_ctx + sup_offset : n_ctx + sup_offset + sup_frames
+            :, n_ctx + sup_offset : n_ctx + sup_offset + sup_span
         ] = True
         import os as _os
         if _os.environ.get("ARRWM_ROPE_DEBUG"):
@@ -5592,10 +5709,10 @@ class ActionForcingDMD(SelfForcingModel):
                     self._rope_dbg_42f = _c + 1
                     ntot = N // npb
                     ncc = n_ctx // npb
-                    supc = sup_frames // npb
+                    supc = sup_span // npb   # # of supervised chunks (allsup>1)
                     # Per noisy chunk-slot label: G=GT, S=sup-student,
                     # s=ctx-student (masked).
-                    _supc0 = ncc + (sup_offset // npb)   # supervised slot
+                    _supc0 = ncc + (sup_offset // npb)   # first supervised slot
                     nlab = []
                     for _sl in range(ntot):
                         if _sl < ncc:
@@ -6091,6 +6208,10 @@ class ActionForcingDMD(SelfForcingModel):
                         M2_long_weight=self.stat_anchor_M2_long_weight,
                         TV_short_weight=self.stat_anchor_TV_short_weight,
                         TV_long_weight=self.stat_anchor_TV_long_weight,
+                        SOS_short_weight=self.stat_anchor_SOS_short_weight,
+                        SOS_long_weight=self.stat_anchor_SOS_long_weight,
+                        M1_short_weight=self.stat_anchor_M1_short_weight,
+                        M1_long_weight=self.stat_anchor_M1_long_weight,
                         rel_tol_short=self.stat_anchor_rel_tol_short,
                         rel_tol_long=self.stat_anchor_rel_tol_long,
                         long_STD_anchor_override=long_STD_ov,
@@ -6477,6 +6598,22 @@ class ActionForcingDMD(SelfForcingModel):
             # fake_score IS training (see fake_grad_norm).
             "critic_loss": float(denoising_loss.detach().item()),
         }
+        # Train the forward noiser on aligned (rollout1, rollout2) pairs.
+        # The 42f/asymmetric critic path returns here BEFORE the FN block
+        # in ``compute_critic_loss_streaming``, so the FN was never trained
+        # under dmd_42f_enabled — wire it in explicitly (mirrors the non-42f
+        # block). Folded into the critic loss so one backward lights up both
+        # fake_score and forward_noiser params; the trainer's separate FN
+        # optimizer steps the noiser grads.
+        if self.forward_noiser_enabled and self.forward_noiser is not None:
+            fn_loss = self._compute_forward_noiser_loss(
+                chunk=chunk, info=info, critic_log=critic_log,
+            )
+            if fn_loss is not None:
+                denoising_loss = denoising_loss + (
+                    self.forward_noiser_loss_weight
+                    * fn_loss.to(denoising_loss.dtype)
+                )
         return denoising_loss, critic_log
 
     def compute_critic_loss_streaming(

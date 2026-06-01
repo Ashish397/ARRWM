@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-E31-sansgans
+#SBATCH --job-name=af-p3-E43-rvfgan
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=01:30:00
+#SBATCH --time=04:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
@@ -58,6 +58,7 @@ export NCCL_DEBUG=WARN
 export NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+export ARRWM_ROPE_DEBUG=1
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
@@ -129,6 +130,7 @@ srun torchrun \
     dmd_only_first_chunk_per_ride=true \
     checkpoint_interval=100000 \
     flash_dmd_enabled=true \
+    fake_score_ema_weight=0.95 \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=0.25 \
@@ -155,14 +157,44 @@ srun torchrun \
     ladd_wavelet_hf_ll_weight=0.15 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
     ladd_gt_vs_fake_enabled=true \
-    ladd_gt_transition_enabled=true \
-    ladd_gt_transition_weight=1.0 \
+    ladd_gt_transition_enabled=false \
+    ladd_gt_transition_weight=0.0 \
     ladd_gt_vs_fake_weight=1.0 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
-    fake_score_ema_weight=0.95 \
+    dmd_context=self \
+    real_teacher_train_online=true \
+    real_teacher_lr=2.5e-5 \
+    real_teacher_warmup_steps=0 \
+    real_teacher_input_source=gt \
+    teacher_cadence=fake \
+    real_score_ema_weight=0.0 \
+    dmd_frozen_teacher_pass_enabled=false \
+    aux_teacher_p_schedule_enabled=false \
+    aux_teacher_send_student_grad=false \
+    aux_teacher_start_step=0 \
+    aux_teacher_loss_weight=1.0 \
+    aux_teacher_loss_warmup_steps=80 \
+    aux_teacher_lora_rank=32 \
+    aux_teacher_lora_alpha=64 \
+    aux_real_clean_x_source=gt \
+    aux_noisy_from_raw_gt=false \
+    fake_alt_head_enabled=true \
+    fake_alt_head_start_step=0 \
+    fake_alt_apply_start_step=0 \
+    fake_alt_target_mode=rollout2_student \
+    fake_alt_rollout2_num_seed_chunks=5 \
+    forward_noiser_enabled=true \
+    forward_noiser_hidden_dim=512 \
+    forward_noiser_num_blocks=4 \
+    forward_noiser_max_carn_step=8 \
+    forward_noiser_loss_weight=1.0 \
+    forward_noiser_apply_in_aux=true \
+    forward_noiser_apply_strategy=learned \
+    forward_noiser_lr=5e-5 \
+    forward_noiser_lowfreq_smooth_window=0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=E3_1_sa_ns_gans_j${SLURM_JOB_ID}
+    run_name=E4_3_sa_ns_online_rvf_gan_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

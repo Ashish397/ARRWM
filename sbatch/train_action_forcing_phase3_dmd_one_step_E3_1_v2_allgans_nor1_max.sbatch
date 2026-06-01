@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-E31-sansgans
+#SBATCH --job-name=af-p3-E31v2-allmax
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -131,14 +131,14 @@ srun torchrun \
     flash_dmd_enabled=true \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
-    gan_loss_weight=0.25 \
+    gan_loss_weight=0.40 \
     gan_lr=2e-5 \
     gan_critic_warmup_steps=20 \
     gan_disc_start_step=20 \
     gan_warmup_steps=25 \
     gan_warmup_shape=linear \
     gan_updates_per_step=1 \
-    gan_r1_gamma=2.0 \
+    gan_r1_gamma=0.0 \
     gan_max_grad_norm=10.0 \
     ladd_proj_dim=256 \
     ladd_use_csm=true \
@@ -146,10 +146,10 @@ srun torchrun \
     ladd_use_prompt_cond=false \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
-    ladd_r1_gamma=0.01 \
+    ladd_r1_gamma=0.0 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=2 \
+    ladd_pairs_per_step=3 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
     ladd_wavelet_hf_ll_weight=0.15 \
@@ -163,6 +163,6 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=E3_1_sa_ns_gans_j${SLURM_JOB_ID}
+    run_name=E3_1_v2_allgans_nor1_max_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

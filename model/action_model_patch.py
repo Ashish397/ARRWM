@@ -554,8 +554,27 @@ def _bidir_forward_with_action_tokens(
         pad_target = natural_joint
     else:
         natural_joint = num_frames_local * frame_seqlen_local
-        half_pad = seq_len + num_frames_local * a_per_f
-        pad_target = half_pad
+        # Pad to the natural interleaved length, NOT to the caller's
+        # fixed ``seq_len`` capacity. The per-block reshape
+        # (model.py:334) does ``frame_seqlen = x.shape[1] //
+        # num_frames`` then ``unflatten(num_frames, frame_seqlen)``,
+        # which REQUIRES ``x.shape[1] == num_frames * frame_seqlen_local``
+        # exactly — both for divisibility AND for frame alignment. The
+        # old target ``seq_len + F*a_per_f`` only satisfies this when the
+        # input fills the window (``seq_len == F*spatial_seqlen``); in
+        # that case ``natural_joint`` is identical to it (no-op). When the
+        # input is SHORTER than the window — e.g. the GAN disc feeding a
+        # 3-frame chunk or a 6-frame gt_transition pair into a teacher
+        # whose ``self.seq_len`` is sized for the full rollout — the old
+        # target leaves stray padding that (a) isn't a multiple of
+        # ``num_frames`` (6-frame pair: 6*5464+3 -> unflatten crash) and
+        # (b) misaligns the per-frame modulation even when it does
+        # divide. ``natural_joint`` fixes both: each frame occupies
+        # exactly ``frame_seqlen_local`` tokens, so the reshape is always
+        # exact and frame-aligned. flash_attention/RoPE read ``seq_lens``
+        # + ``grid_sizes`` (real token counts), so removing the surplus
+        # padding is safe.
+        pad_target = natural_joint
     if int(seq_lens.max().item()) > pad_target:
         raise RuntimeError(
             f"interleaved seq_lens.max()={int(seq_lens.max().item())} "

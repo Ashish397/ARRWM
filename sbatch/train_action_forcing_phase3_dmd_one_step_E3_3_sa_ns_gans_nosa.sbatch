@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-E31-sansgans
+#SBATCH --job-name=af-p3-E33-gansnosa
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -111,7 +111,7 @@ srun torchrun \
     dmd_loss_start_step=0 \
     dmd_loss_warmup_steps=20 \
     dmd_normalization_enabled=true \
-    stat_anchor_loss_weight=1.0 \
+    stat_anchor_loss_weight=0.0 \
     stat_anchor_STD_short_weight=0.1 \
     stat_anchor_STD_long_weight=0.1 \
     stat_anchor_M2_short_weight=0.0 \
@@ -163,6 +163,6 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=E3_1_sa_ns_gans_j${SLURM_JOB_ID}
+    run_name=E3_3_sa_ns_gans_nosa_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

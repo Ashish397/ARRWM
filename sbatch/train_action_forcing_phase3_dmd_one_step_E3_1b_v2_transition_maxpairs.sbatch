@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-E31-sansgans
+#SBATCH --job-name=af-p3-E31bv2-transmax
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -149,20 +149,20 @@ srun torchrun \
     ladd_r1_gamma=0.01 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=2 \
+    ladd_pairs_per_step=6 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
     ladd_wavelet_hf_ll_weight=0.15 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
-    ladd_gt_vs_fake_enabled=true \
+    ladd_gt_vs_fake_enabled=false \
     ladd_gt_transition_enabled=true \
     ladd_gt_transition_weight=1.0 \
-    ladd_gt_vs_fake_weight=1.0 \
+    ladd_gt_vs_fake_weight=0.0 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     fake_score_ema_weight=0.95 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=E3_1_sa_ns_gans_j${SLURM_JOB_ID}
+    run_name=E3_1b_v2_transition_maxpairs_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

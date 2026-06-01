@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-E31-sansgans
+#SBATCH --job-name=af-p3-E33-allselfgan
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -124,8 +124,9 @@ srun torchrun \
     dmd_42f_enabled=true \
     dmd_42f_2chunk=true \
     dmd_42f_seed_last=false \
-    dmd_42f_gt_after_chunks=3 \
-    dmd_42f_rand_sup_slot=true \
+    dmd_42f_gt_after_chunks=2 \
+    dmd_42f_rand_sup_slot=false \
+    dmd_42f_clean_self=true \
     dmd_only_first_chunk_per_ride=true \
     checkpoint_interval=100000 \
     flash_dmd_enabled=true \
@@ -163,6 +164,6 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=E3_1_sa_ns_gans_j${SLURM_JOB_ID}
+    run_name=E3_3_allself_gans_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-E31-sansgans
-#SBATCH --nodes=8
+#SBATCH --job-name=smoke-E34-carnformer
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
@@ -91,7 +91,7 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=200 \
+    max_steps=35 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -133,9 +133,9 @@ srun torchrun \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=0.25 \
     gan_lr=2e-5 \
-    gan_critic_warmup_steps=20 \
-    gan_disc_start_step=20 \
-    gan_warmup_steps=25 \
+    gan_critic_warmup_steps=5 \
+    gan_disc_start_step=5 \
+    gan_warmup_steps=8 \
     gan_warmup_shape=linear \
     gan_updates_per_step=1 \
     gan_r1_gamma=2.0 \
@@ -149,20 +149,36 @@ srun torchrun \
     ladd_r1_gamma=0.01 \
     ladd_r1_every_n_steps=10 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=2 \
+    ladd_pairs_per_step=6 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=false \
     ladd_wavelet_hf_ll_weight=0.15 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
-    ladd_gt_vs_fake_enabled=true \
+    ladd_gt_vs_fake_enabled=false \
     ladd_gt_transition_enabled=true \
     ladd_gt_transition_weight=1.0 \
-    ladd_gt_vs_fake_weight=1.0 \
+    ladd_gt_vs_fake_weight=0.0 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
+    ladd_gt_transition_carn_former=true \
+    ladd_gt_transition_carn_steps=1 \
+    fake_alt_head_enabled=true \
+    fake_alt_head_start_step=0 \
+    fake_alt_apply_start_step=0 \
+    fake_alt_target_mode=rollout2_student \
+    fake_alt_rollout2_num_seed_chunks=5 \
+    forward_noiser_enabled=true \
+    forward_noiser_hidden_dim=512 \
+    forward_noiser_num_blocks=4 \
+    forward_noiser_max_carn_step=8 \
+    forward_noiser_loss_weight=1.0 \
+    forward_noiser_apply_in_aux=false \
+    forward_noiser_apply_strategy=learned \
+    forward_noiser_lr=5e-5 \
+    forward_noiser_lowfreq_smooth_window=0 \
     fake_score_ema_weight=0.95 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=E3_1_sa_ns_gans_j${SLURM_JOB_ID}
+    run_name=smoke_E3_4_carn_former_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

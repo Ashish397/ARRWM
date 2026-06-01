@@ -244,7 +244,11 @@ def _causal_cumulative_mean(x: torch.Tensor) -> torch.Tensor:
     weights = torch.arange(
         1, x.shape[1] + 1, device=x.device, dtype=x.dtype,
     )
-    return cs / weights
+    # Broadcast the [F] weights against dim=1 for any rank >= 2
+    # (e.g. [B, F] STD/M2/TV/SOS or [B, F, C] M1).
+    shape = [1] * x.dim()
+    shape[1] = x.shape[1]
+    return cs / weights.view(shape)
 
 
 def _per_frame_M2(x: torch.Tensor) -> torch.Tensor:
@@ -252,6 +256,22 @@ def _per_frame_M2(x: torch.Tensor) -> torch.Tensor:
     ``x: [B, F, C, H, W]`` -> ``[B, F]``."""
     sigma = x.std(dim=[3, 4], unbiased=False)        # [B, F, C]
     return (sigma ** 2).sum(dim=-1)                   # [B, F]
+
+
+def _per_frame_SOS(x: torch.Tensor) -> torch.Tensor:
+    """Per-frame raw sum-of-squares ``Σ_{C,H,W} x²`` (NOT mean-subtracted —
+    this is the raw second moment / energy, unlike M2/STD which measure
+    variance). ``x: [B, F, C, H, W]`` -> ``[B, F]``."""
+    return (x ** 2).sum(dim=[2, 3, 4])
+
+
+def _per_frame_M1(x: torch.Tensor) -> torch.Tensor:
+    """Per-frame, per-channel raw sum-of-squares ``Σ_{H,W} x²`` — summed
+    over the spatial dims (H, W) but NOT over channels, so each channel's
+    energy is anchored independently (catches a single channel collapsing
+    while others compensate, which the channel-pooled SOS cannot see).
+    ``x: [B, F, C, H, W]`` -> ``[B, F, C]``."""
+    return (x ** 2).sum(dim=[3, 4])
 
 
 def _per_frame_TV(x: torch.Tensor) -> torch.Tensor:
@@ -315,12 +335,18 @@ def compute_stat_anchor_loss(
     seed_STD_anchor: Optional[torch.Tensor] = None,
     seed_M2_anchor: Optional[torch.Tensor] = None,
     seed_TV_anchor: Optional[torch.Tensor] = None,
+    seed_SOS_anchor: Optional[torch.Tensor] = None,
+    seed_M1_anchor: Optional[torch.Tensor] = None,
     STD_short_weight: float = 0.1,
     STD_long_weight: float = 0.1,
     M2_short_weight: float = 0.1,
     M2_long_weight: float = 0.1,
     TV_short_weight: float = 0.1,
     TV_long_weight: float = 0.1,
+    SOS_short_weight: float = 0.0,
+    SOS_long_weight: float = 0.0,
+    M1_short_weight: float = 0.0,
+    M1_long_weight: float = 0.0,
     rel_tol_short: float = 0.20,
     rel_tol_long: float = 0.10,
     # Optional long-horizon anchor overrides — scalar tensors. When
@@ -397,6 +423,8 @@ def compute_stat_anchor_loss(
             STD_anchor = _per_frame_STD(seed).mean(dim=1)      # [B]
             M2_anchor = _per_frame_M2(seed).mean(dim=1)        # [B]
             TV_anchor = _per_frame_TV(seed).mean(dim=1)        # [B]
+            SOS_anchor = _per_frame_SOS(seed).mean(dim=1)      # [B]
+            M1_anchor = _per_frame_M1(seed).mean(dim=1)        # [B, C]
     else:
         if (
             seed_STD_anchor is None
@@ -411,6 +439,13 @@ def compute_stat_anchor_loss(
         STD_anchor = seed_STD_anchor.detach()
         M2_anchor = seed_M2_anchor.detach()
         TV_anchor = seed_TV_anchor.detach()
+        # SOS/M1 optional in the precomputed path — None disables the term.
+        SOS_anchor = (
+            seed_SOS_anchor.detach() if seed_SOS_anchor is not None else None
+        )
+        M1_anchor = (
+            seed_M1_anchor.detach() if seed_M1_anchor is not None else None
+        )
 
     # Per-frame stats on pred (graph-attached).
     STD_pf = _per_frame_STD(pred_x0)                   # [B, F]
@@ -496,6 +531,49 @@ def compute_stat_anchor_loss(
     loss_TV_short = (mse_TV_short - floor_TV_short).clamp(min=0)
     loss_TV_long = (mse_TV_long - floor_TV_long).clamp(min=0)
 
+    # ------------------------------------------------------------------
+    # SOS (raw Σ_{C,H,W} x²; [B,F]) and M1 (per-channel Σ_{H,W} x²;
+    # [B,F,C]). Both anchored with the same floor-clamped MSE machinery.
+    # Skipped (zero) when the anchor is unavailable (precomputed path
+    # without seed_SOS/seed_M1 anchors) or the weight is 0. NOTE: these
+    # are raw second moments — anchor magnitudes are large (sum, not
+    # mean), so use small weights relative to STD/TV.
+    # ------------------------------------------------------------------
+    zero = pred_x0.new_zeros(())
+    loss_SOS_short = loss_SOS_long = zero
+    floor_SOS_short = floor_SOS_long = 0.0
+    mse_SOS_short = mse_SOS_long = zero
+    if SOS_anchor is not None and (
+        float(SOS_short_weight) != 0.0 or float(SOS_long_weight) != 0.0
+    ):
+        SOS_pf = _per_frame_SOS(pred_x0)                    # [B, F]
+        SOS_long = _causal_cumulative_mean(SOS_pf)          # [B, F]
+        a_SOS = SOS_anchor.unsqueeze(1).to(SOS_pf.dtype)    # [B, 1]
+        mse_SOS_short = (SOS_pf - a_SOS).pow(2).mean()
+        mse_SOS_long = (SOS_long - a_SOS).pow(2).mean()
+        SOS_a2 = float(SOS_anchor.detach().mean().pow(2).item())
+        floor_SOS_short = rs2 * SOS_a2
+        floor_SOS_long = rl2 * SOS_a2
+        loss_SOS_short = (mse_SOS_short - floor_SOS_short).clamp(min=0)
+        loss_SOS_long = (mse_SOS_long - floor_SOS_long).clamp(min=0)
+
+    loss_M1_short = loss_M1_long = zero
+    floor_M1_short = floor_M1_long = 0.0
+    mse_M1_short = mse_M1_long = zero
+    if M1_anchor is not None and (
+        float(M1_short_weight) != 0.0 or float(M1_long_weight) != 0.0
+    ):
+        M1_pf = _per_frame_M1(pred_x0)                      # [B, F, C]
+        M1_long = _causal_cumulative_mean(M1_pf)            # [B, F, C]
+        a_M1 = M1_anchor.unsqueeze(1).to(M1_pf.dtype)       # [B, 1, C]
+        mse_M1_short = (M1_pf - a_M1).pow(2).mean()
+        mse_M1_long = (M1_long - a_M1).pow(2).mean()
+        M1_a2 = float(M1_anchor.detach().mean().pow(2).item())
+        floor_M1_short = rs2 * M1_a2
+        floor_M1_long = rl2 * M1_a2
+        loss_M1_short = (mse_M1_short - floor_M1_short).clamp(min=0)
+        loss_M1_long = (mse_M1_long - floor_M1_long).clamp(min=0)
+
     loss = (
         float(STD_short_weight) * loss_STD_short
         + float(STD_long_weight) * loss_STD_long
@@ -503,6 +581,10 @@ def compute_stat_anchor_loss(
         + float(M2_long_weight) * loss_M2_long
         + float(TV_short_weight) * loss_TV_short
         + float(TV_long_weight) * loss_TV_long
+        + float(SOS_short_weight) * loss_SOS_short
+        + float(SOS_long_weight) * loss_SOS_long
+        + float(M1_short_weight) * loss_M1_short
+        + float(M1_long_weight) * loss_M1_long
     )
 
     dev = pred_x0.device
@@ -556,6 +638,25 @@ def compute_stat_anchor_loss(
         "stat/M2_active_long": loss_M2_long.detach(),
         "stat/TV_active_short": loss_TV_short.detach(),
         "stat/TV_active_long": loss_TV_long.detach(),
+        # SOS / M1 (raw sum-of-squares terms)
+        "stat/SOS_anchor": (
+            SOS_anchor.mean().detach() if SOS_anchor is not None else zero
+        ),
+        "stat/M1_anchor": (
+            M1_anchor.mean().detach() if M1_anchor is not None else zero
+        ),
+        "stat/SOS_mse_short": mse_SOS_short.detach(),
+        "stat/SOS_mse_long": mse_SOS_long.detach(),
+        "stat/M1_mse_short": mse_M1_short.detach(),
+        "stat/M1_mse_long": mse_M1_long.detach(),
+        "stat/SOS_floor_short": _t(floor_SOS_short),
+        "stat/SOS_floor_long": _t(floor_SOS_long),
+        "stat/M1_floor_short": _t(floor_M1_short),
+        "stat/M1_floor_long": _t(floor_M1_long),
+        "stat/SOS_active_short": loss_SOS_short.detach(),
+        "stat/SOS_active_long": loss_SOS_long.detach(),
+        "stat/M1_active_short": loss_M1_short.detach(),
+        "stat/M1_active_long": loss_M1_long.detach(),
     }
     return loss, logs
 
