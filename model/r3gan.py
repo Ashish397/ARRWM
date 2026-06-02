@@ -248,6 +248,43 @@ def rpgan_g_loss(d_real: torch.Tensor, d_fake: torch.Tensor) -> torch.Tensor:
     return F.softplus(d_real - d_fake).mean()
 
 
+def rpgan_d_loss_allpairs(
+    d_real: torch.Tensor, d_fake: torch.Tensor,
+) -> torch.Tensor:
+    """All-pairs RpGAN discriminator loss.
+
+    Standard ``rpgan_d_loss`` compares each real to its position-matched
+    fake (``softplus(d_fake_i - d_real_i)``). This variant compares EVERY
+    real to EVERY fake across the leading (sample/chunk) dimension —
+    ``E_{i,j}[softplus(d_fake_j - d_real_i)]`` — so the disc learns
+    "GT chunks look real, generated chunks look fake" as a *style*
+    distinction independent of chunk position, and gets B_real x B_fake
+    comparison terms instead of B. Per-token granularity is preserved:
+    the outer product is taken over the batch dim only, elementwise over
+    the trailing token dim.
+
+    Args:
+        d_real: ``[B_real, ...]`` real logits (per-token along trailing dims).
+        d_fake: ``[B_fake, ...]`` fake logits (same trailing shape).
+    Returns: scalar = mean over ``B_real x B_fake x tokens``.
+    """
+    # [B_real, 1, ...] - ... -> broadcast to [B_real, B_fake, ...].
+    diff = d_fake.unsqueeze(0) - d_real.unsqueeze(1)
+    return F.softplus(diff).mean()
+
+
+def rpgan_g_loss_allpairs(
+    d_real: torch.Tensor, d_fake: torch.Tensor,
+) -> torch.Tensor:
+    """All-pairs RpGAN generator loss — counterpart to
+    ``rpgan_d_loss_allpairs``. ``E_{i,j}[softplus(d_real_i - d_fake_j)]``.
+    Each generated chunk is pushed to look real relative to ALL real
+    chunks (gradient to ``d_fake_j`` accumulates over every real ``i``).
+    ``d_real`` is detached at the call site."""
+    diff = d_real.unsqueeze(1) - d_fake.unsqueeze(0)
+    return F.softplus(diff).mean()
+
+
 def r1_penalty(
     discriminator: nn.Module,
     real_input: torch.Tensor,

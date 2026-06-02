@@ -1043,6 +1043,68 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_vs_fake_enabled = bool(
             getattr(args, "ladd_gt_vs_fake_enabled", False)
         )
+        # All-pairs (style, not position) gt_vs_fake: compare EVERY GT
+        # chunk to EVERY generated chunk in the disc loss (B_real x B_fake
+        # relativistic terms) instead of position-matched (GT_i vs gen_i).
+        # The disc forward is unchanged (still B unique reals + B unique
+        # fakes); only the RpGAN reduction becomes a 7x7-style outer
+        # product, so the extra signal is ~free in memory. Trains a
+        # position-invariant "GT-style vs generated-style" discriminator.
+        self.ladd_gt_vs_fake_all_pairs = bool(
+            getattr(args, "ladd_gt_vs_fake_all_pairs", False)
+        )
+        # All-pairs for the gt_transition mode: compare EVERY GT
+        # transition-pair (chunk i->i+1) to EVERY student transition-pair
+        # (chunk j->j+1) in the disc loss (N_trans x N_trans relativistic
+        # terms) instead of position-matched. Decorrelates transition
+        # STYLE from position. Same outer-product loss as the gt_vs_fake
+        # variant; the forward is unchanged (each transition already
+        # carries its own position's action tokens, so every logit stays
+        # correctly self-conditioned).
+        self.ladd_gt_transition_all_pairs = bool(
+            getattr(args, "ladd_gt_transition_all_pairs", False)
+        )
+        # Mismatched all-pairs: feed N_real GT chunks (sampled fresh from
+        # the full ride window) vs the N_fake student chunks, giving an
+        # N_real x N_fake all-pairs comparison (more decorrelated GT). The
+        # GT side is RESAMPLED every D-update (hardcoded), so updates x
+        # N_real distinct GT chunks per step. >0 enables it (and requires
+        # the matching all_pairs knob). gt_vs_fake uses single chunks;
+        # gt_transition uses transition-pairs. Texture-only disc, so the
+        # co-located real actions are sufficient. Separate real/fake/
+        # perturbed disc forwards make R1 exact for unequal counts.
+        self.ladd_gt_vs_fake_n_real = int(
+            getattr(args, "ladd_gt_vs_fake_n_real", 0)
+        )
+        self.ladd_gt_transition_n_real = int(
+            getattr(args, "ladd_gt_transition_n_real", 0)
+        )
+        # Magnitude-equalize the two members (former / latter chunk) of
+        # every gt_transition pair — for BOTH real and fake — to their
+        # common average MEAN MAGNITUDE (mean of |x|, the brightness/energy
+        # proxy; NOT the signed mean, which can cancel to ~0). Done by
+        # SCALING each member (lower magnitude up, higher down), preserving
+        # the pair's overall magnitude. Removes the inter-chunk magnitude
+        # (brightness) DRIFT across the transition from the disc's view, so
+        # the transition GAN can no longer reward ever-increasing
+        # brightness (the failure the gt_vs_fake disc doesn't have).
+        # Differentiable on the grad-on fake side, so it also kills the
+        # gen-side gradient that would push the inter-member magnitude.
+        self.ladd_gt_transition_mean_equalize = bool(
+            getattr(args, "ladd_gt_transition_mean_equalize", False)
+        )
+        # Wide-real: draw the REAL (GT) chunks for the all-pairs gt_vs_fake
+        # disc from the FULL loaded ride window (~25 chunks: seed + rollout
+        # + post-window) instead of only the 21-frame scored slice — more
+        # varied/decorrelated GT in the style comparison. Counts stay equal
+        # to the fake side (so no forward/R1 change); only WHICH GT chunks
+        # are sliced changes. Requires all_pairs (position no longer
+        # matters). Real latent + its action are sliced from the same
+        # absolute position in the same-coordinate ride windows, so they
+        # stay co-located. Off by default.
+        self.ladd_gt_vs_fake_wide_real = bool(
+            getattr(args, "ladd_gt_vs_fake_wide_real", False)
+        )
         self.ladd_adjacent_chunks_enabled = bool(
             getattr(args, "ladd_adjacent_chunks_enabled", True)
         )

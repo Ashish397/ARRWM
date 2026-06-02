@@ -69,6 +69,8 @@ from model.r3gan import (
     R3GANDiscriminator3D,
     rpgan_d_loss,
     rpgan_g_loss,
+    rpgan_d_loss_allpairs,
+    rpgan_g_loss_allpairs,
     r1_penalty,
     r2_penalty,
 )
@@ -3914,6 +3916,47 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 f"_ladd_run_pair_mode: unknown pair_mode={pair_mode!r}."
             )
 
+        # All-pairs (style, not position) RpGAN: compare EVERY real to
+        # EVERY fake in the loss (B_real x B_fake relativistic terms)
+        # rather than position-matched. The disc forward is unchanged
+        # (same B reals + B fakes); only the loss reduction becomes an
+        # outer product, so the extra signal is ~free in memory. Enabled
+        # per-mode: gt_vs_fake (chunk vs chunk) via
+        # ``ladd_gt_vs_fake_all_pairs``, gt_transition (transition-pair vs
+        # transition-pair) via ``ladd_gt_transition_all_pairs``. Each
+        # logit stays bound to its own chunk/transition's action through
+        # the forward, so the outer product only recombines correctly
+        # self-conditioned scalars. adjacent_chunks keeps positional
+        # pairing. ``_d_loss_fn`` / ``_g_loss_fn`` are used at every
+        # RpGAN reduction site below.
+        _all_pairs_mode = (
+            (
+                pair_mode == "gt_vs_fake"
+                and bool(getattr(
+                    self.model, "ladd_gt_vs_fake_all_pairs", False))
+            )
+            or (
+                pair_mode == "gt_transition"
+                and bool(getattr(
+                    self.model, "ladd_gt_transition_all_pairs", False))
+            )
+        )
+        _d_loss_fn = rpgan_d_loss_allpairs if _all_pairs_mode else rpgan_d_loss
+        _g_loss_fn = rpgan_g_loss_allpairs if _all_pairs_mode else rpgan_g_loss
+
+        # Mismatched all-pairs (N_real != N_fake) + resample-per-update.
+        # N_real GT chunks (sampled fresh each D-update from the full ride
+        # window) vs the N_fake student chunks. Only meaningful with
+        # all-pairs (the loss is a non-square outer product). Handled by a
+        # dedicated self-contained branch below (the matched path is left
+        # untouched). 0 = off.
+        _n_real = 0
+        if _all_pairs_mode and pair_mode == "gt_vs_fake":
+            _n_real = int(getattr(self.model, "ladd_gt_vs_fake_n_real", 0))
+        elif _all_pairs_mode and pair_mode == "gt_transition":
+            _n_real = int(getattr(self.model, "ladd_gt_transition_n_real", 0))
+        _mismatched = _n_real > 0
+
         # Optional pair budget. ``ladd_pair_selection`` decides which pairs
         # when capped: "first" = the first N rolled chunks (deterministic,
         # lowest drift); "random" = random subset seeded by the step (same
@@ -3941,12 +3984,85 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             pairs = all_pairs
         n_pairs = len(pairs)
 
+        # Wide-real (all-pairs gt_vs_fake only): draw the REAL GT chunks
+        # from the FULL loaded ride window (seed + rollout + post-window)
+        # rather than the position-matched scored slice, for more varied
+        # GT in the style comparison. ``real_positions`` (one absolute
+        # chunk index per pair) + ``real_src_eff`` drive BOTH the real-
+        # latent slice and the real-action slice below; both index the
+        # same-coordinate ride windows (ride_latents_window /
+        # ride_actions_window share the ride offset s) at the same
+        # absolute frame, so latent and action stay co-located. Counts
+        # stay == n_pairs (== fake count), so the batched forward and the
+        # R1 finite-diff split are unaffected. Non-wide path reproduces
+        # the original behaviour exactly (real_src_eff=real_src,
+        # real_positions=[i for (i,_) in pairs]).
+        _wide_real = (
+            _all_pairs_mode
+            and pair_mode == "gt_vs_fake"
+            and chunks_per_pair == 1
+            and bool(getattr(self.model, "ladd_gt_vs_fake_wide_real", False))
+        )
+        real_src_eff = real_src
+        real_positions = [i for (i, _) in pairs]
+        if _wide_real:
+            _ss = getattr(self.model, "streaming_state", None)
+            _wide_win = (
+                _ss.get("ride_latents_window")
+                if isinstance(_ss, dict) else None
+            )
+            if _wide_win is not None and int(_wide_win.shape[1]) >= npb:
+                real_src_eff = _wide_win.detach().to(real_src.dtype)
+                _w_chunks = int(_wide_win.shape[1] // npb)
+                # Step-seeded sample (same positions across ranks is fine —
+                # each rank holds a different ride, so GT content still
+                # differs; the COUNT is fixed = n_pairs so disc-forward
+                # shapes match across ranks → DDP-safe). Cycle if the
+                # window holds fewer chunks than n_pairs.
+                _g = torch.Generator(device="cpu").manual_seed(
+                    int(current_step) * 131 + 17
+                )
+                _perm = torch.randperm(_w_chunks, generator=_g).tolist()
+                real_positions = [
+                    _perm[k % _w_chunks] for k in range(n_pairs)
+                ]
+            else:
+                _wide_real = False  # window unavailable → fall back
+
         def _slice(t, i):
             return t[:, i * npb:(i + 1) * npb]
 
         def _slice_pair(t, i, j):
             # F-concat both indices: [B, 2*npb, C, H, W].
             return torch.cat([_slice(t, i), _slice(t, j)], dim=1)
+
+        # Magnitude-equalize the two members of a gt_transition pair
+        # (former [:, :npb], latter [:, npb:]) to their common average
+        # MEAN MAGNITUDE (mean of |x| — the energy/brightness proxy, NOT
+        # the signed mean which is direction+magnitude and can cancel to
+        # ~0). Equalizing a magnitude requires SCALING (not shifting):
+        # scale the lower-magnitude chunk UP and the higher one DOWN by
+        # the matching factor so both reach the pair's average magnitude,
+        # preserving the pair's overall magnitude. Removes the inter-chunk
+        # magnitude (brightness) drift across the transition from the
+        # disc's view — counters the transition GAN's progressive
+        # brightening. Differentiable, so on the grad-on fake side it also
+        # zeroes the gen-side gradient pushing the inter-member magnitude.
+        _mean_eq = (
+            chunks_per_pair == 2
+            and bool(getattr(
+                self.model, "ladd_gt_transition_mean_equalize", False))
+        )
+
+        def _mean_equalize_pair(pair):
+            fmr = pair[:, :npb]
+            ltr = pair[:, npb:]
+            eps = 1e-6
+            a_f = fmr.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+            a_l = ltr.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+            a = 0.5 * (a_f + a_l)
+            return torch.cat(
+                [fmr * (a / (a_f + eps)), ltr * (a / (a_l + eps))], dim=1)
 
         # CARN-former (ladd_gt_transition_carn_former): degrade the FORMER
         # chunk of each GT transition pair through the trained forward
@@ -4006,9 +4122,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 [_slice_pair(fake_src_grad, i, j) for (i, j) in pairs],
                 dim=0,
             )
+            if _mean_eq:
+                # Equalize both pair members for real + fake (D-side and
+                # grad-on gen-side). Real is detached GT; the grad-on fake
+                # keeps the equalize differentiable so no gen gradient
+                # pushes the inter-member mean.
+                real_chunks_det = _mean_equalize_pair(real_chunks_det)
+                fake_chunks_det = _mean_equalize_pair(fake_chunks_det)
+                fake_chunks_grad_tensor = _mean_equalize_pair(
+                    fake_chunks_grad_tensor)
         else:
             real_chunks_det = torch.cat(
-                [_slice(real_src, i) for (i, _) in pairs], dim=0,
+                [_slice(real_src_eff, real_positions[k])
+                 for k in range(n_pairs)], dim=0,
             )
             fake_chunks_det = torch.cat(
                 [_slice(fake_src_detached, j) for (_, j) in pairs], dim=0,
@@ -4143,13 +4269,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # Build per-pair action slices for real and fake sides.
             real_acts = []
             fake_acts = []
-            for (i_real, j_fake) in pairs:
+            for k, (i_real, j_fake) in enumerate(pairs):
                 # ride_actions: [B, cf+rollout, A]. Chunk i covers frames
                 # [cf + i*npb, cf + (i+1)*npb) within the rollout. For
                 # gt_vs_fake, real and fake use the same chunk index
                 # (i_real == j_fake). For adjacent_chunks they differ
                 # by one (j_fake = i_real + 1).
-                lo_r = cf_state + i_real * npb
+                # Wide-real: the real chunk k was sliced from absolute
+                # window position real_positions[k] (NOT cf_state-relative);
+                # its action is co-located at the same absolute frame in
+                # ride_actions_window (latents/actions share the ride
+                # offset s), so use real_positions[k]*npb. Only fires for
+                # all-pairs gt_vs_fake (chunks_per_pair==1).
+                if _wide_real:
+                    lo_r = real_positions[k] * npb
+                else:
+                    lo_r = cf_state + i_real * npb
                 lo_f = cf_state + j_fake * npb
                 if chunks_per_pair == 2:
                     # gt_transition: both sides cover the (i, i+1)
@@ -4260,6 +4395,276 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         #     only the iters where R1 has a real value.
         last_r1_grad_sq = float("nan")
         last_r1_fired = 0.0
+
+        # ===== Mismatched all-pairs (N_real != N_fake) + resample-per-update
+        # =====
+        # Feed N_real GT chunks (gt_vs_fake) / transition-pairs
+        # (gt_transition) — RESAMPLED fresh from the full ride window every
+        # D-update — against the N_fake student chunks, for an
+        # N_real x N_fake all-pairs comparison with maximal GT
+        # decorrelation. Real / fake / perturbed are forwarded SEPARATELY
+        # (no equal-count combined split), so the R1 finite-diff is exact
+        # for unequal counts. Real latent + its action are co-located (same
+        # absolute window position). Self-contained: runs its own D-loop +
+        # gen-side and returns the standard (generator_gan_loss, logs).
+        # Matched configs never enter here (gated on n_real knob > 0).
+        _mm_win = None
+        if _mismatched:
+            _ss_mm = getattr(self.model, "streaming_state", None)
+            _mm_win = (
+                _ss_mm.get("ride_latents_window")
+                if isinstance(_ss_mm, dict) else None
+            )
+        if _mismatched and _mm_win is not None and int(_mm_win.shape[1]) >= npb:
+            _win = _mm_win.detach().to(torch.float32)
+            _w_chunks = int(_win.shape[1] // npb)
+            _n_units = _w_chunks if chunks_per_pair == 1 else max(1, _w_chunks - 1)
+            _K_stat = int(getattr(self.r3gan_disc, "stat_logit_count", 0))
+            _W_stat = float(getattr(
+                self.model, "ladd_stat_head_loss_weight", 1.0))
+            _r1_gamma = float(getattr(self.model, "ladd_r1_gamma", 1.0))
+            _r1_every_n = max(1, int(
+                getattr(self.model, "ladd_r1_every_n_steps", 1)))
+            _r1_sigma = float(getattr(self.model, "ladd_r1_sigma", 0.01))
+            _need_pp = pooled_prompt is not None
+
+            def _resample_real(salt):
+                # Sample _n_real fresh window positions (cycle if short);
+                # slice co-located latent + action.
+                g = torch.Generator(device="cpu").manual_seed(
+                    int(current_step) * 977 + int(salt) * 131 + 17)
+                perm = torch.randperm(_n_units, generator=g).tolist()
+                pos = [perm[k % _n_units] for k in range(_n_real)]
+                if chunks_per_pair == 1:
+                    rc = torch.cat([_slice(_win, p) for p in pos], dim=0)
+                else:
+                    rc = torch.cat(
+                        [_slice_pair(_win, p, p + 1) for p in pos], dim=0)
+                    if _mean_eq:
+                        rc = _mean_equalize_pair(rc)
+                rat = None
+                ram = None
+                if a_per_f > 0 and ride_actions is not None and atp is not None:
+                    acts = []
+                    for p in pos:
+                        if chunks_per_pair == 1:
+                            lo = p * npb
+                            acts.append(ride_actions[:, lo:lo + npb])
+                        else:
+                            lo0, lo1 = p * npb, (p + 1) * npb
+                            acts.append(torch.cat([
+                                ride_actions[:, lo0:lo0 + npb],
+                                ride_actions[:, lo1:lo1 + npb],
+                            ], dim=1))
+                    acts_t = torch.cat(acts, dim=0).to(
+                        device=device, dtype=prompt_embeds_eff.dtype)
+                    with torch.no_grad():
+                        rat = atp(acts_t).detach()
+                        if ap is not None:
+                            ram = ap(
+                                acts_t, num_frames=acts_t.shape[1]).detach()
+                return rc.detach(), rat, ram
+
+            def _mm_noise(x):
+                # Count-correct disc noise (the outer _add_disc_noise reuses
+                # the matched-sized t_disc, so it can't take a differently-
+                # sized batch).
+                if disc_t_int <= 0:
+                    return x
+                scheduler = getattr(self.model, "scheduler", None)
+                if scheduler is None or not hasattr(scheduler, "add_noise"):
+                    raise RuntimeError(
+                        "_mm_noise: disc_t_int > 0 but model has no scheduler "
+                        "with add_noise. Set flash_dmd_enabled=False (disc_t=0) "
+                        "or provide a scheduler.")
+                eps = torch.randn_like(x)
+                x_flat = x.flatten(0, 1)
+                eps_flat = eps.flatten(0, 1)
+                t_pf = torch.full(
+                    (x_flat.shape[0],), disc_t_int,
+                    dtype=torch.long, device=x.device)
+                noisy = scheduler.add_noise(x_flat, eps_flat, t_pf)
+                return noisy.unflatten(0, x.shape[:2])
+
+            def _mm_fwd_segments(disc, segs):
+                # ONE disc forward over concatenated segments — DDP-safe
+                # (single forward -> single backward; 3 separate forwards
+                # before a backward would desync DDP's grad reducer).
+                # segs: list of (chunks, action_tokens, action_mod). Returns
+                # the per-segment logit slices in order. Prompt/pooled are
+                # tiled position-major to match the chunk concat ordering.
+                xs = [s[0] for s in segs]
+                counts = [int(s[0].shape[0]) for s in segs]
+                x = torch.cat(xs, dim=0)
+                n_rows = x.shape[0]
+                t = torch.full(
+                    (n_rows, t_frames), disc_t_int,
+                    dtype=torch.long, device=device)
+                reps = max(1, n_rows // int(prompt_embeds.shape[0]))
+                pe = prompt_embeds.repeat(reps, 1, 1)
+                pp = (
+                    prompt_embeds.float().mean(dim=1).repeat(reps, 1)
+                    if _need_pp else None)
+                ce = None
+                if any(s[1] is not None for s in segs):
+                    ce = {"_action_tokens": torch.cat(
+                        [s[1] for s in segs], dim=0)}
+                    if all(s[2] is not None for s in segs):
+                        ce["_action_modulation"] = torch.cat(
+                            [s[2] for s in segs], dim=0)
+                logits = disc(
+                    x_noisy=x, timestep=t, prompt_embeds=pe,
+                    pooled_prompt=pp, conditional_extra=ce)
+                out = []
+                o = 0
+                for c in counts:
+                    out.append(logits[o:o + c])
+                    o += c
+                return out
+
+            def _mm_rp(d_real, d_fake, loss_fn, detach_real):
+                if _K_stat > 0 and _W_stat > 0.0:
+                    rv, rs = d_real[:, :-_K_stat], d_real[:, -_K_stat:]
+                    fv, fs = d_fake[:, :-_K_stat], d_fake[:, -_K_stat:]
+                    if detach_real:
+                        rv, rs = rv.detach(), rs.detach()
+                    lv = loss_fn(rv, fv)
+                    ls = loss_fn(rs, fs)
+                    return lv + _W_stat * ls, float(ls.detach().item())
+                rr = d_real.detach() if detach_real else d_real
+                return loss_fn(rr, d_fake), 0.0
+
+            # ---- D-updates (resample real each iter) ----
+            if n_disc_updates > 0 and self.r3gan_optimizer is not None:
+                for _iter_idx in range(n_disc_updates):
+                    self.r3gan_optimizer.zero_grad(set_to_none=True)
+                    _rc, _rat, _ram = _resample_real(_iter_idx)
+                    _rn = _mm_noise(_rc)
+                    if diff_aug_policy:
+                        _rn, _ = latent_diff_augment(
+                            _rn, _rn, policy=diff_aug_policy,
+                            seed=int(current_step) * 31 + seed_offset
+                            + _iter_idx * 101)
+                    _rn = _rn.detach()
+                    _fk = fake_chunks_det_noisy.detach()
+                    _fseg = (_fk, fake_action_tokens, fake_action_modulation)
+                    if current_step % _r1_every_n == 0:
+                        eps = _r1_sigma * torch.randn_like(_rn)
+                        d_real_logits, d_fake_logits, d_real_pert = (
+                            _mm_fwd_segments(disc_for_update, [
+                                (_rn, _rat, _ram),
+                                _fseg,
+                                (_rn + eps, _rat, _ram),
+                            ]))
+                        d_real_sum = d_real_logits.sum(dim=1)
+                        d_real_pert_sum = d_real_pert.sum(dim=1)
+                        _r1_grad_sq_raw = (
+                            ((d_real_pert_sum - d_real_sum) / _r1_sigma)
+                            .pow(2).mean())
+                        r1 = 0.5 * _r1_gamma * _r1_grad_sq_raw
+                        last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
+                        last_r1_fired = 1.0
+                    else:
+                        d_real_logits, d_fake_logits = _mm_fwd_segments(
+                            disc_for_update, [(_rn, _rat, _ram), _fseg])
+                        r1 = d_real_logits.sum() * 0.0
+                    d_rp, _dstat = _mm_rp(
+                        d_real_logits, d_fake_logits, _d_loss_fn, False)
+                    (d_rp + r1).backward()
+                    if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in self.r3gan_disc.parameters()
+                             if p.grad is not None],
+                            self.gan_max_grad_norm)
+                    self.r3gan_optimizer.step()
+                    last_d_loss = float(d_rp.detach().item())
+                    last_d_real = float(d_real_logits.detach().mean().item())
+                    last_d_fake = float(d_fake_logits.detach().mean().item())
+                    last_r1 = float(r1.detach().item())
+                    last_d_loss_stat = _dstat
+            self._mem_step_snapshot(f"ladd_{pair_mode}_b_post_d_update")
+
+            # ---- Gen-side (resample real once) ----
+            critic_warmup_done = (
+                current_step >= int(getattr(self, "gan_critic_warmup_steps", 0)))
+            if (
+                self.gan_warmup_steps > 0
+                and current_step < (
+                    self.gan_critic_warmup_steps + self.gan_warmup_steps)
+                and current_step >= self.gan_critic_warmup_steps
+            ):
+                _ramp_in = current_step - self.gan_critic_warmup_steps
+                gen_gan_weight = self._gan_warmup_shape_apply(
+                    _ramp_in / max(1, self.gan_warmup_steps)
+                ) * self.gan_loss_weight
+            elif current_step >= (
+                self.gan_critic_warmup_steps + self.gan_warmup_steps
+            ):
+                gen_gan_weight = self.gan_loss_weight
+            else:
+                gen_gan_weight = 0.0
+            gen_gan_weight = gen_gan_weight * float(
+                getattr(self.model, "ladd_disc_loss_weight", 1.0))
+
+            generator_gan_loss = zero
+            gen_gan_main_value = 0.0
+            gen_gan_stat_value = 0.0
+            if critic_warmup_done and gen_gan_weight > 0 and not skip_g:
+                disc_for_guidance.requires_grad_(False)
+                _disc_was_training = disc_for_guidance.training
+                disc_for_guidance.eval()
+                try:
+                    _rc, _rat, _ram = _resample_real(7919)
+                    _rn = _mm_noise(_rc).detach()
+                    _fg = _mm_noise(fake_chunks_grad_tensor)
+                    if diff_aug_policy:
+                        _rn, _ = latent_diff_augment(
+                            _rn, _rn, policy=diff_aug_policy,
+                            seed=int(current_step) * 31 + seed_offset + 99)
+                        _, _fg = latent_diff_augment(
+                            _fg, _fg, policy=diff_aug_policy,
+                            seed=int(current_step) * 31 + seed_offset + 199)
+                    d_real_g, d_fake_g = _mm_fwd_segments(
+                        disc_for_guidance, [
+                            (_rn, _rat, _ram),
+                            (_fg, fake_action_tokens, fake_action_modulation),
+                        ])
+                    g_rp, gen_gan_stat_value = _mm_rp(
+                        d_real_g, d_fake_g, _g_loss_fn, True)
+                    generator_gan_loss = (
+                        gen_gan_weight * g_rp.to(pred_image_dtype))
+                    gen_gan_main_value = float(g_rp.detach().item())
+                finally:
+                    disc_for_guidance.requires_grad_(True)
+                    if _disc_was_training:
+                        disc_for_guidance.train()
+            self._mem_step_snapshot(f"ladd_{pair_mode}_c_post_g_forward")
+
+            logs = {
+                "train/r3gan_disc_skipped": 1.0 if disc_skipped else 0.0,
+                "train/r3gan_d_loss": last_d_loss,
+                "train/r3gan_d_real": last_d_real,
+                "train/r3gan_d_fake_detached": last_d_fake,
+                "train/r3gan_r1": last_r1,
+                "train/r3gan_r1_grad_sq": last_r1_grad_sq,
+                "train/r3gan_r1_fired": last_r1_fired,
+                "train/r3gan_r1_gamma": float(_r1_gamma),
+                "train/r3gan_g_loss_raw": gen_gan_main_value,
+                "train/r3gan_g_loss_weighted": gen_gan_weight * gen_gan_main_value,
+                "train/r3gan_g_weight": float(gen_gan_weight),
+                "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
+                "train/ladd_n_pairs": float(n_pairs),
+                "train/ladd_n_real": float(_n_real),
+                "train/ladd_disc_t": float(disc_t_int),
+                "train/r3gan_d_loss_stat": last_d_loss_stat,
+                "train/r3gan_d_real_stat": last_d_real_stat,
+                "train/r3gan_d_fake_detached_stat": last_d_fake_stat,
+                "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
+                "train/r3gan_stat_loss_weight": float(
+                    getattr(self.model, "ladd_stat_head_loss_weight", 1.0)),
+            }
+            return generator_gan_loss, logs
+
         if n_disc_updates > 0 and self.r3gan_optimizer is not None:
             for _ in range(n_disc_updates):
                 self.r3gan_optimizer.zero_grad(set_to_none=True)
@@ -4466,14 +4871,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     d_fake_v = d_fake_logits[:, :-_K_stat]
                     d_real_s = d_real_logits[:, -_K_stat:]
                     d_fake_s = d_fake_logits[:, -_K_stat:]
-                    d_rp_visual = rpgan_d_loss(d_real_v, d_fake_v)
-                    d_rp_stat = rpgan_d_loss(d_real_s, d_fake_s)
+                    d_rp_visual = _d_loss_fn(d_real_v, d_fake_v)
+                    d_rp_stat = _d_loss_fn(d_real_s, d_fake_s)
                     d_rp = d_rp_visual + _W_stat * d_rp_stat
                     last_d_loss_stat = float(d_rp_stat.detach().item())
                     last_d_real_stat = float(d_real_s.detach().mean().item())
                     last_d_fake_stat = float(d_fake_s.detach().mean().item())
                 else:
-                    d_rp = rpgan_d_loss(d_real_logits, d_fake_logits)
+                    d_rp = _d_loss_fn(d_real_logits, d_fake_logits)
                     last_d_loss_stat = 0.0
                     last_d_real_stat = 0.0
                     last_d_fake_stat = 0.0
@@ -4608,12 +5013,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     d_fake_g_v = d_fake_g[:, :-_K_stat_g]
                     d_real_g_s = d_real_g[:, -_K_stat_g:]
                     d_fake_g_s = d_fake_g[:, -_K_stat_g:]
-                    g_rp_visual = rpgan_g_loss(d_real_g_v.detach(), d_fake_g_v)
-                    g_rp_stat = rpgan_g_loss(d_real_g_s.detach(), d_fake_g_s)
+                    g_rp_visual = _g_loss_fn(d_real_g_v.detach(), d_fake_g_v)
+                    g_rp_stat = _g_loss_fn(d_real_g_s.detach(), d_fake_g_s)
                     g_rp = g_rp_visual + _W_stat_g * g_rp_stat
                     gen_gan_stat_value = float(g_rp_stat.detach().item())
                 else:
-                    g_rp = rpgan_g_loss(d_real_g.detach(), d_fake_g)
+                    g_rp = _g_loss_fn(d_real_g.detach(), d_fake_g)
                     gen_gan_stat_value = 0.0
                 generator_gan_loss = (
                     gen_gan_weight * g_rp.to(pred_image_dtype)

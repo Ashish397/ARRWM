@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-24-nsallsup-cb-flashtr
-#SBATCH --nodes=8
+#SBATCH --job-name=smoke-cb-v3-allpairs
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
@@ -92,7 +92,7 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=200 \
+    max_steps=30 \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -160,15 +160,15 @@ srun torchrun \
     ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_ll_weight=0.0 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
-    ladd_gt_vs_fake_enabled=false \
-    ladd_gt_vs_fake_weight=0.0 \
-    ladd_gt_transition_enabled=true \
-    ladd_gt_transition_weight=1.0 \
-    ladd_gt_transition_all_pairs=true \
+    ladd_gt_vs_fake_enabled=true \
+    ladd_gt_vs_fake_weight=1.0 \
+    ladd_gt_vs_fake_all_pairs=true \
+    ladd_gt_transition_enabled=false \
+    ladd_gt_transition_weight=0.0 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_j${SLURM_JOB_ID}
+    run_name=2_4_SMOKE_cb_v3_allpairs_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
