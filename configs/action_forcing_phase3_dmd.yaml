@@ -53,6 +53,20 @@ ladd_cmap_dim: 64                    # inner-product cmap dim (StyleGAN-T)
 ladd_disc_loss_weight: 1.0           # additional G-side multiplier on top of gan_loss_weight ramp
 ladd_r1_gamma: 1.0                   # R1 on chunk_i (real-anchor)
 ladd_r1_every_n_steps: 1             # lazy R1: compute every N disc updates (1=every step)
+# R2 — zero-centered gradient penalty on the FAKE side (R3GAN pairs R1+R2).
+# OFF by default (ladd_r2_gamma=0.0). When enabled, R2 fires on an OFFSET
+# cadence from R1 so the two perturbed-input disc forwards never stack in a
+# single D-update (OOM guard). IMPORTANT: the offset only separates R1 and
+# R2 when BOTH cadences are >= 2 — if either every_n is 1 (fires every step)
+# they co-fire and both perturbed forwards land together. Intended usage:
+#   ladd_r1_every_n_steps=2  ladd_r2_every_n_steps=2  ladd_r2_phase_offset=1
+#   -> R1 on even steps, R2 on odd steps.
+# The trainer logs a loud WARNING at startup if the configured cadences
+# actually collide. every_n / sigma fall back to R1's when unset.
+ladd_r2_gamma: 0.0                   # 0 = OFF; set >0 to enable fake-side R2
+ladd_r2_every_n_steps: 2            # lazy R2 cadence; keep >=2 for the offset guard
+ladd_r2_phase_offset: 1             # step offset between R1 and R2 firing
+# ladd_r2_sigma:                    # FD perturbation sigma (defaults to R1's)
 ladd_diff_aug_policy: "flip,cutout,translation"  # latent-space DiffAugment
 ladd_pair_start_seed_boundary: true  # include (last_seed, first_AR) pair
 ladd_pairs_per_step: 0               # 0 = all pairs; >0 = random subset

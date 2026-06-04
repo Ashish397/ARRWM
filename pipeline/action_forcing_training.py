@@ -501,6 +501,19 @@ class ActionForcingTrainingPipeline:
                 "prefill), the i2v initial_latent path is legacy."
             )
         self._last_extension_metrics = {}
+        # Per-channel stat imposition target: set BEFORE any student forward
+        # in this rollout, from the seed window the student is conditioned
+        # on (the imposition rescales every pred_x0 toward these per-channel
+        # seed stats). No-op when imposition is disabled on the generator.
+        # Falls back to ``initial_latent`` for the legacy i2v path; if
+        # neither is present the generator retains its previous target (and
+        # warns once if it has none). This is the single place the target is
+        # bound for the action-forcing rollout, so it follows the student
+        # through every forward below.
+        if hasattr(self.generator, "set_impose_stat_target"):
+            _impose_seed = seed_latents if seed_latents is not None \
+                else initial_latent
+            self.generator.set_impose_stat_target(_impose_seed)
         # Reset per-call Flash-DMD t=flash_dmd_gan_t output. Populated
         # below when ``flash_dmd_enabled=True``; remains None otherwise
         # so callers can fail-fast if they expect it but the rollout

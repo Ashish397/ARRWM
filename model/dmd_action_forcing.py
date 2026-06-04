@@ -1007,6 +1007,39 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_r1_sigma = float(
             getattr(args, "ladd_r1_sigma", 0.01)
         )
+        # --- R2 (zero-centered gradient penalty on the FAKE side) ---
+        # The R3GAN ("GAN is dead, long live the GAN") recipe pairs R1
+        # (penalty on real) with R2 (penalty on fake) — both are needed
+        # for the local-convergence guarantee. The LADD path only had
+        # R1; these knobs add the symmetric R2. Computed in the SAME
+        # finite-difference style as R1 (one extra disc forward on
+        # ``fake + sigma*eps``) on the DETACHED fake, so only D is
+        # regularized (no gradient flows to the generator).
+        #
+        # Default ``ladd_r2_gamma=0.0`` -> OFF, so existing runs are
+        # bit-identical until R2 is explicitly enabled.
+        self.ladd_r2_gamma = float(getattr(args, "ladd_r2_gamma", 0.0))
+        # Lazy R2 cadence (every N disc updates). Falls back to the R1
+        # cadence when unset.
+        self.ladd_r2_every_n_steps = int(
+            getattr(args, "ladd_r2_every_n_steps",
+                    self.ladd_r1_every_n_steps)
+        )
+        # Phase offset (in steps) between R1 and R2 firing. With equal
+        # cadences (e.g. both every 2), an offset of 1 makes R1 fire on
+        # even steps and R2 on odd steps, so the two perturbed-input
+        # forwards NEVER stack in the same D-update — avoids the OOM of
+        # carrying both extra segments at once. R1 fires on
+        # ``step % r1_every == 0``; R2 fires on
+        # ``(step - r2_offset) % r2_every == 0``. Default 1.
+        self.ladd_r2_phase_offset = int(
+            getattr(args, "ladd_r2_phase_offset", 1)
+        )
+        # Sigma for the finite-difference R2 perturbation. Falls back to
+        # the R1 sigma when unset.
+        self.ladd_r2_sigma = float(
+            getattr(args, "ladd_r2_sigma", self.ladd_r1_sigma)
+        )
         _diff_aug_raw = str(
             getattr(args, "ladd_diff_aug_policy", "flip,cutout,translation")
         )
@@ -1079,6 +1112,41 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_n_real = int(
             getattr(args, "ladd_gt_transition_n_real", 0)
         )
+        # Content-MATCHED wide GT (gt_transition). For each fake transition,
+        # pick the K GT transitions from the loaded ride that are CLOSEST by
+        # MAE — measured on the MEAN-EQUALIZED representation, so the match
+        # is on texture/structure, NOT brightness (and so a brightness-
+        # drifted fake can't cherry-pick a drifted GT). Each fake is then
+        # scored ONLY against its own K matched GT (block-diagonal RpGAN,
+        # NOT all_pairs), giving multiple RELEVANT real views per fake
+        # without the content-confounded noise of all_pairs. Position is
+        # never used (the student rollout drifts in time, so position-
+        # matching is unreliable — content-matching is the point). Mutually
+        # exclusive with all_pairs / n_real. ``match_k`` = GT per fake.
+        # The candidate pool is the full loaded ride (stashed on
+        # streaming_state as ``gt_match_latents`` / ``gt_match_actions``),
+        # i.e. wider than ride_latents_window.
+        self.ladd_gt_transition_match = bool(
+            getattr(args, "ladd_gt_transition_match", False)
+        )
+        self.ladd_gt_transition_match_k = int(
+            getattr(args, "ladd_gt_transition_match_k", 4)
+        )
+        # Relevant pool the per-update sampler draws the K matched GT from
+        # (preserves 5b's resample-fresh-each-D-update GT decorrelation
+        # without widening to the irrelevant whole-ride). 0 = auto (2*K);
+        # ==K disables resampling (deterministic top-K).
+        self.ladd_gt_transition_match_pool = int(
+            getattr(args, "ladd_gt_transition_match_pool", 0)
+        )
+        # Hard cap on the number of DISTINCT GT transitions forwarded through
+        # the disc per D-update (the combined real+fake+R1-perturbed forward
+        # is 2*n_uniq + n_fake rows). Decouples the wide match pool from
+        # disc-forward memory; over the cap, a fake's extra pick is remapped
+        # to one of its own already-included nearer GT. 0 = uncapped.
+        self.ladd_gt_transition_match_max_real = int(
+            getattr(args, "ladd_gt_transition_match_max_real", 12)
+        )
         # Magnitude-equalize the two members (former / latter chunk) of
         # every gt_transition pair — for BOTH real and fake — to their
         # common average MEAN MAGNITUDE (mean of |x|, the brightness/energy
@@ -1093,6 +1161,26 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_mean_equalize = bool(
             getattr(args, "ladd_gt_transition_mean_equalize", False)
         )
+        # Per-pair, per-channel magnitude normalization of gt_transition
+        # pairs (both GT and student) — each pair self-normalizes using
+        # ITS OWN per-channel stats (over F,H,W; C kept), so different
+        # videos' different distributions are each handled correctly (no
+        # cross-pair / cross-video reference). Makes per-channel magnitude
+        # non-discriminative so the disc can't set brightness; DMD /
+        # stat-anchor (M1) own brightness instead. Modes:
+        #   ""     : off (default).
+        #   "m1"   : divide each channel by its RMS -> unit per-channel
+        #            ENERGY (M1). Removes per-channel brightness/magnitude;
+        #            keeps per-channel contrast (std) for the disc.
+        #   "m1m2" : per-channel standardize (subtract mean, divide std) ->
+        #            unit per-channel energy AND contrast (M1 + M2). Removes
+        #            brightness AND per-channel contrast.
+        # Differentiable + scale(/shift)-invariant per channel, so the
+        # gen-side gradient on the normalized stat is zeroed. Supersedes
+        # mean_equalize when set.
+        self.ladd_gt_transition_mag_norm = str(
+            getattr(args, "ladd_gt_transition_mag_norm", "")
+        ).lower()
         # Wide-real: draw the REAL (GT) chunks for the all-pairs gt_vs_fake
         # disc from the FULL loaded ride window (~25 chunks: seed + rollout
         # + post-window) instead of only the 21-frame scored slice — more
@@ -1313,6 +1401,51 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_normalization_enabled = bool(
             getattr(args, "dmd_normalization_enabled", True)
         )
+        # --- MAE-based student-vs-teacher DMD downweighting ---
+        # The DMD gradient pulls the student toward the frozen teacher
+        # (real_score). That is only helpful while the teacher is the
+        # better oracle. Once the student's per-chunk prediction is as
+        # good as — or better than — the teacher's denoise on the SAME
+        # scored chunk, the DMD pull is at best uninformative and at
+        # worst actively drags the (better) student back toward the
+        # (worse) teacher. This gate measures both errors against GT at
+        # the scoring site and scales the DMD loss down as they converge:
+        #   m_real = |pred_real    - gt|   (teacher denoise error)
+        #   m_fake = |pred_student - gt|   (student pred_x0 error)
+        #   r      = m_fake / m_real       (EMA-smoothed)
+        #   w      = clamp((r - 1) / (r_full - 1), min_weight, 1)
+        # so w=1 when the student is >= r_full x worse than the teacher,
+        # ramping to ``min_weight`` (default 0) as the student reaches
+        # teacher parity (r->1) or beats it (r<1). Default OFF.
+        self.dmd_mae_gate_enabled = bool(
+            getattr(args, "dmd_mae_gate_enabled", False)
+        )
+        # Ratio at/above which the gate passes the full DMD signal.
+        # Must be > 1. At r = r_full -> w = 1; at r = 1 (parity) -> w =
+        # min_weight.
+        self.dmd_mae_gate_r_full = float(
+            getattr(args, "dmd_mae_gate_r_full", 2.0)
+        )
+        if self.dmd_mae_gate_enabled and self.dmd_mae_gate_r_full <= 1.0:
+            raise ValueError(
+                "dmd_mae_gate_r_full must be > 1.0 (it is the fake/real "
+                f"MAE ratio at which DMD reaches full weight); got "
+                f"{self.dmd_mae_gate_r_full}."
+            )
+        # EMA on the ratio so a single noisy step (the per-step MAE is
+        # jumpy) can't slam the gate shut. 0 = no smoothing (use the raw
+        # per-step ratio); closer to 1 = heavier smoothing.
+        self.dmd_mae_gate_ema = float(
+            getattr(args, "dmd_mae_gate_ema", 0.9)
+        )
+        # Floor on the gate weight. Default 0.0 (DMD can be fully gated
+        # off once the student matches/beats the teacher). Set > 0 to
+        # always retain a residual DMD pull.
+        self.dmd_mae_gate_min_weight = float(
+            getattr(args, "dmd_mae_gate_min_weight", 0.0)
+        )
+        # Per-rank EMA state for the gate ratio (None until first update).
+        self._dmd_mae_gate_ratio_ema: Optional[float] = None
         # Anti-collapse variance floor. Penalizes the student's
         # per-frame latent std falling below the GT frame's std
         # (one-sided ReLU gap). Counters the loss-shape pull toward
@@ -2778,6 +2911,70 @@ class ActionForcingDMD(SelfForcingModel):
             if cap_frames < shape[1]:
                 mask[:, cap_frames:] = False
         return mask
+
+    def _dmd_mae_gate_weight(
+        self,
+        pred_real: torch.Tensor,
+        pred_student: torch.Tensor,
+        gt_target: Optional[torch.Tensor],
+        gradient_mask: torch.Tensor,
+        log_dict: Dict[str, Any],
+    ) -> float:
+        """Scalar in ``[min_weight, 1]`` that scales the DMD loss down as
+        the student's per-chunk error approaches/beats the teacher's.
+
+        Both errors are measured against GT on the SAME scored chunk and
+        on the SAME supervised slots (``gradient_mask``) — the only
+        apples-to-apples comparison of "is the teacher still the better
+        oracle here". Returns 1.0 (no gating) when the gate is disabled,
+        GT is unavailable, shapes mismatch, or the teacher error is
+        degenerate. Per-rank (each rank gates on its own ride); the EMA
+        state lives on ``self`` and is deterministic given its inputs.
+        """
+        if not self.dmd_mae_gate_enabled:
+            return 1.0
+        if gt_target is None:
+            log_dict["dmd_mae_gate_skipped"] = 1.0
+            return 1.0
+        gt = gt_target.to(dtype=pred_real.dtype, device=pred_real.device)
+        if not (gt.shape == pred_real.shape == pred_student.shape):
+            log_dict["dmd_mae_gate_skipped"] = 1.0
+            return 1.0
+        if not gradient_mask.any():
+            log_dict["dmd_mae_gate_skipped"] = 1.0
+            return 1.0
+        with torch.no_grad():
+            m = gradient_mask
+            gtf = gt.float()
+            m_real = (pred_real.float() - gtf)[m].abs().mean()
+            m_fake = (pred_student.float() - gtf)[m].abs().mean()
+            eps = 1e-8
+            # Degenerate teacher error -> don't gate (avoid div blow-up).
+            if float(m_real.item()) <= eps:
+                log_dict["dmd_mae_gate_skipped"] = 1.0
+                return 1.0
+            r = float((m_fake / (m_real + eps)).item())
+            # EMA-smooth the ratio (per-rank state).
+            a = self.dmd_mae_gate_ema
+            if self._dmd_mae_gate_ratio_ema is None or a <= 0.0:
+                r_s = r
+            else:
+                r_s = a * self._dmd_mae_gate_ratio_ema + (1.0 - a) * r
+            self._dmd_mae_gate_ratio_ema = r_s
+            # w ramps 0->1 over r in [1, r_full]; clamped to [min_w, 1].
+            r_full = self.dmd_mae_gate_r_full
+            w = (r_s - 1.0) / (r_full - 1.0)
+            w = max(self.dmd_mae_gate_min_weight, min(1.0, w))
+            log_dict["dmd_mae_gate_m_real"] = float(m_real.item())
+            log_dict["dmd_mae_gate_m_fake"] = float(m_fake.item())
+            log_dict["dmd_mae_gate_ratio"] = r
+            log_dict["dmd_mae_gate_ratio_ema"] = r_s
+            log_dict["dmd_mae_gate_weight"] = float(w)
+            # Always-on companion to ``real_score_mae_vs_gt`` so the
+            # student-vs-teacher crossover is finally visible on the
+            # SAME (per-chunk, masked) basis.
+            log_dict["student_mae_vs_gt"] = float(m_fake.item())
+            return float(w)
 
     def _sigma_at_timestep(
         self, timestep: torch.Tensor, like: torch.Tensor

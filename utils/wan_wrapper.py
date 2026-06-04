@@ -199,7 +199,51 @@ class WanDiffusionWrapper(torch.nn.Module):
         # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
         self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
         self._base_seq_len = self.seq_len
+
+        # Per-channel stat imposition (STUDENT-ONLY: the teacher/real_score
+        # and critic/fake_score wrappers leave this disabled). When
+        # ``_impose_stat_mode`` is non-empty, EVERY pred_x0 this wrapper
+        # produces is rescaled per-channel toward ``_impose_stat_target``
+        # (a seed-derived dict) at the single chokepoint in ``forward``,
+        # so the affine follows the student output through training,
+        # inference and eval alike. The target is (re)set by the pipeline
+        # at the start of each rollout via ``set_impose_stat_target``. See
+        # ``model.anti_collapse.{seed_channel_stat_target,
+        # impose_channel_stats}``.
+        self._impose_stat_mode = ""
+        self._impose_stat_target = None
+        self._impose_stat_warned = False
+
         self.post_init()
+
+    def configure_impose_stat(self, mode: str) -> None:
+        """Enable per-channel stat imposition on this wrapper's pred_x0.
+
+        ``mode`` in {"", "m1", "m2", "both", "meanabs"}; "" disables.
+        Call ONLY on the student generator (not teacher/critic).
+        """
+        mode = str(mode or "").lower()
+        if mode not in ("", "m1", "m2", "both", "meanabs"):
+            raise ValueError(
+                f"configure_impose_stat: bad mode {mode!r} (expected "
+                "'', 'm1', 'm2', 'both', 'meanabs')."
+            )
+        self._impose_stat_mode = mode
+
+    def set_impose_stat_target(self, seed_latents: torch.Tensor) -> None:
+        """Compute + stash the per-channel seed target the imposition
+        rescales toward. No-op when imposition is disabled or
+        ``seed_latents`` is None (the previously-set target is retained, so
+        the affine still follows the student). Called by the pipeline at
+        the start of every rollout."""
+        if not self._impose_stat_mode or seed_latents is None:
+            return
+        from model.anti_collapse import seed_channel_stat_target
+        self._impose_stat_target = seed_channel_stat_target(seed_latents)
+        # Re-arm the one-shot warning each rollout: if a later forward ever
+        # hits the no-target / shape-mismatch passthrough, it re-surfaces
+        # instead of going silent forever after a single step-0 line.
+        self._impose_stat_warned = False
 
     def adjust_seq_len_for_action_tokens(self, num_frames: int = 21, action_per_frame: int = 1):
         """Increase seq_len capacity to accommodate per-frame action tokens."""
@@ -674,6 +718,43 @@ class WanDiffusionWrapper(torch.nn.Module):
             xt=noisy_image_or_video.flatten(0, 1),
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
+
+        # STUDENT-ONLY per-channel stat imposition. Single chokepoint: any
+        # caller (training rollout, inference, eval) that gets a student
+        # pred_x0 gets the imposed version, with no way to bypass it. The
+        # transform is differentiable + scale/shift-invariant, so it sets
+        # the per-channel stat externally without handing the student a
+        # gradient on it. Disabled on teacher/critic (mode == ""). If the
+        # mode is on but no target has been set yet (a student forward
+        # outside a managed rollout, or a batch-size mismatch), we warn
+        # loudly once and pass the latent through un-imposed rather than
+        # crash the run — surfacing the gap without silently corrupting it.
+        if self._impose_stat_mode and self._impose_stat_target is not None:
+            from model.anti_collapse import impose_channel_stats
+            _tgt_B = self._impose_stat_target["mean"].shape[0]
+            if _tgt_B == pred_x0.shape[0] and pred_x0.shape[2] == \
+                    self._impose_stat_target["mean"].shape[1]:
+                pred_x0 = impose_channel_stats(
+                    pred_x0, self._impose_stat_target, self._impose_stat_mode,
+                )
+            elif not self._impose_stat_warned:
+                print(
+                    "[WanDiffusionWrapper] impose_stat target shape "
+                    f"{tuple(self._impose_stat_target['mean'].shape)} does not "
+                    f"match pred_x0 {tuple(pred_x0.shape)} (B,C) — passing "
+                    "through un-imposed. Check seed-target threading.",
+                    flush=True,
+                )
+                self._impose_stat_warned = True
+        elif self._impose_stat_mode and not self._impose_stat_warned:
+            print(
+                "[WanDiffusionWrapper] impose_stat mode "
+                f"'{self._impose_stat_mode}' is ON but no seed target is set "
+                "for this student forward — passing through un-imposed. The "
+                "pipeline should call set_impose_stat_target before rollout.",
+                flush=True,
+            )
+            self._impose_stat_warned = True
 
         # Alt head conversion (when present). Mirrors the main head's
         # flow→x0 conversion exactly so downstream code can treat

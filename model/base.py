@@ -83,6 +83,12 @@ class BaseModel(nn.Module):
         if "model_name" not in model_kwargs:
             model_kwargs["model_name"] = self.real_model_name
         self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
+        # Per-channel stat imposition is a STUDENT-ONLY transform — enable it
+        # on the generator here and NEVER on self.real_score / self.fake_score
+        # below, so only the student's pred_x0 is rescaled. "" = disabled.
+        self.generator.configure_impose_stat(
+            str(getattr(args, "impose_stat_mode", "") or "")
+        )
         # Apply action patches before any distributed/FSDP wrapping so the inner
         # module gains the extended signature and hooks.
         if self._action_patch_enabled:

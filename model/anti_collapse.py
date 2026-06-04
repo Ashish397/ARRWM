@@ -328,6 +328,109 @@ def _per_frame_stable_rank(
     return stable_rank.reshape(B, F_).to(x.dtype)
 
 
+def seed_channel_stat_target(seed_latents: torch.Tensor) -> dict:
+    """Per-channel summary stats of a seed window, for stat imposition.
+
+    ``seed_latents: [B, F, C, H, W]`` -> dict of ``[B, C]`` tensors
+    (detached, fp32), reduced over ``(F, H, W)`` so each channel gets a
+    single target per batch element:
+
+      * ``mean``    : per-channel mean.
+      * ``std``     : per-channel std (population, unbiased=False).
+      * ``rms``     : per-channel root-mean-square ``sqrt(mean x^2)`` —
+                      the L2 energy proxy (M1 / sum-of-squares family).
+      * ``meanabs`` : per-channel mean absolute value ``mean|x|`` — the
+                      L1 magnitude proxy (the mean-abs alternative to
+                      sum-of-squares).
+
+    These are the targets the student's per-channel affine imposition
+    rescales toward (see ``impose_channel_stats``). The seed is the
+    conditioning context, so the target is available at inference too.
+    """
+    if seed_latents.dim() != 5:
+        raise ValueError(
+            "seed_channel_stat_target expects [B, F, C, H, W]; got "
+            f"{tuple(seed_latents.shape)}"
+        )
+    with torch.no_grad():
+        s = seed_latents.detach().float()
+        B, F, C, H, W = s.shape
+        flat = s.permute(0, 2, 1, 3, 4).reshape(B, C, -1)  # [B, C, F*H*W]
+        mean = flat.mean(dim=2)                            # [B, C]
+        std = flat.var(dim=2, unbiased=False).clamp_min(0).sqrt()
+        rms = flat.pow(2).mean(dim=2).clamp_min(0).sqrt()
+        meanabs = flat.abs().mean(dim=2)
+    return {"mean": mean, "std": std, "rms": rms, "meanabs": meanabs}
+
+
+def impose_channel_stats(
+    x: torch.Tensor, target: dict, mode: str, eps: float = 1e-6,
+) -> torch.Tensor:
+    """Differentiable per-channel affine that imposes a target stat on the
+    student output, frame-by-frame.
+
+    ``x: [B, F, C, H, W]`` (grad-on student latent). ``target`` is a dict
+    of ``[B, C]`` per-channel targets (detached) from
+    ``seed_channel_stat_target``. The current per-(B, F, C) stats are
+    computed from ``x`` over the spatial dims ``(H, W)`` **with gradient**
+    (NOT detached), so the imposition is scale/shift-invariant: the
+    student receives no gradient pressure on the imposed stat (it is set
+    externally), and DMD/GAN gradients only shape the residual texture.
+
+    Modes:
+      * ``"m1"``      : per-channel ENERGY — pure multiplicative scaling
+                        to match the seed RMS (``sqrt(mean x^2)``). Touches
+                        magnitude only (mean rides along, since RMS is not
+                        mean-subtracted). The sum-of-squares family.
+      * ``"meanabs"`` : per-channel L1 MAGNITUDE — pure scaling to match
+                        the seed ``mean|x|`` (the mean-abs alternative to
+                        sum-of-squares).
+      * ``"m2"``      : per-channel STD — center, rescale spread to the
+                        seed std, keep the current per-channel mean.
+      * ``"both"``    : per-channel mean AND std — full standardize to the
+                        seed (mean, std).
+
+    Returns the rescaled ``x`` (same shape, dtype).
+    """
+    if mode not in ("m1", "m2", "both", "meanabs"):
+        raise ValueError(f"impose_channel_stats: unknown mode {mode!r}.")
+    if x.dim() != 5:
+        raise ValueError(
+            f"impose_channel_stats expects [B, F, C, H, W]; got {tuple(x.shape)}"
+        )
+    B, F, C, H, W = x.shape
+    for k in ("mean", "std", "rms", "meanabs"):
+        t = target.get(k)
+        if t is not None and tuple(t.shape) != (B, C):
+            raise ValueError(
+                f"impose_channel_stats: target['{k}'] must be [B={B}, C={C}]; "
+                f"got {tuple(t.shape)}"
+            )
+
+    def _bf(t):  # [B, C] -> [B, 1, C, 1, 1]  (broadcast over F, H, W)
+        return t.to(x.dtype).view(B, 1, C, 1, 1)
+
+    if mode in ("m1", "meanabs"):
+        if mode == "m1":
+            cur = x.pow(2).mean(dim=(3, 4)).clamp_min(eps * eps).sqrt()  # [B,F,C]
+            tgt = _bf(target["rms"])
+        else:
+            cur = x.abs().mean(dim=(3, 4)).clamp_min(eps)                # [B,F,C]
+            tgt = _bf(target["meanabs"])
+        scale = tgt / (cur.unsqueeze(-1).unsqueeze(-1))                  # [B,F,C,1,1]
+        return x * scale
+
+    # m2 / both: standardize per (B, F, C) then re-affine.
+    mean_c = x.mean(dim=(3, 4)).unsqueeze(-1).unsqueeze(-1)              # [B,F,C,1,1]
+    std_c = (
+        x.std(dim=(3, 4), unbiased=False).clamp_min(eps)
+        .unsqueeze(-1).unsqueeze(-1)
+    )
+    scale = _bf(target["std"]) / std_c                                  # [B,F,C,1,1]
+    out_mean = mean_c if mode == "m2" else _bf(target["mean"])
+    return out_mean + (x - mean_c) * scale
+
+
 def compute_stat_anchor_loss(
     pred_x0: torch.Tensor,
     seed_latents: Optional[torch.Tensor] = None,
