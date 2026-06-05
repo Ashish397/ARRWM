@@ -3720,6 +3720,273 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         }
         return generator_gan_loss, logs
 
+    # ==================================================================
+    # ForwardNoiser (CARN) — teacher_feat training
+    # ==================================================================
+    # Train the FN to map rollout1 chunks -> rollout2 chunks (+1 CARN
+    # drift step) by DISTRIBUTION-matching them in the FROZEN teacher's
+    # feature space (the LADD WanFeatureProjector backbone, NOT its
+    # trained heads). The teacher is a fixed, comprehensive critic, so the
+    # FN can't exploit an adversary's blind spots. SEPARATE backward
+    # (FN grads only; the train() loop steps the FN optimizer) — fully
+    # decoupled from fake_score. The FN is step-UNCONDITIONED (carn_step=0
+    # always): it learns one generic "+1 shift" transform.
+    def _fn_action_blind_cond(self, n_rows: int, n_frames: int,
+                              device, dtype):
+        """Build action-blind (zeroed) conditioning of the shape the
+        action-aware WAN teacher requires, so the projector forward runs.
+        Returns None when the teacher has no action tokens."""
+        m = self.model
+        a_per_f = 0
+        _rs = getattr(m, "real_score", None)
+        if _rs is None:
+            return None
+        for _cand in [_rs] + list(_rs.modules()):
+            if hasattr(_cand, "action_tokens_per_frame"):
+                a_per_f = int(getattr(_cand, "action_tokens_per_frame", 0))
+                if a_per_f > 0:
+                    break
+        if a_per_f <= 0:
+            return None
+        atp = getattr(m, "action_token_projection", None)
+        ap = getattr(m, "action_projection", None)
+        s = getattr(m, "streaming_state", None)
+        ride_act = s.get("ride_actions_window") if isinstance(s, dict) else None
+        a_dim = int(ride_act.shape[-1]) if ride_act is not None else int(
+            getattr(m, "raw_action_dim", 2)
+        )
+        acts_zero = torch.zeros(
+            (n_rows, n_frames, a_dim), device=device, dtype=dtype,
+        )
+        cond: Dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            if atp is not None:
+                cond["_action_tokens"] = atp(acts_zero).detach()
+            if ap is not None:
+                cond["_action_modulation"] = ap(
+                    acts_zero, num_frames=n_frames,
+                ).detach()
+        return cond if cond else None
+
+    def _fn_teacher_feat_loss(self, fn_out, r2_target, projector):
+        """Sliced-Wasserstein per-token distribution match between
+        FN(rollout1) [grad-on] and rollout2 [detached] in the frozen
+        teacher's feature space. Returns a scalar loss graph-attached
+        through ``fn_out`` only.
+
+        NOT a moment (mean+std) match: GT<->student moments barely differ
+        and are pinned by the stat anchor, so a moment match is inert (v8d
+        fn_tf_loss ~1e-6). The full sliced-Wasserstein marginal captures
+        the texture/cartoon distribution shift the FN must learn."""
+        m = self.model
+        feat_t = int(getattr(m, "forward_noiser_feat_t", 0))
+        # Match the disc's input pipeline: when the disc applies a wavelet-HF
+        # pre-stage, the projector was conditioned on wavelet'd CLEAN latents
+        # (disc forces t=0 when wavelet_on). Replicate both here so the FN is
+        # matched in the SAME feature space its output is consumed in
+        # (the carn_former feeds FN(GT) through this same wavelet'd disc).
+        wavelet = getattr(self.r3gan_disc, "wavelet_hf", None)
+        if wavelet is not None:
+            feat_t = 0
+        n_rows, n_frames = int(fn_out.shape[0]), int(fn_out.shape[1])
+        device = fn_out.device
+        s = m.streaming_state
+        pe = s.get("prompt_embeds")
+        if pe is None:
+            return fn_out.sum() * 0.0
+        # repeat (not repeat_interleave): rows are chunk-major (torch.cat of
+        # per-chunk slices) and there is a single global prompt, so a tiled
+        # repeat aligns per-row. (For B>1 with per-sample prompts this would
+        # need revisiting — not the case in these configs.)
+        reps = max(1, n_rows // int(pe.shape[0]))
+        pe_eff = pe.repeat(reps, 1, 1) if int(pe.shape[0]) != n_rows else pe
+        t = torch.full(
+            (n_rows, n_frames), feat_t, dtype=torch.long, device=device,
+        )
+
+        # The wavelet-HF adapter is a DISC-owned trainable module; the FN
+        # backward must NOT update it (only FN params). Freeze its params
+        # for the duration of this forward (the transform stays
+        # differentiable w.r.t. the INPUT, so the FN gradient still flows
+        # through it). Restored in ``finally``.
+        _wav_params = list(wavelet.parameters()) if wavelet is not None else []
+        _wav_req = [p.requires_grad for p in _wav_params]
+
+        def _prep(x):
+            xn = _noise(x)
+            if wavelet is not None:
+                xn = wavelet(xn)
+            return xn
+
+        def _noise(x):
+            if feat_t <= 0:
+                return x
+            sched = getattr(m, "scheduler", None)
+            if sched is None or not hasattr(sched, "add_noise"):
+                return x
+            eps = torch.randn_like(x)
+            xf, ef = x.flatten(0, 1), eps.flatten(0, 1)
+            tpf = torch.full(
+                (xf.shape[0],), feat_t, dtype=torch.long, device=device,
+            )
+            return sched.add_noise(xf, ef, tpf).unflatten(0, x.shape[:2])
+
+        cond_extra = self._fn_action_blind_cond(
+            n_rows, n_frames, device, pe_eff.dtype,
+        )
+        for _p in _wav_params:
+            _p.requires_grad_(False)
+        try:
+            feats_fake = projector(
+                x_noisy=_prep(fn_out), timestep=t, prompt_embeds=pe_eff,
+                conditional_extra=cond_extra,
+            )
+            with torch.no_grad():
+                feats_real = projector(
+                    x_noisy=_prep(r2_target), timestep=t,
+                    prompt_embeds=pe_eff, conditional_extra=cond_extra,
+                )
+        finally:
+            for _p, _r in zip(_wav_params, _wav_req):
+                _p.requires_grad_(_r)
+        # Sliced-Wasserstein per-token: treat the LAST feature dim as the
+        # channel and every (row, token) as a sample; project onto random
+        # unit directions and L2 the SORTED 1D marginals (= 1D Wasserstein-2
+        # per direction, averaged). Captures the full distribution shape
+        # (all moments), not just the first two -> the texture/cartoon shift
+        # survives where mean+std collapsed to ~0.
+        n_proj = int(getattr(m, "forward_noiser_sw_n_proj", 64))
+        max_tok = int(getattr(m, "forward_noiser_sw_max_tokens", 4096))
+        idxs = list(feats_fake.keys())
+        loss = fn_out.new_zeros(())
+        for idx in idxs:
+            ff = feats_fake[idx].float().reshape(-1, int(feats_fake[idx].shape[-1]))
+            fr = feats_real[idx].float().reshape(
+                -1, int(feats_real[idx].shape[-1])).detach()
+            D = ff.shape[-1]
+            M = min(int(ff.shape[0]), int(fr.shape[0]))
+            if M == 0:
+                # Empty tap (no tokens) -> skip; mean() over empty = NaN.
+                # Unreachable for real latents, but cheap to bulletproof.
+                continue
+            if max_tok > 0 and M > max_tok:
+                # Independent subsample per side: a sorted-marginal match
+                # needs only equal COUNTS, not paired indices. Caps sort
+                # cost + variance. FN grad flows through the gathered fake
+                # tokens (differentiable index_select).
+                sel_f = torch.randperm(int(ff.shape[0]), device=ff.device)[:max_tok]
+                sel_r = torch.randperm(int(fr.shape[0]), device=fr.device)[:max_tok]
+                ff = ff[sel_f]
+                fr = fr[sel_r]
+            elif int(ff.shape[0]) != int(fr.shape[0]):
+                # Shapes should match (fn_out and r2_target are same shape);
+                # guard anyway so the sorted L2 has equal lengths.
+                ff = ff[:M]
+                fr = fr[:M]
+            dirs = torch.randn(D, n_proj, device=ff.device, dtype=ff.dtype)
+            dirs = dirs / dirs.norm(dim=0, keepdim=True).clamp_min(1e-8)
+            pf_s, _ = torch.sort(ff @ dirs, dim=0)
+            pr_s, _ = torch.sort(fr @ dirs, dim=0)
+            loss = loss + (pf_s - pr_s).pow(2).mean()
+        return loss / max(1, len(idxs))
+
+    def _train_forward_noiser_tf(self, rollout1_chunk, info) -> dict:
+        """teacher_feat FN training step (separate FN backward). Builds the
+        flattened (rollout1_chunk, rollout2_chunk) pairs, runs FN on the
+        rollout1 chunks (step-unconditioned), and backprops the teacher-
+        feature distribution-match into the FN. DDP-balanced: every rank
+        runs at least one FN forward+backward (zero-anchor on bail)."""
+        m = self.model
+        if not (
+            getattr(m, "forward_noiser_enabled", False)
+            and getattr(m, "forward_noiser_loss_mode", "mse") == "teacher_feat"
+            and getattr(m, "forward_noiser", None) is not None
+        ):
+            return {}
+        npb = int(m.num_frame_per_block)
+        proj = (
+            getattr(self.r3gan_disc, "projector", None)
+            if self.r3gan_disc is not None else None
+        )
+
+        def _anchor(reason: str) -> dict:
+            # Keep FN DDP participation identical across ranks: ALWAYS run a
+            # zero FN forward+backward so its grad-bucket all-reduce fires on
+            # every rank, regardless of why this rank bailed. If a rank ran
+            # the real backward while another ran nothing, the FN DDP reducer
+            # would hang — so the anchor is unconditional. The FN is fully
+            # convolutional, so a minimal synthetic input still produces a
+            # gradient on every parameter (bucket shapes are param-shaped and
+            # input-size-independent; batch size need not match across ranks).
+            fn = m.forward_noiser
+            fn_inner = fn.module if hasattr(fn, "module") else fn
+            p0 = next(fn.parameters())
+            if (rollout1_chunk is not None
+                    and int(rollout1_chunk.shape[1]) >= npb):
+                x0 = rollout1_chunk[:, :npb].detach()
+            else:
+                # No usable rollout1 chunk — synthesize a minimal zero input.
+                C = int(getattr(fn_inner, "latent_channels", 16))
+                B = int(rollout1_chunk.shape[0]) if rollout1_chunk is not None else 1
+                x0 = torch.zeros(
+                    (B, npb, C, 8, 8), device=p0.device, dtype=p0.dtype,
+                )
+            cz = torch.zeros(
+                (x0.shape[0],), dtype=torch.long, device=x0.device,
+            )
+            z = fn(x0, cz, residual=True)
+            (z.sum() * 0.0).backward()
+            return {"train/fn_tf_loss": 0.0, "train/fn_tf_pairs": 0.0,
+                    "train/fn_tf_skipped": 1.0}
+
+        if proj is None:
+            return _anchor("no_projector")
+        s = getattr(m, "streaming_state", None)
+        if not isinstance(s, dict):
+            return _anchor("no_state")
+        r2 = s.get("rollout2_x0")
+        r2_abs = s.get("rollout2_abs_frame_start")
+        if r2 is None or r2_abs is None:
+            return _anchor("no_rollout2")
+        r2_abs = int(r2_abs)
+        r2_total = int(r2.shape[1])
+        # rollout1 input: prefer the t=60 flash chunk (cleaner) like the
+        # MSE path; both are detached (FN input is never grad-on upstream).
+        flash = info.get("flash_dmd_gan_x0")
+        r1 = flash.detach() if flash is not None else rollout1_chunk
+        if r1 is None or int(r1.shape[1]) % npb != 0:
+            return _anchor("bad_r1")
+        n_chunks = int(r1.shape[1]) // npb
+        abs_new_start = int(info.get("abs_frame_start", 0))
+        overlap = int(info.get("overlap", 0))
+        chunk_abs_start = abs_new_start - overlap
+        fn_inputs, r2_targets = [], []
+        for c in range(n_chunks):
+            f0, f1 = c * npb, c * npb + npb
+            a0, a1 = chunk_abs_start + f0, chunk_abs_start + f1
+            if a0 < r2_abs or a1 > r2_abs + r2_total:
+                continue
+            s0 = a0 - r2_abs
+            fn_inputs.append(r1[:, f0:f1].detach())
+            r2_targets.append(r2[:, s0:s0 + npb].to(
+                dtype=r1.dtype, device=r1.device).detach())
+        if not fn_inputs:
+            return _anchor("no_pairs")
+        fn_in = torch.cat(fn_inputs, dim=0)       # [N*B, npb, C, H, W]
+        r2_tg = torch.cat(r2_targets, dim=0)
+        # Step-UNCONDITIONED: carn_step=0 always (generic +1 shift).
+        carn = torch.zeros(
+            (fn_in.shape[0],), dtype=torch.long, device=fn_in.device,
+        )
+        fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
+        loss = self._fn_teacher_feat_loss(fn_out, r2_tg, proj)
+        loss.backward()
+        return {
+            "train/fn_tf_loss": float(loss.detach().item()),
+            "train/fn_tf_pairs": float(len(fn_inputs)),
+            "train/fn_tf_skipped": 0.0,
+        }
+
     #     "student vs teacher's clean data".
     #   * "adjacent_chunks" (ASD-style): real = chunk_i, fake =
     #     chunk_{i+1} from the same gen rollout. Pushes
@@ -4195,6 +4462,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             getattr(self.model, "ladd_gt_transition_carn_former", None)
             or getattr(self.config, "ladd_gt_transition_carn_former", False)
         )
+        # carn_former applies the learned ForwardNoiser (FN) to the GT
+        # former chunk: the FN has learned the rollout1->rollout2 "+1
+        # cartoon shift" (sliced-Wasserstein teacher-feature match), so
+        # FN(GT_former) = "GT with one AR step of texture drift". The real
+        # anchor becomes [cartoon-shifted GT former -> clean GT latter] = a
+        # self-correcting (de-cartoon) transition the student must match.
+        # Latent-space (no wavelet); requires the FN to be present.
         _carn_former_on = (
             pair_mode == "gt_transition"
             and _carn_knob
@@ -4204,23 +4478,53 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self._carn_former_dbg = getattr(self, "_carn_former_dbg", 0) + 1
             import sys as _sys
             print(
-                f"[CARN-FORMER] ON: gt_transition GT former chunk pushed "
-                f"through forward_noiser ({getattr(self.model, 'ladd_gt_transition_carn_steps', 1)} step)",
+                "[CARN-FORMER] ON: gt_transition GT former chunk pushed +1 "
+                "cartoon step by the learned ForwardNoiser.",
                 file=_sys.stderr, flush=True,
             )
 
         def _carn_former(x):
             n_steps = int(getattr(self.model, "ladd_gt_transition_carn_steps", 1))
+            # Step-unconditioned FN: every apply passes carn_step=0 (the FN
+            # learned one generic "+1 shift"). Otherwise pass the iteration
+            # index as the CARN level (legacy).
+            _uncond = bool(getattr(
+                self.model, "forward_noiser_step_unconditioned", False))
+            x0 = x  # original former (pre-carn) for moment restoration
             with torch.no_grad():
                 for _s in range(max(1, n_steps)):
                     cs = torch.full(
-                        (x.shape[0],), _s, dtype=torch.long, device=x.device,
+                        (x.shape[0],), 0 if _uncond else _s,
+                        dtype=torch.long, device=x.device,
                     )
                     x = self.model.forward_noiser(x, cs, residual=True)
+                # MOMENT-PRESERVING carn (texture only, NO stats — see the
+                # "CARN = texture, not stats" directive). The FN trains on
+                # un-normalized rollout1->rollout2, where rollout2 runs hot
+                # (one more drift step), so its output drifts BRIGHTER. If
+                # that reaches the GT former, ``_mean_equalize_pair`` below
+                # rescales BOTH members to their common magnitude a=0.5*(a_f
+                # +a_l) -> a hot former drags the clean latter UP and lifts
+                # the whole REAL pair above the fake pair -> the disc learns
+                # "brighter=real" -> student brightens -> rollout2 brighter
+                # -> FN brighter -> WHITE COLLAPSE. Restore the original
+                # former's (a) per-channel DC mean and (b) per-sample mean-
+                # magnitude (the exact stat _mean_equalize_pair keys on), so
+                # carn changes only HF/texture STRUCTURE and the equalize
+                # sees an unchanged former. Scalar rescale preserves the
+                # texture pattern.
+                eps = 1e-6
+                mc_in = x0.mean(dim=[1, 3, 4], keepdim=True)
+                mc_out = x.mean(dim=[1, 3, 4], keepdim=True)
+                x = x - mc_out + mc_in
+                a_in = x0.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                a_out = x.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                x = x * (a_in / (a_out + eps))
             return x.detach()
 
         def _slice_pair_carn(t, i, j):
-            return torch.cat([_carn_former(_slice(t, i)), _slice(t, j)], dim=1)
+            former = _carn_former(_slice(t, i))
+            return torch.cat([former, _slice(t, j)], dim=1)
 
         if chunks_per_pair == 2:
             # gt_transition: real and fake BOTH cover the chunk-pair
@@ -7604,6 +7908,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         })
         critic_loss.backward()
         self._mem_step_snapshot("6_after_critic_backward")
+
+        # ForwardNoiser teacher_feat training (separate FN backward, fully
+        # decoupled from fake_score). Runs AFTER the gen+critic backwards so
+        # the gen/critic graphs are freed before the FN's own teacher
+        # forward (memory hygiene). Populates FN grads; the outer train()
+        # loop clips + steps the FN optimizer. No-op unless
+        # forward_noiser_loss_mode=="teacher_feat".
+        if (
+            getattr(self.model, "forward_noiser_enabled", False)
+            and getattr(self.model, "forward_noiser_loss_mode", "mse")
+            == "teacher_feat"
+        ):
+            fn_tf_logs = self._train_forward_noiser_tf(train_chunk, train_info)
+            out.update(fn_tf_logs)
+            self._mem_step_snapshot("6b_after_fn_tf_backward")
 
         # teacher_cadence='fake': run ``dfake_gen_update_ratio`` total
         # LoRA optimizer steps per outer iter (vs the default 1 under

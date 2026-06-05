@@ -834,6 +834,53 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_carn_steps = int(
             getattr(args, "ladd_gt_transition_carn_steps", 1)
         )
+        # ``forward_noiser_loss_mode``: how the FN is trained.
+        #   "mse" (default, legacy): value-match FN(rollout1) -> rollout2
+        #       per chunk (folded into the critic backward — couples to
+        #       fake_score).
+        #   "teacher_feat": DISTRIBUTION-match FN(rollout1) -> rollout2 in
+        #       the FROZEN teacher's feature space (the LADD
+        #       WanFeatureProjector backbone, NOT its trained heads), as a
+        #       SEPARATE backward stepping only the FN optimizer (fully
+        #       decoupled from fake_score). The teacher is a fixed,
+        #       comprehensive critic, so the FN can't exploit an adversary's
+        #       blind spots. Computed trainer-side (where the projector +
+        #       FN optimizer live). See trainer ``_train_forward_noiser_tf``.
+        self.forward_noiser_loss_mode = str(
+            getattr(args, "forward_noiser_loss_mode", "mse")
+        ).lower()
+        if self.forward_noiser_loss_mode not in ("mse", "teacher_feat"):
+            raise ValueError(
+                "forward_noiser_loss_mode must be 'mse' or 'teacher_feat'; "
+                f"got {self.forward_noiser_loss_mode!r}."
+            )
+        # ``forward_noiser_step_unconditioned``: when True, the FN never
+        # sees the CARN level — every call passes carn_step=0, so it learns
+        # a single generic "+1 shift" transform (input chunk -> output
+        # chunk) regardless of how drifted the input is. Used by the
+        # teacher_feat regime (and the carn_former GAN application). The
+        # FiLM conditioning still exists but receives a constant, so it
+        # collapses to a fixed modulation.
+        self.forward_noiser_step_unconditioned = bool(
+            getattr(args, "forward_noiser_step_unconditioned", False)
+        )
+        # Timestep at which the frozen teacher extracts features for the
+        # teacher_feat distribution match (both FN(rollout1) and rollout2
+        # are noised to this t before the projector forward). 0 = clean.
+        self.forward_noiser_feat_t = int(
+            getattr(args, "forward_noiser_feat_t", 0)
+        )
+        # Sliced-Wasserstein knobs for the teacher_feat FN loss.
+        #   sw_n_proj: number of random 1D projections per feature tap
+        #     (more = lower-variance Wasserstein estimate, linear cost).
+        #   sw_max_tokens: cap on the per-tap sample count (random subsample
+        #     per side) to bound sort cost/memory; 0 = use all tokens.
+        self.forward_noiser_sw_n_proj = int(
+            getattr(args, "forward_noiser_sw_n_proj", 64)
+        )
+        self.forward_noiser_sw_max_tokens = int(
+            getattr(args, "forward_noiser_sw_max_tokens", 4096)
+        )
         self.forward_noiser = None
         if self.forward_noiser_enabled:
             from model.forward_noiser import ForwardNoiser
@@ -1472,6 +1519,19 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_mae_gate_min_weight = float(
             getattr(args, "dmd_mae_gate_min_weight", 0.0)
         )
+        # Shape of the gate ramp. 1.0 = linear (w = (r-1)/(r_full-1));
+        # <1 = CONCAVE — DMD stays near full strength across most of
+        # (1, r_full) and only drops sharply toward parity, raising the
+        # effective DMD strength under the gate (compensates the gate's
+        # attenuation). >1 = convex (gentler, weaker). Default 1.0.
+        self.dmd_mae_gate_exponent = float(
+            getattr(args, "dmd_mae_gate_exponent", 1.0)
+        )
+        if self.dmd_mae_gate_exponent <= 0.0:
+            raise ValueError(
+                "dmd_mae_gate_exponent must be > 0; got "
+                f"{self.dmd_mae_gate_exponent}."
+            )
         # Per-rank EMA state for the gate ratio (None until first update).
         self._dmd_mae_gate_ratio_ema: Optional[float] = None
         # Anti-collapse variance floor. Penalizes the student's
@@ -3000,8 +3060,17 @@ class ActionForcingDMD(SelfForcingModel):
                 r_s = a * self._dmd_mae_gate_ratio_ema + (1.0 - a) * r
             self._dmd_mae_gate_ratio_ema = r_s
             # w ramps 0->1 over r in [1, r_full]; clamped to [min_w, 1].
+            # ``dmd_mae_gate_exponent`` shapes the ramp: exponent=1 is the
+            # linear ramp; exponent<1 makes it CONCAVE — DMD stays near full
+            # strength across most of (1, r_full) and only drops sharply
+            # toward parity (r->1). Use exponent<1 to keep the DMD signal
+            # strong despite the gate, with the loss "going away" only very
+            # close to where the student matches the teacher.
             r_full = self.dmd_mae_gate_r_full
-            w = (r_s - 1.0) / (r_full - 1.0)
+            base = (r_s - 1.0) / (r_full - 1.0)
+            base = max(0.0, min(1.0, base))
+            exponent = float(self.dmd_mae_gate_exponent)
+            w = base ** exponent if exponent != 1.0 else base
             w = max(self.dmd_mae_gate_min_weight, min(1.0, w))
             log_dict["dmd_mae_gate_m_real"] = float(m_real.item())
             log_dict["dmd_mae_gate_m_fake"] = float(m_fake.item())
@@ -4350,10 +4419,19 @@ class ActionForcingDMD(SelfForcingModel):
         # critic step's alt-head loss to consume.
         rollout2_x0 = None
         rollout2_abs_frame_start = None
-        if (
+        # Prebuild rollout2 (one fewer seed chunk = +1 CARN drift step) when
+        # EITHER the fake-score alt head consumes it (legacy) OR the FN's
+        # teacher_feat regime needs the rollout1->rollout2 pairs. The latter
+        # is independent of the alt head (so the FN can be trained without
+        # any fake_score coupling).
+        _need_rollout2 = (
             self.fake_alt_head_enabled
             and self.fake_alt_target_mode == "rollout2_student"
-        ):
+        ) or (
+            self.forward_noiser_enabled
+            and self.forward_noiser_loss_mode == "teacher_feat"
+        )
+        if _need_rollout2:
             rollout2_x0, rollout2_abs_frame_start = (
                 self._prebuild_rollout2_for_v24(
                     seed_latents=seed_latents,
@@ -4539,6 +4617,10 @@ class ActionForcingDMD(SelfForcingModel):
         rollout-2's coverage).
         """
         if self.forward_noiser is None:
+            return None
+        # teacher_feat mode trains the FN trainer-side in a SEPARATE backward
+        # (decoupled from fake_score), so the critic-folded MSE path is off.
+        if self.forward_noiser_loss_mode == "teacher_feat":
             return None
         npb = int(self.num_frame_per_block)
         # DDP anchor on every data-dependent bail: each of the 32 ranks
@@ -4776,8 +4858,13 @@ class ActionForcingDMD(SelfForcingModel):
                     # blur_noise and sum strategies have been removed —
                     # they depended on a 2D spatial Gaussian blur op
                     # that is no longer in the codebase.
+                    # Step-unconditioned FN -> carn_step=0 every apply.
                     carn_step = torch.full(
-                        (B,), k, dtype=torch.long, device=device,
+                        (B,),
+                        0 if bool(getattr(
+                            self, "forward_noiser_step_unconditioned", False,
+                        )) else k,
+                        dtype=torch.long, device=device,
                     )
                     chunk_out = self.forward_noiser(
                         chunk_in, carn_step, residual=True,
