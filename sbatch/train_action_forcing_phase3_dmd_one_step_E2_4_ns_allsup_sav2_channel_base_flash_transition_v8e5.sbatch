@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8e2
+#SBATCH --job-name=af-p3-cb-flashtr-v8e5
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,7 +11,38 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step — v8e2 = v8e + CARN BRIGHTNESS-COLLAPSE FIX.
+# Phase-3 DMD one-step — v8e5 = v8e4 but FLATTEN (across all four) instead
+# of per-pair.
+#
+# Same as v8e4 (per-channel mean + std cross-eq) EXCEPT
+# ladd_gt_transition_xeq_preserve_delta=FALSE: instead of scaling each
+# pair by one shared factor (which preserves the within-pair former->latter
+# brightness/contrast transition), every one of the FOUR members -- real
+# former, real latter, fake former, fake latter -- is normalized
+# INDEPENDENTLY to the common per-channel mean a* and std s*. So the disc
+# is FULLY moment-blind: no absolute level, no within-pair transition --
+# pure texture only. This is the "across all four" variant vs v8e4's
+# "per pair". per-channel + std stay ON.
+# Config = v8e4 with preserve_delta=false.
+#
+# ---- v8e4/v8e3 lineage ----
+# v8e4 = v8e3 + STD equalization; v8e3 = v8e2 + per-channel + preserve-delta.
+#
+# v8e2 confirmed cross-equalization kills the white-collapse (brightness
+# flat past the old step-61 point). v8e2 flattened ALL FOUR pair members
+# to one level -> the disc was fully brightness-blind (within-pair delta
+# gone too). v8e3 flips on ladd_gt_transition_xeq_preserve_delta=true:
+# each PAIR is scaled by ONE shared factor to the common level a*, so the
+# real/fake ABSOLUTE level is still equalized (no collapse) but the
+# within-pair former->latter brightness TRANSITION ratio is PRESERVED ->
+# the disc can see, and push the student to match, GT's transition
+# brightness behaviour. (To become the hardcoded default.)
+# ALSO: ladd_gt_transition_xeq_per_channel=true -> the equalization
+# magnitude is computed PER CHANNEL (reduce [F,H,W], keep C) instead of
+# one scalar over all channels, so per-channel brightness/colour is fully
+# non-discriminative. Fix code is shared; config = v8e2 + these two flags.
+#
+# ---- v8e2 lineage: CARN BRIGHTNESS-COLLAPSE FIX ----
 #
 # v8e collapsed to white by ~step 61. Root cause (transition GAN carn
 # path): the FN trains on un-normalized rollout1->rollout2 (rollout2 runs
@@ -213,6 +244,9 @@ srun torchrun \
     ladd_gt_transition_n_real=0 \
     ladd_gt_transition_match=true \
     ladd_gt_transition_match_k=4 \
+    ladd_gt_transition_xeq_preserve_delta=false \
+    ladd_gt_transition_xeq_per_channel=true \
+    ladd_gt_transition_std_equalize=true \
     forward_noiser_enabled=true \
     forward_noiser_loss_mode=teacher_feat \
     forward_noiser_step_unconditioned=true \
@@ -226,6 +260,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e2_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e5_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

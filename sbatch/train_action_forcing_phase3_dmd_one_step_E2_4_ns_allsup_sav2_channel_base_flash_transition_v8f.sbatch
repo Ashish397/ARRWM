@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8e2
+#SBATCH --job-name=af-p3-cb-flashtr-v8f
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,7 +11,31 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step — v8e2 = v8e + CARN BRIGHTNESS-COLLAPSE FIX.
+# Phase-3 DMD one-step — v8f = let the TRANSITION GAN own brightness +
+# contrast (drop the naive anchors), off an 8e3 base.
+#
+# Premise (confirmed on 8e3): cartoonification is solved; the remaining
+# problem is brightness/contrast SHIFTS, and naively anchoring them is no
+# longer good enough — we want the model to LEARN the right brightness/
+# contrast, and the transition GAN should be able to do that now that the
+# carn brightness BUG is fixed (carn moment-restore stays ON, so the real
+# anchor is never artificially inflated). Changes vs 8e3:
+#   * ladd_gt_transition_mean_equalize=false -> ALL GAN magnitude
+#     normalizers OFF (no cross-eq). The disc sees raw brightness/contrast.
+#   * ladd_wavelet_hf_enabled=false -> wavelet OFF, so the disc sees the
+#     full latent (LL=brightness/contrast + HF), not HF-only.
+#   * ladd_disc_force_clean=true -> disc on CLEAN (t=0) latents. REQUIRED:
+#     with wavelet off the disc would otherwise run at flash_t(~60) NOISED,
+#     which swamps the brightness/contrast signal. (Does not touch
+#     flash_dmd_gan_t, which the main DMD path shares.)
+#   * stat_anchor rampdown to a TENTH: start=50 (after the GAN is
+#     established ~step45), over 50 steps, floor=0.1 -> keeps a thin
+#     stat-anchor safety net while the GAN takes over brightness/contrast.
+#   * gan_loss_weight 1.0 -> 1.5 (a touch more; the GAN now owns more).
+#   * preserve_delta OFF (moot — nothing is normalized inside the GAN now).
+#   * CARN magnitude normalizer (moment-restore) KEPT ON.
+#
+# ---- 8e3/8e2 lineage: CARN BRIGHTNESS-COLLAPSE FIX ----
 #
 # v8e collapsed to white by ~step 61. Root cause (transition GAN carn
 # path): the FN trains on un-normalized rollout1->rollout2 (rollout2 runs
@@ -156,6 +180,9 @@ srun torchrun \
     dmd_mae_gate_min_weight=0.0 \
     dmd_mae_gate_exponent=0.75 \
     stat_anchor_loss_weight=1.0 \
+    stat_anchor_rampdown_start_step=50 \
+    stat_anchor_rampdown_steps=50 \
+    stat_anchor_rampdown_floor=0.1 \
     stat_anchor_STD_short_weight=0.0 \
     stat_anchor_STD_long_weight=0.0 \
     stat_anchor_M2_short_weight=0.1 \
@@ -181,7 +208,7 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
-    gan_loss_weight=1.0 \
+    gan_loss_weight=1.5 \
     gan_lr=2e-5 \
     gan_critic_warmup_steps=20 \
     gan_disc_start_step=20 \
@@ -200,7 +227,7 @@ srun torchrun \
     ladd_r1_every_n_steps=1 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=7 \
-    ladd_wavelet_hf_enabled=true \
+    ladd_wavelet_hf_enabled=false \
     ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_ll_weight=0.0 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
@@ -209,10 +236,13 @@ srun torchrun \
     ladd_gt_transition_enabled=true \
     ladd_gt_transition_weight=1.0 \
     ladd_gt_transition_all_pairs=false \
-    ladd_gt_transition_mean_equalize=true \
+    ladd_gt_transition_mean_equalize=false \
     ladd_gt_transition_n_real=0 \
     ladd_gt_transition_match=true \
     ladd_gt_transition_match_k=4 \
+    ladd_gt_transition_xeq_preserve_delta=false \
+    ladd_gt_transition_xeq_per_channel=true \
+    ladd_disc_force_clean=true \
     forward_noiser_enabled=true \
     forward_noiser_loss_mode=teacher_feat \
     forward_noiser_step_unconditioned=true \
@@ -226,6 +256,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e2_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8f_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

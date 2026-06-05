@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8e2
+#SBATCH --job-name=af-p3-cb-flashtr-v8b3
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,58 +11,25 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step — v8e2 = v8e + CARN BRIGHTNESS-COLLAPSE FIX.
+# Phase-3 DMD one-step — single frozen teacher, no aux pass.
 #
-# v8e collapsed to white by ~step 61. Root cause (transition GAN carn
-# path): the FN trains on un-normalized rollout1->rollout2 (rollout2 runs
-# HOT, +1 drift step) so FN(GT_former) drifts BRIGHTER; the GAN's
-# mean_equalize was within-pool only (real and fake equalized separately),
-# so the hot real pair sat above the fake pair -> disc learns
-# "brighter=real" -> student brightens -> rollout2 brighter -> FN brighter
-# -> runaway white. TWO fixes (both in shared trainer code; config is
-# otherwise identical to v8e):
-#   1) CROSS-EQUALIZED mean_equalize (now the hardcoded default): all four
-#      members of each pair row -- real former+latter, fake former+latter
-#      -- are scaled to ONE common per-row mean-magnitude. The disc can no
-#      longer see ANY magnitude difference (within-pair OR real-vs-fake),
-#      so the GAN affects only texture, never brightness. Target is
-#      detached -> no magnitude gradient to the student.
-#   2) MOMENT-PRESERVING carn (_carn_former): restore the former's
-#      per-channel DC + magnitude after the FN, so carn changes only
-#      texture STRUCTURE (no stats) and its texture isn't rescaled away by
-#      the cross-eq. Belt-and-braces with (1).
+# v8b2 = v8b but with the 7h DMD normalize FIX instead of norm-off:
+#   * dmd_normalization_enabled=true + dmd_normalization_denom_floor=1.0
+#     -> DMD grad divided by max(|f|, 1) (f = |x0 - pred_real|.mean()).
+#     Keeps scale-invariant down-scaling of over-large grads but removes
+#     the cusp AMPLIFICATION near convergence (when |f| < 1 it divides by
+#     1, not by a tiny number). Replaces v8b's fully-raw norm-off.
+#   * MAE-based student-vs-teacher DMD gate (dmd_mae_gate_enabled=true):
+#     measures m_real=|pred_real-gt| and m_fake=|pred_student-gt| on the
+#     SAME scored chunk/supervised slots and scales the DMD loss down as
+#     m_fake -> m_real (and to 0 once the student matches/beats the
+#     teacher). r_full=2.0, ema=0.9, min_weight=0.0. Also logs
+#     gen/student_mae_vs_gt so the per-chunk crossover is finally
+#     visible on the same basis as gen/real_score_mae_vs_gt.
+#   * Aligned with v6e otherwise: R1-only GAN (NO R2), ladd_r1_every_n_steps=1,
+#     diff_aug on. The DMD normalize-fix + MAE gate are the only deltas vs v6e.
 #
-# Inherits v8b2 (normalize-fix max(|f|,1) + MAE gate + GT-anchor +
-# local_attn=24, R1-only GAN). Changes vs v8b2:
-#   * Learned ForwardNoiser (CARN) trained to map rollout1 -> rollout2 =
-#     the "+1 cartoon shift" (the per-step texture/detail drift of the
-#     causal AR rollout). LATENT SPACE — NO wavelet decomposition.
-#     forward_noiser_loss_mode=teacher_feat, but the match is now a
-#     SLICED-WASSERSTEIN per-token distribution match in the frozen
-#     teacher's feature space (NOT mean+std). v8d's mean+std match was
-#     inert (fn_tf_loss ~1e-6) because GT<->student moments barely differ
-#     and are pinned by the stat anchor; the full SW marginal captures the
-#     texture/cartoon shift those moments missed. Step-unconditioned
-#     (one generic +1 shift). Separate FN backward, FN optimizer only ->
-#     fully DECOUPLED from fake_score.
-#   * fake_alt_rollout2_num_seed_chunks=5 = (cf/npb)-1 = 6-1, so rollout2
-#     is exactly ONE seed chunk shorter than rollout1 -> a clean +1 drift
-#     step (matches the prebuild's max_length_r2 = max_length + npb
-#     geometry). rollout2 auto-builds because loss_mode=teacher_feat.
-#   * ladd_gt_transition_carn_former=true (1 step): apply the FN ONCE to
-#     the FIRST GT chunk of each transition pair -> real anchor =
-#     [cartoon-shifted GT former -> clean GT latter] = a SELF-CORRECTING
-#     (de-cartoon) transition the student is pushed to match.
-#   * GAN at v6e strength: gan_updates_per_step=5, ladd_pairs_per_step=7
-#     (RESTORE GAN STRENGTH per the user's instruction). NOTE: rollout2's
-#     second no-grad rollout is a real memory tax (it forced the 8d cuts);
-#     5/7 + rollout2 may re-OOM. If it does, the lever is GAN strength
-#     (5->3) or ladd_pairs_per_step, NOT the CARN.
-#   * DMD-strength compensation for the gate kept: dmd_mae_gate_exponent=
-#     0.75 (mild concave ramp -> DMD held above the linear weight, fading
-#     toward parity, but gentler than the 0.5 sqrt ramp).
-#
-# 21->24 frame window, 200-step max. GAN ON (ladd_teacher_feat), R1-only.
+# 21-frame window, 200-step max. GAN ON (ladd_teacher_feat).
 # =====================================================================
 
 set -e -o pipefail
@@ -99,13 +66,12 @@ export ARRWM_ROPE_DEBUG=1
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 DMD ONE-STEP (v8e = v8b2 + learned latent-space SW CARN, v6e GAN) on $(date)"
-echo "  * allsup: 3 supervised chunks; cf=18 seed + GT-anchor = 7 GT; local_attn=24."
+echo "Starting Phase-3 DMD ONE-STEP (v8b2 = v6e + DMD normalize-fix + MAE gate, R1-only) on $(date)"
+echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed)."
 echo "  * 1 roll per ride (fresh seed each step)."
-echo "  * GAN: ON (ladd_teacher_feat, matched gt_transition), R1-only, v6e strength (5/7)."
-echo "  * CARN-former: learned FN, +1 cartoon shift (latent-space sliced-Wasserstein teacher-feat), rollout2 ON."
-echo "  * dmd_normalization: ON, denom floor=1.0 -> divide by max(|f|,1)."
-echo "  * MAE gate: ON (r_full=2.0, ema=0.0 [per-sample, no smoothing], min_weight=0.0, exponent=0.75)."
+echo "  * GAN: ON (ladd_teacher_feat, content-matched gt_transition), R1-only (NO R2)."
+echo "  * dmd_normalization: ON with denom floor=1.0 -> divide by max(|f|,1)."
+echo "  * MAE gate: ON (r_full=2.0, ema=0.9, min_weight=0.0)."
 echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
@@ -213,19 +179,10 @@ srun torchrun \
     ladd_gt_transition_n_real=0 \
     ladd_gt_transition_match=true \
     ladd_gt_transition_match_k=4 \
-    forward_noiser_enabled=true \
-    forward_noiser_loss_mode=teacher_feat \
-    forward_noiser_step_unconditioned=true \
-    forward_noiser_feat_t=0 \
-    forward_noiser_sw_n_proj=64 \
-    forward_noiser_sw_max_tokens=4096 \
-    fake_alt_rollout2_num_seed_chunks=5 \
-    ladd_gt_transition_carn_former=true \
-    ladd_gt_transition_carn_steps=1 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e2_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8b3_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

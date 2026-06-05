@@ -4543,15 +4543,147 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 [_slice_pair(fake_src_grad, i, j) for (i, j) in pairs],
                 dim=0,
             )
-            if _mean_eq:
-                # Equalize both pair members for real + fake (D-side and
-                # grad-on gen-side). Real is detached GT; the grad-on fake
-                # keeps the equalize differentiable so no gen gradient
-                # pushes the inter-member mean.
+            if _mean_eq and _mag_mode in ("m1", "m1m2"):
+                # Per-channel magnitude mode (opt-in): unchanged, per-tensor.
                 real_chunks_det = _mean_equalize_pair(real_chunks_det)
                 fake_chunks_det = _mean_equalize_pair(fake_chunks_det)
                 fake_chunks_grad_tensor = _mean_equalize_pair(
                     fake_chunks_grad_tensor)
+            elif _mean_eq:
+                # CROSS-equalize the OVERALL level across the real and fake
+                # pools so the disc gets NO absolute-brightness cue (kills
+                # the white-collapse feedback). a* is the common per-row
+                # target level, built from DETACHED magnitudes so the grad-on
+                # fake gets a constant target. Two variants
+                # (ladd_gt_transition_xeq_preserve_delta):
+                #   * flatten (False, default): scale each of the 4 members
+                #     INDEPENDENTLY to a* -> within-pair former<->latter
+                #     brightness delta removed too; disc fully brightness-
+                #     blind.
+                #   * preserve_delta (True): scale each PAIR by ONE shared
+                #     factor a*/a_pair -> real/fake absolute level equalized
+                #     but the within-pair brightness TRANSITION ratio is
+                #     preserved, so the disc still sees (and pushes the
+                #     student to match GT's) transition brightness. No
+                #     collapse because absolute level is still pinned.
+                # Either way the rescale is a scalar per member/pair, so
+                # texture STRUCTURE is preserved. real-row-i and fake-row-i
+                # are the same chunk-pair position (GT vs student).
+                _eps = 1e-6
+                _preserve_delta = bool(
+                    getattr(self.model,
+                            "ladd_gt_transition_xeq_preserve_delta", None)
+                    or getattr(self.config,
+                               "ladd_gt_transition_xeq_preserve_delta", False)
+                )
+                _per_channel = bool(
+                    getattr(self.model,
+                            "ladd_gt_transition_xeq_per_channel", None)
+                    or getattr(self.config,
+                               "ladd_gt_transition_xeq_per_channel", False)
+                )
+                # Reduce over [F,H,W] keeping C (per-channel) or over
+                # [F,C,H,W] (one scalar). keepdim=True so a_star / the
+                # factors broadcast either way.
+                _red = [1, 3, 4] if _per_channel else [1, 2, 3, 4]
+
+                def _mags(t):
+                    return (
+                        t[:, :npb].abs().mean(dim=_red, keepdim=True),
+                        t[:, npb:].abs().mean(dim=_red, keepdim=True),
+                    )
+
+                _da_rf, _da_rl = _mags(real_chunks_det.detach())
+                _da_ff, _da_fl = _mags(fake_chunks_det.detach())
+                if real_chunks_det.shape[0] == fake_chunks_det.shape[0]:
+                    a_star = 0.25 * (_da_rf + _da_rl + _da_ff + _da_fl)  # per row
+                else:
+                    # Defensive (row-count mismatch): one shared target
+                    # (per-channel if enabled, else scalar) so real and fake
+                    # still share a level. mean over the stacked rows, keep C.
+                    a_star = torch.cat(
+                        [_da_rf, _da_rl, _da_ff, _da_fl], dim=0,
+                    ).mean(dim=0, keepdim=True)
+
+                if _preserve_delta:
+                    def _xeq(t):
+                        af, al = _mags(t)  # in-graph for the grad tensor
+                        a_pair = 0.5 * (af + al)            # this pair's level
+                        factor = a_star / (a_pair + _eps)   # ONE factor, both members
+                        return t * factor                   # ratio (transition) kept
+                else:
+                    def _xeq(t):
+                        af, al = _mags(t)  # in-graph for the grad tensor
+                        return torch.cat(
+                            [t[:, :npb] * (a_star / (af + _eps)),
+                             t[:, npb:] * (a_star / (al + _eps))], dim=1,
+                        )
+
+                real_chunks_det = _xeq(real_chunks_det)
+                fake_chunks_det = _xeq(fake_chunks_det)
+                fake_chunks_grad_tensor = _xeq(fake_chunks_grad_tensor)
+
+                # STD equalization (same cross-eq mechanism, on the 2nd
+                # moment). Applied AFTER the mean-eq, CENTERED: scale each
+                # member's deviations-from-mean to the common std s* and
+                # re-add the mean, so it sets spread/contrast WITHOUT
+                # disturbing the level. Honours the same per-channel /
+                # preserve-delta options. With both mean+std eq on, the disc
+                # input is per-channel first+second-moment-free -> the GAN
+                # keys on pure texture, never brightness OR contrast.
+                _std_eq = bool(
+                    getattr(self.model,
+                            "ladd_gt_transition_std_equalize", None)
+                    or getattr(self.config,
+                               "ladd_gt_transition_std_equalize", False)
+                )
+                if _std_eq:
+                    def _stds(t):
+                        return (
+                            t[:, :npb].std(dim=_red, unbiased=False,
+                                           keepdim=True),
+                            t[:, npb:].std(dim=_red, unbiased=False,
+                                           keepdim=True),
+                        )
+
+                    def _means(t):
+                        return (
+                            t[:, :npb].mean(dim=_red, keepdim=True),
+                            t[:, npb:].mean(dim=_red, keepdim=True),
+                        )
+
+                    _ds_rf, _ds_rl = _stds(real_chunks_det.detach())
+                    _ds_ff, _ds_fl = _stds(fake_chunks_det.detach())
+                    if real_chunks_det.shape[0] == fake_chunks_det.shape[0]:
+                        s_star = 0.25 * (_ds_rf + _ds_rl + _ds_ff + _ds_fl)
+                    else:
+                        s_star = torch.cat(
+                            [_ds_rf, _ds_rl, _ds_ff, _ds_fl], dim=0,
+                        ).mean(dim=0, keepdim=True)
+
+                    if _preserve_delta:
+                        def _xeq_std(t):
+                            sf, sl = _stds(t)
+                            mf, ml = _means(t)
+                            s_pair = 0.5 * (sf + sl)
+                            fac = s_star / (s_pair + _eps)  # ONE factor, both
+                            return torch.cat(
+                                [(t[:, :npb] - mf) * fac + mf,
+                                 (t[:, npb:] - ml) * fac + ml], dim=1,
+                            )
+                    else:
+                        def _xeq_std(t):
+                            sf, sl = _stds(t)
+                            mf, ml = _means(t)
+                            return torch.cat(
+                                [(t[:, :npb] - mf) * (s_star / (sf + _eps)) + mf,
+                                 (t[:, npb:] - ml) * (s_star / (sl + _eps)) + ml],
+                                dim=1,
+                            )
+
+                    real_chunks_det = _xeq_std(real_chunks_det)
+                    fake_chunks_det = _xeq_std(fake_chunks_det)
+                    fake_chunks_grad_tensor = _xeq_std(fake_chunks_grad_tensor)
         else:
             real_chunks_det = torch.cat(
                 [_slice(real_src_eff, real_positions[k])
@@ -4586,7 +4718,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         wavelet_on = bool(
             getattr(self.r3gan_disc, "wavelet_hf_enabled", False)
         )
-        if wavelet_on:
+        # Force clean disc input when requested (e.g. wavelet off but the
+        # disc is meant to learn brightness/contrast, which t=flash_t noise
+        # would swamp). Does NOT touch flash_dmd_gan_t (shared with main DMD).
+        _disc_force_clean = bool(
+            getattr(self.model, "ladd_disc_force_clean", None)
+            or getattr(self.config, "ladd_disc_force_clean", False)
+        )
+        if wavelet_on or _disc_force_clean:
             disc_t_int = 0
         else:
             disc_t_int = flash_t if flash_on else 0

@@ -1222,6 +1222,60 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_mean_equalize = bool(
             getattr(args, "ladd_gt_transition_mean_equalize", False)
         )
+        # Cross-equalization variant for mean_equalize on gt_transition
+        # pairs. Both variants equalize the OVERALL level across the real
+        # and fake pools so the disc gets NO absolute-brightness cue (kills
+        # the white-collapse feedback). They differ on the WITHIN-pair
+        # former->latter brightness delta:
+        #   False (default, "flatten"): scale each of the 4 members
+        #     independently to the common level a* -> the within-pair delta
+        #     is removed too; the disc is FULLY brightness-blind.
+        #   True ("preserve_delta"): scale each PAIR by ONE shared factor to
+        #     a* -> real/fake absolute level is equalized but the within-
+        #     pair brightness TRANSITION ratio is preserved, so the disc can
+        #     still see (and push the student to match GT's) transition
+        #     brightness behaviour. No collapse because the absolute level
+        #     is still pinned. Intended to become the hardcoded default.
+        self.ladd_gt_transition_xeq_preserve_delta = bool(
+            getattr(args, "ladd_gt_transition_xeq_preserve_delta", False)
+        )
+        # Cross-equalization granularity. The magnitude(s) used to equalize
+        # are computed either as ONE scalar over all channels, or PER
+        # CHANNEL.
+        #   False (default): reduce over [F, C, H, W] -> one scalar per
+        #     member; only the aggregate magnitude is equalized, so per-
+        #     channel brightness/colour differences survive as a disc cue.
+        #   True ("per_channel"): reduce over [F, H, W] keeping C -> a
+        #     per-channel magnitude; each channel is equalized
+        #     independently, so per-channel brightness/colour is fully
+        #     non-discriminative (composes with preserve_delta: the shared
+        #     factor becomes per-channel, still preserving the within-pair
+        #     transition per channel). Intended to become the default.
+        self.ladd_gt_transition_xeq_per_channel = bool(
+            getattr(args, "ladd_gt_transition_xeq_per_channel", False)
+        )
+        # STD equalization — same cross-eq mechanism as the mean(-magnitude)
+        # equalization above, but on the STD (spread/contrast) instead of
+        # the magnitude. Applied AFTER the mean-eq, centered (scale the
+        # deviations-from-mean to a common std, re-add the mean) so it sets
+        # the 2nd moment WITHOUT disturbing the level. Honours the same
+        # xeq_per_channel and xeq_preserve_delta options. Together with the
+        # mean-eq this makes the disc input first+second-moment-free (per
+        # channel) = a per-channel standardization -> the GAN keys on pure
+        # texture, never brightness OR contrast. Requires mean_equalize on.
+        self.ladd_gt_transition_std_equalize = bool(
+            getattr(args, "ladd_gt_transition_std_equalize", False)
+        )
+        # Force the LADD disc to operate on CLEAN (t=0) latents. Normally the
+        # disc timestep follows the wavelet stage (clean) or, with wavelet
+        # off, the flash-DMD t (=flash_dmd_gan_t, ~60, NOISED). When the disc
+        # is meant to learn brightness/contrast (wavelet off), noised input
+        # swamps that signal — set this True to keep the disc on clean
+        # latents without touching flash_dmd_gan_t (which the main DMD path
+        # shares). Default False = legacy behaviour.
+        self.ladd_disc_force_clean = bool(
+            getattr(args, "ladd_disc_force_clean", False)
+        )
         # Per-pair, per-channel magnitude normalization of gt_transition
         # pairs (both GT and student) — each pair self-normalizes using
         # ITS OWN per-channel stats (over F,H,W; C kept), so different
@@ -1712,6 +1766,13 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.stat_anchor_rampdown_steps = int(
             getattr(args, "stat_anchor_rampdown_steps", 0)
+        )
+        # Floor (as a FRACTION of the full weight) the rampdown decays TO,
+        # instead of all the way to 0. Default 0.0 = ramp to zero (legacy).
+        # Set e.g. 0.1 to keep a thin stat-anchor safety net (a tenth of
+        # full) after the GAN takes over brightness/contrast.
+        self.stat_anchor_rampdown_floor = float(
+            getattr(args, "stat_anchor_rampdown_floor", 0.0)
         )
         # v28G_5+: optional EMA on the LONG-HORIZON stat_anchor.
         # Short-horizon (per-frame) anchor keeps the per-batch seed
@@ -7576,13 +7637,15 @@ class ActionForcingDMD(SelfForcingModel):
             return full
         s = int(current_step)
         start = int(self.stat_anchor_rampdown_start_step)
+        # Floor weight the rampdown decays TO (fraction of full; 0 = legacy).
+        floor = full * float(self.stat_anchor_rampdown_floor)
         if s < start:
             return full
         if s >= start + rampdown_steps:
-            return 0.0
-        # Linear ramp from full at s=start to 0 at s=start+rampdown_steps.
+            return floor
+        # Linear ramp from full at s=start to floor at s=start+rampdown_steps.
         progress = float(s - start) / float(rampdown_steps)
-        return full * (1.0 - progress)
+        return full * (1.0 - progress) + floor * progress
 
     def _resolved_dmd_loss_weight(self, current_step: int) -> float:
         """Return the effective DMD loss weight at this step.
