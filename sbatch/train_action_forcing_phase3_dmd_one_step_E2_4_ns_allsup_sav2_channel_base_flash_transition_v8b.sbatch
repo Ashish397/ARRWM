@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v7h
+#SBATCH --job-name=af-p3-cb-flashtr-v8b
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,11 +11,23 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step v7H — base v6E, DMD_NORMALIZATION DISABLED.
-# Ablation test: does turning off the DMD score normalization change
-# the dynamics enough to break the disc out of log(2) saturation
-# (or shift overall training behaviour)?
-# All other knobs identical to v6E.
+# Phase-3 DMD one-step — single frozen teacher, no aux pass.
+#
+# v8b = v8a (v6e + R2) + DMD convergence-awareness:
+#   * dmd_normalization_enabled=false — use the RAW (pred_fake -
+#     pred_real) gradient so the DMD signal decays naturally as the
+#     teacher agrees with the student (the normalized form AMPLIFIES
+#     near convergence, the opposite of what we want).
+#   * MAE-based student-vs-teacher DMD gate (dmd_mae_gate_enabled=true):
+#     measures m_real=|pred_real-gt| and m_fake=|pred_student-gt| on the
+#     SAME scored chunk/supervised slots and scales the DMD loss down as
+#     m_fake -> m_real (and to 0 once the student matches/beats the
+#     teacher). r_full=2.0, ema=0.9, min_weight=0.0. Also logs
+#     gen/student_mae_vs_gt so the per-chunk crossover is finally
+#     visible on the same basis as gen/real_score_mae_vs_gt.
+#   * Carries v8a's R2 (every-2 / offset-1) and everything else from v6e.
+#
+# 21-frame window, 200-step max. GAN ON (ladd_teacher_feat).
 # =====================================================================
 
 set -e -o pipefail
@@ -52,13 +64,14 @@ export ARRWM_ROPE_DEBUG=1
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 DMD ONE-STEP v7H (clamped-denominator normalizer) on $(date)"
-echo "  * Base: v6E."
-echo "  * CHANGE: DMD normalizer kept ON but denominator = max(|f|, 1)"
-echo "    (dmd_normalization_enabled=true, dmd_normalization_denom_floor=1.0)."
-echo "    No amplification once the student converges (|f|<1); still"
-echo "    down-scales over-large grads. (Was: normalization fully OFF.)"
-echo "  * Everything else identical to v6E."
+echo "Starting Phase-3 DMD ONE-STEP (v8b = v8a + dmd-norm-off + MAE gate) on $(date)"
+echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed)."
+echo "  * 1 roll per ride (fresh seed each step)."
+echo "  * GAN: ON (ladd_teacher_feat, content-matched gt_transition)."
+echo "  * R2: ON, gamma=0.02, every-2 / offset-1 (R1 even, R2 odd)."
+echo "  * dmd_normalization_enabled=false (raw decaying DMD gradient)."
+echo "  * MAE gate: ON (r_full=2.0, ema=0.9, min_weight=0.0)."
+echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -101,8 +114,11 @@ srun torchrun \
     dmd_loss_weight=1.0 \
     dmd_loss_start_step=0 \
     dmd_loss_warmup_steps=20 \
-    dmd_normalization_enabled=true \
-    dmd_normalization_denom_floor=1.0 \
+    dmd_normalization_enabled=false \
+    dmd_mae_gate_enabled=true \
+    dmd_mae_gate_r_full=2.0 \
+    dmd_mae_gate_ema=0.9 \
+    dmd_mae_gate_min_weight=0.0 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.0 \
     stat_anchor_STD_long_weight=0.0 \
@@ -144,7 +160,10 @@ srun torchrun \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.02 \
-    ladd_r1_every_n_steps=1 \
+    ladd_r1_every_n_steps=2 \
+    ladd_r2_gamma=0.02 \
+    ladd_r2_every_n_steps=2 \
+    ladd_r2_phase_offset=1 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=7 \
     ladd_wavelet_hf_enabled=true \
@@ -164,6 +183,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v7h_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8b_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

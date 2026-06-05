@@ -87,6 +87,32 @@ ladd_wavelet_hf_drop_ll: true        # drop LL (HF-only disc input)
 ladd_wavelet_hf_adapter_init_gain: 0.1  # small init -> step-0 in-distribution
 
 # ---------------------------------------------------------------------------
+# MAE-based student-vs-teacher DMD downweighting (opt-in; default OFF).
+# ---------------------------------------------------------------------------
+# The DMD gradient pulls the student toward the frozen teacher. That only
+# helps while the teacher is the better oracle. This gate compares the
+# student's and teacher's per-chunk error vs GT on the SAME scored chunk
+# (and same supervised slots) and scales the DMD loss down as they
+# converge — to 0 once the student matches/beats the teacher (where DMD
+# would otherwise drag the better student back to the worse teacher).
+#   m_real = |pred_real - gt| ; m_fake = |pred_student - gt|
+#   r = EMA(m_fake / m_real) ; w = clamp((r-1)/(r_full-1), min_weight, 1)
+# Also logs gen/student_mae_vs_gt (companion to gen/real_score_mae_vs_gt)
+# so the crossover is visible on the same per-chunk basis.
+dmd_mae_gate_enabled: false          # opt-in
+dmd_mae_gate_r_full: 2.0             # fake/real ratio at which DMD = full weight (>1)
+dmd_mae_gate_ema: 0.9               # EMA smoothing of the ratio (0 = raw per-step)
+dmd_mae_gate_min_weight: 0.0        # floor on the gate weight (0 = can fully gate off)
+
+# CausVid normalizer denominator floor. DMD grad is divided by
+# max(|x0 - pred_real|.mean(), floor). Default 0.05 (legacy: only guards
+# the extreme cusp, caps amplification at 20x). Set to 1.0 to divide by
+# max(|f|, 1) -> no amplification once the student converges (|f| < 1),
+# while still down-scaling over-large grads. Only applies when
+# dmd_normalization_enabled=true.
+dmd_normalization_denom_floor: 0.05
+
+# ---------------------------------------------------------------------------
 # Teacher — frozen v14 LoRA merged into base Wan. ONE pass only.
 # ---------------------------------------------------------------------------
 # Online v14 LoRA training is OFF: the LoRA load merges the adapter

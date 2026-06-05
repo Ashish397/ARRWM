@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v7h
+#SBATCH --job-name=af-p3-cb-flashtr-v8c
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,11 +11,33 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step v7H — base v6E, DMD_NORMALIZATION DISABLED.
-# Ablation test: does turning off the DMD score normalization change
-# the dynamics enough to break the disc out of log(2) saturation
-# (or shift overall training behaviour)?
-# All other knobs identical to v6E.
+# Phase-3 DMD one-step — v8c = v6e + bring TRAINING context up to the
+# INFERENCE (7-chunk eval) operating regime.
+#
+# Two coupled changes vs v6e (so the supervised chunks roll from clean
+# GT context that matches deployment, not a degraded training-only one):
+#   * dmd_42f_gt_anchor=true  (B): the +npb leading anchor is now a CLEAN
+#     GT chunk (seed-prefilled) instead of a drifted student rollout —
+#     removes the generate-vs-score mismatch (student anchor in the KV
+#     slot the 42f teacher scores with GT) AND adds a 7th clean GT chunk
+#     on top of the 6-chunk (cf=18) seed, so the supervised chunks see
+#     pure GT context.
+#   * local_attn_size=24            : 8-chunk attention window (7 GT
+#     context + self) so that 7th GT chunk is actually ATTENDED (the
+#     21-frame window only held 6 context chunks). The 7-chunk eval runs
+#     on the same pipeline, so it ALSO uses window 24 -> train/eval match.
+#
+# NOTE: cf stays 18 (Option "C", cf=21, is BOTH blocked by the hard guard
+# cf < num_training_frames=21 AND redundant — the GT anchor already adds
+# the 7th GT chunk; a cf=21 8th chunk would just evict from the 24-window).
+#
+# RESEARCH RISK (not a bug): the generator is warm-started from an ODE
+# checkpoint trained at local_attn_size=21; attending to 24 is a wider
+# (slightly OOD) window the student may need a few steps to adapt to.
+#
+# Everything else identical to v6e (R1-only GAN, matched gt_transition).
+# If validated, gt_anchor + local_attn=24 become defaults.
+# 21->24 frame window, 200-step max.
 # =====================================================================
 
 set -e -o pipefail
@@ -28,6 +50,8 @@ WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
 conda activate arrwm
+
+# GAN OFF -> no SAM2 prereq checks needed.
 
 CACHE_DIR='/scratch/u6ex/as1748.u6ex/frodobots/hf_cache'
 export HF_HOME=$CACHE_DIR
@@ -52,13 +76,12 @@ export ARRWM_ROPE_DEBUG=1
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 DMD ONE-STEP v7H (clamped-denominator normalizer) on $(date)"
-echo "  * Base: v6E."
-echo "  * CHANGE: DMD normalizer kept ON but denominator = max(|f|, 1)"
-echo "    (dmd_normalization_enabled=true, dmd_normalization_denom_floor=1.0)."
-echo "    No amplification once the student converges (|f|<1); still"
-echo "    down-scales over-large grads. (Was: normalization fully OFF.)"
-echo "  * Everything else identical to v6E."
+echo "Starting Phase-3 DMD ONE-STEP v8c (v6e + GT-anchor + local_attn=24) on $(date)"
+echo "  * allsup: 3 supervised chunks per 7-chunk roll."
+echo "  * cf=18 seed + clean GT anchor = 7 GT chunks; local_attn_size=24."
+echo "  * 1 roll per ride (fresh seed each step)."
+echo "  * GAN: ON (ladd_teacher_feat, matched gt_transition, R1-only)."
+echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -90,11 +113,11 @@ srun torchrun \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=1 \
     dfake_gen_update_ratio=5 \
-    model_kwargs.local_attn_size=21 \
+    model_kwargs.local_attn_size=24 \
     num_workers=0 \
     sample_fps=16 \
     boundary_vae_roundtrip=false \
-    local_attn_size_schedule=[[0,21]] \
+    local_attn_size_schedule=[[0,24]] \
     real_teacher_causal_mask=false \
     real_guidance_scale=0.0 \
     dmd_context_clean_frames=18 \
@@ -102,7 +125,6 @@ srun torchrun \
     dmd_loss_start_step=0 \
     dmd_loss_warmup_steps=20 \
     dmd_normalization_enabled=true \
-    dmd_normalization_denom_floor=1.0 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.0 \
     stat_anchor_STD_long_weight=0.0 \
@@ -123,6 +145,7 @@ srun torchrun \
     dmd_42f_gt_after_chunks=3 \
     dmd_42f_rand_sup_slot=false \
     dmd_42f_allsup=true \
+    dmd_42f_gt_anchor=true \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
@@ -164,6 +187,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v7h_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8c_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

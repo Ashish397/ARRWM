@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v7h
+#SBATCH --job-name=af-p3-cb-flashtr-v8b2
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,11 +11,25 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step v7H — base v6E, DMD_NORMALIZATION DISABLED.
-# Ablation test: does turning off the DMD score normalization change
-# the dynamics enough to break the disc out of log(2) saturation
-# (or shift overall training behaviour)?
-# All other knobs identical to v6E.
+# Phase-3 DMD one-step — single frozen teacher, no aux pass.
+#
+# v8b2 = v8b but with the 7h DMD normalize FIX instead of norm-off:
+#   * dmd_normalization_enabled=true + dmd_normalization_denom_floor=1.0
+#     -> DMD grad divided by max(|f|, 1) (f = |x0 - pred_real|.mean()).
+#     Keeps scale-invariant down-scaling of over-large grads but removes
+#     the cusp AMPLIFICATION near convergence (when |f| < 1 it divides by
+#     1, not by a tiny number). Replaces v8b's fully-raw norm-off.
+#   * MAE-based student-vs-teacher DMD gate (dmd_mae_gate_enabled=true):
+#     measures m_real=|pred_real-gt| and m_fake=|pred_student-gt| on the
+#     SAME scored chunk/supervised slots and scales the DMD loss down as
+#     m_fake -> m_real (and to 0 once the student matches/beats the
+#     teacher). r_full=2.0, ema=0.9, min_weight=0.0. Also logs
+#     gen/student_mae_vs_gt so the per-chunk crossover is finally
+#     visible on the same basis as gen/real_score_mae_vs_gt.
+#   * Aligned with v6e otherwise: R1-only GAN (NO R2), ladd_r1_every_n_steps=1,
+#     diff_aug on. The DMD normalize-fix + MAE gate are the only deltas vs v6e.
+#
+# 21-frame window, 200-step max. GAN ON (ladd_teacher_feat).
 # =====================================================================
 
 set -e -o pipefail
@@ -52,13 +66,13 @@ export ARRWM_ROPE_DEBUG=1
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 DMD ONE-STEP v7H (clamped-denominator normalizer) on $(date)"
-echo "  * Base: v6E."
-echo "  * CHANGE: DMD normalizer kept ON but denominator = max(|f|, 1)"
-echo "    (dmd_normalization_enabled=true, dmd_normalization_denom_floor=1.0)."
-echo "    No amplification once the student converges (|f|<1); still"
-echo "    down-scales over-large grads. (Was: normalization fully OFF.)"
-echo "  * Everything else identical to v6E."
+echo "Starting Phase-3 DMD ONE-STEP (v8b2 = v6e + DMD normalize-fix + MAE gate, R1-only) on $(date)"
+echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed)."
+echo "  * 1 roll per ride (fresh seed each step)."
+echo "  * GAN: ON (ladd_teacher_feat, content-matched gt_transition), R1-only (NO R2)."
+echo "  * dmd_normalization: ON with denom floor=1.0 -> divide by max(|f|,1)."
+echo "  * MAE gate: ON (r_full=2.0, ema=0.9, min_weight=0.0)."
+echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
 srun --ntasks-per-node=1 bash -c \
@@ -90,11 +104,11 @@ srun torchrun \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=1 \
     dfake_gen_update_ratio=5 \
-    model_kwargs.local_attn_size=21 \
+    model_kwargs.local_attn_size=24 \
     num_workers=0 \
     sample_fps=16 \
     boundary_vae_roundtrip=false \
-    local_attn_size_schedule=[[0,21]] \
+    local_attn_size_schedule=[[0,24]] \
     real_teacher_causal_mask=false \
     real_guidance_scale=0.0 \
     dmd_context_clean_frames=18 \
@@ -102,7 +116,10 @@ srun torchrun \
     dmd_loss_start_step=0 \
     dmd_loss_warmup_steps=20 \
     dmd_normalization_enabled=true \
-    dmd_normalization_denom_floor=1.0 \
+    dmd_mae_gate_enabled=true \
+    dmd_mae_gate_r_full=2.0 \
+    dmd_mae_gate_ema=0.9 \
+    dmd_mae_gate_min_weight=0.0 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.0 \
     stat_anchor_STD_long_weight=0.0 \
@@ -123,6 +140,7 @@ srun torchrun \
     dmd_42f_gt_after_chunks=3 \
     dmd_42f_rand_sup_slot=false \
     dmd_42f_allsup=true \
+    dmd_42f_gt_anchor=true \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
@@ -164,6 +182,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v7h_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8b2_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

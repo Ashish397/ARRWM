@@ -303,6 +303,20 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "dmd_42f_allsup", False)
         )
 
+        # ``dmd_42f_gt_anchor``: make the +npb leading-anchor chunk (rolled
+        # in ``setup_sequence`` before the first supervised chunk) a CLEAN
+        # GT chunk (seed-prefilled) instead of a student rollout. The
+        # student anchor writes a drifted student chunk into the KV slot
+        # the supervised chunks attend to, while the 42f teacher scores
+        # that slot with GT (a generate-vs-score mismatch); a GT anchor
+        # removes the mismatch and gives the supervised chunks clean GT
+        # context (= the 7-chunk inference eval). Default OFF (legacy
+        # student anchor). See ``setup_sequence``. NOTE: candidate to
+        # become the default if it validates.
+        self.dmd_42f_gt_anchor = bool(
+            getattr(args, "dmd_42f_gt_anchor", False)
+        )
+
         # ``dmd_only_first_chunk_per_ride``: pair with
         # ``max_rolls_per_ride > 1`` to roll the student N causal
         # chunks per ride but only DMD-supervise the first. Subsequent
@@ -1400,6 +1414,20 @@ class ActionForcingDMD(SelfForcingModel):
         # in v11+ where we want no power when teacher matches student.
         self.dmd_normalization_enabled = bool(
             getattr(args, "dmd_normalization_enabled", True)
+        )
+        # Denominator FLOOR for the CausVid normalizer. The DMD grad is
+        # divided by ``max(|x0 - pred_real|.mean(), floor)``. The legacy
+        # value 0.05 only guards the extreme cusp (caps amplification at
+        # 20x) but still amplifies the gradient whenever the per-sample
+        # normalizer < 1. Setting the floor to 1.0 makes the denominator
+        # ``max(|f|, 1)``: for normalizers >= 1 it behaves like the
+        # standard normalizer (down-scaling large grads), but once the
+        # student converges and |f| drops below 1 it divides by 1 — i.e.
+        # NO amplification near convergence, while still keeping the
+        # scale-invariant down-weighting of over-large grads. Default
+        # 0.05 preserves the prior behaviour exactly.
+        self.dmd_normalization_denom_floor = float(
+            getattr(args, "dmd_normalization_denom_floor", 0.05)
         )
         # --- MAE-based student-vs-teacher DMD downweighting ---
         # The DMD gradient pulls the student toward the frozen teacher
@@ -2928,8 +2956,18 @@ class ActionForcingDMD(SelfForcingModel):
         apples-to-apples comparison of "is the teacher still the better
         oracle here". Returns 1.0 (no gating) when the gate is disabled,
         GT is unavailable, shapes mismatch, or the teacher error is
-        degenerate. Per-rank (each rank gates on its own ride); the EMA
-        state lives on ``self`` and is deterministic given its inputs.
+        degenerate.
+
+        DDP note: the weight is per-rank (each rank gates on its OWN
+        ride's student-vs-teacher ratio, with its own EMA state on
+        ``self``). DDP then averages the scaled gradients, so the
+        effective signal is ``mean_r(w_r · g_r)`` — each ride is
+        downweighted by how good ITS student is, which is the intended
+        behaviour (not a bug). The EMA momentum makes the per-rank
+        ``w_r`` converge over time. No-op steps (early-returns below)
+        deliberately do NOT touch the EMA, so an occasional empty-mask /
+        missing-GT step leaves the smoothed ratio untouched rather than
+        resetting it.
         """
         if not self.dmd_mae_gate_enabled:
             return 1.0
@@ -3163,12 +3201,14 @@ class ActionForcingDMD(SelfForcingModel):
             # clamp_min bounds the cusp amplification when the student
             # converges to the teacher: small p_real => big 1/normalizer
             # => DMD gradient pulled hard toward the teacher's prior
-            # (gray-collapse signature with foreign teachers). 0.05 caps
-            # the per-sample amplification at 20x; 1e-6 was effectively
-            # unbounded (1e6x). Prefer ``dmd_normalization_enabled=false``
-            # for foreign teachers; this clamp is a defensive secondary
-            # guard.
-            grad = grad / normalizer.clamp_min(0.05)
+            # (gray-collapse signature with foreign teachers). The floor
+            # is ``dmd_normalization_denom_floor`` (default 0.05 caps the
+            # per-sample amplification at 20x). Set it to 1.0 to divide by
+            # ``max(|f|, 1)`` — no amplification once |f| < 1 (near
+            # convergence) while still down-scaling over-large grads.
+            grad = grad / normalizer.clamp_min(
+                self.dmd_normalization_denom_floor
+            )
         grad = torch.nan_to_num(grad)
 
         # Diagnostics: pred_real / pred_fake L2 norms (RMS) for the gen
@@ -3415,6 +3455,22 @@ class ActionForcingDMD(SelfForcingModel):
             (original_latent.double() - grad.double()).detach()[gradient_mask],
             reduction="mean",
         )
+
+        # MAE-based student-vs-teacher gate: scale the DMD loss (hence
+        # its gradient) down as the student's per-chunk error approaches
+        # / beats the teacher's on the SAME scored chunk. ``w`` is a
+        # detached scalar so it only reweights the gradient — it does not
+        # add a gradient path of its own. No-op (w=1) when disabled.
+        # Applied to the DMD term ONLY; anti-collapse below is untouched.
+        _gate_w = self._dmd_mae_gate_weight(
+            pred_real=pred_real_image_detached,
+            pred_student=original_latent.detach(),
+            gt_target=gt_target,
+            gradient_mask=gradient_mask,
+            log_dict=dmd_log_dict,
+        )
+        if _gate_w != 1.0:
+            dmd_loss = dmd_loss * _gate_w
 
         # Anti-collapse: stashed unscaled on ``self`` so the caller adds
         # it AFTER the dmd_loss_weight multiplication. See helper
@@ -4358,27 +4414,65 @@ class ActionForcingDMD(SelfForcingModel):
         # ``noisy_start_sdn = npb`` (= the absolute position right
         # after the anchor) and the geometry of clean_lo / clean_x_GT
         # slicing collapses to the uniform iter k≥2 formula.
-        anchor_noise = torch.randn(
-            [batch_size, npb, *seed_latents.shape[2:]],
-            device=device, dtype=dtype,
-        )
-        with torch.no_grad():
-            anchor_full_cond, _ = self.build_action_conditional(
-                prompt_embeds=prompt_embeds,
-                gt_actions=ride_actions_window,
+        # ``dmd_42f_gt_anchor``: make the +npb leading-anchor chunk a CLEAN
+        # GT chunk (seed-prefilled, same denoise->commit path as the seed
+        # loop) instead of a student-rolled chunk. The student anchor
+        # writes a drifted student chunk into KV frames [cf, cf+npb) that
+        # the supervised rollout chunks attend to AND that the 42f teacher
+        # scores with GT in that slot (n_ctx is GT) — a generate-vs-score
+        # mismatch. A GT anchor makes the supervised chunk's KV context
+        # purely clean GT (matching the 7-chunk inference eval) and aligns
+        # the rollout context with the GT the teacher scores against, while
+        # keeping the EXACT iter-1 geometry (``current_length=npb`` headroom
+        # the 42f slice bounds need). Default OFF (legacy student anchor).
+        if bool(getattr(self, "dmd_42f_gt_anchor", False)):
+            anchor_gt = ride_latents_window[:, cf:cf + npb]
+            if int(anchor_gt.shape[1]) < npb:
+                raise RuntimeError(
+                    "dmd_42f_gt_anchor: ride_latents_window too short for a "
+                    f"GT anchor at [cf:cf+npb]=[{cf}:{cf + npb}] (have "
+                    f"{int(ride_latents_window.shape[1])} frames)."
+                )
+            with torch.no_grad():
+                anchor_cond_dict, _ = self.build_action_conditional(
+                    prompt_embeds=prompt_embeds,
+                    gt_actions=ride_actions_window,
+                )
+                anchor_block_cond = _slice_per_frame_streams(
+                    anchor_cond_dict, frame_start=cf, frame_count=npb,
+                )
+                # Same model-style denoise->commit prefill as the seed loop,
+                # so KV frames [cf, cf+npb) carry a GT trace in the same
+                # representation regime as the rest of the seed.
+                pipe._seed_prefill_chunk(
+                    seed_chunk=anchor_gt,
+                    seed_block_cond=anchor_block_cond,
+                    current_start_frame=cf,
+                )
+            del anchor_cond_dict
+            anchor_chunk = anchor_gt.detach()
+        else:
+            anchor_noise = torch.randn(
+                [batch_size, npb, *seed_latents.shape[2:]],
+                device=device, dtype=dtype,
             )
-            # Anchor cold-start (pure noise + full ladder).
-            anchor_chunk, _, _ = pipe.generate_chunk_with_cache(
-                noise=anchor_noise,
-                current_start_frame=cf,
-                requires_grad=False,
-                prefer_cache_pred_in_output=False,
-                gt_latents=None,  # no MAE on the anchor
-                flash_dmd_enabled=bool(self.flash_dmd_enabled),
-                **anchor_full_cond,
-            )
-        del anchor_full_cond
-        anchor_chunk = anchor_chunk.detach()
+            with torch.no_grad():
+                anchor_full_cond, _ = self.build_action_conditional(
+                    prompt_embeds=prompt_embeds,
+                    gt_actions=ride_actions_window,
+                )
+                # Anchor cold-start (pure noise + full ladder).
+                anchor_chunk, _, _ = pipe.generate_chunk_with_cache(
+                    noise=anchor_noise,
+                    current_start_frame=cf,
+                    requires_grad=False,
+                    prefer_cache_pred_in_output=False,
+                    gt_latents=None,  # no MAE on the anchor
+                    flash_dmd_enabled=bool(self.flash_dmd_enabled),
+                    **anchor_full_cond,
+                )
+            del anchor_full_cond
+            anchor_chunk = anchor_chunk.detach()
 
         self.streaming_state = {
             "current_length": int(npb),  # anchor counts toward the cumulative sdn
