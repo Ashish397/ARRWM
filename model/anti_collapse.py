@@ -560,10 +560,16 @@ def compute_stat_anchor_loss(
     M2_long = _causal_cumulative_mean(M2_pf)
     TV_long = _causal_cumulative_mean(TV_pf)
 
-    # Anchor broadcast — SHORT horizon uses per-batch seed anchor.
-    a_STD_short = STD_anchor.unsqueeze(1).to(STD_pf.dtype)   # [B, 1]
-    a_M2_short = M2_anchor.unsqueeze(1).to(M2_pf.dtype)
-    a_TV_short = TV_anchor.unsqueeze(1).to(TV_pf.dtype)
+    # Anchor broadcast. The anchor may be per-batch ``[B]`` (seed mode —
+    # one value per ride, broadcast over frames) OR per-frame ``[B, F]``
+    # (matched-GT mode — each rolled chunk carries its own k-closest-GT
+    # anchor). ``[B] -> [B,1]`` broadcasts; ``[B,F]`` is used as-is.
+    def _bf(a, like):
+        a = a.to(like.dtype)
+        return a if a.dim() == 2 else a.unsqueeze(1)
+    a_STD_short = _bf(STD_anchor, STD_pf)
+    a_M2_short = _bf(M2_anchor, M2_pf)
+    a_TV_short = _bf(TV_anchor, TV_pf)
 
     # LONG-horizon anchor — uses override (e.g. cross-rank EMA of GT
     # population stats) when provided, else falls back to the same
@@ -651,7 +657,7 @@ def compute_stat_anchor_loss(
     ):
         SOS_pf = _per_frame_SOS(pred_x0)                    # [B, F]
         SOS_long = _causal_cumulative_mean(SOS_pf)          # [B, F]
-        a_SOS = SOS_anchor.unsqueeze(1).to(SOS_pf.dtype)    # [B, 1]
+        a_SOS = _bf(SOS_anchor, SOS_pf)    # [B,1] (seed) or [B,F] (matched)
         mse_SOS_short = (SOS_pf - a_SOS).pow(2).mean()
         mse_SOS_long = (SOS_long - a_SOS).pow(2).mean()
         SOS_a2 = float(SOS_anchor.detach().mean().pow(2).item())
@@ -668,7 +674,9 @@ def compute_stat_anchor_loss(
     ):
         M1_pf = _per_frame_M1(pred_x0)                      # [B, F, C]
         M1_long = _causal_cumulative_mean(M1_pf)            # [B, F, C]
-        a_M1 = M1_anchor.unsqueeze(1).to(M1_pf.dtype)       # [B, 1, C]
+        # M1 anchor: per-batch [B,C] -> [B,1,C], or per-frame [B,F,C] as-is.
+        a_M1 = M1_anchor.to(M1_pf.dtype)
+        a_M1 = a_M1 if a_M1.dim() == 3 else a_M1.unsqueeze(1)
         mse_M1_short = (M1_pf - a_M1).pow(2).mean()
         mse_M1_long = (M1_long - a_M1).pow(2).mean()
         M1_a2 = float(M1_anchor.detach().mean().pow(2).item())
@@ -763,138 +771,6 @@ def compute_stat_anchor_loss(
     }
     return loss, logs
 
-
-def compute_stat_anchor_target_matching_loss(
-    pred_x0: torch.Tensor,
-    *,
-    M2_target: float = 9.0,
-    M2_band_low: float = 5.0,
-    M2_band_high: float = 13.0,
-    M2_weight: float = 0.1,
-    TV_target: float = 7.8,
-    TV_band_low: float = 6.0,
-    TV_band_high: float = 9.0,
-    TV_weight: float = 0.1,
-    rank_target: float = 1.5,
-    rank_band_high: float = 2.25,
-    rank_band_low: Optional[float] = None,
-    rank_weight: float = 0.1,
-) -> Tuple[torch.Tensor, dict]:
-    """Fixed-target dead-band MSE matching on per-frame summary stats.
-
-    For each per-frame stat ``s[t]`` (computed on the rollout), apply
-    a square loss toward a fixed target ``T``, gated to fire only
-    when ``s[t]`` is outside a configured pass-through band:
-
-        loss[t] = (s[t] - T)^2   if s[t] < band_low or s[t] > band_high
-                  else 0
-
-    Means over (B, F) and across the three stats then multiplied by
-    their per-stat weights. Differs from ``compute_stat_anchor_loss``:
-    no seed anchor, no EMA, no relative tolerance — just absolute
-    targets + absolute gating thresholds derived from offline GT
-    distribution analysis.
-
-    Stats:
-      * **M2** (= Σ_c σ_c², user's "STD" target): typical Wan-1.3B
-        value 6-9. Default target 9, band [5, 13] (two-sided gate).
-      * **TV** (= Σ_c mean|Δx|): typical Wan-1.3B value 7-10.
-        Default target 7.8, band [6, 9] (two-sided gate).
-      * **stable_rank** (= ||X||_F²/σ_max² per frame): typical 1.0-2.0
-        in GT. Default target 1.5, upper-only gate at 2.25 (rank
-        being above the band signals over-uniform spectrum =
-        collapse-precursor; rank being below 1.5 toward 1.0 just
-        means the chunk has a dominant direction, which is fine).
-        Set ``rank_band_low`` to enable a two-sided gate; ``None``
-        keeps the upper-only contract.
-
-    Returns ``(loss_scalar, log_dict)``. ``loss_scalar`` is graph-
-    attached to ``pred_x0``; ``log_dict`` has stat values, band-
-    membership rates, and per-stat active losses for wandb.
-    """
-    if pred_x0.dim() != 5:
-        raise ValueError(
-            f"compute_stat_anchor_target_matching_loss expects "
-            f"[B, F, C, H, W]; got {tuple(pred_x0.shape)}"
-        )
-
-    # Per-frame stats (graph-attached on pred).
-    M2_pf = _per_frame_M2(pred_x0)                  # [B, F]
-    TV_pf = _per_frame_TV(pred_x0)
-    rank_pf = _per_frame_stable_rank(pred_x0)
-
-    M2_t = float(M2_target)
-    TV_t = float(TV_target)
-    rk_t = float(rank_target)
-
-    # Per-stat square error, gated to zero inside the pass-through band.
-    M2_sq = (M2_pf - M2_t).pow(2)
-    M2_gate = (
-        (M2_pf < float(M2_band_low)) | (M2_pf > float(M2_band_high))
-    ).to(M2_sq.dtype)
-    M2_active_pf = M2_sq * M2_gate
-
-    TV_sq = (TV_pf - TV_t).pow(2)
-    TV_gate = (
-        (TV_pf < float(TV_band_low)) | (TV_pf > float(TV_band_high))
-    ).to(TV_sq.dtype)
-    TV_active_pf = TV_sq * TV_gate
-
-    rank_sq = (rank_pf - rk_t).pow(2)
-    if rank_band_low is not None:
-        rk_gate = (
-            (rank_pf < float(rank_band_low))
-            | (rank_pf > float(rank_band_high))
-        ).to(rank_sq.dtype)
-    else:
-        rk_gate = (rank_pf > float(rank_band_high)).to(rank_sq.dtype)
-    rank_active_pf = rank_sq * rk_gate
-
-    M2_loss = M2_active_pf.mean()
-    TV_loss = TV_active_pf.mean()
-    rank_loss = rank_active_pf.mean()
-
-    loss = (
-        float(M2_weight) * M2_loss
-        + float(TV_weight) * TV_loss
-        + float(rank_weight) * rank_loss
-    )
-
-    logs = {
-        # Targets + band thresholds (constant within run, but logged
-        # for traceability when scrubbing wandb).
-        "stat/tm_M2_target": torch.tensor(M2_t, device=pred_x0.device),
-        "stat/tm_M2_band_low": torch.tensor(
-            float(M2_band_low), device=pred_x0.device,
-        ),
-        "stat/tm_M2_band_high": torch.tensor(
-            float(M2_band_high), device=pred_x0.device,
-        ),
-        "stat/tm_TV_target": torch.tensor(TV_t, device=pred_x0.device),
-        "stat/tm_TV_band_low": torch.tensor(
-            float(TV_band_low), device=pred_x0.device,
-        ),
-        "stat/tm_TV_band_high": torch.tensor(
-            float(TV_band_high), device=pred_x0.device,
-        ),
-        "stat/tm_rank_target": torch.tensor(rk_t, device=pred_x0.device),
-        "stat/tm_rank_band_high": torch.tensor(
-            float(rank_band_high), device=pred_x0.device,
-        ),
-        # Pred summary
-        "stat/tm_M2_pred_mean": M2_pf.mean().detach(),
-        "stat/tm_TV_pred_mean": TV_pf.mean().detach(),
-        "stat/tm_rank_pred_mean": rank_pf.mean().detach(),
-        # Out-of-band rates (= fraction of (B,F) frames triggering loss).
-        "stat/tm_M2_out_of_band_rate": M2_gate.mean().detach(),
-        "stat/tm_TV_out_of_band_rate": TV_gate.mean().detach(),
-        "stat/tm_rank_out_of_band_rate": rk_gate.mean().detach(),
-        # Per-stat active losses (post-gate, pre-weight)
-        "stat/tm_M2_active": M2_loss.detach(),
-        "stat/tm_TV_active": TV_loss.detach(),
-        "stat/tm_rank_active": rank_loss.detach(),
-    }
-    return loss, logs
 
 
 def compute_std_corridor_anti_collapse(

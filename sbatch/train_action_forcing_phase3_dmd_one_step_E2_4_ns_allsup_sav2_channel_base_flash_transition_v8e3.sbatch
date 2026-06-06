@@ -192,6 +192,10 @@ srun torchrun \
     dmd_42f_rand_sup_slot=false \
     dmd_42f_allsup=true \
     dmd_42f_gt_anchor=true \
+    forward_noiser_enabled=true \
+    forward_noiser_loss_mode=teacher_feat \
+    forward_noiser_step_unconditioned=true \
+    forward_noiser_feat_t=0 \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
@@ -231,10 +235,6 @@ srun torchrun \
     ladd_gt_transition_match_k=4 \
     ladd_gt_transition_xeq_preserve_delta=true \
     ladd_gt_transition_xeq_per_channel=true \
-    forward_noiser_enabled=true \
-    forward_noiser_loss_mode=teacher_feat \
-    forward_noiser_step_unconditioned=true \
-    forward_noiser_feat_t=0 \
     forward_noiser_sw_n_proj=64 \
     forward_noiser_sw_max_tokens=4096 \
     fake_alt_rollout2_num_seed_chunks=5 \

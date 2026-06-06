@@ -6555,6 +6555,79 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     pass
 
     @torch.no_grad()
+    def _build_holdout_eval_dataset(self):
+        """Lazily build a small ZarrRideDataset over ``holdout_eval_root``,
+        used to SEED the pred_image_7_chunk eval from rides the model never
+        trains on (true held-out generalization eval). Built with NO cache
+        (a 20-ride scan is fast) so all ranks can build concurrently with no
+        manifest-write race. Returns None when holdout_eval_root is unset."""
+        if getattr(self, "_holdout_eval_dataset_built", False):
+            return self._holdout_eval_dataset
+        self._holdout_eval_dataset_built = True
+        self._holdout_eval_dataset = None
+        root = getattr(self.config, "holdout_eval_root", None)
+        if not root:
+            return None
+        from utils.zarr_dataset import ZarrRideDataset
+        cfg = self.config
+        try:
+            self._holdout_eval_dataset = ZarrRideDataset(
+                encoded_root=str(root),
+                caption_root=str(cfg.caption_root),
+                motion_root=str(cfg.motion_root),
+                ss_vae_checkpoint=str(cfg.ss_vae_checkpoint),
+                min_ride_frames=int(getattr(cfg, "min_ride_frames", 64)),
+                device="cpu",
+                max_rides=None,
+                sort_by_length=None,
+                cache_path=None,  # no shared cache -> no cross-rank write race
+            )
+            if self.is_main_process:
+                logging.info(
+                    "[holdout-eval] 7chunk eval seeds from %d held-out rides "
+                    "in %s", len(self._holdout_eval_dataset), str(root),
+                )
+        except Exception as e:  # never let eval-setup kill training
+            logging.warning(
+                "[holdout-eval] failed to build holdout dataset from %s: %r "
+                "-> falling back to training-ride 7chunk seed.", str(root), e,
+            )
+            self._holdout_eval_dataset = None
+        return self._holdout_eval_dataset
+
+    def _holdout_eval_ride_for_step(self, step: int):
+        """Return a {latents, z_actions, prompt_embeds} 14-chunk slice from
+        the holdout set to seed the 7chunk eval, or None. DETERMINISTIC per
+        step (same ride on every rank -> DDP-balanced + runs comparable).
+        ``holdout_eval_mode``: 'cycle' (default) rotates a different held-out
+        ride per eval step; 'fixed' always uses ride 0 (watch one scene)."""
+        ds = self._build_holdout_eval_dataset()
+        if ds is None or len(ds) == 0:
+            return None
+        npb = int(getattr(self.config, "num_frame_per_block", 3))
+        need = 14 * npb
+        mode = str(getattr(self.config, "holdout_eval_mode", "cycle")).lower()
+        interval = max(1, int(getattr(self, "sample_interval", 1)))
+        ordinal = int(step) // interval
+        n = len(ds)
+        for off in range(n):  # skip any too-short ride (rare; all >=69 frames)
+            idx = 0 if mode == "fixed" else (ordinal + off) % n
+            meta = ds[idx]
+            if int(meta.get("n_latent_frames", 0)) < need:
+                continue
+            ride = _load_ride_tensors(
+                ds, meta, self.device, self.dtype,
+                action_dims=self.action_dims, max_frames=need,
+            )
+            if ride is None or int(ride["latents"].shape[1]) < need:
+                continue
+            return {
+                "latents": ride["latents"][:, :need].contiguous(),
+                "z_actions": ride["z_actions"][:, :need].contiguous(),
+                "prompt_embeds": ride["prompt_embeds"],
+            }
+        return None
+
     def _log_pred_image_7chunk_sample(self, step: int) -> None:
         """Eval rollout: seed the causal student with 7 GT-context chunks
         (21 latent frames) and roll out 7 more chunks (21 frames), then
@@ -8180,6 +8253,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 getattr(self, "_sample_7chunk_ride", None) is not None,
             )
         if _do7:
+            # Seed the 7chunk eval from the HELD-OUT set (rides excluded from
+            # training) when holdout_eval_root is set, so the video measures
+            # generalization, not memorized training rides. Overrides the
+            # training-ride stash on ALL ranks with the SAME deterministic
+            # held-out ride (DDP-balanced). pred_image is left untouched.
+            if getattr(self.config, "holdout_eval_root", None):
+                _hr = self._holdout_eval_ride_for_step(int(self.step) + 1)
+                if _hr is not None:
+                    self._sample_7chunk_ride = _hr
             self._log_pred_image_7chunk_sample(int(self.step) + 1)
 
         self._mem_step_snapshot("8_exit")

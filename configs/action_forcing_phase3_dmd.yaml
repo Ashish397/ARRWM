@@ -12,6 +12,34 @@ _extends: action_forcing_phase1.yaml
 config_name: action-forcing-phase3-dmd
 run_name: action_forcing_phase3_dmd
 
+# ---------------------------------------------------------------------------
+# Dataset selection (config-set). The active dataset is ``encoded_root``
+# (+ caption_root/motion_root from phase1). ``holdout_zarr_list`` names a
+# file of zarr basenames excluded from TRAINING (held out for eval).
+#
+# DEFAULT (this file): encoded_root = frodobots_encoded_weu, with the 20
+# holdout rides EXCLUDED from training (configs/holdout_rides.txt). The
+# held-out rides back the eval videos.
+#
+# Alternative dataset presets — select by overriding encoded_root (and
+# holdout_zarr_list) on the sbatch ``--override`` line:
+#   weu (current, holdout):  encoded_root=/projects/u6ex/fbots/frodobots_encoded_weu
+#                            holdout_zarr_list=configs/holdout_rides.txt   (838 train rides)
+#   weunz (clean eval):      encoded_root=/projects/u6ex/fbots/frodobots_encoded_weunz
+#                            holdout_zarr_list=configs/holdout_rides.txt  (NOTE: weunz ALREADY
+#                            contains the 20 holdout rides, so you MUST keep this exclusion
+#                            for a clean held-out eval -> ~2619 train rides)
+#   weunz (max, no holdout): encoded_root=/projects/u6ex/fbots/frodobots_encoded_weunz
+#                            holdout_zarr_list=null   (all 2639; the holdout IS trained on,
+#                            so its eval is no longer held out)
+# To SEED the pred_image_7_chunk eval from the held-out rides, also set
+#   holdout_eval_root=/projects/u6ex/fbots/frodobots_encoded_weu_holdout
+#   holdout_eval_mode=cycle|fixed   (cycle: a different held-out ride per eval step)
+# Other curated pools available: frodobots_encoded_6cities (1939),
+# frodobots_encoded (master, 4160). First scan of a new root is slow
+# (~scan all zarrs) then cached to <log_dir>/.ride_manifest.pt.
+holdout_zarr_list: configs/holdout_rides.txt
+
 # 21-frame KV cache window — covers a single rolled chunk
 # (rollout_frames = num_max_frames = 21).
 local_attn_size_schedule: [[0, 21]]

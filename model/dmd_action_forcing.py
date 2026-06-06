@@ -1707,6 +1707,24 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_loss_weight = float(
             getattr(args, "stat_anchor_loss_weight", 0.0)
         )
+        # --- Matched-GT stat anchor (stat_anchor_mode='target_matching') ---
+        # In target_matching mode the stat anchor sources ALL its stats
+        # (STD/M2/TV/SOS/M1) from the K closest GT chunks the GAN's matcher
+        # would pick (same MAE-on-mean-equalized texture metric + the same
+        # gt_match_latents pool), PER ROLLED CHUNK, instead of the positional
+        # GT seed. See ``_matched_gt_stat_anchors``; the anchors feed the
+        # normal ``compute_stat_anchor_loss`` (one code path, per-stat
+        # weights as usual). ``stat_anchor_match_k``: how many closest GT
+        # chunks to average (the "k" — like the GAN's match_k).
+        self.stat_anchor_match_k = int(
+            getattr(args, "stat_anchor_match_k", 3)
+        )
+        # Cap on the candidate GT pool scanned (memory: weunz rides can be
+        # thousands of chunks). Stride-subsampled to this many chunks.
+        # 0 = no cap (only safe for short rides).
+        self.stat_anchor_match_max_pool = int(
+            getattr(args, "stat_anchor_match_max_pool", 256)
+        )
         # Per-stat per-horizon weights for the MSE-with-floor regulariser
         # against the seed anchor (STD, M2, TV) × (short = per-frame,
         # long = causal cumavg). See ``compute_stat_anchor_loss``.
@@ -1807,12 +1825,15 @@ class ActionForcingDMD(SelfForcingModel):
         # ``seed_anchor`` (default): the original MSE-with-floor
         #     comparison against per-batch seed anchors (optionally
         #     EMA-driven for the long horizon).
-        # ``target_matching``: fixed per-stat targets + pass-through
-        #     dead-bands derived from offline GT analysis. No seed
-        #     anchor, no EMA. Active stats: M2 (= ``Σ_c σ_c²``;
-        #     user calls this "STD" externally), TV, stable_rank.
-        #     See ``compute_stat_anchor_target_matching_loss`` for
-        #     the math.
+        # ``target_matching``: the anchor SOURCE for ALL stats becomes the
+        #     per-rolled-chunk K-CLOSEST GT chunks (K=``stat_anchor_match_k``)
+        #     selected from ``streaming_state['gt_match_latents']`` by MAE on
+        #     the mean-equalized rep — the same selection the LADD GAN
+        #     matcher uses. The resulting per-frame anchors feed the SAME
+        #     ``compute_stat_anchor_loss`` (per-frame-anchor aware). Requires
+        #     ``ladd_gt_transition_match=true`` (populates the pool); falls
+        #     back to the seed anchor with a one-time warning otherwise.
+        #     See ``_matched_gt_stat_anchors``.
         self.stat_anchor_mode = str(
             getattr(args, "stat_anchor_mode", "seed_anchor")
         ).lower().strip()
@@ -3061,6 +3082,106 @@ class ActionForcingDMD(SelfForcingModel):
                 mask[:, cap_frames:] = False
         return mask
 
+    def _matched_gt_stat_anchors(self, pred_image: torch.Tensor):
+        """Per-frame stat anchors from the per-chunk k-CLOSEST GT chunks.
+
+        Used by ``stat_anchor_mode='target_matching'``: for each rolled
+        chunk, find the K nearest GT chunks in the match pool
+        (``streaming_state['gt_match_latents']``) by MAE on the mean-
+        equalized (brightness-removed, texture) rep — the same selection
+        the LADD matcher uses, K = ``stat_anchor_match_k`` — and set that
+        chunk's anchor for EVERY stat (STD, M2, TV, SOS, M1) to the mean of
+        those K matched GT chunks. Returns a dict of per-frame anchors
+        ({STD,M2,TV,SOS: [B,F]; M1: [B,F,C]}, fully detached) to feed
+        ``compute_stat_anchor_loss``'s precomputed-anchor path — so ALL
+        stats flow through the SAME function, no separate loss term.
+        Returns None when the pool is unavailable (e.g.
+        ladd_gt_transition_match off) -> caller falls back to the seed.
+        """
+        s = getattr(self, "streaming_state", None)
+        pool = s.get("gt_match_latents") if isinstance(s, dict) else None
+        if pool is None or pred_image is None:
+            if pool is None and not getattr(self, "_matched_gt_warned", False):
+                self._matched_gt_warned = True
+                if _is_main():
+                    import logging as _logging
+                    _logging.warning(
+                        "[ActionForcingDMD] stat_anchor_mode='target_matching' "
+                        "but gt_match_latents is missing -> falling back to the "
+                        "seed anchor. Set ladd_gt_transition_match=true to "
+                        "populate the match pool."
+                    )
+            return None
+        from model.anti_collapse import (
+            _per_frame_STD, _per_frame_M2, _per_frame_TV,
+            _per_frame_SOS, _per_frame_M1,
+        )
+        npb = int(self.num_frame_per_block)
+        if pred_image.dim() != 5 or int(pred_image.shape[1]) < npb:
+            return None
+        B, F_, C, H, W = pred_image.shape
+        pool = pool.detach().to(device=pred_image.device, dtype=torch.float32)
+        n_pool = int(pool.shape[1]) // npb
+        if n_pool < 1:
+            return None
+        eps = 1e-6
+        pred = pred_image.float().detach()  # anchors are TARGETS -> detached
+        n_chunks = F_ // npb
+
+        def _meq(x):  # abs-mean normalize per chunk over (npb,C,H,W)
+            a = x.abs().mean(dim=(-4, -3, -2, -1), keepdim=True).clamp_min(eps)
+            return x / a
+
+        with torch.no_grad():
+            # Cap the candidate pool for memory — weunz rides can be
+            # thousands of chunks long; stride-subsample to <= max_pool.
+            max_pool = int(getattr(self, "stat_anchor_match_max_pool", 256))
+            pool_c = pool[:, : n_pool * npb].reshape(B, n_pool, npb, C, H, W)
+            if max_pool > 0 and n_pool > max_pool:
+                stride = n_pool // max_pool
+                sel = torch.arange(
+                    0, n_pool, stride, device=pool.device,
+                )[:max_pool]
+                pool_c = pool_c[:, sel]
+            n_sel = int(pool_c.shape[1])
+            pool_meq = _meq(pool_c).reshape(B, n_sel, -1)            # [B,n_sel,D]
+            _flat = pool_c.reshape(B * n_sel, npb, C, H, W)
+            # per-GT-chunk stats = mean over the chunk's npb frames.
+            p_std = _per_frame_STD(_flat).reshape(B, n_sel, npb).mean(-1)   # [B,n_sel]
+            p_m2 = _per_frame_M2(_flat).reshape(B, n_sel, npb).mean(-1)
+            p_tv = _per_frame_TV(_flat).reshape(B, n_sel, npb).mean(-1)
+            p_sos = _per_frame_SOS(_flat).reshape(B, n_sel, npb).mean(-1)
+            p_m1 = _per_frame_M1(_flat).reshape(B, n_sel, npb, C).mean(2)   # [B,n_sel,C]
+            K = max(1, min(int(getattr(self, "stat_anchor_match_k", 3)), n_sel))
+            _D = float(pool_meq.shape[-1])
+
+            a_std = pred.new_zeros((B, F_))
+            a_m2 = pred.new_zeros((B, F_))
+            a_tv = pred.new_zeros((B, F_))
+            a_sos = pred.new_zeros((B, F_))
+            a_m1 = pred.new_zeros((B, F_, C))
+            for c in range(n_chunks):
+                fsl = slice(c * npb, (c + 1) * npb)
+                pc_meq = _meq(pred[:, fsl]).reshape(B, 1, -1)
+                # cdist (p=1) avoids materializing the [B,n_sel,D] diff.
+                mae = torch.cdist(pc_meq, pool_meq, p=1).squeeze(1) / _D  # [B,n_sel]
+                top = torch.topk(mae, K, dim=1, largest=False).indices    # [B,K]
+                a_std[:, fsl] = p_std.gather(1, top).mean(1, keepdim=True)
+                a_m2[:, fsl] = p_m2.gather(1, top).mean(1, keepdim=True)
+                a_tv[:, fsl] = p_tv.gather(1, top).mean(1, keepdim=True)
+                a_sos[:, fsl] = p_sos.gather(1, top).mean(1, keepdim=True)
+                top_m1 = top.unsqueeze(-1).expand(B, K, C)                # [B,K,C]
+                a_m1[:, fsl] = p_m1.gather(1, top_m1).mean(1, keepdim=True)
+            rem = F_ - n_chunks * npb
+            if rem > 0:  # remainder frames (F not a multiple of npb): repeat last
+                j = n_chunks * npb
+                a_std[:, j:] = a_std[:, j - 1:j]
+                a_m2[:, j:] = a_m2[:, j - 1:j]
+                a_tv[:, j:] = a_tv[:, j - 1:j]
+                a_sos[:, j:] = a_sos[:, j - 1:j]
+                a_m1[:, j:] = a_m1[:, j - 1:j]
+        return {"STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos, "M1": a_m1}
+
     def _dmd_mae_gate_weight(
         self,
         pred_real: torch.Tensor,
@@ -4104,16 +4225,10 @@ class ActionForcingDMD(SelfForcingModel):
         stat_anchor_w_resolved = self._resolved_stat_anchor_loss_weight(
             int(getattr(self, "_last_current_step", 0))
         )
-        if (
-            stat_anchor_w_resolved > 0.0
-            and seed_latents is not None
-            and pred_image is not None
-        ):
+        if stat_anchor_w_resolved > 0.0 and pred_image is not None:
             from model.anti_collapse import compute_stat_anchor_loss
             try:
-                stat_loss, stat_logs = compute_stat_anchor_loss(
-                    pred_x0=pred_image.float(),
-                    seed_latents=seed_latents.float(),
+                _wk = dict(
                     STD_short_weight=self.stat_anchor_STD_short_weight,
                     STD_long_weight=self.stat_anchor_STD_long_weight,
                     M2_short_weight=self.stat_anchor_M2_short_weight,
@@ -4127,16 +4242,43 @@ class ActionForcingDMD(SelfForcingModel):
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
                 )
-                stat_loss = (
-                    stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
+                # Anchor SOURCE by mode: 'target_matching' -> per-chunk
+                # k-closest-GT anchors for ALL stats; else -> the GT seed.
+                _matched = (
+                    self._matched_gt_stat_anchors(pred_image.float())
+                    if getattr(self, "stat_anchor_mode", "seed_anchor")
+                    == "target_matching" else None
                 )
-                dmd_loss = dmd_loss + stat_loss
-                dmd_log_dict["stat_anchor_total"] = stat_loss.detach()
-                dmd_log_dict["stat_anchor_weight_resolved"] = float(
-                    stat_anchor_w_resolved
-                )
-                for k, v in stat_logs.items():
-                    dmd_log_dict[k] = v
+                if _matched is not None:
+                    stat_loss, stat_logs = compute_stat_anchor_loss(
+                        pred_x0=pred_image.float(), seed_latents=None,
+                        seed_STD_anchor=_matched["STD"],
+                        seed_M2_anchor=_matched["M2"],
+                        seed_TV_anchor=_matched["TV"],
+                        seed_SOS_anchor=_matched["SOS"],
+                        seed_M1_anchor=_matched["M1"], **_wk,
+                    )
+                elif seed_latents is not None:
+                    stat_loss, stat_logs = compute_stat_anchor_loss(
+                        pred_x0=pred_image.float(),
+                        seed_latents=seed_latents.float(), **_wk,
+                    )
+                else:
+                    stat_loss, stat_logs = None, {}
+                if stat_loss is not None:
+                    stat_loss = (
+                        stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
+                    )
+                    dmd_loss = dmd_loss + stat_loss
+                    dmd_log_dict["stat_anchor_total"] = stat_loss.detach()
+                    dmd_log_dict["stat_anchor_weight_resolved"] = float(
+                        stat_anchor_w_resolved
+                    )
+                    dmd_log_dict["stat_anchor_mode"] = float(
+                        1.0 if _matched is not None else 0.0
+                    )
+                    for k, v in stat_logs.items():
+                        dmd_log_dict[k] = v
             except Exception as exc:
                 # Fail-soft: log and continue. If the loss is genuinely
                 # broken the operator will see the wandb key go away.
@@ -6651,46 +6793,45 @@ class ActionForcingDMD(SelfForcingModel):
         # branch. The mode dispatch lives inside the gate so the call
         # sequence stays identical (one ``compute_*`` call, same total
         # add to dmd_loss).
+        # Stat anchor (streaming). Anchor SOURCE by mode:
+        #   seed_anchor (default): the GT seed window (ride_window[:cf]).
+        #   target_matching: per-chunk k-CLOSEST GT chunks for ALL stats
+        #     (``_matched_gt_stat_anchors`` -> compute_stat_anchor_loss's
+        #     precomputed-anchor path). ONE compute call either way.
         _mode = getattr(self, "stat_anchor_mode", "seed_anchor")
-        if (
-            stat_anchor_w_resolved > 0.0
-            and (
-                _mode == "target_matching"
-                or (cf_state > 0 and ride_window.shape[1] >= cf_state)
-            )
-        ):
+        if stat_anchor_w_resolved > 0.0:
             try:
-                if _mode == "target_matching":
-                    from model.anti_collapse import (
-                        compute_stat_anchor_target_matching_loss,
+                from model.anti_collapse import compute_stat_anchor_loss
+                _wk = dict(
+                    STD_short_weight=self.stat_anchor_STD_short_weight,
+                    STD_long_weight=self.stat_anchor_STD_long_weight,
+                    M2_short_weight=self.stat_anchor_M2_short_weight,
+                    M2_long_weight=self.stat_anchor_M2_long_weight,
+                    TV_short_weight=self.stat_anchor_TV_short_weight,
+                    TV_long_weight=self.stat_anchor_TV_long_weight,
+                    SOS_short_weight=self.stat_anchor_SOS_short_weight,
+                    SOS_long_weight=self.stat_anchor_SOS_long_weight,
+                    M1_short_weight=self.stat_anchor_M1_short_weight,
+                    M1_long_weight=self.stat_anchor_M1_long_weight,
+                    rel_tol_short=self.stat_anchor_rel_tol_short,
+                    rel_tol_long=self.stat_anchor_rel_tol_long,
+                )
+                _matched = (
+                    self._matched_gt_stat_anchors(chunk.float())
+                    if _mode == "target_matching" else None
+                )
+                if _matched is not None:
+                    stat_loss, stat_logs = compute_stat_anchor_loss(
+                        pred_x0=chunk.float(), seed_latents=None,
+                        seed_STD_anchor=_matched["STD"],
+                        seed_M2_anchor=_matched["M2"],
+                        seed_TV_anchor=_matched["TV"],
+                        seed_SOS_anchor=_matched["SOS"],
+                        seed_M1_anchor=_matched["M1"], **_wk,
                     )
-                    stat_loss, stat_logs = (
-                        compute_stat_anchor_target_matching_loss(
-                            pred_x0=chunk.float(),
-                            M2_target=self.stat_anchor_target_M2,
-                            M2_band_low=self.stat_anchor_target_M2_band_low,
-                            M2_band_high=self.stat_anchor_target_M2_band_high,
-                            M2_weight=self.stat_anchor_target_M2_weight,
-                            TV_target=self.stat_anchor_target_TV,
-                            TV_band_low=self.stat_anchor_target_TV_band_low,
-                            TV_band_high=self.stat_anchor_target_TV_band_high,
-                            TV_weight=self.stat_anchor_target_TV_weight,
-                            rank_target=self.stat_anchor_target_rank,
-                            rank_band_high=(
-                                self.stat_anchor_target_rank_band_high
-                            ),
-                            rank_band_low=(
-                                self.stat_anchor_target_rank_band_low
-                            ),
-                            rank_weight=self.stat_anchor_target_rank_weight,
-                        )
-                    )
-                else:
-                    from model.anti_collapse import compute_stat_anchor_loss
+                elif cf_state > 0 and ride_window.shape[1] >= cf_state:
                     seed_latents_stream = ride_window[:, :cf_state].detach()
-                    # Long-horizon EMA anchor when enabled — see
-                    # ``_update_stat_anchor_long_ema`` for the
-                    # cross-rank averaging + running-mean rationale.
+                    # Long-horizon EMA anchor when enabled.
                     long_STD_ov = long_M2_ov = long_TV_ov = None
                     if self.stat_anchor_long_ema_enabled:
                         (
@@ -6703,32 +6844,24 @@ class ActionForcingDMD(SelfForcingModel):
                     stat_loss, stat_logs = compute_stat_anchor_loss(
                         pred_x0=chunk.float(),
                         seed_latents=seed_latents_stream.float(),
-                        STD_short_weight=self.stat_anchor_STD_short_weight,
-                        STD_long_weight=self.stat_anchor_STD_long_weight,
-                        M2_short_weight=self.stat_anchor_M2_short_weight,
-                        M2_long_weight=self.stat_anchor_M2_long_weight,
-                        TV_short_weight=self.stat_anchor_TV_short_weight,
-                        TV_long_weight=self.stat_anchor_TV_long_weight,
-                        SOS_short_weight=self.stat_anchor_SOS_short_weight,
-                        SOS_long_weight=self.stat_anchor_SOS_long_weight,
-                        M1_short_weight=self.stat_anchor_M1_short_weight,
-                        M1_long_weight=self.stat_anchor_M1_long_weight,
-                        rel_tol_short=self.stat_anchor_rel_tol_short,
-                        rel_tol_long=self.stat_anchor_rel_tol_long,
                         long_STD_anchor_override=long_STD_ov,
                         long_M2_anchor_override=long_M2_ov,
                         long_TV_anchor_override=long_TV_ov,
+                        **_wk,
                     )
-                stat_loss = (
-                    stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
-                )
-                dmd_loss = dmd_loss + stat_loss
-                dmd_log["stat_anchor_total"] = stat_loss.detach()
-                dmd_log["stat_anchor_mode"] = float(
-                    1.0 if _mode == "target_matching" else 0.0
-                )
-                for k, v in stat_logs.items():
-                    dmd_log[k] = v
+                else:
+                    stat_loss, stat_logs = None, {}
+                if stat_loss is not None:
+                    stat_loss = (
+                        stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
+                    )
+                    dmd_loss = dmd_loss + stat_loss
+                    dmd_log["stat_anchor_total"] = stat_loss.detach()
+                    dmd_log["stat_anchor_mode"] = float(
+                        1.0 if _matched is not None else 0.0
+                    )
+                    for k, v in stat_logs.items():
+                        dmd_log[k] = v
             except Exception as exc:
                 if _is_main():
                     import logging as _logging

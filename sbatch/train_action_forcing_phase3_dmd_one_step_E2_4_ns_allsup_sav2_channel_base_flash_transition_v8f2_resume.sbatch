@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8e5
+#SBATCH --job-name=af-p3-cb-flashtr-v8f2r
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,38 +11,55 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# Phase-3 DMD one-step — v8e5 = v8e4 but FLATTEN (across all four) instead
-# of per-pair.
+# Phase-3 DMD one-step — v8f2 = 8f + WEUNZ dataset + MATCHED-GT stat anchor
+# (stat_anchor_mode=target_matching).
 #
-# Same as v8e4 (per-channel mean + std cross-eq) EXCEPT
-# ladd_gt_transition_xeq_preserve_delta=FALSE: instead of scaling each
-# pair by one shared factor (which preserves the within-pair former->latter
-# brightness/contrast transition), every one of the FOUR members -- real
-# former, real latter, fake former, fake latter -- is normalized
-# INDEPENDENTLY to the common per-channel mean a* and std s*. So the disc
-# is FULLY moment-blind: no absolute level, no within-pair transition --
-# pure texture only. This is the "across all four" variant vs v8e4's
-# "per pair". per-channel + std stay ON.
-# Config = v8e4 with preserve_delta=false.
+# Deltas vs 8f:
+#   * Dataset = WEUNZ (2639 rides) with the 20 holdout rides EXCLUDED from
+#     training (holdout_zarr_list) -> ~2619 train rides. NOTE weunz already
+#     CONTAINS the holdout, so the exclusion is REQUIRED for a clean eval.
+#     pred_image_7_chunk seeds from the held-out rides
+#     (holdout_eval_root, cycle); pred_image left as-is.
+#   * stat_anchor_mode=target_matching: the stat anchor's SOURCE switches
+#     from the positional GT SEED to the per-rolled-chunk K-CLOSEST GT
+#     chunks (k=stat_anchor_match_k=4; same MAE-on-mean-equalized texture
+#     selection + gt_match_latents pool the GAN uses). ALL active stats
+#     flow through the SAME compute_stat_anchor_loss (now per-frame anchor
+#     aware) — no separate term. Active weights: M2 (Σσ²) + SOS (Σx² energy)
+#     at 0.1, TV 0.1, M1 3e-9; each rolled chunk's stats are pinned to its
+#     most content-similar real chunks instead of its time-aligned GT.
+#     (requires ladd_gt_transition_match=true, which populates the pool.)
+#   * max_ride_frames=1500 — caps weunz's long rides so the match pool +
+#     footprint stay bounded (prevents the long-ride OOM).
+#   * Stat-anchor RAMPDOWN DISABLED (rampdown_steps=0) — stat anchor stays
+#     at full strength for the whole run.
 #
-# ---- v8e4/v8e3 lineage ----
-# v8e4 = v8e3 + STD equalization; v8e3 = v8e2 + per-channel + preserve-delta.
+# ---- 8f lineage ----
+# v8f = let the TRANSITION GAN own brightness + contrast (drop the naive
+# anchors), off an 8e3 base.
 #
-# v8e2 confirmed cross-equalization kills the white-collapse (brightness
-# flat past the old step-61 point). v8e2 flattened ALL FOUR pair members
-# to one level -> the disc was fully brightness-blind (within-pair delta
-# gone too). v8e3 flips on ladd_gt_transition_xeq_preserve_delta=true:
-# each PAIR is scaled by ONE shared factor to the common level a*, so the
-# real/fake ABSOLUTE level is still equalized (no collapse) but the
-# within-pair former->latter brightness TRANSITION ratio is PRESERVED ->
-# the disc can see, and push the student to match, GT's transition
-# brightness behaviour. (To become the hardcoded default.)
-# ALSO: ladd_gt_transition_xeq_per_channel=true -> the equalization
-# magnitude is computed PER CHANNEL (reduce [F,H,W], keep C) instead of
-# one scalar over all channels, so per-channel brightness/colour is fully
-# non-discriminative. Fix code is shared; config = v8e2 + these two flags.
+# Premise (confirmed on 8e3): cartoonification is solved; the remaining
+# problem is brightness/contrast SHIFTS, and naively anchoring them is no
+# longer good enough — we want the model to LEARN the right brightness/
+# contrast, and the transition GAN should be able to do that now that the
+# carn brightness BUG is fixed (carn moment-restore stays ON, so the real
+# anchor is never artificially inflated). Changes vs 8e3:
+#   * ladd_gt_transition_mean_equalize=false -> ALL GAN magnitude
+#     normalizers OFF (no cross-eq). The disc sees raw brightness/contrast.
+#   * ladd_wavelet_hf_enabled=false -> wavelet OFF, so the disc sees the
+#     full latent (LL=brightness/contrast + HF), not HF-only.
+#   * ladd_disc_force_clean=true -> disc on CLEAN (t=0) latents. REQUIRED:
+#     with wavelet off the disc would otherwise run at flash_t(~60) NOISED,
+#     which swamps the brightness/contrast signal. (Does not touch
+#     flash_dmd_gan_t, which the main DMD path shares.)
+#   * stat_anchor rampdown to a TENTH: start=50 (after the GAN is
+#     established ~step45), over 50 steps, floor=0.1 -> keeps a thin
+#     stat-anchor safety net while the GAN takes over brightness/contrast.
+#   * gan_loss_weight 1.0 -> 1.5 (a touch more; the GAN now owns more).
+#   * preserve_delta OFF (moot — nothing is normalized inside the GAN now).
+#   * CARN magnitude normalizer (moment-restore) KEPT ON.
 #
-# ---- v8e2 lineage: CARN BRIGHTNESS-COLLAPSE FIX ----
+# ---- 8e3/8e2 lineage: CARN BRIGHTNESS-COLLAPSE FIX ----
 #
 # v8e collapsed to white by ~step 61. Root cause (transition GAN carn
 # path): the FN trains on un-normalized rollout1->rollout2 (rollout2 runs
@@ -162,7 +179,7 @@ srun torchrun \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
     max_steps=200 \
-    encoded_root=/projects/u6ex/fbots/frodobots_encoded_weu \
+    encoded_root=/projects/u6ex/fbots/frodobots_encoded_weunz \
     holdout_zarr_list=configs/holdout_rides.txt \
     holdout_eval_root=/projects/u6ex/fbots/frodobots_encoded_weu_holdout \
     holdout_eval_mode=cycle \
@@ -172,6 +189,7 @@ srun torchrun \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=1 \
+    max_ride_frames=1500 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=24 \
     num_workers=0 \
@@ -252,7 +270,7 @@ srun torchrun \
     ladd_gt_transition_match_k=4 \
     ladd_gt_transition_xeq_preserve_delta=true \
     ladd_gt_transition_xeq_per_channel=true \
-    ladd_gt_transition_std_equalize=false \
+    ladd_disc_force_clean=true \
     forward_noiser_enabled=true \
     forward_noiser_loss_mode=teacher_feat \
     forward_noiser_step_unconditioned=true \
@@ -266,6 +284,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e5_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8f2_j5068137
 
 echo "Training completed on $(date)"

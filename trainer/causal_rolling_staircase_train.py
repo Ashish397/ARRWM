@@ -473,6 +473,47 @@ class RollingStaircaseDMDTrainer:
             cache_path=_manifest_cache,
         )
 
+        # Holdout exclusion (config-set). ``holdout_zarr_list`` points at a
+        # text file of zarr basenames (one per line, '#' comments allowed);
+        # those rides are dropped from the TRAINING dataset so the model
+        # never trains on them (they back the held-out eval). Applied here,
+        # post-construction and BEFORE the sampler, so the DistributedSampler
+        # indexes the filtered ride list. Works regardless of cache/scan
+        # path. Leave unset/null to disable (e.g. the weunz_hold_plus preset,
+        # which deliberately INCLUDES the holdout in training).
+        holdout_list = getattr(cfg, "holdout_zarr_list", None)
+        holdout_names = set()
+        if holdout_list:
+            hp = Path(str(holdout_list))
+            if not hp.exists():
+                raise FileNotFoundError(
+                    f"holdout_zarr_list={hp} does not exist."
+                )
+            for line in hp.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    holdout_names.add(line)
+        if holdout_names:
+            _before = len(self.dataset._rides)
+            self.dataset._rides = [
+                r for r in self.dataset._rides
+                if Path(r[0]).name not in holdout_names
+            ]
+            _removed = _before - len(self.dataset._rides)
+            logging.info(
+                "[holdout] excluded %d/%d rides from training "
+                "(%d listed in %s) -> %d training rides remain.",
+                _removed, _before, len(holdout_names),
+                str(holdout_list), len(self.dataset._rides),
+            )
+            if _removed == 0:
+                logging.warning(
+                    "[holdout] 0 rides excluded — none of the %d listed "
+                    "names matched this encoded_root's rides. Check the "
+                    "list matches the dataset (e.g. weunz vs weu).",
+                    len(holdout_names),
+                )
+
         shuffle_rides = (sort_mode is None)
         self.sampler = DistributedSampler(
             self.dataset,
