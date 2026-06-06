@@ -1719,12 +1719,10 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_match_k = int(
             getattr(args, "stat_anchor_match_k", 3)
         )
-        # Cap on the candidate GT pool scanned (memory: weunz rides can be
-        # thousands of chunks). Stride-subsampled to this many chunks.
-        # 0 = no cap (only safe for short rides).
-        self.stat_anchor_match_max_pool = int(
-            getattr(args, "stat_anchor_match_max_pool", 256)
-        )
+        # NOTE: the matched anchor searches the WHOLE gt_match_latents pool
+        # EXHAUSTIVELY (same scheme as the GAN matcher) — no subsampling, no
+        # window. Memory is bounded by the pool size (= max_ride_frames) and
+        # by computing stats for the K selected chunks only. (No knob.)
         # Per-stat per-horizon weights for the MSE-with-floor regulariser
         # against the seed anchor (STD, M2, TV) × (short = per-frame,
         # long = causal cumavg). See ``compute_stat_anchor_loss``.
@@ -3133,27 +3131,18 @@ class ActionForcingDMD(SelfForcingModel):
             return x / a
 
         with torch.no_grad():
-            # Cap the candidate pool for memory — weunz rides can be
-            # thousands of chunks long; stride-subsample to <= max_pool.
-            max_pool = int(getattr(self, "stat_anchor_match_max_pool", 256))
             pool_c = pool[:, : n_pool * npb].reshape(B, n_pool, npb, C, H, W)
-            if max_pool > 0 and n_pool > max_pool:
-                stride = n_pool // max_pool
-                sel = torch.arange(
-                    0, n_pool, stride, device=pool.device,
-                )[:max_pool]
-                pool_c = pool_c[:, sel]
-            n_sel = int(pool_c.shape[1])
-            pool_meq = _meq(pool_c).reshape(B, n_sel, -1)            # [B,n_sel,D]
-            _flat = pool_c.reshape(B * n_sel, npb, C, H, W)
-            # per-GT-chunk stats = mean over the chunk's npb frames.
-            p_std = _per_frame_STD(_flat).reshape(B, n_sel, npb).mean(-1)   # [B,n_sel]
-            p_m2 = _per_frame_M2(_flat).reshape(B, n_sel, npb).mean(-1)
-            p_tv = _per_frame_TV(_flat).reshape(B, n_sel, npb).mean(-1)
-            p_sos = _per_frame_SOS(_flat).reshape(B, n_sel, npb).mean(-1)
-            p_m1 = _per_frame_M1(_flat).reshape(B, n_sel, npb, C).mean(2)   # [B,n_sel,C]
-            K = max(1, min(int(getattr(self, "stat_anchor_match_k", 3)), n_sel))
+            # SAME SCHEME AS THE GAN MATCHER: each rolled chunk searches the
+            # WHOLE pool EXHAUSTIVELY (torch.cdist over all n_pool chunks,
+            # p=1 on the mean-equalized rep) for its k-nearest GT — NO
+            # subsampling, NO window. Memory stays light because we only
+            # materialize (a) the mean-equalized search reps for the cdist and
+            # (b) the raw latents of the K SELECTED chunks for stats (just
+            # like the GAN only forwards its selected reals) — never the stats
+            # of the whole pool. The pool size is bounded by max_ride_frames.
+            pool_meq = _meq(pool_c).reshape(B, n_pool, -1)           # [B,n_pool,D]
             _D = float(pool_meq.shape[-1])
+            K = max(1, min(int(getattr(self, "stat_anchor_match_k", 3)), n_pool))
 
             a_std = pred.new_zeros((B, F_))
             a_m2 = pred.new_zeros((B, F_))
@@ -3163,15 +3152,24 @@ class ActionForcingDMD(SelfForcingModel):
             for c in range(n_chunks):
                 fsl = slice(c * npb, (c + 1) * npb)
                 pc_meq = _meq(pred[:, fsl]).reshape(B, 1, -1)
-                # cdist (p=1) avoids materializing the [B,n_sel,D] diff.
-                mae = torch.cdist(pc_meq, pool_meq, p=1).squeeze(1) / _D  # [B,n_sel]
+                # Exhaustive cdist over the WHOLE pool (no subsample/window).
+                mae = torch.cdist(pc_meq, pool_meq, p=1).squeeze(1) / _D  # [B,n_pool]
                 top = torch.topk(mae, K, dim=1, largest=False).indices    # [B,K]
-                a_std[:, fsl] = p_std.gather(1, top).mean(1, keepdim=True)
-                a_m2[:, fsl] = p_m2.gather(1, top).mean(1, keepdim=True)
-                a_tv[:, fsl] = p_tv.gather(1, top).mean(1, keepdim=True)
-                a_sos[:, fsl] = p_sos.gather(1, top).mean(1, keepdim=True)
-                top_m1 = top.unsqueeze(-1).expand(B, K, C)                # [B,K,C]
-                a_m1[:, fsl] = p_m1.gather(1, top_m1).mean(1, keepdim=True)
+                # Stats for the K SELECTED chunks only (gather raw latents).
+                sel = pool_c.gather(
+                    1, top.view(B, K, 1, 1, 1, 1).expand(B, K, npb, C, H, W),
+                )                                                        # [B,K,npb,...]
+                sf = sel.reshape(B * K, npb, C, H, W)
+                a_std[:, fsl] = _per_frame_STD(sf).reshape(
+                    B, K, npb).mean(-1).mean(1, keepdim=True)
+                a_m2[:, fsl] = _per_frame_M2(sf).reshape(
+                    B, K, npb).mean(-1).mean(1, keepdim=True)
+                a_tv[:, fsl] = _per_frame_TV(sf).reshape(
+                    B, K, npb).mean(-1).mean(1, keepdim=True)
+                a_sos[:, fsl] = _per_frame_SOS(sf).reshape(
+                    B, K, npb).mean(-1).mean(1, keepdim=True)
+                a_m1[:, fsl] = _per_frame_M1(sf).reshape(
+                    B, K, npb, C).mean(2).mean(1, keepdim=True)
             rem = F_ - n_chunks * npb
             if rem > 0:  # remainder frames (F not a multiple of npb): repeat last
                 j = n_chunks * npb

@@ -77,6 +77,7 @@ def _load_ride_tensors_cpu_part(
     meta: dict,
     *,
     max_frames: Optional[int] = None,
+    random_window: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """CPU-side ride load: zarr disk read of latents + motion .npy +
     prompt_embeds tensor. Skips the ss_vae forward (GPU work) and the
@@ -86,17 +87,35 @@ def _load_ride_tensors_cpu_part(
     inside the dataset's ss_vae path). Used by the action-forcing
     trainer's prefetch executor to overlap disk I/O of the next ride
     with the current step's compute.
+
+    ``max_frames`` caps how many latent frames are loaded. With
+    ``random_window=False`` (default) the FIRST ``max_frames`` are loaded
+    (``[0:N]``); with ``random_window=True`` a RANDOM chunk-aligned window
+    ``[r:r+N]`` of the full ride is loaded instead, so over training the
+    model sees the whole ride (not just its head) — more data from long
+    rides. The offset ``r`` is threaded to ``_finalize_ride_to_gpu`` (as
+    ``win_start``) so latents, z_actions and motion all use the SAME window.
     """
+    from utils.zarr_dataset import _LATENTS_PER_MOTION_CHUNK as _MCHUNK
     zarr_path = meta["zarr_path"]
-    n_latent_frames = int(meta["n_latent_frames"])
+    full_n = int(meta["n_latent_frames"])
+    n_latent_frames = full_n
     if max_frames is not None:
-        n_latent_frames = min(n_latent_frames, int(max_frames))
+        n_latent_frames = min(full_n, int(max_frames))
     if n_latent_frames <= 0:
         return None
 
+    # Window start: 0 (head) or a random chunk-aligned offset into the ride.
+    win_start = 0
+    if random_window and full_n > n_latent_frames:
+        max_off_chunks = (full_n - n_latent_frames) // _MCHUNK
+        if max_off_chunks > 0:
+            import random as _random
+            win_start = _MCHUNK * _random.randint(0, max_off_chunks)
+
     try:
         latents_cpu = ZarrRideDataset.load_latent_chunk(
-            zarr_path, 0, n_latent_frames,
+            zarr_path, win_start, win_start + n_latent_frames,
         )
     except Exception as e:
         logging.warning("load_latent_chunk failed for %s: %s", zarr_path, e)
@@ -108,13 +127,16 @@ def _load_ride_tensors_cpu_part(
     if prompt_embeds.dim() == 2:
         prompt_embeds = prompt_embeds.unsqueeze(0)
 
-    # Per-latent-frame motion magnitude (CPU numpy → CPU tensor).
+    # Per-latent-frame motion magnitude (CPU numpy → CPU tensor), sliced to
+    # the SAME [win_start : win_start+N] window as the latents.
     motion_mag: Optional[torch.Tensor] = None
     mag_loader = getattr(dataset, "load_motion_magnitudes", None)
     if mag_loader is not None:
         try:
-            mag_np = mag_loader(zarr_path, n_latent_frames)
-            motion_mag = torch.from_numpy(mag_np)
+            mag_np = mag_loader(zarr_path, win_start + n_latent_frames)
+            motion_mag = torch.from_numpy(
+                mag_np[win_start : win_start + n_latent_frames]
+            )
         except Exception as e:
             logging.warning(
                 "load_motion_magnitudes failed for %s: %s — offset "
@@ -125,6 +147,7 @@ def _load_ride_tensors_cpu_part(
     return {
         "zarr_path": zarr_path,
         "n_latent_frames": n_latent_frames,
+        "win_start": win_start,                     # ride-frame offset of [0]
         "latents_cpu": latents_cpu,                # [T, C, H, W] CPU
         "prompt_embeds_cpu": prompt_embeds,        # [1, L, C_txt] CPU
         "motion_mag": motion_mag,                  # [T] float32 CPU or None
@@ -148,13 +171,18 @@ def _finalize_ride_to_gpu(
     """
     zarr_path = cpu_part["zarr_path"]
     n_latent_frames = cpu_part["n_latent_frames"]
+    win_start = int(cpu_part.get("win_start", 0))   # ride-frame offset of [0]
 
     try:
         resolved = zarr_path
         if resolved not in dataset._attrs_by_path:  # pylint: disable=protected-access
             resolved = str(Path(zarr_path).resolve())
+        # Encode z_actions for the SAME [win_start : win_start+N] window the
+        # latents/motion were loaded from (win_start=0 -> the head, original
+        # behaviour). The bound (2nd arg) must cover the window end.
         z_actions = dataset.encode_z_actions_window(
-            resolved, n_latent_frames, 0, n_latent_frames,
+            resolved, win_start + n_latent_frames,
+            win_start, win_start + n_latent_frames,
         )
     except Exception as e:
         logging.warning("encode_z_actions_window failed for %s: %s", zarr_path, e)
@@ -183,6 +211,7 @@ def _load_ride_tensors(
     *,
     action_dims: Optional[List[int]] = None,
     max_frames: Optional[int] = None,
+    random_window: bool = False,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Synchronous full ride load: CPU disk read + GPU finalize. Kept
     as the single-call entry point used by the existing rolling
@@ -190,7 +219,9 @@ def _load_ride_tensors(
     a prefetched two-phase pipeline (see
     ``_load_ride_tensors_cpu_part`` + ``_finalize_ride_to_gpu``).
     """
-    cpu_part = _load_ride_tensors_cpu_part(dataset, meta, max_frames=max_frames)
+    cpu_part = _load_ride_tensors_cpu_part(
+        dataset, meta, max_frames=max_frames, random_window=random_window,
+    )
     if cpu_part is None:
         return None
     return _finalize_ride_to_gpu(
@@ -1413,6 +1444,35 @@ class RollingStaircaseDMDTrainer:
             state["fake_score"] = fake_module.state_dict()
             if self.fake_optimizer is not None:
                 state["fake_optimizer"] = self.fake_optimizer.state_dict()
+        # GAN discriminator (R3GAN/LADD) + its optimizer — save when the GAN
+        # is enabled so a resume continues the trained adversary instead of
+        # reinitializing it (a fresh disc mid-training restarts the warmup
+        # and corrupts the adversarial signal). Unwrap DDP if wrapped.
+        if getattr(self, "gan_enabled", False):
+            _disc = getattr(self, "r3gan_disc", None)
+            if _disc is not None:
+                _disc_mod = (
+                    self.r3gan_disc_ddp.module
+                    if getattr(self, "r3gan_disc_ddp", None) is not None
+                    else _disc
+                )
+                # Key MUST match the restore side in
+                # ActionForcingDMDTrainer._maybe_resume (r3gan_discriminator).
+                state["r3gan_discriminator"] = _disc_mod.state_dict()
+                if getattr(self, "r3gan_optimizer", None) is not None:
+                    state["r3gan_optimizer"] = (
+                        self.r3gan_optimizer.state_dict()
+                    )
+        # ForwardNoiser (CARN) + its optimizer — same rationale (a fresh
+        # zero-init FN at resume restarts the learned +1 drift operator).
+        _fn = getattr(self.model, "forward_noiser", None)
+        if _fn is not None:
+            _fn_mod = _fn.module if hasattr(_fn, "module") else _fn
+            state["forward_noiser"] = _fn_mod.state_dict()
+            if getattr(self, "forward_noiser_optimizer", None) is not None:
+                state["forward_noiser_optimizer"] = (
+                    self.forward_noiser_optimizer.state_dict()
+                )
         if self.generator_ema is not None:
             state["generator_ema"] = self.generator_ema.state_dict()
             state["ema_weight"] = self.ema_weight

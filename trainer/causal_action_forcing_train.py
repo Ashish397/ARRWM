@@ -2484,6 +2484,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             "resume: r3gan_optimizer load failed: %s. "
                             "Starting r3gan optim from fresh state.", exc,
                         )
+        # ForwardNoiser (CARN) + its optimizer.
+        _fn = getattr(self.model, "forward_noiser", None)
+        if _fn is not None and "forward_noiser" in state:
+            _fn_mod = _fn.module if hasattr(_fn, "module") else _fn
+            fn_missing, fn_unexpected = _fn_mod.load_state_dict(
+                state["forward_noiser"], strict=False,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "resume: forward_noiser missing=%d unexpected=%d",
+                    len(fn_missing), len(fn_unexpected),
+                )
+            _fn_opt = getattr(self, "forward_noiser_optimizer", None)
+            if _fn_opt is not None and "forward_noiser_optimizer" in state:
+                try:
+                    _fn_opt.load_state_dict(state["forward_noiser_optimizer"])
+                    if self.is_main_process:
+                        logging.info("resume: forward_noiser_optimizer restored")
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: forward_noiser_optimizer load failed: %s. "
+                            "Starting FN optim from fresh state.", exc,
+                        )
         if self.moment_gan_enabled and self.moment_disc is not None:
             md_module = (
                 self.moment_disc_ddp.module
@@ -7396,6 +7420,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 continue
             cpu_part = _load_ride_tensors_cpu_part(
                 self.dataset, meta, max_frames=max_frames,
+                random_window=bool(
+                    getattr(self.config, "max_ride_frames_random", False)
+                ),
             )
             if cpu_part is None or cpu_part["latents_cpu"].shape[0] < rollout_frames:
                 attempts += 1
@@ -8956,6 +8983,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.dataset, meta, self.device, self.dtype,
                 action_dims=self.action_dims,
                 max_frames=getattr(self, "max_ride_frames", None),
+                random_window=bool(
+                    getattr(self.config, "max_ride_frames_random", False)
+                ),
             )
             if ride is None or ride["latents"].shape[1] < rollout_frames:
                 attempts += 1

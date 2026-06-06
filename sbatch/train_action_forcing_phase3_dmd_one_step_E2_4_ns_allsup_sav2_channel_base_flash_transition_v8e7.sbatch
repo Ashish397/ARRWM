@@ -1,16 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8e5r
+#SBATCH --job-name=af-p3-cb-flashtr-v8e7
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
+# Phase-3 DMD one-step — v8e6 = v8e5 + gan_loss_weight=2.5 + 3h wall to
+# reach step 200 in one shot (from scratch). Checkpoints now ALSO save the
+# GAN disc + ForwardNoiser, so this run is cleanly resumable.
+#
+# ---- v8e5 base ----
 # Phase-3 DMD one-step — v8e5 = v8e4 but FLATTEN (across all four) instead
 # of per-pair.
 #
@@ -166,6 +171,8 @@ srun torchrun \
     holdout_zarr_list=configs/holdout_rides.txt \
     holdout_eval_root=/projects/u6ex/fbots/frodobots_encoded_weu_holdout \
     holdout_eval_mode=cycle \
+    max_ride_frames=900 \
+    max_ride_frames_random=true \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
@@ -195,16 +202,16 @@ srun torchrun \
     stat_anchor_STD_long_weight=0.0 \
     stat_anchor_mode=target_matching \
     stat_anchor_match_k=4 \
-    stat_anchor_M2_short_weight=0.1 \
-    stat_anchor_M2_long_weight=0.1 \
+    stat_anchor_M2_short_weight=0.2 \
+    stat_anchor_M2_long_weight=0.2 \
     stat_anchor_SOS_short_weight=0.0 \
     stat_anchor_SOS_long_weight=0.0 \
-    stat_anchor_M1_short_weight=3e-9 \
-    stat_anchor_M1_long_weight=3e-9 \
-    stat_anchor_TV_short_weight=0.1 \
-    stat_anchor_TV_long_weight=0.1 \
-    stat_anchor_rel_tol_short=0.1 \
-    stat_anchor_rel_tol_long=0.1 \
+    stat_anchor_M1_short_weight=5e-9 \
+    stat_anchor_M1_long_weight=5e-9 \
+    stat_anchor_TV_short_weight=0.0 \
+    stat_anchor_TV_long_weight=0.0 \
+    stat_anchor_rel_tol_short=0.0\
+    stat_anchor_rel_tol_long=0.0\
     dmd_asymmetric_scoring_enabled=false \
     dmd_42f_enabled=true \
     dmd_42f_2chunk=true \
@@ -218,7 +225,7 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
-    gan_loss_weight=1.5 \
+    gan_loss_weight=1.0 \
     gan_lr=2e-5 \
     gan_critic_warmup_steps=20 \
     gan_disc_start_step=20 \
@@ -266,6 +273,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e5_j5068588
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8e7_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
