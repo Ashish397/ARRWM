@@ -11,6 +11,11 @@ prompts
 checkpoints/
 logs/
 wandb/
+# Literal "$LOGDIR" directory: created when the env var is unexpanded
+# (the smoke launcher passes ``log_dir=$LOGDIR`` as a literal string).
+$LOGDIR/
+# Generated sample/eval videos anywhere in the tree.
+*.mp4
 pre_encode.log
 *.err
 *.out
@@ -30,6 +35,8 @@ action_analysis_results.md
 # Project logbook and working notes (not for version control)
 .claude/
 claude/
+
+.codex
 
 # Heavyweight working directories — never belong in the repo.
 #   * noise_model/ : model weights + caches (~2.6 GB)
