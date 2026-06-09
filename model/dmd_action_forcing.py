@@ -820,6 +820,39 @@ class ActionForcingDMD(SelfForcingModel):
                 f"'off'; got {self.forward_noiser_apply_strategy!r} "
                 "(legacy 'blur_noise' and 'sum' strategies removed)."
             )
+        # ``aux_carn_level_mode``: how the per-chunk CARN level is assigned
+        # in ``_apply_forward_noiser_to_gt`` (the aux-teacher GT corruption).
+        #   "position" (default): level = max(0, chunk_abs_idx -
+        #       (num_seed - 1)) — drift-faithful to the student rollout's
+        #       actual CARN at each absolute ride position. The first
+        #       ``num_seed`` chunks (the clean seed region) get level 0,
+        #       then it ramps 1, 2, ...
+        #   "local_index": level = the chunk's index WITHIN the aux window
+        #       (chunk 0 -> 0 CARN, chunk 1 -> 1, chunk 2 -> 2, ...). Treats
+        #       only the window's first chunk as the clean anchor, so the
+        #       teacher sees the full 0..(n_chunks-1) drift ladder every
+        #       aux step regardless of where the window sits in the ride.
+        self.aux_carn_level_mode = str(
+            getattr(args, "aux_carn_level_mode", "position")
+        ).lower()
+        if self.aux_carn_level_mode not in ("position", "local_index"):
+            raise ValueError(
+                "aux_carn_level_mode must be 'position' or 'local_index'; "
+                f"got {self.aux_carn_level_mode!r}."
+            )
+        # ``carn_recurse``: how the per-chunk CARN level is REALISED.
+        #   True (default): the FN is a +1 stepper, applied RECURSIVELY k
+        #       times to reach level k (the input is fed back each call).
+        #       Trained rollout1->rollout2 (a single +1 drift).
+        #   False: the FN is a CUMULATIVE jumper conditioned on the target
+        #       level. To reach level k we call it ONCE with carn_step=k on
+        #       the CLEAN input (no recursion). This requires the FN to be
+        #       trained clean(GT)->student-drifted-at-level-k with
+        #       carn_step=k (handled in _train_forward_noiser_tf). The SAME
+        #       choice drives the GAN-former CARN so the model stays
+        #       consistent. carn_recurse=False implies the step IS used (the
+        #       forward_noiser_step_unconditioned flag is ignored here).
+        self.carn_recurse = bool(getattr(args, "carn_recurse", True))
         # ``ladd_gt_transition_carn_former``: in the transition GAN's GT
         # pairs (former_chunk, latter_chunk), push the FORMER through the
         # (trained) forward noiser so the disc sees REAL = "CARN-degraded ->
@@ -833,6 +866,58 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.ladd_gt_transition_carn_steps = int(
             getattr(args, "ladd_gt_transition_carn_steps", 1)
+        )
+        # FIX A (gen-side former detach): the gt_transition real pair is
+        # [CARN(GT_former) -> clean GT_latter]; the disc rewards a CARN-
+        # degraded former, so the gen-side GAN loss (which flows to BOTH
+        # student former and latter) pulls a GOOD/clean student former
+        # back UP toward the fixed CARN level. When True, the gen-side
+        # fake pair DETACHES the former so the GAN gradient cleans only
+        # the LATTER (the transition target) and never degrades the
+        # former. The disc D-update still sees both members (texture
+        # learning + transition intact). Default off (= e8 behaviour).
+        self.ladd_gt_transition_gen_detach_former = bool(
+            getattr(args, "ladd_gt_transition_gen_detach_former", False)
+        )
+        # FIX B (random real-former CARN level): instead of a FIXED
+        # ``carn_steps`` on the GT former, draw the CARN level uniformly in
+        # [0, ladd_gt_transition_carn_max_level] PER PAIR (0 = clean
+        # former). The disc then sees real formers at every degradation
+        # level (incl. clean), so it cannot pull the student toward any
+        # single fixed CARN level — it must key on the transition (clean
+        # latter | any former). Default off; max_level defaults to
+        # carn_steps.
+        self.ladd_gt_transition_carn_random_level = bool(
+            getattr(args, "ladd_gt_transition_carn_random_level", False)
+        )
+        self.ladd_gt_transition_carn_max_level = int(
+            getattr(
+                args, "ladd_gt_transition_carn_max_level",
+                self.ladd_gt_transition_carn_steps,
+            )
+        )
+        # e11: apply CARN inside the MATCHED candidate pool (the path e8
+        # actually uses). e8's _carn_former only touched real_chunks_det,
+        # which is UNUSED when ladd_gt_transition_match=true -> CARN was
+        # inert. With this flag, the disc's matched real formers ARE
+        # CARN'd, and:
+        #   * Req 1: the per-row CARN level is drawn uniformly in [1, cap],
+        #     cap = (min drift of the fake pairs this real serves) - 1, so
+        #     the real former is always noised LESS than the student former
+        #     it's compared against (and 0/clean when cap<1). Non-trivial
+        #     (can exceed 1), per-row.
+        #   * Req 2: the D-update sees the POST-CARN former (teaches the
+        #     transition); the gen-side sees the PRE-CARN (clean) former
+        #     (so the student is pulled toward clean, never toward CARN).
+        # Default off (e8/g unchanged).
+        self.ladd_gt_transition_carn_match_pool = bool(
+            getattr(args, "ladd_gt_transition_carn_match_pool", False)
+        )
+        # Fixed CARN level for the matched real formers (Req-1 drift-capped).
+        # 0 (default) => random level in [1, cap]; >0 => exactly this many
+        # CARN steps per eligible former (still capped below served-fake drift).
+        self.ladd_gt_transition_carn_match_pool_level = int(
+            getattr(args, "ladd_gt_transition_carn_match_pool_level", 0)
         )
         # ``forward_noiser_loss_mode``: how the FN is trained.
         #   "mse" (default, legacy): value-match FN(rollout1) -> rollout2
@@ -946,6 +1031,16 @@ class ActionForcingDMD(SelfForcingModel):
                 f"aux_teacher_loss_warmup_steps="
                 f"{self.aux_teacher_loss_warmup_steps} must be >= 0"
             )
+        # ``aux_teacher_separate_backward``: when True, the aux teacher is
+        # NOT fused into the generator loss. Instead the trainer runs it as
+        # a standalone forward+backward at END-OF-STEP (after the gen+critic
+        # graphs are freed), so the 1.3B teacher's activation graph never
+        # coexists with the GAN R1 double-backward. Same training signal
+        # (fresh eps,t via run_extra_aux_pass), ~10-15 GB lower gen-step
+        # peak. The real_teacher_optimizer step is unchanged (outer loop).
+        self.aux_teacher_separate_backward = bool(
+            getattr(args, "aux_teacher_separate_backward", False)
+        )
 
         # GAN-disc-borrowed regularisers on the LoRA aux teacher's x0
         # estimate. The disc already encodes a high-quality "what does
@@ -1835,11 +1930,22 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_mode = str(
             getattr(args, "stat_anchor_mode", "seed_anchor")
         ).lower().strip()
-        if self.stat_anchor_mode not in ("seed_anchor", "target_matching"):
+        if self.stat_anchor_mode not in (
+            "seed_anchor", "target_matching", "gt_window",
+        ):
             raise ValueError(
-                "stat_anchor_mode must be 'seed_anchor' or "
-                f"'target_matching'; got {self.stat_anchor_mode!r}."
+                "stat_anchor_mode must be 'seed_anchor', 'target_matching', "
+                f"or 'gt_window'; got {self.stat_anchor_mode!r}."
             )
+        # ``gt_window`` mode: the anchor SOURCE is the POSITIONALLY-ALIGNED
+        # GT chunk (the actual GT the student should produce at this rolled
+        # position) plus/minus ``stat_anchor_match_k`` neighbour chunks,
+        # averaged -> a smoothed local-GT anchor. The SAME ``stat_anchor_
+        # match_k`` knob serves both modes: in ``target_matching`` it is the
+        # number of content-CLOSEST GT chunks; in ``gt_window`` it is the
+        # +/-k window RADIUS of temporally-adjacent GT around the chunk's own
+        # ride position. k=0 -> exactly the aligned GT chunk; k=2 -> mean over
+        # a 5-chunk window centred on it.
         # Target-matching knobs (consulted only when mode ==
         # ``target_matching``). M2 target / band correspond to the
         # user's externally-named "STD" (Σ σ², typical Wan range 6-9).
@@ -3172,6 +3278,75 @@ class ActionForcingDMD(SelfForcingModel):
                     B, K, npb, C).mean(2).mean(1, keepdim=True)
             rem = F_ - n_chunks * npb
             if rem > 0:  # remainder frames (F not a multiple of npb): repeat last
+                j = n_chunks * npb
+                a_std[:, j:] = a_std[:, j - 1:j]
+                a_m2[:, j:] = a_m2[:, j - 1:j]
+                a_tv[:, j:] = a_tv[:, j - 1:j]
+                a_sos[:, j:] = a_sos[:, j - 1:j]
+                a_m1[:, j:] = a_m1[:, j - 1:j]
+        return {"STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos, "M1": a_m1}
+
+    def _gt_window_stat_anchors(self, pred_image: torch.Tensor, chunk_lo: int):
+        """Per-frame stat anchors from the POSITIONALLY-ALIGNED GT chunk
+        +/- ``stat_anchor_match_k`` neighbour chunks (smoothed local GT).
+
+        Used by ``stat_anchor_mode='gt_window'``. For each rolled chunk ``c``
+        in ``pred_image`` (whose GT lives at abs ride frame
+        ``chunk_lo + c*npb`` in ``streaming_state['ride_latents_window']``),
+        the anchor for EVERY stat (STD, M2, TV, SOS, M1) is the mean over the
+        GT frames in the window ``[p - k*npb, p + (k+1)*npb)`` clamped to the
+        ride. This is the actual GT the student should match at that position
+        — not a content search (``target_matching``) and not the seed prefix
+        (``seed_anchor``) — smoothed over +/- k chunks to suppress per-chunk
+        GT noise. Returns ``{STD,M2,TV,SOS:[B,F]; M1:[B,F,C]}`` detached, or
+        ``None`` if the ride window is unavailable (caller falls back).
+        """
+        s = getattr(self, "streaming_state", None)
+        ride = s.get("ride_latents_window") if isinstance(s, dict) else None
+        if ride is None or pred_image is None:
+            return None
+        from model.anti_collapse import (
+            _per_frame_STD, _per_frame_M2, _per_frame_TV,
+            _per_frame_SOS, _per_frame_M1,
+        )
+        npb = int(self.num_frame_per_block)
+        if pred_image.dim() != 5 or int(pred_image.shape[1]) < npb:
+            return None
+        B, F_, C, H, W = pred_image.shape
+        ride = ride.detach().to(device=pred_image.device, dtype=torch.float32)
+        T = int(ride.shape[1])
+        if T < npb:
+            return None
+        k = int(getattr(self, "stat_anchor_match_k", 3))
+        n_chunks = F_ // npb
+        a_std = pred_image.new_zeros((B, F_))
+        a_m2 = pred_image.new_zeros((B, F_))
+        a_tv = pred_image.new_zeros((B, F_))
+        a_sos = pred_image.new_zeros((B, F_))
+        a_m1 = pred_image.new_zeros((B, F_, C))
+        with torch.no_grad():
+            for c in range(n_chunks):
+                p = int(chunk_lo) + c * npb
+                lo = p - k * npb
+                hi = p + (k + 1) * npb
+                # Clamp the +/-k window to the ride; if it falls entirely
+                # outside, snap to the nearest in-bounds single chunk.
+                lo = max(0, lo)
+                hi = min(T, hi)
+                if hi - lo < npb:
+                    lo = max(0, min(p, T - npb))
+                    hi = lo + npb
+                win = ride[:, lo:hi]                 # [B, w, C, H, W]
+                fsl = slice(c * npb, (c + 1) * npb)
+                # Per-frame stats over the window, averaged over its frames;
+                # [B,1] broadcasts across the chunk's npb frames ([B,1,C] for M1).
+                a_std[:, fsl] = _per_frame_STD(win).mean(1, keepdim=True)
+                a_m2[:, fsl] = _per_frame_M2(win).mean(1, keepdim=True)
+                a_tv[:, fsl] = _per_frame_TV(win).mean(1, keepdim=True)
+                a_sos[:, fsl] = _per_frame_SOS(win).mean(1, keepdim=True)
+                a_m1[:, fsl] = _per_frame_M1(win).mean(1, keepdim=True)
+            rem = F_ - n_chunks * npb
+            if rem > 0:  # remainder frames: repeat the last chunk's anchor
                 j = n_chunks * npb
                 a_std[:, j:] = a_std[:, j - 1:j]
                 a_m2[:, j:] = a_m2[:, j - 1:j]
@@ -5038,8 +5213,16 @@ class ActionForcingDMD(SelfForcingModel):
 
         target_carn_per_chunk: list = []
         for c in range(n_chunks):
-            chunk_abs_idx = (int(abs_frame_start_gt) + c * npb) // npb
-            target_carn = max(0, chunk_abs_idx - (num_seed_r1 - 1))
+            if self.aux_carn_level_mode == "local_index":
+                # Window-local ladder: chunk 0 -> 0 CARN, chunk 1 -> 1, ...
+                # Only the first chunk is the clean anchor; the rest
+                # accumulate +1 CARN application each, recursively.
+                target_carn = c
+            else:
+                # "position": drift-faithful to the rollout's CARN at the
+                # chunk's absolute ride position (seed region = level 0).
+                chunk_abs_idx = (int(abs_frame_start_gt) + c * npb) // npb
+                target_carn = max(0, chunk_abs_idx - (num_seed_r1 - 1))
             target_carn_per_chunk.append(int(target_carn))
 
         max_carn = max(target_carn_per_chunk) if target_carn_per_chunk else 0
@@ -5047,6 +5230,26 @@ class ActionForcingDMD(SelfForcingModel):
             return gt_target
 
         current = gt_target.clone()
+        if not self.carn_recurse:
+            # SINGLE-CALL mode: one conditioned call per chunk straight from
+            # the CLEAN GT, carn_step = the chunk's target level. No
+            # recursion / no feeding the output back. Matches the cumulative
+            # FN training (clean -> drifted-at-level-k). Level-0 chunks are
+            # left untouched.
+            with torch.no_grad():
+                for c, tc in enumerate(target_carn_per_chunk):
+                    if tc <= 0:
+                        continue
+                    f_start = c * npb
+                    f_end = f_start + npb
+                    chunk_in = gt_target[:, f_start:f_end].contiguous()
+                    carn_step = torch.full(
+                        (B,), int(tc), dtype=torch.long, device=device,
+                    )
+                    current[:, f_start:f_end] = self.forward_noiser(
+                        chunk_in, carn_step, residual=True,
+                    )
+            return current
         with torch.no_grad():
             for k in range(max_carn):
                 for c, tc in enumerate(target_carn_per_chunk):
@@ -6814,10 +7017,14 @@ class ActionForcingDMD(SelfForcingModel):
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
                 )
-                _matched = (
-                    self._matched_gt_stat_anchors(chunk.float())
-                    if _mode == "target_matching" else None
-                )
+                if _mode == "target_matching":
+                    _matched = self._matched_gt_stat_anchors(chunk.float())
+                elif _mode == "gt_window":
+                    _matched = self._gt_window_stat_anchors(
+                        chunk.float(), chunk_lo,
+                    )
+                else:
+                    _matched = None
                 if _matched is not None:
                     stat_loss, stat_logs = compute_stat_anchor_loss(
                         pred_x0=chunk.float(), seed_latents=None,
@@ -6937,6 +7144,10 @@ class ActionForcingDMD(SelfForcingModel):
             self.real_teacher_train_online
             and self.aux_teacher_loss_weight > 0.0
             and int(current_step) >= int(self.aux_teacher_start_step)
+            # When separate_backward is on, the aux teacher runs as its OWN
+            # backward at end-of-step (trainer) so its 1.3B forward graph
+            # never coexists with the GAN R1 backward — do NOT fuse it here.
+            and not getattr(self, "aux_teacher_separate_backward", False)
         )
         if aux_active:
             aux_loss, aux_log = self._compute_aux_teacher_loss_streaming(

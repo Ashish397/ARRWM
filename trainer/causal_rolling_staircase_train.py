@@ -606,7 +606,28 @@ class RollingStaircaseDMDTrainer:
                 if atp_trainable:
                     trainable_params.append(p)
 
-        self.optimizer = torch.optim.AdamW(
+        # Optional 8-bit AdamW (bitsandbytes) for the big gen + critic
+        # optimizers — cuts optimizer state ~4x (fp32 m/v -> 8-bit blocks),
+        # freeing ~20 GB across the two 1.3B optimizers so the GAN-R1 +
+        # aux-teacher budget fits with a FULL fine-tune critic. Falls back
+        # to torch AdamW if bitsandbytes is unavailable.
+        _use_8bit = bool(getattr(cfg, "use_8bit_adam", False))
+        _AdamW = torch.optim.AdamW
+        if _use_8bit:
+            try:
+                from bitsandbytes.optim import AdamW8bit as _AdamW
+                if self.is_main_process:
+                    logging.info(
+                        "[opt] use_8bit_adam=True: AdamW8bit for gen + critic"
+                    )
+            except Exception as _e:
+                _AdamW = torch.optim.AdamW
+                if self.is_main_process:
+                    logging.warning(
+                        "[opt] use_8bit_adam=True but bitsandbytes import "
+                        "failed (%s); falling back to torch AdamW", _e,
+                    )
+        self.optimizer = _AdamW(
             trainable_params, lr=lr, betas=betas, eps=eps, weight_decay=wd
         )
         self.max_grad_norm = float(getattr(cfg, "max_grad_norm", 1.0))
@@ -638,7 +659,7 @@ class RollingStaircaseDMDTrainer:
                     "trainable parameters. Did DMD2B2BLAM_Staircase.__init__ "
                     "accidentally freeze them?"
                 )
-            self.fake_optimizer = torch.optim.AdamW(
+            self.fake_optimizer = _AdamW(
                 fake_params,
                 lr=fake_lr,
                 betas=fake_betas,

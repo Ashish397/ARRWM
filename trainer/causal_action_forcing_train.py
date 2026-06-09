@@ -3984,6 +3984,53 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         abs_new_start = int(info.get("abs_frame_start", 0))
         overlap = int(info.get("overlap", 0))
         chunk_abs_start = abs_new_start - overlap
+
+        # ===== carn_recurse=False: CUMULATIVE single-call FN training =====
+        # Train FN(clean GT chunk, carn_step=level) -> student-drifted chunk
+        # at that level, in ONE conditioned call (no rollout2 / no +1
+        # composition). The student's rollout1 chunk at abs position p IS the
+        # level-L(p) drift of the clean GT at p; we pair them and condition on
+        # L(p). Application (_apply_forward_noiser_to_gt / _carn_former) then
+        # reaches level k with a single carn_step=k call. Level-0 chunks carry
+        # no drift, so they are skipped (the FN stays identity at step 0).
+        if not bool(getattr(m, "carn_recurse", True)):
+            ride_win = s.get("ride_latents_window")
+            if ride_win is None:
+                return _anchor("no_ride_window_cumulative")
+            num_seed = int(m.dmd_context_clean_frames // npb)
+            ride_T = int(ride_win.shape[1])
+            Bc = int(r1.shape[0])
+            gt_inputs, r1_targets, carn_levels = [], [], []
+            for c in range(n_chunks):
+                f0, f1 = c * npb, c * npb + npb
+                a0, a1 = chunk_abs_start + f0, chunk_abs_start + f1
+                if a0 < 0 or a1 > ride_T:
+                    continue
+                lvl = max(0, (a0 // npb) - (num_seed - 1))
+                if lvl <= 0:
+                    continue  # level-0: no drift to learn (FN identity).
+                gt_inputs.append(
+                    ride_win[:, a0:a1].to(dtype=r1.dtype, device=r1.device).detach())
+                r1_targets.append(r1[:, f0:f1].detach())
+                carn_levels.append(int(lvl))
+            if not gt_inputs:
+                return _anchor("no_pairs_cumulative")
+            fn_in = torch.cat(gt_inputs, dim=0)           # [N*B, npb, C, H, W]
+            cum_tg = torch.cat(r1_targets, dim=0)
+            carn = torch.cat([
+                torch.full((Bc,), lvl, dtype=torch.long, device=fn_in.device)
+                for lvl in carn_levels
+            ])
+            fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
+            loss = self._fn_teacher_feat_loss(fn_out, cum_tg, proj)
+            loss.backward()
+            return {
+                "train/fn_tf_loss": float(loss.detach().item()),
+                "train/fn_tf_pairs": float(len(gt_inputs)),
+                "train/fn_tf_skipped": 0.0,
+                "train/fn_tf_cumulative": 1.0,
+            }
+
         fn_inputs, r2_targets = [], []
         for c in range(n_chunks):
             f0, f1 = c * npb, c * npb + npb
@@ -4509,19 +4556,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         def _carn_former(x):
             n_steps = int(getattr(self.model, "ladd_gt_transition_carn_steps", 1))
+            # FIX B (random real-former CARN level): draw the level per PAIR
+            # uniformly in [0, max_level] (0 = clean former). The disc then
+            # sees real formers at every degradation level (incl. clean), so
+            # it can't pull the student toward a single fixed CARN level —
+            # it must key on the transition (clean latter | any former).
+            if bool(getattr(
+                self.model, "ladd_gt_transition_carn_random_level", False)):
+                _maxlvl = int(getattr(
+                    self.model, "ladd_gt_transition_carn_max_level", n_steps))
+                n_steps = int(torch.randint(0, max(1, _maxlvl) + 1, (1,)).item())
+                if n_steps <= 0:
+                    return x.detach()  # level 0 -> clean GT former, no CARN
             # Step-unconditioned FN: every apply passes carn_step=0 (the FN
             # learned one generic "+1 shift"). Otherwise pass the iteration
             # index as the CARN level (legacy).
             _uncond = bool(getattr(
                 self.model, "forward_noiser_step_unconditioned", False))
+            _recurse = bool(getattr(self.model, "carn_recurse", True))
             x0 = x  # original former (pre-carn) for moment restoration
             with torch.no_grad():
-                for _s in range(max(1, n_steps)):
+                if not _recurse:
+                    # SINGLE-CALL mode (consistent with the aux CARN): one
+                    # conditioned call from the clean former, carn_step =
+                    # the target level (= n_steps, default 1). No recursion.
                     cs = torch.full(
-                        (x.shape[0],), 0 if _uncond else _s,
+                        (x.shape[0],), int(max(1, n_steps)),
                         dtype=torch.long, device=x.device,
                     )
-                    x = self.model.forward_noiser(x, cs, residual=True)
+                    x = self.model.forward_noiser(x0, cs, residual=True)
+                else:
+                    for _s in range(max(1, n_steps)):
+                        cs = torch.full(
+                            (x.shape[0],), 0 if _uncond else _s,
+                            dtype=torch.long, device=x.device,
+                        )
+                        x = self.model.forward_noiser(x, cs, residual=True)
                 # MOMENT-PRESERVING carn (texture only, NO stats — see the
                 # "CARN = texture, not stats" directive). The FN trains on
                 # un-normalized rollout1->rollout2, where rollout2 runs hot
@@ -4563,8 +4633,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 [_slice_pair(fake_src_detached, i, j) for (i, j) in pairs],
                 dim=0,
             )
+            _gen_detach_former = bool(getattr(
+                self.model, "ladd_gt_transition_gen_detach_former", False))
+
+            def _slice_pair_gen(t, i, j):
+                # FIX A: on the gen-side fake pair, optionally DETACH the
+                # former so the GAN gradient flows only to the LATTER (the
+                # transition target) — the student learns "given my drifted
+                # former, make the next chunk clean" without being pushed to
+                # degrade its own former toward the real-pair's CARN level.
+                former = _slice(t, i)
+                if _gen_detach_former:
+                    former = former.detach()
+                return torch.cat([former, _slice(t, j)], dim=1)
+
             fake_chunks_grad_tensor = torch.cat(
-                [_slice_pair(fake_src_grad, i, j) for (i, j) in pairs],
+                [_slice_pair_gen(fake_src_grad, i, j) for (i, j) in pairs],
                 dim=0,
             )
             if _mean_eq and _mag_mode in ("m1", "m1m2"):
@@ -5098,7 +5182,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     for p in range(n_pairs):
                         top_idx[p][b] = idx[p]
 
-            def _match_select(salt):
+            def _match_select(salt, carn=False):
                 # Sample Kk of each fake's M nearest GT — FRESH per call
                 # (seeded step+salt) — then DEDUP: forward each unique GT
                 # ONCE and recover the per-fake-K block-diagonal at the logit
@@ -5160,6 +5244,87 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         ], dim=1))
                 ru = torch.stack(real_rows, dim=0).to(
                     device=device, dtype=_fdt)                   # [n_uniq, ...]
+                # e11: CARN the matched real FORMERS (Req 1 + Req 2). Only on
+                # the D-update side (carn=True); the gen-side keeps clean
+                # formers (Req 2), so the student is pulled toward clean GT.
+                if carn and bool(getattr(
+                        self.model, "ladd_gt_transition_carn_match_pool", False)):
+                    n_uniq = ru.shape[0]
+                    # Per-row cap = (min served-fake drift) - 1. A row's
+                    # served fakes come from gm; fake pair p's former drift
+                    # = pairs[p][0] (rollout chunk index). The cap keeps the
+                    # real former noised LESS than every student former it is
+                    # compared against (Req 1).
+                    BIG = 1 << 30
+                    row_mindrift = [BIG] * n_uniq
+                    for _p in range(n_pairs):
+                        _fd = int(pairs[_p][0])
+                        for _b in range(B):
+                            _fr = _p * B + _b
+                            for _k in range(Kk):
+                                _r = int(gm[_fr, _k].item())
+                                if _fd < row_mindrift[_r]:
+                                    row_mindrift[_r] = _fd
+                    # Fixed level (>0): degrade every eligible real former by
+                    # exactly this many CARN steps (still drift-capped by
+                    # Req 1). 0 (default) => random level in [1, cap].
+                    _fixed_lvl = int(getattr(
+                        self.model,
+                        "ladd_gt_transition_carn_match_pool_level", 0))
+                    _levels = []
+                    for _r in range(n_uniq):
+                        _lvlcap = (row_mindrift[_r] - 1
+                                   if row_mindrift[_r] < BIG else 0)
+                        if _lvlcap < 1:
+                            _levels.append(0)
+                        elif _fixed_lvl > 0:
+                            _levels.append(min(_fixed_lvl, _lvlcap))
+                        else:
+                            _levels.append(
+                                int(torch.randint(
+                                    1, _lvlcap + 1, (1,)).item()))
+                    _maxlvl = max(_levels) if _levels else 0
+                    if (getattr(self, "is_main_process", True)
+                            and getattr(self, "_carn_match_pool_dbg", 0) < 3):
+                        self._carn_match_pool_dbg = getattr(
+                            self, "_carn_match_pool_dbg", 0) + 1
+                        import sys as _sys
+                        print(
+                            "[CARN-MATCH-POOL] ACTIVE: n_uniq=%d "
+                            "row_mindrift=%s levels=%s maxlvl=%d "
+                            "(real formers get recursive CARN < served-fake "
+                            "drift; gen-side stays clean)" % (
+                                n_uniq, row_mindrift[:8], _levels[:8],
+                                _maxlvl,
+                            ),
+                            file=_sys.stderr, flush=True,
+                        )
+                    if _maxlvl > 0:
+                        _x0 = ru[:, :npb].clone()
+                        _cur = _x0.clone()
+                        with torch.no_grad():
+                            for _kk in range(_maxlvl):
+                                _idx = [r for r in range(n_uniq)
+                                        if _levels[r] > _kk]
+                                if not _idx:
+                                    continue
+                                _ii = torch.tensor(_idx, device=_cur.device)
+                                _sub = _cur.index_select(0, _ii)
+                                _cs = torch.zeros(
+                                    (_sub.shape[0],), dtype=torch.long,
+                                    device=_sub.device)
+                                _sub = self.model.forward_noiser(
+                                    _sub, _cs, residual=True)
+                                _cur = _cur.index_copy(0, _ii, _sub)
+                            # Moment-preserving (texture-only) restore.
+                            _e = 1e-6
+                            _mci = _x0.mean(dim=[1, 3, 4], keepdim=True)
+                            _mco = _cur.mean(dim=[1, 3, 4], keepdim=True)
+                            _cur = _cur - _mco + _mci
+                            _ai = _x0.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                            _ao = _cur.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                            _cur = _cur * (_ai / (_ao + _e))
+                        ru = torch.cat([_cur.detach(), ru[:, npb:]], dim=1)
                 gflat = gm.reshape(-1).to(device)                # [n_pairs*B*Kk]
                 rat = ram = None
                 if acts_list:
@@ -5250,7 +5415,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if n_disc_updates > 0 and self.r3gan_optimizer is not None:
                 for _it in range(n_disc_updates):
                     self.r3gan_optimizer.zero_grad(set_to_none=True)
-                    real_m, real_m_rat, real_m_ram, group_flat = _match_select(_it)
+                    # D-update: POST-CARN matched real formers (Req 2).
+                    real_m, real_m_rat, real_m_ram, group_flat = _match_select(
+                        _it, carn=True)
                     last_n_real = float(real_m.shape[0])
                     _rn = _m_noise(real_m)
                     if diff_aug_policy:
@@ -8162,6 +8329,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             fn_tf_logs = self._train_forward_noiser_tf(train_chunk, train_info)
             out.update(fn_tf_logs)
             self._mem_step_snapshot("6b_after_fn_tf_backward")
+
+        # aux_teacher_separate_backward: run the aux teacher as its OWN
+        # forward+backward HERE — after the gen+critic (+FN) graphs are
+        # freed — so the 1.3B teacher's activation graph never coexists with
+        # the GAN R1 double-backward (drops the gen-step peak ~10-15 GB).
+        # The fused aux in compute_generator_loss_streaming is gated OFF in
+        # this mode. run_extra_aux_pass does a fresh (eps,t) pass and
+        # returns the weighted loss; the outer loop clips + steps
+        # real_teacher_optimizer and runs the EMA pull. DDP-safe: the
+        # all_reduce(MAX) short-ride skip lives inside
+        # _compute_aux_teacher_loss_streaming, so all ranks agree on
+        # whether a usable loss exists.
+        if (
+            getattr(self.model, "aux_teacher_separate_backward", False)
+            and getattr(self, "real_teacher_optimizer", None) is not None
+            and self.step >= int(
+                getattr(self.config, "aux_teacher_start_step", 0)
+            )
+        ):
+            aux_loss_sep, aux_log_sep = self.model.run_extra_aux_pass(
+                train_chunk.detach(), train_info,
+            )
+            if aux_loss_sep is not None and aux_loss_sep.requires_grad:
+                aux_loss_sep.backward()
+            if isinstance(aux_log_sep, dict):
+                out.update(aux_log_sep)
+            self._mem_step_snapshot("6c_after_aux_separate_backward")
 
         # teacher_cadence='fake': run ``dfake_gen_update_ratio`` total
         # LoRA optimizer steps per outer iter (vs the default 1 under

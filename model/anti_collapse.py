@@ -189,6 +189,65 @@ def latent_std_mse_loss(
     return (s_pred - s_gt).pow(2).mean()
 
 
+def latent_std_energy_meanabs_mse_loss(
+    pred_x0: torch.Tensor,
+    gt_target: torch.Tensor,
+    std_weight: float = 1.0,
+    energy_weight: float = 1.0,
+    meanabs_weight: float = 1.0,
+    eps: float = 1e-6,
+):
+    """Per-frame MSE on THREE global latent statistics vs point-wise GT.
+
+    Extends ``latent_std_mse_loss`` with an energy (RMS) term and a
+    mean-absolute term so the loss matches not just the spread but also
+    the overall magnitude / DC level of the latent (which a bare std,
+    being mean-invariant, ignores). All three stats are GLOBAL per-frame
+    (channels and spatial pooled — ``dim=[2,3,4]``), matching the
+    ``latent_std_mse_loss`` convention:
+
+      * ``std``     = ``std(x)``              — spread, mean-invariant
+      * ``energy``  = ``sqrt(mean(x^2))``     — RMS magnitude (incl. DC),
+        unit-consistent with std (x-units, not x^2) so the three terms
+        sit on a comparable scale
+      * ``meanabs`` = ``mean(|x|)``           — L1 magnitude / level
+
+    Each term is ``(stat_pred - stat_gt)^2`` averaged over (B, F), summed
+    with per-term weights. Symmetric (over/under penalised equally). GT
+    is detached.
+
+    Returns:
+        ``(loss_scalar, parts)`` where ``parts`` maps
+        ``{"std","energy","meanabs"} -> detached raw MSE`` for logging.
+    """
+    gt = gt_target.detach()
+    rd = [2, 3, 4]
+
+    s_pred = pred_x0.std(dim=rd, unbiased=False)
+    s_gt = gt.std(dim=rd, unbiased=False)
+    loss_std = (s_pred - s_gt).pow(2).mean()
+
+    e_pred = pred_x0.pow(2).mean(dim=rd).clamp_min(0).sqrt()
+    e_gt = gt.pow(2).mean(dim=rd).clamp_min(0).sqrt()
+    loss_energy = (e_pred - e_gt).pow(2).mean()
+
+    ma_pred = pred_x0.abs().mean(dim=rd)
+    ma_gt = gt.abs().mean(dim=rd)
+    loss_meanabs = (ma_pred - ma_gt).pow(2).mean()
+
+    total = (
+        std_weight * loss_std
+        + energy_weight * loss_energy
+        + meanabs_weight * loss_meanabs
+    )
+    parts = {
+        "std": loss_std.detach(),
+        "energy": loss_energy.detach(),
+        "meanabs": loss_meanabs.detach(),
+    }
+    return total, parts
+
+
 def latent_std_graded_mse_constant_loss(
     pred_x0: torch.Tensor,
     target_std: float = 0.875,
