@@ -302,6 +302,23 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_42f_allsup = bool(
             getattr(args, "dmd_42f_allsup", False)
         )
+        # ``dmd_42f_rolling_sup_new`` (phase-2 rolling): on streaming rolls
+        # k>=2 (info["overlap"] > 0) anchor the 42f noisy window on the NEW
+        # frames instead of the window head. Without this, the supervised
+        # block ``chunk[:, :sup_span]`` lands on the DETACHED overlap
+        # frames on every k>=2 roll -> the DMD "loss" backwards into
+        # nothing (silent zero-gradient). With it, the layout becomes
+        #   [GT ctx | new chunks (graph-on, supervised) | GT future chunk]
+        # where the GT future chunk (ride GT at the next abs position)
+        # fills the structurally-OOD newest slot RoPE [N, N+npb) (masked
+        # from gradient, content only). All new chunks then sit at
+        # counterpart-valid slots -> every rolled chunk is DMD-supervised
+        # exactly once when the per-roll advance equals the supervised
+        # count (streaming_force_new_frame_chunks = num supervised chunks).
+        # Iter 1 (overlap=0) keeps the standard layout unchanged.
+        self.dmd_42f_rolling_sup_new = bool(
+            getattr(args, "dmd_42f_rolling_sup_new", False)
+        )
 
         # ``dmd_42f_gt_anchor``: make the +npb leading-anchor chunk (rolled
         # in ``setup_sequence`` before the first supervised chunk) a CLEAN
@@ -939,6 +956,72 @@ class ActionForcingDMD(SelfForcingModel):
                 "forward_noiser_loss_mode must be 'mse' or 'teacher_feat'; "
                 f"got {self.forward_noiser_loss_mode!r}."
             )
+        # ``forward_noiser_reverse`` (h1): flip the FN training direction.
+        #   False (default): FN(rollout1) -> rollout2  (learn to ADD a drift
+        #                    step = a learned CARN).
+        #   True:            FN(rollout2) -> rollout1  (learn to REMOVE a
+        #                    drift step = a learned de-CARN denoiser).
+        # Only wired for the teacher_feat path (_train_forward_noiser_tf).
+        self.forward_noiser_reverse = bool(
+            getattr(args, "forward_noiser_reverse", False)
+        )
+        # ``forward_noiser_apply_gt_both`` (h1): apply the FN ONCE to BOTH
+        # GT latents (former + latter) of each matched real transition pair
+        # (texture-only, moment-preserving). With forward_noiser_reverse it
+        # de-CARNs the disc's real target, suppressing the rollout's
+        # explode/harmonise modes from the real data distribution.
+        self.forward_noiser_apply_gt_both = bool(
+            getattr(args, "forward_noiser_apply_gt_both", False)
+        )
+        # ``forward_noiser_apply_gt_level`` (h1): the carn_step passed when
+        # applying a STEP-CONDITIONED reverse FN to the GT pair. The de-CARN
+        # FN learned (drifted @ level L -> clean GT) conditioned on L; level 1
+        # removes one drift-level's worth of modes. Ignored when the FN is
+        # step-unconditioned (then carn_step=0 is used, matching training).
+        self.forward_noiser_apply_gt_level = int(
+            getattr(args, "forward_noiser_apply_gt_level", 1)
+        )
+        # ``forward_noiser_apply_gt_former`` (h3): apply the FN ONCE to the
+        # FORMER GT latent only of each matched real transition pair —
+        # NAIVE variant: same CARN'd former on BOTH the D-update and the
+        # gen-side real views (no drift cap, no gen-side clean former).
+        # With a FORWARD-trained FN this makes the real anchor a
+        # [1-step-drifted GT former -> clean GT latter] self-correcting
+        # transition. Mutually exclusive with apply_gt_both (former wins
+        # if both set... they should not both be set).
+        self.forward_noiser_apply_gt_former = bool(
+            getattr(args, "forward_noiser_apply_gt_former", False)
+        )
+        # ``forward_noiser_apply_gt_level_max`` (h4): when > apply_gt_level
+        # (and the FN is step-conditioned), the application level is drawn
+        # PER ROW uniformly in [apply_gt_level, level_max] instead of the
+        # fixed level — a stronger, varied de-CARN/CARN. 0 (default) =
+        # fixed level.
+        self.forward_noiser_apply_gt_level_max = int(
+            getattr(args, "forward_noiser_apply_gt_level_max", 0)
+        )
+        # ``forward_noiser_apply_gt_drift_cap`` (h5): per-row level drawn
+        # uniformly in [1, cap] where cap = (min drift step of the student
+        # formers this real row is served against) - 1 — i.e. the real
+        # former is CARN'd strictly LESS than the student former it is
+        # discriminated against (e11's Req-1 cap, here in the naive
+        # step-conditioned application). Rows whose served fakes are at
+        # drift <= 1 keep a CLEAN former (level 0 = no FN). Takes
+        # precedence over apply_gt_level / level_max. Step-conditioned
+        # FN only.
+        self.forward_noiser_apply_gt_drift_cap = bool(
+            getattr(args, "forward_noiser_apply_gt_drift_cap", False)
+        )
+        # ``fn_frontier_pairs`` (phase-2 rolling): at every ride RESET,
+        # generate a fresh (rollout1', rollout2') chunk pair AT THE RIDE'S
+        # FRONTIER — two short no_grad rollouts seeded from the student's
+        # own newest chunks (6 vs 5 seeds -> +1 AR step of drift at the
+        # same world position, mirroring the setup-time r1/r2 geometry) —
+        # and train the FN on it. Keeps the FN looking at data from the
+        # depths the generator actually reaches as rolling advances.
+        self.fn_frontier_pairs = bool(
+            getattr(args, "fn_frontier_pairs", False)
+        )
         # ``forward_noiser_step_unconditioned``: when True, the FN never
         # sees the CARN level — every call passes carn_step=0, so it learns
         # a single generic "+1 shift" transform (input chunk -> output
@@ -5309,7 +5392,16 @@ class ActionForcingDMD(SelfForcingModel):
         # Rollout 2 needs 1 extra generated chunk to reach the same end
         # absolute position as rollout 1 (it started one seed-chunk
         # earlier in the ride).
-        max_length_r2 = int(max_length) + npb
+        # CAP at the standard scoring window: under phase-2 rolling,
+        # ``max_length`` is the RIDE cap (hundreds of frames) — without
+        # this cap the prebuild would pre-roll the whole ride no_grad at
+        # every setup (~300 chunks, looks like a silent multi-minute
+        # hang at 100% GPU). FN pairs only ever consume the first-window
+        # span, so nothing is lost. Stationary configs (max_length ==
+        # num_training_frames) are unaffected.
+        max_length_r2 = min(
+            int(max_length), int(self.num_training_frames)
+        ) + npb
         device = seed_latents.device
         dtype = seed_latents.dtype
         batch_size = int(seed_latents.shape[0])
@@ -5324,6 +5416,15 @@ class ActionForcingDMD(SelfForcingModel):
         # operates on rollout 2's transient state (built below).
         saved_streaming_state = self.streaming_state
         self.streaming_state = None
+        # Pin the stride knobs to legacy prebuild behavior for the
+        # duration: phase-2 rolling sets a deterministic multi-chunk
+        # stride (num_chunks_roll_forward) + a large min_new_frame, which
+        # would otherwise gate ``can_generate_more`` / the picker inside
+        # this short prebuild and skip its streamed chunks entirely.
+        saved_min_new = self.streaming_min_new_frame
+        saved_force = self.streaming_force_new_frame_chunks
+        self.streaming_min_new_frame = npb
+        self.streaming_force_new_frame_chunks = 0
 
         rollout2_chunks: list = []
         try:
@@ -5445,6 +5546,8 @@ class ActionForcingDMD(SelfForcingModel):
             # at this stage of setup_sequence).
             pipe.reset_cache_state()
             self.streaming_state = saved_streaming_state
+            self.streaming_min_new_frame = saved_min_new
+            self.streaming_force_new_frame_chunks = saved_force
             # Defrag — prebuild's transient activations leave the heap
             # fragmented, and the upcoming GAN engage at step 80 spikes
             # memory by ~35GB. Without this, v24 OOMs where v25 (no
@@ -5458,6 +5561,117 @@ class ActionForcingDMD(SelfForcingModel):
         # of permanent GPU residency for the duration of the ride.
         rollout2_x0 = rollout2_x0.detach().cpu()
         return rollout2_x0, int(cf_r2)
+
+    def generate_fn_frontier_pair(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """FN frontier pair (phase-2 rolling): two short no_grad rollouts
+        seeded from the student's NEWEST chunks, producing a chunk pair
+        at the ride's frontier position F (= the next ungenerated chunk):
+
+          r1' : seeds = last 6 student chunks -> 1 AR step lands [F, F+npb)
+          r2' : seeds = last 5 of those (one chunk earlier) -> 2 AR steps
+                land [F, F+npb) = +1 AR step of drift vs r1'
+
+        Mirrors the setup-time rollout1/rollout2 geometry (6 vs 5 GT seed
+        chunks, delta = cf/npb - fake_alt_rollout2_num_seed_chunks) but on
+        STUDENT seed material at the depth the generator actually
+        reached. Both mini-rides are rebased to abs 0 (rides start at
+        arbitrary offsets in training, so this is in-distribution); the
+        action stream is the TRUE ride actions for those positions.
+
+        CLOBBERS the pipeline KV caches (via the prebuild) — call ONLY
+        when the open sequence is about to be reset.
+
+        Returns (r1_chunk, r2_chunk) on CPU, both [B, npb, C, H, W]
+        detached, or None when the geometry doesn't fit (caller must
+        keep DDP participation balanced with a zero-anchor).
+        """
+        s = self.streaming_state
+        if s is None:
+            return None
+        npb = int(self.num_frame_per_block)
+        prev = s.get("previous_chunk")
+        if prev is None or int(prev.shape[1]) < 6 * npb:
+            return None
+        cf = int(s["cf"])
+        cur = int(s["current_length"])
+        if cur < 6 * npb:
+            return None
+        F = cf + cur                                # frontier abs frame
+        lat = s["ride_latents_window"]
+        act = s["ride_actions_window"]
+        if F - 6 * npb < 0 or F + npb > int(act.shape[1]) \
+                or F + npb > int(lat.shape[1]):
+            return None
+        pe = s["prompt_embeds"]
+        n1 = 6
+        delta = max(1, (cf // npb) - int(self.fake_alt_rollout2_num_seed_chunks))
+        n2 = n1 - delta
+        if n2 < 1:
+            return None
+        seed1 = prev[:, -n1 * npb:].detach()        # chunks [F-6 .. F)
+        seed2 = prev[:, -n1 * npb:-delta * npb].detach()  # [F-6 .. F-delta)
+        # Mini windows rebased to 0 at world frame F - n1*npb. Latent
+        # windows only need shape (seed check + state plumbing); action
+        # window must be the TRUE actions for these positions.
+        mini_act = act[:, F - n1 * npb : F + npb]
+        mini_lat1 = torch.cat(
+            [seed1, lat[:, F : F + npb].to(seed1.dtype)], dim=1,
+        )
+        mini_lat2 = torch.cat(
+            [seed2, lat[:, F - delta * npb : F + npb].to(seed2.dtype)],
+            dim=1,
+        )
+        saved_nseed = self.fake_alt_rollout2_num_seed_chunks
+        try:
+            # r1': 6 seed chunks, anchor only (max_length=0) -> 1 chunk
+            # at rebased [n1*npb, n1*npb + npb) = world [F, F+npb).
+            self.fake_alt_rollout2_num_seed_chunks = n1
+            r1_x0, _ = self._prebuild_rollout2_for_v24(
+                seed_latents=seed1,
+                ride_latents_window=mini_lat1,
+                ride_actions_window=mini_act,
+                prompt_embeds=pe,
+                max_length=0,
+            )
+            # r2': n2 seed chunks, anchor (regen of an existing chunk) +
+            # delta streamed chunks -> the LAST lands at world [F, F+npb)
+            # with +delta AR steps of drift vs r1'.
+            self.fake_alt_rollout2_num_seed_chunks = n2
+            r2_x0, _ = self._prebuild_rollout2_for_v24(
+                seed_latents=seed2,
+                ride_latents_window=mini_lat2,
+                ride_actions_window=mini_act,
+                prompt_embeds=pe,
+                max_length=delta * npb,
+            )
+        finally:
+            self.fake_alt_rollout2_num_seed_chunks = saved_nseed
+        if int(r1_x0.shape[1]) < npb or int(r2_x0.shape[1]) < npb:
+            return None
+        r1c = r1_x0[:, :npb].detach()
+        r2c = r2_x0[:, -npb:].detach()
+        # Probe: prove the FN pair ADVANCES with the generator. World
+        # positions are ride-window abs frames; F grows with ride depth
+        # (deeper rides -> deeper frontier pairs).
+        try:
+            import torch.distributed as _dist
+            _is_r0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
+        except Exception:
+            _is_r0 = True
+        if _is_r0:
+            import sys as _sys
+            print(
+                f"[FN-PAIR] frontier F={F} (ride chunk {F // npb}): "
+                f"r1' seeds world [{F - n1 * npb},{F}) -> pair chunk "
+                f"[{F},{F + npb}) @1 AR step; r2' seeds "
+                f"[{F - n1 * npb},{F - delta * npb}) -> same chunk "
+                f"@{1 + delta} AR steps (ride_offset_s="
+                f"{int(s.get('ride_offset_s', 0))})",
+                file=_sys.stderr, flush=True,
+            )
+        return r1c, r2c
 
     def _streaming_build_cond_dicts(
         self,
@@ -6351,6 +6565,62 @@ class ActionForcingDMD(SelfForcingModel):
         chunk_lo = cf + noisy_start_sdn            # first student chunk's abs pos
         ride_lat = s["ride_latents_window"]
         ride_act = s["ride_actions_window"]
+        # ---- Phase-2 rolling (dmd_42f_rolling_sup_new): on k>=2 rolls
+        # (overlap > 0) the WHOLE 42f window rolls forward with the
+        # student. Layout becomes
+        #   [n_ctx STUDENT ctx (overlap, detached) | new frames (graph-on,
+        #    supervised) | npb GT future scaffold]
+        # i.e. the noisy half is the student's own rolled window — the
+        # GT-context former half is SPECIAL to iter 1 only (per design).
+        # The GT future chunk occupies the structurally-OOD newest slot
+        # RoPE [N, N+npb) (gradient-masked, content only): a chunk newer
+        # than the newest rolled chunk does not exist yet, and that slot
+        # must be filled for v14's exact 21f joint geometry. clean_x
+        # stays positional GT and rolls forward with the window.
+        # Without this branch the supervised block = chunk[:, :sup_span]
+        # = the DETACHED overlap frames -> silent zero-gradient DMD on
+        # every roll after the first.
+        _rolling = (
+            bool(getattr(self, "dmd_42f_rolling_sup_new", False))
+            and int(info.get("overlap", 0)) > 0
+        )
+        if _rolling:
+            _ovl = int(info["overlap"])
+            _nf = int(info["new_frames"])
+            if _nf % npb != 0 or _nf <= 0:
+                raise RuntimeError(
+                    f"42f rolling: new_frames={_nf} must be a positive "
+                    f"multiple of npb={npb}."
+                )
+            sup_frames = _nf                       # supervise ALL new chunks
+            gt_after_frames = npb                  # GT scaffold at the OOD slot
+            n_ctx = N - sup_frames - gt_after_frames
+            if n_ctx < 0:
+                raise RuntimeError(
+                    f"42f rolling: n_ctx={n_ctx} < 0 — new_frames={_nf} too "
+                    f"large for N={N} (reduce num_chunks_roll_forward)."
+                )
+            if _ovl < n_ctx:
+                raise RuntimeError(
+                    f"42f rolling: overlap={_ovl} < n_ctx={n_ctx} — the "
+                    f"student window cannot supply the context half."
+                )
+            # Rebind ``chunk`` to [n_ctx student ctx | new frames]: drop
+            # the overlap frames older than the context window. The
+            # context slice comes from the previous iters' chunks
+            # (already detached); the new frames stay graph-on.
+            # ``chunk_lo`` keeps its downstream meaning = abs pos of the
+            # first SUPERVISED frame (ctx occupies [chunk_lo - n_ctx,
+            # chunk_lo), exactly the overlap frames preceding the new
+            # ones), so noisy_lo / noisy_hi / clean_lo math is unchanged.
+            chunk = torch.cat(
+                [
+                    chunk[:, _ovl - n_ctx:_ovl].detach(),
+                    chunk[:, _ovl:],
+                ],
+                dim=1,
+            )
+            chunk_lo = chunk_lo + _ovl             # abs pos of first NEW frame
         # noisy half abs span [chunk_lo - n_ctx, chunk_lo + sup_frames +
         # gt_after_frames) (21 frames); clean half shifted back npb.
         noisy_lo = chunk_lo - n_ctx
@@ -6376,24 +6646,34 @@ class ActionForcingDMD(SelfForcingModel):
         # num_chunks / short rollout fails loud, not via an opaque
         # out-of-bounds slice below.
         _rand_need = bool(getattr(self, "dmd_42f_rand_sup_slot", False))
-        chunk_need = (
-            sup_frames
-            if (seed_last and not _rand_need)
-            else (sup_frames + gt_after_frames)
-        )
+        if _rolling:
+            # Rolling: the (rebound) chunk holds [n_ctx student ctx |
+            # new frames]; the after-slot is sourced from ride GT.
+            chunk_need = n_ctx + sup_frames
+        else:
+            chunk_need = (
+                sup_frames
+                if (seed_last and not _rand_need)
+                else (sup_frames + gt_after_frames)
+            )
         if int(chunk.shape[1]) < chunk_need:
             raise RuntimeError(
                 f"42f DMD: student chunk has {int(chunk.shape[1])} frames "
                 f"but {chunk_need} required (sup_frames={sup_frames}, "
                 f"seed_last={seed_last}, gt_after_frames={gt_after_frames})."
             )
-        # noisy_x: n_ctx GT context (detached) + the first ``sup_frames``
-        # student frames (graph-on, supervised) + the newest chunk(s)
-        # (detached, masked context). The supervised chunks sit at the
-        # reliable mid-window slots; the newest is at [21,24) (masked).
-        gt_ctx = ride_lat[:, noisy_lo:chunk_lo].to(
-            dtype=chunk.dtype, device=chunk.device,
-        ).detach()
+        # noisy_x: n_ctx context (detached) + the ``sup_frames`` student
+        # frames (graph-on, supervised) + the newest chunk(s) (detached,
+        # masked context). The supervised chunks sit at the reliable
+        # mid-window slots; the newest is at [21,24) (masked).
+        # Context source: ride GT normally; the STUDENT's own overlap
+        # frames on rolling k>=2 (iter 1's GT former half is special).
+        if _rolling:
+            gt_ctx = chunk[:, :n_ctx].detach()
+        else:
+            gt_ctx = ride_lat[:, noisy_lo:chunk_lo].to(
+                dtype=chunk.dtype, device=chunk.device,
+            ).detach()
         # Random supervised slot (rand_sup_slot): pick WHICH after-slot
         # carries the DMD gradient. Valid slots are those whose noisy frames
         # still have a clean counterpart — every slot except the last
@@ -6423,12 +6703,40 @@ class ActionForcingDMD(SelfForcingModel):
         _allsup = (not seed_last) and bool(
             getattr(self, "dmd_42f_allsup", False)
         )
-        if _allsup:
+        if _rolling:
+            # Rolling overrides allsup/rand_slot geometry: every new chunk
+            # is supervised; the after-slot is a GT scaffold.
+            sup_span = sup_frames
+            sup_offset = 0
+            _allsup = False
+            _rand_slot = False
+        elif _allsup:
             sup_span = (N - npb) - n_ctx
             sup_offset = 0
         else:
             sup_span = sup_frames
-        if _allsup:
+        if _rolling:
+            gt_future = ride_lat[
+                :,
+                chunk_lo + sup_frames : chunk_lo + sup_frames + gt_after_frames,
+            ].to(dtype=chunk.dtype, device=chunk.device).detach()
+            _sup_block = chunk[:, n_ctx:n_ctx + sup_frames]
+            parts = [gt_ctx, _sup_block, gt_future]
+            if getattr(self, "_rolling_42f_dbg", 0) < 2:
+                self._rolling_42f_dbg = getattr(
+                    self, "_rolling_42f_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    f"[42F-ROLLING] ACTIVE: full student window — "
+                    f"ctx=STUDENT overlap [{chunk_lo - n_ctx},{chunk_lo}) "
+                    f"sup=[{chunk_lo},{chunk_lo + sup_frames}) "
+                    f"(graph-on={bool(_sup_block.requires_grad)}) "
+                    f"gt_future=[{chunk_lo + sup_frames},"
+                    f"{chunk_lo + sup_frames + gt_after_frames}) "
+                    f"clean_lo={chunk_lo - n_ctx - npb} (GT, rolls fwd)",
+                    file=_sys.stderr, flush=True,
+                )
+        elif _allsup:
             stu_tot = sup_frames + gt_after_frames
             parts = [
                 gt_ctx,
@@ -8525,8 +8833,10 @@ class ActionForcingDMD(SelfForcingModel):
             err_masked_dbg = (err_dbg * mask_f_dbg).sum() / denom_dbg
             aux_teacher_pred_mae_v = float(err_masked_dbg.item())
             aux_t_mean_v = float(t.float().mean().item())
+        # float, not a raw bf16 tensor — see real_teacher log note: a bf16
+        # value kills the trainer's whole wandb.log call for the step.
         log: Dict[str, Any] = {
-            "aux_teacher_loss": loss.detach(),
+            "aux_teacher_loss": float(loss.detach().item()),
             "aux_teacher_input_was_gt": 1.0,
             "aux_teacher_pred_mae": aux_teacher_pred_mae_v,
             "aux_teacher_t_mean": aux_t_mean_v,
@@ -8793,9 +9103,13 @@ class ActionForcingDMD(SelfForcingModel):
             err_masked = (err * mask_f).sum() / denom
             real_teacher_pred_mae_v = float(err_masked.item())
             t_mean = float(t.float().mean().item())
+        # Scalars/float32 only: a raw bf16 tensor here propagates into the
+        # trainer's wandb payload and kills the WHOLE wandb.log call
+        # ("Got unsupported ScalarType BFloat16") — every metric for the
+        # step is silently dropped.
         log: Dict[str, Any] = {
-            "real_teacher_loss": loss.detach(),
-            "real_teacher_timestep": t.detach(),
+            "real_teacher_loss": float(loss.detach().item()),
+            "real_teacher_timestep": t.detach().float(),
             "real_teacher_input_was_gt": 1.0 if use_gt else 0.0,
             "real_teacher_pred_mae": real_teacher_pred_mae_v,
             "real_teacher_t_mean": t_mean,

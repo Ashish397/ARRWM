@@ -2114,6 +2114,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if previous_time is not None:
                         log_payload["per_iter_time"] = time.time() - previous_time
                     try:
+                        # Sanitize: wandb chokes on bf16/fp16 tensors
+                        # ("Got unsupported ScalarType BFloat16") and the
+                        # exception drops the WHOLE payload for this step.
+                        for _k, _v in list(log_payload.items()):
+                            if (torch.is_tensor(_v)
+                                    and _v.is_floating_point()
+                                    and _v.dtype != torch.float32):
+                                log_payload[_k] = (
+                                    float(_v.item()) if _v.numel() == 1
+                                    else _v.detach().float()
+                                )
                         wandb.log(log_payload, step=self.step)
                     except Exception as e:
                         logging.warning("wandb.log failed: %s", e)
@@ -3914,6 +3925,66 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             loss = loss + (pf_s - pr_s).pow(2).mean()
         return loss / max(1, len(idxs))
 
+    def _train_fn_frontier_pair(self) -> dict:
+        """FN frontier training (phase-2 rolling): consume the
+        (rollout1', rollout2') chunk pair generated at the ride's
+        frontier (``model.generate_fn_frontier_pair``) and backprop the
+        teacher-feat SW loss into the FN. Called ONLY on reset steps
+        (rank-lockstep), immediately before ``reset_streaming_state``.
+        Mirrors ``_train_forward_noiser_tf``'s DDP discipline: every
+        rank runs exactly one FN forward+backward (zero-anchor on any
+        bail) so the FN DDP reducer stays matched."""
+        m = self.model
+
+        def _anchor(reason: str) -> dict:
+            fn = m.forward_noiser
+            fn_inner = fn.module if hasattr(fn, "module") else fn
+            p0 = next(fn.parameters())
+            C = int(getattr(fn_inner, "latent_channels", 16))
+            x0 = torch.zeros(
+                (1, int(getattr(m, "num_frame_per_block", 3)), C, 8, 8),
+                device=p0.device, dtype=p0.dtype,
+            )
+            cz = torch.zeros((1,), dtype=torch.long, device=x0.device)
+            (fn(x0, cz, residual=True).sum() * 0.0).backward()
+            return {
+                "train/fn_frontier_skipped": 1.0,
+            }
+
+        proj = (
+            getattr(self.r3gan_disc, "projector", None)
+            if self.r3gan_disc is not None else None
+        )
+        if proj is None:
+            return _anchor("no_projector")
+        pair = m.generate_fn_frontier_pair()
+        if pair is None:
+            return _anchor("no_pair_geometry")
+        r1c, r2c = pair
+        p0 = next(m.forward_noiser.parameters())
+        r1c = r1c.to(device=p0.device, dtype=p0.dtype)
+        r2c = r2c.to(device=p0.device, dtype=p0.dtype)
+        cs = torch.zeros(
+            (r1c.shape[0],), dtype=torch.long, device=r1c.device,
+        )
+        fn_out = m.forward_noiser(r1c, cs, residual=True)  # grad-on
+        loss = self._fn_teacher_feat_loss(fn_out, r2c, proj)
+        loss.backward()
+        if (getattr(self, "is_main_process", True)
+                and getattr(self, "_fn_frontier_dbg", 0) < 3):
+            self._fn_frontier_dbg = getattr(self, "_fn_frontier_dbg", 0) + 1
+            import sys as _sys
+            print(
+                f"[FN-FRONTIER] trained on frontier pair at ride depth "
+                f"{self._chunks_in_current_ride} (loss="
+                f"{float(loss.detach().item()):.5f})",
+                file=_sys.stderr, flush=True,
+            )
+        return {
+            "train/fn_frontier_loss": float(loss.detach().item()),
+            "train/fn_frontier_pairs": 1.0,
+        }
+
     def _train_forward_noiser_tf(self, rollout1_chunk, info) -> dict:
         """teacher_feat FN training step (separate FN backward). Builds the
         flattened (rollout1_chunk, rollout2_chunk) pairs, runs FN on the
@@ -3985,14 +4056,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         overlap = int(info.get("overlap", 0))
         chunk_abs_start = abs_new_start - overlap
 
+        # ``forward_noiser_reverse`` (h1): flip the mapping the FN learns.
+        #   forward (default): FN(clean/rollout1) -> drifted/rollout2  (ADD a
+        #                      drift step; a learned CARN that reproduces the
+        #                      rollout's per-step explode/harmonise modes).
+        #   reverse  (=true):  FN(drifted/rollout2) -> clean/rollout1  (REMOVE
+        #                      a drift step; a learned de-CARN denoiser).
+        #                      Applied to GT it suppresses those modes from
+        #                      the real distribution (matched-pool gt_both).
+        _reverse = bool(getattr(m, "forward_noiser_reverse", False))
+
         # ===== carn_recurse=False: CUMULATIVE single-call FN training =====
-        # Train FN(clean GT chunk, carn_step=level) -> student-drifted chunk
-        # at that level, in ONE conditioned call (no rollout2 / no +1
-        # composition). The student's rollout1 chunk at abs position p IS the
-        # level-L(p) drift of the clean GT at p; we pair them and condition on
-        # L(p). Application (_apply_forward_noiser_to_gt / _carn_former) then
-        # reaches level k with a single carn_step=k call. Level-0 chunks carry
-        # no drift, so they are skipped (the FN stays identity at step 0).
+        # forward: FN(clean GT chunk, carn_step=L) -> student-drifted chunk @L,
+        # in ONE conditioned call (no rollout2 / no +1 composition). The
+        # student's rollout1 chunk at abs position p IS the level-L(p) drift of
+        # the clean GT at p; we pair them and condition on L(p).
+        # reverse:  FN(student-drifted chunk @L, carn_step=L) -> clean GT — a
+        # de-CARN denoiser conditioned on the input's drift level. Application
+        # (_apply_forward_noiser_to_gt / matched-pool gt_both) passes a real
+        # level (forward_noiser_apply_gt_level, default 1) so the FN removes
+        # one drift-level's worth of modes. Level-0 chunks carry no drift, so
+        # they are skipped (the FN stays identity at step 0) either direction.
         if not bool(getattr(m, "carn_recurse", True)):
             ride_win = s.get("ride_latents_window")
             if ride_win is None:
@@ -4000,7 +4084,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             num_seed = int(m.dmd_context_clean_frames // npb)
             ride_T = int(ride_win.shape[1])
             Bc = int(r1.shape[0])
-            gt_inputs, r1_targets, carn_levels = [], [], []
+            cum_inputs, cum_targets, carn_levels = [], [], []
             for c in range(n_chunks):
                 f0, f1 = c * npb, c * npb + npb
                 a0, a1 = chunk_abs_start + f0, chunk_abs_start + f1
@@ -4009,14 +4093,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 lvl = max(0, (a0 // npb) - (num_seed - 1))
                 if lvl <= 0:
                     continue  # level-0: no drift to learn (FN identity).
-                gt_inputs.append(
-                    ride_win[:, a0:a1].to(dtype=r1.dtype, device=r1.device).detach())
-                r1_targets.append(r1[:, f0:f1].detach())
+                gt_chunk = ride_win[:, a0:a1].to(
+                    dtype=r1.dtype, device=r1.device).detach()
+                drift_chunk = r1[:, f0:f1].detach()
+                if _reverse:
+                    cum_inputs.append(drift_chunk)   # drifted @L  -> input
+                    cum_targets.append(gt_chunk)     # clean GT    -> target
+                else:
+                    cum_inputs.append(gt_chunk)
+                    cum_targets.append(drift_chunk)
                 carn_levels.append(int(lvl))
-            if not gt_inputs:
+            if not cum_inputs:
                 return _anchor("no_pairs_cumulative")
-            fn_in = torch.cat(gt_inputs, dim=0)           # [N*B, npb, C, H, W]
-            cum_tg = torch.cat(r1_targets, dim=0)
+            fn_in = torch.cat(cum_inputs, dim=0)          # [N*B, npb, C, H, W]
+            cum_tg = torch.cat(cum_targets, dim=0)
             carn = torch.cat([
                 torch.full((Bc,), lvl, dtype=torch.long, device=fn_in.device)
                 for lvl in carn_levels
@@ -4026,36 +4116,59 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             loss.backward()
             return {
                 "train/fn_tf_loss": float(loss.detach().item()),
-                "train/fn_tf_pairs": float(len(gt_inputs)),
+                "train/fn_tf_pairs": float(len(cum_inputs)),
                 "train/fn_tf_skipped": 0.0,
                 "train/fn_tf_cumulative": 1.0,
+                "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
             }
 
-        fn_inputs, r2_targets = [], []
+        fn_inputs, fn_targets = [], []
+        _pair_abs: list = []
         for c in range(n_chunks):
             f0, f1 = c * npb, c * npb + npb
             a0, a1 = chunk_abs_start + f0, chunk_abs_start + f1
             if a0 < r2_abs or a1 > r2_abs + r2_total:
                 continue
             s0 = a0 - r2_abs
-            fn_inputs.append(r1[:, f0:f1].detach())
-            r2_targets.append(r2[:, s0:s0 + npb].to(
-                dtype=r1.dtype, device=r1.device).detach())
+            r1_chunk = r1[:, f0:f1].detach()
+            r2_chunk = r2[:, s0:s0 + npb].to(
+                dtype=r1.dtype, device=r1.device).detach()
+            _pair_abs.append(int(a0))
+            if _reverse:
+                fn_inputs.append(r2_chunk)   # input  = rollout2 (drifted)
+                fn_targets.append(r1_chunk)  # target = rollout1 (cleaner)
+            else:
+                fn_inputs.append(r1_chunk)
+                fn_targets.append(r2_chunk)
         if not fn_inputs:
             return _anchor("no_pairs")
+        # Probe: where the SETUP-WINDOW FN pairs live (abs ride frames).
+        # Expected under rolling: only each ride's FIRST window yields
+        # pairs (rollout2 covers the setup span) — the frontier pairs
+        # ([FN-PAIR]) are the ones that advance with the generator.
+        if (getattr(self, "is_main_process", True)
+                and getattr(self, "_fn_tf_pos_dbg", 0) < 6):
+            self._fn_tf_pos_dbg = getattr(self, "_fn_tf_pos_dbg", 0) + 1
+            import sys as _sys
+            print(
+                f"[FN-TF] setup-window pairs n={len(_pair_abs)} "
+                f"r1_abs={_pair_abs} r2_span=[{r2_abs},{r2_abs + r2_total})",
+                file=_sys.stderr, flush=True,
+            )
         fn_in = torch.cat(fn_inputs, dim=0)       # [N*B, npb, C, H, W]
-        r2_tg = torch.cat(r2_targets, dim=0)
-        # Step-UNCONDITIONED: carn_step=0 always (generic +1 shift).
+        fn_tg = torch.cat(fn_targets, dim=0)
+        # Step-UNCONDITIONED: carn_step=0 always (generic +/-1 shift).
         carn = torch.zeros(
             (fn_in.shape[0],), dtype=torch.long, device=fn_in.device,
         )
         fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
-        loss = self._fn_teacher_feat_loss(fn_out, r2_tg, proj)
+        loss = self._fn_teacher_feat_loss(fn_out, fn_tg, proj)
         loss.backward()
         return {
             "train/fn_tf_loss": float(loss.detach().item()),
             "train/fn_tf_pairs": float(len(fn_inputs)),
             "train/fn_tf_skipped": 0.0,
+            "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
         }
 
     #     "student vs teacher's clean data".
@@ -5325,6 +5438,131 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             _ao = _cur.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
                             _cur = _cur * (_ai / (_ao + _e))
                         ru = torch.cat([_cur.detach(), ru[:, npb:]], dim=1)
+                # FN application to the matched real pairs (both naive: the
+                # SAME transformed pair feeds the D-update and the gen-side
+                # real view — no Req-1 drift cap, no Req-2 gen-side shield):
+                #   * apply_gt_both (h1): ONE FN call per half (former AND
+                #     latter). With a REVERSE-trained FN this de-CARNs the
+                #     real target (suppresses the rollout's explode/
+                #     harmonise modes from the real distribution).
+                #   * apply_gt_former (h3): ONE FN call on the FORMER only.
+                #     With a FORWARD-trained FN the real anchor becomes
+                #     [1-step-drifted GT former -> clean GT latter], the
+                #     self-correcting transition.
+                # Moment-preserving (texture-only) restore per transformed
+                # half so only texture STRUCTURE changes (no brightness/
+                # colour shift).
+                _gt_both = bool(getattr(
+                    self.model, "forward_noiser_apply_gt_both", False))
+                _gt_former = bool(getattr(
+                    self.model, "forward_noiser_apply_gt_former", False))
+                if ((_gt_both or _gt_former)
+                        and getattr(self.model, "forward_noiser", None)
+                        is not None):
+                    # Conditioning level for the application. A step-
+                    # UNCONDITIONED FN trained only at carn_step=0, so apply
+                    # at 0. A step-CONDITIONED FN (give it the numbers)
+                    # trained at the input's drift level L; applying at
+                    # forward_noiser_apply_gt_level (default 1) adds/removes
+                    # one drift-level's worth depending on the FN direction.
+                    _step_uncond = bool(getattr(
+                        self.model,
+                        "forward_noiser_step_unconditioned", False))
+                    _apply_lvl = 0 if _step_uncond else int(getattr(
+                        self.model, "forward_noiser_apply_gt_level", 1))
+                    # h4: per-row random level in [apply_lvl, lvl_max]
+                    # (step-conditioned only). 0/<=apply_lvl = fixed level.
+                    _lvl_max = 0 if _step_uncond else int(getattr(
+                        self.model, "forward_noiser_apply_gt_level_max", 0))
+                    # h5: drift-capped per-row level — rand[1, mindrift-1]
+                    # where mindrift = min drift step of the student
+                    # formers this real row is served against (via gm).
+                    # Rows served only by drift<=1 fakes keep a CLEAN
+                    # former (level 0 -> FN output discarded below).
+                    _drift_cap = (not _step_uncond) and bool(getattr(
+                        self.model,
+                        "forward_noiser_apply_gt_drift_cap", False))
+                    _fn_offsets = (0, npb) if _gt_both else (0,)
+                    with torch.no_grad():
+                        if _drift_cap:
+                            _BIGc = 1 << 30
+                            _mind = [_BIGc] * int(ru.shape[0])
+                            for _p in range(n_pairs):
+                                _fd = int(pairs[_p][0])
+                                for _b in range(B):
+                                    _fr = _p * B + _b
+                                    for _k in range(Kk):
+                                        _r = int(gm[_fr, _k].item())
+                                        if _fd < _mind[_r]:
+                                            _mind[_r] = _fd
+                            _lvls = []
+                            for _r in range(int(ru.shape[0])):
+                                _cp = (_mind[_r] - 1
+                                       if _mind[_r] < _BIGc else 0)
+                                _lvls.append(
+                                    int(torch.randint(
+                                        1, _cp + 1, (1,)).item())
+                                    if _cp >= 1 else 0)
+                            _cs0 = torch.tensor(
+                                _lvls, dtype=torch.long, device=ru.device)
+                        elif _lvl_max > _apply_lvl:
+                            _cs0 = torch.randint(
+                                _apply_lvl, _lvl_max + 1, (ru.shape[0],),
+                                dtype=torch.long, device=ru.device)
+                        else:
+                            _cs0 = torch.full(
+                                (ru.shape[0],), _apply_lvl,
+                                dtype=torch.long, device=ru.device)
+                        _halves = []
+                        for _h0 in (0, npb):
+                            _x0 = ru[:, _h0:_h0 + npb]
+                            if _h0 not in _fn_offsets:
+                                _halves.append(_x0)
+                                continue
+                            _cur = self.model.forward_noiser(
+                                _x0, _cs0, residual=True)
+                            _e = 1e-6
+                            _mci = _x0.mean(dim=[1, 3, 4], keepdim=True)
+                            _mco = _cur.mean(dim=[1, 3, 4], keepdim=True)
+                            _cur = _cur - _mco + _mci
+                            _ai = _x0.abs().mean(
+                                dim=[1, 2, 3, 4], keepdim=True)
+                            _ao = _cur.abs().mean(
+                                dim=[1, 2, 3, 4], keepdim=True)
+                            _cur = _cur * (_ai / (_ao + _e))
+                            # Level-0 rows (drift-cap mode: served fakes at
+                            # drift <= 1) keep the ORIGINAL clean half — the
+                            # FN was never trained at level 0, so its output
+                            # there is undefined; discard it.
+                            _keep = (_cs0 > 0).view(-1, 1, 1, 1, 1)
+                            _cur = torch.where(_keep, _cur, _x0)
+                            _halves.append(_cur)
+                        ru = torch.cat(_halves, dim=1).detach()
+                    if (getattr(self, "is_main_process", True)
+                            and getattr(self, "_fn_gt_both_dbg", 0) < 2):
+                        self._fn_gt_both_dbg = getattr(
+                            self, "_fn_gt_both_dbg", 0) + 1
+                        import sys as _sys
+                        if _drift_cap:
+                            _lvl_desc = (
+                                "drift-capped rand[1,mindrift-1] "
+                                "(levels=%s)" % (
+                                    _cs0.tolist()[:8],))
+                        elif _lvl_max > _apply_lvl:
+                            _lvl_desc = "rand[%d,%d]" % (
+                                _apply_lvl, _lvl_max)
+                        else:
+                            _lvl_desc = str(_apply_lvl)
+                        print(
+                            "[FN-GT-%s] ACTIVE: FN applied to %s of %d "
+                            "matched real pairs at carn_step=%s "
+                            "(step_uncond=%s, naive both-sides)" % (
+                                "BOTH" if _gt_both else "FORMER",
+                                "BOTH GT latents" if _gt_both
+                                else "the FORMER GT latent",
+                                ru.shape[0], _lvl_desc, _step_uncond),
+                            file=_sys.stderr, flush=True,
+                        )
                 gflat = gm.reshape(-1).to(device)                # [n_pairs*B*Kk]
                 rat = ram = None
                 if acts_list:
@@ -7386,11 +7624,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         restricts the candidate set to offsets whose rollout window
         ``ride[s + window_lo_offset : s + window_lo_offset + window_len]``
         has mean per-frame motion magnitude ≥ ``cfg.motion_start_threshold``
-        (default 0.5 — empirically separates parked / idling windows
-        from clearly-moving ones across the dataset). With probability
-        1 - prob, samples uniformly. If motion is unavailable for this
-        ride or no candidate meets the threshold, falls back to uniform
-        sampling on ``[0, s_local_max]``.
+        (code default 0.5, but the phase-3 DMD config sets 5.0 to keep
+        only clearly high-motion windows; 0.5 merely excludes parked /
+        idling windows). Among qualifying windows it samples uniformly.
+        With probability 1 - prob, samples uniformly over all offsets.
+        If motion is unavailable for this ride (or the window bounds
+        don't fit), falls back to uniform sampling on ``[0, s_local_max]``.
+        If motion IS available but NO window clears the threshold, picks
+        the ride's single highest-motion window (argmax) — never a random
+        low-motion offset — so the high-motion guarantee holds per ride.
 
         Per-rank: each rank picks independently from its own ride's
         motion. The legacy DDP pattern broadcast a rank-0 pick (so
@@ -7457,18 +7699,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             - csum[lo : lo + n_candidates]
         )
         means = sums / float(window_len)
-        valid_idx = np.flatnonzero(means >= threshold)
-        if valid_idx.size == 0:
-            return _snap(random.randint(0, s_local_max))
-        # Restrict to npb-aligned candidates among valid_idx so we
-        # don't bias toward pseudo-aligned offsets via post-hoc snap.
-        # ``valid_idx`` is sorted (np.flatnonzero output), so the
-        # filter just keeps the multiples-of-npb entries; if none are
-        # valid, fall back to snapping a random valid offset.
-        aligned_valid = valid_idx[valid_idx % npb == 0]
+        # Work directly on npb-aligned candidate offsets so we never bias
+        # toward pseudo-aligned offsets via a post-hoc snap.
+        aligned_all = np.arange(0, s_local_max + 1, npb)
+        aligned_means = means[aligned_all]
+        aligned_valid = aligned_all[aligned_means >= threshold]
         if aligned_valid.size > 0:
+            # Uniform among the high-motion (>= threshold) windows.
             return int(aligned_valid[random.randrange(aligned_valid.size)])
-        return _snap(int(valid_idx[random.randrange(valid_idx.size)]))
+        # No aligned window clears the threshold for this ride. Rather
+        # than a uniform-random (low-motion) offset, pick the ride's
+        # single HIGHEST-motion window (argmax) so "high motion only"
+        # still holds even on rides whose best window is below cutoff.
+        return int(aligned_all[int(np.argmax(aligned_means))])
 
     # ------------------------------------------------------------------
     # CPU-only ride prefetch (executor + queued future). Worker thread
@@ -7735,6 +7978,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         """
         cfg = self.config
         max_rolls = int(getattr(cfg, "max_rolls_per_ride", 60))
+        # Rolling-depth CURRICULUM (phase-2 rolling): cap the rolls per
+        # ride at ``base + (step - start) // every`` so early training
+        # re-seeds often (short rides) and later training rolls deeper.
+        # E.g. base=2, every=50: steps [start, start+50) -> first window
+        # + 1 extra roll; +1 extra roll per 50 steps thereafter. 0 = off
+        # (plain max_rolls_per_ride). The schedule only LOWERS the cap.
+        _sched_every = int(getattr(
+            cfg, "rolling_rolls_schedule_every", 0))
+        if _sched_every > 0:
+            _sched_base = int(getattr(
+                cfg, "rolling_rolls_schedule_base", 2))
+            _sched_start = int(getattr(
+                cfg, "rolling_rolls_schedule_start_step", 0))
+            _cur_step = int(getattr(self, "step", 0))
+            max_rolls = min(
+                max_rolls,
+                _sched_base
+                + max(0, _cur_step - _sched_start) // _sched_every,
+            )
         force_exit_step_enabled = bool(
             getattr(cfg, "force_exit_step_enabled", False)
         )
@@ -7877,12 +8139,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # reset; the cost is a few resets that some ranks didn't
         # individually need (their ride state still gets thrown away),
         # but that's strictly better than a hang.
-        # MAE-collapse reset removed (the MAE-extension path was
-        # deleted; we no longer monitor MAE for ride resets).
-        # The cap + exhausted gates still fire normally.
+        # MAE-collapse reset (phase-2 rolling): reset the ride when the
+        # trained window's MAE vs GT crosses ``streaming_mae_collapse_
+        # threshold`` (0 = off). ``avg_mae`` is this step's per-rank MAE
+        # on the chunk_size window (computed in Stage 3). ``min_chunks``
+        # skips the gate on the first roll(s) of a ride, where the MAE
+        # is dominated by the fresh-window rollout rather than drift.
+        # Per-rank decision; the MAX-reduce below keeps resets lockstep.
+        _mae_thr = float(getattr(
+            cfg, "streaming_mae_collapse_threshold", 0.0))
+        _mae_min_chunks = int(getattr(
+            cfg, "streaming_mae_collapse_min_chunks", 2))
+        local_mae_collapse = (
+            _mae_thr > 0.0
+            and self._chunks_in_current_ride >= _mae_min_chunks
+            and avg_mae > _mae_thr
+        )
         local_hit_cap = self._chunks_in_current_ride >= max_rolls
         local_exhausted = not self.model.can_generate_more()
-        local_should_reset = local_hit_cap or local_exhausted
+        local_should_reset = (
+            local_hit_cap or local_exhausted or local_mae_collapse
+        )
         if dist.is_initialized() and dist.get_world_size() > 1:
             flag_t = torch.tensor(
                 [1 if local_should_reset else 0],
@@ -7898,18 +8175,58 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # reset". Both ranks always agree on the boolean now.
         if should_reset:
             out["streaming_did_reset"] = 1.0
-            # MAE-collapse reset removed alongside the MAE-extension
-            # path. Only cap / end-of-ride / peer-triggered reasons
-            # remain.
-            if local_hit_cap:
+            if local_mae_collapse:
+                out["streaming_reset_reason_mae_collapse"] = 1.0
+            elif local_hit_cap:
                 out["streaming_reset_reason_cap"] = 1.0
             elif local_exhausted:
                 out["streaming_reset_reason_end_of_ride"] = 1.0
             else:
                 out["streaming_reset_reason_peer_triggered"] = 1.0
+            # FN frontier pair (phase-2 rolling): train the FN on a fresh
+            # rollout1'/rollout2' pair generated AT THE RIDE'S FRONTIER,
+            # right before the sequence is torn down (the pair generation
+            # clobbers the pipeline KV caches, which is safe ONLY here).
+            # Reset is rank-lockstep, so every rank runs exactly one FN
+            # backward per reset step (DDP bucket counts stay matched;
+            # bail-outs run the zero-anchor).
+            if (
+                bool(getattr(self.model, "fn_frontier_pairs", False))
+                and getattr(self.model, "forward_noiser", None) is not None
+                and str(getattr(
+                    self.model, "forward_noiser_loss_mode", "mse",
+                )) == "teacher_feat"
+            ):
+                out.update(self._train_fn_frontier_pair())
             self.model.reset_streaming_state()
         else:
             out["streaming_did_reset"] = 0.0
+
+        # Phase-2 rolling stderr telemetry (rank 0, only when the
+        # deterministic-stride rolling mode is active): one compact line
+        # per step so ride depth / MAE / resets are visible offline
+        # (wandb-only metrics don't reach .err).
+        if (
+            self.is_main_process
+            and int(getattr(
+                self.model, "streaming_force_new_frame_chunks", 0)) > 0
+        ):
+            import sys as _sys
+            if should_reset:
+                _rr = (
+                    "mae_collapse" if local_mae_collapse
+                    else "cap" if local_hit_cap
+                    else "end_of_ride" if local_exhausted
+                    else "peer"
+                )
+            else:
+                _rr = "-"
+            print(
+                f"[ROLL] step={int(getattr(self, 'step', -1))} "
+                f"ride_chunk={self._chunks_in_current_ride}/{max_rolls} "
+                f"mae={avg_mae:.4f} reset={int(bool(should_reset))}({_rr})",
+                file=_sys.stderr, flush=True,
+            )
 
         # Wall-clock telemetry. Lets us tell apart two failure modes
         # of the prefetch design:
@@ -8550,11 +8867,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         actual_cap = min(cap, ride_len - cf_dmdctx - s)
         if actual_cap % npb != 0:
             actual_cap = (actual_cap // npb) * npb
+        # Phase-2 rolling (dmd_42f_rolling_sup_new): the 42f rolling
+        # layout needs one GT chunk BEYOND the newest rolled frame (the
+        # scaffold at the masked OOD slot). Keep the ride window sliced
+        # at the full ``actual_cap`` but stop the ROLLING ``max_length``
+        # one chunk short, so ride GT at [new_hi, new_hi + npb) always
+        # exists for the last roll.
+        _rolling_slack = (
+            npb if bool(getattr(
+                self.config, "dmd_42f_rolling_sup_new", False)) else 0
+        )
+        roll_cap = actual_cap - _rolling_slack
         # Reject if the ride can't fit the +npb anchor + at least one
         # valid ``generate_next_chunk`` call.
         min_new = int(getattr(self.model, "streaming_min_new_frame", npb))
         anchor_frames = int(getattr(self.model, "dmd_clean_x_anchor_frames", npb))
-        if actual_cap < anchor_frames + min_new:
+        if roll_cap < anchor_frames + min_new:
             return False
 
         prompt_embeds = ride["prompt_embeds"]
@@ -8585,7 +8913,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             ride_latents_window=ride_lat_window,
             ride_actions_window=ride_act_window,
             prompt_embeds=prompt_embeds,
-            max_length=int(actual_cap),
+            max_length=int(roll_cap),
         )
 
         # GT match pool for the content-matched transition GAN: the FULL

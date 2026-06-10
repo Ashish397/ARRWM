@@ -191,6 +191,7 @@ srun torchrun \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
+    motion_start_threshold=5.0 \
     fake_score_lora_enabled=false \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
@@ -222,7 +223,9 @@ srun torchrun \
     ladd_gt_transition_enabled=true \
     ladd_gt_transition_weight=1.0 \
     ladd_gt_transition_all_pairs=false \
-    ladd_gt_transition_mean_equalize=false \
+    ladd_gt_transition_mean_equalize=true \
+    ladd_gt_transition_xeq_preserve_delta=true \
+    ladd_gt_transition_xeq_per_channel=true \
     ladd_gt_transition_n_real=0 \
     ladd_gt_transition_match=true \
     ladd_gt_transition_match_k=4 \
