@@ -565,6 +565,16 @@ class ActionForcingTrainingPipeline:
         """
         batch_size, npb = seed_chunk.shape[:2]
         device = seed_chunk.device
+        # Phase-LoRA dispatch: both seed-prefill forwards run at low t
+        # (denoising_step_list[-1] for the prediction; context_noise for
+        # the commit), so route through the LAST ODE rung's adapter (=
+        # K-1) — the rung specialized for the lowest-t bracket. This
+        # is canonical for cold-start prefill at the bottom of the
+        # denoising ladder. Also resets adapter state from any prior
+        # rollout (e.g. rollout2's leftover rung_flash), so the next
+        # grad-on rollout's first dispatch starts from a known state.
+        num_rungs = len(self.denoising_step_list)
+        prefill_step_idx = max(0, num_rungs - 1)
 
         with torch.no_grad():
             seed_t_int = int(round(float(self.denoising_step_list[-1])))
@@ -578,6 +588,7 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(seed_chunk_flat),
                 seed_t.flatten(0, 1),
             ).unflatten(0, seed_chunk.shape[:2])
+            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs)
             _, cache_pred = self.generator(
                 noisy_image_or_video=seed_noised,
                 conditional_dict=seed_block_cond,
@@ -598,6 +609,7 @@ class ActionForcingTrainingPipeline:
                 ctx_t.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
             del commit_input_clean, commit_input_flat
+            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs)
             self.generator(
                 noisy_image_or_video=cache_commit_input,
                 conditional_dict=seed_block_cond,
@@ -1032,6 +1044,15 @@ class ActionForcingTrainingPipeline:
             cache_pred = denoised_pred.detach()
             num_rungs = len(self.denoising_step_list)
             for j in range(exit_index + 1, num_rungs):
+                # Phase-LoRA dispatch for the post-exit no_grad
+                # finish-denoise step: each j is a distinct ODE rung,
+                # so route through that rung's adapter even though
+                # the forward is no_grad. Without this, all post-exit
+                # forwards inherit the exit_index rung's adapter and
+                # write KV traces that won't match the next chunk's
+                # rung-X forward — subtle quality drift over a
+                # multi-chunk rollout.
+                self._maybe_set_phase_lora_for_step(j, num_rungs)
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
                 )))
@@ -1165,6 +1186,13 @@ class ActionForcingTrainingPipeline:
                         _flash_fn, flash_input, use_reentrant=False,
                     )
                 else:
+                    # Phase-LoRA dispatch for the no_grad flash branch
+                    # (warmup / final-block-of-multi-block skip). Must
+                    # dispatch even no_grad so the rung_flash adapter is
+                    # the one running through the model — without this,
+                    # the flash forward inherits whatever adapter the
+                    # post-exit no_grad loop left active.
+                    self._maybe_set_phase_lora_for_flash()
                     with torch.no_grad():
                         _, flash_dmd_pred = self.generator(
                             noisy_image_or_video=flash_input,
@@ -1254,6 +1282,18 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(commit_input_clean.flatten(0, 1)),
                 context_timestep.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
+            # Phase-LoRA dispatch for the context_noise commit forward.
+            # This forward writes the KV cache at t=context_noise (~0)
+            # — same logical position as _seed_prefill_chunk's commit
+            # forward, so route through the lowest-t ODE rung (= K-1).
+            # Without this, the commit inherits whichever adapter the
+            # preceding flash forward left active (e.g. rung_flash),
+            # writing KV that doesn't correspond to the canonical low-t
+            # ODE rung's output distribution.
+            self._maybe_set_phase_lora_for_step(
+                max(0, len(self.denoising_step_list) - 1),
+                len(self.denoising_step_list),
+            )
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=cache_commit_input,
@@ -1648,6 +1688,9 @@ class ActionForcingTrainingPipeline:
             # with ``cache_pred`` = clean x0 estimate at the last rung.
             cache_pred = denoised_pred.detach()
             for j in range(exit_index + 1, num_denoising_steps):
+                # Phase-LoRA dispatch per rung; see the equivalent
+                # block in inference_with_trajectory for rationale.
+                self._maybe_set_phase_lora_for_step(j, num_denoising_steps)
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
                 )))
@@ -1750,6 +1793,9 @@ class ActionForcingTrainingPipeline:
                         _flash_fn, flash_input, use_reentrant=False,
                     )
                 else:
+                    # Phase-LoRA dispatch for the no_grad flash branch.
+                    # See inference_with_trajectory's twin for rationale.
+                    self._maybe_set_phase_lora_for_flash()
                     with torch.no_grad():
                         _, flash_dmd_pred = self.generator(
                             noisy_image_or_video=flash_input,
@@ -1808,6 +1854,16 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(commit_input_clean.flatten(0, 1)),
                 context_timestep.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
+            # Phase-LoRA dispatch for the context_noise commit forward.
+            # See the equivalent block in inference_with_trajectory for
+            # rationale: route through the lowest-t ODE rung (= K-1)
+            # so the KV commit traces match the canonical low-t output
+            # distribution, not the flash-adapter (rung_flash) output
+            # left active by the preceding flash forward.
+            self._maybe_set_phase_lora_for_step(
+                max(0, len(self.denoising_step_list) - 1),
+                len(self.denoising_step_list),
+            )
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=cache_commit,
