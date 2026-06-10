@@ -220,14 +220,15 @@ srun torchrun \
     holdout_eval_root=/projects/u6ex/fbots/frodobots_encoded_weu_holdout \
     holdout_eval_mode=cycle \
     max_ride_frames=900 \
-    max_ride_frames_random=true \
+    max_ride_frames_random=false \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
     max_rolls_per_ride=100000 \
-    streaming_max_length=900 \
+    streaming_max_length=600 \
+    gen_gradient_checkpointing=true \
     num_chunks_roll_forward=4 \
     streaming_min_new_frame=12 \
     dmd_42f_rolling_sup_new=true \
