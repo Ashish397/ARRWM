@@ -402,6 +402,54 @@ class ActionForcingDMD(SelfForcingModel):
                 f"fake_score_lora_rank={self.fake_score_lora_rank} "
                 f"must be > 0"
             )
+
+        # Phased DMD K-LoRA on the student. When enabled, K separate
+        # named peft adapters ('rung_0'..'rung_{K-1}') are added to
+        # ``generator.model``. The active adapter is selected per
+        # denoise step via ``set_adapter()`` (see pipeline). All K
+        # share the frozen WAN base; only LoRA params are trainable
+        # when ``freeze_base=True``. Default OFF = legacy full-FT.
+        self.student_phase_lora_enabled = bool(
+            getattr(args, "student_phase_lora_enabled", False)
+        )
+        self.student_phase_lora_K = int(
+            getattr(args, "student_phase_lora_K", 0)
+        )
+        self.student_phase_lora_rank = int(
+            getattr(args, "student_phase_lora_rank", 32)
+        )
+        self.student_phase_lora_alpha = float(
+            getattr(args, "student_phase_lora_alpha", self.student_phase_lora_rank)
+        )
+        self.student_phase_lora_dropout = float(
+            getattr(args, "student_phase_lora_dropout", 0.0)
+        )
+        self.student_phase_lora_freeze_base = bool(
+            getattr(args, "student_phase_lora_freeze_base", True)
+        )
+        # When True, also create a dedicated ``rung_flash`` adapter
+        # (separate from the K ODE rungs). The pipeline routes the
+        # Flash-DMD t=60 forward to this adapter so the K ODE rungs
+        # don't absorb flash GAN gradient (clean per-rung
+        # specialization on the ODE chain).
+        self.student_phase_lora_flash_adapter_enabled = bool(
+            getattr(args, "student_phase_lora_flash_adapter_enabled", False)
+        )
+        if self.student_phase_lora_enabled:
+            if self.student_phase_lora_K <= 0:
+                raise ValueError(
+                    f"student_phase_lora_enabled=True requires "
+                    f"student_phase_lora_K > 0; got "
+                    f"{self.student_phase_lora_K}"
+                )
+            if self.student_phase_lora_rank <= 0:
+                raise ValueError(
+                    f"student_phase_lora_rank="
+                    f"{self.student_phase_lora_rank} must be > 0"
+                )
+        self._student_phase_lora_names: list = []
+        self._active_phase_rung_idx: int = 0
+
         # Causal mask flag on the joint [clean | noisy] TF sequence
         # (v14 parity = True). When False, the inner CausalWanModel's
         # ``_prepare_teacher_forcing_mask`` returns a full-bidirectional
@@ -2129,6 +2177,11 @@ class ActionForcingDMD(SelfForcingModel):
         # would intercept the load path). See ``_apply_fake_score_lora``
         # for the memory-savings rationale and head_alt handling.
         self._apply_fake_score_lora(device)
+        # Phased DMD K-LoRA on the student. Default OFF. MUST run
+        # AFTER the ODE checkpoint load AND AFTER the fake_score
+        # mirror (mirror copies generator.model.state_dict(); a peft
+        # wrap on top would rename keys and break that path).
+        self._apply_student_phase_lora(device)
 
         # Attach the (now weight-loaded) state_probe to the real_score
         # wrapper too. Must run AFTER the v14 LoRA peft wrap so the
@@ -2877,6 +2930,128 @@ class ActionForcingDMD(SelfForcingModel):
                 rank, alpha, dropout,
                 trainable_lora, alt_head_params,
             )
+
+    def _apply_student_phase_lora(self, device) -> None:
+        """Wrap ``generator.model`` with K named peft LoRA adapters
+        ('rung_0'..'rung_{K-1}'). One frozen WAN base, K shared-base
+        adapters. Active adapter is selected per generator forward by
+        the pipeline via ``set_student_phase_rung``. Must run AFTER
+        ``_load_generator_from_ode_checkpoint`` (loader writes to the
+        bare WAN) and AFTER ``_mirror_generator_into_fake_score``
+        (mirror reads ``generator.model.state_dict()`` and expects
+        bare keys).
+        """
+        if not self.student_phase_lora_enabled:
+            return
+        if not _HAS_PEFT:
+            raise RuntimeError(
+                "student_phase_lora_enabled=True but peft is not installed."
+            )
+        K = int(self.student_phase_lora_K)
+        rank = int(self.student_phase_lora_rank)
+        alpha = float(self.student_phase_lora_alpha)
+        dropout = float(self.student_phase_lora_dropout)
+        target_modules = self._collect_target_modules(self.generator.model)
+        if not target_modules:
+            target_modules = ["q", "k", "v", "o"]
+        names = [f"rung_{k}" for k in range(K)]
+
+        def _mk_cfg() -> "LoraConfig":
+            return LoraConfig(
+                r=rank, lora_alpha=alpha, lora_dropout=dropout,
+                target_modules=target_modules, bias="none",
+            )
+
+        peft_model = peft.get_peft_model(
+            self.generator.model, _mk_cfg(), adapter_name=names[0],
+        )
+        for nm in names[1:]:
+            peft_model.add_adapter(nm, _mk_cfg())
+        # Optional dedicated flash adapter (K+1 design). When present,
+        # the pipeline's _maybe_set_phase_lora_for_flash routes the
+        # Flash-DMD t=60 forward HERE so the K ODE rungs stay clean.
+        flash_added = False
+        if self.student_phase_lora_flash_adapter_enabled:
+            peft_model.add_adapter("rung_flash", _mk_cfg())
+            flash_added = True
+        self.generator.model = peft_model.to(device=device, dtype=self.dtype)
+
+        # All K adapters trainable BEFORE the DDP wrap so the reducer
+        # sees the union. set_adapter() at forward time only flips
+        # which one contributes to grads on a given step; DDP marks
+        # the inactive K-1 as unused (find_unused_parameters=True is
+        # required and set by the trainer).
+        trainable_lora = 0
+        for n, p in self.generator.model.named_parameters():
+            if "lora_" in n:
+                p.requires_grad = True
+                trainable_lora += 1
+            elif self.student_phase_lora_freeze_base:
+                p.requires_grad = False
+            # else: leave base requires_grad as-is (full-FT + LoRA hybrid)
+
+        self._student_phase_lora_names = names
+        # NOTE: do NOT call set_adapter(names[0]) here — peft's
+        # set_adapter forces requires_grad=False on the non-active
+        # adapters, which would break the optimizer build that
+        # follows (rung_k>0 would see 0 trainable params). The pipeline
+        # dispatcher calls set_adapter per rung at forward time; we
+        # re-enable all lora_ requires_grad AFTER each dispatch so
+        # DDP's static graph stays consistent across iters.
+
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] student phase LoRA wrapped: K=%d "
+                "(rank=%d alpha=%s drop=%s freeze_base=%s flash_adapter=%s). "
+                "%d LoRA params trainable across %d adapters; "
+                "target_modules=%d.",
+                K, rank, alpha, dropout,
+                self.student_phase_lora_freeze_base,
+                flash_added,
+                trainable_lora, K + (1 if flash_added else 0),
+                len(target_modules),
+            )
+
+    def set_student_phase_rung(self, rung_idx: int) -> None:
+        """Dispatcher: select which student LoRA contributes to the
+        next generator forward. Safe under ``torch.no_grad()``.
+        Unsafe under ``torch.compile`` (mutates active adapter Python
+        attr; would force recompile). Call BEFORE each per-rung
+        generator forward in the pipeline."""
+        if not getattr(self, "student_phase_lora_enabled", False):
+            return
+        names = getattr(self, "_student_phase_lora_names", None)
+        if not names:
+            return
+        idx = int(rung_idx) % len(names)
+        self._active_phase_rung_idx = idx
+        try:
+            # set_adapter is on the PeftModel; if DDP-wrapped, peek
+            # through .module.
+            gen_model = self.generator.model
+            if hasattr(gen_model, "module"):
+                gen_model = gen_model.module
+            gen_model.set_adapter(names[idx])
+        except Exception as exc:
+            if _is_main():
+                logging.warning(
+                    "[ActionForcingDMD] set_student_phase_rung(%d) failed: %s",
+                    idx, exc,
+                )
+
+    def _phase_lora_idx_for_step(
+        self, denoise_idx: int, num_denoising_steps: int,
+    ) -> int:
+        """Map a denoise rung index in ``[0, num_denoising_steps)`` to
+        a phase-LoRA adapter index in ``[0, K)``. K=4 over 4 rungs is
+        identity; K=2 over 4 rungs is {0,1}->0, {2,3}->1; K=1 always 0.
+        No-op (returns 0) when phase LoRA is disabled.
+        """
+        if not getattr(self, "student_phase_lora_enabled", False):
+            return 0
+        K = max(1, int(self.student_phase_lora_K))
+        bucket = max(1, int(num_denoising_steps) // K)
+        return min(K - 1, int(denoise_idx) // bucket)
 
     # ------------------------------------------------------------------
     # Action conditioning helpers

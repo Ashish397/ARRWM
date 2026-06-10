@@ -610,7 +610,8 @@ class RollingStaircaseDMDTrainer:
         # optimizers — cuts optimizer state ~4x (fp32 m/v -> 8-bit blocks),
         # freeing ~20 GB across the two 1.3B optimizers so the GAN-R1 +
         # aux-teacher budget fits with a FULL fine-tune critic. Falls back
-        # to torch AdamW if bitsandbytes is unavailable.
+        # to torch AdamW if bitsandbytes is unavailable. Used by both the
+        # legacy single-optimizer path AND the K-LoRA per-rung path below.
         _use_8bit = bool(getattr(cfg, "use_8bit_adam", False))
         _AdamW = torch.optim.AdamW
         if _use_8bit:
@@ -627,9 +628,67 @@ class RollingStaircaseDMDTrainer:
                         "[opt] use_8bit_adam=True but bitsandbytes import "
                         "failed (%s); falling back to torch AdamW", _e,
                     )
-        self.optimizer = _AdamW(
-            trainable_params, lr=lr, betas=betas, eps=eps, weight_decay=wd
+
+        # Phased DMD K-LoRA: K named ``rung_k`` adapters on the
+        # student. Build one AdamW per rung so each adapter's
+        # optimizer state is isolated (and the user can later set
+        # per-rung LR knobs if needed). Off by default = single
+        # AdamW over the union of trainable params (legacy path).
+        phase_lora_on = bool(
+            getattr(cfg, "student_phase_lora_enabled", False)
         )
+        phase_K = int(getattr(cfg, "student_phase_lora_K", 0)) if phase_lora_on else 0
+        self.phase_lora_optimizers: List[torch.optim.Optimizer] = []
+
+        if phase_lora_on and phase_K > 0:
+            # Unwrap DDP / peft outermost so named_parameters() yields
+            # the rung_k.lora_A / lora_B keys; DDP at this point is
+            # not yet wrapped (build_optimizer runs before DDP wrap),
+            # so generator.model is the PeftModel directly.
+            gen_module = self.model.generator.model
+            global_extras = [
+                p for p in trainable_params
+                if not any(p is q for q in gen_module.parameters())
+            ]
+            # Build one AdamW per K ODE rung. The optional flash
+            # adapter (created by
+            # ``student_phase_lora_flash_adapter_enabled=true``) gets
+            # its own AdamW appended after the K rung optimizers.
+            adapter_names = [f"rung_{k}" for k in range(phase_K)]
+            if bool(
+                getattr(cfg, "student_phase_lora_flash_adapter_enabled", False)
+            ):
+                adapter_names.append("rung_flash")
+            for slot_idx, name in enumerate(adapter_names):
+                rung_params = [
+                    p for n, p in gen_module.named_parameters()
+                    if p.requires_grad and "lora_" in n and f".{name}." in n
+                ]
+                if not rung_params:
+                    raise RuntimeError(
+                        f"phase LoRA: {name} has no trainable params "
+                        f"(check student_phase_lora_K / "
+                        f"freeze_base / flash_adapter_enabled)."
+                    )
+                # rung_0 also owns any global trainables (action
+                # heads, etc.) so they step exactly once per iter.
+                if slot_idx == 0 and global_extras:
+                    rung_params = rung_params + global_extras
+                self.phase_lora_optimizers.append(
+                    _AdamW(
+                        rung_params, lr=lr, betas=betas, eps=eps,
+                        weight_decay=wd,
+                    )
+                )
+            # ``self.optimizer`` aliases rung_0 so existing
+            # ``.step()`` / ``.zero_grad()`` call sites also drive
+            # the global heads + rung_0; the trainer iter loop
+            # additionally steps the remaining ``phase_lora_optimizers``.
+            self.optimizer = self.phase_lora_optimizers[0]
+        else:
+            self.optimizer = _AdamW(
+                trainable_params, lr=lr, betas=betas, eps=eps, weight_decay=wd
+            )
         self.max_grad_norm = float(getattr(cfg, "max_grad_norm", 1.0))
 
         # ------------------------------------------------------------------
