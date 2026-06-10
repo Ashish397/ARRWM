@@ -158,6 +158,7 @@ class ActionForcingTrainingPipeline:
         num_max_frames: int = 21,
         rollout_frames: Optional[int] = None,
         context_noise: int = 0,
+        exit_flag_weights: Optional[List[float]] = None,
         **kwargs,
     ):
         self.scheduler = scheduler
@@ -180,6 +181,27 @@ class ActionForcingTrainingPipeline:
         self.context_noise = int(context_noise)
         self.same_step_across_blocks = bool(same_step_across_blocks)
         self.last_step_only = bool(last_step_only)
+        # Optional non-uniform exit-flag sampling. When set, a list of K
+        # non-negative floats (K = num_denoising_steps) reweights the
+        # per-iter random exit rung. Used to concentrate training on
+        # middle-t rungs (which sit in the highest-SNR / lowest-
+        # gradient-variance regime — analogous to min-SNR-γ / P2
+        # weighting in diffusion training literature) while preserving
+        # some training on the extremes. None / empty preserves uniform
+        # sampling (default behavior — identical to torch.randint).
+        if exit_flag_weights is None or len(exit_flag_weights) == 0:
+            self.exit_flag_weights = None
+        else:
+            w = [float(v) for v in exit_flag_weights]
+            if any(v < 0 for v in w):
+                raise ValueError(
+                    f"exit_flag_weights must be non-negative; got {w}"
+                )
+            if sum(w) <= 0:
+                raise ValueError(
+                    f"exit_flag_weights must sum > 0; got {w}"
+                )
+            self.exit_flag_weights = w
         self.num_max_frames = int(num_max_frames)
         # ``rollout_frames`` decouples the per-iter rollout length from
         # the gradient/scoring window (``num_max_frames``). When unset
@@ -245,6 +267,121 @@ class ActionForcingTrainingPipeline:
             except Exception:
                 pass
         return model
+
+    def _peft_model_or_none(self):
+        """Walk DDP -> PeftModel without unwrapping further. Returns
+        the PeftModel when the generator was wrapped by phase LoRA,
+        else None. Used by ``_maybe_set_phase_lora_for_step`` to
+        dispatch active adapter per denoising rung."""
+        model = self.generator.model
+        if hasattr(model, "module"):
+            try:
+                from torch.nn.parallel import DistributedDataParallel as _DDP
+                if isinstance(model, _DDP):
+                    model = model.module
+            except Exception:
+                pass
+        if hasattr(model, "set_adapter") and hasattr(model, "peft_config"):
+            return model
+        return None
+
+    def _maybe_set_phase_lora_for_step(self, step_idx: int, num_steps: int) -> None:
+        """If the generator is peft-wrapped with named ``rung_*``
+        adapters (Phased DMD K-LoRA), select the active adapter for
+        the current rung. No-op when no such wrap is present.
+
+        Mapping: with K=4 over 4 rungs the mapping is identity;
+        K=2 over 4 rungs is ``{0,1}->0, {2,3}->1``; K=1 always 0.
+        K is read from the live ``peft_config`` so this auto-syncs
+        with whatever the model's ``_apply_student_phase_lora`` set up.
+        """
+        peft_model = self._peft_model_or_none()
+        if peft_model is None:
+            return
+        # Exclude the optional ``rung_flash`` adapter from the ODE
+        # rung count — it's a sibling adapter used only by the flash
+        # forward, not part of the K-rung ODE chain.
+        names = [
+            n for n in peft_model.peft_config.keys()
+            if n.startswith("rung_") and n != "rung_flash"
+        ]
+        if not names:
+            return
+        K = len(names)
+        bucket = max(1, int(num_steps) // K)
+        idx = min(K - 1, int(step_idx) // bucket)
+        target = f"rung_{idx}"
+        if target not in peft_model.peft_config:
+            return
+        try:
+            peft_model.set_adapter(target)
+            # peft's set_adapter forces requires_grad=False on the
+            # K-1 non-active adapters. That would break the optimizer
+            # build (rung_k>0 has 0 trainable params seen) AND make
+            # DDP's per-iter "expected gradient set" non-stationary
+            # across iters (different lora params each rung). Re-arm
+            # ALL lora_ params to requires_grad=True so the set of
+            # tracked params is stable across rungs and iters; the
+            # forward through only-the-active adapter still routes
+            # gradient solely into that adapter, and the K-1 inactive
+            # adapters' params naturally end up with .grad=None ->
+            # their optimizer.step() is a no-op (skip-None branch).
+            for n, p in peft_model.named_parameters():
+                if "lora_" in n:
+                    p.requires_grad = True
+        except Exception:
+            pass
+
+    def _maybe_set_phase_lora_for_flash(self) -> None:
+        """Phase-LoRA dispatch for the Flash-DMD t=60 forward.
+
+        Routing rule (in priority order):
+
+        1. If a dedicated ``rung_flash`` adapter exists (created by
+           ``student_phase_lora_flash_adapter_enabled=true``), route
+           flash here. This is the K+1 design: K ODE rungs train
+           cleanly on their t-bracket DMD loss, and rung_flash trains
+           solely on the t=60 GAN adversarial loss. No inter-task
+           interference within any single adapter.
+
+        2. Else, fall back to env var ``FLASH_PHASE_LORA_ROUTE``:
+             - unset or ``exit``: no-op. Flash uses whichever adapter
+               the ODE loop's exit step left active (uniform-random
+               across ODE rungs).
+             - ``last``: set active adapter to ``rung_{K-1}``.
+               Concentrates flash on the lowest-t ODE rung; freeing
+               rungs 0..K-2 but overloading rung_{K-1} with two
+               heterogeneous loss signals (DMD + GAN).
+
+        No-op when no phase-LoRA wrap is present.
+        """
+        peft_model = self._peft_model_or_none()
+        if peft_model is None:
+            return
+        target: Optional[str] = None
+        if "rung_flash" in peft_model.peft_config:
+            target = "rung_flash"
+        else:
+            import os
+            route = (
+                os.environ.get("FLASH_PHASE_LORA_ROUTE") or "exit"
+            ).strip().lower()
+            if route != "last":
+                return
+            ode_names = sorted(
+                n for n in peft_model.peft_config.keys()
+                if n.startswith("rung_") and n != "rung_flash"
+            )
+            if not ode_names:
+                return
+            target = ode_names[-1]
+        try:
+            peft_model.set_adapter(target)
+            for n, p in peft_model.named_parameters():
+                if "lora_" in n:
+                    p.requires_grad = True
+        except Exception:
+            pass
 
     @property
     def frame_seq_length(self) -> int:
@@ -339,15 +476,47 @@ class ActionForcingTrainingPipeline:
                 f"low={low} out of range [0, sample_high={sample_high})."
             )
 
+        # When ``exit_flag_weights`` is set on the pipeline, sample
+        # weighted (multinomial) over the [low, sample_high) range
+        # instead of uniform randint. Weights are sliced/padded to match
+        # the active range so ``low`` and ``exclude_last_rung`` still
+        # work correctly. ``last_step_only`` still short-circuits
+        # everything (returns the last rung).
+        weights: Optional[torch.Tensor] = None
+        if self.exit_flag_weights is not None and not self.last_step_only:
+            full_w = self.exit_flag_weights
+            if len(full_w) != num_denoising_steps:
+                raise ValueError(
+                    f"exit_flag_weights has length {len(full_w)} but "
+                    f"num_denoising_steps={num_denoising_steps}"
+                )
+            sliced = full_w[low:sample_high]
+            if sum(sliced) <= 0:
+                raise ValueError(
+                    f"exit_flag_weights slice [{low}:{sample_high}] has "
+                    f"non-positive sum: {sliced}"
+                )
+            weights = torch.tensor(
+                sliced, device=device, dtype=torch.float32,
+            )
+
+        def _sample(n: int) -> torch.Tensor:
+            if weights is not None:
+                # multinomial with replacement → independent samples per
+                # block. Returns indices in [0, len(weights)); shift by
+                # ``low`` to get back into the original rung space.
+                idx_local = torch.multinomial(
+                    weights, num_samples=n, replacement=True,
+                )
+                return (idx_local + low).to(device=device, dtype=torch.long)
+            return torch.randint(
+                low=low, high=sample_high, size=(n,), device=device,
+            )
+
         if sync:
             rank = dist.get_rank() if dist.is_initialized() else 0
             if rank == 0:
-                indices = torch.randint(
-                    low=low,
-                    high=sample_high,
-                    size=(num_blocks,),
-                    device=device,
-                )
+                indices = _sample(num_blocks)
                 if self.last_step_only:
                     indices = torch.ones_like(indices) * (num_denoising_steps - 1)
             else:
@@ -356,12 +525,7 @@ class ActionForcingTrainingPipeline:
             if dist.is_initialized():
                 dist.broadcast(indices, src=0)
         else:
-            indices = torch.randint(
-                low=low,
-                high=sample_high,
-                size=(num_blocks,),
-                device=device,
-            )
+            indices = _sample(num_blocks)
             if self.last_step_only:
                 indices = torch.ones_like(indices) * (num_denoising_steps - 1)
         return indices.tolist()
@@ -401,6 +565,16 @@ class ActionForcingTrainingPipeline:
         """
         batch_size, npb = seed_chunk.shape[:2]
         device = seed_chunk.device
+        # Phase-LoRA dispatch: both seed-prefill forwards run at low t
+        # (denoising_step_list[-1] for the prediction; context_noise for
+        # the commit), so route through the LAST ODE rung's adapter (=
+        # K-1) — the rung specialized for the lowest-t bracket. This
+        # is canonical for cold-start prefill at the bottom of the
+        # denoising ladder. Also resets adapter state from any prior
+        # rollout (e.g. rollout2's leftover rung_flash), so the next
+        # grad-on rollout's first dispatch starts from a known state.
+        num_rungs = len(self.denoising_step_list)
+        prefill_step_idx = max(0, num_rungs - 1)
 
         with torch.no_grad():
             seed_t_int = int(round(float(self.denoising_step_list[-1])))
@@ -414,6 +588,7 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(seed_chunk_flat),
                 seed_t.flatten(0, 1),
             ).unflatten(0, seed_chunk.shape[:2])
+            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs)
             _, cache_pred = self.generator(
                 noisy_image_or_video=seed_noised,
                 conditional_dict=seed_block_cond,
@@ -434,6 +609,7 @@ class ActionForcingTrainingPipeline:
                 ctx_t.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
             del commit_input_clean, commit_input_flat
+            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs)
             self.generator(
                 noisy_image_or_video=cache_commit_input,
                 conditional_dict=seed_block_cond,
@@ -740,6 +916,11 @@ class ActionForcingTrainingPipeline:
             # Step 3.1: Truncated denoise loop over the full ladder.
             for index in range(0, num_denoising_steps):
                 current_timestep = self.denoising_step_list[index]
+                # Phase-LoRA dispatch: select which student adapter
+                # contributes to this rung's forward (no-op when phase
+                # LoRA is not wrapped). Must run BEFORE the generator
+                # call below.
+                self._maybe_set_phase_lora_for_step(index, num_denoising_steps)
                 if self.same_step_across_blocks:
                     exit_flag = (index == exit_flags[0])
                 else:
@@ -815,15 +996,31 @@ class ActionForcingTrainingPipeline:
                         # K/V slots get overwritten by Step 3.4
                         # context-noise commits and stay stable until
                         # next rollout reset).
+                        #
+                        # Phase-LoRA dispatch MUST happen INSIDE the
+                        # checkpoint function so backward-time recompute
+                        # (use_reentrant=False re-runs forward) re-sets
+                        # the same active adapter as the original
+                        # forward. Without this, if set_adapter is called
+                        # between original forward (e.g. for the flash
+                        # forward in the K+1 design) and backward, the
+                        # recompute would use the wrong active adapter —
+                        # gradient flows to the wrong rung's lora
+                        # matrices, manifesting as DDP's "marked ready
+                        # twice" error.
                         def _exit_fn(
                             x,
+                            _self=self,
                             _gen=self.generator,
                             _cond=block_cond,
                             _t=timestep,
                             _kv=self.kv_cache1,
                             _xa=self.crossattn_cache,
                             _start=current_start_frame * self.frame_seq_length,
+                            _idx=index,
+                            _ns=num_denoising_steps,
                         ):
+                            _self._maybe_set_phase_lora_for_step(_idx, _ns)
                             return _gen(
                                 noisy_image_or_video=x,
                                 conditional_dict=_cond,
@@ -847,6 +1044,15 @@ class ActionForcingTrainingPipeline:
             cache_pred = denoised_pred.detach()
             num_rungs = len(self.denoising_step_list)
             for j in range(exit_index + 1, num_rungs):
+                # Phase-LoRA dispatch for the post-exit no_grad
+                # finish-denoise step: each j is a distinct ODE rung,
+                # so route through that rung's adapter even though
+                # the forward is no_grad. Without this, all post-exit
+                # forwards inherit the exit_index rung's adapter and
+                # write KV traces that won't match the next chunk's
+                # rung-X forward — subtle quality drift over a
+                # multi-chunk rollout.
+                self._maybe_set_phase_lora_for_step(j, num_rungs)
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
                 )))
@@ -885,6 +1091,13 @@ class ActionForcingTrainingPipeline:
             # (no final-block restriction).
             flash_dmd_pred: Optional[torch.Tensor] = None
             if flash_dmd_enabled:
+                # Phase-LoRA dispatch for the flash forward. No-op
+                # when phase LoRA isn't wrapped, or when env var
+                # FLASH_PHASE_LORA_ROUTE is unset/"exit" (preserves
+                # the historical uniform-across-rung gradient
+                # distribution). Set FLASH_PHASE_LORA_ROUTE=last to
+                # route flash GAN gradient to rung_{K-1} only.
+                self._maybe_set_phase_lora_for_flash()
                 flash_t_value = int(flash_dmd_gan_t)
                 flash_flat = cache_pred.flatten(0, 1)
                 flash_input = self.scheduler.add_noise(
@@ -941,8 +1154,17 @@ class ActionForcingTrainingPipeline:
                     # recompute, the prior-slot K/V state is
                     # bit-identical to the original-forward state.
                     # ✓ Mathematically clean.
+                    # Phase-LoRA dispatch INSIDE the ckpt fn so
+                    # backward-time recompute (use_reentrant=False
+                    # re-runs forward) also routes to the same active
+                    # adapter (rung_flash in K+1 design). Otherwise the
+                    # recompute would inherit whichever adapter was set
+                    # by the most-recent external call, sending the
+                    # gradient to the wrong rung's lora matrices —
+                    # manifests as DDP's "marked ready twice" error.
                     def _flash_fn(
                         x,
+                        _self=self,
                         _gen=self.generator,
                         _cond=block_cond,
                         _t=flash_t_step,
@@ -950,6 +1172,7 @@ class ActionForcingTrainingPipeline:
                         _xa=self.crossattn_cache,
                         _start=current_start_frame * self.frame_seq_length,
                     ):
+                        _self._maybe_set_phase_lora_for_flash()
                         return _gen(
                             noisy_image_or_video=x,
                             conditional_dict=_cond,
@@ -963,6 +1186,13 @@ class ActionForcingTrainingPipeline:
                         _flash_fn, flash_input, use_reentrant=False,
                     )
                 else:
+                    # Phase-LoRA dispatch for the no_grad flash branch
+                    # (warmup / final-block-of-multi-block skip). Must
+                    # dispatch even no_grad so the rung_flash adapter is
+                    # the one running through the model — without this,
+                    # the flash forward inherits whatever adapter the
+                    # post-exit no_grad loop left active.
+                    self._maybe_set_phase_lora_for_flash()
                     with torch.no_grad():
                         _, flash_dmd_pred = self.generator(
                             noisy_image_or_video=flash_input,
@@ -1052,6 +1282,18 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(commit_input_clean.flatten(0, 1)),
                 context_timestep.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
+            # Phase-LoRA dispatch for the context_noise commit forward.
+            # This forward writes the KV cache at t=context_noise (~0)
+            # — same logical position as _seed_prefill_chunk's commit
+            # forward, so route through the lowest-t ODE rung (= K-1).
+            # Without this, the commit inherits whichever adapter the
+            # preceding flash forward left active (e.g. rung_flash),
+            # writing KV that doesn't correspond to the canonical low-t
+            # ODE rung's output distribution.
+            self._maybe_set_phase_lora_for_step(
+                max(0, len(self.denoising_step_list) - 1),
+                len(self.denoising_step_list),
+            )
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=cache_commit_input,
@@ -1333,6 +1575,9 @@ class ActionForcingTrainingPipeline:
             exit_index = num_denoising_steps - 1
             for index in range(0, num_denoising_steps):
                 current_timestep = self.denoising_step_list[index]
+                # Phase-LoRA dispatch — see comment at the matching
+                # site in the streaming rollout above.
+                self._maybe_set_phase_lora_for_step(index, num_denoising_steps)
                 if self.same_step_across_blocks:
                     exit_flag = (index == exit_flags[0])
                 else:
@@ -1405,15 +1650,25 @@ class ActionForcingTrainingPipeline:
                         # by-value capture; cache safety guaranteed
                         # by Step 3.4 context-noise commits being
                         # outside the checkpoint scope.
+                        #
+                        # Phase-LoRA dispatch INSIDE the ckpt fn so
+                        # backward-time recompute re-sets the same
+                        # active adapter (rung_{exit_index}). See the
+                        # parallel _exit_fn in inference_with_trajectory
+                        # for the full rationale.
                         def _exit_fn(
                             x,
+                            _self=self,
                             _gen=self.generator,
                             _cond=block_cond,
                             _t=timestep,
                             _kv=self.kv_cache1,
                             _xa=self.crossattn_cache,
                             _start=current_start_frame * self.frame_seq_length,
+                            _idx=index,
+                            _ns=num_denoising_steps,
                         ):
+                            _self._maybe_set_phase_lora_for_step(_idx, _ns)
                             return _gen(
                                 noisy_image_or_video=x,
                                 conditional_dict=_cond,
@@ -1433,6 +1688,9 @@ class ActionForcingTrainingPipeline:
             # with ``cache_pred`` = clean x0 estimate at the last rung.
             cache_pred = denoised_pred.detach()
             for j in range(exit_index + 1, num_denoising_steps):
+                # Phase-LoRA dispatch per rung; see the equivalent
+                # block in inference_with_trajectory for rationale.
+                self._maybe_set_phase_lora_for_step(j, num_denoising_steps)
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
                 )))
@@ -1463,6 +1721,11 @@ class ActionForcingTrainingPipeline:
             # Step 3.4 below for paper §3.3 cross-timestep decoupling.
             flash_dmd_pred: Optional[torch.Tensor] = None
             if flash_dmd_enabled:
+                # Phase-LoRA dispatch for the flash forward. See
+                # _maybe_set_phase_lora_for_flash for routing rules
+                # (env var FLASH_PHASE_LORA_ROUTE: "exit" no-op vs
+                # "last" → rung_{K-1}).
+                self._maybe_set_phase_lora_for_flash()
                 flash_t_value = int(flash_dmd_gan_t)
                 flash_flat = cache_pred.flatten(0, 1)
                 flash_input = self.scheduler.add_noise(
@@ -1498,8 +1761,17 @@ class ActionForcingTrainingPipeline:
                     # next rollout reset, so backward-time recompute
                     # reads bit-identical state to the original
                     # forward).
+                    # Phase-LoRA dispatch INSIDE the ckpt fn so
+                    # backward-time recompute (use_reentrant=False
+                    # re-runs forward) also routes to the same active
+                    # adapter (rung_flash in K+1 design). Otherwise the
+                    # recompute would inherit whichever adapter was set
+                    # by the most-recent external call, sending the
+                    # gradient to the wrong rung's lora matrices —
+                    # manifests as DDP's "marked ready twice" error.
                     def _flash_fn(
                         x,
+                        _self=self,
                         _gen=self.generator,
                         _cond=block_cond,
                         _t=flash_t_step,
@@ -1507,6 +1779,7 @@ class ActionForcingTrainingPipeline:
                         _xa=self.crossattn_cache,
                         _start=current_start_frame * self.frame_seq_length,
                     ):
+                        _self._maybe_set_phase_lora_for_flash()
                         return _gen(
                             noisy_image_or_video=x,
                             conditional_dict=_cond,
@@ -1520,6 +1793,9 @@ class ActionForcingTrainingPipeline:
                         _flash_fn, flash_input, use_reentrant=False,
                     )
                 else:
+                    # Phase-LoRA dispatch for the no_grad flash branch.
+                    # See inference_with_trajectory's twin for rationale.
+                    self._maybe_set_phase_lora_for_flash()
                     with torch.no_grad():
                         _, flash_dmd_pred = self.generator(
                             noisy_image_or_video=flash_input,
@@ -1578,6 +1854,16 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(commit_input_clean.flatten(0, 1)),
                 context_timestep.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
+            # Phase-LoRA dispatch for the context_noise commit forward.
+            # See the equivalent block in inference_with_trajectory for
+            # rationale: route through the lowest-t ODE rung (= K-1)
+            # so the KV commit traces match the canonical low-t output
+            # distribution, not the flash-adapter (rung_flash) output
+            # left active by the preceding flash forward.
+            self._maybe_set_phase_lora_for_step(
+                max(0, len(self.denoising_step_list) - 1),
+                len(self.denoising_step_list),
+            )
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=cache_commit,

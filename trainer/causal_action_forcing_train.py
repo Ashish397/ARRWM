@@ -27,6 +27,7 @@ The dataset is constrained to rides with at least
 """
 from __future__ import annotations
 
+import ast
 import atexit
 import gc
 import logging
@@ -341,11 +342,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.generator_ddp: Optional[DDP] = None
         self.fake_score_ddp: Optional[DDP] = None
         if self.world_size > 1:
+            # Phased DMD K-LoRA: each gen step only one of K adapters
+            # contributes to grads; the inactive K-1 are "unused".
+            # find_unused_parameters=True lets the DDP reducer mark
+            # those as ready-with-zero. Mirrors the real_teacher /
+            # forward_noiser ddp patterns elsewhere in this file.
+            gen_fup = debug_fup or bool(
+                getattr(self.config, "student_phase_lora_enabled", False)
+            )
             self.generator_ddp = DDP(
                 model.generator.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=debug_fup,
+                find_unused_parameters=gen_fup,
                 broadcast_buffers=False,
             )
             model.generator.model = self.generator_ddp  # type: ignore
@@ -1147,6 +1156,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 f"by num_frame_per_block ({num_frame_per_block})."
             )
         context_noise = int(getattr(cfg, "context_noise", 0))
+        # Optional non-uniform exit-flag sampling for phase-LoRA (or
+        # plain DMD) training. List of K non-negative floats reweights
+        # the random exit-rung selection; None / empty preserves uniform
+        # behavior. Use to concentrate training on middle-t rungs
+        # (min-SNR-γ-style) where score-matching has the best signal-
+        # to-gradient-variance trade-off — extremes (rung 0 = highest
+        # noise, rung K-1 = lowest noise) get less weight.
+        exit_flag_weights_raw = getattr(cfg, "exit_flag_weights", None)
+        exit_flag_weights: Optional[List[float]] = None
+        if exit_flag_weights_raw is not None:
+            if isinstance(exit_flag_weights_raw, str):
+                # OmegaConf override "[0.1,0.4,0.4,0.1]" may arrive as
+                # a string when the launcher does not parse the list
+                # literal. Defensive parse handles both forms.
+                try:
+                    exit_flag_weights = list(
+                        ast.literal_eval(exit_flag_weights_raw)
+                    )
+                except Exception:
+                    exit_flag_weights = None
+            else:
+                exit_flag_weights = [float(v) for v in exit_flag_weights_raw]
+            if exit_flag_weights is not None and (
+                len(exit_flag_weights) != len(denoising_step_list)
+            ):
+                raise ValueError(
+                    f"cfg.exit_flag_weights has length "
+                    f"{len(exit_flag_weights)} but denoising_step_list "
+                    f"has length {len(denoising_step_list)}"
+                )
 
         self.pipeline = ActionForcingTrainingPipeline(
             denoising_step_list=denoising_step_list,
@@ -1159,6 +1198,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             num_max_frames=num_max_frames,
             rollout_frames=rollout_frames,
             context_noise=context_noise,
+            exit_flag_weights=exit_flag_weights,
         )
         # The ActionForcingDMD model needs the pipeline reference for backward
         # simulation inside generator_loss / critic_loss.
@@ -1802,6 +1842,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+                # Phase LoRA: step the K-1 remaining per-rung
+                # optimizers (rung_0 IS self.optimizer above; the
+                # rest each own only their adapter's LoRA params).
+                for _opt in getattr(self, "phase_lora_optimizers", [])[1:]:
+                    _opt.step()
+                    _opt.zero_grad(set_to_none=True)
                 self._maybe_update_generator_ema()
             else:
                 gen_grad_norm = torch.tensor(0.0, device=self.device)
