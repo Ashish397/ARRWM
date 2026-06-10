@@ -285,7 +285,12 @@ class ActionForcingTrainingPipeline:
             return model
         return None
 
-    def _maybe_set_phase_lora_for_step(self, step_idx: int, num_steps: int) -> None:
+    def _maybe_set_phase_lora_for_step(
+        self,
+        step_idx: int,
+        num_steps: int,
+        re_arm: bool = True,
+    ) -> None:
         """If the generator is peft-wrapped with named ``rung_*``
         adapters (Phased DMD K-LoRA), select the active adapter for
         the current rung. No-op when no such wrap is present.
@@ -294,6 +299,26 @@ class ActionForcingTrainingPipeline:
         K=2 over 4 rungs is ``{0,1}->0, {2,3}->1``; K=1 always 0.
         K is read from the live ``peft_config`` so this auto-syncs
         with whatever the model's ``_apply_student_phase_lora`` set up.
+
+        ``re_arm`` (default True): after ``set_adapter``, force
+        ``requires_grad=True`` on ALL ``lora_*`` params so the set of
+        params DDP tracks is stationary across iters. Required for
+        the grad-on dispatch points (ckpt-internal _exit_fn / _flash_fn
+        and the top-of-ODE-loop pre-call) — without re-arm, peft's
+        set_adapter side-effect would leave non-active adapters with
+        requires_grad=False, breaking the optimizer build and making
+        DDP's per-iter tracked-param set non-stationary.
+
+        Pass ``re_arm=False`` from no_grad call sites (seed prefill,
+        post-exit finish-denoise loop, non-ckpt flash branch, Step 3.4
+        context_noise commit). The forward there is no_grad, so
+        gradient routing isn't affected by requires_grad. Skipping the
+        re-arm reduces DDP-state churn between forwards — Fix B for
+        the ``unmarked_param_indices.empty() ASSERT FAILED`` crash on
+        v8e8 + K+1: too many re-arms across the new no_grad dispatch
+        sites destabilised DDP's bucket-rebuild metadata. The grad-on
+        path's re-arm at iter boundary still restores the canonical
+        all-True state before the next backward.
         """
         peft_model = self._peft_model_or_none()
         if peft_model is None:
@@ -315,24 +340,14 @@ class ActionForcingTrainingPipeline:
             return
         try:
             peft_model.set_adapter(target)
-            # peft's set_adapter forces requires_grad=False on the
-            # K-1 non-active adapters. That would break the optimizer
-            # build (rung_k>0 has 0 trainable params seen) AND make
-            # DDP's per-iter "expected gradient set" non-stationary
-            # across iters (different lora params each rung). Re-arm
-            # ALL lora_ params to requires_grad=True so the set of
-            # tracked params is stable across rungs and iters; the
-            # forward through only-the-active adapter still routes
-            # gradient solely into that adapter, and the K-1 inactive
-            # adapters' params naturally end up with .grad=None ->
-            # their optimizer.step() is a no-op (skip-None branch).
-            for n, p in peft_model.named_parameters():
-                if "lora_" in n:
-                    p.requires_grad = True
+            if re_arm:
+                for n, p in peft_model.named_parameters():
+                    if "lora_" in n:
+                        p.requires_grad = True
         except Exception:
             pass
 
-    def _maybe_set_phase_lora_for_flash(self) -> None:
+    def _maybe_set_phase_lora_for_flash(self, re_arm: bool = True) -> None:
         """Phase-LoRA dispatch for the Flash-DMD t=60 forward.
 
         Routing rule (in priority order):
@@ -352,6 +367,8 @@ class ActionForcingTrainingPipeline:
                Concentrates flash on the lowest-t ODE rung; freeing
                rungs 0..K-2 but overloading rung_{K-1} with two
                heterogeneous loss signals (DMD + GAN).
+
+        ``re_arm`` semantics: see ``_maybe_set_phase_lora_for_step``.
 
         No-op when no phase-LoRA wrap is present.
         """
@@ -377,9 +394,10 @@ class ActionForcingTrainingPipeline:
             target = ode_names[-1]
         try:
             peft_model.set_adapter(target)
-            for n, p in peft_model.named_parameters():
-                if "lora_" in n:
-                    p.requires_grad = True
+            if re_arm:
+                for n, p in peft_model.named_parameters():
+                    if "lora_" in n:
+                        p.requires_grad = True
         except Exception:
             pass
 
@@ -588,7 +606,7 @@ class ActionForcingTrainingPipeline:
                 torch.randn_like(seed_chunk_flat),
                 seed_t.flatten(0, 1),
             ).unflatten(0, seed_chunk.shape[:2])
-            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs)
+            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs, re_arm=False)
             _, cache_pred = self.generator(
                 noisy_image_or_video=seed_noised,
                 conditional_dict=seed_block_cond,
@@ -609,7 +627,7 @@ class ActionForcingTrainingPipeline:
                 ctx_t.flatten(0, 1),
             ).unflatten(0, commit_input_clean.shape[:2])
             del commit_input_clean, commit_input_flat
-            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs)
+            self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs, re_arm=False)
             self.generator(
                 noisy_image_or_video=cache_commit_input,
                 conditional_dict=seed_block_cond,
@@ -1052,7 +1070,7 @@ class ActionForcingTrainingPipeline:
                 # write KV traces that won't match the next chunk's
                 # rung-X forward — subtle quality drift over a
                 # multi-chunk rollout.
-                self._maybe_set_phase_lora_for_step(j, num_rungs)
+                self._maybe_set_phase_lora_for_step(j, num_rungs, re_arm=False)
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
                 )))
@@ -1192,7 +1210,10 @@ class ActionForcingTrainingPipeline:
                     # the one running through the model — without this,
                     # the flash forward inherits whatever adapter the
                     # post-exit no_grad loop left active.
-                    self._maybe_set_phase_lora_for_flash()
+                    # re_arm=False: this is a no_grad path; skipping
+                    # the requires_grad re-arm reduces DDP-state churn
+                    # (Fix B for the unmarked_param_indices crash).
+                    self._maybe_set_phase_lora_for_flash(re_arm=False)
                     with torch.no_grad():
                         _, flash_dmd_pred = self.generator(
                             noisy_image_or_video=flash_input,
@@ -1293,6 +1314,7 @@ class ActionForcingTrainingPipeline:
             self._maybe_set_phase_lora_for_step(
                 max(0, len(self.denoising_step_list) - 1),
                 len(self.denoising_step_list),
+                re_arm=False,
             )
             with torch.no_grad():
                 self.generator(
@@ -1690,7 +1712,7 @@ class ActionForcingTrainingPipeline:
             for j in range(exit_index + 1, num_denoising_steps):
                 # Phase-LoRA dispatch per rung; see the equivalent
                 # block in inference_with_trajectory for rationale.
-                self._maybe_set_phase_lora_for_step(j, num_denoising_steps)
+                self._maybe_set_phase_lora_for_step(j, num_denoising_steps, re_arm=False)
                 next_t_value = int(round(float(
                     self.denoising_step_list[j]
                 )))
@@ -1795,7 +1817,9 @@ class ActionForcingTrainingPipeline:
                 else:
                     # Phase-LoRA dispatch for the no_grad flash branch.
                     # See inference_with_trajectory's twin for rationale.
-                    self._maybe_set_phase_lora_for_flash()
+                    # re_arm=False (Fix B): no_grad path; skipping
+                    # the re-arm reduces DDP-state churn.
+                    self._maybe_set_phase_lora_for_flash(re_arm=False)
                     with torch.no_grad():
                         _, flash_dmd_pred = self.generator(
                             noisy_image_or_video=flash_input,
@@ -1863,6 +1887,7 @@ class ActionForcingTrainingPipeline:
             self._maybe_set_phase_lora_for_step(
                 max(0, len(self.denoising_step_list) - 1),
                 len(self.denoising_step_list),
+                re_arm=False,
             )
             with torch.no_grad():
                 self.generator(
