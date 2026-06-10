@@ -3935,8 +3935,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         rank runs exactly one FN forward+backward (zero-anchor on any
         bail) so the FN DDP reducer stays matched."""
         m = self.model
+        if (getattr(self, "is_main_process", True)
+                and getattr(self, "_fn_frontier_entry_dbg", 0) < 5):
+            self._fn_frontier_entry_dbg = getattr(
+                self, "_fn_frontier_entry_dbg", 0) + 1
+            import sys as _sys
+            print(
+                f"[FN-FRONTIER] invoked at ride depth "
+                f"{self._chunks_in_current_ride}",
+                file=_sys.stderr, flush=True,
+            )
 
         def _anchor(reason: str) -> dict:
+            if (getattr(self, "is_main_process", True)
+                    and getattr(self, "_fn_frontier_anchor_dbg", 0) < 5):
+                self._fn_frontier_anchor_dbg = getattr(
+                    self, "_fn_frontier_anchor_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    f"[FN-FRONTIER] skipped: {reason}",
+                    file=_sys.stderr, flush=True,
+                )
             fn = m.forward_noiser
             fn_inner = fn.module if hasattr(fn, "module") else fn
             p0 = next(fn.parameters())
@@ -8199,6 +8218,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             ):
                 out.update(self._train_fn_frontier_pair())
             self.model.reset_streaming_state()
+            # Deferred 7chunk eval (see the gate in
+            # ``_streaming_train_one_chunk``): fire ONLY at ride teardown
+            # so the eval's KV-cache clobber can't truncate a live
+            # multi-roll ride. ``_pending_7chunk_sample`` was set via a
+            # rank-0 broadcast and ``should_reset`` is MAX-reduced, so
+            # every rank takes this branch together (the eval rollout is
+            # an all-ranks collective).
+            if (
+                getattr(self, "_pending_7chunk_sample", False)
+                and bool(getattr(self, "sample_7chunk_enabled", True))
+            ):
+                self._pending_7chunk_sample = False
+                if getattr(self.config, "holdout_eval_root", None):
+                    _hr = self._holdout_eval_ride_for_step(
+                        int(self.step) + 1)
+                    if _hr is not None:
+                        self._sample_7chunk_ride = _hr
+                self._log_pred_image_7chunk_sample(int(self.step) + 1)
         else:
             out["streaming_did_reset"] = 0.0
 
@@ -8221,10 +8258,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
             else:
                 _rr = "-"
+            _alloc_gb = _peakstep_gb = 0.0
+            if torch.cuda.is_available():
+                _alloc_gb = torch.cuda.memory_allocated() / 2**30
+                _peakstep_gb = torch.cuda.max_memory_allocated() / 2**30
+                # Per-gen-step peak window (rolling mode only — this
+                # branch is gated on the deterministic-stride knob).
+                torch.cuda.reset_peak_memory_stats()
             print(
                 f"[ROLL] step={int(getattr(self, 'step', -1))} "
                 f"ride_chunk={self._chunks_in_current_ride}/{max_rolls} "
-                f"mae={avg_mae:.4f} reset={int(bool(should_reset))}({_rr})",
+                f"mae={avg_mae:.4f} reset={int(bool(should_reset))}({_rr}) "
+                f"alloc={_alloc_gb:.2f} step_peak={_peakstep_gb:.2f}",
                 file=_sys.stderr, flush=True,
             )
 
@@ -8785,22 +8830,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _do7 = bool(int(_due_flag.item()) > 0)
         if self.is_main_process:
             logging.info(
-                "[ActionForcing] 7chunk gate: step=%d sample_due=%s fire=%s "
-                "ride_stashed=%s",
+                "[ActionForcing] 7chunk gate: step=%d sample_due=%s "
+                "pending=%s ride_stashed=%s",
                 int(self.step), bool(_sample_due_now), _do7,
                 getattr(self, "_sample_7chunk_ride", None) is not None,
             )
         if _do7:
-            # Seed the 7chunk eval from the HELD-OUT set (rides excluded from
-            # training) when holdout_eval_root is set, so the video measures
-            # generalization, not memorized training rides. Overrides the
-            # training-ride stash on ALL ranks with the SAME deterministic
-            # held-out ride (DDP-balanced). pred_image is left untouched.
-            if getattr(self.config, "holdout_eval_root", None):
-                _hr = self._holdout_eval_ride_for_step(int(self.step) + 1)
-                if _hr is not None:
-                    self._sample_7chunk_ride = _hr
-            self._log_pred_image_7chunk_sample(int(self.step) + 1)
+            # DEFERRED FIRE (phase-2 rolling fix): the 7chunk eval rollout
+            # clobbers the pipeline KV cache + streaming state, which under
+            # multi-roll rides would silently TRUNCATE the live ride at the
+            # sample cadence (the "end_of_ride at every 15th step" bug).
+            # Mark the sample as pending (all ranks, broadcast above keeps
+            # it lockstep); ``_streaming_step`` fires it on the next RESET
+            # step, right after the sequence is torn down — where the
+            # clobber is free. Stationary configs (max_rolls_per_ride=1)
+            # reset every step, so the eval still fires the same step.
+            self._pending_7chunk_sample = True
 
         self._mem_step_snapshot("8_exit")
 
@@ -8924,8 +8969,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if bool(getattr(self.model, "ladd_gt_transition_match", False)):
             _ss = self.model.streaming_state
             _dev = _ss["ride_latents_window"].device
-            _ss["gt_match_latents"] = ride["latents"].detach().to(_dev)
-            _ss["gt_match_actions"] = ride["z_actions"].detach().to(_dev)
+            _gm_lat = ride["latents"]
+            _gm_act = ride["z_actions"]
+            if bool(getattr(self.config, "dmd_42f_rolling_sup_new", False)):
+                # Phase-2 rolling: bound the matcher pool to the ACTIVE
+                # ride window. Rolling rides are full-length (no random
+                # truncation), and a whole-ride pool scales the per-fake
+                # MAE matching transients with ride length (the 91-GiB
+                # ceiling has no room for that). The window (<= cf +
+                # streaming_max_length frames) is still hundreds of
+                # chunks AND positionally tracks where the student
+                # actually rolls. Stationary configs keep the legacy
+                # whole-ride pool.
+                _gm_lat = _gm_lat[:, s : s + cf_dmdctx + actual_cap]
+                _gm_act = _gm_act[:, s : s + cf_dmdctx + actual_cap]
+            _ss["gt_match_latents"] = _gm_lat.detach().to(_dev)
+            _ss["gt_match_actions"] = _gm_act.detach().to(_dev)
 
         # Telemetry: stash the ride's absolute zarr-latent offset ``s``
         # and its motion.npy chunk offset on streaming_state so the
