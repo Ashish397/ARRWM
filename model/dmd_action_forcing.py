@@ -5762,23 +5762,39 @@ class ActionForcingDMD(SelfForcingModel):
         detached, or None when the geometry doesn't fit (caller must
         keep DDP participation balanced with a zero-anchor).
         """
+        def _bail(reason: str) -> None:
+            if getattr(self, "_fn_pair_bail_dbg", 0) < 5:
+                self._fn_pair_bail_dbg = getattr(
+                    self, "_fn_pair_bail_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    f"[FN-PAIR-BAIL] {reason}",
+                    file=_sys.stderr, flush=True,
+                )
+            return None
+
         s = self.streaming_state
         if s is None:
-            return None
+            return _bail("no_streaming_state")
         npb = int(self.num_frame_per_block)
         prev = s.get("previous_chunk")
         if prev is None or int(prev.shape[1]) < 6 * npb:
-            return None
+            return _bail(
+                f"prev_chunk={None if prev is None else int(prev.shape[1])}f"
+            )
         cf = int(s["cf"])
         cur = int(s["current_length"])
         if cur < 6 * npb:
-            return None
+            return _bail(f"current_length={cur} < {6 * npb}")
         F = cf + cur                                # frontier abs frame
         lat = s["ride_latents_window"]
         act = s["ride_actions_window"]
         if F - 6 * npb < 0 or F + npb > int(act.shape[1]) \
                 or F + npb > int(lat.shape[1]):
-            return None
+            return _bail(
+                f"bounds F={F} act_len={int(act.shape[1])} "
+                f"lat_len={int(lat.shape[1])}"
+            )
         pe = s["prompt_embeds"]
         n1 = 6
         delta = max(1, (cf // npb) - int(self.fake_alt_rollout2_num_seed_chunks))
