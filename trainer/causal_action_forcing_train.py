@@ -8816,9 +8816,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         gen_mod = self.model.generator.model
         if hasattr(gen_mod, "module"):
             gen_mod = gen_mod.module
+        # Re-arm FIRST, then ghost over ALL lora params. The no_grad
+        # dispatch sites use re_arm=False, so whichever dispatch ran
+        # last (typically the Step 3.4 context_noise commit) leaves
+        # only ONE adapter's params requires_grad=True via peft's
+        # set_adapter side-effect. Filtering the ghost by the CURRENT
+        # requires_grad would then cover a single adapter and leave
+        # the other buckets unreduced — find_unused=False DDP dies
+        # with "Expected to have finished reduction in the prior
+        # iteration" at the next iter's first grad-on forward
+        # (observed on j5169482/3/4, ~iter 1-2). Re-arming here also
+        # restores the canonical all-True state before backward, which
+        # both the ckpt recomputes and DDP's tracked-param set expect.
         ghost: Optional[torch.Tensor] = None
         for n, p in gen_mod.named_parameters():
-            if "lora_" in n and p.requires_grad:
+            if "lora_" in n:
+                p.requires_grad = True
                 ghost = p.sum() if ghost is None else ghost + p.sum()
         if ghost is not None:
             loss = loss + 0.0 * ghost
