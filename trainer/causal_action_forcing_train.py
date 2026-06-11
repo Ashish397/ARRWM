@@ -342,14 +342,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.generator_ddp: Optional[DDP] = None
         self.fake_score_ddp: Optional[DDP] = None
         if self.world_size > 1:
-            # Phased DMD K-LoRA: each gen step only one of K adapters
-            # contributes to grads; the inactive K-1 are "unused".
-            # find_unused_parameters=True lets the DDP reducer mark
-            # those as ready-with-zero. Mirrors the real_teacher /
-            # forward_noiser ddp patterns elsewhere in this file.
-            gen_fup = debug_fup or bool(
-                getattr(self.config, "student_phase_lora_enabled", False)
-            )
+            # Phased DMD K-LoRA: each gen step only the active adapter
+            # gets a REAL gradient, but the trainer's ghost anchor
+            # (see ``_streaming_train_one_chunk``) adds a zero-weighted
+            # touch on EVERY lora param to the gen loss, so every
+            # adapter receives an (exactly-zero) grad on every
+            # backward. With full coverage guaranteed,
+            # find_unused_parameters must stay FALSE: the ghost params
+            # are outside the forward-output graph, so unused-param
+            # traversal would pre-mark them ready and the arriving
+            # ghost grad would mark them twice (DDP error). The
+            # find_unused=True variant (without ghost) was tried first
+            # and died in DDP's deferred bucket rebuild — rung_flash
+            # gets zero real grads until gan_disc_start_step, leaving
+            # its params unmarked for ~20 iters, and the rebuild then
+            # fired mid-ckpt-recompute (j5147634/5/6, j5151298+).
+            gen_fup = debug_fup
             self.generator_ddp = DDP(
                 model.generator.model,
                 device_ids=[self.local_rank],
@@ -8313,6 +8321,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["sc_dmd_weight_effective"] = float(sc_weight)
             out["sc_dmd_loss_weighted"] = float(weighted_sc.detach().item())
 
+        # Phase-LoRA ghost anchor — see ``_phase_lora_ghost_anchor``
+        # for the full rationale (K+1 DDP rebuild fix).
+        generator_loss = self._phase_lora_ghost_anchor(generator_loss)
+
         out["generator_loss"] = float(generator_loss.detach().item())
         # retain_graph=True so the critic backward can walk the shared
         # cond_dict / action_projection subgraph that both losses use.
@@ -8759,6 +8771,59 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
             return None
 
+    def _phase_lora_ghost_anchor(
+        self, loss: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero-weighted touch on EVERY student phase-LoRA param.
+
+        K+1 DDP rebuild fix: each gen step only the active adapter
+        gets a REAL gradient. The dedicated ``rung_flash`` adapter's
+        only real signal is the GAN adversarial loss, which is gated
+        off until ``gan_disc_start_step`` — so for the first ~20 iters
+        its params are NEVER marked ready in DDP's reducer. DDP defers
+        its one-time bucket rebuild until every tracked param has been
+        marked at least once; at the first GAN-active iter (step 21)
+        rung_flash finally fires, the deferred rebuild triggers MID-
+        CKPT-RECOMPUTE (the recompute's ``_pre_forward`` runs inside
+        the outer backward), and the reducer dies with
+        ``!unmarked_param_indices.empty() INTERNAL ASSERT``
+        (reducer.cpp:2035; observed at step=21 on j5147634/5/6 and the
+        j5151298+ Fix-B resubmits — both crashes exactly one step
+        after gan_disc_start_step=20).
+
+        Adding ``0.0 * sum(lora params)`` to the gen loss guarantees
+        every adapter receives an (exactly-zero) grad on every
+        backward from iter 1 → the rebuild completes cleanly at iter 2
+        the same way it does on the no-LoRA baseline. The added
+        gradient is identically zero: per-rung training signal,
+        optimizer state, and rung independence are untouched
+        (weight_decay=0 → idle-rung AdamW steps are pure momentum
+        decay, no shrinkage, no cross-rung pollution).
+
+        Pairs with ``find_unused_parameters=False`` on the gen DDP
+        wrap: with full coverage guaranteed, unused-param traversal
+        is unnecessary — and would actually BREAK (ghost params are
+        outside the forward-output graph, so find_unused=True would
+        pre-mark them ready and the arriving ghost grad would mark
+        them twice).
+
+        No-op (returns ``loss`` unchanged) when phase LoRA is off.
+        """
+        if not bool(
+            getattr(self.config, "student_phase_lora_enabled", False)
+        ):
+            return loss
+        gen_mod = self.model.generator.model
+        if hasattr(gen_mod, "module"):
+            gen_mod = gen_mod.module
+        ghost: Optional[torch.Tensor] = None
+        for n, p in gen_mod.named_parameters():
+            if "lora_" in n and p.requires_grad:
+                ghost = p.sum() if ghost is None else ghost + p.sum()
+        if ghost is not None:
+            loss = loss + 0.0 * ghost
+        return loss
+
     def _fwdbwd_streaming_step(
         self,
         train_generator: bool,
@@ -9103,6 +9168,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         weighted_sc.detach().item()
                     )
 
+                generator_loss = self._phase_lora_ghost_anchor(
+                    generator_loss
+                )
                 merged["generator_loss"] = float(generator_loss.detach().item())
                 generator_loss.backward()
                 return merged
@@ -9145,6 +9213,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         weighted_sc.detach().item()
                     )
 
+                generator_loss = self._phase_lora_ghost_anchor(
+                    generator_loss
+                )
                 merged_plain["generator_loss"] = float(
                     generator_loss.detach().item()
                 )
