@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=arrwm_p4_E3_1_SAv3_FT_v1
+#SBATCH --job-name=arrwm_p4_E3_1_SAv3_FT_v1b
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=12:00:00
+#SBATCH --time=04:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
@@ -185,14 +185,14 @@ echo "Master: $MASTER_ADDR:$MASTER_PORT"
 # auto_resume starts rolling from the trained stationary h3 baseline.
 # Skipped when the run dir already holds a checkpoint (requeue case).
 # FATAL if no h3 checkpoint exists yet.
-RUN_NAME=arrwm_p4_E3_1_nsallsup_SAv3_FT_v1_j${SLURM_JOB_ID}
+RUN_NAME=arrwm_p4_E3_1_nsallsup_SAv3_FT_v1b_j${SLURM_JOB_ID}
 RUN_DIR=$LOGDIR/$RUN_NAME
 mkdir -p "$RUN_DIR"
 if ! ls "$RUN_DIR"/phase1_step*.pt >/dev/null 2>&1; then
   # Prefer the LATEST checkpoint from a PREVIOUS rolling run (continue
   # the phase-2 run across resubmits); fall back to the h3 stationary
   # baseline only when no rolling checkpoint exists yet.
-  PREV_CKPT=$(ls -t $LOGDIR/arrwm_p4_E3_1_nsallsup_SAv3_FT_v1_j*/phase1_step*.pt 2>/dev/null | head -1 || true)
+  PREV_CKPT=$(ls -t $LOGDIR/arrwm_p4_E3_1_nsallsup_SAv3_FT_v1b_j*/phase1_step*.pt 2>/dev/null | head -1 || true)
   if [ -n "$PREV_CKPT" ]; then
     cp "$PREV_CKPT" "$RUN_DIR/"
     echo "Pre-staged PREVIOUS rolling checkpoint: $PREV_CKPT -> $RUN_DIR/"
@@ -222,7 +222,7 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=1000 \
+    max_steps=400 \
     checkpoint_interval=100 \
     ema_weight=0.0 \
     ema_start_step=1000000 \
@@ -290,6 +290,7 @@ srun torchrun \
     dmd_42f_allsup=true \
     dmd_42f_gt_anchor=true \
     dmd_only_first_chunk_per_ride=false \
+    dmd_42f_fix_clean_counterpart=true \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
     motion_start_threshold=5.0 \
@@ -338,7 +339,7 @@ srun torchrun \
     forward_noiser_sw_max_tokens=4096 \
     fake_alt_rollout2_num_seed_chunks=5 \
     forward_noiser_apply_gt_former=true \
-    fn_frontier_pairs=true \
+    fn_frontier_pairs=false \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \

@@ -1,41 +1,43 @@
 #!/bin/bash
-#SBATCH --job-name=arrwm_p4_E3_1_SAv3_FT_v1
+#SBATCH --job-name=af-p3-cb-flashtr-v8i3
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=12:00:00
+#SBATCH --time=03:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# train_arrwm_p4_E3_1_nsallsup_SAv3_FT_v1 = PHASE-2/4 ROLLING TRAINING
-# on the v8h3 base (naive forward CARN-former). Resumes from h3's
-# step-200 checkpoint (pre-staged below) and rolls each ride INDEFINITELY
-# instead of re-seeding every step:
-#   * Per ride: seed 6 GT chunks (cf=18) -> iter 1 rolls the full 7-chunk
-#     window -> every later step rolls 3 NEW chunks (9f) on the
-#     persistent KV cache (self-forcing) and trains the latest 7-chunk
-#     window [4 ctx | 3 new].
-#   * num_chunks_roll_forward=4 + streaming_min_new_frame=12 =
-#     deterministic 4-chunk advance (window = [3 kept | 4 new]).
-#   * dmd_42f_rolling_sup_new=true: 42f window re-anchors on the NEW
-#     frames on rolls k>=2 -> [9f GT ctx | 9f new (supervised) | 3f GT
-#     future scaffold]; every rolled chunk DMD-supervised exactly once.
-#   * dmd_only_first_chunk_per_ride=false: DMD fires every roll.
-#   * MAE-collapse gate: streaming_mae_collapse_threshold (currently 0.0
-#     = OFF; set from rolling telemetry) resets the ride when window MAE
-#     vs GT crosses it. Rides otherwise reset at end-of-ride.
-#   * h3's FN (forward CARN-former, [FN-GT-FORMER]) stays active. The FN
-#     teacher_feat training only finds rollout1/rollout2 pairs on each
-#     ride's FIRST window (rollout2 covers the setup window); later
-#     rolls hit the DDP-safe zero-anchor, so the FN trains at reduced
-#     duty during rolling.
-#   * 1000 steps total (resume @200 -> +800 rolling), ckpt every 100.
+# v8i3 = v8h3 + STUDENT PHASE LoRA (K+1 design), uniform exit_flag.
+# Byte-identical to h3 (naive FORWARD CARN-former applied to the FORMER
+# GT latent only) EXCEPT the student generator is now wrapped with K=4
+# per-rung LoRA adapters (rung_0..rung_3) plus a dedicated rung_flash
+# adapter: student_phase_lora_enabled=true, K=4, rank=32, alpha=32,
+# dropout=0.0, freeze_base=true, flash_adapter_enabled=true. UNIFORM
+# exit_flag (no weights). fake_score LoRA off. All other h3 knobs
+# unchanged. (I-series = h1/h2/h3 with phase LoRA on; ported from the
+# v8e8 K4flash_uniform reference, as1748 paths / 3h wall.)
 #
-# ---- h3 base notes below ----
+# ---- h3 lineage below ----
+# v8h3 = NAIVE FORWARD CARN-FORMER (h1 base, FN direction flipped back).
+# The FN trains FORWARD (default, no reverse): clean GT @ level L ->
+# student-drifted @ L, ONE conditioned call (carn_recurse=false +
+# step_unconditioned=false: FN is given the drift level as carn_step).
+# teacher_feat/SW loss. Application (forward_noiser_apply_gt_former=true):
+# ONE FN call at carn_step=1 on the FORMER GT latent only of each matched
+# real transition pair (moment-preserving / texture-only) -> the real
+# anchor is [1-step-drifted GT former -> clean GT latter], the self-
+# correcting transition e8's carn_former intended but never executed in
+# the matched path. NAIVE on purpose: the SAME CARN'd former feeds both
+# the D-update and the gen-side real view (no Req-1 drift cap, no Req-2
+# gen-side clean former) — with one CARN step that leak is acceptable.
+# vs h1: h1 = REVERSE FN applied to BOTH latents (de-CARN'd real);
+# h3 = FORWARD FN applied to FORMER only (drifted-former transition).
+# Confirmation in .err: [FN-GT-FORMER] ACTIVE ... carn_step=1.
+#
 # ---- legacy e-lineage notes below (mostly describe the FORWARD CARN) ----
 # Phase-3 DMD one-step — v8e6 = v8e5 + gan_loss_weight=2.5 + 3h wall to
 # reach step 200 in one shot (from scratch). Checkpoints now ALSO save the
@@ -180,36 +182,6 @@ echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
-
-# ---- Pre-stage h3's step-200 checkpoint into THIS run's dir so
-# auto_resume starts rolling from the trained stationary h3 baseline.
-# Skipped when the run dir already holds a checkpoint (requeue case).
-# FATAL if no h3 checkpoint exists yet.
-RUN_NAME=arrwm_p4_E3_1_nsallsup_SAv3_FT_v1_j${SLURM_JOB_ID}
-RUN_DIR=$LOGDIR/$RUN_NAME
-mkdir -p "$RUN_DIR"
-if ! ls "$RUN_DIR"/phase1_step*.pt >/dev/null 2>&1; then
-  # Prefer the LATEST checkpoint from a PREVIOUS rolling run (continue
-  # the phase-2 run across resubmits); fall back to the h3 stationary
-  # baseline only when no rolling checkpoint exists yet.
-  PREV_CKPT=$(ls -t $LOGDIR/arrwm_p4_E3_1_nsallsup_SAv3_FT_v1_j*/phase1_step*.pt 2>/dev/null | head -1 || true)
-  if [ -n "$PREV_CKPT" ]; then
-    cp "$PREV_CKPT" "$RUN_DIR/"
-    echo "Pre-staged PREVIOUS rolling checkpoint: $PREV_CKPT -> $RUN_DIR/"
-  else
-  H3_CKPT=$(ls -t $LOGDIR/*v8h3_j*/phase1_step0000200.pt 2>/dev/null | head -1 || true)
-  if [ -z "$H3_CKPT" ]; then
-    H3_CKPT=$(ls -t $LOGDIR/*v8h3_j*/phase1_step*.pt 2>/dev/null | head -1 || true)
-  fi
-  if [ -z "$H3_CKPT" ]; then
-    echo "FATAL: no v8h3 checkpoint found under $LOGDIR/*v8h3_j*/ — this run needs the h3 baseline. Aborting."
-    exit 1
-  fi
-  cp "$H3_CKPT" "$RUN_DIR/"
-  echo "Pre-staged h3 baseline checkpoint: $H3_CKPT -> $RUN_DIR/"
-  fi
-fi
-
 srun torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
@@ -222,32 +194,19 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=1000 \
-    checkpoint_interval=100 \
-    ema_weight=0.0 \
-    ema_start_step=1000000 \
+    max_steps=200 \
     encoded_root=/projects/u6ex/fbots/frodobots_encoded_weu \
     holdout_zarr_list=configs/holdout_rides.txt \
     holdout_eval_root=/projects/u6ex/fbots/frodobots_encoded_weu_holdout \
     holdout_eval_mode=cycle \
     max_ride_frames=900 \
-    max_ride_frames_random=false \
+    max_ride_frames_random=true \
     action_teacher_mode=off \
     action_critic_aux_enabled=false \
     state_probe_aux_enabled=false \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
-    max_rolls_per_ride=100000 \
-    streaming_max_length=300 \
-    gen_gradient_checkpointing=true \
-    num_chunks_roll_forward=4 \
-    streaming_min_new_frame=12 \
-    dmd_42f_rolling_sup_new=true \
-    streaming_mae_collapse_threshold=0.0 \
-    streaming_mae_collapse_min_chunks=2 \
-    rolling_rolls_schedule_every=50 \
-    rolling_rolls_schedule_base=2 \
-    rolling_rolls_schedule_start_step=200 \
+    max_rolls_per_ride=1 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=24 \
     num_workers=0 \
@@ -289,7 +248,7 @@ srun torchrun \
     dmd_42f_rand_sup_slot=false \
     dmd_42f_allsup=true \
     dmd_42f_gt_anchor=true \
-    dmd_only_first_chunk_per_ride=false \
+    dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
     motion_start_threshold=5.0 \
@@ -314,7 +273,7 @@ srun torchrun \
     ladd_r1_gamma=0.02 \
     ladd_r1_every_n_steps=1 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=5 \
+    ladd_pairs_per_step=7 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_ll_weight=0.0 \
@@ -332,17 +291,25 @@ srun torchrun \
     ladd_gt_transition_match_k=4 \
     forward_noiser_enabled=true \
     forward_noiser_loss_mode=teacher_feat \
-    forward_noiser_step_unconditioned=true \
+    forward_noiser_step_unconditioned=false \
+    carn_recurse=false \
     forward_noiser_feat_t=0 \
     forward_noiser_sw_n_proj=64 \
     forward_noiser_sw_max_tokens=4096 \
     fake_alt_rollout2_num_seed_chunks=5 \
     forward_noiser_apply_gt_former=true \
-    fn_frontier_pairs=true \
+    forward_noiser_apply_gt_level=1 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=${RUN_NAME}
+    student_phase_lora_enabled=true \
+    student_phase_lora_K=4 \
+    student_phase_lora_rank=32 \
+    student_phase_lora_alpha=32 \
+    student_phase_lora_dropout=0.0 \
+    student_phase_lora_freeze_base=true \
+    student_phase_lora_flash_adapter_enabled=true \
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8i3_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

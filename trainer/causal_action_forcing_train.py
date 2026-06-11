@@ -2186,6 +2186,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
                 self._pending_video_latents = None
 
+                # Rolling: also emit the FULL ride rollout accumulated
+                # across rolls (the 21f pred_image window only shows the
+                # latest slice once rides run deep). cap_frames=False —
+                # the whole rollout is the point.
+                _acc = getattr(self, "_rollout_video_acc", None)
+                if _acc is not None and int(_acc.shape[1]) > 21:
+                    try:
+                        self._log_pred_image_video(
+                            _acc.to(device=self.device, dtype=self.dtype),
+                            int(self.step),
+                            name="pred_image_rollout",
+                            caption_suffix=(
+                                f"full ride rollout "
+                                f"({int(_acc.shape[1])} latent frames)"
+                            ),
+                            cap_frames=False,
+                        )
+                    except Exception as _exc:
+                        logging.warning(
+                            "[ActionForcing] pred_image_rollout decode "
+                            "failed (len=%d): %s",
+                            int(_acc.shape[1]), _exc,
+                        )
+
                 # DMD scorer + clean_x diagnostic videos. ``pred_real``
                 # / ``pred_fake`` are the scorers' denoised x0 estimates
                 # on the SAME noisy student input — divergence between
@@ -8175,6 +8199,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             (chunk.detach().float() - gt_slice.float()).abs().mean().item()
         )
         t_rollout_ms = (time.monotonic() - t_rollout_start) * 1000.0
+
+        # Rolling: accumulate the student's WHOLE ride rollout (rank 0,
+        # CPU, detached) so sample videos can show the full generated
+        # sequence instead of just the last 21f window. Restarted at
+        # each ride setup; kept across the ride's reset so the sampler
+        # can still emit the completed ride's full video.
+        if (
+            self.is_main_process
+            and int(getattr(
+                self.model, "streaming_force_new_frame_chunks", 0)) > 0
+        ):
+            _nf_acc = int(info["new_frames"])
+            _src_acc = info.get("flash_dmd_gan_x0")
+            _new_acc = (
+                _src_acc if _src_acc is not None else chunk
+            )[:, -_nf_acc:].detach().float().cpu()
+            if needs_setup or getattr(self, "_rollout_video_acc", None) is None:
+                self._rollout_video_acc = _new_acc
+            else:
+                self._rollout_video_acc = torch.cat(
+                    [self._rollout_video_acc, _new_acc], dim=1)
 
         out["streaming_chunks_in_ride"] = float(self._chunks_in_current_ride)
         out["streaming_window_avg_mae"] = float(avg_mae)

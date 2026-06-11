@@ -738,6 +738,34 @@ class ActionForcingDMD(SelfForcingModel):
         self.aux_noisy_from_raw_gt = bool(
             getattr(args, "aux_noisy_from_raw_gt", False)
         )
+        # ===== j-series: random-window clean_x curriculum =====
+        # ``aux_clean_x_random_window``: train the ONLINE teacher with a
+        # clean_x conditioning window sliced from a RANDOM position of
+        # the SAME ride instead of the time-locked window. The denoising
+        # TARGET (gt_target / noisy input) stays time-locked — only the
+        # TF conditioning drifts. Ramped by a curriculum so behaviour is
+        # exactly time-locked at the start and fully position-free at
+        # the end: the teacher's "clean_x and noisy_x are aligned in
+        # time and space" assumption is annealed away, leaving clean_x
+        # as an appearance/texture prior. (Unlocks the teacher for
+        # phase-2 rolling, where clean_x cannot be honestly time-locked
+        # to drifted student content.) The clean ACTION streams are
+        # swapped to the random window's actions so the conditioning
+        # stays self-consistent.
+        self.aux_clean_x_random_window = bool(
+            getattr(args, "aux_clean_x_random_window", False)
+        )
+        # Curriculum: drift fraction = clamp((step - start)/(full -
+        # start), 0, 1). The clean window start is shifted from the
+        # time-locked position by U[-m, +m] where m = frac * (ride_len
+        # - window); frac=0 -> identical to time-locked, frac=1 -> any
+        # position in the ride.
+        self.aux_clean_x_drift_start_step = int(
+            getattr(args, "aux_clean_x_drift_start_step", 0)
+        )
+        self.aux_clean_x_drift_full_step = int(
+            getattr(args, "aux_clean_x_drift_full_step", 150)
+        )
         # Upper bound for the per-chunk random renoise applied to
         # the pure-GT clean_x_aux slice. Each chunk of ``npb`` frames
         # is renoised at a SINGLE timestep sampled uniformly from
@@ -6275,8 +6303,16 @@ class ActionForcingDMD(SelfForcingModel):
 
         new_frames = self._streaming_pick_new_frames(device)
         if s["previous_chunk"] is None:
-            # First iter of the sequence: roll a full chunk_size, no overlap.
-            new_frames = chunk_size
+            # First iter of the sequence: roll a full chunk_size, no
+            # overlap — CAPPED at the remaining room. (Short transient
+            # sequences — e.g. the FN frontier mini-prebuilds with
+            # max_length < chunk_size — would otherwise overrun their
+            # action windows: the forced 21f roll sliced cond streams
+            # past their end. Normal rides always have room >=
+            # chunk_size on iter 1, so this cap is a no-op for them.)
+            _room0 = int(s["max_length"]) - int(s["current_length"])
+            _room0 = max(npb, (_room0 // npb) * npb)
+            new_frames = min(chunk_size, _room0)
             overlap = 0
         else:
             overlap = chunk_size - new_frames
@@ -6992,12 +7028,20 @@ class ActionForcingDMD(SelfForcingModel):
         # frames (more v14-faithful than dropping a key, which the flash
         # kernel can't do for a mid-sequence frame anyway).
         if bool(getattr(self, "dmd_42f_fix_clean_counterpart", False)):
-            stu_lo = n_ctx
-            # Student frames in noisy_x = supervised block, plus the
-            # after-block when it is student-rolled (not seed_last GT).
-            stu_hi = n_ctx + sup_frames + (
-                0 if seed_last else gt_after_frames
-            )
+            if _rolling:
+                # Rolling: the noisy half is student from frame 0 (ctx +
+                # new chunks); only the gt_after scaffold tail is GT. The
+                # whole student span needs its clean counterparts
+                # replaced, not just [n_ctx:...] (which assumes GT ctx).
+                stu_lo = 0
+                stu_hi = n_ctx + sup_frames
+            else:
+                stu_lo = n_ctx
+                # Student frames in noisy_x = supervised block, plus the
+                # after-block when it is student-rolled (not seed_last GT).
+                stu_hi = n_ctx + sup_frames + (
+                    0 if seed_last else gt_after_frames
+                )
             dst_lo = stu_lo + npb
             dst_hi = min(stu_hi + npb, N)
             n_rep = dst_hi - dst_lo
@@ -8677,6 +8721,109 @@ class ActionForcingDMD(SelfForcingModel):
         clean_x_for_real = ride_window[
             :, _clean_start:_clean_end,
         ].to(dtype=chunk.dtype, device=chunk.device).detach()
+        # ===== j-series: RANDOM-WINDOW clean_x curriculum =====
+        # Replace the time-locked clean_x with a window at a curriculum-
+        # drifted RANDOM position of the same ride (full-ride pool =
+        # gt_match_latents). gt_target / noisy_input stay time-locked.
+        # See the knob registration for the full rationale.
+        _randx_probe_ctx = None
+        if bool(getattr(self, "aux_clean_x_random_window", False)):
+            _step_now = int(getattr(self, "_last_current_step", 0))
+            _d0 = int(getattr(self, "aux_clean_x_drift_start_step", 0))
+            _d1 = max(_d0 + 1, int(getattr(
+                self, "aux_clean_x_drift_full_step", _d0 + 1)))
+            _frac = min(1.0, max(0.0, (_step_now - _d0) / float(_d1 - _d0)))
+            self._aux_randx_frac = float(_frac)
+            self._aux_randx_shift = 0.0
+            _pool_lat = s.get("gt_match_latents")
+            _pool_act = s.get("gt_match_actions")
+            # Both frames AND actions must be swappable, else stay fully
+            # time-locked (review finding: a frames-only swap leaves the
+            # clean conditioning self-INconsistent — never do it
+            # silently).
+            _pool_ok = (
+                _pool_lat is not None
+                and _pool_act is not None
+                and int(_pool_lat.shape[1]) >= chunk_size
+                and int(_pool_act.shape[1]) >= int(_pool_lat.shape[1])
+            )
+            if not _pool_ok:
+                if not getattr(self, "_aux_randx_warned", False):
+                    self._aux_randx_warned = True
+                    import sys as _sys
+                    print(
+                        "[AUX-RANDX] WARNING: gt_match latents/actions "
+                        "pool unavailable or too short — clean_x stays "
+                        "TIME-LOCKED. Enable ladd_gt_transition_match.",
+                        file=_sys.stderr, flush=True,
+                    )
+            elif _frac > 0.0:
+                _ride_off = int(s.get("ride_offset_s", 0))
+                # Time-locked clean start in FULL-RIDE coordinates.
+                # NOTE (phase-2 port hazard, by review): under
+                # dmd_42f_rolling_sup_new the trainer slices the pool to
+                # START AT s — adding ride_offset_s there double-counts
+                # the offset. Must be re-based before any rolling port.
+                _anchor_abs = _ride_off + _clean_start
+                _max_lo = int(_pool_lat.shape[1]) - chunk_size
+                _max_shift = int(round(_frac * _max_lo))
+                _shift = (
+                    int(torch.randint(
+                        -_max_shift, _max_shift + 1, (1,)).item())
+                    if _max_shift > 0 else 0
+                )
+                _lo = min(max(_anchor_abs + _shift, 0), _max_lo)
+                _lo = (_lo // npb) * npb
+                self._aux_randx_shift = float(_lo - _anchor_abs)
+                # Stash the probe context BEFORE overwriting: the paired
+                # no-grad probes (locked / far / zero clean_x) reuse the
+                # main pass's noisy input + t + eps for comparability.
+                _far_lo = (
+                    min(max(_anchor_abs + _max_lo, 0), _max_lo) // npb
+                ) * npb
+                _randx_probe_ctx = {
+                    "locked_clean": clean_x_for_real,
+                    "locked_cond": cond_for_scoring,
+                    "far_lo": _far_lo,
+                    "pool_lat": _pool_lat,
+                    "pool_act": _pool_act,
+                    "step": _step_now,
+                }
+                clean_x_for_real = _pool_lat[
+                    :, _lo:_lo + chunk_size,
+                ].to(dtype=chunk.dtype, device=chunk.device).detach()
+                # Swap the clean ACTION streams to the random window's
+                # actions (self-consistent conditioning). GRAD-ATTACHED,
+                # exactly like the time-locked path's clean streams —
+                # detaching only here would silently change which params
+                # the aux backward feeds as the curriculum ramps
+                # (review finding: frac=0 vs frac>0 gradient-flow
+                # mismatch).
+                if (_pool_act is not None
+                        and int(_pool_act.shape[1]) >= _lo + chunk_size):
+                    _rc, _ = self.build_action_conditional(
+                        prompt_embeds=s["prompt_embeds"],
+                        gt_actions=_pool_act[:, _lo:_lo + chunk_size],
+                    )
+                    cond_for_scoring = dict(cond_for_scoring)
+                    _rm = _rc.get("_action_modulation")
+                    _rt = _rc.get("_action_tokens")
+                    if _rm is not None:
+                        cond_for_scoring["_action_modulation_clean"] = _rm
+                    if _rt is not None:
+                        cond_for_scoring["_action_tokens_clean"] = _rt
+                if (getattr(self, "_aux_randx_dbg", 0) < 3
+                        or _step_now % 50 == 0):
+                    self._aux_randx_dbg = getattr(
+                        self, "_aux_randx_dbg", 0) + 1
+                    import sys as _sys
+                    print(
+                        f"[AUX-RANDX] step={_step_now} frac={_frac:.2f} "
+                        f"anchor={_anchor_abs} shift={_shift} -> clean "
+                        f"window [{_lo},{_lo + chunk_size}) of ride "
+                        f"len {int(_pool_lat.shape[1])}",
+                        file=_sys.stderr, flush=True,
+                    )
         # Renoise the pure-GT clean_x via the scheduler. Each chunk
         # of ``npb`` frames gets a SINGLE random timestep sampled
         # uniformly from ``[0, clean_x_gt_noise_t]`` (default upper
@@ -9049,6 +9196,77 @@ class ActionForcingDMD(SelfForcingModel):
         # params via lora_state_preds. Keys are nested under "_aux_teacher_
         # tensors" so the standard ``isinstance(v, dict)`` filter in the
         # trainer's wandb-log unpack skips them (else .item() would fail).
+        # ===== j-series probes (review must-fix): every 25 steps run
+        # paired NO-GRAD teacher forwards on the SAME noisy input / t /
+        # eps with three clean_x variants — time-locked / far-shifted /
+        # zeroed — and log their losses. Separates "texture prior"
+        # (locked < far << zero) from "clean_x ignored" (locked ≈ far ≈
+        # zero) and "alignment forgotten" (locked drifting up vs the h2
+        # baseline). 3 extra forwards / 25 steps — negligible.
+        if (_randx_probe_ctx is not None
+                and int(_randx_probe_ctx["step"]) % 25 == 0):
+            with torch.no_grad():
+                _zero_aug = torch.zeros(
+                    (gt_target.shape[0], int(gt_target.shape[1])),
+                    device=chunk.device, dtype=torch.long,
+                )
+
+                def _randx_probe(_cx, _cond_p):
+                    _outp = self.real_score(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=_cond_p,
+                        timestep=t,
+                        clean_x=_cx,
+                        aug_t=_zero_aug,
+                    )
+                    _fp = _outp[0]
+                    return float(self.denoising_loss_func(
+                        x=gt_target.flatten(0, 1),
+                        x_pred=None,
+                        noise=eps.flatten(0, 1),
+                        noise_pred=None,
+                        alphas_cumprod=self.scheduler.alphas_cumprod,
+                        timestep=t.flatten(0, 1),
+                        flow_pred=_fp.flatten(0, 1),
+                        gradient_mask=gradient_mask_flat,
+                    ).detach().item())
+
+                _pl = _randx_probe_ctx["pool_lat"]
+                _pa = _randx_probe_ctx["pool_act"]
+                _flo = int(_randx_probe_ctx["far_lo"])
+                _far_clean = _pl[:, _flo:_flo + chunk_size].to(
+                    dtype=chunk.dtype, device=chunk.device,
+                )
+                _fc, _ = self.build_action_conditional(
+                    prompt_embeds=s["prompt_embeds"],
+                    gt_actions=_pa[:, _flo:_flo + chunk_size],
+                )
+                _far_cond = dict(cond_for_scoring)
+                if _fc.get("_action_modulation") is not None:
+                    _far_cond["_action_modulation_clean"] = (
+                        _fc["_action_modulation"]
+                    )
+                if _fc.get("_action_tokens") is not None:
+                    _far_cond["_action_tokens_clean"] = (
+                        _fc["_action_tokens"]
+                    )
+                log["aux_randx_probe_locked"] = _randx_probe(
+                    _randx_probe_ctx["locked_clean"],
+                    _randx_probe_ctx["locked_cond"],
+                )
+                log["aux_randx_probe_far"] = _randx_probe(
+                    _far_clean, _far_cond,
+                )
+                log["aux_randx_probe_zero"] = _randx_probe(
+                    torch.zeros_like(_randx_probe_ctx["locked_clean"]),
+                    _randx_probe_ctx["locked_cond"],
+                )
+        if bool(getattr(self, "aux_clean_x_random_window", False)):
+            log["aux_randx_frac"] = float(
+                getattr(self, "_aux_randx_frac", 0.0))
+            log["aux_randx_shift"] = float(
+                getattr(self, "_aux_randx_shift", 0.0))
+
         log["_aux_teacher_tensors"] = {
             "lora_x0": _x0,
             "lora_state_preds": lora_state_preds,
