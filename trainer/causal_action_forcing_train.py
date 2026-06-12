@@ -1891,7 +1891,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # Phase LoRA: step the K-1 remaining per-rung
                 # optimizers (rung_0 IS self.optimizer above; the
                 # rest each own only their adapter's LoRA params).
+                # Each adapter is clipped INDEPENDENTLY at the same
+                # max_grad_norm as rung_0: per-adapter granularity is
+                # the right unit (a spike on one rung — most likely
+                # rung_flash, which alone absorbs the full
+                # gan_loss_weight adversarial gradient — must not
+                # shrink another rung's legitimate update, which a
+                # single global clip over all lora params would do).
                 for _opt in getattr(self, "phase_lora_optimizers", [])[1:]:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in _opt.param_groups[0]["params"]
+                         if p.grad is not None],
+                        max_norm=self.max_grad_norm,
+                    )
                     _opt.step()
                     _opt.zero_grad(set_to_none=True)
                 self._maybe_update_generator_ema()
