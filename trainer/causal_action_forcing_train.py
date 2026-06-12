@@ -1902,7 +1902,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in _opt.param_groups[0]["params"]
                          if p.grad is not None],
-                        max_norm=self.max_grad_norm,
+                        max_norm=getattr(
+                            self, "phase_lora_max_grad_norm",
+                            self.max_grad_norm,
+                        ),
                     )
                     _opt.step()
                     _opt.zero_grad(set_to_none=True)

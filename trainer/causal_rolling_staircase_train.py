@@ -690,6 +690,18 @@ class RollingStaircaseDMDTrainer:
                 trainable_params, lr=lr, betas=betas, eps=eps, weight_decay=wd
             )
         self.max_grad_norm = float(getattr(cfg, "max_grad_norm", 1.0))
+        # Phase-LoRA per-rung clip threshold. LoRA adapters have far
+        # fewer params than the full DiT, so their gradient norms are
+        # naturally smaller and the global max_grad_norm (tuned for
+        # full fine-tune) may never bind. A tighter dedicated value
+        # protects each adapter's Adam second-moment memory from GAN
+        # gradient spikes (rung_flash absorbs the full adversarial
+        # gradient alone). Defaults to max_grad_norm when unset.
+        self.phase_lora_max_grad_norm = float(
+            getattr(
+                cfg, "student_phase_lora_max_grad_norm", self.max_grad_norm,
+            )
+        )
 
         # ------------------------------------------------------------------
         # Fake-score optimizer (only when fake-score updates are enabled).
