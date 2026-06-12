@@ -358,12 +358,41 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # its params unmarked for ~20 iters, and the rebuild then
             # fired mid-ckpt-recompute (j5147634/5/6, j5151298+).
             gen_fup = debug_fup
+            # static_graph completes the ghost-anchor fix. All three
+            # phase-LoRA crash modes shared ONE structural root cause:
+            # DDP's one-time bucket rebuild fires inside a checkpoint
+            # recompute's _pre_forward (mid-backward) the moment its
+            # precondition — every tracked param marked ready at least
+            # once — is met DURING a backward:
+            #   * without ghost: rung_flash is gradient-silent until
+            #     gan_disc_start_step, precondition completes mid-
+            #     backward at step 21 -> INTERNAL ASSERT
+            #     (j5147634/5/6, j5151298+).
+            #   * with ghost: the ghost term is a shallow node on the
+            #     loss, so ALL lora grads arrive at the very START of
+            #     backward, precondition completes mid-backward at
+            #     iter 1 -> "Expected to have finished reduction"
+            #     (j5173579).
+            #   * the no-LoRA baseline only survives by ordering luck:
+            #     full-FT grads arrive bottom-up and complete at the
+            #     END of backward, deferring the rebuild to iter 2's
+            #     clean (outside-backward) forward.
+            # static_graph=True removes the rebuild entirely and is
+            # documented to support reentrant backwards + multiple /
+            # unused-param activation checkpointing. Its one demand —
+            # a per-iter-constant gradient-receiving param set — is
+            # exactly what the ghost anchor guarantees. The two are
+            # complementary halves of one fix.
+            gen_static = bool(
+                getattr(self.config, "student_phase_lora_enabled", False)
+            ) and not debug_fup
             self.generator_ddp = DDP(
                 model.generator.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
                 find_unused_parameters=gen_fup,
                 broadcast_buffers=False,
+                static_graph=gen_static,
             )
             model.generator.model = self.generator_ddp  # type: ignore
 
