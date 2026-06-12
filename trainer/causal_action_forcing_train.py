@@ -341,60 +341,69 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         debug_fup = bool(getattr(self.config, "debug_find_unused_parameters", False))
         self.generator_ddp: Optional[DDP] = None
         self.fake_score_ddp: Optional[DDP] = None
+        _phase_lora_no_ddp = bool(
+            getattr(self.config, "student_phase_lora_enabled", False)
+        )
         if self.world_size > 1:
-            # Phased DMD K-LoRA: each gen step only the active adapter
-            # gets a REAL gradient, but the trainer's ghost anchor
-            # (see ``_streaming_train_one_chunk``) adds a zero-weighted
-            # touch on EVERY lora param to the gen loss, so every
-            # adapter receives an (exactly-zero) grad on every
-            # backward. With full coverage guaranteed,
-            # find_unused_parameters must stay FALSE: the ghost params
-            # are outside the forward-output graph, so unused-param
-            # traversal would pre-mark them ready and the arriving
-            # ghost grad would mark them twice (DDP error). The
-            # find_unused=True variant (without ghost) was tried first
-            # and died in DDP's deferred bucket rebuild — rung_flash
-            # gets zero real grads until gan_disc_start_step, leaving
-            # its params unmarked for ~20 iters, and the rebuild then
-            # fired mid-ckpt-recompute (j5147634/5/6, j5151298+).
-            gen_fup = debug_fup
-            # static_graph completes the ghost-anchor fix. All three
-            # phase-LoRA crash modes shared ONE structural root cause:
-            # DDP's one-time bucket rebuild fires inside a checkpoint
-            # recompute's _pre_forward (mid-backward) the moment its
-            # precondition — every tracked param marked ready at least
-            # once — is met DURING a backward:
-            #   * without ghost: rung_flash is gradient-silent until
-            #     gan_disc_start_step, precondition completes mid-
-            #     backward at step 21 -> INTERNAL ASSERT
-            #     (j5147634/5/6, j5151298+).
-            #   * with ghost: the ghost term is a shallow node on the
-            #     loss, so ALL lora grads arrive at the very START of
-            #     backward, precondition completes mid-backward at
-            #     iter 1 -> "Expected to have finished reduction"
-            #     (j5173579).
-            #   * the no-LoRA baseline only survives by ordering luck:
-            #     full-FT grads arrive bottom-up and complete at the
-            #     END of backward, deferring the rebuild to iter 2's
-            #     clean (outside-backward) forward.
-            # static_graph=True removes the rebuild entirely and is
-            # documented to support reentrant backwards + multiple /
-            # unused-param activation checkpointing. Its one demand —
-            # a per-iter-constant gradient-receiving param set — is
-            # exactly what the ghost anchor guarantees. The two are
-            # complementary halves of one fix.
-            gen_static = bool(
-                getattr(self.config, "student_phase_lora_enabled", False)
-            ) and not debug_fup
-            self.generator_ddp = DDP(
-                model.generator.model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=gen_fup,
-                broadcast_buffers=False,
-                static_graph=gen_static,
-            )
-            model.generator.model = self.generator_ddp  # type: ignore
+            if _phase_lora_no_ddp:
+                # Phase LoRA: the student is deliberately NOT DDP-
+                # wrapped. Every DDP reducer configuration was tried
+                # and failed — the per-iter-varying autograd graph
+                # (random exit rung selects a different lora branch
+                # each iter) and the ckpt-recompute forwards (which
+                # call DDP _pre_forward MID-backward) together break
+                # all of the reducer's modes:
+                #   * find_unused=True: deferred bucket rebuild fires
+                #     mid-recompute at step 21 (= gan_disc_start_step
+                #     + 1, when rung_flash's first real grad completes
+                #     the rebuild precondition) -> INTERNAL ASSERT
+                #     (j5147634/5/6, j5151298+).
+                #   * find_unused=False + ghost: ghost is a shallow
+                #     loss node, all lora grads arrive at backward
+                #     START, the rebuild precondition completes mid-
+                #     backward at iter 1 -> "Expected to have finished
+                #     reduction" (j5173579).
+                #   * + static_graph: per-iter graph-structure
+                #     variation (different lora branch per exit rung)
+                #     violates the static-graph contract -> "training
+                #     graph has changed in this iteration" at iter 2
+                #     (j5176005/11).
+                # With freeze_base=true the ONLY trainable student
+                # params are the lora matrices (~tens of MB), so
+                # manual gradient sync is cheap and removes the entire
+                # reducer state machine from the problem. Mirrors the
+                # existing ``action_projection`` manual-sync pattern
+                # (see ``_all_reduce_extra_trainable_grads``, which
+                # also syncs the lora grads in this mode).
+                #
+                # DDP's construction-time param broadcast is replaced
+                # by an explicit one-time broadcast: peft initialises
+                # lora_A from per-rank RNG, so ranks MUST be aligned
+                # before the first forward.
+                if dist.is_initialized():
+                    _n_bcast = 0
+                    for _n, _p in model.generator.model.named_parameters():
+                        if "lora_" in _n:
+                            dist.broadcast(_p.data, src=0)
+                            _n_bcast += 1
+                    if self.is_main_process:
+                        logging.info(
+                            "[ActionForcing] phase LoRA no-DDP mode: "
+                            "broadcast %d lora params from rank 0; "
+                            "student grads sync manually in "
+                            "_all_reduce_extra_trainable_grads.",
+                            _n_bcast,
+                        )
+            else:
+                gen_fup = debug_fup
+                self.generator_ddp = DDP(
+                    model.generator.model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=gen_fup,
+                    broadcast_buffers=False,
+                )
+                model.generator.model = self.generator_ddp  # type: ignore
 
             if bool(getattr(self.config, "fake_score_updates_enabled", True)):
                 # v21: fake_alt_head_enabled adds head_alt params that
@@ -8829,12 +8838,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         (weight_decay=0 → idle-rung AdamW steps are pure momentum
         decay, no shrinkage, no cross-rung pollution).
 
-        Pairs with ``find_unused_parameters=False`` on the gen DDP
-        wrap: with full coverage guaranteed, unused-param traversal
-        is unnecessary — and would actually BREAK (ghost params are
-        outside the forward-output graph, so find_unused=True would
-        pre-mark them ready and the arriving ghost grad would mark
-        them twice).
+        In the current no-DDP phase-LoRA mode (the student is not
+        DDP-wrapped; lora grads sync manually in
+        ``_all_reduce_extra_trainable_grads``), the ghost's job is to
+        guarantee every lora param has a non-None grad on every iter,
+        so the manual all-reduce param list is identical across ranks
+        and iters — no divergence risk, no conditional sync logic.
 
         No-op (returns ``loss`` unchanged) when phase LoRA is off.
         """
