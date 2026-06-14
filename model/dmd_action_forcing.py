@@ -334,6 +334,37 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "dmd_42f_gt_anchor", False)
         )
 
+        # ``dmd_42f_clean_drift_*`` (e-framework unlock): ramp the 42f
+        # clean-half GT CONTENT from v14's back-shift (-npb, time-locked)
+        # toward a forward shift (+npb) over [start_step, full_step]. RoPE
+        # stays pinned at tf_rope_offset=npb — this is a CONTENT-ONLY drift
+        # (mirrors the proven randx unlock, NOT a RoPE drift). At frac=1 the
+        # supervised band sits centrally with forward GT support and the
+        # bidirectional online teacher unlocks to lean on that future
+        # context. ``fix_clean_counterpart`` is made drift-aware below so the
+        # band's own GT is always masked from the clean half (no leak) as the
+        # shift slot moves. drift_off = round((2*frac - 1) * npb).
+        self.dmd_42f_clean_drift_enabled = bool(
+            getattr(args, "dmd_42f_clean_drift_enabled", False)
+        )
+        self.dmd_42f_clean_drift_start_step = int(
+            getattr(args, "dmd_42f_clean_drift_start_step", 0)
+        )
+        self.dmd_42f_clean_drift_full_step = int(
+            getattr(args, "dmd_42f_clean_drift_full_step", 0)
+        )
+        # clean_self writes the clean after-region at the FIXED legacy offset
+        # (n_ctx+npb), which is NOT drift-aware — combining it with the clean
+        # drift would place student content at the wrong world frames and
+        # fight the drift-aware counterpart fix. Fail loud.
+        if self.dmd_42f_clean_drift_enabled and bool(
+            getattr(self, "dmd_42f_clean_self", False)
+        ):
+            raise ValueError(
+                "dmd_42f_clean_drift_enabled is mutually exclusive with "
+                "dmd_42f_clean_self (the clean_self write is not drift-aware)."
+            )
+
         # ``dmd_only_first_chunk_per_ride``: pair with
         # ``max_rolls_per_ride > 1`` to roll the student N causal
         # chunks per ride but only DMD-supervise the first. Subsequent
@@ -5352,7 +5383,15 @@ class ActionForcingDMD(SelfForcingModel):
             ).detach()
             input_r1 = fn_input_chunk[:, f_start:f_end].detach()
             chunk_abs_idx = abs_f_start // npb
-            carn_r1 = max(0, chunk_abs_idx - (num_seed_r1 - 1))
+            # Clamp to the FN's trained CARN range (saturate at max_carn_step)
+            # so training and application (_apply_forward_noiser_to_gt) share
+            # the SAME level convention at rolling depth — the sinusoidal step
+            # embedding accepts any value, but levels beyond max_carn_step are
+            # untrained extrapolation.
+            carn_r1 = min(
+                max(0, chunk_abs_idx - (num_seed_r1 - 1)),
+                int(self.forward_noiser_max_carn_step),
+            )
             carn_step = torch.full(
                 (fn_input_chunk.shape[0],), carn_r1,
                 dtype=torch.long, device=fn_input_chunk.device,
@@ -5509,6 +5548,16 @@ class ActionForcingDMD(SelfForcingModel):
                 # chunk's absolute ride position (seed region = level 0).
                 chunk_abs_idx = (int(abs_frame_start_gt) + c * npb) // npb
                 target_carn = max(0, chunk_abs_idx - (num_seed_r1 - 1))
+            # Clamp to the FN's trained CARN range. The step conditioning is
+            # a SINUSOIDAL embedding (no index table -> no crash above max),
+            # but the FN is only TRAINED up to max_carn_step, so deeper
+            # rolling levels would feed it untrained/extrapolated conditioning
+            # and produce unreliable drift. Saturate at max_carn_step (matched
+            # by the same clamp in the FN training path
+            # _compute_forward_noiser_loss).
+            target_carn = min(
+                int(target_carn), int(self.forward_noiser_max_carn_step)
+            )
             target_carn_per_chunk.append(int(target_carn))
 
         max_carn = max(target_carn_per_chunk) if target_carn_per_chunk else 0
@@ -6852,11 +6901,36 @@ class ActionForcingDMD(SelfForcingModel):
         # gt_after_frames) (21 frames); clean half shifted back npb.
         noisy_lo = chunk_lo - n_ctx
         noisy_hi = chunk_lo + sup_frames + gt_after_frames
-        clean_lo = noisy_lo - npb                  # = chunk_lo - n_ctx - npb
+        # clean half shift. v14 back-shift = -npb. The e-framework clean
+        # drift ramps drift_off from -npb (frac 0) toward +npb (frac 1) over
+        # the curriculum so the supervised band ends up CENTRAL with forward
+        # GT support. RoPE is NOT touched (content-only B unlock); drift_off
+        # feeds the drift-aware fix_clean_counterpart below.
+        drift_off = -npb
+        if bool(getattr(self, "dmd_42f_clean_drift_enabled", False)):
+            _ds = int(getattr(self, "dmd_42f_clean_drift_start_step", 0))
+            _df = int(getattr(self, "dmd_42f_clean_drift_full_step", 0))
+            _cs = int(info.get("current_step", 0))
+            if _df <= _ds:
+                _frac = 1.0 if _cs >= _df else 0.0
+            else:
+                _frac = max(0.0, min(1.0, (_cs - _ds) / float(_df - _ds)))
+            drift_off = int(round((2.0 * _frac - 1.0) * npb))
+            if getattr(self, "_42f_drift_dbg", 0) < 4 or _cs % 50 == 0:
+                self._42f_drift_dbg = getattr(self, "_42f_drift_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    f"[42F-DRIFT] step={_cs} frac={_frac:.2f} "
+                    f"drift_off={drift_off} clean_lo={noisy_lo + drift_off} "
+                    f"(noisy_lo={noisy_lo}, npb={npb}, RoPE pinned)",
+                    file=_sys.stderr, flush=True,
+                )
+        clean_lo = noisy_lo + drift_off            # = chunk_lo - n_ctx + drift_off
         if clean_lo < 0:
             raise RuntimeError(
                 f"42f DMD: clean_lo={clean_lo} < 0 (chunk_lo={chunk_lo}, "
-                f"N={N}, ns={ns}). Need a larger dmd_context_clean_frames."
+                f"N={N}, ns={ns}, drift_off={drift_off}). Need a larger "
+                f"dmd_context_clean_frames."
             )
         need = max(noisy_hi, clean_lo + N)
         if need > int(ride_lat.shape[1]) or need > int(ride_act.shape[1]):
@@ -7042,13 +7116,23 @@ class ActionForcingDMD(SelfForcingModel):
                 stu_hi = n_ctx + sup_frames + (
                     0 if seed_last else gt_after_frames
                 )
-            dst_lo = stu_lo + npb
-            dst_hi = min(stu_hi + npb, N)
-            n_rep = dst_hi - dst_lo
-            if n_rep > 0:
+            # Drift-aware counterpart slot. clean[i] world = clean_lo + i =
+            # noisy_lo + drift_off + i; it equals student noisy[j] world
+            # (= noisy_lo + j) when i = j - drift_off. So the clean slot
+            # holding the band's OWN GT is (j - drift_off): the legacy
+            # j + npb at the back-shift (drift_off=-npb), and it MOVES as the
+            # clean half drifts forward. Mask whichever slot it currently is,
+            # else the bidirectional teacher reads the band's GT (leak).
+            raw_lo = stu_lo - drift_off
+            raw_hi = stu_hi - drift_off
+            dst_lo = max(0, raw_lo)
+            dst_hi = min(N, raw_hi)
+            if dst_hi > dst_lo:
+                src_lo = stu_lo + (dst_lo - raw_lo)
+                n_rep = dst_hi - dst_lo
                 clean_x = clean_x.clone()
                 clean_x[:, dst_lo:dst_hi] = (
-                    noisy_x[:, stu_lo:stu_lo + n_rep].detach()
+                    noisy_x[:, src_lo:src_lo + n_rep].detach()
                 )
         # Clean-self: put the student's OWN rolled chunks into the clean
         # after-region (clean[n_ctx+npb : N] = supervised chunk's clean
@@ -8758,13 +8842,18 @@ class ActionForcingDMD(SelfForcingModel):
                         file=_sys.stderr, flush=True,
                     )
             elif _frac > 0.0:
-                _ride_off = int(s.get("ride_offset_s", 0))
-                # Time-locked clean start in FULL-RIDE coordinates.
-                # NOTE (phase-2 port hazard, by review): under
-                # dmd_42f_rolling_sup_new the trainer slices the pool to
-                # START AT s — adding ride_offset_s there double-counts
-                # the offset. Must be re-based before any rolling port.
-                _anchor_abs = _ride_off + _clean_start
+                # Anchor = time-locked clean start in POOL coordinates.
+                # Stationary: pool = the FULL ride (zarr coords) -> add
+                # ride_offset_s. Rolling (dmd_42f_rolling_sup_new): the
+                # trainer slices the pool to START AT s (window coords)
+                # -> _clean_start is already pool-relative; adding the
+                # offset would double-count (review port-hazard fix).
+                if bool(getattr(self, "dmd_42f_rolling_sup_new", False)):
+                    _anchor_abs = _clean_start
+                else:
+                    _anchor_abs = (
+                        int(s.get("ride_offset_s", 0)) + _clean_start
+                    )
                 _max_lo = int(_pool_lat.shape[1]) - chunk_size
                 _max_shift = int(round(_frac * _max_lo))
                 _shift = (
@@ -9069,10 +9158,22 @@ class ActionForcingDMD(SelfForcingModel):
         # ``aux_teacher_send_student_grad=True``, so it must be a
         # ``Tensor`` arg (not a closed-over name) for checkpoint to
         # plumb backward correctly.
+        # The aux/teacher backward trains the LoRA ONLY. Detach every
+        # cond tensor (noisy + clean action streams, incl. the j-series
+        # random-window swap) so the teacher's loss can no longer
+        # deposit gradients into the SHARED action projections that
+        # condition the student — a cross-module leak that was never a
+        # deliberate choice (audit finding B). Deliberate contract
+        # change: applies to fused and separate aux modes alike.
+        _cond_aux_detached = {
+            k: (v.detach() if torch.is_tensor(v) else v)
+            for k, v in cond_for_scoring.items()
+        }
+
         def _aux_real_score_fn(
             x,
             _gen=self.real_score,
-            _cond=cond_for_scoring,
+            _cond=_cond_aux_detached,
             _t=t,
             _clean=clean_x_for_real,
             _aug=aug_t_for_real,

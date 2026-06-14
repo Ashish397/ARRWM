@@ -30,6 +30,10 @@ import os
 import logging
 from pathlib import Path
 
+import sys
+# Ensure the repo root is importable regardless of how the script is launched.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 from omegaconf import OmegaConf
 
@@ -182,6 +186,12 @@ def main():
                         "rendered_z7_mean": teacher_z27[..., 1].mean().item(),
                         "true_z2_mean": target_chunk[..., 0].mean().item(),
                         "true_z7_mean": target_chunk[..., 1].mean().item(),
+                        # Raw per-chunk arrays [n_chunks, 2] = (z2,z7) so we can
+                        # stratify controllability by command DIRECTION offline
+                        # (e.g. forward vs reverse / sign of z7) without rerunning.
+                        "rendered_z27": teacher_z27[0].float().cpu().tolist(),
+                        "true_cmd_z27": target_chunk[0, :n_chunks].float().cpu().tolist(),
+                        "fed_cmd_z27": fed_chunk[0].float().cpu().tolist(),
                     }
                     records.append(rec)
                     logging.info("ride=%s cond=%-7s seed=%d | corr(rendered,fed)=%.3f corr(rendered,true)=%.3f mse_true=%.4f",

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8j3
+#SBATCH --job-name=af-p3-cb-flashtr-v8j1c
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -17,21 +17,20 @@
 # window of the same ride (drift 40->160; actions ride along), pairs=5 +
 # 8-bit Adam + gen ckpt + separate backward to fit the aux pass. The
 # base FN behaviour (CARN application on the GAN former) is unchanged.
-# v8h3 = NAIVE FORWARD CARN-FORMER (h1 base, FN direction flipped back).
-# The FN trains FORWARD (default, no reverse): clean GT @ level L ->
-# student-drifted @ L, ONE conditioned call (carn_recurse=false +
-# step_unconditioned=false: FN is given the drift level as carn_step).
-# teacher_feat/SW loss. Application (forward_noiser_apply_gt_former=true):
-# ONE FN call at carn_step=1 on the FORMER GT latent only of each matched
-# real transition pair (moment-preserving / texture-only) -> the real
-# anchor is [1-step-drifted GT former -> clean GT latter], the self-
-# correcting transition e8's carn_former intended but never executed in
-# the matched path. NAIVE on purpose: the SAME CARN'd former feeds both
-# the D-update and the gen-side real view (no Req-1 drift cap, no Req-2
-# gen-side clean former) — with one CARN step that leak is acceptable.
-# vs h1: h1 = REVERSE FN applied to BOTH latents (de-CARN'd real);
-# h3 = FORWARD FN applied to FORMER only (drifted-former transition).
-# Confirmation in .err: [FN-GT-FORMER] ACTIVE ... carn_step=1.
+# v8h1 = REVERSED ForwardNoiser (de-CARN denoiser), STEP-CONDITIONED
+# single-call. Unlike e8 (FN learns clean->drifted = ADD a drift step), h1
+# sets forward_noiser_reverse=true so the FN learns drifted->clean = REMOVE
+# a drift step (learned de-CARN). carn_recurse=false + step_unconditioned=
+# false: ONE conditioned call per chunk, FN given the drift level L as
+# carn_step (cleaner than recursive composition). teacher_feat/SW loss.
+# It is then applied ONCE to BOTH GT latents (former + latter) of every
+# matched real transition pair (forward_noiser_apply_gt_both=true,
+# carn_step=forward_noiser_apply_gt_level=1, texture-only / moment-
+# preserving), so the disc's "real" target is GT with one drift-level's
+# worth of explode/harmonise modes removed -> the student is pulled away
+# from producing those modes. Replaces e8's former-only carn_former.
+# Confirmation in .err: [FN-TRAIN]/fn_tf_reverse=1 + fn_tf_cumulative=1,
+# and [FN-GT-BOTH] ACTIVE ... carn_step=1.
 #
 # ---- legacy e-lineage notes below (mostly describe the FORWARD CARN) ----
 # Phase-3 DMD one-step — v8e6 = v8e5 + gan_loss_weight=2.5 + 3h wall to
@@ -218,7 +217,7 @@ srun torchrun \
     dmd_mae_gate_enabled=true \
     dmd_mae_gate_r_full=2.0 \
     dmd_mae_gate_ema=0.0 \
-    dmd_mae_gate_min_weight=0.3 \
+    dmd_mae_gate_min_weight=0.0 \
     dmd_mae_gate_exponent=0.75 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.0 \
@@ -306,16 +305,17 @@ srun torchrun \
     forward_noiser_loss_mode=teacher_feat \
     forward_noiser_step_unconditioned=false \
     carn_recurse=false \
+    forward_noiser_reverse=true \
     forward_noiser_feat_t=0 \
     forward_noiser_sw_n_proj=64 \
     forward_noiser_sw_max_tokens=4096 \
     fake_alt_rollout2_num_seed_chunks=5 \
-    forward_noiser_apply_gt_former=true \
+    forward_noiser_apply_gt_both=true \
     forward_noiser_apply_gt_level=1 \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8j3_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8j1c_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

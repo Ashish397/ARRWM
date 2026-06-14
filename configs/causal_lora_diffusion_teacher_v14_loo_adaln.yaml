@@ -1,0 +1,128 @@
+config_name: v14-loo-adaln
+load_checkpoint_config_name: v14-loo-adaln
+
+trainer: causal_lora_diffusion
+
+seed: 0
+mixed_precision: true
+autocast_dtype: bf16
+max_iters: 4000
+log_interval: 10
+ckpt_interval: 50
+max_grad_norm: 1.0
+auto_resume: true
+allow_checkpoint_config_mismatch: true
+wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
+wandb_entity: ashish397-university-of-exeter
+wandb_project: frodobots_wm
+wandb_run_name: v14-loo-adaln
+wandb_group: causal-lora-teacher-ablation
+wandb_tags:
+  - causal
+  - teacher-forcing
+  - ar-diffusion
+  - streaming
+  - z-critic
+  - v14
+  - weunz
+  - fresh-wan
+  - ablation
+  - loo
+  - no-adaln-modulation
+
+# Causal-specific settings
+teacher_forcing: true
+num_frame_per_block: 3
+context_frames: 3
+noise_augmentation_max_timestep: 0
+noise_augmentation_warmup_steps: 0
+
+# Streaming training — shuffle windows across rides
+streaming_chunk_size: 21
+
+# Held-out evaluation
+test_start_index: 0
+test_num_rides: 20
+eval_interval: 50
+eval_inference_steps: 48
+grad_norm_interval: 50
+
+eval_ride_zarrs:
+  - 20240216101235.zarr  # Madrid, 1564 latents
+  - 20240314084739.zarr  # Rome,   2190 latents
+  - 20240319133048.zarr  # Stockholm, 1752 latents
+  - 20240314090046.zarr  # Rome,   3895 latents
+
+# Data -- MRS subset (Madrid+Rome+Stockholm, 574 rides, 81.5h, ~70K windows)
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weu
+caption_root: /projects/u6ex/fbots/frodobots_captions/train
+motion_root: /projects/u6ex/fbots/frodobots_motion
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+# Action conditioning
+# ---- ABLATION (LOO-adaln): AdaLN-Zero modulation REMOVED; action tokens kept.
+model_variant: action-injection
+raw_action_dim: 2
+action_dims: [2, 7]
+enable_adaln_zero: true
+action_conditioning_mode: action_tokens  # v14: both -> action_tokens (drop AdaLN)
+
+# LoRA adapter settings
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+
+# Optimizer
+lr: 5.0e-05
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+gradient_accumulation_steps: 1
+warmup_steps: 200
+
+# Model settings
+model_name: Wan2.1-T2V-1.3B
+num_training_frames: 21
+num_train_timestep: 1000
+denoising_loss_type: flow
+gradient_checkpointing: true
+num_workers: 8
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: -1
+  sink_size: 0
+
+# Z-predictor critic  (unchanged from v14)
+action_critic_enabled: true
+action_critic_dims: [2, 7]
+action_critic_z_out_dim: 8
+action_critic_z_loss_weight: 0.5
+generator_action_z_guidance_weight: 0.25
+z_guidance_warmup_steps: 200
+critic_lr: 3.0e-04
+critic_updates_per_step: 2
+action_critic_base_channels: 128
+action_critic_num_blocks: 4
+
+# State action head — cross-attention probes  (unchanged from v14)
+state_head_enabled: true
+state_probe_mode: true
+state_probe_dim: 256
+state_probe_n_taps: 6
+state_probe_num_heads: 8
+state_head_loss_weight: 0.1
+state_head_action_dim_weight: 3.0
+state_head_out_dim: 8
+
+# Frozen-readout generator guidance  (unchanged from v14)
+state_guidance_weight: 0.2
+state_guidance_warmup_steps: 200
+state_guidance_action_scale: 1.0
+
+# Logging
+logdir: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_loo_adaln

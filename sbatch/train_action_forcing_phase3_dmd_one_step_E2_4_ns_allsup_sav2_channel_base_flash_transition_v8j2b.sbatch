@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8j3
+#SBATCH --job-name=af-p3-cb-flashtr-v8j2b
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,27 +11,40 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# ---- j-series add-on: ONLINE TEACHER + RANDOM-WINDOW clean_x curriculum
-# (same block as v8j2, which beat h2): rank-32/alpha-64 LoRA teacher,
-# EMA-0.95 as DMD real score, clean_x conditioning sliced from a random
-# window of the same ride (drift 40->160; actions ride along), pairs=5 +
-# 8-bit Adam + gen ckpt + separate backward to fit the aux pass. The
-# base FN behaviour (CARN application on the GAN former) is unchanged.
-# v8h3 = NAIVE FORWARD CARN-FORMER (h1 base, FN direction flipped back).
-# The FN trains FORWARD (default, no reverse): clean GT @ level L ->
-# student-drifted @ L, ONE conditioned call (carn_recurse=false +
-# step_unconditioned=false: FN is given the drift level as carn_step).
-# teacher_feat/SW loss. Application (forward_noiser_apply_gt_former=true):
-# ONE FN call at carn_step=1 on the FORMER GT latent only of each matched
-# real transition pair (moment-preserving / texture-only) -> the real
-# anchor is [1-step-drifted GT former -> clean GT latter], the self-
-# correcting transition e8's carn_former intended but never executed in
-# the matched path. NAIVE on purpose: the SAME CARN'd former feeds both
-# the D-update and the gen-side real view (no Req-1 drift cap, no Req-2
-# gen-side clean former) — with one CARN step that leak is acceptable.
-# vs h1: h1 = REVERSE FN applied to BOTH latents (de-CARN'd real);
-# h3 = FORWARD FN applied to FORMER only (drifted-former transition).
-# Confirmation in .err: [FN-GT-FORMER] ACTIVE ... carn_step=1.
+# v8j2b = j2 with fake_score_ema_weight=0.0 — the SINGLE-VARIABLE A/B
+# against j2 (which ran 0.95). Tests the critic-contamination theory:
+# 0.95 EMA-pulls the fake_score's WEIGHTS toward the one-step causal
+# GENERATOR's weights every gen step (flash-DMD §3.3) — valid when the
+# generator is still a denoiser, but ours isn't, so the critic becomes
+# a weight-space chimera that "hallucinates" instead of cleanly
+# tracking p_gen. Prediction if true: pred_fake videos coherent,
+# wandb critic_loss decays, dmd_grad trends DOWN instead of the flat
+# ~0.27-0.55 floor seen in every 0.95 run.
+#
+# ---- j2 base notes below ----
+# v8j2 = h2 + ONLINE TEACHER with the RANDOM-WINDOW clean_x curriculum
+# ("unlock the teacher"). The online LoRA teacher (g5's proven stack:
+# rank-32/alpha-64 LoRA on real_score, EMA-0.95 as the DMD real score,
+# separate backward, 8-bit Adam, gen ckpt, pairs=5) is trained to
+# denoise time-locked noised GT -> GT, BUT its clean_x TF conditioning
+# is sliced from a RANDOM window of the SAME ride, ramped by a
+# curriculum: identical to time-locked at the start
+# (drift_start_step=40), fully position-free by drift_full_step=160.
+# The clean ACTION streams ride along with the random window. NO CARN
+# anywhere (forward_noiser stays off; this replaces the g-series
+# de-CARN ladder as the teacher's unlock mechanism).
+# Goal: anneal away the teacher's "clean_x and noisy_x are aligned in
+# time and space" assumption so clean_x degrades into an appearance/
+# texture prior -> a teacher usable in phase-2 rolling where clean_x
+# cannot be honestly time-locked. Confirmation in .err: [AUX-RANDX]
+# lines showing frac ramping 0->1 and the sampled windows.
+#
+# ---- h2 base notes below ----
+# v8h2 = h1 WITHOUT the ForwardNoiser entirely (ablation control).
+# forward_noiser_enabled=false: no FN training, no de-CARN application to
+# the GT pair, no rollout2 prebuild (saves its memory/compute). The disc's
+# "real" target is plain clean GT transitions. Everything else identical
+# to h1, so h1-vs-h2 isolates the reversed-FN (de-CARN) contribution.
 #
 # ---- legacy e-lineage notes below (mostly describe the FORWARD CARN) ----
 # Phase-3 DMD one-step — v8e6 = v8e5 + gan_loss_weight=2.5 + 3h wall to
@@ -302,20 +315,11 @@ srun torchrun \
     aux_clean_x_drift_full_step=160 \
     use_8bit_adam=true \
     gen_gradient_checkpointing=true \
-    forward_noiser_enabled=true \
-    forward_noiser_loss_mode=teacher_feat \
-    forward_noiser_step_unconditioned=false \
-    carn_recurse=false \
-    forward_noiser_feat_t=0 \
-    forward_noiser_sw_n_proj=64 \
-    forward_noiser_sw_max_tokens=4096 \
-    fake_alt_rollout2_num_seed_chunks=5 \
-    forward_noiser_apply_gt_former=true \
-    forward_noiser_apply_gt_level=1 \
+    forward_noiser_enabled=false \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8j3_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8j2b_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

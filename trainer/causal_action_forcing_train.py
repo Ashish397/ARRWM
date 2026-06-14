@@ -2066,9 +2066,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     msg_parts.append(
                         f"dmd_grad={generator_log_dict['dmdtrain_gradient_norm']:.4f}"
                     )
-                msg_parts.append(
-                    f"critic_loss={critic_log_dict.get('critic_loss', 0.0):.4f}"
+                # Streaming mode: the standalone critic iter is a no-op
+                # (its dict has no critic_loss) — the REAL diffusion loss
+                # comes from the gtfix path merged into the gen-step
+                # dict. Without this fallback the line printed a
+                # misleading 0.0000 for weeks.
+                _cl_disp = critic_log_dict.get(
+                    "critic_loss",
+                    generator_log_dict.get("critic_loss", 0.0),
                 )
+                if not _cl_disp:
+                    _cl_disp = generator_log_dict.get("critic_loss", 0.0)
+                msg_parts.append(f"critic_loss={float(_cl_disp):.4f}")
                 msg_parts.append(
                     f"gen_grad_norm={float(gen_grad_norm.item()) if torch.is_tensor(gen_grad_norm) else float(gen_grad_norm):.4f}"
                 )
@@ -2115,12 +2124,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     and getattr(self, "wandb_enabled", False)
                 ):
                     log_payload: Dict[str, Any] = {}
+                    # Skip private/internal keys (e.g. ``_aux_teacher_tensors``
+                    # — a dict of bf16 graph tensors stashed for the LoRA
+                    # action/probe losses, NOT a metric). Leaving it in
+                    # poisons the payload: wandb can't serialize the nested
+                    # bf16 and drops the WHOLE step, so every gen/critic curve
+                    # silently vanishes. Also drop multi-element tensors here.
                     for k, v in generator_log_dict.items():
+                        if str(k).startswith("_"):
+                            continue
                         if torch.is_tensor(v):
+                            if v.numel() != 1:
+                                continue
                             v = float(v.item())
                         log_payload[f"gen/{k}"] = v
                     for k, v in critic_log_dict.items():
+                        if str(k).startswith("_"):
+                            continue
                         if torch.is_tensor(v):
+                            if v.numel() != 1:
+                                continue
                             v = float(v.item())
                         log_payload[f"critic/{k}"] = v
                     log_payload["gen/grad_norm"] = (
@@ -2160,18 +2183,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if previous_time is not None:
                         log_payload["per_iter_time"] = time.time() - previous_time
                     try:
-                        # Sanitize: wandb chokes on bf16/fp16 tensors
+                        # Final guard: wandb chokes on bf16/fp16 tensors
                         # ("Got unsupported ScalarType BFloat16") and the
-                        # exception drops the WHOLE payload for this step.
-                        for _k, _v in list(log_payload.items()):
-                            if (torch.is_tensor(_v)
-                                    and _v.is_floating_point()
-                                    and _v.dtype != torch.float32):
-                                log_payload[_k] = (
-                                    float(_v.item()) if _v.numel() == 1
-                                    else _v.detach().float()
-                                )
-                        wandb.log(log_payload, step=self.step)
+                        # exception drops the WHOLE payload for the step.
+                        # Coerce scalar tensors to float and DROP anything
+                        # that isn't a plain number/bool (containers, strings,
+                        # multi-element tensors) so one bad value can never
+                        # nuke the curves again.
+                        clean_payload: Dict[str, Any] = {}
+                        for _k, _v in log_payload.items():
+                            if torch.is_tensor(_v):
+                                if _v.numel() == 1:
+                                    clean_payload[_k] = float(_v.item())
+                                continue
+                            if isinstance(_v, (int, float, bool)):
+                                clean_payload[_k] = _v
+                        wandb.log(clean_payload, step=self.step)
                     except Exception as e:
                         logging.warning("wandb.log failed: %s", e)
                 previous_time = time.time()
@@ -8504,7 +8531,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             eval_stash = getattr(self.model, "_dmd_eval_stash", None)
             if isinstance(eval_stash, dict) and eval_stash:
                 self._pending_dmd_eval_latents = eval_stash
-            self.model._dmd_eval_stash = None
+            # Do NOT disarm the stash here: under aux_teacher_separate_
+            # backward the aux pass runs LATER in this step and writes
+            # ``pred_real_lora`` / ``clean_x_aux`` into the SAME dict
+            # (shared reference with _pending_dmd_eval_latents). The
+            # early ``= None`` here was why those videos vanished in
+            # every separate-backward run (g5+, j2). Disarmed at the
+            # end of the step instead.
 
         out["generator_dmd_loss"] = float(gen_loss_dmd.detach().item())
         out.update({
@@ -8938,6 +8971,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # reset every step, so the eval still fires the same step.
             self._pending_7chunk_sample = True
 
+        # Disarm the eval stash only now — after the (possibly separate-
+        # backward) aux pass had its chance to add pred_real_lora /
+        # clean_x_aux. See the harvest comment above.
+        self.model._dmd_eval_stash = None
+
         self._mem_step_snapshot("8_exit")
 
     # ------------------------------------------------------------------
@@ -9013,6 +9051,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             npb if bool(getattr(
                 self.config, "dmd_42f_rolling_sup_new", False)) else 0
         )
+        # Forward clean drift (e-framework) places clean_x up to +npb AHEAD of
+        # the noisy window at frac=1, so the 42f clean slice (clean_lo+N) needs
+        # npb MORE real GT beyond the rolling scaffold. Reserve it so the last
+        # roll's forward-clean read stays in-bounds.
+        if bool(getattr(self.config, "dmd_42f_clean_drift_enabled", False)):
+            _rolling_slack += npb
         roll_cap = actual_cap - _rolling_slack
         # Reject if the ride can't fit the +npb anchor + at least one
         # valid ``generate_next_chunk`` call.

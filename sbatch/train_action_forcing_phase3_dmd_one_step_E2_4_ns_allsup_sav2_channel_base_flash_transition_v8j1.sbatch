@@ -217,7 +217,7 @@ srun torchrun \
     dmd_mae_gate_enabled=true \
     dmd_mae_gate_r_full=2.0 \
     dmd_mae_gate_ema=0.0 \
-    dmd_mae_gate_min_weight=0.0 \
+    dmd_mae_gate_min_weight=0.3 \
     dmd_mae_gate_exponent=0.75 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.0 \
@@ -244,7 +244,7 @@ srun torchrun \
     dmd_42f_gt_anchor=true \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
-    fake_score_ema_weight=0.95 \
+    fake_score_ema_weight=0.0 \
     motion_start_threshold=5.0 \
     fake_score_lora_enabled=false \
     gan_enabled=true \

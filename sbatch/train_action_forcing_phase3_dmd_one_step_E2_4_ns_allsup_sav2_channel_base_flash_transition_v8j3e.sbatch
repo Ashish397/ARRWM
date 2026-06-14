@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-p3-cb-flashtr-v8j3
+#SBATCH --job-name=af-p3-cb-flashtr-v8j3e
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -218,7 +218,7 @@ srun torchrun \
     dmd_mae_gate_enabled=true \
     dmd_mae_gate_r_full=2.0 \
     dmd_mae_gate_ema=0.0 \
-    dmd_mae_gate_min_weight=0.3 \
+    dmd_mae_gate_min_weight=0.0 \
     dmd_mae_gate_exponent=0.75 \
     stat_anchor_loss_weight=1.0 \
     stat_anchor_STD_short_weight=0.0 \
@@ -237,15 +237,20 @@ srun torchrun \
     stat_anchor_rel_tol_long=0.0 \
     dmd_asymmetric_scoring_enabled=false \
     dmd_42f_enabled=true \
-    dmd_42f_2chunk=true \
-    dmd_42f_seed_last=false \
-    dmd_42f_gt_after_chunks=3 \
+    dmd_42f_2chunk=false \
+    dmd_42f_seed_last=true \
+    dmd_42f_gt_after_chunks=2 \
     dmd_42f_rand_sup_slot=false \
-    dmd_42f_allsup=true \
+    dmd_42f_allsup=false \
     dmd_42f_gt_anchor=true \
+    dmd_42f_num_chunks=3 \
+    dmd_42f_fix_clean_counterpart=true \
+    dmd_42f_clean_drift_enabled=true \
+    dmd_42f_clean_drift_start_step=40 \
+    dmd_42f_clean_drift_full_step=160 \
     dmd_only_first_chunk_per_ride=true \
     flash_dmd_enabled=true \
-    fake_score_ema_weight=0.0 \
+    fake_score_ema_weight=0.95 \
     motion_start_threshold=5.0 \
     fake_score_lora_enabled=false \
     gan_enabled=true \
@@ -268,7 +273,7 @@ srun torchrun \
     ladd_r1_gamma=0.02 \
     ladd_r1_every_n_steps=1 \
     ladd_diff_aug_policy=flip,cutout,translation \
-    ladd_pairs_per_step=5 \
+    ladd_pairs_per_step=4 \
     ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_ll_weight=0.0 \
@@ -297,7 +302,7 @@ srun torchrun \
     aux_teacher_separate_backward=true \
     aux_real_clean_x_source=gt \
     aux_noisy_from_raw_gt=true \
-    aux_clean_x_random_window=true \
+    aux_clean_x_random_window=false \
     aux_clean_x_drift_start_step=40 \
     aux_clean_x_drift_full_step=160 \
     use_8bit_adam=true \
@@ -316,6 +321,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8j3_j${SLURM_JOB_ID}
+    run_name=2_4_ns_allsup_sav2_channel_base_flash_transition_v8j3e_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
