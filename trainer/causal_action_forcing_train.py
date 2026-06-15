@@ -4343,8 +4343,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 d_r_pert_g = _outs[_nxt]
                 _nxt += 1
                 d_r_owned = d_r_g.index_select(0, pos)
+                # Token-normalize (ladd_r1_normalize_tokens, default off): see
+                # the inline R1 site — divide the FD by the token count so
+                # grad_sq estimates ‖∇ MEAN_i D_i‖², not ‖∇ Σ_i D_i‖².
+                _r1_tok = (
+                    float(d_r_owned.shape[1]) if bool(getattr(
+                        self.config, "ladd_r1_normalize_tokens",
+                        getattr(self.model, "ladd_r1_normalize_tokens", False)))
+                    else 1.0)
                 gsq_terms = ((d_r_pert_g.sum(dim=1) - d_r_owned.sum(dim=1))
-                             / _r1_sigma).pow(2)
+                             / (_r1_sigma * _r1_tok)).pow(2)
                 gsq_part = gsq_terms.sum() / float(M_r1)
                 r1_g = 0.5 * _r1_gamma * gsq_part
                 r1_acc += float(r1_g.detach().item())
@@ -5795,7 +5803,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         # segments are appended to the SINGLE batched disc
                         # forward only on the steps they fire (offset so the
                         # two never stack — OOM guard).
-                        _do_r1 = (current_step % _r1_every_n == 0)
+                        # R1 cadence. By default R1 fires on ALL n_disc_updates
+                        # of a fire-step (heavy). ladd_r1_once_per_step (default
+                        # off) restricts it to the FIRST update only (1-of-N) so
+                        # the per-fire-step R1 dose is cut ~n_disc_updates-fold.
+                        _do_r1 = (current_step % _r1_every_n == 0) and (
+                            _it == 0 or not bool(getattr(
+                                self.config, "ladd_r1_once_per_step",
+                                getattr(self.model, "ladd_r1_once_per_step",
+                                        False))))
                         _do_r2 = self._ladd_r2_fires(
                             _r2_gamma, _r2_every_n, _r2_offset, current_step)
                         if _micro_groups > 1:
@@ -5844,9 +5860,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         if _do_r1:
                             d_r_pert = _outs[_nxt]
                             _nxt += 1
+                            # ladd_r1_normalize_tokens (default off): divide the
+                            # summed-logit FD by the token count so grad_sq is
+                            # ‖∇ MEAN_i D_i‖² (token-count-independent) instead of
+                            # ‖∇ Σ_i D_i‖² (which scales with ~T² over ~47k
+                            # tokens, forcing γ to a tiny un-portable value).
+                            _r1_tok = (
+                                float(d_r.shape[1]) if bool(getattr(
+                                    self.config, "ladd_r1_normalize_tokens",
+                                    getattr(self.model,
+                                            "ladd_r1_normalize_tokens", False)))
+                                else 1.0)
                             _gsq = (
                                 ((d_r_pert.sum(dim=1) - d_r.sum(dim=1))
-                                 / _r1_sigma).pow(2).mean())
+                                 / (_r1_sigma * _r1_tok)).pow(2).mean())
                             r1 = 0.5 * _r1_gamma * _gsq
                             last_r1_grad_sq = float(_gsq.detach().item())
                             last_r1_fired = 1.0
