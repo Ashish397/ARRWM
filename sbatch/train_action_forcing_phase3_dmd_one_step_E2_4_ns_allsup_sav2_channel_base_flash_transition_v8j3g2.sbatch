@@ -28,6 +28,12 @@
 # 0.02 -> 0.1 and ladd_r1_sigma 0.01 -> 0.05. j3g's gap opened (peak +0.93)
 # but DECAYED (tail +0.19) while r3gan_r1_grad_sq exploded to ~4.5M (disc
 # over-sharpening); stronger/smoother R1 should hold the gap open.
+# AND maximises GAN pairs: ladd_gt_transition_match_k 4 -> 12. The disc
+# already forwards the full match_max_real=12 unique GT reals (the cap is
+# hit at k=4); scoring each of the 6 fake transition pairs against all 12
+# (block-diagonal) gives 6x12=72 relativistic comparisons vs 6x4=24, at
+# ~zero extra memory — the expansion is at the LOGIT level (index_select +
+# repeat_interleave), same disc forward of <=12 reals + 6 fakes.
 # Everything else identical to v8j3g (wavelet off, all-pairs supervision
 # + FT_v3 micro-batch, matching on).
 # =====================================================================
@@ -347,7 +353,7 @@ srun torchrun \
     ladd_gt_transition_xeq_per_channel=false \
     ladd_gt_transition_n_real=0 \
     ladd_gt_transition_match=true \
-    ladd_gt_transition_match_k=4 \
+    ladd_gt_transition_match_k=12 \
     real_teacher_train_online=true \
     dmd_frozen_teacher_pass_enabled=false \
     real_score_ema_weight=0.95 \
