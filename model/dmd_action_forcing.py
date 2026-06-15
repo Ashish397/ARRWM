@@ -353,6 +353,18 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_42f_clean_drift_full_step = int(
             getattr(args, "dmd_42f_clean_drift_full_step", 0)
         )
+        # ``dmd_42f_clean_drift_couple_rope`` (f-series): also drift the
+        # teacher's RoPE offset together with the clean CONTENT, so the RoPE
+        # stays FAITHFUL to where the clean half actually sits. The e-series
+        # moved the content but left RoPE pinned at +npb (clean read at a
+        # position implying it's BEHIND the noisy band even once it has
+        # drifted ahead) — a clean/RoPE misalignment. With this on, the 42f
+        # builder returns rope_offset = -drift_off so tf_rope_offset tracks
+        # the content gap (npb at frac=0 -> -npb at frac=1, clean genuinely
+        # ahead). Requires the negative-offset RoPE fix in causal_model.
+        self.dmd_42f_clean_drift_couple_rope = bool(
+            getattr(args, "dmd_42f_clean_drift_couple_rope", False)
+        )
         # clean_self writes the clean after-region at the FIXED legacy offset
         # (n_ctx+npb), which is NOT drift-aware — combining it with the clean
         # drift would place student content at the wrong world frames and
@@ -1396,9 +1408,6 @@ class ActionForcingDMD(SelfForcingModel):
         if _diff_aug_raw.lower() in ("none", "off", "false", ""):
             _diff_aug_raw = ""
         self.ladd_diff_aug_policy = _diff_aug_raw
-        self.ladd_pair_start_seed_boundary = bool(
-            getattr(args, "ladd_pair_start_seed_boundary", True)
-        )
         self.ladd_pairs_per_step = int(
             getattr(args, "ladd_pairs_per_step", 0)
         )  # 0 = use all pairs
@@ -5123,6 +5132,12 @@ class ActionForcingDMD(SelfForcingModel):
         ) or (
             self.forward_noiser_enabled
             and self.forward_noiser_loss_mode == "teacher_feat"
+            # Only the carn_recurse=True FN path composes the prebuilt
+            # rollout2; the carn_recurse=False path trains from the ride
+            # window + flash chunk (see _train_forward_noiser_tf). Skipping
+            # the prebuild here is the FT_v3 / j*f OOM win — the extra
+            # no-grad +1 rollout was built every ride setup and never read.
+            and self.carn_recurse
         )
         if _need_rollout2:
             rollout2_x0, rollout2_abs_frame_start = (
@@ -6919,10 +6934,14 @@ class ActionForcingDMD(SelfForcingModel):
             if getattr(self, "_42f_drift_dbg", 0) < 4 or _cs % 50 == 0:
                 self._42f_drift_dbg = getattr(self, "_42f_drift_dbg", 0) + 1
                 import sys as _sys
+                if getattr(self, "dmd_42f_clean_drift_couple_rope", False):
+                    _rope_msg = f"RoPE coupled -> tf_rope_offset={-drift_off}"
+                else:
+                    _rope_msg = f"RoPE pinned at npb={npb}"
                 print(
                     f"[42F-DRIFT] step={_cs} frac={_frac:.2f} "
                     f"drift_off={drift_off} clean_lo={noisy_lo + drift_off} "
-                    f"(noisy_lo={noisy_lo}, npb={npb}, RoPE pinned)",
+                    f"(noisy_lo={noisy_lo}, npb={npb}, {_rope_msg})",
                     file=_sys.stderr, flush=True,
                 )
         clean_lo = noisy_lo + drift_off            # = chunk_lo - n_ctx + drift_off
@@ -7237,6 +7256,16 @@ class ActionForcingDMD(SelfForcingModel):
                     )
             except Exception:
                 pass
+        # RoPE offset for the clean/noisy joint. Content-only drift (e-series)
+        # keeps None -> the scorer's init tf_rope_offset=npb (clean read as
+        # if BEHIND, even after the content drifts ahead). Coupled/faithful
+        # drift (f-series): rope_offset = -drift_off so the RoPE gap tracks
+        # the clean content position — npb at frac=0 (back-shift, == v14),
+        # -npb at frac=1 (clean genuinely AHEAD). The negative value is made
+        # safe by the per-half non-negative distribution in causal_model.
+        _rope_offset = None
+        if bool(getattr(self, "dmd_42f_clean_drift_couple_rope", False)):
+            _rope_offset = int(-drift_off)
         return {
             "noisy_x": noisy_x,
             "clean_x": clean_x,
@@ -7245,7 +7274,7 @@ class ActionForcingDMD(SelfForcingModel):
             "uncond": uncond,
             "gt_target": gt_target,
             "gradient_mask": gradient_mask,
-            "rope_offset": None,   # keep v14's init offset (npb=3)
+            "rope_offset": _rope_offset,
         }
 
     def _streaming_clean_cond_slice(

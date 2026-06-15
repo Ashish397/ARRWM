@@ -67,7 +67,6 @@ from trainer.causal_rolling_staircase_train import (
 )
 from model.dmd_action_forcing import ActionForcingDMD
 from model.r3gan import (
-    R3GANDiscriminator3D,
     rpgan_d_loss,
     rpgan_g_loss,
     rpgan_d_loss_allpairs,
@@ -602,60 +601,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_enabled = bool(getattr(self.config, "gan_enabled", False))
         self.r3gan_disc: Optional[torch.nn.Module] = None
         self.r3gan_disc_ddp: Optional[DDP] = None
-        # ``gan_backbone`` selects the discriminator architecture:
-        #   * "latent_3d_conv" (default, legacy) — 3D ConvNet on the
-        #     student's latent video. Cheap, no VAE decode required.
-        #   * "ladd_teacher_feat" — LADD adjacent-chunk discriminator
-        #     on WAN teacher intermediate features.
+        # ``gan_backbone`` selects the discriminator architecture. Only
+        # "ladd_teacher_feat" is supported: a LADD adjacent-chunk
+        # discriminator on WAN teacher intermediate features.
         self.gan_backbone = str(
-            getattr(self.config, "gan_backbone", "latent_3d_conv")
+            getattr(self.config, "gan_backbone", "ladd_teacher_feat")
         )
-        if self.gan_backbone not in (
-            "latent_3d_conv", "ladd_teacher_feat",
-        ):
+        if self.gan_backbone != "ladd_teacher_feat":
             raise ValueError(
-                "gan_backbone must be one of 'latent_3d_conv' | "
-                "'ladd_teacher_feat'; got "
+                "gan_backbone must be 'ladd_teacher_feat'; got "
                 f"{self.gan_backbone!r}."
             )
         if self.gan_enabled:
-            if self.gan_backbone == "latent_3d_conv":
-                in_channels = int(
-                    getattr(self.config, "gan_disc_in_channels", 16)
-                )
-                base_channels = int(
-                    getattr(self.config, "gan_disc_base_channels", 64)
-                )
-                num_blocks = int(
-                    getattr(self.config, "gan_disc_num_blocks", 4)
-                )
-                disc = R3GANDiscriminator3D(
-                    in_channels=in_channels,
-                    base_channels=base_channels,
-                    num_blocks=num_blocks,
-                )
-                disc.to(device=self.device, dtype=torch.float32)
-                disc.train()
-                self.r3gan_disc = disc
-                if self.world_size > 1:
-                    self.r3gan_disc_ddp = DDP(
-                        disc,
-                        device_ids=[self.local_rank],
-                        output_device=self.local_rank,
-                        find_unused_parameters=False,
-                        broadcast_buffers=False,
-                    )
-                if self.is_main_process:
-                    n_params = sum(p.numel() for p in disc.parameters())
-                    logging.info(
-                        "[ActionForcing] R3GAN discriminator built: "
-                        "in_channels=%d base_channels=%d num_blocks=%d "
-                        "params=%.2fM (DDP=%s)",
-                        in_channels, base_channels, num_blocks,
-                        n_params / 1e6,
-                        self.r3gan_disc_ddp is not None,
-                    )
-            elif self.gan_backbone == "ladd_teacher_feat":
+            if self.gan_backbone == "ladd_teacher_feat":
                 # ===== LADD adjacent-chunk discriminator (v28) =====
                 # Frozen WAN-teacher feature taps + trainable CCM/CSM
                 # + 1D SpectralConv heads. See model/ladd_disc.py for
@@ -918,76 +876,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             "no perturbed-forward stacking.",
                             _r2_g, _r1_e, _r2_e, _r2_o,
                         )
-
-
-        # ------------------------------------------------------------------
-        # Moment-GAN — distribution-matching alternative to the std-MSE
-        # anti-collapse loss. Trained independently of the main wavelet
-        # LADD disc (own optimizer, own warmup schedule) but uses the same
-        # R3GAN softplus + FD-R1 recipe. See model/ladd_disc.py for the
-        # MomentDiscriminator architecture. Built in fp32 for R1 stability.
-        # ------------------------------------------------------------------
-        self.moment_disc: Optional[torch.nn.Module] = None
-        self.moment_disc_ddp: Optional[DDP] = None
-        self.moment_disc_optimizer: Optional[torch.optim.Optimizer] = None
-        self.moment_gan_enabled = bool(
-            getattr(self.config, "moment_gan_enabled", False)
-        )
-        if self.moment_gan_enabled:
-            from model.ladd_disc import build_moment_disc
-            mdisc = build_moment_disc(
-                in_channels=int(
-                    getattr(self.config, "moment_gan_in_channels", 16)
-                ),
-                hidden_dim=int(
-                    getattr(self.config, "moment_gan_hidden_dim", 128)
-                ),
-                num_blocks=int(
-                    getattr(self.config, "moment_gan_num_blocks", 2)
-                ),
-                include_mean=bool(
-                    getattr(self.config, "moment_gan_include_mean", True)
-                ),
-                include_rms=bool(
-                    getattr(self.config, "moment_gan_include_rms", True)
-                ),
-                clip_logit_enabled=bool(
-                    getattr(
-                        self.config,
-                        "moment_gan_clip_logit_enabled",
-                        False,
-                    )
-                ),
-                clip_hidden_dim=int(
-                    getattr(
-                        self.config,
-                        "moment_gan_clip_hidden_dim",
-                        128,
-                    )
-                ),
-            )
-            mdisc.to(device=self.device, dtype=torch.float32)
-            mdisc.train()
-            self.moment_disc = mdisc
-            if self.world_size > 1:
-                self.moment_disc_ddp = DDP(
-                    mdisc,
-                    device_ids=[self.local_rank],
-                    output_device=self.local_rank,
-                    find_unused_parameters=False,
-                    broadcast_buffers=False,
-                )
-            if self.is_main_process:
-                n_total = sum(p.numel() for p in mdisc.parameters())
-                logging.info(
-                    "[ActionForcing] MomentDiscriminator built: "
-                    "in_ch=%d hidden=%d blocks=%d include_mean=%s "
-                    "include_rms=%s clip_logit=%s params=%.2fK (DDP=%s)",
-                    mdisc.in_channels, mdisc.hidden_dim, mdisc.num_blocks,
-                    mdisc.include_mean, mdisc.include_rms,
-                    mdisc.clip_logit_enabled,
-                    n_total / 1e3, self.moment_disc_ddp is not None,
-                )
 
 
         # ------------------------------------------------------------------
@@ -1433,74 +1321,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.gan_loss_weight, self.gan_r1_gamma,
                     self.gan_r2_gamma, self.gan_warmup_steps,
                     self.gan_updates_per_step,
-                )
-
-        # Moment-GAN hyperparams + optimizer. Independent of the main
-        # GAN/wavelet disc — has its own loss weight, lr, warmup
-        # schedule and R1 cadence. All knobs default to safe values
-        # that mirror the wavelet LADD disc's defaults so the moment
-        # disc engages on a similar timeline.
-        self.moment_gan_loss_weight = float(
-            getattr(cfg, "moment_gan_loss_weight", 0.01)
-        )
-        self.moment_gan_r1_gamma = float(
-            getattr(cfg, "moment_gan_r1_gamma", 0.01)
-        )
-        self.moment_gan_r1_every_n_steps = max(
-            1, int(getattr(cfg, "moment_gan_r1_every_n_steps", 10))
-        )
-        self.moment_gan_r1_sigma = float(
-            getattr(cfg, "moment_gan_r1_sigma", 0.01)
-        )
-        self.moment_gan_disc_start_step = int(
-            getattr(cfg, "moment_gan_disc_start_step", 20)
-        )
-        self.moment_gan_critic_warmup_steps = int(
-            getattr(cfg, "moment_gan_critic_warmup_steps", 20)
-        )
-        self.moment_gan_warmup_steps = int(
-            getattr(cfg, "moment_gan_warmup_steps", 100)
-        )
-        self.moment_gan_updates_per_step = int(
-            getattr(cfg, "moment_gan_updates_per_step", 1)
-        )
-        self.moment_gan_max_grad_norm = float(
-            getattr(cfg, "moment_gan_max_grad_norm", self.max_grad_norm)
-        )
-        if self.moment_gan_enabled and self.moment_disc is not None:
-            mdisc_lr = float(getattr(cfg, "moment_gan_lr", 2e-5))
-            mdisc_betas = tuple(
-                getattr(cfg, "moment_gan_betas", [0.0, 0.9])
-            )
-            mdisc_eps = float(getattr(cfg, "moment_gan_eps", 1e-8))
-            mdisc_wd = float(getattr(cfg, "moment_gan_weight_decay", 0.0))
-            mdisc_params = [
-                p for p in self.moment_disc.parameters() if p.requires_grad
-            ]
-            if not mdisc_params:
-                raise RuntimeError(
-                    "moment_disc has no trainable parameters; check the "
-                    "MomentDiscriminator constructor."
-                )
-            self.moment_disc_optimizer = torch.optim.AdamW(
-                mdisc_params,
-                lr=mdisc_lr,
-                betas=mdisc_betas,
-                eps=mdisc_eps,
-                weight_decay=mdisc_wd,
-            )
-            if self.is_main_process:
-                n_params = sum(p.numel() for p in mdisc_params)
-                logging.info(
-                    "[ActionForcing] MomentGAN optimizer built: AdamW "
-                    "lr=%.2e betas=%s wd=%.4f params=%.2fK "
-                    "(loss_weight=%.4f, R1_gamma=%.4f, warmup_steps=%d, "
-                    "critic_warmup=%d, disc_start=%d)",
-                    mdisc_lr, mdisc_betas, mdisc_wd, n_params / 1e3,
-                    self.moment_gan_loss_weight, self.moment_gan_r1_gamma,
-                    self.moment_gan_warmup_steps,
-                    self.moment_gan_critic_warmup_steps,
-                    self.moment_gan_disc_start_step,
                 )
 
         # GAN warmup / disc-start schedule (used by the LADD path).
@@ -2019,6 +1839,39 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         self.step, _alloc_gb, _reserved_gb,
                     )
 
+            # CUDA allocation-history snapshot (definitive per-callsite/per-
+            # tensor attribution of the transient peak). ``cuda_mem_history_
+            # dump_step=N`` starts recording at step N-2 (so a couple of
+            # GAN-active disc transients land in the ring buffer) and dumps a
+            # pickle at step N. Analyse offline: the device_traces timeline
+            # shows the peak-segment allocations + their Python stacks even
+            # after they're freed. rank-0 only; off by default (N=0).
+            _snap_step = int(getattr(cfg, "cuda_mem_history_dump_step", 0))
+            if (
+                _snap_step > 0
+                and torch.cuda.is_available()
+                and getattr(self, "is_main_process", True)
+            ):
+                if self.step == max(1, _snap_step - 2):
+                    try:
+                        torch.cuda.memory._record_memory_history(
+                            max_entries=300000)
+                        logging.info(
+                            "[mem-snapshot] history recording ON at step %d",
+                            self.step)
+                    except Exception as _e:
+                        logging.warning("[mem-snapshot] record failed: %s", _e)
+                if self.step == _snap_step:
+                    try:
+                        _p = (
+                            f"logs/smoke/cuda_mem_snapshot_step{self.step}"
+                            f"_rank0.pickle")
+                        torch.cuda.memory._dump_snapshot(_p)
+                        torch.cuda.memory._record_memory_history(enabled=None)
+                        logging.info("[mem-snapshot] dumped %s", _p)
+                    except Exception as _e:
+                        logging.warning("[mem-snapshot] dump failed: %s", _e)
+
             # Mark wandb log as DUE if the cadence boundary just
             # crossed. With ``dfake_gen_update_ratio>1`` the boundary
             # often lands on a critic-only iter (no fresh gen data),
@@ -2439,19 +2292,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if self.r3gan_optimizer is not None:
                 state["r3gan_optimizer"] = self.r3gan_optimizer.state_dict()
                 appended.append("r3gan_optimizer")
-        if self.moment_gan_enabled and self.moment_disc is not None:
-            md_module = (
-                self.moment_disc_ddp.module
-                if self.moment_disc_ddp is not None
-                else self.moment_disc
-            )
-            state["moment_discriminator"] = md_module.state_dict()
-            appended.append("moment_discriminator")
-            if self.moment_disc_optimizer is not None:
-                state["moment_disc_optimizer"] = (
-                    self.moment_disc_optimizer.state_dict()
-                )
-                appended.append("moment_disc_optimizer")
         if self.real_teacher_train_online:
             # FAIL-LOUD on save: silently dropping the LoRA state from
             # the checkpoint pairs with the resume path's silent
@@ -2615,40 +2455,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         logging.warning(
                             "resume: forward_noiser_optimizer load failed: %s. "
                             "Starting FN optim from fresh state.", exc,
-                        )
-        if self.moment_gan_enabled and self.moment_disc is not None:
-            md_module = (
-                self.moment_disc_ddp.module
-                if self.moment_disc_ddp is not None
-                else self.moment_disc
-            )
-            if "moment_discriminator" in state:
-                md_missing, md_unexpected = md_module.load_state_dict(
-                    state["moment_discriminator"], strict=False,
-                )
-                if self.is_main_process:
-                    logging.info(
-                        "resume: moment_discriminator missing=%d unexpected=%d",
-                        len(md_missing), len(md_unexpected),
-                    )
-            if (
-                self.moment_disc_optimizer is not None
-                and "moment_disc_optimizer" in state
-            ):
-                try:
-                    self.moment_disc_optimizer.load_state_dict(
-                        state["moment_disc_optimizer"]
-                    )
-                    if self.is_main_process:
-                        logging.info(
-                            "resume: moment_disc_optimizer state restored"
-                        )
-                except Exception as exc:
-                    if self.is_main_process:
-                        logging.warning(
-                            "resume: moment_disc_optimizer load failed: %s. "
-                            "Starting moment_disc optim from fresh state.",
-                            exc,
                         )
         if self.real_teacher_train_online:
             # FAIL-LOUD on resume: silently rolling the LoRA back to
@@ -3659,199 +3465,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # Supports two pair construction modes, independently toggleable:
     #   * "gt_vs_fake" (LADD canonical): real = GT chunks at the same
     #     temporal positions as the gen output. Standard adversarial
-    def _compute_moment_gan_losses(
-        self,
-        pred_image: torch.Tensor,
-        gt_latents_window: torch.Tensor,
-        current_step: int,
-    ) -> tuple:
-        """Distribution-matching GAN on per-frame latent moments.
-
-        Trains a tiny MLP discriminator (``self.moment_disc``) to tell
-        GT per-frame moment vectors apart from the student's, then
-        backprops the symmetric RpGAN gen loss into ``pred_image``.
-
-        The semantic shift vs ``latent_std_mse_loss``: that loss pulls
-        ``s_pred`` toward ``s_gt`` *per frame* (point-wise match); this
-        loss pulls the student's *distribution* of per-frame moments
-        toward GT's, leaving room for natural per-frame variation. See
-        ``model.ladd_disc.MomentDiscriminator`` for the architecture.
-
-        Mirrors ``_ladd_run_pair_mode``'s recipe: combined real+fake
-        D-update forward, FD-R1 calibrated to the autograd magnitude
-        (``0.5 · γ · ‖∇_x Σ_i D_i‖²``), gen-side forward in disc.eval()
-        to silence spectral_norm power-iter mutation.
-
-        Returns ``(generator_gan_loss, logs)``. ``generator_gan_loss``
-        is graph-attached through ``pred_image``.
-        """
-        device = pred_image.device
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        if (
-            not self.moment_gan_enabled
-            or self.moment_disc is None
-        ):
-            return zero, {}
-
-        # Shape parity is assumed downstream — both sides feed the same
-        # disc forward and pair their logits 1-to-1. A mismatched
-        # window slice would fail deep inside ``extract_moments`` with
-        # a confusing reshape error; fail loud at the boundary instead.
-        if pred_image.shape != gt_latents_window.shape:
-            raise ValueError(
-                "_compute_moment_gan_losses: pred_image and "
-                "gt_latents_window must have identical shapes; got "
-                f"pred_image={tuple(pred_image.shape)} vs "
-                f"gt_latents_window={tuple(gt_latents_window.shape)}."
-            )
-
-        fake_grad = pred_image.to(torch.float32)
-        fake_det = fake_grad.detach()
-        real_det = gt_latents_window.detach().to(torch.float32)
-
-        disc_for_update = (
-            self.moment_disc_ddp
-            if self.moment_disc_ddp is not None
-            else self.moment_disc
-        )
-        disc_for_guidance = self.moment_disc
-
-        # ----- D-update -----
-        disc_skipped = (
-            current_step < int(self.moment_gan_disc_start_step)
-        )
-        last_d_loss = 0.0
-        last_d_real = 0.0
-        last_d_fake = 0.0
-        last_r1 = 0.0
-        last_r1_grad_sq = float("nan")
-        last_r1_fired = 0.0
-        if not disc_skipped and self.moment_disc_optimizer is not None:
-            for _ in range(int(self.moment_gan_updates_per_step)):
-                self.moment_disc_optimizer.zero_grad(set_to_none=True)
-                _do_r1 = (
-                    current_step % self.moment_gan_r1_every_n_steps == 0
-                )
-                B_d = real_det.shape[0]
-                if _do_r1:
-                    # FD-R1: perturb real only, batch [real, fake,
-                    # real_perturbed] through a single disc forward.
-                    sigma = float(self.moment_gan_r1_sigma)
-                    real_part = real_det.detach()
-                    fake_part = fake_det.detach()
-                    eps_real = sigma * torch.randn_like(real_part)
-                    real_perturbed = real_part + eps_real
-                    combined = torch.cat(
-                        [real_part, fake_part, real_perturbed], dim=0,
-                    ).requires_grad_(False)
-                    logits = disc_for_update(combined)
-                    d_real = logits[:B_d]
-                    d_fake = logits[B_d:2 * B_d]
-                    d_real_pert = logits[2 * B_d:]
-                    # Match the LADD FD-R1 calibration: sum the per-token
-                    # logits per sample BEFORE FD so the penalty
-                    # magnitude tracks ``‖∇_x Σ_i D_i‖²`` (same as
-                    # autograd). Here per-frame logits are [B, F]; sum
-                    # over F to get one scalar per sample.
-                    d_real_sum = d_real.sum(dim=1)
-                    d_real_pert_sum = d_real_pert.sum(dim=1)
-                    r1_grad_fd = (d_real_pert_sum - d_real_sum) / sigma
-                    _r1_grad_sq_raw = r1_grad_fd.pow(2).mean()
-                    r1 = 0.5 * self.moment_gan_r1_gamma * _r1_grad_sq_raw
-                    last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
-                    last_r1_fired = 1.0
-                else:
-                    combined = torch.cat([real_det, fake_det], dim=0)
-                    logits = disc_for_update(combined)
-                    d_real = logits[:B_d]
-                    d_fake = logits[B_d:]
-                    # Graph-connected zero so backward is safe.
-                    r1 = logits.sum() * 0.0
-                d_rp = rpgan_d_loss(d_real, d_fake)
-                d_total = d_rp + r1
-                d_total.backward()
-                if (
-                    self.moment_gan_max_grad_norm
-                    and self.moment_gan_max_grad_norm > 0
-                ):
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.moment_disc.parameters()
-                         if p.grad is not None],
-                        self.moment_gan_max_grad_norm,
-                    )
-                self.moment_disc_optimizer.step()
-                last_d_loss = float(d_rp.detach().item())
-                last_d_real = float(d_real.detach().mean().item())
-                last_d_fake = float(d_fake.detach().mean().item())
-                last_r1 = float(r1.detach().item())
-
-        # ----- Gen-side -----
-        critic_warmup_done = (
-            current_step >= int(self.moment_gan_critic_warmup_steps)
-        )
-        if (
-            self.moment_gan_warmup_steps > 0
-            and current_step < (
-                self.moment_gan_critic_warmup_steps
-                + self.moment_gan_warmup_steps
-            )
-            and current_step >= self.moment_gan_critic_warmup_steps
-        ):
-            ramp_steps_in = current_step - self.moment_gan_critic_warmup_steps
-            t_norm = ramp_steps_in / max(1, self.moment_gan_warmup_steps)
-            ramp = self._gan_warmup_shape_apply(t_norm)
-            gen_gan_weight = ramp * self.moment_gan_loss_weight
-        elif current_step >= (
-            self.moment_gan_critic_warmup_steps
-            + self.moment_gan_warmup_steps
-        ):
-            gen_gan_weight = self.moment_gan_loss_weight
-        else:
-            gen_gan_weight = 0.0
-
-        gen_gan_main_value = 0.0
-        if critic_warmup_done and gen_gan_weight > 0:
-            disc_for_guidance.requires_grad_(False)
-            disc_was_training = disc_for_guidance.training
-            disc_for_guidance.eval()
-            try:
-                B_g = real_det.shape[0]
-                combined_g = torch.cat([real_det, fake_grad], dim=0)
-                g_logits = disc_for_guidance(combined_g)
-                d_real_g = g_logits[:B_g]
-                d_fake_g = g_logits[B_g:]
-                g_rp = rpgan_g_loss(d_real_g.detach(), d_fake_g)
-                generator_gan_loss = (
-                    gen_gan_weight * g_rp.to(pred_image.dtype)
-                )
-                gen_gan_main_value = float(g_rp.detach().item())
-            finally:
-                disc_for_guidance.requires_grad_(True)
-                if disc_was_training:
-                    disc_for_guidance.train()
-        else:
-            generator_gan_loss = zero
-
-        logs = {
-            "train/moment_gan_disc_skipped": 1.0 if disc_skipped else 0.0,
-            "train/moment_gan_d_loss": last_d_loss,
-            "train/moment_gan_d_real": last_d_real,
-            "train/moment_gan_d_fake_detached": last_d_fake,
-            "train/moment_gan_r1": last_r1,
-            "train/moment_gan_r1_grad_sq": last_r1_grad_sq,
-            "train/moment_gan_r1_fired": last_r1_fired,
-            "train/moment_gan_r1_gamma": float(self.moment_gan_r1_gamma),
-            "train/moment_gan_g_loss_raw": gen_gan_main_value,
-            "train/moment_gan_g_loss_weighted": (
-                gen_gan_weight * gen_gan_main_value
-            ),
-            "train/moment_gan_g_weight": float(gen_gan_weight),
-            "train/moment_gan_critic_warmup_done": (
-                1.0 if critic_warmup_done else 0.0
-            ),
-        }
-        return generator_gan_loss, logs
-
     # ==================================================================
     # ForwardNoiser (CARN) — teacher_feat training
     # ==================================================================
@@ -4155,12 +3768,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         s = getattr(m, "streaming_state", None)
         if not isinstance(s, dict):
             return _anchor("no_state")
-        r2 = s.get("rollout2_x0")
-        r2_abs = s.get("rollout2_abs_frame_start")
-        if r2 is None or r2_abs is None:
-            return _anchor("no_rollout2")
-        r2_abs = int(r2_abs)
-        r2_total = int(r2.shape[1])
+        # NOTE: rollout2 (the prebuilt +1-drift rollout) is fetched LATER,
+        # just before the carn_recurse=True path that actually consumes it.
+        # The carn_recurse=False branch below builds its pairs from the
+        # ride window + flash chunk and never touches rollout2, so requiring
+        # it here would needlessly gate FN training off whenever the
+        # prebuild is skipped (the carn_recurse=False memory optimisation —
+        # see the _need_rollout2 gate in dmd_action_forcing).
         # rollout1 input: prefer the t=60 flash chunk (cleaner) like the
         # MSE path; both are detached (FN input is never grad-on upstream).
         flash = info.get("flash_dmd_gan_x0")
@@ -4237,6 +3851,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/fn_tf_cumulative": 1.0,
                 "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
             }
+
+        # carn_recurse=True (+1 composition) path: this is the ONLY consumer
+        # of the prebuilt rollout2. Fetch + require it here (the False branch
+        # above already returned), so the prebuild can be skipped entirely
+        # when carn_recurse=False without disabling FN training.
+        r2 = s.get("rollout2_x0")
+        r2_abs = s.get("rollout2_abs_frame_start")
+        if r2 is None or r2_abs is None:
+            return _anchor("no_rollout2")
+        r2_abs = int(r2_abs)
+        r2_total = int(r2.shape[1])
 
         fn_inputs, fn_targets = [], []
         _pair_abs: list = []
@@ -4373,10 +3998,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         two_phase = len(enabled_modes) > 1
 
+        # In two-phase (multi-mode) runs the D-update happens in the
+        # ``d_only`` call below and the ``g_only`` call leaves ``last_d_*``
+        # at their 0.0 init — so without capturing these, the merged logs
+        # report d_real/d_fake/d_loss/R1 as 0 for every mode (the bug that
+        # made smoke B's gtxn gap read 0.000). Stash the d_only logs and
+        # overlay the D-side metrics after the g_only merge below.
+        _d_only_logs: dict = {}
         if two_phase:
             # Phase 1: all D-updates (each backward + step immediately).
             for mode_name, real_src_t, _suffix in enabled_modes:
-                self._ladd_run_pair_mode(
+                _, _dlog = self._ladd_run_pair_mode(
                     real_src=real_src_t,
                     fake_src_grad=src_grad,
                     fake_src_detached=src_detached,
@@ -4385,6 +4017,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     current_step=current_step,
                     phase="d_only",
                 )
+                _d_only_logs[mode_name] = _dlog or {}
 
         # Phase 2: per-mode gen-side forwards (or single combined
         # call when only one mode is enabled).
@@ -4409,6 +4042,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             gen_loss_total = gen_loss_total + w * g_loss
             for k, v in partial_logs.items():
                 logs[k + suffix] = v
+            # Overlay D-side metrics from the d_only run — the g_only call
+            # above left them at their 0.0 init in two-phase mode. Single-
+            # mode runs use phase="both" (no _d_only_logs entry) and are
+            # untouched.
+            if two_phase and mode_name in _d_only_logs:
+                _dl = _d_only_logs[mode_name]
+                for _dk in (
+                    "train/r3gan_disc_skipped", "train/r3gan_d_loss",
+                    "train/r3gan_d_real", "train/r3gan_d_fake_detached",
+                    "train/r3gan_d_loss_stat",
+                    "train/r3gan_r1", "train/r3gan_r1_grad_sq",
+                    "train/r3gan_r1_fired",
+                    "train/r3gan_r2", "train/r3gan_r2_grad_sq",
+                    "train/r3gan_r2_fired",
+                    "train/ladd_match_n_real", "train/ladd_n_real",
+                ):
+                    if _dk in _dl:
+                        logs[_dk + suffix] = _dl[_dk]
 
         # Top-level (non-suffixed) R1 traces so the wandb plot is
         # findable as ``train/r3gan_r1*`` without the ``_gt`` / ``_adj``
@@ -4495,6 +4146,259 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         (offset) lazy cadence. Kept identical across all three D-update
         branches so the offset-vs-R1 OOM guarantee holds everywhere."""
         return gamma > 0.0 and ((current_step - offset) % every_n == 0)
+
+    def _ladd_disc_update_microbatched(
+        self, *, _it, _rn, _fk, _fseg, _fseg_act, real_m, real_m_rat,
+        real_m_ram, group_flat, _do_r1, _do_r2, n_pairs, B, Kk, _m_fwd,
+        disc_for_update, _disc_no_sync, rpgan_d_loss, _K_stat, _W_stat,
+        _r1_sigma, _r1_gamma, _r2_sigma, _r2_gamma, _r1_num_samples,
+        current_step, _micro_groups,
+    ):
+        """Memory-fix micro-batched D-update (ON path; default-OFF leaves
+        the verbatim single-batch code untouched).
+
+        Splits the ``n_fake`` fakes into ``_micro_groups`` roughly-equal
+        groups and does ONE disc forward+backward per group with gradient
+        accumulation, so the transient backward peak (gradient-checkpointed
+        teacher disc-backbone recompute over the whole batch) is cut by the
+        group factor. The optimizer steps ONCE after all groups, exactly as
+        the single-batch path.
+
+        MATH FAITHFULNESS:
+          * RpGAN (``_m_rp``): each fake is scored ONLY against its own Kk
+            matched reals (block-diagonal), so the loss is a MEAN over
+            ``n_fake*Kk`` independent rows laid out FAKE-MAJOR. A fake group
+            owns a contiguous block of fake rows -> a contiguous block of
+            ``Kk``-row chunks of ``group_flat``. Each group's partial loss is
+            ``softplus(rg-fg).SUM()/N_total`` (NOT /N_group); summing the
+            per-group backwards == the full ``.mean().backward()`` bit-for-
+            bit (up to fp summation order). The optional K_stat/W_stat
+            channel-split term is the same row-mean on a disjoint token slice
+            and is split identically.
+          * R2 (fake-side penalty): a mean over ``n_fake`` fakes; each fake
+            belongs to exactly one group, so per-group ``_gsq2`` partials
+            (sum-of-squares / n_fake_total) sum to the full R2.
+          * FD-R1 (real-side penalty): a mean over the (subsampled) unique
+            reals. R1 reals are chosen GLOBALLY (deterministic subsample,
+            seeded by current_step), then each is forwarded in the FIRST
+            group whose fakes reference it (so it is perturbed-forwarded once
+            only); partials are ``sum-of-sq / M`` and sum to the full R1.
+            ``_r1_num_samples<=0`` => all unique reals (current behaviour).
+
+        DDP: with multiple ``.backward()`` per step, DDP all-reduces on each
+        backward unless wrapped in ``no_sync()``. We wrap groups
+        ``0..G-2`` in ``_disc_no_sync()`` and let the LAST group's backward
+        do the (single) all-reduce — the standard grad-accumulation pattern.
+
+        Returns a dict of the SAME logging scalars the inline path writes
+        (aggregated: d_loss/d_loss_stat are the full-batch means, d_real/
+        d_fake are full-batch logit means, r1/r2 are the full penalties).
+        """
+        device = _rn.device
+        n_fake = n_pairs * B
+        # group_flat is fake-major: row r in [0, n_fake*Kk) belongs to fake
+        # r // Kk. Split fakes into _micro_groups contiguous, ~equal groups.
+        G = max(1, min(int(_micro_groups), n_fake))
+        bounds = [(g * n_fake) // G for g in range(G + 1)]  # fake-index cuts
+        N_total = n_fake * Kk  # total RpGAN rows
+        n_uniq = int(real_m.shape[0])
+
+        # ----- R1 global real subsample (deterministic, DDP-consistent) -----
+        r1_rows = None        # LongTensor of unique-real indices to penalise
+        M_r1 = 0
+        if _do_r1:
+            if _r1_num_samples is not None and int(_r1_num_samples) > 0 \
+                    and int(_r1_num_samples) < n_uniq:
+                gseed = int(current_step) * 1000003 + 7 + int(_it) * 9176
+                g_cpu = torch.Generator(device="cpu").manual_seed(gseed)
+                perm = torch.randperm(n_uniq, generator=g_cpu)
+                r1_rows = perm[:int(_r1_num_samples)].sort().values.to(device)
+            else:
+                r1_rows = torch.arange(n_uniq, device=device)
+            M_r1 = int(r1_rows.shape[0])
+        # Map: which group "owns" the perturbed-forward of each R1 real (the
+        # FIRST group whose fake block references it). Reals never referenced
+        # by any group's fakes (cannot happen for picked reals) are skipped.
+        r1_owner = {}
+        if _do_r1 and M_r1 > 0:
+            r1_set = set(int(x) for x in r1_rows.tolist())
+            gf_cpu = group_flat.to("cpu")
+            for g in range(G):
+                lo, hi = bounds[g], bounds[g + 1]
+                if hi <= lo:
+                    continue
+                rows = gf_cpu[lo * Kk: hi * Kk].tolist()
+                for u in rows:
+                    if u in r1_set and u not in r1_owner:
+                        r1_owner[u] = g
+
+        # ----- R2 fake-side eps (one draw for the whole update) -----
+        eps_f_full = None
+        if _do_r2:
+            eps_f_full = _r2_sigma * torch.randn_like(_fk)
+        # R1 real-side eps (one draw, indexed per group below).
+        eps_r_full = None
+        if _do_r1 and M_r1 > 0:
+            eps_r_full = _r1_sigma * torch.randn_like(_rn)
+
+        # Accumulators for logging (full-batch equivalents).
+        sum_d_r = torch.zeros((), device=device, dtype=torch.float64)
+        cnt_d_r = 0
+        sum_d_f = torch.zeros((), device=device, dtype=torch.float64)
+        cnt_d_f = 0
+        d_loss_acc = 0.0
+        d_loss_stat_acc = 0.0
+        r1_acc = 0.0
+        r2_acc = 0.0
+        r1_gsq_acc = 0.0
+        r2_gsq_acc = 0.0
+
+        self._mem_step_snapshot(
+            f"disc_it{_it}_micro_pre_groups_G{G}"
+            f"_r1{int(_do_r1)}_r2{int(_do_r2)}")
+        for g in range(G):
+            lo, hi = bounds[g], bounds[g + 1]
+            if hi <= lo:
+                continue
+            n_fake_g = hi - lo
+            # Group fakes (and their actions).
+            fk_g = _fk[lo:hi]
+            fa0_g = (_fseg_act[0][lo:hi]
+                     if _fseg_act[0] is not None else None)
+            fa1_g = (_fseg_act[1][lo:hi]
+                     if _fseg_act[1] is not None else None)
+            # Group's slice of group_flat (global unique-real indices), then
+            # re-index into a GROUP-LOCAL unique-real set.
+            gflat_g = group_flat[lo * Kk: hi * Kk]            # [n_fake_g*Kk]
+            local_uniq, gflat_local = torch.unique(
+                gflat_g, sorted=True, return_inverse=True)
+            ru_g = _rn.index_select(0, local_uniq)
+            rat_g = (real_m_rat.index_select(0, local_uniq)
+                     if real_m_rat is not None else None)
+            ram_g = (real_m_ram.index_select(0, local_uniq)
+                     if real_m_ram is not None else None)
+
+            # R1 reals OWNED by this group (perturbed-forwarded here).
+            r1_local = None
+            if _do_r1 and M_r1 > 0:
+                owned = [u for u in local_uniq.tolist()
+                         if r1_owner.get(int(u)) == g]
+                if owned:
+                    owned_t = torch.tensor(
+                        sorted(owned), device=device, dtype=torch.long)
+                    # position of each owned global-uniq id within local set
+                    pos = torch.searchsorted(local_uniq, owned_t)
+                    r1_local = (owned_t, pos)
+
+            _segs = [(ru_g, rat_g, ram_g), (fk_g, fa0_g, fa1_g)]
+            if r1_local is not None:
+                owned_t, pos = r1_local
+                rn_pert = ru_g.index_select(0, pos) \
+                    + eps_r_full.index_select(0, owned_t)
+                # The R1 perturbed segment covers only the OWNED subset of
+                # this group's unique reals (``pos`` rows), so its per-row
+                # action tokens/modulation must be sliced to ``pos`` too —
+                # otherwise the disc forward gets full-group modulation rows
+                # against a ``pos``-row latent batch (shape mismatch).
+                rat_pert = (rat_g.index_select(0, pos)
+                            if rat_g is not None else None)
+                ram_pert = (ram_g.index_select(0, pos)
+                            if ram_g is not None else None)
+                _segs.append((rn_pert, rat_pert, ram_pert))
+            if _do_r2:
+                eps_f_g = eps_f_full[lo:hi]
+                _segs.append((fk_g + eps_f_g, fa0_g, fa1_g))
+
+            _outs = _m_fwd(disc_for_update, _segs)
+            d_r_g, d_f_g = _outs[0], _outs[1]
+            _nxt = 2
+            # ---- block-diagonal RpGAN partial (scaled by 1/N_total) ----
+            rg = d_r_g.index_select(0, gflat_local)          # [n_fake_g*Kk,t]
+            fg = d_f_g.repeat_interleave(Kk, dim=0)
+            if _K_stat > 0 and _W_stat > 0.0:
+                rv, rs = rg[:, :-_K_stat], rg[:, -_K_stat:]
+                fv, fs = fg[:, :-_K_stat], fg[:, -_K_stat:]
+                # softplus(rv-fv).sum()/N_total per token col, then /tokcols
+                # equals the contribution to mfn(rv,fv).mean()*(N_g/N)*...
+                # Match _m_rp EXACTLY: lv = softplus(rg-fg).mean() over
+                # ALL elements (rows*tokcols). So partial = SUM/total_elems.
+                ltot_v = float(rv.numel()) / float(n_fake_g) * n_fake  # =N_total*vtok
+                ltot_s = float(rs.numel()) / float(n_fake_g) * n_fake
+                # NB: rpgan_d_loss(real, fake) = softplus(fake - real).mean()
+                # (the SIGN is fake-minus-real); we replicate it as a SUM
+                # over all elements scaled by 1/total_elems so per-group
+                # backwards SUM to the full ``.mean()``.
+                lv_p = torch.nn.functional.softplus(fv - rv).sum() / ltot_v
+                ls_p = torch.nn.functional.softplus(fs - rs).sum() / ltot_s
+                d_rp_g = lv_p + _W_stat * ls_p
+                d_loss_stat_acc += float(ls_p.detach().item())
+            else:
+                ltot = float(rg.numel()) / float(n_fake_g) * n_fake
+                d_rp_g = torch.nn.functional.softplus(fg - rg).sum() / ltot
+            d_loss_acc += float(d_rp_g.detach().item())
+
+            # ---- R1 partial (sum-of-sq over owned reals / M_r1) ----
+            if r1_local is not None:
+                owned_t, pos = r1_local
+                d_r_pert_g = _outs[_nxt]
+                _nxt += 1
+                d_r_owned = d_r_g.index_select(0, pos)
+                gsq_terms = ((d_r_pert_g.sum(dim=1) - d_r_owned.sum(dim=1))
+                             / _r1_sigma).pow(2)
+                gsq_part = gsq_terms.sum() / float(M_r1)
+                r1_g = 0.5 * _r1_gamma * gsq_part
+                r1_acc += float(r1_g.detach().item())
+                r1_gsq_acc += float(gsq_part.detach().item())
+            else:
+                r1_g = d_r_g.sum() * 0.0
+
+            # ---- R2 partial (sum-of-sq over group fakes / n_fake total) ----
+            if _do_r2:
+                d_f_pert_g = _outs[_nxt]
+                _nxt += 1
+                gsq2_terms = ((d_f_pert_g.sum(dim=1) - d_f_g.sum(dim=1))
+                              / _r2_sigma).pow(2)
+                gsq2_part = gsq2_terms.sum() / float(n_fake)
+                r2_g = 0.5 * _r2_gamma * gsq2_part
+                r2_acc += float(r2_g.detach().item())
+                r2_gsq_acc += float(gsq2_part.detach().item())
+            else:
+                r2_g = d_f_g.sum() * 0.0
+
+            # ---- accumulate logit-mean stats (full-batch d_real/d_fake) ----
+            sum_d_r += d_r_g.detach().double().sum()
+            cnt_d_r += int(d_r_g.numel())
+            sum_d_f += d_f_g.detach().double().sum()
+            cnt_d_f += int(d_f_g.numel())
+
+            loss_g = d_rp_g + r1_g + r2_g
+            is_last = (g == G - 1)
+            if is_last:
+                loss_g.backward()
+            else:
+                with _disc_no_sync():
+                    loss_g.backward()
+        self._mem_step_snapshot(f"disc_it{_it}_micro_post_groups")
+
+        if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.r3gan_disc.parameters()
+                 if p.grad is not None],
+                self.gan_max_grad_norm)
+        self.r3gan_optimizer.step()
+
+        return {
+            "d_loss": d_loss_acc,
+            "d_loss_stat": d_loss_stat_acc,
+            "d_real": float((sum_d_r / max(1, cnt_d_r)).item()),
+            "d_fake": float((sum_d_f / max(1, cnt_d_f)).item()),
+            "r1": r1_acc,
+            "r2": r2_acc,
+            "r1_grad_sq": r1_gsq_acc if (_do_r1 and M_r1 > 0) else 0.0,
+            "r1_fired": 1.0 if (_do_r1 and M_r1 > 0) else 0.0,
+            "r2_grad_sq": r2_gsq_acc if _do_r2 else 0.0,
+            "r2_fired": 1.0 if _do_r2 else 0.0,
+        }
 
     def _ladd_run_pair_mode(
         self,
@@ -5096,24 +5000,39 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             noisy_flat = scheduler.add_noise(x_flat, eps_flat, t_per_frame)
             return noisy_flat.unflatten(0, x.shape[:2])
 
-        real_chunks_det_noisy = _add_disc_noise(real_chunks_det)
-        fake_chunks_det_noisy = _add_disc_noise(fake_chunks_det)
-
+        # ``_match`` (the matched gt_transition branch) re-noises + re-
+        # augments inside its own D-loop (_m_noise / per-update
+        # latent_diff_augment) and NEVER reads these whole-pair pre-noised
+        # tensors — only the positional / mismatched branches (gt_vs_fake,
+        # adjacent, all_pairs) consume real/fake_chunks_det_noisy. Skip the
+        # noise + diff-aug-clone work when matching is active. ``_match`` is
+        # defined further below and bound to this (``_match = _match_active``)
+        # so the two cannot diverge.
+        _match_active = (
+            pair_mode == "gt_transition"
+            and chunks_per_pair == 2
+            and bool(getattr(self.model, "ladd_gt_transition_match", False))
+        )
         # DiffAugment — same per-sample randomness on real and fake.
         # Different seeds per mode so the augmentations decorrelate.
+        # (Defined unconditionally: the matched D-loop reads diff_aug_policy.)
         diff_aug_policy = str(
             getattr(self.model, "ladd_diff_aug_policy", "")
         )
         seed_offset = 0 if pair_mode == "gt_vs_fake" else 7919
-        if diff_aug_policy:
-            real_chunks_det_noisy, fake_chunks_det_noisy = (
-                latent_diff_augment(
-                    real_chunks_det_noisy,
-                    fake_chunks_det_noisy,
-                    policy=diff_aug_policy,
-                    seed=int(current_step) * 31 + seed_offset,
+        real_chunks_det_noisy = fake_chunks_det_noisy = None
+        if not _match_active:
+            real_chunks_det_noisy = _add_disc_noise(real_chunks_det)
+            fake_chunks_det_noisy = _add_disc_noise(fake_chunks_det)
+            if diff_aug_policy:
+                real_chunks_det_noisy, fake_chunks_det_noisy = (
+                    latent_diff_augment(
+                        real_chunks_det_noisy,
+                        fake_chunks_det_noisy,
+                        policy=diff_aug_policy,
+                        seed=int(current_step) * 31 + seed_offset,
+                    )
                 )
-            )
 
         # ----- Prompt embedding (broadcast across pairs) -----
         prompt_embeds = None
@@ -5312,11 +5231,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # (own D-loop + gen-side + R1). Assumes per-rank B==1 (single ride),
         # like the mismatched branch's prompt tiling. Mutually exclusive
         # with all_pairs / mismatched n_real.
-        _match = (
-            pair_mode == "gt_transition"
-            and chunks_per_pair == 2
-            and bool(getattr(self.model, "ladd_gt_transition_match", False))
-        )
+        _match = _match_active  # bound to the precompute-guard condition above
         # Mutually exclusive with the all_pairs matrix and the mismatched
         # n_real sampler — the match branch is physically first and returns,
         # so a co-set config would SILENTLY ignore those. Fail loud instead.
@@ -5369,15 +5284,41 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     pool_lat[b:b + 1, (u + 1) * npb:(u + 2) * npb],
                 ], dim=1)                                        # [1, 2*npb, ...]
 
-            # Candidate transitions per batch elem, mean-equalized (the disc
-            # input AND the match key — match on the same rep the disc sees).
-            cand_disc = []          # over b: [n_cand, 2*npb, C,H,W] (equalized)
-            for b in range(B):
-                cl = torch.cat(
-                    [_pool_pair_lat(b, u) for u in range(n_cand)], dim=0)
+            # Lazy cand_disc (memory, flag-gated default OFF): rebuild a
+            # single equalized candidate pair on demand instead of holding
+            # the whole-window cand_disc list pinned across the D-loop +
+            # gen-side (+ the deferred backward when ladd_defer_disc_update).
+            # _mean_equalize_pair reduces over dim=[1..4] (per-pair), so
+            # _cand_pair(b,u) is byte-identical to cand_disc[b][u]. When lazy,
+            # cand_disc is NEVER materialized: the top-M matcher streams it in
+            # chunks (below) and _match_select rebuilds only the selected
+            # pairs — bounding both the persistent hold and the matcher's
+            # [n_cand, D] float transient.
+            _lazy_cand = bool(getattr(
+                self.config, "ladd_lazy_cand_disc",
+                getattr(self.model, "ladd_lazy_cand_disc", False)))
+
+            def _cand_pair(b, u):
+                cl = _pool_pair_lat(b, u)
                 if _mean_eq:
                     cl = _mean_equalize_pair(cl)
-                cand_disc.append(cl.to(_fdt))
+                return cl.to(_fdt)[0]
+
+            # Candidate transitions per batch elem, mean-equalized (the disc
+            # input AND the match key — match on the same rep the disc sees).
+            # When lazy, skip materializing the whole-window cand_disc — the
+            # top-M matcher streams it below and _match_select rebuilds the
+            # selected pairs on demand.
+            if not _lazy_cand:
+                cand_disc = []      # over b: [n_cand, 2*npb, C,H,W] (equalized)
+                for b in range(B):
+                    cl = torch.cat(
+                        [_pool_pair_lat(b, u) for u in range(n_cand)], dim=0)
+                    if _mean_eq:
+                        cl = _mean_equalize_pair(cl)
+                    cand_disc.append(cl.to(_fdt))
+            else:
+                cand_disc = None
 
             # Fake queries: fake_chunks_det is [n_pairs*B, 2*npb, ...]
             # pair-major batch-minor, already mean-equalized. View [n_pairs,B].
@@ -5397,15 +5338,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if _M <= 0:
                 _M = 2 * Kk
             _M = max(Kk, min(_M, n_cand))
+            # Candidate-chunk size for the streaming (lazy) matcher; bounds
+            # the [chunk, D] float transient. Ignored on the dense path.
+            _cand_chunk = max(1, int(getattr(
+                self.config, "ladd_lazy_cand_chunk",
+                getattr(self.model, "ladd_lazy_cand_chunk", 64))))
             top_idx = [[None] * B for _ in range(n_pairs)]
             with torch.no_grad():
                 for b in range(B):
-                    ce = cand_disc[b].float().flatten(1)         # [n_cand, D]
                     fb = fq[:, b].float().flatten(1)             # [n_pairs, D]
+                    _Dn = float(fb.shape[1])
                     # L1 mean distance via cdist (p=1 = sum|.|) / D — avoids
-                    # materializing the [n_pairs, n_cand, D] difference tensor
-                    # (the dominant transient for long rides / large K).
-                    mae = torch.cdist(fb, ce, p=1) / float(fb.shape[1])
+                    # materializing the [n_pairs, n_cand, D] difference tensor.
+                    if cand_disc is not None:
+                        ce = cand_disc[b].float().flatten(1)     # [n_cand, D]
+                        mae = torch.cdist(fb, ce, p=1) / _Dn
+                    else:
+                        # Lazy: stream candidate rows in chunks via _cand_pair
+                        # and concatenate the cdist columns. ``mae`` is
+                        # [n_pairs, n_cand] — identical to the dense path; only
+                        # the per-chunk [chunk, D] float buffer is ever held.
+                        _cols = []
+                        for _u0 in range(0, n_cand, _cand_chunk):
+                            _u1 = min(_u0 + _cand_chunk, n_cand)
+                            _ce_c = torch.stack([
+                                _cand_pair(b, u).float().flatten()
+                                for u in range(_u0, _u1)
+                            ], dim=0)                            # [chunk, D]
+                            _cols.append(torch.cdist(fb, _ce_c, p=1) / _Dn)
+                        mae = torch.cat(_cols, dim=1)            # [n_pairs, n_cand]
                     idx = torch.topk(
                         mae, _M, dim=1, largest=False).indices.tolist()
                     for p in range(n_pairs):
@@ -5463,7 +5424,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                 key_to_row[(b, u)] = len(rows_bu)
                                 rows_bu.append((b, u))
                                 gm[fr, k] = key_to_row[(b, u)]
-                real_rows = [cand_disc[b][u] for (b, u) in rows_bu]
+                real_rows = [
+                    (_cand_pair(b, u) if cand_disc is None
+                     else cand_disc[b][u])
+                    for (b, u) in rows_bu
+                ]
                 acts_list = []
                 if a_per_f > 0 and pool_act_full is not None and atp is not None:
                     for (b, u) in rows_bu:
@@ -5765,77 +5730,159 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _fseg_act = (fake_action_tokens, fake_action_modulation)
 
             # ---- D-updates (resample each fake's K matched GT FRESH per
-            # update — salt=_it — to preserve 5b's GT decorrelation) ----
-            if n_disc_updates > 0 and self.r3gan_optimizer is not None:
-                for _it in range(n_disc_updates):
-                    self.r3gan_optimizer.zero_grad(set_to_none=True)
-                    # D-update: POST-CARN matched real formers (Req 2).
-                    real_m, real_m_rat, real_m_ram, group_flat = _match_select(
-                        _it, carn=True)
-                    last_n_real = float(real_m.shape[0])
-                    _rn = _m_noise(real_m)
-                    if diff_aug_policy:
-                        _rn, _ = latent_diff_augment(
-                            _rn, _rn, policy=diff_aug_policy,
-                            seed=int(current_step) * 31 + seed_offset + _it * 101)
-                    _rn = _rn.detach()
-                    _fk = _m_noise(fake_chunks_det).detach()
-                    _fseg = (_fk, _fseg_act[0], _fseg_act[1])
-                    # R1 (real-side) + R2 (fake-side) gradient penalties,
-                    # each on its own lazy cadence. The perturbed
-                    # segments are appended to the SINGLE batched disc
-                    # forward only on the steps they fire (offset so the
-                    # two never stack — OOM guard).
-                    _do_r1 = (current_step % _r1_every_n == 0)
-                    _do_r2 = self._ladd_r2_fires(
-                        _r2_gamma, _r2_every_n, _r2_offset, current_step)
-                    _segs = [(_rn, real_m_rat, real_m_ram), _fseg]
-                    if _do_r1:
-                        _eps_r = _r1_sigma * torch.randn_like(_rn)
-                        _segs.append((_rn + _eps_r, real_m_rat, real_m_ram))
-                    if _do_r2:
-                        _eps_f = _r2_sigma * torch.randn_like(_fk)
-                        _segs.append(
-                            (_fk + _eps_f, _fseg_act[0], _fseg_act[1]))
-                    _outs = _m_fwd(disc_for_update, _segs)
-                    d_r, d_f = _outs[0], _outs[1]
-                    _nxt = 2
-                    if _do_r1:
-                        d_r_pert = _outs[_nxt]
-                        _nxt += 1
-                        _gsq = (
-                            ((d_r_pert.sum(dim=1) - d_r.sum(dim=1)) / _r1_sigma)
-                            .pow(2).mean())
-                        r1 = 0.5 * _r1_gamma * _gsq
-                        last_r1_grad_sq = float(_gsq.detach().item())
-                        last_r1_fired = 1.0
-                    else:
-                        r1 = d_r.sum() * 0.0
-                    if _do_r2:
-                        d_f_pert = _outs[_nxt]
-                        _nxt += 1
-                        _gsq2 = (
-                            ((d_f_pert.sum(dim=1) - d_f.sum(dim=1)) / _r2_sigma)
-                            .pow(2).mean())
-                        r2 = 0.5 * _r2_gamma * _gsq2
-                        last_r2_grad_sq = float(_gsq2.detach().item())
-                        last_r2_fired = 1.0
-                    else:
-                        r2 = d_f.sum() * 0.0
-                    d_rp, _dstat = _m_rp(d_r, d_f, False, group_flat)
-                    (d_rp + r1 + r2).backward()
-                    if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in self.r3gan_disc.parameters()
-                             if p.grad is not None],
-                            self.gan_max_grad_norm)
-                    self.r3gan_optimizer.step()
-                    last_d_loss = float(d_rp.detach().item())
-                    last_d_real = float(d_r.detach().mean().item())
-                    last_d_fake = float(d_f.detach().mean().item())
-                    last_r1 = float(r1.detach().item())
-                    last_r2 = float(r2.detach().item())
-                    last_d_loss_stat = _dstat
+            # update — salt=_it — to preserve 5b's GT decorrelation).
+            # Wrapped in a closure so it can be DEFERRED past the outer
+            # ``generator_loss.backward()`` when ``ladd_defer_disc_update``
+            # is set. The D-update reads ONLY detached inputs (``_fk`` /
+            # detached actions / the detached GT match pool), so its result
+            # is independent of WHEN it runs relative to the gen backward —
+            # but running it AFTER lets the gen graph (~88 GB) free first, so
+            # the disc backward no longer stacks on it (the FT_v3 rolling
+            # OOM). Flag OFF (default) -> ``_run_disc_updates()`` is called
+            # inline here, BYTE-IDENTICAL to the prior behaviour. When
+            # deferred, the gen-side term below sees the PRE-update disc
+            # (standard G-then-D ordering). ``nonlocal`` keeps the inline
+            # path's logging-var writes intact.
+            # ---- Memory-fix knobs (default-OFF => byte-identical) ----
+            #   ladd_disc_micro_batch_groups (int, default 1): split the
+            #     n_fake fakes into this many groups and do one disc
+            #     forward+backward per group with grad accumulation. 1 = the
+            #     existing single-batch path (verbatim).
+            #   ladd_r1_num_samples (int, default 0): when >0, compute FD-R1
+            #     on at most this many UNIQUE reals (deterministic subsample
+            #     seeded by current_step); 0 = all reals (current).
+            _micro_groups = int(getattr(
+                self.config, "ladd_disc_micro_batch_groups",
+                getattr(self.model, "ladd_disc_micro_batch_groups", 1)))
+            _r1_num_samples = int(getattr(
+                self.config, "ladd_r1_num_samples",
+                getattr(self.model, "ladd_r1_num_samples", 0)))
+
+            def _disc_no_sync():
+                # DDP fires an all-reduce on EVERY .backward() unless wrapped
+                # in no_sync(). ``disc_for_update`` is the DDP wrapper when
+                # DDP is active (r3gan_disc_ddp), else the plain module (no
+                # no_sync attr) -> contextlib.nullcontext is the no-op.
+                _m = disc_for_update
+                if hasattr(_m, "no_sync"):
+                    return _m.no_sync()
+                import contextlib
+                return contextlib.nullcontext()
+
+            def _run_disc_updates():
+                nonlocal last_d_loss, last_d_real, last_d_fake, last_r1
+                nonlocal last_r2, last_r1_grad_sq, last_r1_fired
+                nonlocal last_r2_grad_sq, last_r2_fired, last_d_loss_stat
+                nonlocal last_n_real
+                if n_disc_updates > 0 and self.r3gan_optimizer is not None:
+                    for _it in range(n_disc_updates):
+                        self.r3gan_optimizer.zero_grad(set_to_none=True)
+                        # D-update: POST-CARN matched real formers (Req 2).
+                        real_m, real_m_rat, real_m_ram, group_flat = (
+                            _match_select(_it, carn=True))
+                        last_n_real = float(real_m.shape[0])
+                        _rn = _m_noise(real_m)
+                        if diff_aug_policy:
+                            _rn, _ = latent_diff_augment(
+                                _rn, _rn, policy=diff_aug_policy,
+                                seed=int(current_step) * 31
+                                + seed_offset + _it * 101)
+                        _rn = _rn.detach()
+                        _fk = _m_noise(fake_chunks_det).detach()
+                        _fseg = (_fk, _fseg_act[0], _fseg_act[1])
+                        # R1 (real-side) + R2 (fake-side) gradient penalties,
+                        # each on its own lazy cadence. The perturbed
+                        # segments are appended to the SINGLE batched disc
+                        # forward only on the steps they fire (offset so the
+                        # two never stack — OOM guard).
+                        _do_r1 = (current_step % _r1_every_n == 0)
+                        _do_r2 = self._ladd_r2_fires(
+                            _r2_gamma, _r2_every_n, _r2_offset, current_step)
+                        if _micro_groups > 1:
+                            _log = self._ladd_disc_update_microbatched(
+                                _it=_it, _rn=_rn, _fk=_fk, _fseg=_fseg,
+                                _fseg_act=_fseg_act, real_m=real_m,
+                                real_m_rat=real_m_rat, real_m_ram=real_m_ram,
+                                group_flat=group_flat, _do_r1=_do_r1,
+                                _do_r2=_do_r2, n_pairs=n_pairs, B=B, Kk=Kk,
+                                _m_fwd=_m_fwd, disc_for_update=disc_for_update,
+                                _disc_no_sync=_disc_no_sync,
+                                rpgan_d_loss=rpgan_d_loss, _K_stat=_K_stat,
+                                _W_stat=_W_stat, _r1_sigma=_r1_sigma,
+                                _r1_gamma=_r1_gamma, _r2_sigma=_r2_sigma,
+                                _r2_gamma=_r2_gamma,
+                                _r1_num_samples=_r1_num_samples,
+                                current_step=current_step,
+                                _micro_groups=_micro_groups)
+                            last_d_loss = _log["d_loss"]
+                            last_d_real = _log["d_real"]
+                            last_d_fake = _log["d_fake"]
+                            last_r1 = _log["r1"]
+                            last_r2 = _log["r2"]
+                            last_r1_grad_sq = _log["r1_grad_sq"]
+                            last_r1_fired = _log["r1_fired"]
+                            last_r2_grad_sq = _log["r2_grad_sq"]
+                            last_r2_fired = _log["r2_fired"]
+                            last_d_loss_stat = _log["d_loss_stat"]
+                            continue
+                        _segs = [(_rn, real_m_rat, real_m_ram), _fseg]
+                        if _do_r1:
+                            _eps_r = _r1_sigma * torch.randn_like(_rn)
+                            _segs.append(
+                                (_rn + _eps_r, real_m_rat, real_m_ram))
+                        if _do_r2:
+                            _eps_f = _r2_sigma * torch.randn_like(_fk)
+                            _segs.append(
+                                (_fk + _eps_f, _fseg_act[0], _fseg_act[1]))
+                        self._mem_step_snapshot(
+                            f"disc_it{_it}_pre_fwd_nseg{len(_segs)}"
+                            f"_r1{int(_do_r1)}_r2{int(_do_r2)}")
+                        _outs = _m_fwd(disc_for_update, _segs)
+                        self._mem_step_snapshot(f"disc_it{_it}_post_fwd")
+                        d_r, d_f = _outs[0], _outs[1]
+                        _nxt = 2
+                        if _do_r1:
+                            d_r_pert = _outs[_nxt]
+                            _nxt += 1
+                            _gsq = (
+                                ((d_r_pert.sum(dim=1) - d_r.sum(dim=1))
+                                 / _r1_sigma).pow(2).mean())
+                            r1 = 0.5 * _r1_gamma * _gsq
+                            last_r1_grad_sq = float(_gsq.detach().item())
+                            last_r1_fired = 1.0
+                        else:
+                            r1 = d_r.sum() * 0.0
+                        if _do_r2:
+                            d_f_pert = _outs[_nxt]
+                            _nxt += 1
+                            _gsq2 = (
+                                ((d_f_pert.sum(dim=1) - d_f.sum(dim=1))
+                                 / _r2_sigma).pow(2).mean())
+                            r2 = 0.5 * _r2_gamma * _gsq2
+                            last_r2_grad_sq = float(_gsq2.detach().item())
+                            last_r2_fired = 1.0
+                        else:
+                            r2 = d_f.sum() * 0.0
+                        d_rp, _dstat = _m_rp(d_r, d_f, False, group_flat)
+                        self._mem_step_snapshot(f"disc_it{_it}_pre_bwd")
+                        (d_rp + r1 + r2).backward()
+                        self._mem_step_snapshot(f"disc_it{_it}_post_bwd")
+                        if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                [p for p in self.r3gan_disc.parameters()
+                                 if p.grad is not None],
+                                self.gan_max_grad_norm)
+                        self.r3gan_optimizer.step()
+                        last_d_loss = float(d_rp.detach().item())
+                        last_d_real = float(d_r.detach().mean().item())
+                        last_d_fake = float(d_f.detach().mean().item())
+                        last_r1 = float(r1.detach().item())
+                        last_r2 = float(r2.detach().item())
+                        last_d_loss_stat = _dstat
+            if bool(getattr(self.config, "ladd_defer_disc_update", False)):
+                self._ladd_pending_disc = _run_disc_updates
+            else:
+                _run_disc_updates()
 
             # ---- Gen-side ----
             critic_warmup_done = (
@@ -5912,308 +5959,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/ladd_match_pool_m": float(_M),
                 "train/ladd_match_n_real": last_n_real,
                 "train/r3gan_d_loss_stat": last_d_loss_stat,
-                "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
-                "train/r3gan_stat_loss_weight": float(
-                    getattr(self.model, "ladd_stat_head_loss_weight", 1.0)),
-            }
-            return generator_gan_loss, logs
-
-        # ===== Mismatched all-pairs (N_real != N_fake) + resample-per-update
-        # =====
-        # Feed N_real GT chunks (gt_vs_fake) / transition-pairs
-        # (gt_transition) — RESAMPLED fresh from the full ride window every
-        # D-update — against the N_fake student chunks, for an
-        # N_real x N_fake all-pairs comparison with maximal GT
-        # decorrelation. Real / fake / perturbed are forwarded SEPARATELY
-        # (no equal-count combined split), so the R1 finite-diff is exact
-        # for unequal counts. Real latent + its action are co-located (same
-        # absolute window position). Self-contained: runs its own D-loop +
-        # gen-side and returns the standard (generator_gan_loss, logs).
-        # Matched configs never enter here (gated on n_real knob > 0).
-        _mm_win = None
-        if _mismatched:
-            _ss_mm = getattr(self.model, "streaming_state", None)
-            _mm_win = (
-                _ss_mm.get("ride_latents_window")
-                if isinstance(_ss_mm, dict) else None
-            )
-        if _mismatched and _mm_win is not None and int(_mm_win.shape[1]) >= npb:
-            _win = _mm_win.detach().to(torch.float32)
-            _w_chunks = int(_win.shape[1] // npb)
-            _n_units = _w_chunks if chunks_per_pair == 1 else max(1, _w_chunks - 1)
-            _K_stat = int(getattr(self.r3gan_disc, "stat_logit_count", 0))
-            _W_stat = float(getattr(
-                self.model, "ladd_stat_head_loss_weight", 1.0))
-            _r1_gamma = float(getattr(self.model, "ladd_r1_gamma", 1.0))
-            _r1_every_n = max(1, int(
-                getattr(self.model, "ladd_r1_every_n_steps", 1)))
-            _r1_sigma = float(getattr(self.model, "ladd_r1_sigma", 0.01))
-            _r2_gamma, _r2_every_n, _r2_offset, _r2_sigma = self._ladd_r2_knobs(
-                _r1_every_n, _r1_sigma)
-            _need_pp = pooled_prompt is not None
-
-            def _resample_real(salt):
-                # Sample _n_real fresh window positions (cycle if short);
-                # slice co-located latent + action.
-                g = torch.Generator(device="cpu").manual_seed(
-                    int(current_step) * 977 + int(salt) * 131 + 17)
-                perm = torch.randperm(_n_units, generator=g).tolist()
-                pos = [perm[k % _n_units] for k in range(_n_real)]
-                if chunks_per_pair == 1:
-                    rc = torch.cat([_slice(_win, p) for p in pos], dim=0)
-                else:
-                    rc = torch.cat(
-                        [_slice_pair(_win, p, p + 1) for p in pos], dim=0)
-                    if _mean_eq:
-                        rc = _mean_equalize_pair(rc)
-                rat = None
-                ram = None
-                if a_per_f > 0 and ride_actions is not None and atp is not None:
-                    acts = []
-                    for p in pos:
-                        if chunks_per_pair == 1:
-                            lo = p * npb
-                            acts.append(ride_actions[:, lo:lo + npb])
-                        else:
-                            lo0, lo1 = p * npb, (p + 1) * npb
-                            acts.append(torch.cat([
-                                ride_actions[:, lo0:lo0 + npb],
-                                ride_actions[:, lo1:lo1 + npb],
-                            ], dim=1))
-                    acts_t = torch.cat(acts, dim=0).to(
-                        device=device, dtype=prompt_embeds_eff.dtype)
-                    with torch.no_grad():
-                        rat = atp(acts_t).detach()
-                        if ap is not None:
-                            ram = ap(
-                                acts_t, num_frames=acts_t.shape[1]).detach()
-                return rc.detach(), rat, ram
-
-            def _mm_noise(x):
-                # Count-correct disc noise (the outer _add_disc_noise reuses
-                # the matched-sized t_disc, so it can't take a differently-
-                # sized batch).
-                if disc_t_int <= 0:
-                    return x
-                scheduler = getattr(self.model, "scheduler", None)
-                if scheduler is None or not hasattr(scheduler, "add_noise"):
-                    raise RuntimeError(
-                        "_mm_noise: disc_t_int > 0 but model has no scheduler "
-                        "with add_noise. Set flash_dmd_enabled=False (disc_t=0) "
-                        "or provide a scheduler.")
-                eps = torch.randn_like(x)
-                x_flat = x.flatten(0, 1)
-                eps_flat = eps.flatten(0, 1)
-                t_pf = torch.full(
-                    (x_flat.shape[0],), disc_t_int,
-                    dtype=torch.long, device=x.device)
-                noisy = scheduler.add_noise(x_flat, eps_flat, t_pf)
-                return noisy.unflatten(0, x.shape[:2])
-
-            def _mm_fwd_segments(disc, segs):
-                # ONE disc forward over concatenated segments — DDP-safe
-                # (single forward -> single backward; 3 separate forwards
-                # before a backward would desync DDP's grad reducer).
-                # segs: list of (chunks, action_tokens, action_mod). Returns
-                # the per-segment logit slices in order. Prompt/pooled are
-                # tiled position-major to match the chunk concat ordering.
-                xs = [s[0] for s in segs]
-                counts = [int(s[0].shape[0]) for s in segs]
-                x = torch.cat(xs, dim=0)
-                n_rows = x.shape[0]
-                t = torch.full(
-                    (n_rows, t_frames), disc_t_int,
-                    dtype=torch.long, device=device)
-                reps = max(1, n_rows // int(prompt_embeds.shape[0]))
-                pe = prompt_embeds.repeat(reps, 1, 1)
-                pp = (
-                    prompt_embeds.float().mean(dim=1).repeat(reps, 1)
-                    if _need_pp else None)
-                ce = None
-                if any(s[1] is not None for s in segs):
-                    ce = {"_action_tokens": torch.cat(
-                        [s[1] for s in segs], dim=0)}
-                    if all(s[2] is not None for s in segs):
-                        ce["_action_modulation"] = torch.cat(
-                            [s[2] for s in segs], dim=0)
-                logits = disc(
-                    x_noisy=x, timestep=t, prompt_embeds=pe,
-                    pooled_prompt=pp, conditional_extra=ce)
-                out = []
-                o = 0
-                for c in counts:
-                    out.append(logits[o:o + c])
-                    o += c
-                return out
-
-            def _mm_rp(d_real, d_fake, loss_fn, detach_real):
-                if _K_stat > 0 and _W_stat > 0.0:
-                    rv, rs = d_real[:, :-_K_stat], d_real[:, -_K_stat:]
-                    fv, fs = d_fake[:, :-_K_stat], d_fake[:, -_K_stat:]
-                    if detach_real:
-                        rv, rs = rv.detach(), rs.detach()
-                    lv = loss_fn(rv, fv)
-                    ls = loss_fn(rs, fs)
-                    return lv + _W_stat * ls, float(ls.detach().item())
-                rr = d_real.detach() if detach_real else d_real
-                return loss_fn(rr, d_fake), 0.0
-
-            # ---- D-updates (resample real each iter) ----
-            if n_disc_updates > 0 and self.r3gan_optimizer is not None:
-                for _iter_idx in range(n_disc_updates):
-                    self.r3gan_optimizer.zero_grad(set_to_none=True)
-                    _rc, _rat, _ram = _resample_real(_iter_idx)
-                    _rn = _mm_noise(_rc)
-                    if diff_aug_policy:
-                        _rn, _ = latent_diff_augment(
-                            _rn, _rn, policy=diff_aug_policy,
-                            seed=int(current_step) * 31 + seed_offset
-                            + _iter_idx * 101)
-                    _rn = _rn.detach()
-                    _fk = fake_chunks_det_noisy.detach()
-                    _fseg = (_fk, fake_action_tokens, fake_action_modulation)
-                    # R1 (real-side) + R2 (fake-side) gradient penalties.
-                    # Append the perturbed segment(s) to the SINGLE
-                    # DDP-safe disc forward only on the steps each fires
-                    # (offset so the two perturbed forwards never stack —
-                    # OOM guard).
-                    _do_r1 = (current_step % _r1_every_n == 0)
-                    _do_r2 = self._ladd_r2_fires(
-                        _r2_gamma, _r2_every_n, _r2_offset, current_step)
-                    _segs = [(_rn, _rat, _ram), _fseg]
-                    if _do_r1:
-                        _eps_r = _r1_sigma * torch.randn_like(_rn)
-                        _segs.append((_rn + _eps_r, _rat, _ram))
-                    if _do_r2:
-                        _eps_f = _r2_sigma * torch.randn_like(_fk)
-                        _segs.append((
-                            _fk + _eps_f, fake_action_tokens,
-                            fake_action_modulation))
-                    _outs = _mm_fwd_segments(disc_for_update, _segs)
-                    d_real_logits, d_fake_logits = _outs[0], _outs[1]
-                    _nxt = 2
-                    if _do_r1:
-                        d_real_pert = _outs[_nxt]
-                        _nxt += 1
-                        d_real_sum = d_real_logits.sum(dim=1)
-                        d_real_pert_sum = d_real_pert.sum(dim=1)
-                        _r1_grad_sq_raw = (
-                            ((d_real_pert_sum - d_real_sum) / _r1_sigma)
-                            .pow(2).mean())
-                        r1 = 0.5 * _r1_gamma * _r1_grad_sq_raw
-                        last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
-                        last_r1_fired = 1.0
-                    else:
-                        r1 = d_real_logits.sum() * 0.0
-                    if _do_r2:
-                        d_fake_pert = _outs[_nxt]
-                        _nxt += 1
-                        d_fake_sum = d_fake_logits.sum(dim=1)
-                        d_fake_pert_sum = d_fake_pert.sum(dim=1)
-                        _r2_grad_sq_raw = (
-                            ((d_fake_pert_sum - d_fake_sum) / _r2_sigma)
-                            .pow(2).mean())
-                        r2 = 0.5 * _r2_gamma * _r2_grad_sq_raw
-                        last_r2_grad_sq = float(_r2_grad_sq_raw.detach().item())
-                        last_r2_fired = 1.0
-                    else:
-                        r2 = d_fake_logits.sum() * 0.0
-                    d_rp, _dstat = _mm_rp(
-                        d_real_logits, d_fake_logits, _d_loss_fn, False)
-                    (d_rp + r1 + r2).backward()
-                    if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in self.r3gan_disc.parameters()
-                             if p.grad is not None],
-                            self.gan_max_grad_norm)
-                    self.r3gan_optimizer.step()
-                    last_d_loss = float(d_rp.detach().item())
-                    last_d_real = float(d_real_logits.detach().mean().item())
-                    last_d_fake = float(d_fake_logits.detach().mean().item())
-                    last_r1 = float(r1.detach().item())
-                    last_r2 = float(r2.detach().item())
-                    last_d_loss_stat = _dstat
-            self._mem_step_snapshot(f"ladd_{pair_mode}_b_post_d_update")
-
-            # ---- Gen-side (resample real once) ----
-            critic_warmup_done = (
-                current_step >= int(getattr(self, "gan_critic_warmup_steps", 0)))
-            if (
-                self.gan_warmup_steps > 0
-                and current_step < (
-                    self.gan_critic_warmup_steps + self.gan_warmup_steps)
-                and current_step >= self.gan_critic_warmup_steps
-            ):
-                _ramp_in = current_step - self.gan_critic_warmup_steps
-                gen_gan_weight = self._gan_warmup_shape_apply(
-                    _ramp_in / max(1, self.gan_warmup_steps)
-                ) * self.gan_loss_weight
-            elif current_step >= (
-                self.gan_critic_warmup_steps + self.gan_warmup_steps
-            ):
-                gen_gan_weight = self.gan_loss_weight
-            else:
-                gen_gan_weight = 0.0
-            gen_gan_weight = gen_gan_weight * float(
-                getattr(self.model, "ladd_disc_loss_weight", 1.0))
-
-            generator_gan_loss = zero
-            gen_gan_main_value = 0.0
-            gen_gan_stat_value = 0.0
-            if critic_warmup_done and gen_gan_weight > 0 and not skip_g:
-                disc_for_guidance.requires_grad_(False)
-                _disc_was_training = disc_for_guidance.training
-                disc_for_guidance.eval()
-                try:
-                    _rc, _rat, _ram = _resample_real(7919)
-                    _rn = _mm_noise(_rc).detach()
-                    _fg = _mm_noise(fake_chunks_grad_tensor)
-                    if diff_aug_policy:
-                        _rn, _ = latent_diff_augment(
-                            _rn, _rn, policy=diff_aug_policy,
-                            seed=int(current_step) * 31 + seed_offset + 99)
-                        _, _fg = latent_diff_augment(
-                            _fg, _fg, policy=diff_aug_policy,
-                            seed=int(current_step) * 31 + seed_offset + 199)
-                    d_real_g, d_fake_g = _mm_fwd_segments(
-                        disc_for_guidance, [
-                            (_rn, _rat, _ram),
-                            (_fg, fake_action_tokens, fake_action_modulation),
-                        ])
-                    g_rp, gen_gan_stat_value = _mm_rp(
-                        d_real_g, d_fake_g, _g_loss_fn, True)
-                    generator_gan_loss = (
-                        gen_gan_weight * g_rp.to(pred_image_dtype))
-                    gen_gan_main_value = float(g_rp.detach().item())
-                finally:
-                    disc_for_guidance.requires_grad_(True)
-                    if _disc_was_training:
-                        disc_for_guidance.train()
-            self._mem_step_snapshot(f"ladd_{pair_mode}_c_post_g_forward")
-
-            logs = {
-                "train/r3gan_disc_skipped": 1.0 if disc_skipped else 0.0,
-                "train/r3gan_d_loss": last_d_loss,
-                "train/r3gan_d_real": last_d_real,
-                "train/r3gan_d_fake_detached": last_d_fake,
-                "train/r3gan_r1": last_r1,
-                "train/r3gan_r1_grad_sq": last_r1_grad_sq,
-                "train/r3gan_r1_fired": last_r1_fired,
-                "train/r3gan_r1_gamma": float(_r1_gamma),
-                "train/r3gan_r2": last_r2,
-                "train/r3gan_r2_grad_sq": last_r2_grad_sq,
-                "train/r3gan_r2_fired": last_r2_fired,
-                "train/r3gan_r2_gamma": float(_r2_gamma),
-                "train/r3gan_g_loss_raw": gen_gan_main_value,
-                "train/r3gan_g_loss_weighted": gen_gan_weight * gen_gan_main_value,
-                "train/r3gan_g_weight": float(gen_gan_weight),
-                "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
-                "train/ladd_n_pairs": float(n_pairs),
-                "train/ladd_n_real": float(_n_real),
-                "train/ladd_disc_t": float(disc_t_int),
-                "train/r3gan_d_loss_stat": last_d_loss_stat,
-                "train/r3gan_d_real_stat": last_d_real_stat,
-                "train/r3gan_d_fake_detached_stat": last_d_fake_stat,
                 "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
                 "train/r3gan_stat_loss_weight": float(
                     getattr(self.model, "ladd_stat_head_loss_weight", 1.0)),
@@ -6726,109 +6471,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 current_step=current_step,
                 flash_dmd_gan_x0=flash_dmd_gan_x0,
             )
-
-        disc_for_update = (
-            self.r3gan_disc_ddp if self.r3gan_disc_ddp is not None else self.r3gan_disc
-        )
-        disc_for_guidance = self.r3gan_disc
-
-        # D's own arithmetic stays in fp32 for the second-order
-        # gradient penalty. The cost is one extra cast.
-        # ``pred_image_for_g`` is the graph-carrying version used in
-        # the G-side branch; ``*_detached`` versions feed the D-update.
-        real_detached_lat = gt_latents_window.detach().to(torch.float32)
-        fake_detached_lat = pred_image.detach().to(torch.float32)
-        # Flash-DMD: the G-side fake is the t=flash_dmd_gan_t forward
-        # output (a separate near-clean gen forward) when available;
-        # otherwise the rolling rollout's pred_image is used. Grad
-        # path is restricted to the t=gan_t forward — the high-noise
-        # denoising rungs were no_grad.
-        if flash_dmd_gan_x0 is not None:
-            pred_image_for_g_lat = flash_dmd_gan_x0.to(torch.float32)
-        else:
-            pred_image_for_g_lat = pred_image.to(torch.float32)
-        skip_g_side = False
-
-        real_detached = real_detached_lat
-        fake_detached = fake_detached_lat
-        pred_image_for_g = (
-            None if skip_g_side else pred_image_for_g_lat
-        )
-
-        # --- D-update (multi-step) -----------------------------------
-        d_loss_value = 0.0
-        d_real_value = 0.0
-        d_fake_detached_value = 0.0
-        r1_value = 0.0
-        r2_value = 0.0
-        for _k in range(max(1, self.gan_updates_per_step)):
-            self.r3gan_optimizer.zero_grad(set_to_none=True)
-            real_in = real_detached.clone().requires_grad_(True)
-            fake_in = fake_detached.clone().requires_grad_(True)
-            r1, d_real = r1_penalty(disc_for_update, real_in, gamma=self.gan_r1_gamma)
-            r2, d_fake_d = r2_penalty(disc_for_update, fake_in, gamma=self.gan_r2_gamma)
-            d_main = rpgan_d_loss(d_real, d_fake_d)
-            d_total = d_main + r1 + r2
-            d_total.backward()
-            if self.gan_max_grad_norm is not None and self.gan_max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in (
-                        self.r3gan_disc_ddp.parameters() if self.r3gan_disc_ddp is not None
-                        else self.r3gan_disc.parameters()
-                    ) if p.grad is not None],
-                    self.gan_max_grad_norm,
-                )
-            self.r3gan_optimizer.step()
-            d_loss_value = float(d_main.detach().item())
-            d_real_value = float(d_real.detach().mean().item())
-            d_fake_detached_value = float(d_fake_d.detach().mean().item())
-            r1_value = float(r1.detach().item())
-            r2_value = float(r2.detach().item())
-
-        # --- G-side RpGAN term (frozen D) ----------------------------
-        # Warmup: ramp G's GAN weight 0 -> gan_loss_weight over
-        # gan_warmup_steps steps. D learns from step 0 regardless.
-        if self.gan_warmup_steps > 0 and current_step < self.gan_warmup_steps:
-            t_norm = current_step / max(1, self.gan_warmup_steps)
-            ramp = self._gan_warmup_shape_apply(t_norm)
-            gen_gan_weight = ramp * self.gan_loss_weight
-        else:
-            gen_gan_weight = self.gan_loss_weight
-
-        if gen_gan_weight > 0 and not skip_g_side:
-            # Freeze the disc for the G-side path.
-            disc_for_guidance.requires_grad_(False)
-            try:
-                d_real_for_g = disc_for_guidance(real_detached).detach()
-                d_fake_for_g = disc_for_guidance(pred_image_for_g)
-                gen_gan_main = rpgan_g_loss(d_real_for_g, d_fake_for_g)
-                generator_gan_loss = gen_gan_weight * gen_gan_main.to(pred_image.dtype)
-            finally:
-                disc_for_guidance.requires_grad_(True)
-            d_fake_for_g_value = float(d_fake_for_g.detach().mean().item())
-            gen_gan_main_value = float(gen_gan_main.detach().item())
-        else:
-            generator_gan_loss = zero
-            d_fake_for_g_value = 0.0
-            gen_gan_main_value = 0.0
-
-        logs = {
-            "train/r3gan_d_loss": d_loss_value,
-            "train/r3gan_r1": r1_value,
-            "train/r3gan_r2": r2_value,
-            "train/r3gan_d_real": d_real_value,
-            "train/r3gan_d_fake_detached": d_fake_detached_value,
-            "train/r3gan_d_fake_for_g": d_fake_for_g_value,
-            "train/r3gan_g_loss_raw": gen_gan_main_value,
-            "train/r3gan_g_loss_weighted": (
-                float(generator_gan_loss.detach().item())
-                if torch.is_tensor(generator_gan_loss)
-                and generator_gan_loss.requires_grad
-                else 0.0
-            ),
-            "train/r3gan_g_weight": float(gen_gan_weight),
-        }
-        return generator_gan_loss, logs
 
     # ------------------------------------------------------------------
     # SC-DMD warmup helper.
@@ -8075,6 +7717,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return ride, wait_ms
 
     # ------------------------------------------------------------------
+    # Toothpaste curriculum — pure helpers (unit-tested in
+    # testing/test_toothpaste_and_defer_disc.py).
+    # ------------------------------------------------------------------
+    # Thin delegates to the torch-free, unit-tested helpers in
+    # ``trainer/toothpaste.py`` (kept separate so the pure curriculum logic
+    # can be tested without importing this CUDA-initialising module).
+    @staticmethod
+    def _toothpaste_grow(window, win, prev_avg, tol):
+        from trainer.toothpaste import toothpaste_grow
+        return toothpaste_grow(window, win, prev_avg, tol)
+
+    @staticmethod
+    def _toothpaste_gone(frontier_mae, gone_base, gone_factor):
+        from trainer.toothpaste import toothpaste_gone
+        return toothpaste_gone(frontier_mae, gone_base, gone_factor)
+
+    @staticmethod
+    def _setup_s_local_max(ride_len, cf, cap, slack, anchor, min_new, npb):
+        from trainer.toothpaste import setup_s_local_max
+        return setup_s_local_max(
+            ride_len, cf, cap, slack, anchor, min_new, npb)
+
+    # ------------------------------------------------------------------
     # K=1-per-step state machine. Each call rolls one chunk on the
     # current ride (or sets up a fresh ride if reset was triggered last
     # step), trains every active head, and decides whether to reset
@@ -8094,25 +7759,50 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         """
         cfg = self.config
         max_rolls = int(getattr(cfg, "max_rolls_per_ride", 60))
-        # Rolling-depth CURRICULUM (phase-2 rolling): cap the rolls per
-        # ride at ``base + (step - start) // every`` so early training
-        # re-seeds often (short rides) and later training rolls deeper.
-        # E.g. base=2, every=50: steps [start, start+50) -> first window
-        # + 1 extra roll; +1 extra roll per 50 steps thereafter. 0 = off
-        # (plain max_rolls_per_ride). The schedule only LOWERS the cap.
-        _sched_every = int(getattr(
-            cfg, "rolling_rolls_schedule_every", 0))
-        if _sched_every > 0:
-            _sched_base = int(getattr(
-                cfg, "rolling_rolls_schedule_base", 2))
-            _sched_start = int(getattr(
-                cfg, "rolling_rolls_schedule_start_step", 0))
-            _cur_step = int(getattr(self, "step", 0))
-            max_rolls = min(
-                max_rolls,
-                _sched_base
-                + max(0, _cur_step - _sched_start) // _sched_every,
-            )
+        # ---- Toothpaste rollout-depth curriculum (phase-2 rolling) -------
+        # MAE-EARNED depth growth: the rollout depth cap grows by +1 roll
+        # ONLY when the running-average frontier MAE at the current depth is
+        # <= the previous depth's running average x (1+tol) ("as good as one
+        # step shallower"). Replaces the step-count rolls schedule. Depth is
+        # GLOBAL (all ranks agree): the growth decision is driven by the
+        # all-reduced MEAN frontier MAE at reset, so every rank holds an
+        # identical _tp_depth and the reset cadence stays lockstep. Lazy
+        # state init on first call. See the reset block for grow/gone logic.
+        _tp_on = bool(getattr(cfg, "rolling_toothpaste_enabled", False))
+        if _tp_on and not getattr(self, "_tp_init", False):
+            self._tp_init = True
+            self._tp_depth = int(
+                getattr(cfg, "rolling_toothpaste_depth_start", 4))
+            self._tp_cur: List[float] = []        # frontier MAEs @ cur depth
+            self._tp_prev_avg: Optional[float] = None  # prev-depth running avg
+            self._tp_win = int(
+                getattr(cfg, "rolling_toothpaste_avg_window", 5))
+            self._tp_tol = float(
+                getattr(cfg, "rolling_toothpaste_grow_tol", 0.10))
+            self._tp_gone = float(
+                getattr(cfg, "rolling_toothpaste_gone_factor", 3.0))
+            self._tp_windows_per_ride = int(
+                getattr(cfg, "rolling_windows_per_ride", 8))
+            self._tp_windows_this_ride = 0
+            self._tp_held_ride: Optional[Dict[str, Any]] = None
+        if _tp_on:
+            max_rolls = int(self._tp_depth)
+        else:
+            # Legacy step-count schedule (only LOWERS the cap): cap rolls at
+            # ``base + (step - start) // every``.
+            _sched_every = int(getattr(
+                cfg, "rolling_rolls_schedule_every", 0))
+            if _sched_every > 0:
+                _sched_base = int(getattr(
+                    cfg, "rolling_rolls_schedule_base", 2))
+                _sched_start = int(getattr(
+                    cfg, "rolling_rolls_schedule_start_step", 0))
+                _cur_step = int(getattr(self, "step", 0))
+                max_rolls = min(
+                    max_rolls,
+                    _sched_base
+                    + max(0, _cur_step - _sched_start) // _sched_every,
+                )
         force_exit_step_enabled = bool(
             getattr(cfg, "force_exit_step_enabled", False)
         )
@@ -8126,17 +7816,38 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         needs_setup = self.model.streaming_state is None
         if needs_setup:
             t_setup_start = time.monotonic()
-            ride, prefetch_wait_ms = self._consume_or_load_ride(
-                rollout_frames + cf_dmdctx,
+            # Same-ride resampling (toothpaste): instead of loading a fresh
+            # ride from disk on every reset, REUSE the already-resident ride
+            # for up to ``rolling_windows_per_ride`` windows, re-seeding from
+            # a NEW motion-aware offset each time (the whole ride is on GPU
+            # and is longer than one window — picking a new ``s`` is free,
+            # vs a disk read + decode + H2D for a new ride). The reuse
+            # decision is identical across ranks (the windows counter is
+            # bumped only on the rank-lockstep reset, windows_per_ride is a
+            # constant, and every rank holds a ride after setup), so the
+            # anchor-forward broadcast inside setup_sequence stays matched.
+            _reuse_ride = (
+                _tp_on
+                and getattr(self, "_tp_held_ride", None) is not None
+                and self._tp_windows_this_ride < self._tp_windows_per_ride
             )
-            if ride is None:
-                # Loader exhausted on this step. Outer trainer treats
-                # None as "skip optim, increment step, continue". The
-                # consecutive-None guard below catches a permanent
-                # loader fault before silently wasting the entire run.
-                return self._handle_streaming_step_none(
-                    "ride_loader_exhausted_on_setup",
+            if _reuse_ride:
+                ride = self._tp_held_ride
+                prefetch_wait_ms = 0.0
+            else:
+                ride, prefetch_wait_ms = self._consume_or_load_ride(
+                    rollout_frames + cf_dmdctx,
                 )
+                if ride is None:
+                    # Loader exhausted on this step. Outer trainer treats
+                    # None as "skip optim, increment step, continue". The
+                    # consecutive-None guard below catches a permanent
+                    # loader fault before silently wasting the entire run.
+                    return self._handle_streaming_step_none(
+                        "ride_loader_exhausted_on_setup",
+                    )
+                if _tp_on:
+                    self._tp_windows_this_ride = 0   # fresh ride
             ok = self._streaming_setup_sequence_from_ride(
                 rollout_frames=rollout_frames,
                 max_total_rollout_frames=rollout_frames,
@@ -8144,11 +7855,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 ride=ride,
             )
             if not ok:
+                # Setup rejected this ride (too short / bad offset). Drop any
+                # held ride so the next setup loads a fresh one.
+                if _tp_on:
+                    self._tp_held_ride = None
                 return self._handle_streaming_step_none(
                     "setup_sequence_rejected_ride",
                 )
+            if _tp_on:
+                self._tp_held_ride = ride   # hold for same-ride resampling
             self._chunks_in_current_ride = 0
             t_setup_ms = (time.monotonic() - t_setup_start) * 1000.0
+            # FT_v3 fresh-ride OOM fix. setup_sequence above runs the
+            # _prebuild_rollout2 + seed-prefill mini-rollouts (no_grad, freed
+            # immediately) but their blocks stay reserved in the caching
+            # allocator. This SAME step then runs a full training step ending
+            # in the GAN disc R1/R2 double-backward (heavy); the setup residual
+            # stacks under that backward and tips fresh-ride steps over (the
+            # observed OOM missed by ~40 MB). Return the freed setup blocks to
+            # the allocator now so the training forward/backward allocates from
+            # a clean state. Result-preserving; rank-uniform (needs_setup is
+            # lockstep — every rank resets together — so the sync can't desync
+            # DDP).
+            if (
+                bool(getattr(
+                    self.config, "empty_cache_after_ride_setup", True))
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.empty_cache()
         # Reset the consecutive-None counter on any successful setup
         # OR continuing-from-existing-state path.
         self._consecutive_streaming_step_none = 0
@@ -8253,13 +7987,58 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["streaming_did_setup_this_step"] = 1.0 if needs_setup else 0.0
         out["streaming_window_start_chunk"] = float(self._chunks_in_current_ride)
 
-        # ---- Stage 4: train every active head -----------------------
+        # ---- Toothpaste GONE gate -----------------------------------
+        # If this window's frontier MAE has blown past the off-manifold bar
+        # (prev-depth running avg x gone_factor), the chunk is GONE: skip
+        # supervising it (DMD/GAN against a collapsed chunk drags the
+        # generator off its delicate manifold) and force a reset below. DDP:
+        # MAX-reduce the gone flag so ALL ranks skip Stage 4 together (its
+        # gen/critic backward all-reduces stay matched) and ALL reset.
+        _tp_gone_hit = False
+        # Gone baseline: the previous depth's running avg once it exists,
+        # ELSE the current depth's running avg (so GONE arms after the first
+        # clean window at the start depth, instead of being inert until the
+        # first growth — closes the early-training off-manifold hole).
+        _gone_base = self._tp_prev_avg if _tp_on else None
+        if _tp_on and _gone_base is None and len(self._tp_cur) >= 1:
+            _gone_base = sum(self._tp_cur) / float(len(self._tp_cur))
+        if (
+            _tp_on
+            and _gone_base is not None
+            and self._chunks_in_current_ride >= 1
+        ):
+            _local_gone = self._toothpaste_gone(
+                avg_mae, _gone_base, self._tp_gone)
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                _gt = torch.tensor(
+                    [1 if _local_gone else 0],
+                    device=self.device, dtype=torch.long,
+                )
+                dist.all_reduce(_gt, op=dist.ReduceOp.MAX)
+                _tp_gone_hit = bool(int(_gt.item()))
+            else:
+                _tp_gone_hit = _local_gone
+
+        # ---- Stage 4: train every active head (skipped if GONE) ----------
         t_train_start = time.monotonic()
-        self._streaming_train_one_chunk(
-            chunk, info, avg_mae,
-            state=state, cf_state=cf_state, chunk_size=chunk_size,
-            out=out,
-        )
+        if not _tp_gone_hit:
+            self._streaming_train_one_chunk(
+                chunk, info, avg_mae,
+                state=state, cf_state=cf_state, chunk_size=chunk_size,
+                out=out,
+            )
+        else:
+            out["streaming_tp_gone"] = 1.0
+            # GONE skips Stage 4's gen backward, but the rollout forward
+            # (generate_next_chunk, requires_grad=True) already armed the
+            # generator's DDP reducer. Discharge it with a ZERO-ANCHOR
+            # backward (zero grad -> no param update) so the next step's
+            # forward can't trip "Expected to have finished reduction in the
+            # prior iteration". Mirrors the FN zero-anchor pattern. GONE is
+            # MAX-reduced (all ranks take this branch) and requires_grad is
+            # set uniformly, so this backward is collective-matched.
+            if torch.is_tensor(chunk) and chunk.requires_grad:
+                (chunk.float().sum() * 0.0).backward()
         t_train_ms = (time.monotonic() - t_train_start) * 1000.0
 
         # ---- Stage 5: reset decision for NEXT step ------------------
@@ -8294,8 +8073,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
         local_hit_cap = self._chunks_in_current_ride >= max_rolls
         local_exhausted = not self.model.can_generate_more()
+        # Toothpaste GONE forces a reset (already global via the MAX-reduce
+        # in the gone gate above, so it agrees across ranks).
         local_should_reset = (
             local_hit_cap or local_exhausted or local_mae_collapse
+            or _tp_gone_hit
         )
         if dist.is_initialized() and dist.get_world_size() > 1:
             flag_t = torch.tensor(
@@ -8306,6 +8088,44 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             should_reset = bool(int(flag_t.item()))
         else:
             should_reset = local_should_reset
+
+        # ---- Toothpaste depth growth (global, DDP-consistent) -----------
+        # On a reset, record this ride's frontier MAE (MEAN-reduced across
+        # ranks so _tp_depth stays identical everywhere). GONE resets are
+        # failures and do NOT feed the grow average. Once a full sliding
+        # window of clean samples exists at the current depth, grow depth by
+        # +1 roll if the running average is <= the previous depth's average
+        # x (1+tol). Unbounded — the per-ride roll_cap (ride length) is the
+        # physical limit, so an over-large depth just exhausts the ride.
+        if _tp_on and should_reset:
+            # Same-ride window budget: count this completed window; once the
+            # ride has served ``windows_per_ride`` windows, drop it so the
+            # next setup loads a fresh ride. A GONE reset still counts but
+            # stays on the same ride (a different window) until the budget is
+            # spent — i.e. it jumps to a new offset rather than reloading.
+            self._tp_windows_this_ride += 1
+            if self._tp_windows_this_ride >= self._tp_windows_per_ride:
+                self._tp_held_ride = None
+            _fr_mae = float(avg_mae)
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                _ft = torch.tensor(
+                    [_fr_mae], device=self.device, dtype=torch.float32)
+                dist.all_reduce(_ft, op=dist.ReduceOp.SUM)
+                _fr_mae = float(_ft.item()) / float(dist.get_world_size())
+            if not _tp_gone_hit:
+                self._tp_cur.append(_fr_mae)
+                if len(self._tp_cur) > self._tp_win:
+                    self._tp_cur.pop(0)
+                _grow, _new_base = self._toothpaste_grow(
+                    self._tp_cur, self._tp_win, self._tp_prev_avg,
+                    self._tp_tol)
+                if _grow:
+                    self._tp_depth += 1
+                    self._tp_prev_avg = _new_base
+                    self._tp_cur = []   # fresh window at the new depth
+            out["streaming_tp_depth"] = float(self._tp_depth)
+            out["streaming_tp_gone"] = 1.0 if _tp_gone_hit else out.get(
+                "streaming_tp_gone", 0.0)
 
         # Telemetry: log the LOCAL reason so we can tell apart "this
         # rank actually wanted to reset" from "peer triggered the
@@ -8334,6 +8154,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.model, "forward_noiser_loss_mode", "mse",
                 )) == "teacher_feat"
             ):
+                # FT_v3 reset-boundary OOM fix. The gen+critic backwards in
+                # Stage 4 already RELEASED this chunk's autograd graph, but the
+                # freed activation blocks stay in the caching allocator
+                # (reserved, possibly fragmented). _train_fn_frontier_pair then
+                # generates TWO fresh frontier rollouts; on a reserved/
+                # fragmented cache those allocations grow the high-water mark
+                # and STACK toward OOM (the ~2x reset-step spike). Drop the
+                # step's last grad-tensor references and return the freed
+                # blocks to the allocator FIRST, so the frontier pair allocates
+                # from a clean state instead of on top of the rolling step.
+                # Result-preserving (no math touched — chunk/info are unused
+                # past this point on a reset step) and rank-uniform (every rank
+                # takes this MAX-reduced reset branch in lockstep, so the
+                # empty_cache sync can't desync DDP).
+                chunk = None
+                info = None
+                if (
+                    bool(getattr(
+                        self.config, "free_graph_before_frontier_pair", True))
+                    and torch.cuda.is_available()
+                ):
+                    torch.cuda.empty_cache()
                 out.update(self._train_fn_frontier_pair())
             self.model.reset_streaming_state()
             # Deferred 7chunk eval (see the gate in
@@ -8356,6 +8198,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self._log_pred_image_7chunk_sample(int(self.step) + 1)
         else:
             out["streaming_did_reset"] = 0.0
+
+        # Leak hunt (memory_audit_enabled): per-RANK, per-roll allocated +
+        # peak, on EVERY rank (not just rank 0) so we can see the rank that
+        # actually OOMs and whether its ``alloc`` grows MONOTONICALLY within
+        # a ride (= a rolling leak) vs is stable (= a transient peak). Logs
+        # ride_chunk so growth-vs-depth is visible.
+        if (
+            bool(getattr(self.config, "memory_audit_enabled", False))
+            and torch.cuda.is_available()
+        ):
+            import sys as _sys
+            _rk = dist.get_rank() if (
+                dist.is_initialized() and dist.get_world_size() > 1) else 0
+            print(
+                f"[MEMRANK] rank={_rk} step={int(getattr(self, 'step', -1))} "
+                f"ride_chunk={self._chunks_in_current_ride} "
+                f"reset={int(bool(should_reset))} "
+                f"alloc_gb={torch.cuda.memory_allocated()/2**30:.2f} "
+                f"peak_gb={torch.cuda.max_memory_allocated()/2**30:.2f}",
+                file=_sys.stderr, flush=True,
+            )
 
         # Phase-2 rolling stderr telemetry (rank 0, only when the
         # deterministic-stride rolling mode is active): one compact line
@@ -8690,6 +8553,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # through so the disc and gen-side aux losses consume the
             # near-clean output as the G-side fake.
             _flash_dmd_gan_x0 = train_info.get("flash_dmd_gan_x0")
+            # Reset the deferred-disc slot before the GAN compute. When
+            # ladd_defer_disc_update is on, _compute_r3gan_losses stashes the
+            # disc-update closure here instead of running it inline; we run it
+            # after the critic backward frees the gen graph (see below).
+            self._ladd_pending_disc = None
             gen_gan_loss, gan_logs = self._compute_r3gan_losses(
                 pred_image=train_chunk,
                 gt_latents_window=gt_window,
@@ -8699,21 +8567,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
             self._mem_step_snapshot("4_after_gan_pre_backward")
-
-        # Moment-GAN runs independently of the main GAN gate (its own
-        # ``moment_gan_enabled`` flag). Trained against GT moments
-        # (always available); supplies a distribution-matching signal
-        # on per-frame std (+ optional mean / RMS) that replaces the
-        # point-wise ``latent_std_mse_loss`` anti-collapse signal.
-        if self.moment_gan_enabled and self.moment_disc is not None:
-            _mgt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
-            moment_gen_loss, moment_logs = self._compute_moment_gan_losses(
-                pred_image=train_chunk,
-                gt_latents_window=_mgt_window,
-                current_step=int(self.step),
-            )
-            generator_loss = generator_loss + moment_gen_loss
-            out.update(moment_logs)
 
         # Pixel-space perceptual losses (LPIPS + pixel reconstruction).
         # Direct anti-blur + anti-drift signals on a graph-on decoded
@@ -8800,6 +8653,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         })
         critic_loss.backward()
         self._mem_step_snapshot("6_after_critic_backward")
+
+        # Deferred GAN disc update (ladd_defer_disc_update): the gen +
+        # critic backwards above have now freed the shared ~88 GB gen graph
+        # (the gen backward used retain_graph=True; the critic backward
+        # released it). Run the disc update HERE — its closure (stashed in
+        # _compute_r3gan_losses) reads only detached inputs, so its result is
+        # identical to running inline, but the disc backward no longer stacks
+        # on the resident gen graph (the FT_v3 rolling OOM). No-op when the
+        # flag is off (slot stays None) or no GAN ran this step. DDP-safe:
+        # GAN gating is step-based (same on all ranks) so the closure is
+        # stashed-and-run on all ranks or none — disc collectives stay matched.
+        _pending_disc = getattr(self, "_ladd_pending_disc", None)
+        if _pending_disc is not None:
+            _pending_disc()
+            self._ladd_pending_disc = None
+            self._mem_step_snapshot("6a_after_deferred_disc")
 
         # ForwardNoiser teacher_feat training (separate FN backward, fully
         # decoupled from fake_score). Runs AFTER the gen+critic backwards so
@@ -9016,13 +8885,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 return False
         ride_len = int(ride["latents"].shape[1])
 
-        # Per-rank motion-aware s pick. Each rank biases toward its
-        # OWN ride's motion. ``rollout_frames`` is the window we want
-        # motion in (= the first valid scoring window of the streaming
-        # sequence).
-        s_local_max = max(
-            0, min(ride_len // 2, ride_len - cf_dmdctx - cap),
+        # Rolling GT-headroom, reserved UP FRONT (before picking s).
+        #   * dmd_42f_rolling_sup_new: +npb GT scaffold beyond the newest
+        #     rolled frame (the masked OOD slot).
+        #   * dmd_42f_clean_drift_enabled: forward clean places clean_x up to
+        #     +npb AHEAD of the noisy window at frac=1, so the 42f clean
+        #     slice (clean_lo+N) needs another +npb of real GT.
+        _rolling_slack = (
+            npb if bool(getattr(
+                self.config, "dmd_42f_rolling_sup_new", False)) else 0
         )
+        if bool(getattr(self.config, "dmd_42f_clean_drift_enabled", False)):
+            _rolling_slack += npb
+        min_new = int(getattr(self.model, "streaming_min_new_frame", npb))
+        anchor_frames = int(getattr(
+            self.model, "dmd_clean_x_anchor_frames", npb))
+
+        # Per-rank motion-aware s pick. Each rank biases toward its OWN
+        # ride's motion. CRITICAL: ``s_local_max`` reserves the rolling
+        # headroom + anchor + min_new floor so that roll_cap clears the
+        # reject threshold for EVERY s in range (the +npb covers the
+        # actual_cap npb-snap). Without this, same-ride resampling could
+        # draw a large s that fails the roll_cap reject on SOME ranks but
+        # not others -> divergent ``return False`` -> DDP hang. With it, a
+        # ride that ever set up successfully (at any s, incl. s=0) can be
+        # re-seeded at any new s without a per-rank reject split.
+        s_local_max = self._setup_s_local_max(
+            ride_len, cf_dmdctx, cap, _rolling_slack,
+            anchor_frames, min_new, npb)
         s = self._pick_motion_aware_offset(
             ride,
             s_local_max=s_local_max,
@@ -9030,38 +8920,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             window_len=int(rollout_frames),
         )
 
-        # Per-rank rolling-window cap: how many post-seed frames fit
-        # in this rank's ride. Snap to npb. NO MIN-reduce — each rank
-        # rolls until its own ride's MAE crosses or its own cap is
-        # reached. Cross-rank lockstep is not required because every
-        # collective in the per-step training (gen / fake_score backward
-        # all-reduces, the inner pipeline's exit-flag broadcast) fires
-        # exactly once per outer trainer iter on every rank by
-        # construction.
+        # Per-rank rolling-window cap: how many post-seed frames fit in this
+        # rank's ride. Snap to npb. NO MIN-reduce — each rank rolls until its
+        # own ride's MAE crosses or its own cap is reached.
         actual_cap = min(cap, ride_len - cf_dmdctx - s)
         if actual_cap % npb != 0:
             actual_cap = (actual_cap // npb) * npb
-        # Phase-2 rolling (dmd_42f_rolling_sup_new): the 42f rolling
-        # layout needs one GT chunk BEYOND the newest rolled frame (the
-        # scaffold at the masked OOD slot). Keep the ride window sliced
-        # at the full ``actual_cap`` but stop the ROLLING ``max_length``
-        # one chunk short, so ride GT at [new_hi, new_hi + npb) always
-        # exists for the last roll.
-        _rolling_slack = (
-            npb if bool(getattr(
-                self.config, "dmd_42f_rolling_sup_new", False)) else 0
-        )
-        # Forward clean drift (e-framework) places clean_x up to +npb AHEAD of
-        # the noisy window at frac=1, so the 42f clean slice (clean_lo+N) needs
-        # npb MORE real GT beyond the rolling scaffold. Reserve it so the last
-        # roll's forward-clean read stays in-bounds.
-        if bool(getattr(self.config, "dmd_42f_clean_drift_enabled", False)):
-            _rolling_slack += npb
         roll_cap = actual_cap - _rolling_slack
-        # Reject if the ride can't fit the +npb anchor + at least one
-        # valid ``generate_next_chunk`` call.
-        min_new = int(getattr(self.model, "streaming_min_new_frame", npb))
-        anchor_frames = int(getattr(self.model, "dmd_clean_x_anchor_frames", npb))
+        # Belt-and-braces: should be unreachable for length now that
+        # s_local_max reserves the floor — only fires for a genuinely tiny
+        # ride (guarded by the dataset min_ride_frames filter), and no
+        # longer depends on the per-rank s, so it can't split control flow
+        # across ranks on a reused ride.
         if roll_cap < anchor_frames + min_new:
             return False
 
@@ -9546,23 +9416,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                     generator_loss = generator_loss + gen_gan_loss
                     merged.update(gan_logs)
-
-                # Moment-GAN runs independently of the main GAN gate
-                # (own ``moment_gan_enabled`` flag). Same idea as the
-                # streaming path above.
-                if self.moment_gan_enabled and self.moment_disc is not None:
-                    _mgt_window = latents[
-                        :, gen_window_start:gen_window_end
-                    ]
-                    moment_gen_loss, moment_logs = (
-                        self._compute_moment_gan_losses(
-                            pred_image=pred_image,
-                            gt_latents_window=_mgt_window,
-                            current_step=int(self.step),
-                        )
-                    )
-                    generator_loss = generator_loss + moment_gen_loss
-                    merged.update(moment_logs)
 
                 if sc_dmd_active:
                     sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
