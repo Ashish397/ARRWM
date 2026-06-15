@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-rolling_main
+#SBATCH --job-name=af-stat_main
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,7 +11,7 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# ============================ new_main ===============================
+# ============================ stat_main ===============================
 # Fresh baseline (clean naming; was the v8j3g3 lineage). Authoritative
 # config summary — the GAN is FIXED and now being tuned to drive harder:
 #   GAN:  wavelet OFF (the disc-blinding bug), eq OFF, matching ON
@@ -21,13 +21,17 @@
 #         -> gamma=10 on the normalized scale; fires 1-of-5 per step
 #         (ladd_r1_once_per_step); sigma=0.01.
 #   GAN volume: gan_loss_weight=1.0.  Disc CAPACITY: proj_dim 256 -> 512.
-#   DMD:  dmd_42f_fix_clean_counterpart=FALSE (per user request, overriding
-#         my concern) — the supervised chunk's clean counterpart is now GT,
-#         not student. CAVEAT ON RECORD: the bidir scorer can now read the
-#         band's GT in the clean half (a leak the flag was added to kill) and
-#         the clean/noisy halves disagree (OOD vs v14's identical-halves
-#         contract); the DMD target is ALREADY GT (gt_target). Testing the
-#         hypothesis that a GT clean reference helps anyway.
+#   DMD:  dmd_42f_seed_last=FALSE (per user) — the noisy after-block is the
+#         student's OWN rolled chunks (DETACHED/no-grad), not a GT scaffold,
+#         so the supervised chunk is scored in the future-context it actually
+#         sees at inference (student), not an OOD GT-anchored future. Noisy:
+#         [ G G G | S S | s s ] (s = student, no-grad).
+#         dmd_42f_fix_clean_counterpart=FALSE (per user, overriding my
+#         concern) — the supervised chunk's clean counterpart is now GT, not
+#         student, so clean = all GT. CAVEAT ON RECORD: the bidir scorer can
+#         now read the band's GT in the clean half (a leak the flag was added
+#         to kill) + clean/noisy halves disagree (OOD vs v14's identical-half
+#         contract); the DMD target is ALREADY GT (gt_target). Testing both.
 # Judge by gen/dmd_mae_gate_m_fake (student MAE), NOT the (d_real-d_fake) gap.
 # >>> SMOKE FIRST: confirm normalized R1 grad_sq scale (gamma sane) + no OOM
 #     from proj_dim=512 before the full run. <<<
@@ -354,7 +358,7 @@ srun torchrun \
     dmd_asymmetric_scoring_enabled=false \
     dmd_42f_enabled=true \
     dmd_42f_2chunk=false \
-    dmd_42f_seed_last=true \
+    dmd_42f_seed_last=false \
     dmd_42f_gt_after_chunks=2 \
     dmd_42f_rand_sup_slot=false \
     dmd_42f_allsup=false \
@@ -443,6 +447,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=rolling_main_j${SLURM_JOB_ID}
+    run_name=stat_main_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
