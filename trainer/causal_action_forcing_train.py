@@ -5965,6 +5965,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             }
             return generator_gan_loss, logs
 
+        # Degenerate-match fallback: if _match was True but the match pool was
+        # absent/too small, the matched branch above fell through and the
+        # precompute guard left the noisy tensors None — the positional D-loop
+        # below would None-deref. Build them now so behaviour matches the
+        # pre-guard graceful fallback (only hit on an empty-match ride; the
+        # normal matched path returns above and never reaches here).
+        if _match_active and real_chunks_det_noisy is None:
+            real_chunks_det_noisy = _add_disc_noise(real_chunks_det)
+            fake_chunks_det_noisy = _add_disc_noise(fake_chunks_det)
+            if diff_aug_policy:
+                real_chunks_det_noisy, fake_chunks_det_noisy = (
+                    latent_diff_augment(
+                        real_chunks_det_noisy,
+                        fake_chunks_det_noisy,
+                        policy=diff_aug_policy,
+                        seed=int(current_step) * 31 + seed_offset,
+                    )
+                )
+
         if n_disc_updates > 0 and self.r3gan_optimizer is not None:
             for _ in range(n_disc_updates):
                 self.r3gan_optimizer.zero_grad(set_to_none=True)
