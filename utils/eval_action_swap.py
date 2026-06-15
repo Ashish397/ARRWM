@@ -82,6 +82,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--logdir", default="", help="override checkpoint logdir")
+    ap.add_argument("--checkpoint", default="", help="explicit checkpoint path (overrides auto_resume latest)")
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--out", default="/scratch/u6ex/as1748.u6ex/ARRWM/paper_assets/action_swap_results.json")
     args = ap.parse_args()
@@ -93,6 +94,10 @@ def main():
     config = OmegaConf.merge(default_config, config)
     if args.logdir:
         config.logdir = args.logdir
+    if args.checkpoint:
+        # Explicit checkpoint takes precedence over auto_resume's latest
+        # (used to skip a truncated/corrupt latest checkpoint).
+        config.resume_from = args.checkpoint
     # eval-only flags
     config.disable_wandb = True
     config.no_save = True

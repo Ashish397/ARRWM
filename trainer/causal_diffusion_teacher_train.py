@@ -1148,7 +1148,29 @@ class CausalLoRADiffusionTrainer:
         if self.logdir is None:
             return None
         checkpoints = sorted(self.logdir.glob("causal_lora_step*.pt"))
-        return checkpoints[-1] if checkpoints else None
+        if not checkpoints:
+            return None
+        # Skip a truncated newest checkpoint (e.g. the job was killed mid-write).
+        # We compare file SIZES via stat() only -- we must never read content to
+        # validate, because reading a partially-written file over the network
+        # filesystem can BLOCK indefinitely (the failure mode this guards against).
+        sizes = {}
+        for c in checkpoints:
+            try:
+                sizes[c] = c.stat().st_size
+            except OSError:
+                sizes[c] = 0
+        ref = max(sizes.values()) if sizes else 0
+        for c in reversed(checkpoints):  # newest first
+            if sizes[c] > 0 and sizes[c] >= 0.97 * ref:
+                return c
+            if self.is_main_process:
+                logging.warning(
+                    "Skipping suspect checkpoint %s (%.0f MB < 97%% of %.0f MB); "
+                    "likely truncated by an interrupted write.",
+                    c.name, sizes[c] / 1e6, ref / 1e6,
+                )
+        return None
 
     def _maybe_resume(self) -> None:
         resume = getattr(self.config, "resume_from", None)
@@ -1318,13 +1340,36 @@ class CausalLoRADiffusionTrainer:
                 state["state_token_init"] = base._state_token_init.data
                 state["state_readout"] = base._state_readout.state_dict()
         if self.is_main_process:
-            torch.save(state, path)
+            # Atomic write: save to a temp file, flush to disk, then rename.
+            # If the process is killed mid-write, only the ``.tmp`` is left
+            # partial (it is excluded by the ``*.pt`` glob), so the canonical
+            # checkpoint is never truncated -- preventing the load-time hang a
+            # partially-written file causes over the network filesystem.
+            tmp_path = path.parent / (path.name + ".tmp")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            torch.save(state, tmp_path)
+            try:
+                with open(tmp_path, "rb") as _f:
+                    os.fsync(_f.fileno())
+            except OSError:
+                pass
+            os.replace(tmp_path, path)
             logging.info("Saved checkpoint to %s", path)
             self._cleanup_old_checkpoints(keep_last=keep_last)
 
     def _cleanup_old_checkpoints(self, keep_last: int = 3) -> None:
         if self.logdir is None:
             return
+        # Remove any stale temp files left by an interrupted atomic write.
+        for stale in self.logdir.glob("causal_lora_step*.pt.tmp"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         checkpoints = sorted(self.logdir.glob("causal_lora_step*.pt"))
         if len(checkpoints) <= keep_last:
             return

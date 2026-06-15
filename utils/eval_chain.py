@@ -136,6 +136,42 @@ MODEL_ASSIGNMENTS = [
         "critic_base_ch": 128,
         "critic_res_blocks": 4,
     },
+    {  # index 6: v14 with state probe ablated (loo_f3); injection unchanged
+        "ckpt": "logs/v14_loo_f3/causal_lora_step0003700.pt",
+        "label": "v14_loo_f3",
+        "has_critic": True,
+        "has_adaln": True,
+        "has_action_tokens": True,
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
+    {  # index 7: v14 with action tokens ablated (loo_tokens); AdaLN-only injection
+        "ckpt": "logs/v14_loo_tokens/causal_lora_step0004000.pt",
+        "label": "v14_loo_tokens",
+        "has_critic": True,
+        "has_adaln": True,
+        "has_action_tokens": False,   # mode=adaln -> no action-token projection
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
+    {  # index 8: v14 with AdaLN ablated (loo_adaln); action-tokens-only injection
+        "ckpt": "logs/v14_loo_adaln/causal_lora_step0004000.pt",
+        "label": "v14_loo_adaln",
+        "has_critic": True,
+        "has_adaln": False,           # mode=action_tokens -> no AdaLN projection
+        "has_action_tokens": True,
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
+    {  # index 9: v14 with critic guidance loss ablated (loo_f2); injection unchanged
+        "ckpt": "logs/v14_loo_f2/causal_lora_step0004000.pt",
+        "label": "v14_loo_f2",
+        "has_critic": True,
+        "has_adaln": True,
+        "has_action_tokens": True,
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
 ]
 
 # Per-segment denoising noise: same across all GPUs for a given segment index.

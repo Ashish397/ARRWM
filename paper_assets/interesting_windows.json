@@ -1,0 +1,7583 @@
+{
+ "n_rides": 842,
+ "windows": [
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411092748.zarr",
+   "start": 6,
+   "n_latent_frames": 1046,
+   "turn": 0.92,
+   "turn_var": 0.908,
+   "motion": 0.939,
+   "score": 2.031
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502110116.zarr",
+   "start": 1083,
+   "n_latent_frames": 1258,
+   "turn": 0.899,
+   "turn_var": 0.894,
+   "motion": 0.968,
+   "score": 2.024
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240419085357.zarr",
+   "start": 1416,
+   "n_latent_frames": 1479,
+   "turn": 0.927,
+   "turn_var": 0.922,
+   "motion": 0.861,
+   "score": 1.991
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502111936.zarr",
+   "start": 885,
+   "n_latent_frames": 1320,
+   "turn": 0.828,
+   "turn_var": 0.842,
+   "motion": 0.961,
+   "score": 1.922
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430070818.zarr",
+   "start": 687,
+   "n_latent_frames": 1474,
+   "turn": 0.838,
+   "turn_var": 0.839,
+   "motion": 0.945,
+   "score": 1.919
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501125737.zarr",
+   "start": 123,
+   "n_latent_frames": 1161,
+   "turn": 0.848,
+   "turn_var": 0.846,
+   "motion": 0.925,
+   "score": 1.918
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318111202.zarr",
+   "start": 174,
+   "n_latent_frames": 1482,
+   "turn": 0.818,
+   "turn_var": 0.851,
+   "motion": 0.943,
+   "score": 1.903
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409122719.zarr",
+   "start": 237,
+   "n_latent_frames": 837,
+   "turn": 0.843,
+   "turn_var": 0.844,
+   "motion": 0.91,
+   "score": 1.901
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320103947.zarr",
+   "start": 1284,
+   "n_latent_frames": 1455,
+   "turn": 0.829,
+   "turn_var": 0.837,
+   "motion": 0.914,
+   "score": 1.887
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405113053.zarr",
+   "start": 621,
+   "n_latent_frames": 981,
+   "turn": 0.827,
+   "turn_var": 0.837,
+   "motion": 0.892,
+   "score": 1.87
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319113538.zarr",
+   "start": 45,
+   "n_latent_frames": 1494,
+   "turn": 0.813,
+   "turn_var": 0.82,
+   "motion": 0.915,
+   "score": 1.863
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319110417.zarr",
+   "start": 429,
+   "n_latent_frames": 1491,
+   "turn": 0.836,
+   "turn_var": 0.774,
+   "motion": 0.912,
+   "score": 1.861
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416095316.zarr",
+   "start": 24,
+   "n_latent_frames": 1410,
+   "turn": 0.821,
+   "turn_var": 0.798,
+   "motion": 0.915,
+   "score": 1.861
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314102957.zarr",
+   "start": 963,
+   "n_latent_frames": 1428,
+   "turn": 0.839,
+   "turn_var": 0.828,
+   "motion": 0.863,
+   "score": 1.858
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318112401.zarr",
+   "start": 54,
+   "n_latent_frames": 1482,
+   "turn": 0.805,
+   "turn_var": 0.842,
+   "motion": 0.883,
+   "score": 1.844
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318101018.zarr",
+   "start": 168,
+   "n_latent_frames": 1491,
+   "turn": 0.788,
+   "turn_var": 0.81,
+   "motion": 0.928,
+   "score": 1.843
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318113642.zarr",
+   "start": 459,
+   "n_latent_frames": 707,
+   "turn": 0.78,
+   "turn_var": 0.802,
+   "motion": 0.937,
+   "score": 1.837
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411111101.zarr",
+   "start": 345,
+   "n_latent_frames": 1485,
+   "turn": 0.785,
+   "turn_var": 0.804,
+   "motion": 0.896,
+   "score": 1.814
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221103934.zarr",
+   "start": 51,
+   "n_latent_frames": 1470,
+   "turn": 0.783,
+   "turn_var": 0.79,
+   "motion": 0.895,
+   "score": 1.804
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409101734.zarr",
+   "start": 606,
+   "n_latent_frames": 1326,
+   "turn": 0.832,
+   "turn_var": 0.721,
+   "motion": 0.874,
+   "score": 1.804
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409123859.zarr",
+   "start": 987,
+   "n_latent_frames": 1491,
+   "turn": 0.767,
+   "turn_var": 0.807,
+   "motion": 0.899,
+   "score": 1.8
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416104537.zarr",
+   "start": 15,
+   "n_latent_frames": 1348,
+   "turn": 0.754,
+   "turn_var": 0.803,
+   "motion": 0.92,
+   "score": 1.8
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315115332.zarr",
+   "start": 420,
+   "n_latent_frames": 722,
+   "turn": 0.897,
+   "turn_var": 0.858,
+   "motion": 0.675,
+   "score": 1.798
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316154528.zarr",
+   "start": 705,
+   "n_latent_frames": 1497,
+   "turn": 0.757,
+   "turn_var": 0.772,
+   "motion": 0.935,
+   "score": 1.797
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425091420.zarr",
+   "start": 18,
+   "n_latent_frames": 1470,
+   "turn": 0.791,
+   "turn_var": 0.787,
+   "motion": 0.874,
+   "score": 1.796
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314104839.zarr",
+   "start": 417,
+   "n_latent_frames": 760,
+   "turn": 0.769,
+   "turn_var": 0.785,
+   "motion": 0.902,
+   "score": 1.793
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410083721.zarr",
+   "start": 906,
+   "n_latent_frames": 1208,
+   "turn": 0.754,
+   "turn_var": 0.784,
+   "motion": 0.919,
+   "score": 1.789
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315102957.zarr",
+   "start": 1095,
+   "n_latent_frames": 1494,
+   "turn": 0.749,
+   "turn_var": 0.779,
+   "motion": 0.921,
+   "score": 1.784
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418091717.zarr",
+   "start": 681,
+   "n_latent_frames": 1497,
+   "turn": 0.743,
+   "turn_var": 0.737,
+   "motion": 0.952,
+   "score": 1.778
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318102238.zarr",
+   "start": 75,
+   "n_latent_frames": 1497,
+   "turn": 0.741,
+   "turn_var": 0.811,
+   "motion": 0.899,
+   "score": 1.776
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425094114.zarr",
+   "start": 696,
+   "n_latent_frames": 1285,
+   "turn": 0.78,
+   "turn_var": 0.762,
+   "motion": 0.879,
+   "score": 1.776
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405125833.zarr",
+   "start": 336,
+   "n_latent_frames": 1488,
+   "turn": 0.739,
+   "turn_var": 0.749,
+   "motion": 0.934,
+   "score": 1.768
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315163459.zarr",
+   "start": 1197,
+   "n_latent_frames": 1491,
+   "turn": 0.748,
+   "turn_var": 0.78,
+   "motion": 0.897,
+   "score": 1.765
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501093431.zarr",
+   "start": 18,
+   "n_latent_frames": 1470,
+   "turn": 0.793,
+   "turn_var": 0.773,
+   "motion": 0.835,
+   "score": 1.764
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319155712.zarr",
+   "start": 582,
+   "n_latent_frames": 803,
+   "turn": 0.765,
+   "turn_var": 0.777,
+   "motion": 0.864,
+   "score": 1.758
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416090812.zarr",
+   "start": 711,
+   "n_latent_frames": 1421,
+   "turn": 0.787,
+   "turn_var": 0.798,
+   "motion": 0.815,
+   "score": 1.757
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314124824.zarr",
+   "start": 69,
+   "n_latent_frames": 524,
+   "turn": 0.765,
+   "turn_var": 0.778,
+   "motion": 0.859,
+   "score": 1.755
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315160152.zarr",
+   "start": 21,
+   "n_latent_frames": 551,
+   "turn": 0.752,
+   "turn_var": 0.774,
+   "motion": 0.873,
+   "score": 1.75
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314120823.zarr",
+   "start": 114,
+   "n_latent_frames": 1491,
+   "turn": 0.843,
+   "turn_var": 0.903,
+   "motion": 0.649,
+   "score": 1.749
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314124348.zarr",
+   "start": 243,
+   "n_latent_frames": 692,
+   "turn": 0.788,
+   "turn_var": 0.743,
+   "motion": 0.843,
+   "score": 1.749
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314114545.zarr",
+   "start": 1440,
+   "n_latent_frames": 1470,
+   "turn": 0.773,
+   "turn_var": 0.803,
+   "motion": 0.815,
+   "score": 1.745
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422112340.zarr",
+   "start": 465,
+   "n_latent_frames": 1497,
+   "turn": 0.732,
+   "turn_var": 0.732,
+   "motion": 0.916,
+   "score": 1.739
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313083852.zarr",
+   "start": 6,
+   "n_latent_frames": 1443,
+   "turn": 0.787,
+   "turn_var": 0.727,
+   "motion": 0.837,
+   "score": 1.736
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314090046.zarr",
+   "start": 1467,
+   "n_latent_frames": 1491,
+   "turn": 0.745,
+   "turn_var": 0.74,
+   "motion": 0.885,
+   "score": 1.734
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405124741.zarr",
+   "start": 459,
+   "n_latent_frames": 695,
+   "turn": 0.763,
+   "turn_var": 0.758,
+   "motion": 0.845,
+   "score": 1.734
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320132958.zarr",
+   "start": 1185,
+   "n_latent_frames": 1497,
+   "turn": 0.773,
+   "turn_var": 0.783,
+   "motion": 0.81,
+   "score": 1.731
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405120627.zarr",
+   "start": 384,
+   "n_latent_frames": 744,
+   "turn": 0.727,
+   "turn_var": 0.761,
+   "motion": 0.89,
+   "score": 1.731
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407123535.zarr",
+   "start": 1419,
+   "n_latent_frames": 1497,
+   "turn": 0.796,
+   "turn_var": 0.655,
+   "motion": 0.864,
+   "score": 1.728
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417093408.zarr",
+   "start": 123,
+   "n_latent_frames": 1360,
+   "turn": 0.771,
+   "turn_var": 0.689,
+   "motion": 0.873,
+   "score": 1.727
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315111636.zarr",
+   "start": 876,
+   "n_latent_frames": 1485,
+   "turn": 0.719,
+   "turn_var": 0.75,
+   "motion": 0.9,
+   "score": 1.724
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407084210.zarr",
+   "start": 177,
+   "n_latent_frames": 1333,
+   "turn": 0.723,
+   "turn_var": 0.795,
+   "motion": 0.863,
+   "score": 1.724
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411105510.zarr",
+   "start": 1032,
+   "n_latent_frames": 1161,
+   "turn": 0.719,
+   "turn_var": 0.734,
+   "motion": 0.91,
+   "score": 1.723
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320130544.zarr",
+   "start": 561,
+   "n_latent_frames": 1497,
+   "turn": 0.729,
+   "turn_var": 0.732,
+   "motion": 0.897,
+   "score": 1.722
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409100516.zarr",
+   "start": 1233,
+   "n_latent_frames": 1497,
+   "turn": 0.715,
+   "turn_var": 0.723,
+   "motion": 0.917,
+   "score": 1.719
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411102209.zarr",
+   "start": 30,
+   "n_latent_frames": 1491,
+   "turn": 0.738,
+   "turn_var": 0.798,
+   "motion": 0.82,
+   "score": 1.711
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314161951.zarr",
+   "start": 189,
+   "n_latent_frames": 503,
+   "turn": 0.677,
+   "turn_var": 0.736,
+   "motion": 0.945,
+   "score": 1.707
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426083424.zarr",
+   "start": 393,
+   "n_latent_frames": 1366,
+   "turn": 0.704,
+   "turn_var": 0.75,
+   "motion": 0.897,
+   "score": 1.707
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410090720.zarr",
+   "start": 1176,
+   "n_latent_frames": 1488,
+   "turn": 0.678,
+   "turn_var": 0.715,
+   "motion": 0.947,
+   "score": 1.698
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409113709.zarr",
+   "start": 300,
+   "n_latent_frames": 1027,
+   "turn": 0.689,
+   "turn_var": 0.703,
+   "motion": 0.934,
+   "score": 1.694
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411110102.zarr",
+   "start": 420,
+   "n_latent_frames": 581,
+   "turn": 0.708,
+   "turn_var": 0.721,
+   "motion": 0.889,
+   "score": 1.692
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429111610.zarr",
+   "start": 729,
+   "n_latent_frames": 1476,
+   "turn": 0.779,
+   "turn_var": 0.775,
+   "motion": 0.747,
+   "score": 1.69
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416081731.zarr",
+   "start": 633,
+   "n_latent_frames": 674,
+   "turn": 0.759,
+   "turn_var": 0.767,
+   "motion": 0.782,
+   "score": 1.689
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410120640.zarr",
+   "start": 57,
+   "n_latent_frames": 1479,
+   "turn": 0.702,
+   "turn_var": 0.741,
+   "motion": 0.879,
+   "score": 1.687
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409125004.zarr",
+   "start": 798,
+   "n_latent_frames": 1026,
+   "turn": 0.688,
+   "turn_var": 0.743,
+   "motion": 0.893,
+   "score": 1.684
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418103858.zarr",
+   "start": 1413,
+   "n_latent_frames": 1497,
+   "turn": 0.69,
+   "turn_var": 0.642,
+   "motion": 0.96,
+   "score": 1.683
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322131625.zarr",
+   "start": 300,
+   "n_latent_frames": 1428,
+   "turn": 0.668,
+   "turn_var": 0.718,
+   "motion": 0.933,
+   "score": 1.68
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322141826.zarr",
+   "start": 465,
+   "n_latent_frames": 669,
+   "turn": 0.669,
+   "turn_var": 0.721,
+   "motion": 0.93,
+   "score": 1.68
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240219111418.zarr",
+   "start": 1149,
+   "n_latent_frames": 1485,
+   "turn": 0.675,
+   "turn_var": 0.695,
+   "motion": 0.937,
+   "score": 1.678
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409154812.zarr",
+   "start": 975,
+   "n_latent_frames": 1491,
+   "turn": 0.698,
+   "turn_var": 0.702,
+   "motion": 0.897,
+   "score": 1.677
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411104459.zarr",
+   "start": 9,
+   "n_latent_frames": 1431,
+   "turn": 0.761,
+   "turn_var": 0.722,
+   "motion": 0.792,
+   "score": 1.676
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417114030.zarr",
+   "start": 30,
+   "n_latent_frames": 1272,
+   "turn": 0.758,
+   "turn_var": 0.748,
+   "motion": 0.776,
+   "score": 1.676
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424092714.zarr",
+   "start": 12,
+   "n_latent_frames": 1488,
+   "turn": 0.747,
+   "turn_var": 0.707,
+   "motion": 0.82,
+   "score": 1.675
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409122220.zarr",
+   "start": 525,
+   "n_latent_frames": 946,
+   "turn": 0.7,
+   "turn_var": 0.762,
+   "motion": 0.839,
+   "score": 1.668
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410084811.zarr",
+   "start": 1374,
+   "n_latent_frames": 1497,
+   "turn": 0.827,
+   "turn_var": 0.336,
+   "motion": 0.961,
+   "score": 1.668
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325145852.zarr",
+   "start": 63,
+   "n_latent_frames": 1374,
+   "turn": 0.727,
+   "turn_var": 0.728,
+   "motion": 0.821,
+   "score": 1.666
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318161503.zarr",
+   "start": 51,
+   "n_latent_frames": 1497,
+   "turn": 0.7,
+   "turn_var": 0.747,
+   "motion": 0.845,
+   "score": 1.665
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322133653.zarr",
+   "start": 201,
+   "n_latent_frames": 1437,
+   "turn": 0.681,
+   "turn_var": 0.723,
+   "motion": 0.89,
+   "score": 1.665
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240226100859.zarr",
+   "start": 54,
+   "n_latent_frames": 1470,
+   "turn": 0.694,
+   "turn_var": 0.73,
+   "motion": 0.863,
+   "score": 1.663
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322142236.zarr",
+   "start": 504,
+   "n_latent_frames": 1452,
+   "turn": 0.656,
+   "turn_var": 0.697,
+   "motion": 0.929,
+   "score": 1.655
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314084225.zarr",
+   "start": 408,
+   "n_latent_frames": 854,
+   "turn": 0.726,
+   "turn_var": 0.734,
+   "motion": 0.8,
+   "score": 1.653
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429085813.zarr",
+   "start": 1410,
+   "n_latent_frames": 1488,
+   "turn": 0.657,
+   "turn_var": 0.695,
+   "motion": 0.926,
+   "score": 1.653
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320101214.zarr",
+   "start": 171,
+   "n_latent_frames": 1482,
+   "turn": 0.748,
+   "turn_var": 0.738,
+   "motion": 0.765,
+   "score": 1.652
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405123152.zarr",
+   "start": 1230,
+   "n_latent_frames": 1482,
+   "turn": 0.649,
+   "turn_var": 0.687,
+   "motion": 0.943,
+   "score": 1.652
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322154926.zarr",
+   "start": 696,
+   "n_latent_frames": 1494,
+   "turn": 0.683,
+   "turn_var": 0.742,
+   "motion": 0.853,
+   "score": 1.651
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314092417.zarr",
+   "start": 771,
+   "n_latent_frames": 1497,
+   "turn": 0.679,
+   "turn_var": 0.711,
+   "motion": 0.879,
+   "score": 1.65
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322092806.zarr",
+   "start": 498,
+   "n_latent_frames": 747,
+   "turn": 0.692,
+   "turn_var": 0.592,
+   "motion": 0.946,
+   "score": 1.65
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315083616.zarr",
+   "start": 936,
+   "n_latent_frames": 1377,
+   "turn": 0.728,
+   "turn_var": 0.758,
+   "motion": 0.771,
+   "score": 1.647
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406141900.zarr",
+   "start": 1089,
+   "n_latent_frames": 1497,
+   "turn": 0.644,
+   "turn_var": 0.701,
+   "motion": 0.929,
+   "score": 1.645
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307064002.zarr",
+   "start": 141,
+   "n_latent_frames": 1236,
+   "turn": 0.716,
+   "turn_var": 0.744,
+   "motion": 0.795,
+   "score": 1.644
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315101947.zarr",
+   "start": 264,
+   "n_latent_frames": 588,
+   "turn": 0.687,
+   "turn_var": 0.727,
+   "motion": 0.848,
+   "score": 1.644
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425094913.zarr",
+   "start": 39,
+   "n_latent_frames": 1146,
+   "turn": 0.722,
+   "turn_var": 0.579,
+   "motion": 0.901,
+   "score": 1.642
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321105933.zarr",
+   "start": 549,
+   "n_latent_frames": 1398,
+   "turn": 0.703,
+   "turn_var": 0.752,
+   "motion": 0.803,
+   "score": 1.641
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411111728.zarr",
+   "start": 129,
+   "n_latent_frames": 1005,
+   "turn": 0.658,
+   "turn_var": 0.701,
+   "motion": 0.896,
+   "score": 1.635
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411133723.zarr",
+   "start": 1344,
+   "n_latent_frames": 1488,
+   "turn": 0.724,
+   "turn_var": 0.652,
+   "motion": 0.835,
+   "score": 1.635
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426081231.zarr",
+   "start": 687,
+   "n_latent_frames": 1179,
+   "turn": 0.682,
+   "turn_var": 0.665,
+   "motion": 0.887,
+   "score": 1.635
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502114755.zarr",
+   "start": 822,
+   "n_latent_frames": 1482,
+   "turn": 0.639,
+   "turn_var": 0.698,
+   "motion": 0.922,
+   "score": 1.634
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406133319.zarr",
+   "start": 1149,
+   "n_latent_frames": 1479,
+   "turn": 0.804,
+   "turn_var": 0.402,
+   "motion": 0.898,
+   "score": 1.633
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314162436.zarr",
+   "start": 12,
+   "n_latent_frames": 909,
+   "turn": 0.695,
+   "turn_var": 0.737,
+   "motion": 0.811,
+   "score": 1.631
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411100350.zarr",
+   "start": 330,
+   "n_latent_frames": 1494,
+   "turn": 0.648,
+   "turn_var": 0.686,
+   "motion": 0.908,
+   "score": 1.627
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320102508.zarr",
+   "start": 1077,
+   "n_latent_frames": 1491,
+   "turn": 0.698,
+   "turn_var": 0.625,
+   "motion": 0.875,
+   "score": 1.623
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425092442.zarr",
+   "start": 27,
+   "n_latent_frames": 903,
+   "turn": 0.763,
+   "turn_var": 0.715,
+   "motion": 0.719,
+   "score": 1.623
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322100217.zarr",
+   "start": 60,
+   "n_latent_frames": 1464,
+   "turn": 0.918,
+   "turn_var": 0.065,
+   "motion": 0.959,
+   "score": 1.622
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406151028.zarr",
+   "start": 843,
+   "n_latent_frames": 1455,
+   "turn": 0.653,
+   "turn_var": 0.713,
+   "motion": 0.874,
+   "score": 1.621
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416105126.zarr",
+   "start": 1299,
+   "n_latent_frames": 1485,
+   "turn": 0.639,
+   "turn_var": 0.663,
+   "motion": 0.928,
+   "score": 1.62
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417090910.zarr",
+   "start": 324,
+   "n_latent_frames": 1497,
+   "turn": 0.758,
+   "turn_var": 0.809,
+   "motion": 0.654,
+   "score": 1.62
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407152144.zarr",
+   "start": 1050,
+   "n_latent_frames": 1482,
+   "turn": 0.68,
+   "turn_var": 0.643,
+   "motion": 0.88,
+   "score": 1.618
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502113600.zarr",
+   "start": 1155,
+   "n_latent_frames": 1404,
+   "turn": 0.744,
+   "turn_var": 0.743,
+   "motion": 0.718,
+   "score": 1.618
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318093240.zarr",
+   "start": 468,
+   "n_latent_frames": 1407,
+   "turn": 0.691,
+   "turn_var": 0.71,
+   "motion": 0.816,
+   "score": 1.617
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429102849.zarr",
+   "start": 876,
+   "n_latent_frames": 1488,
+   "turn": 0.661,
+   "turn_var": 0.63,
+   "motion": 0.915,
+   "score": 1.616
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407111135.zarr",
+   "start": 750,
+   "n_latent_frames": 1497,
+   "turn": 0.657,
+   "turn_var": 0.697,
+   "motion": 0.87,
+   "score": 1.615
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407092405.zarr",
+   "start": 468,
+   "n_latent_frames": 1470,
+   "turn": 0.757,
+   "turn_var": 0.755,
+   "motion": 0.684,
+   "score": 1.614
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320120406.zarr",
+   "start": 1074,
+   "n_latent_frames": 1497,
+   "turn": 0.7,
+   "turn_var": 0.717,
+   "motion": 0.792,
+   "score": 1.613
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411094101.zarr",
+   "start": 336,
+   "n_latent_frames": 1434,
+   "turn": 0.629,
+   "turn_var": 0.676,
+   "motion": 0.917,
+   "score": 1.609
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314164606.zarr",
+   "start": 1335,
+   "n_latent_frames": 1479,
+   "turn": 0.744,
+   "turn_var": 0.762,
+   "motion": 0.688,
+   "score": 1.607
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404154848.zarr",
+   "start": 189,
+   "n_latent_frames": 366,
+   "turn": 0.657,
+   "turn_var": 0.703,
+   "motion": 0.852,
+   "score": 1.605
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430133822.zarr",
+   "start": 972,
+   "n_latent_frames": 1476,
+   "turn": 0.623,
+   "turn_var": 0.65,
+   "motion": 0.938,
+   "score": 1.604
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501090219.zarr",
+   "start": 12,
+   "n_latent_frames": 1146,
+   "turn": 0.788,
+   "turn_var": 0.394,
+   "motion": 0.886,
+   "score": 1.604
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307083945.zarr",
+   "start": 324,
+   "n_latent_frames": 1497,
+   "turn": 0.652,
+   "turn_var": 0.657,
+   "motion": 0.888,
+   "score": 1.602
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319112621.zarr",
+   "start": 1326,
+   "n_latent_frames": 1365,
+   "turn": 0.647,
+   "turn_var": 0.612,
+   "motion": 0.927,
+   "score": 1.602
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314084739.zarr",
+   "start": 222,
+   "n_latent_frames": 1497,
+   "turn": 0.643,
+   "turn_var": 0.703,
+   "motion": 0.866,
+   "score": 1.601
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306083915.zarr",
+   "start": 1185,
+   "n_latent_frames": 1209,
+   "turn": 0.67,
+   "turn_var": 0.662,
+   "motion": 0.856,
+   "score": 1.6
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409101732.zarr",
+   "start": 210,
+   "n_latent_frames": 1410,
+   "turn": 0.62,
+   "turn_var": 0.687,
+   "motion": 0.91,
+   "score": 1.6
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424074353.zarr",
+   "start": 1401,
+   "n_latent_frames": 1497,
+   "turn": 0.626,
+   "turn_var": 0.642,
+   "motion": 0.934,
+   "score": 1.6
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404152201.zarr",
+   "start": 51,
+   "n_latent_frames": 1434,
+   "turn": 0.687,
+   "turn_var": 0.659,
+   "motion": 0.83,
+   "score": 1.598
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240412091708.zarr",
+   "start": 465,
+   "n_latent_frames": 1467,
+   "turn": 0.658,
+   "turn_var": 0.664,
+   "motion": 0.868,
+   "score": 1.597
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416075220.zarr",
+   "start": 75,
+   "n_latent_frames": 1143,
+   "turn": 0.772,
+   "turn_var": 0.352,
+   "motion": 0.926,
+   "score": 1.597
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405134421.zarr",
+   "start": 387,
+   "n_latent_frames": 1467,
+   "turn": 0.635,
+   "turn_var": 0.678,
+   "motion": 0.888,
+   "score": 1.596
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429114540.zarr",
+   "start": 63,
+   "n_latent_frames": 1370,
+   "turn": 0.61,
+   "turn_var": 0.664,
+   "motion": 0.935,
+   "score": 1.596
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240228112655.zarr",
+   "start": 297,
+   "n_latent_frames": 1464,
+   "turn": 0.664,
+   "turn_var": 0.674,
+   "motion": 0.849,
+   "score": 1.595
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240419092103.zarr",
+   "start": 855,
+   "n_latent_frames": 1470,
+   "turn": 0.618,
+   "turn_var": 0.676,
+   "motion": 0.913,
+   "score": 1.595
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314100414.zarr",
+   "start": 606,
+   "n_latent_frames": 965,
+   "turn": 0.622,
+   "turn_var": 0.677,
+   "motion": 0.903,
+   "score": 1.593
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315081419.zarr",
+   "start": 141,
+   "n_latent_frames": 1431,
+   "turn": 0.687,
+   "turn_var": 0.697,
+   "motion": 0.796,
+   "score": 1.592
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429112640.zarr",
+   "start": 237,
+   "n_latent_frames": 1494,
+   "turn": 0.659,
+   "turn_var": 0.65,
+   "motion": 0.87,
+   "score": 1.592
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422122823.zarr",
+   "start": 837,
+   "n_latent_frames": 1488,
+   "turn": 0.794,
+   "turn_var": 0.737,
+   "motion": 0.609,
+   "score": 1.589
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409103614.zarr",
+   "start": 789,
+   "n_latent_frames": 1470,
+   "turn": 0.642,
+   "turn_var": 0.653,
+   "motion": 0.884,
+   "score": 1.587
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240412092617.zarr",
+   "start": 30,
+   "n_latent_frames": 1112,
+   "turn": 0.69,
+   "turn_var": 0.455,
+   "motion": 0.957,
+   "score": 1.587
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409112141.zarr",
+   "start": 672,
+   "n_latent_frames": 1149,
+   "turn": 0.626,
+   "turn_var": 0.693,
+   "motion": 0.877,
+   "score": 1.586
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406141018.zarr",
+   "start": 1401,
+   "n_latent_frames": 1485,
+   "turn": 0.616,
+   "turn_var": 0.648,
+   "motion": 0.919,
+   "score": 1.583
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319103853.zarr",
+   "start": 69,
+   "n_latent_frames": 1443,
+   "turn": 0.724,
+   "turn_var": 0.657,
+   "motion": 0.755,
+   "score": 1.581
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430101627.zarr",
+   "start": 804,
+   "n_latent_frames": 1488,
+   "turn": 0.626,
+   "turn_var": 0.63,
+   "motion": 0.915,
+   "score": 1.581
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426083350.zarr",
+   "start": 1152,
+   "n_latent_frames": 1497,
+   "turn": 0.683,
+   "turn_var": 0.663,
+   "motion": 0.806,
+   "score": 1.579
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240412081529.zarr",
+   "start": 36,
+   "n_latent_frames": 1208,
+   "turn": 0.626,
+   "turn_var": 0.644,
+   "motion": 0.901,
+   "score": 1.578
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404144927.zarr",
+   "start": 1365,
+   "n_latent_frames": 1485,
+   "turn": 0.608,
+   "turn_var": 0.658,
+   "motion": 0.916,
+   "score": 1.577
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405144700.zarr",
+   "start": 363,
+   "n_latent_frames": 1485,
+   "turn": 0.627,
+   "turn_var": 0.65,
+   "motion": 0.892,
+   "score": 1.577
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429113440.zarr",
+   "start": 9,
+   "n_latent_frames": 1491,
+   "turn": 0.64,
+   "turn_var": 0.605,
+   "motion": 0.905,
+   "score": 1.576
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240304113447.zarr",
+   "start": 1134,
+   "n_latent_frames": 1485,
+   "turn": 0.705,
+   "turn_var": 0.705,
+   "motion": 0.74,
+   "score": 1.575
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425100548.zarr",
+   "start": 18,
+   "n_latent_frames": 1260,
+   "turn": 0.708,
+   "turn_var": 0.714,
+   "motion": 0.728,
+   "score": 1.575
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417094704.zarr",
+   "start": 6,
+   "n_latent_frames": 1497,
+   "turn": 0.639,
+   "turn_var": 0.596,
+   "motion": 0.909,
+   "score": 1.573
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430073555.zarr",
+   "start": 54,
+   "n_latent_frames": 1497,
+   "turn": 0.622,
+   "turn_var": 0.666,
+   "motion": 0.883,
+   "score": 1.572
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502103852.zarr",
+   "start": 447,
+   "n_latent_frames": 1488,
+   "turn": 0.654,
+   "turn_var": 0.599,
+   "motion": 0.883,
+   "score": 1.572
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417085134.zarr",
+   "start": 582,
+   "n_latent_frames": 1488,
+   "turn": 0.611,
+   "turn_var": 0.656,
+   "motion": 0.901,
+   "score": 1.57
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418112326.zarr",
+   "start": 357,
+   "n_latent_frames": 1428,
+   "turn": 0.733,
+   "turn_var": 0.729,
+   "motion": 0.675,
+   "score": 1.57
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240219110355.zarr",
+   "start": 1182,
+   "n_latent_frames": 1296,
+   "turn": 0.715,
+   "turn_var": 0.696,
+   "motion": 0.721,
+   "score": 1.567
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306073740.zarr",
+   "start": 309,
+   "n_latent_frames": 1461,
+   "turn": 0.627,
+   "turn_var": 0.653,
+   "motion": 0.875,
+   "score": 1.566
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404153516.zarr",
+   "start": 432,
+   "n_latent_frames": 1239,
+   "turn": 0.613,
+   "turn_var": 0.642,
+   "motion": 0.901,
+   "score": 1.565
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407110032.zarr",
+   "start": 27,
+   "n_latent_frames": 1491,
+   "turn": 0.649,
+   "turn_var": 0.69,
+   "motion": 0.816,
+   "score": 1.565
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429092005.zarr",
+   "start": 1131,
+   "n_latent_frames": 1497,
+   "turn": 0.633,
+   "turn_var": 0.682,
+   "motion": 0.844,
+   "score": 1.564
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311104318.zarr",
+   "start": 651,
+   "n_latent_frames": 1219,
+   "turn": 0.909,
+   "turn_var": 0.057,
+   "motion": 0.894,
+   "score": 1.563
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404172807.zarr",
+   "start": 1323,
+   "n_latent_frames": 1491,
+   "turn": 0.87,
+   "turn_var": 0.133,
+   "motion": 0.889,
+   "score": 1.56
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240419074216.zarr",
+   "start": 123,
+   "n_latent_frames": 1146,
+   "turn": 0.649,
+   "turn_var": 0.719,
+   "motion": 0.787,
+   "score": 1.56
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318100106.zarr",
+   "start": 426,
+   "n_latent_frames": 522,
+   "turn": 0.578,
+   "turn_var": 0.621,
+   "motion": 0.957,
+   "score": 1.558
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325124142.zarr",
+   "start": 171,
+   "n_latent_frames": 206,
+   "turn": 0.694,
+   "turn_var": 0.75,
+   "motion": 0.697,
+   "score": 1.557
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411085810.zarr",
+   "start": 75,
+   "n_latent_frames": 1497,
+   "turn": 0.659,
+   "turn_var": 0.467,
+   "motion": 0.95,
+   "score": 1.557
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318144211.zarr",
+   "start": 81,
+   "n_latent_frames": 249,
+   "turn": 0.607,
+   "turn_var": 0.666,
+   "motion": 0.881,
+   "score": 1.556
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404155822.zarr",
+   "start": 453,
+   "n_latent_frames": 612,
+   "turn": 0.69,
+   "turn_var": 0.742,
+   "motion": 0.708,
+   "score": 1.556
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418091002.zarr",
+   "start": 1212,
+   "n_latent_frames": 1455,
+   "turn": 0.68,
+   "turn_var": 0.569,
+   "motion": 0.846,
+   "score": 1.556
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405142453.zarr",
+   "start": 33,
+   "n_latent_frames": 577,
+   "turn": 0.885,
+   "turn_var": 0.158,
+   "motion": 0.845,
+   "score": 1.555
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407174018.zarr",
+   "start": 1401,
+   "n_latent_frames": 1497,
+   "turn": 0.904,
+   "turn_var": 0.038,
+   "motion": 0.901,
+   "score": 1.554
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410104622.zarr",
+   "start": 63,
+   "n_latent_frames": 1314,
+   "turn": 0.654,
+   "turn_var": 0.586,
+   "motion": 0.863,
+   "score": 1.552
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411161804.zarr",
+   "start": 285,
+   "n_latent_frames": 1497,
+   "turn": 0.612,
+   "turn_var": 0.628,
+   "motion": 0.891,
+   "score": 1.549
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429104339.zarr",
+   "start": 9,
+   "n_latent_frames": 1179,
+   "turn": 0.599,
+   "turn_var": 0.626,
+   "motion": 0.907,
+   "score": 1.547
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314101717.zarr",
+   "start": 411,
+   "n_latent_frames": 1223,
+   "turn": 0.574,
+   "turn_var": 0.648,
+   "motion": 0.925,
+   "score": 1.545
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315084742.zarr",
+   "start": 1176,
+   "n_latent_frames": 1482,
+   "turn": 0.691,
+   "turn_var": 0.722,
+   "motion": 0.704,
+   "score": 1.545
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321160523.zarr",
+   "start": 9,
+   "n_latent_frames": 1041,
+   "turn": 0.691,
+   "turn_var": 0.676,
+   "motion": 0.736,
+   "score": 1.545
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404143935.zarr",
+   "start": 1449,
+   "n_latent_frames": 1494,
+   "turn": 0.738,
+   "turn_var": 0.372,
+   "motion": 0.887,
+   "score": 1.545
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416110156.zarr",
+   "start": 774,
+   "n_latent_frames": 1467,
+   "turn": 0.888,
+   "turn_var": 0.063,
+   "motion": 0.893,
+   "score": 1.544
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320084120.zarr",
+   "start": 48,
+   "n_latent_frames": 1497,
+   "turn": 0.735,
+   "turn_var": 0.414,
+   "motion": 0.859,
+   "score": 1.543
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417122557.zarr",
+   "start": 438,
+   "n_latent_frames": 1497,
+   "turn": 0.589,
+   "turn_var": 0.601,
+   "motion": 0.934,
+   "score": 1.543
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426085937.zarr",
+   "start": 12,
+   "n_latent_frames": 801,
+   "turn": 0.87,
+   "turn_var": 0.057,
+   "motion": 0.921,
+   "score": 1.543
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325141423.zarr",
+   "start": 228,
+   "n_latent_frames": 707,
+   "turn": 0.906,
+   "turn_var": 0.118,
+   "motion": 0.823,
+   "score": 1.541
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418110426.zarr",
+   "start": 336,
+   "n_latent_frames": 1488,
+   "turn": 0.576,
+   "turn_var": 0.637,
+   "motion": 0.922,
+   "score": 1.541
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411093337.zarr",
+   "start": 1266,
+   "n_latent_frames": 1497,
+   "turn": 0.59,
+   "turn_var": 0.647,
+   "motion": 0.895,
+   "score": 1.54
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405153410.zarr",
+   "start": 1170,
+   "n_latent_frames": 1440,
+   "turn": 0.698,
+   "turn_var": 0.504,
+   "motion": 0.84,
+   "score": 1.539
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325130321.zarr",
+   "start": 963,
+   "n_latent_frames": 1446,
+   "turn": 0.611,
+   "turn_var": 0.631,
+   "motion": 0.873,
+   "score": 1.537
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316155642.zarr",
+   "start": 42,
+   "n_latent_frames": 610,
+   "turn": 0.751,
+   "turn_var": 0.283,
+   "motion": 0.919,
+   "score": 1.536
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430133014.zarr",
+   "start": 651,
+   "n_latent_frames": 1407,
+   "turn": 0.576,
+   "turn_var": 0.635,
+   "motion": 0.917,
+   "score": 1.536
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319103007.zarr",
+   "start": 711,
+   "n_latent_frames": 1395,
+   "turn": 0.612,
+   "turn_var": 0.571,
+   "motion": 0.908,
+   "score": 1.533
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322120216.zarr",
+   "start": 261,
+   "n_latent_frames": 969,
+   "turn": 0.591,
+   "turn_var": 0.624,
+   "motion": 0.899,
+   "score": 1.532
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416074705.zarr",
+   "start": 18,
+   "n_latent_frames": 1262,
+   "turn": 0.723,
+   "turn_var": 0.353,
+   "motion": 0.903,
+   "score": 1.532
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411174458.zarr",
+   "start": 45,
+   "n_latent_frames": 216,
+   "turn": 0.631,
+   "turn_var": 0.603,
+   "motion": 0.854,
+   "score": 1.53
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405092427.zarr",
+   "start": 597,
+   "n_latent_frames": 1035,
+   "turn": 0.623,
+   "turn_var": 0.632,
+   "motion": 0.844,
+   "score": 1.529
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501100413.zarr",
+   "start": 195,
+   "n_latent_frames": 939,
+   "turn": 0.638,
+   "turn_var": 0.692,
+   "motion": 0.775,
+   "score": 1.526
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318104055.zarr",
+   "start": 345,
+   "n_latent_frames": 1497,
+   "turn": 0.649,
+   "turn_var": 0.615,
+   "motion": 0.812,
+   "score": 1.524
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416112554.zarr",
+   "start": 570,
+   "n_latent_frames": 1494,
+   "turn": 0.576,
+   "turn_var": 0.618,
+   "motion": 0.912,
+   "score": 1.524
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321081659.zarr",
+   "start": 63,
+   "n_latent_frames": 1458,
+   "turn": 0.65,
+   "turn_var": 0.682,
+   "motion": 0.76,
+   "score": 1.523
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405154705.zarr",
+   "start": 1116,
+   "n_latent_frames": 1488,
+   "turn": 0.644,
+   "turn_var": 0.5,
+   "motion": 0.898,
+   "score": 1.523
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325114148.zarr",
+   "start": 435,
+   "n_latent_frames": 870,
+   "turn": 0.584,
+   "turn_var": 0.629,
+   "motion": 0.892,
+   "score": 1.522
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409112145.zarr",
+   "start": 780,
+   "n_latent_frames": 1452,
+   "turn": 0.84,
+   "turn_var": 0.101,
+   "motion": 0.903,
+   "score": 1.522
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411112821.zarr",
+   "start": 222,
+   "n_latent_frames": 1122,
+   "turn": 0.585,
+   "turn_var": 0.635,
+   "motion": 0.885,
+   "score": 1.522
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407121316.zarr",
+   "start": 81,
+   "n_latent_frames": 1485,
+   "turn": 0.576,
+   "turn_var": 0.65,
+   "motion": 0.884,
+   "score": 1.52
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322143151.zarr",
+   "start": 12,
+   "n_latent_frames": 1434,
+   "turn": 0.8,
+   "turn_var": 0.271,
+   "motion": 0.833,
+   "score": 1.519
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429113140.zarr",
+   "start": 354,
+   "n_latent_frames": 1497,
+   "turn": 0.602,
+   "turn_var": 0.592,
+   "motion": 0.886,
+   "score": 1.518
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315114603.zarr",
+   "start": 990,
+   "n_latent_frames": 1497,
+   "turn": 0.558,
+   "turn_var": 0.608,
+   "motion": 0.936,
+   "score": 1.517
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322155831.zarr",
+   "start": 24,
+   "n_latent_frames": 453,
+   "turn": 0.82,
+   "turn_var": 0.159,
+   "motion": 0.875,
+   "score": 1.513
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404170359.zarr",
+   "start": 1395,
+   "n_latent_frames": 1488,
+   "turn": 0.786,
+   "turn_var": 0.242,
+   "motion": 0.864,
+   "score": 1.512
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417083925.zarr",
+   "start": 723,
+   "n_latent_frames": 1460,
+   "turn": 0.808,
+   "turn_var": 0.228,
+   "motion": 0.844,
+   "score": 1.512
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409111133.zarr",
+   "start": 273,
+   "n_latent_frames": 1497,
+   "turn": 0.589,
+   "turn_var": 0.621,
+   "motion": 0.874,
+   "score": 1.511
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319094054.zarr",
+   "start": 1431,
+   "n_latent_frames": 1497,
+   "turn": 0.625,
+   "turn_var": 0.561,
+   "motion": 0.863,
+   "score": 1.51
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319105153.zarr",
+   "start": 1365,
+   "n_latent_frames": 1497,
+   "turn": 0.562,
+   "turn_var": 0.561,
+   "motion": 0.952,
+   "score": 1.509
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429052525.zarr",
+   "start": 1194,
+   "n_latent_frames": 1494,
+   "turn": 0.627,
+   "turn_var": 0.52,
+   "motion": 0.888,
+   "score": 1.509
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318090431.zarr",
+   "start": 1107,
+   "n_latent_frames": 1392,
+   "turn": 0.613,
+   "turn_var": 0.632,
+   "motion": 0.824,
+   "score": 1.506
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407120825.zarr",
+   "start": 6,
+   "n_latent_frames": 911,
+   "turn": 0.58,
+   "turn_var": 0.609,
+   "motion": 0.889,
+   "score": 1.506
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314091551.zarr",
+   "start": 957,
+   "n_latent_frames": 1497,
+   "turn": 0.579,
+   "turn_var": 0.609,
+   "motion": 0.879,
+   "score": 1.498
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319085632.zarr",
+   "start": 24,
+   "n_latent_frames": 1497,
+   "turn": 0.654,
+   "turn_var": 0.601,
+   "motion": 0.776,
+   "score": 1.498
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407100546.zarr",
+   "start": 459,
+   "n_latent_frames": 1479,
+   "turn": 0.612,
+   "turn_var": 0.66,
+   "motion": 0.794,
+   "score": 1.497
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240419094929.zarr",
+   "start": 27,
+   "n_latent_frames": 1189,
+   "turn": 0.612,
+   "turn_var": 0.459,
+   "motion": 0.935,
+   "score": 1.496
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314155826.zarr",
+   "start": 273,
+   "n_latent_frames": 829,
+   "turn": 0.57,
+   "turn_var": 0.607,
+   "motion": 0.888,
+   "score": 1.495
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321104430.zarr",
+   "start": 1233,
+   "n_latent_frames": 1497,
+   "turn": 0.563,
+   "turn_var": 0.622,
+   "motion": 0.887,
+   "score": 1.495
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405133425.zarr",
+   "start": 21,
+   "n_latent_frames": 1479,
+   "turn": 0.803,
+   "turn_var": 0.265,
+   "motion": 0.8,
+   "score": 1.495
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411134636.zarr",
+   "start": 984,
+   "n_latent_frames": 1473,
+   "turn": 0.571,
+   "turn_var": 0.59,
+   "motion": 0.899,
+   "score": 1.495
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418100148.zarr",
+   "start": 591,
+   "n_latent_frames": 1458,
+   "turn": 0.771,
+   "turn_var": 0.196,
+   "motion": 0.895,
+   "score": 1.495
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240304103426.zarr",
+   "start": 1077,
+   "n_latent_frames": 1485,
+   "turn": 0.602,
+   "turn_var": 0.601,
+   "motion": 0.844,
+   "score": 1.494
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307105702.zarr",
+   "start": 189,
+   "n_latent_frames": 1485,
+   "turn": 0.705,
+   "turn_var": 0.565,
+   "motion": 0.725,
+   "score": 1.494
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322121523.zarr",
+   "start": 753,
+   "n_latent_frames": 930,
+   "turn": 0.566,
+   "turn_var": 0.545,
+   "motion": 0.937,
+   "score": 1.494
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322144806.zarr",
+   "start": 1128,
+   "n_latent_frames": 1473,
+   "turn": 0.629,
+   "turn_var": 0.531,
+   "motion": 0.857,
+   "score": 1.494
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411170854.zarr",
+   "start": 876,
+   "n_latent_frames": 1497,
+   "turn": 0.594,
+   "turn_var": 0.648,
+   "motion": 0.823,
+   "score": 1.494
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425073744.zarr",
+   "start": 465,
+   "n_latent_frames": 1497,
+   "turn": 0.568,
+   "turn_var": 0.647,
+   "motion": 0.858,
+   "score": 1.493
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409155713.zarr",
+   "start": 24,
+   "n_latent_frames": 1491,
+   "turn": 0.731,
+   "turn_var": 0.407,
+   "motion": 0.796,
+   "score": 1.491
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426084825.zarr",
+   "start": 21,
+   "n_latent_frames": 1497,
+   "turn": 0.611,
+   "turn_var": 0.441,
+   "motion": 0.941,
+   "score": 1.49
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410082505.zarr",
+   "start": 9,
+   "n_latent_frames": 1230,
+   "turn": 0.596,
+   "turn_var": 0.62,
+   "motion": 0.833,
+   "score": 1.489
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422120247.zarr",
+   "start": 1434,
+   "n_latent_frames": 1482,
+   "turn": 0.565,
+   "turn_var": 0.546,
+   "motion": 0.93,
+   "score": 1.489
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319081655.zarr",
+   "start": 165,
+   "n_latent_frames": 1497,
+   "turn": 0.613,
+   "turn_var": 0.637,
+   "motion": 0.79,
+   "score": 1.485
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312102138.zarr",
+   "start": 153,
+   "n_latent_frames": 582,
+   "turn": 0.796,
+   "turn_var": 0.147,
+   "motion": 0.878,
+   "score": 1.484
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318114823.zarr",
+   "start": 1431,
+   "n_latent_frames": 1488,
+   "turn": 0.547,
+   "turn_var": 0.622,
+   "motion": 0.895,
+   "score": 1.484
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502115621.zarr",
+   "start": 1104,
+   "n_latent_frames": 1311,
+   "turn": 0.545,
+   "turn_var": 0.565,
+   "motion": 0.938,
+   "score": 1.484
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240216102338.zarr",
+   "start": 1296,
+   "n_latent_frames": 1458,
+   "turn": 0.602,
+   "turn_var": 0.633,
+   "motion": 0.807,
+   "score": 1.483
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411132907.zarr",
+   "start": 582,
+   "n_latent_frames": 1380,
+   "turn": 0.581,
+   "turn_var": 0.632,
+   "motion": 0.835,
+   "score": 1.482
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416114238.zarr",
+   "start": 1206,
+   "n_latent_frames": 1491,
+   "turn": 0.583,
+   "turn_var": 0.476,
+   "motion": 0.945,
+   "score": 1.482
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429083356.zarr",
+   "start": 849,
+   "n_latent_frames": 1488,
+   "turn": 0.601,
+   "turn_var": 0.586,
+   "motion": 0.838,
+   "score": 1.481
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314151359.zarr",
+   "start": 846,
+   "n_latent_frames": 1098,
+   "turn": 0.644,
+   "turn_var": 0.678,
+   "motion": 0.711,
+   "score": 1.48
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312112717.zarr",
+   "start": 93,
+   "n_latent_frames": 1497,
+   "turn": 0.716,
+   "turn_var": 0.276,
+   "motion": 0.893,
+   "score": 1.479
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405130855.zarr",
+   "start": 1206,
+   "n_latent_frames": 1491,
+   "turn": 0.576,
+   "turn_var": 0.593,
+   "motion": 0.866,
+   "score": 1.479
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409102458.zarr",
+   "start": 1203,
+   "n_latent_frames": 1494,
+   "turn": 0.568,
+   "turn_var": 0.599,
+   "motion": 0.875,
+   "score": 1.479
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411160659.zarr",
+   "start": 1332,
+   "n_latent_frames": 1497,
+   "turn": 0.835,
+   "turn_var": 0.103,
+   "motion": 0.846,
+   "score": 1.479
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240419093708.zarr",
+   "start": 993,
+   "n_latent_frames": 1021,
+   "turn": 0.765,
+   "turn_var": 0.094,
+   "motion": 0.953,
+   "score": 1.479
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429121541.zarr",
+   "start": 132,
+   "n_latent_frames": 1482,
+   "turn": 0.676,
+   "turn_var": 0.411,
+   "motion": 0.854,
+   "score": 1.479
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429055148.zarr",
+   "start": 375,
+   "n_latent_frames": 1479,
+   "turn": 0.729,
+   "turn_var": 0.245,
+   "motion": 0.893,
+   "score": 1.477
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322101445.zarr",
+   "start": 312,
+   "n_latent_frames": 1452,
+   "turn": 0.561,
+   "turn_var": 0.598,
+   "motion": 0.88,
+   "score": 1.476
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411131716.zarr",
+   "start": 1026,
+   "n_latent_frames": 1356,
+   "turn": 0.711,
+   "turn_var": 0.348,
+   "motion": 0.845,
+   "score": 1.476
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240308111557.zarr",
+   "start": 1257,
+   "n_latent_frames": 1497,
+   "turn": 0.8,
+   "turn_var": 0.215,
+   "motion": 0.809,
+   "score": 1.474
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318065649.zarr",
+   "start": 549,
+   "n_latent_frames": 1377,
+   "turn": 0.608,
+   "turn_var": 0.658,
+   "motion": 0.766,
+   "score": 1.474
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325152202.zarr",
+   "start": 312,
+   "n_latent_frames": 933,
+   "turn": 0.572,
+   "turn_var": 0.627,
+   "motion": 0.841,
+   "score": 1.474
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313114112.zarr",
+   "start": 90,
+   "n_latent_frames": 1497,
+   "turn": 0.658,
+   "turn_var": 0.667,
+   "motion": 0.688,
+   "score": 1.473
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322130722.zarr",
+   "start": 1356,
+   "n_latent_frames": 1440,
+   "turn": 0.58,
+   "turn_var": 0.589,
+   "motion": 0.855,
+   "score": 1.473
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430071614.zarr",
+   "start": 843,
+   "n_latent_frames": 1401,
+   "turn": 0.621,
+   "turn_var": 0.605,
+   "motion": 0.782,
+   "score": 1.471
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411164937.zarr",
+   "start": 333,
+   "n_latent_frames": 1497,
+   "turn": 0.548,
+   "turn_var": 0.597,
+   "motion": 0.89,
+   "score": 1.469
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405152300.zarr",
+   "start": 6,
+   "n_latent_frames": 1362,
+   "turn": 0.805,
+   "turn_var": 0.297,
+   "motion": 0.733,
+   "score": 1.467
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322152816.zarr",
+   "start": 45,
+   "n_latent_frames": 1497,
+   "turn": 0.644,
+   "turn_var": 0.483,
+   "motion": 0.826,
+   "score": 1.463
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325150926.zarr",
+   "start": 345,
+   "n_latent_frames": 1467,
+   "turn": 0.547,
+   "turn_var": 0.593,
+   "motion": 0.884,
+   "score": 1.463
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311102739.zarr",
+   "start": 471,
+   "n_latent_frames": 1110,
+   "turn": 0.832,
+   "turn_var": 0.083,
+   "motion": 0.841,
+   "score": 1.462
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325131304.zarr",
+   "start": 702,
+   "n_latent_frames": 999,
+   "turn": 0.551,
+   "turn_var": 0.611,
+   "motion": 0.864,
+   "score": 1.461
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411083010.zarr",
+   "start": 1236,
+   "n_latent_frames": 1497,
+   "turn": 0.527,
+   "turn_var": 0.566,
+   "motion": 0.931,
+   "score": 1.461
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404151333.zarr",
+   "start": 42,
+   "n_latent_frames": 1410,
+   "turn": 0.755,
+   "turn_var": 0.263,
+   "motion": 0.82,
+   "score": 1.46
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240503122234.zarr",
+   "start": 162,
+   "n_latent_frames": 1497,
+   "turn": 0.881,
+   "turn_var": 0.868,
+   "motion": 0.207,
+   "score": 1.46
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319091506.zarr",
+   "start": 39,
+   "n_latent_frames": 1497,
+   "turn": 0.731,
+   "turn_var": 0.488,
+   "motion": 0.689,
+   "score": 1.457
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406150721.zarr",
+   "start": 303,
+   "n_latent_frames": 572,
+   "turn": 0.706,
+   "turn_var": 0.595,
+   "motion": 0.646,
+   "score": 1.456
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424095030.zarr",
+   "start": 606,
+   "n_latent_frames": 1171,
+   "turn": 0.707,
+   "turn_var": 0.489,
+   "motion": 0.718,
+   "score": 1.454
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318084905.zarr",
+   "start": 1347,
+   "n_latent_frames": 1488,
+   "turn": 0.565,
+   "turn_var": 0.649,
+   "motion": 0.806,
+   "score": 1.453
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314122556.zarr",
+   "start": 3,
+   "n_latent_frames": 471,
+   "turn": 0.777,
+   "turn_var": 0.432,
+   "motion": 0.656,
+   "score": 1.452
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240412073903.zarr",
+   "start": 564,
+   "n_latent_frames": 1045,
+   "turn": 0.551,
+   "turn_var": 0.582,
+   "motion": 0.871,
+   "score": 1.452
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418074247.zarr",
+   "start": 12,
+   "n_latent_frames": 1452,
+   "turn": 0.706,
+   "turn_var": 0.23,
+   "motion": 0.901,
+   "score": 1.452
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422075720.zarr",
+   "start": 246,
+   "n_latent_frames": 1485,
+   "turn": 0.578,
+   "turn_var": 0.522,
+   "motion": 0.873,
+   "score": 1.45
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424073442.zarr",
+   "start": 597,
+   "n_latent_frames": 1123,
+   "turn": 0.902,
+   "turn_var": 0.085,
+   "motion": 0.722,
+   "score": 1.45
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425104942.zarr",
+   "start": 1425,
+   "n_latent_frames": 1497,
+   "turn": 0.558,
+   "turn_var": 0.605,
+   "motion": 0.842,
+   "score": 1.45
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240228101652.zarr",
+   "start": 303,
+   "n_latent_frames": 525,
+   "turn": 0.625,
+   "turn_var": 0.59,
+   "motion": 0.755,
+   "score": 1.449
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322153537.zarr",
+   "start": 42,
+   "n_latent_frames": 1482,
+   "turn": 0.78,
+   "turn_var": 0.155,
+   "motion": 0.845,
+   "score": 1.449
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325112105.zarr",
+   "start": 477,
+   "n_latent_frames": 1497,
+   "turn": 0.51,
+   "turn_var": 0.577,
+   "motion": 0.929,
+   "score": 1.449
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405151745.zarr",
+   "start": 591,
+   "n_latent_frames": 821,
+   "turn": 0.538,
+   "turn_var": 0.62,
+   "motion": 0.858,
+   "score": 1.448
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313105601.zarr",
+   "start": 156,
+   "n_latent_frames": 1392,
+   "turn": 0.692,
+   "turn_var": 0.297,
+   "motion": 0.861,
+   "score": 1.444
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322170229.zarr",
+   "start": 438,
+   "n_latent_frames": 1098,
+   "turn": 0.529,
+   "turn_var": 0.603,
+   "motion": 0.875,
+   "score": 1.444
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405143602.zarr",
+   "start": 6,
+   "n_latent_frames": 1413,
+   "turn": 0.879,
+   "turn_var": 0.161,
+   "motion": 0.689,
+   "score": 1.441
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407172800.zarr",
+   "start": 747,
+   "n_latent_frames": 1407,
+   "turn": 0.751,
+   "turn_var": 0.666,
+   "motion": 0.51,
+   "score": 1.441
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407100003.zarr",
+   "start": 693,
+   "n_latent_frames": 1363,
+   "turn": 0.532,
+   "turn_var": 0.615,
+   "motion": 0.852,
+   "score": 1.436
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240304112814.zarr",
+   "start": 93,
+   "n_latent_frames": 1392,
+   "turn": 0.522,
+   "turn_var": 0.546,
+   "motion": 0.915,
+   "score": 1.435
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407093531.zarr",
+   "start": 996,
+   "n_latent_frames": 1488,
+   "turn": 0.55,
+   "turn_var": 0.583,
+   "motion": 0.848,
+   "score": 1.435
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411153950.zarr",
+   "start": 942,
+   "n_latent_frames": 1497,
+   "turn": 0.716,
+   "turn_var": 0.712,
+   "motion": 0.518,
+   "score": 1.435
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425104343.zarr",
+   "start": 693,
+   "n_latent_frames": 1348,
+   "turn": 0.88,
+   "turn_var": 0.14,
+   "motion": 0.692,
+   "score": 1.434
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422114422.zarr",
+   "start": 384,
+   "n_latent_frames": 1464,
+   "turn": 0.788,
+   "turn_var": 0.073,
+   "motion": 0.869,
+   "score": 1.433
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406144933.zarr",
+   "start": 897,
+   "n_latent_frames": 1479,
+   "turn": 0.664,
+   "turn_var": 0.398,
+   "motion": 0.813,
+   "score": 1.432
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322100103.zarr",
+   "start": 111,
+   "n_latent_frames": 1350,
+   "turn": 0.578,
+   "turn_var": 0.552,
+   "motion": 0.824,
+   "score": 1.431
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410073720.zarr",
+   "start": 480,
+   "n_latent_frames": 1482,
+   "turn": 0.548,
+   "turn_var": 0.599,
+   "motion": 0.834,
+   "score": 1.431
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311102142.zarr",
+   "start": 1014,
+   "n_latent_frames": 1379,
+   "turn": 0.779,
+   "turn_var": 0.092,
+   "motion": 0.865,
+   "score": 1.43
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426134958.zarr",
+   "start": 735,
+   "n_latent_frames": 1452,
+   "turn": 0.559,
+   "turn_var": 0.52,
+   "motion": 0.872,
+   "score": 1.429
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325110448.zarr",
+   "start": 795,
+   "n_latent_frames": 1438,
+   "turn": 0.49,
+   "turn_var": 0.563,
+   "motion": 0.937,
+   "score": 1.428
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404141713.zarr",
+   "start": 432,
+   "n_latent_frames": 741,
+   "turn": 0.806,
+   "turn_var": 0.212,
+   "motion": 0.737,
+   "score": 1.428
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315132915.zarr",
+   "start": 147,
+   "n_latent_frames": 1404,
+   "turn": 0.571,
+   "turn_var": 0.659,
+   "motion": 0.751,
+   "score": 1.426
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409121514.zarr",
+   "start": 294,
+   "n_latent_frames": 1488,
+   "turn": 0.505,
+   "turn_var": 0.567,
+   "motion": 0.907,
+   "score": 1.424
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315121333.zarr",
+   "start": 225,
+   "n_latent_frames": 1485,
+   "turn": 0.504,
+   "turn_var": 0.506,
+   "motion": 0.951,
+   "score": 1.423
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320152806.zarr",
+   "start": 1221,
+   "n_latent_frames": 1482,
+   "turn": 0.587,
+   "turn_var": 0.623,
+   "motion": 0.749,
+   "score": 1.423
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320080446.zarr",
+   "start": 996,
+   "n_latent_frames": 1452,
+   "turn": 0.561,
+   "turn_var": 0.57,
+   "motion": 0.822,
+   "score": 1.421
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409083912.zarr",
+   "start": 177,
+   "n_latent_frames": 1476,
+   "turn": 0.621,
+   "turn_var": 0.373,
+   "motion": 0.875,
+   "score": 1.42
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404173716.zarr",
+   "start": 132,
+   "n_latent_frames": 1413,
+   "turn": 0.523,
+   "turn_var": 0.545,
+   "motion": 0.889,
+   "score": 1.418
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320122510.zarr",
+   "start": 225,
+   "n_latent_frames": 1497,
+   "turn": 0.531,
+   "turn_var": 0.574,
+   "motion": 0.855,
+   "score": 1.416
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424082647.zarr",
+   "start": 576,
+   "n_latent_frames": 1488,
+   "turn": 0.879,
+   "turn_var": 0.099,
+   "motion": 0.696,
+   "score": 1.416
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429053732.zarr",
+   "start": 333,
+   "n_latent_frames": 1458,
+   "turn": 0.566,
+   "turn_var": 0.411,
+   "motion": 0.919,
+   "score": 1.415
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315122501.zarr",
+   "start": 1233,
+   "n_latent_frames": 1341,
+   "turn": 0.574,
+   "turn_var": 0.619,
+   "motion": 0.757,
+   "score": 1.414
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410110629.zarr",
+   "start": 1245,
+   "n_latent_frames": 1497,
+   "turn": 0.607,
+   "turn_var": 0.301,
+   "motion": 0.938,
+   "score": 1.414
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404164419.zarr",
+   "start": 1299,
+   "n_latent_frames": 1479,
+   "turn": 0.516,
+   "turn_var": 0.544,
+   "motion": 0.89,
+   "score": 1.411
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405125217.zarr",
+   "start": 786,
+   "n_latent_frames": 1397,
+   "turn": 0.526,
+   "turn_var": 0.574,
+   "motion": 0.854,
+   "score": 1.411
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422121937.zarr",
+   "start": 729,
+   "n_latent_frames": 1190,
+   "turn": 0.484,
+   "turn_var": 0.543,
+   "motion": 0.936,
+   "score": 1.411
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404163457.zarr",
+   "start": 948,
+   "n_latent_frames": 1491,
+   "turn": 0.657,
+   "turn_var": 0.367,
+   "motion": 0.811,
+   "score": 1.409
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410103646.zarr",
+   "start": 87,
+   "n_latent_frames": 1470,
+   "turn": 0.528,
+   "turn_var": 0.604,
+   "motion": 0.827,
+   "score": 1.409
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501103132.zarr",
+   "start": 12,
+   "n_latent_frames": 1460,
+   "turn": 0.599,
+   "turn_var": 0.557,
+   "motion": 0.759,
+   "score": 1.409
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406134124.zarr",
+   "start": 1053,
+   "n_latent_frames": 1497,
+   "turn": 0.48,
+   "turn_var": 0.55,
+   "motion": 0.934,
+   "score": 1.408
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429084602.zarr",
+   "start": 30,
+   "n_latent_frames": 1226,
+   "turn": 0.641,
+   "turn_var": 0.504,
+   "motion": 0.735,
+   "score": 1.408
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502112720.zarr",
+   "start": 483,
+   "n_latent_frames": 1497,
+   "turn": 0.541,
+   "turn_var": 0.429,
+   "motion": 0.93,
+   "score": 1.407
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315120721.zarr",
+   "start": 6,
+   "n_latent_frames": 1347,
+   "turn": 0.642,
+   "turn_var": 0.647,
+   "motion": 0.63,
+   "score": 1.406
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411144407.zarr",
+   "start": 948,
+   "n_latent_frames": 1428,
+   "turn": 0.542,
+   "turn_var": 0.573,
+   "motion": 0.825,
+   "score": 1.406
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325111117.zarr",
+   "start": 1356,
+   "n_latent_frames": 1497,
+   "turn": 0.686,
+   "turn_var": 0.323,
+   "motion": 0.794,
+   "score": 1.403
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325125052.zarr",
+   "start": 360,
+   "n_latent_frames": 660,
+   "turn": 0.501,
+   "turn_var": 0.572,
+   "motion": 0.88,
+   "score": 1.403
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501132416.zarr",
+   "start": 42,
+   "n_latent_frames": 1491,
+   "turn": 0.53,
+   "turn_var": 0.562,
+   "motion": 0.846,
+   "score": 1.403
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322112401.zarr",
+   "start": 210,
+   "n_latent_frames": 370,
+   "turn": 0.54,
+   "turn_var": 0.441,
+   "motion": 0.917,
+   "score": 1.402
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325110116.zarr",
+   "start": 471,
+   "n_latent_frames": 629,
+   "turn": 0.486,
+   "turn_var": 0.486,
+   "motion": 0.958,
+   "score": 1.4
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320110840.zarr",
+   "start": 588,
+   "n_latent_frames": 1497,
+   "turn": 0.745,
+   "turn_var": 0.301,
+   "motion": 0.719,
+   "score": 1.399
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315164317.zarr",
+   "start": 501,
+   "n_latent_frames": 1497,
+   "turn": 0.482,
+   "turn_var": 0.533,
+   "motion": 0.928,
+   "score": 1.398
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325120738.zarr",
+   "start": 114,
+   "n_latent_frames": 1314,
+   "turn": 0.517,
+   "turn_var": 0.568,
+   "motion": 0.853,
+   "score": 1.398
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322102423.zarr",
+   "start": 399,
+   "n_latent_frames": 1449,
+   "turn": 0.533,
+   "turn_var": 0.517,
+   "motion": 0.866,
+   "score": 1.397
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425112356.zarr",
+   "start": 24,
+   "n_latent_frames": 1406,
+   "turn": 0.53,
+   "turn_var": 0.602,
+   "motion": 0.809,
+   "score": 1.397
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240228101258.zarr",
+   "start": 78,
+   "n_latent_frames": 782,
+   "turn": 0.739,
+   "turn_var": 0.253,
+   "motion": 0.756,
+   "score": 1.395
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327085543.zarr",
+   "start": 840,
+   "n_latent_frames": 1428,
+   "turn": 0.575,
+   "turn_var": 0.626,
+   "motion": 0.725,
+   "score": 1.395
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405122024.zarr",
+   "start": 999,
+   "n_latent_frames": 1410,
+   "turn": 0.574,
+   "turn_var": 0.611,
+   "motion": 0.736,
+   "score": 1.395
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502104537.zarr",
+   "start": 27,
+   "n_latent_frames": 1488,
+   "turn": 0.549,
+   "turn_var": 0.451,
+   "motion": 0.887,
+   "score": 1.395
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322112622.zarr",
+   "start": 147,
+   "n_latent_frames": 1497,
+   "turn": 0.73,
+   "turn_var": 0.123,
+   "motion": 0.861,
+   "score": 1.394
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406144402.zarr",
+   "start": 570,
+   "n_latent_frames": 1277,
+   "turn": 0.484,
+   "turn_var": 0.504,
+   "motion": 0.94,
+   "score": 1.394
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409162434.zarr",
+   "start": 294,
+   "n_latent_frames": 980,
+   "turn": 0.501,
+   "turn_var": 0.557,
+   "motion": 0.877,
+   "score": 1.393
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411162636.zarr",
+   "start": 321,
+   "n_latent_frames": 1491,
+   "turn": 0.516,
+   "turn_var": 0.486,
+   "motion": 0.906,
+   "score": 1.393
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411154932.zarr",
+   "start": 1209,
+   "n_latent_frames": 1497,
+   "turn": 0.651,
+   "turn_var": 0.509,
+   "motion": 0.691,
+   "score": 1.389
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429115320.zarr",
+   "start": 492,
+   "n_latent_frames": 1497,
+   "turn": 0.592,
+   "turn_var": 0.369,
+   "motion": 0.874,
+   "score": 1.389
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409113044.zarr",
+   "start": 747,
+   "n_latent_frames": 1171,
+   "turn": 0.488,
+   "turn_var": 0.471,
+   "motion": 0.948,
+   "score": 1.388
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321085643.zarr",
+   "start": 852,
+   "n_latent_frames": 1488,
+   "turn": 0.735,
+   "turn_var": 0.304,
+   "motion": 0.714,
+   "score": 1.387
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321083228.zarr",
+   "start": 12,
+   "n_latent_frames": 1464,
+   "turn": 0.793,
+   "turn_var": 0.197,
+   "motion": 0.706,
+   "score": 1.386
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322110906.zarr",
+   "start": 57,
+   "n_latent_frames": 1497,
+   "turn": 0.515,
+   "turn_var": 0.435,
+   "motion": 0.934,
+   "score": 1.386
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315083028.zarr",
+   "start": 309,
+   "n_latent_frames": 994,
+   "turn": 0.507,
+   "turn_var": 0.583,
+   "motion": 0.838,
+   "score": 1.385
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319151022.zarr",
+   "start": 1215,
+   "n_latent_frames": 1485,
+   "turn": 0.529,
+   "turn_var": 0.567,
+   "motion": 0.819,
+   "score": 1.385
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422111359.zarr",
+   "start": 819,
+   "n_latent_frames": 1371,
+   "turn": 0.498,
+   "turn_var": 0.45,
+   "motion": 0.945,
+   "score": 1.384
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312105235.zarr",
+   "start": 33,
+   "n_latent_frames": 1437,
+   "turn": 0.722,
+   "turn_var": 0.115,
+   "motion": 0.858,
+   "score": 1.38
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325154721.zarr",
+   "start": 1335,
+   "n_latent_frames": 1383,
+   "turn": 0.607,
+   "turn_var": 0.43,
+   "motion": 0.797,
+   "score": 1.38
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407124512.zarr",
+   "start": 15,
+   "n_latent_frames": 1470,
+   "turn": 0.81,
+   "turn_var": 0.169,
+   "motion": 0.694,
+   "score": 1.38
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409103829.zarr",
+   "start": 666,
+   "n_latent_frames": 1395,
+   "turn": 0.515,
+   "turn_var": 0.577,
+   "motion": 0.823,
+   "score": 1.38
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425113012.zarr",
+   "start": 213,
+   "n_latent_frames": 1365,
+   "turn": 0.501,
+   "turn_var": 0.536,
+   "motion": 0.872,
+   "score": 1.38
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318072223.zarr",
+   "start": 1215,
+   "n_latent_frames": 1491,
+   "turn": 0.524,
+   "turn_var": 0.483,
+   "motion": 0.876,
+   "score": 1.379
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409073102.zarr",
+   "start": 105,
+   "n_latent_frames": 365,
+   "turn": 0.705,
+   "turn_var": 0.301,
+   "motion": 0.747,
+   "score": 1.379
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411083925.zarr",
+   "start": 9,
+   "n_latent_frames": 1338,
+   "turn": 0.602,
+   "turn_var": 0.281,
+   "motion": 0.907,
+   "score": 1.377
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430110921.zarr",
+   "start": 39,
+   "n_latent_frames": 1482,
+   "turn": 0.544,
+   "turn_var": 0.542,
+   "motion": 0.802,
+   "score": 1.377
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325124451.zarr",
+   "start": 567,
+   "n_latent_frames": 1274,
+   "turn": 0.467,
+   "turn_var": 0.544,
+   "motion": 0.909,
+   "score": 1.375
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411170119.zarr",
+   "start": 1053,
+   "n_latent_frames": 1479,
+   "turn": 0.527,
+   "turn_var": 0.508,
+   "motion": 0.848,
+   "score": 1.375
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409111045.zarr",
+   "start": 804,
+   "n_latent_frames": 1447,
+   "turn": 0.776,
+   "turn_var": 0.236,
+   "motion": 0.684,
+   "score": 1.372
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322084119.zarr",
+   "start": 807,
+   "n_latent_frames": 1491,
+   "turn": 0.57,
+   "turn_var": 0.57,
+   "motion": 0.737,
+   "score": 1.371
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425111823.zarr",
+   "start": 636,
+   "n_latent_frames": 1164,
+   "turn": 0.67,
+   "turn_var": 0.499,
+   "motion": 0.646,
+   "score": 1.371
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407130831.zarr",
+   "start": 6,
+   "n_latent_frames": 691,
+   "turn": 0.884,
+   "turn_var": 0.091,
+   "motion": 0.627,
+   "score": 1.369
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501134601.zarr",
+   "start": 642,
+   "n_latent_frames": 1341,
+   "turn": 0.494,
+   "turn_var": 0.499,
+   "motion": 0.894,
+   "score": 1.369
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311111624.zarr",
+   "start": 372,
+   "n_latent_frames": 959,
+   "turn": 0.588,
+   "turn_var": 0.333,
+   "motion": 0.876,
+   "score": 1.367
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325133337.zarr",
+   "start": 81,
+   "n_latent_frames": 135,
+   "turn": 0.653,
+   "turn_var": 0.386,
+   "motion": 0.744,
+   "score": 1.367
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326091039.zarr",
+   "start": 1317,
+   "n_latent_frames": 1497,
+   "turn": 0.545,
+   "turn_var": 0.599,
+   "motion": 0.747,
+   "score": 1.367
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314105511.zarr",
+   "start": 1101,
+   "n_latent_frames": 1485,
+   "turn": 0.594,
+   "turn_var": 0.292,
+   "motion": 0.894,
+   "score": 1.365
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405121321.zarr",
+   "start": 633,
+   "n_latent_frames": 1023,
+   "turn": 0.717,
+   "turn_var": 0.29,
+   "motion": 0.716,
+   "score": 1.363
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322080205.zarr",
+   "start": 402,
+   "n_latent_frames": 498,
+   "turn": 0.782,
+   "turn_var": 0.237,
+   "motion": 0.659,
+   "score": 1.362
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406151846.zarr",
+   "start": 744,
+   "n_latent_frames": 1029,
+   "turn": 0.64,
+   "turn_var": 0.338,
+   "motion": 0.79,
+   "score": 1.362
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318100351.zarr",
+   "start": 273,
+   "n_latent_frames": 1476,
+   "turn": 0.527,
+   "turn_var": 0.538,
+   "motion": 0.809,
+   "score": 1.361
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405135709.zarr",
+   "start": 36,
+   "n_latent_frames": 1491,
+   "turn": 0.775,
+   "turn_var": 0.29,
+   "motion": 0.628,
+   "score": 1.361
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409115352.zarr",
+   "start": 54,
+   "n_latent_frames": 1312,
+   "turn": 0.537,
+   "turn_var": 0.605,
+   "motion": 0.742,
+   "score": 1.359
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501130806.zarr",
+   "start": 21,
+   "n_latent_frames": 1497,
+   "turn": 0.73,
+   "turn_var": 0.101,
+   "motion": 0.823,
+   "score": 1.357
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417081702.zarr",
+   "start": 132,
+   "n_latent_frames": 810,
+   "turn": 0.52,
+   "turn_var": 0.482,
+   "motion": 0.85,
+   "score": 1.356
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312113733.zarr",
+   "start": 1071,
+   "n_latent_frames": 1491,
+   "turn": 0.58,
+   "turn_var": 0.286,
+   "motion": 0.902,
+   "score": 1.355
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426123132.zarr",
+   "start": 1161,
+   "n_latent_frames": 1482,
+   "turn": 0.511,
+   "turn_var": 0.537,
+   "motion": 0.821,
+   "score": 1.354
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322104146.zarr",
+   "start": 357,
+   "n_latent_frames": 708,
+   "turn": 0.761,
+   "turn_var": 0.058,
+   "motion": 0.804,
+   "score": 1.353
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406132628.zarr",
+   "start": 525,
+   "n_latent_frames": 1488,
+   "turn": 0.505,
+   "turn_var": 0.487,
+   "motion": 0.864,
+   "score": 1.353
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408101800.zarr",
+   "start": 333,
+   "n_latent_frames": 1488,
+   "turn": 0.596,
+   "turn_var": 0.572,
+   "motion": 0.673,
+   "score": 1.353
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411171948.zarr",
+   "start": 69,
+   "n_latent_frames": 1402,
+   "turn": 0.474,
+   "turn_var": 0.506,
+   "motion": 0.894,
+   "score": 1.353
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417114636.zarr",
+   "start": 1149,
+   "n_latent_frames": 1497,
+   "turn": 0.528,
+   "turn_var": 0.356,
+   "motion": 0.924,
+   "score": 1.353
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315113420.zarr",
+   "start": 33,
+   "n_latent_frames": 217,
+   "turn": 0.753,
+   "turn_var": 0.168,
+   "motion": 0.736,
+   "score": 1.352
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411172750.zarr",
+   "start": 1023,
+   "n_latent_frames": 1140,
+   "turn": 0.544,
+   "turn_var": 0.59,
+   "motion": 0.732,
+   "score": 1.351
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423075510.zarr",
+   "start": 1272,
+   "n_latent_frames": 1494,
+   "turn": 0.621,
+   "turn_var": 0.186,
+   "motion": 0.907,
+   "score": 1.349
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430072532.zarr",
+   "start": 1098,
+   "n_latent_frames": 1164,
+   "turn": 0.449,
+   "turn_var": 0.57,
+   "motion": 0.878,
+   "score": 1.349
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423095536.zarr",
+   "start": 39,
+   "n_latent_frames": 1497,
+   "turn": 0.641,
+   "turn_var": 0.291,
+   "motion": 0.8,
+   "score": 1.346
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426084842.zarr",
+   "start": 1314,
+   "n_latent_frames": 1434,
+   "turn": 0.546,
+   "turn_var": 0.607,
+   "motion": 0.708,
+   "score": 1.345
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430103228.zarr",
+   "start": 765,
+   "n_latent_frames": 942,
+   "turn": 0.7,
+   "turn_var": 0.355,
+   "motion": 0.668,
+   "score": 1.345
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407153117.zarr",
+   "start": 42,
+   "n_latent_frames": 1494,
+   "turn": 0.643,
+   "turn_var": 0.09,
+   "motion": 0.937,
+   "score": 1.344
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307114016.zarr",
+   "start": 1464,
+   "n_latent_frames": 1497,
+   "turn": 0.705,
+   "turn_var": 0.276,
+   "motion": 0.713,
+   "score": 1.342
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411110607.zarr",
+   "start": 735,
+   "n_latent_frames": 1114,
+   "turn": 0.515,
+   "turn_var": 0.564,
+   "motion": 0.778,
+   "score": 1.342
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326090332.zarr",
+   "start": 924,
+   "n_latent_frames": 1497,
+   "turn": 0.743,
+   "turn_var": 0.488,
+   "motion": 0.501,
+   "score": 1.337
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411174040.zarr",
+   "start": 297,
+   "n_latent_frames": 813,
+   "turn": 0.441,
+   "turn_var": 0.499,
+   "motion": 0.923,
+   "score": 1.337
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501075518.zarr",
+   "start": 942,
+   "n_latent_frames": 1485,
+   "turn": 0.761,
+   "turn_var": 0.271,
+   "motion": 0.629,
+   "score": 1.337
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325100411.zarr",
+   "start": 84,
+   "n_latent_frames": 138,
+   "turn": 0.704,
+   "turn_var": 0.365,
+   "motion": 0.642,
+   "score": 1.336
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425113831.zarr",
+   "start": 573,
+   "n_latent_frames": 1422,
+   "turn": 0.521,
+   "turn_var": 0.426,
+   "motion": 0.859,
+   "score": 1.335
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240226111352.zarr",
+   "start": 1146,
+   "n_latent_frames": 1362,
+   "turn": 0.571,
+   "turn_var": 0.253,
+   "motion": 0.909,
+   "score": 1.334
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314125344.zarr",
+   "start": 321,
+   "n_latent_frames": 413,
+   "turn": 0.586,
+   "turn_var": 0.672,
+   "motion": 0.589,
+   "score": 1.334
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321103521.zarr",
+   "start": 1440,
+   "n_latent_frames": 1464,
+   "turn": 0.547,
+   "turn_var": 0.33,
+   "motion": 0.889,
+   "score": 1.334
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406135814.zarr",
+   "start": 54,
+   "n_latent_frames": 716,
+   "turn": 0.754,
+   "turn_var": 0.561,
+   "motion": 0.428,
+   "score": 1.334
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410114046.zarr",
+   "start": 849,
+   "n_latent_frames": 1485,
+   "turn": 0.509,
+   "turn_var": 0.411,
+   "motion": 0.884,
+   "score": 1.333
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423093132.zarr",
+   "start": 543,
+   "n_latent_frames": 1485,
+   "turn": 0.59,
+   "turn_var": 0.291,
+   "motion": 0.854,
+   "score": 1.333
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320103628.zarr",
+   "start": 435,
+   "n_latent_frames": 1497,
+   "turn": 0.562,
+   "turn_var": 0.614,
+   "motion": 0.662,
+   "score": 1.332
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406143824.zarr",
+   "start": 465,
+   "n_latent_frames": 697,
+   "turn": 0.453,
+   "turn_var": 0.489,
+   "motion": 0.905,
+   "score": 1.331
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417120904.zarr",
+   "start": 849,
+   "n_latent_frames": 1449,
+   "turn": 0.529,
+   "turn_var": 0.361,
+   "motion": 0.886,
+   "score": 1.33
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240328091301.zarr",
+   "start": 69,
+   "n_latent_frames": 258,
+   "turn": 0.532,
+   "turn_var": 0.571,
+   "motion": 0.73,
+   "score": 1.328
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411150648.zarr",
+   "start": 219,
+   "n_latent_frames": 1491,
+   "turn": 0.613,
+   "turn_var": 0.169,
+   "motion": 0.898,
+   "score": 1.326
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418080327.zarr",
+   "start": 1203,
+   "n_latent_frames": 1295,
+   "turn": 0.516,
+   "turn_var": 0.467,
+   "motion": 0.822,
+   "score": 1.325
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409082343.zarr",
+   "start": 24,
+   "n_latent_frames": 1488,
+   "turn": 0.605,
+   "turn_var": 0.375,
+   "motion": 0.76,
+   "score": 1.324
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306103238.zarr",
+   "start": 498,
+   "n_latent_frames": 927,
+   "turn": 0.518,
+   "turn_var": 0.453,
+   "motion": 0.827,
+   "score": 1.323
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322090318.zarr",
+   "start": 117,
+   "n_latent_frames": 1497,
+   "turn": 0.615,
+   "turn_var": 0.619,
+   "motion": 0.567,
+   "score": 1.321
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221102652.zarr",
+   "start": 1179,
+   "n_latent_frames": 1335,
+   "turn": 0.593,
+   "turn_var": 0.353,
+   "motion": 0.786,
+   "score": 1.32
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315155407.zarr",
+   "start": 861,
+   "n_latent_frames": 1157,
+   "turn": 0.457,
+   "turn_var": 0.515,
+   "motion": 0.864,
+   "score": 1.319
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319075203.zarr",
+   "start": 1149,
+   "n_latent_frames": 1497,
+   "turn": 0.451,
+   "turn_var": 0.464,
+   "motion": 0.908,
+   "score": 1.319
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426084403.zarr",
+   "start": 336,
+   "n_latent_frames": 527,
+   "turn": 0.611,
+   "turn_var": 0.247,
+   "motion": 0.833,
+   "score": 1.318
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318073934.zarr",
+   "start": 1233,
+   "n_latent_frames": 1491,
+   "turn": 0.449,
+   "turn_var": 0.529,
+   "motion": 0.86,
+   "score": 1.316
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405133033.zarr",
+   "start": 360,
+   "n_latent_frames": 559,
+   "turn": 0.479,
+   "turn_var": 0.447,
+   "motion": 0.871,
+   "score": 1.313
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417121604.zarr",
+   "start": 48,
+   "n_latent_frames": 1488,
+   "turn": 0.491,
+   "turn_var": 0.501,
+   "motion": 0.816,
+   "score": 1.312
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406140212.zarr",
+   "start": 1278,
+   "n_latent_frames": 1497,
+   "turn": 0.468,
+   "turn_var": 0.461,
+   "motion": 0.875,
+   "score": 1.311
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319163529.zarr",
+   "start": 60,
+   "n_latent_frames": 1488,
+   "turn": 0.526,
+   "turn_var": 0.57,
+   "motion": 0.712,
+   "score": 1.31
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326102702.zarr",
+   "start": 33,
+   "n_latent_frames": 1497,
+   "turn": 0.547,
+   "turn_var": 0.619,
+   "motion": 0.648,
+   "score": 1.31
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407104529.zarr",
+   "start": 45,
+   "n_latent_frames": 870,
+   "turn": 0.528,
+   "turn_var": 0.509,
+   "motion": 0.754,
+   "score": 1.31
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501142423.zarr",
+   "start": 648,
+   "n_latent_frames": 1344,
+   "turn": 0.557,
+   "turn_var": 0.202,
+   "motion": 0.931,
+   "score": 1.31
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418115354.zarr",
+   "start": 33,
+   "n_latent_frames": 1243,
+   "turn": 0.494,
+   "turn_var": 0.38,
+   "motion": 0.891,
+   "score": 1.307
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240503120743.zarr",
+   "start": 978,
+   "n_latent_frames": 1458,
+   "turn": 0.58,
+   "turn_var": 0.204,
+   "motion": 0.892,
+   "score": 1.307
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240216101235.zarr",
+   "start": 96,
+   "n_latent_frames": 1479,
+   "turn": 0.818,
+   "turn_var": 0.102,
+   "motion": 0.623,
+   "score": 1.305
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430114001.zarr",
+   "start": 867,
+   "n_latent_frames": 1455,
+   "turn": 0.845,
+   "turn_var": 0.076,
+   "motion": 0.599,
+   "score": 1.303
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326102450.zarr",
+   "start": 321,
+   "n_latent_frames": 423,
+   "turn": 0.53,
+   "turn_var": 0.363,
+   "motion": 0.841,
+   "score": 1.3
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404162324.zarr",
+   "start": 1248,
+   "n_latent_frames": 1497,
+   "turn": 0.52,
+   "turn_var": 0.479,
+   "motion": 0.772,
+   "score": 1.3
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418105707.zarr",
+   "start": 180,
+   "n_latent_frames": 1476,
+   "turn": 0.403,
+   "turn_var": 0.454,
+   "motion": 0.958,
+   "score": 1.3
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404171742.zarr",
+   "start": 834,
+   "n_latent_frames": 1494,
+   "turn": 0.456,
+   "turn_var": 0.491,
+   "motion": 0.851,
+   "score": 1.298
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316141017.zarr",
+   "start": 1179,
+   "n_latent_frames": 1491,
+   "turn": 0.497,
+   "turn_var": 0.373,
+   "motion": 0.876,
+   "score": 1.297
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318104916.zarr",
+   "start": 1233,
+   "n_latent_frames": 1473,
+   "turn": 0.488,
+   "turn_var": 0.363,
+   "motion": 0.897,
+   "score": 1.297
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430135028.zarr",
+   "start": 408,
+   "n_latent_frames": 490,
+   "turn": 0.691,
+   "turn_var": 0.098,
+   "motion": 0.796,
+   "score": 1.297
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316144555.zarr",
+   "start": 1335,
+   "n_latent_frames": 1365,
+   "turn": 0.608,
+   "turn_var": 0.342,
+   "motion": 0.739,
+   "score": 1.296
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426065949.zarr",
+   "start": 111,
+   "n_latent_frames": 1482,
+   "turn": 0.466,
+   "turn_var": 0.486,
+   "motion": 0.838,
+   "score": 1.295
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409120810.zarr",
+   "start": 9,
+   "n_latent_frames": 1425,
+   "turn": 0.468,
+   "turn_var": 0.428,
+   "motion": 0.874,
+   "score": 1.294
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411152358.zarr",
+   "start": 354,
+   "n_latent_frames": 1494,
+   "turn": 0.423,
+   "turn_var": 0.458,
+   "motion": 0.917,
+   "score": 1.294
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320123937.zarr",
+   "start": 183,
+   "n_latent_frames": 226,
+   "turn": 0.581,
+   "turn_var": 0.595,
+   "motion": 0.593,
+   "score": 1.293
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311114827.zarr",
+   "start": 231,
+   "n_latent_frames": 334,
+   "turn": 0.603,
+   "turn_var": 0.105,
+   "motion": 0.91,
+   "score": 1.292
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409110636.zarr",
+   "start": 699,
+   "n_latent_frames": 723,
+   "turn": 0.456,
+   "turn_var": 0.517,
+   "motion": 0.825,
+   "score": 1.292
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407101549.zarr",
+   "start": 1371,
+   "n_latent_frames": 1491,
+   "turn": 0.461,
+   "turn_var": 0.502,
+   "motion": 0.827,
+   "score": 1.291
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426124146.zarr",
+   "start": 870,
+   "n_latent_frames": 1206,
+   "turn": 0.503,
+   "turn_var": 0.372,
+   "motion": 0.859,
+   "score": 1.29
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312110756.zarr",
+   "start": 345,
+   "n_latent_frames": 1497,
+   "turn": 0.434,
+   "turn_var": 0.462,
+   "motion": 0.891,
+   "score": 1.289
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325100728.zarr",
+   "start": 12,
+   "n_latent_frames": 881,
+   "turn": 0.442,
+   "turn_var": 0.539,
+   "motion": 0.823,
+   "score": 1.288
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326090003.zarr",
+   "start": 684,
+   "n_latent_frames": 819,
+   "turn": 0.75,
+   "turn_var": 0.187,
+   "motion": 0.634,
+   "score": 1.288
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319102750.zarr",
+   "start": 195,
+   "n_latent_frames": 276,
+   "turn": 0.841,
+   "turn_var": 0.04,
+   "motion": 0.606,
+   "score": 1.285
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325115225.zarr",
+   "start": 1227,
+   "n_latent_frames": 1473,
+   "turn": 0.459,
+   "turn_var": 0.503,
+   "motion": 0.821,
+   "score": 1.285
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240406132117.zarr",
+   "start": 330,
+   "n_latent_frames": 1170,
+   "turn": 0.42,
+   "turn_var": 0.436,
+   "motion": 0.923,
+   "score": 1.284
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321122555.zarr",
+   "start": 1107,
+   "n_latent_frames": 1188,
+   "turn": 0.622,
+   "turn_var": 0.147,
+   "motion": 0.84,
+   "score": 1.283
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322092319.zarr",
+   "start": 60,
+   "n_latent_frames": 159,
+   "turn": 0.724,
+   "turn_var": 0.228,
+   "motion": 0.635,
+   "score": 1.283
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322094630.zarr",
+   "start": 177,
+   "n_latent_frames": 1497,
+   "turn": 0.595,
+   "turn_var": 0.627,
+   "motion": 0.535,
+   "score": 1.283
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404174833.zarr",
+   "start": 981,
+   "n_latent_frames": 1425,
+   "turn": 0.563,
+   "turn_var": 0.279,
+   "motion": 0.825,
+   "score": 1.28
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325144447.zarr",
+   "start": 261,
+   "n_latent_frames": 918,
+   "turn": 0.758,
+   "turn_var": 0.081,
+   "motion": 0.685,
+   "score": 1.278
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410103000.zarr",
+   "start": 39,
+   "n_latent_frames": 1208,
+   "turn": 0.482,
+   "turn_var": 0.453,
+   "motion": 0.812,
+   "score": 1.277
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319140045.zarr",
+   "start": 1395,
+   "n_latent_frames": 1443,
+   "turn": 0.527,
+   "turn_var": 0.625,
+   "motion": 0.621,
+   "score": 1.275
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314074715.zarr",
+   "start": 144,
+   "n_latent_frames": 564,
+   "turn": 0.626,
+   "turn_var": 0.22,
+   "motion": 0.769,
+   "score": 1.274
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319070321.zarr",
+   "start": 717,
+   "n_latent_frames": 1497,
+   "turn": 0.487,
+   "turn_var": 0.506,
+   "motion": 0.759,
+   "score": 1.272
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240304114412.zarr",
+   "start": 93,
+   "n_latent_frames": 189,
+   "turn": 0.491,
+   "turn_var": 0.55,
+   "motion": 0.722,
+   "score": 1.271
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318105832.zarr",
+   "start": 81,
+   "n_latent_frames": 1497,
+   "turn": 0.421,
+   "turn_var": 0.434,
+   "motion": 0.904,
+   "score": 1.271
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319135635.zarr",
+   "start": 744,
+   "n_latent_frames": 848,
+   "turn": 0.532,
+   "turn_var": 0.447,
+   "motion": 0.736,
+   "score": 1.271
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405142828.zarr",
+   "start": 9,
+   "n_latent_frames": 1473,
+   "turn": 0.684,
+   "turn_var": 0.347,
+   "motion": 0.588,
+   "score": 1.269
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319160148.zarr",
+   "start": 45,
+   "n_latent_frames": 935,
+   "turn": 0.697,
+   "turn_var": 0.335,
+   "motion": 0.575,
+   "score": 1.268
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320110024.zarr",
+   "start": 84,
+   "n_latent_frames": 1491,
+   "turn": 0.586,
+   "turn_var": 0.595,
+   "motion": 0.549,
+   "score": 1.268
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322130205.zarr",
+   "start": 0,
+   "n_latent_frames": 1050,
+   "turn": 0.414,
+   "turn_var": 0.468,
+   "motion": 0.886,
+   "score": 1.268
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423105420.zarr",
+   "start": 963,
+   "n_latent_frames": 1438,
+   "turn": 0.573,
+   "turn_var": 0.162,
+   "motion": 0.877,
+   "score": 1.268
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319072635.zarr",
+   "start": 801,
+   "n_latent_frames": 1497,
+   "turn": 0.441,
+   "turn_var": 0.576,
+   "motion": 0.769,
+   "score": 1.267
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322113718.zarr",
+   "start": 36,
+   "n_latent_frames": 852,
+   "turn": 0.708,
+   "turn_var": 0.74,
+   "motion": 0.269,
+   "score": 1.266
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407105425.zarr",
+   "start": 453,
+   "n_latent_frames": 950,
+   "turn": 0.853,
+   "turn_var": 0.091,
+   "motion": 0.525,
+   "score": 1.266
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319063154.zarr",
+   "start": 717,
+   "n_latent_frames": 879,
+   "turn": 0.581,
+   "turn_var": 0.287,
+   "motion": 0.772,
+   "score": 1.265
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411141618.zarr",
+   "start": 525,
+   "n_latent_frames": 674,
+   "turn": 0.436,
+   "turn_var": 0.49,
+   "motion": 0.832,
+   "score": 1.264
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319143200.zarr",
+   "start": 237,
+   "n_latent_frames": 1086,
+   "turn": 0.415,
+   "turn_var": 0.474,
+   "motion": 0.873,
+   "score": 1.263
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320114619.zarr",
+   "start": 204,
+   "n_latent_frames": 1476,
+   "turn": 0.45,
+   "turn_var": 0.517,
+   "motion": 0.79,
+   "score": 1.261
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426152658.zarr",
+   "start": 375,
+   "n_latent_frames": 791,
+   "turn": 0.61,
+   "turn_var": 0.095,
+   "motion": 0.859,
+   "score": 1.259
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314104130.zarr",
+   "start": 1290,
+   "n_latent_frames": 1491,
+   "turn": 0.454,
+   "turn_var": 0.514,
+   "motion": 0.781,
+   "score": 1.258
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325103427.zarr",
+   "start": 54,
+   "n_latent_frames": 1104,
+   "turn": 0.379,
+   "turn_var": 0.491,
+   "motion": 0.905,
+   "score": 1.258
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426090033.zarr",
+   "start": 24,
+   "n_latent_frames": 1488,
+   "turn": 0.618,
+   "turn_var": 0.09,
+   "motion": 0.847,
+   "score": 1.256
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318111624.zarr",
+   "start": 1356,
+   "n_latent_frames": 1488,
+   "turn": 0.496,
+   "turn_var": 0.199,
+   "motion": 0.942,
+   "score": 1.255
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319103924.zarr",
+   "start": 237,
+   "n_latent_frames": 519,
+   "turn": 0.668,
+   "turn_var": 0.097,
+   "motion": 0.768,
+   "score": 1.255
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322051424.zarr",
+   "start": 1146,
+   "n_latent_frames": 1497,
+   "turn": 0.611,
+   "turn_var": 0.655,
+   "motion": 0.452,
+   "score": 1.255
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426140227.zarr",
+   "start": 51,
+   "n_latent_frames": 1278,
+   "turn": 0.534,
+   "turn_var": 0.486,
+   "motion": 0.681,
+   "score": 1.254
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430080453.zarr",
+   "start": 600,
+   "n_latent_frames": 1132,
+   "turn": 0.884,
+   "turn_var": 0.032,
+   "motion": 0.504,
+   "score": 1.253
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426131331.zarr",
+   "start": 21,
+   "n_latent_frames": 1161,
+   "turn": 0.585,
+   "turn_var": 0.269,
+   "motion": 0.76,
+   "score": 1.252
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416120443.zarr",
+   "start": 768,
+   "n_latent_frames": 1479,
+   "turn": 0.812,
+   "turn_var": 0.08,
+   "motion": 0.571,
+   "score": 1.251
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407113559.zarr",
+   "start": 327,
+   "n_latent_frames": 1482,
+   "turn": 0.421,
+   "turn_var": 0.459,
+   "motion": 0.857,
+   "score": 1.25
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327154240.zarr",
+   "start": 561,
+   "n_latent_frames": 1473,
+   "turn": 0.409,
+   "turn_var": 0.462,
+   "motion": 0.871,
+   "score": 1.249
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322160336.zarr",
+   "start": 33,
+   "n_latent_frames": 957,
+   "turn": 0.421,
+   "turn_var": 0.479,
+   "motion": 0.839,
+   "score": 1.247
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319110620.zarr",
+   "start": 138,
+   "n_latent_frames": 320,
+   "turn": 0.736,
+   "turn_var": 0.112,
+   "motion": 0.649,
+   "score": 1.246
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320124157.zarr",
+   "start": 732,
+   "n_latent_frames": 1497,
+   "turn": 0.426,
+   "turn_var": 0.548,
+   "motion": 0.779,
+   "score": 1.245
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316162118.zarr",
+   "start": 1146,
+   "n_latent_frames": 1485,
+   "turn": 0.41,
+   "turn_var": 0.475,
+   "motion": 0.851,
+   "score": 1.243
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322112735.zarr",
+   "start": 57,
+   "n_latent_frames": 519,
+   "turn": 0.68,
+   "turn_var": 0.072,
+   "motion": 0.744,
+   "score": 1.237
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316134504.zarr",
+   "start": 33,
+   "n_latent_frames": 921,
+   "turn": 0.567,
+   "turn_var": 0.185,
+   "motion": 0.822,
+   "score": 1.235
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327152009.zarr",
+   "start": 39,
+   "n_latent_frames": 1467,
+   "turn": 0.567,
+   "turn_var": 0.634,
+   "motion": 0.502,
+   "score": 1.235
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501121014.zarr",
+   "start": 9,
+   "n_latent_frames": 1494,
+   "turn": 0.591,
+   "turn_var": 0.331,
+   "motion": 0.684,
+   "score": 1.235
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319141301.zarr",
+   "start": 657,
+   "n_latent_frames": 704,
+   "turn": 0.475,
+   "turn_var": 0.368,
+   "motion": 0.817,
+   "score": 1.231
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326092117.zarr",
+   "start": 306,
+   "n_latent_frames": 1497,
+   "turn": 0.597,
+   "turn_var": 0.59,
+   "motion": 0.482,
+   "score": 1.229
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430114930.zarr",
+   "start": 777,
+   "n_latent_frames": 1401,
+   "turn": 0.53,
+   "turn_var": 0.608,
+   "motion": 0.563,
+   "score": 1.228
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319140658.zarr",
+   "start": 156,
+   "n_latent_frames": 450,
+   "turn": 0.373,
+   "turn_var": 0.4,
+   "motion": 0.931,
+   "score": 1.224
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426130056.zarr",
+   "start": 48,
+   "n_latent_frames": 1356,
+   "turn": 0.529,
+   "turn_var": 0.199,
+   "motion": 0.85,
+   "score": 1.224
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318154221.zarr",
+   "start": 717,
+   "n_latent_frames": 823,
+   "turn": 0.377,
+   "turn_var": 0.442,
+   "motion": 0.892,
+   "score": 1.222
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321101507.zarr",
+   "start": 150,
+   "n_latent_frames": 1485,
+   "turn": 0.428,
+   "turn_var": 0.541,
+   "motion": 0.745,
+   "score": 1.22
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411140913.zarr",
+   "start": 879,
+   "n_latent_frames": 1323,
+   "turn": 0.429,
+   "turn_var": 0.306,
+   "motion": 0.912,
+   "score": 1.22
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316143708.zarr",
+   "start": 231,
+   "n_latent_frames": 1497,
+   "turn": 0.416,
+   "turn_var": 0.324,
+   "motion": 0.916,
+   "score": 1.219
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322095552.zarr",
+   "start": 129,
+   "n_latent_frames": 793,
+   "turn": 0.45,
+   "turn_var": 0.526,
+   "motion": 0.723,
+   "score": 1.219
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425114604.zarr",
+   "start": 78,
+   "n_latent_frames": 1401,
+   "turn": 0.406,
+   "turn_var": 0.388,
+   "motion": 0.882,
+   "score": 1.218
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320113508.zarr",
+   "start": 1329,
+   "n_latent_frames": 1389,
+   "turn": 0.456,
+   "turn_var": 0.288,
+   "motion": 0.883,
+   "score": 1.217
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426075726.zarr",
+   "start": 57,
+   "n_latent_frames": 131,
+   "turn": 0.667,
+   "turn_var": 0.074,
+   "motion": 0.73,
+   "score": 1.215
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425103207.zarr",
+   "start": 912,
+   "n_latent_frames": 1440,
+   "turn": 0.523,
+   "turn_var": 0.196,
+   "motion": 0.845,
+   "score": 1.213
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321093757.zarr",
+   "start": 120,
+   "n_latent_frames": 204,
+   "turn": 0.571,
+   "turn_var": 0.61,
+   "motion": 0.48,
+   "score": 1.212
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408144638.zarr",
+   "start": 81,
+   "n_latent_frames": 1494,
+   "turn": 0.651,
+   "turn_var": 0.583,
+   "motion": 0.386,
+   "score": 1.212
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327105228.zarr",
+   "start": 204,
+   "n_latent_frames": 555,
+   "turn": 0.824,
+   "turn_var": 0.076,
+   "motion": 0.496,
+   "score": 1.21
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321123112.zarr",
+   "start": 45,
+   "n_latent_frames": 132,
+   "turn": 0.545,
+   "turn_var": 0.496,
+   "motion": 0.594,
+   "score": 1.209
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425102125.zarr",
+   "start": 744,
+   "n_latent_frames": 1442,
+   "turn": 0.88,
+   "turn_var": 0.037,
+   "motion": 0.444,
+   "score": 1.209
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416115030.zarr",
+   "start": 48,
+   "n_latent_frames": 1497,
+   "turn": 0.393,
+   "turn_var": 0.399,
+   "motion": 0.88,
+   "score": 1.208
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423094210.zarr",
+   "start": 408,
+   "n_latent_frames": 1269,
+   "turn": 0.559,
+   "turn_var": 0.104,
+   "motion": 0.853,
+   "score": 1.208
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311115039.zarr",
+   "start": 501,
+   "n_latent_frames": 700,
+   "turn": 0.513,
+   "turn_var": 0.108,
+   "motion": 0.913,
+   "score": 1.207
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319123020.zarr",
+   "start": 453,
+   "n_latent_frames": 1497,
+   "turn": 0.48,
+   "turn_var": 0.522,
+   "motion": 0.661,
+   "score": 1.204
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318150035.zarr",
+   "start": 18,
+   "n_latent_frames": 1494,
+   "turn": 0.776,
+   "turn_var": 0.098,
+   "motion": 0.54,
+   "score": 1.203
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240308102016.zarr",
+   "start": 789,
+   "n_latent_frames": 1257,
+   "turn": 0.55,
+   "turn_var": 0.101,
+   "motion": 0.856,
+   "score": 1.2
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407122625.zarr",
+   "start": 48,
+   "n_latent_frames": 117,
+   "turn": 0.769,
+   "turn_var": 0.168,
+   "motion": 0.497,
+   "score": 1.2
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318114132.zarr",
+   "start": 381,
+   "n_latent_frames": 1339,
+   "turn": 0.565,
+   "turn_var": 0.589,
+   "motion": 0.484,
+   "score": 1.199
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426132647.zarr",
+   "start": 1023,
+   "n_latent_frames": 1155,
+   "turn": 0.417,
+   "turn_var": 0.367,
+   "motion": 0.855,
+   "score": 1.199
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423115432.zarr",
+   "start": 813,
+   "n_latent_frames": 1449,
+   "turn": 0.511,
+   "turn_var": 0.147,
+   "motion": 0.877,
+   "score": 1.198
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316143048.zarr",
+   "start": 702,
+   "n_latent_frames": 998,
+   "turn": 0.362,
+   "turn_var": 0.425,
+   "motion": 0.886,
+   "score": 1.195
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322110815.zarr",
+   "start": 621,
+   "n_latent_frames": 694,
+   "turn": 0.558,
+   "turn_var": 0.348,
+   "motion": 0.657,
+   "score": 1.192
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411180141.zarr",
+   "start": 186,
+   "n_latent_frames": 810,
+   "turn": 0.453,
+   "turn_var": 0.495,
+   "motion": 0.699,
+   "score": 1.19
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429114739.zarr",
+   "start": 501,
+   "n_latent_frames": 1494,
+   "turn": 0.737,
+   "turn_var": 0.341,
+   "motion": 0.403,
+   "score": 1.19
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411082137.zarr",
+   "start": 750,
+   "n_latent_frames": 1260,
+   "turn": 0.851,
+   "turn_var": 0.055,
+   "motion": 0.442,
+   "score": 1.188
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306095659.zarr",
+   "start": 633,
+   "n_latent_frames": 1143,
+   "turn": 0.516,
+   "turn_var": 0.148,
+   "motion": 0.854,
+   "score": 1.187
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320113055.zarr",
+   "start": 51,
+   "n_latent_frames": 553,
+   "turn": 0.526,
+   "turn_var": 0.091,
+   "motion": 0.88,
+   "score": 1.187
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322102326.zarr",
+   "start": 195,
+   "n_latent_frames": 1497,
+   "turn": 0.523,
+   "turn_var": 0.245,
+   "motion": 0.772,
+   "score": 1.186
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322054850.zarr",
+   "start": 933,
+   "n_latent_frames": 1497,
+   "turn": 0.65,
+   "turn_var": 0.26,
+   "motion": 0.577,
+   "score": 1.184
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240410115032.zarr",
+   "start": 1035,
+   "n_latent_frames": 1449,
+   "turn": 0.845,
+   "turn_var": 0.045,
+   "motion": 0.453,
+   "score": 1.184
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411145720.zarr",
+   "start": 255,
+   "n_latent_frames": 1464,
+   "turn": 0.358,
+   "turn_var": 0.347,
+   "motion": 0.929,
+   "score": 1.182
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319145636.zarr",
+   "start": 1257,
+   "n_latent_frames": 1497,
+   "turn": 0.387,
+   "turn_var": 0.376,
+   "motion": 0.864,
+   "score": 1.18
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322063624.zarr",
+   "start": 1425,
+   "n_latent_frames": 1497,
+   "turn": 0.48,
+   "turn_var": 0.286,
+   "motion": 0.794,
+   "score": 1.179
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322173813.zarr",
+   "start": 534,
+   "n_latent_frames": 954,
+   "turn": 0.423,
+   "turn_var": 0.415,
+   "motion": 0.779,
+   "score": 1.176
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408104440.zarr",
+   "start": 609,
+   "n_latent_frames": 1497,
+   "turn": 0.453,
+   "turn_var": 0.131,
+   "motion": 0.936,
+   "score": 1.174
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240316145947.zarr",
+   "start": 396,
+   "n_latent_frames": 1497,
+   "turn": 0.378,
+   "turn_var": 0.432,
+   "motion": 0.824,
+   "score": 1.171
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409081050.zarr",
+   "start": 21,
+   "n_latent_frames": 1494,
+   "turn": 0.719,
+   "turn_var": 0.343,
+   "motion": 0.4,
+   "score": 1.171
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417092801.zarr",
+   "start": 24,
+   "n_latent_frames": 408,
+   "turn": 0.734,
+   "turn_var": 0.206,
+   "motion": 0.478,
+   "score": 1.171
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322162205.zarr",
+   "start": 588,
+   "n_latent_frames": 1497,
+   "turn": 0.755,
+   "turn_var": 0.34,
+   "motion": 0.347,
+   "score": 1.168
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430104449.zarr",
+   "start": 858,
+   "n_latent_frames": 1155,
+   "turn": 0.696,
+   "turn_var": 0.158,
+   "motion": 0.562,
+   "score": 1.168
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411151643.zarr",
+   "start": 1446,
+   "n_latent_frames": 1485,
+   "turn": 0.354,
+   "turn_var": 0.393,
+   "motion": 0.88,
+   "score": 1.167
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327105514.zarr",
+   "start": 21,
+   "n_latent_frames": 1497,
+   "turn": 0.528,
+   "turn_var": 0.254,
+   "motion": 0.73,
+   "score": 1.166
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318154703.zarr",
+   "start": 1164,
+   "n_latent_frames": 1491,
+   "turn": 0.358,
+   "turn_var": 0.412,
+   "motion": 0.854,
+   "score": 1.162
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430105815.zarr",
+   "start": 1122,
+   "n_latent_frames": 1452,
+   "turn": 0.39,
+   "turn_var": 0.472,
+   "motion": 0.766,
+   "score": 1.162
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318151659.zarr",
+   "start": 21,
+   "n_latent_frames": 1494,
+   "turn": 0.76,
+   "turn_var": 0.096,
+   "motion": 0.497,
+   "score": 1.156
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321100302.zarr",
+   "start": 1278,
+   "n_latent_frames": 1488,
+   "turn": 0.783,
+   "turn_var": 0.062,
+   "motion": 0.487,
+   "score": 1.155
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430073022.zarr",
+   "start": 444,
+   "n_latent_frames": 1464,
+   "turn": 0.777,
+   "turn_var": 0.174,
+   "motion": 0.417,
+   "score": 1.155
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426084638.zarr",
+   "start": 27,
+   "n_latent_frames": 203,
+   "turn": 0.579,
+   "turn_var": 0.32,
+   "motion": 0.591,
+   "score": 1.153
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322094246.zarr",
+   "start": 75,
+   "n_latent_frames": 393,
+   "turn": 0.594,
+   "turn_var": 0.444,
+   "motion": 0.481,
+   "score": 1.152
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322173134.zarr",
+   "start": 483,
+   "n_latent_frames": 1269,
+   "turn": 0.442,
+   "turn_var": 0.166,
+   "motion": 0.895,
+   "score": 1.152
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306094250.zarr",
+   "start": 6,
+   "n_latent_frames": 1422,
+   "turn": 0.437,
+   "turn_var": 0.258,
+   "motion": 0.835,
+   "score": 1.151
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319152315.zarr",
+   "start": 333,
+   "n_latent_frames": 1200,
+   "turn": 0.812,
+   "turn_var": 0.088,
+   "motion": 0.421,
+   "score": 1.151
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319083510.zarr",
+   "start": 1371,
+   "n_latent_frames": 1497,
+   "turn": 0.414,
+   "turn_var": 0.387,
+   "motion": 0.772,
+   "score": 1.148
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319161811.zarr",
+   "start": 429,
+   "n_latent_frames": 1467,
+   "turn": 0.407,
+   "turn_var": 0.495,
+   "motion": 0.705,
+   "score": 1.148
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321110634.zarr",
+   "start": 6,
+   "n_latent_frames": 1059,
+   "turn": 0.465,
+   "turn_var": 0.35,
+   "motion": 0.725,
+   "score": 1.148
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408151459.zarr",
+   "start": 672,
+   "n_latent_frames": 703,
+   "turn": 0.536,
+   "turn_var": 0.482,
+   "motion": 0.53,
+   "score": 1.148
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319063920.zarr",
+   "start": 1305,
+   "n_latent_frames": 1497,
+   "turn": 0.364,
+   "turn_var": 0.363,
+   "motion": 0.858,
+   "score": 1.147
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407103202.zarr",
+   "start": 1311,
+   "n_latent_frames": 1455,
+   "turn": 0.384,
+   "turn_var": 0.497,
+   "motion": 0.735,
+   "score": 1.147
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318155430.zarr",
+   "start": 849,
+   "n_latent_frames": 1497,
+   "turn": 0.334,
+   "turn_var": 0.391,
+   "motion": 0.88,
+   "score": 1.145
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327112732.zarr",
+   "start": 261,
+   "n_latent_frames": 1497,
+   "turn": 0.405,
+   "turn_var": 0.461,
+   "motion": 0.726,
+   "score": 1.144
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423103558.zarr",
+   "start": 48,
+   "n_latent_frames": 1452,
+   "turn": 0.744,
+   "turn_var": 0.092,
+   "motion": 0.501,
+   "score": 1.141
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313133101.zarr",
+   "start": 162,
+   "n_latent_frames": 1497,
+   "turn": 0.392,
+   "turn_var": 0.426,
+   "motion": 0.761,
+   "score": 1.138
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409092626.zarr",
+   "start": 309,
+   "n_latent_frames": 413,
+   "turn": 0.407,
+   "turn_var": 0.215,
+   "motion": 0.889,
+   "score": 1.137
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319150512.zarr",
+   "start": 441,
+   "n_latent_frames": 1042,
+   "turn": 0.752,
+   "turn_var": 0.112,
+   "motion": 0.467,
+   "score": 1.134
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325101157.zarr",
+   "start": 0,
+   "n_latent_frames": 1491,
+   "turn": 0.758,
+   "turn_var": 0.06,
+   "motion": 0.495,
+   "score": 1.134
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240422081812.zarr",
+   "start": 165,
+   "n_latent_frames": 193,
+   "turn": 0.742,
+   "turn_var": 0.157,
+   "motion": 0.44,
+   "score": 1.128
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321115846.zarr",
+   "start": 546,
+   "n_latent_frames": 691,
+   "turn": 0.37,
+   "turn_var": 0.37,
+   "motion": 0.818,
+   "score": 1.127
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322172734.zarr",
+   "start": 279,
+   "n_latent_frames": 940,
+   "turn": 0.755,
+   "turn_var": 0.062,
+   "motion": 0.486,
+   "score": 1.126
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315131714.zarr",
+   "start": 12,
+   "n_latent_frames": 1497,
+   "turn": 0.79,
+   "turn_var": 0.114,
+   "motion": 0.396,
+   "score": 1.125
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307083559.zarr",
+   "start": 27,
+   "n_latent_frames": 168,
+   "turn": 0.701,
+   "turn_var": 0.411,
+   "motion": 0.301,
+   "score": 1.118
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314100819.zarr",
+   "start": 417,
+   "n_latent_frames": 963,
+   "turn": 0.413,
+   "turn_var": 0.439,
+   "motion": 0.691,
+   "score": 1.116
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322162110.zarr",
+   "start": 156,
+   "n_latent_frames": 1039,
+   "turn": 0.342,
+   "turn_var": 0.428,
+   "motion": 0.799,
+   "score": 1.116
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327144443.zarr",
+   "start": 594,
+   "n_latent_frames": 1491,
+   "turn": 0.478,
+   "turn_var": 0.346,
+   "motion": 0.665,
+   "score": 1.116
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322172410.zarr",
+   "start": 129,
+   "n_latent_frames": 326,
+   "turn": 0.396,
+   "turn_var": 0.469,
+   "motion": 0.693,
+   "score": 1.115
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319114949.zarr",
+   "start": 210,
+   "n_latent_frames": 1112,
+   "turn": 0.571,
+   "turn_var": 0.414,
+   "motion": 0.477,
+   "score": 1.112
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322132721.zarr",
+   "start": 249,
+   "n_latent_frames": 627,
+   "turn": 0.796,
+   "turn_var": 0.062,
+   "motion": 0.407,
+   "score": 1.112
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407131549.zarr",
+   "start": 24,
+   "n_latent_frames": 138,
+   "turn": 0.544,
+   "turn_var": 0.279,
+   "motion": 0.611,
+   "score": 1.112
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321120644.zarr",
+   "start": 591,
+   "n_latent_frames": 990,
+   "turn": 0.477,
+   "turn_var": 0.167,
+   "motion": 0.786,
+   "score": 1.11
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430112456.zarr",
+   "start": 27,
+   "n_latent_frames": 1497,
+   "turn": 0.326,
+   "turn_var": 0.366,
+   "motion": 0.859,
+   "score": 1.11
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430124101.zarr",
+   "start": 114,
+   "n_latent_frames": 1422,
+   "turn": 0.718,
+   "turn_var": 0.133,
+   "motion": 0.464,
+   "score": 1.109
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322163900.zarr",
+   "start": 45,
+   "n_latent_frames": 1497,
+   "turn": 0.756,
+   "turn_var": 0.065,
+   "motion": 0.455,
+   "score": 1.107
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320150448.zarr",
+   "start": 753,
+   "n_latent_frames": 1497,
+   "turn": 0.449,
+   "turn_var": 0.196,
+   "motion": 0.798,
+   "score": 1.106
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320090811.zarr",
+   "start": 1020,
+   "n_latent_frames": 1497,
+   "turn": 0.392,
+   "turn_var": 0.419,
+   "motion": 0.718,
+   "score": 1.105
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320103430.zarr",
+   "start": 168,
+   "n_latent_frames": 444,
+   "turn": 0.812,
+   "turn_var": 0.029,
+   "motion": 0.398,
+   "score": 1.105
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327153007.zarr",
+   "start": 1347,
+   "n_latent_frames": 1485,
+   "turn": 0.461,
+   "turn_var": 0.318,
+   "motion": 0.691,
+   "score": 1.104
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327110219.zarr",
+   "start": 465,
+   "n_latent_frames": 1497,
+   "turn": 0.675,
+   "turn_var": 0.299,
+   "motion": 0.398,
+   "score": 1.103
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322151403.zarr",
+   "start": 276,
+   "n_latent_frames": 480,
+   "turn": 0.632,
+   "turn_var": 0.229,
+   "motion": 0.5,
+   "score": 1.096
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322163457.zarr",
+   "start": 429,
+   "n_latent_frames": 963,
+   "turn": 0.804,
+   "turn_var": 0.049,
+   "motion": 0.381,
+   "score": 1.096
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426065157.zarr",
+   "start": 1416,
+   "n_latent_frames": 1488,
+   "turn": 0.491,
+   "turn_var": 0.127,
+   "motion": 0.774,
+   "score": 1.096
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315160951.zarr",
+   "start": 63,
+   "n_latent_frames": 149,
+   "turn": 0.303,
+   "turn_var": 0.362,
+   "motion": 0.87,
+   "score": 1.093
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318145111.zarr",
+   "start": 15,
+   "n_latent_frames": 1491,
+   "turn": 0.715,
+   "turn_var": 0.074,
+   "motion": 0.485,
+   "score": 1.092
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321153332.zarr",
+   "start": 1332,
+   "n_latent_frames": 1476,
+   "turn": 0.765,
+   "turn_var": 0.153,
+   "motion": 0.358,
+   "score": 1.092
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322081358.zarr",
+   "start": 228,
+   "n_latent_frames": 555,
+   "turn": 0.729,
+   "turn_var": 0.322,
+   "motion": 0.287,
+   "score": 1.091
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322104504.zarr",
+   "start": 33,
+   "n_latent_frames": 1497,
+   "turn": 0.718,
+   "turn_var": 0.26,
+   "motion": 0.344,
+   "score": 1.089
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426080545.zarr",
+   "start": 168,
+   "n_latent_frames": 1491,
+   "turn": 0.536,
+   "turn_var": 0.35,
+   "motion": 0.538,
+   "score": 1.088
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221104718.zarr",
+   "start": 48,
+   "n_latent_frames": 141,
+   "turn": 0.73,
+   "turn_var": 0.121,
+   "motion": 0.421,
+   "score": 1.085
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321133430.zarr",
+   "start": 516,
+   "n_latent_frames": 1221,
+   "turn": 0.797,
+   "turn_var": 0.104,
+   "motion": 0.336,
+   "score": 1.084
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322121611.zarr",
+   "start": 180,
+   "n_latent_frames": 402,
+   "turn": 0.716,
+   "turn_var": 0.258,
+   "motion": 0.341,
+   "score": 1.084
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320150253.zarr",
+   "start": 36,
+   "n_latent_frames": 251,
+   "turn": 0.778,
+   "turn_var": 0.035,
+   "motion": 0.402,
+   "score": 1.077
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240328084524.zarr",
+   "start": 15,
+   "n_latent_frames": 448,
+   "turn": 0.798,
+   "turn_var": 0.047,
+   "motion": 0.363,
+   "score": 1.075
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240328091710.zarr",
+   "start": 39,
+   "n_latent_frames": 332,
+   "turn": 0.776,
+   "turn_var": 0.111,
+   "motion": 0.348,
+   "score": 1.075
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501122152.zarr",
+   "start": 108,
+   "n_latent_frames": 1497,
+   "turn": 0.685,
+   "turn_var": 0.292,
+   "motion": 0.343,
+   "score": 1.071
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320101218.zarr",
+   "start": 231,
+   "n_latent_frames": 333,
+   "turn": 0.579,
+   "turn_var": 0.316,
+   "motion": 0.476,
+   "score": 1.07
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327091247.zarr",
+   "start": 324,
+   "n_latent_frames": 1461,
+   "turn": 0.528,
+   "turn_var": 0.247,
+   "motion": 0.592,
+   "score": 1.066
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322144045.zarr",
+   "start": 387,
+   "n_latent_frames": 675,
+   "turn": 0.741,
+   "turn_var": 0.086,
+   "motion": 0.398,
+   "score": 1.063
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319144756.zarr",
+   "start": 807,
+   "n_latent_frames": 1443,
+   "turn": 0.753,
+   "turn_var": 0.111,
+   "motion": 0.362,
+   "score": 1.062
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321151235.zarr",
+   "start": 1281,
+   "n_latent_frames": 1482,
+   "turn": 0.373,
+   "turn_var": 0.39,
+   "motion": 0.705,
+   "score": 1.062
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240501094242.zarr",
+   "start": 36,
+   "n_latent_frames": 71,
+   "turn": 0.521,
+   "turn_var": 0.139,
+   "motion": 0.673,
+   "score": 1.062
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322113542.zarr",
+   "start": 765,
+   "n_latent_frames": 1497,
+   "turn": 0.484,
+   "turn_var": 0.518,
+   "motion": 0.44,
+   "score": 1.052
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407115217.zarr",
+   "start": 1428,
+   "n_latent_frames": 1473,
+   "turn": 0.312,
+   "turn_var": 0.36,
+   "motion": 0.792,
+   "score": 1.047
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319153038.zarr",
+   "start": 714,
+   "n_latent_frames": 1482,
+   "turn": 0.312,
+   "turn_var": 0.33,
+   "motion": 0.813,
+   "score": 1.046
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425103947.zarr",
+   "start": 405,
+   "n_latent_frames": 507,
+   "turn": 0.684,
+   "turn_var": 0.177,
+   "motion": 0.388,
+   "score": 1.044
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426081355.zarr",
+   "start": 678,
+   "n_latent_frames": 1317,
+   "turn": 0.74,
+   "turn_var": 0.048,
+   "motion": 0.4,
+   "score": 1.044
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322133035.zarr",
+   "start": 819,
+   "n_latent_frames": 1497,
+   "turn": 0.766,
+   "turn_var": 0.097,
+   "motion": 0.326,
+   "score": 1.043
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319143728.zarr",
+   "start": 6,
+   "n_latent_frames": 1470,
+   "turn": 0.395,
+   "turn_var": 0.144,
+   "motion": 0.82,
+   "score": 1.041
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321133933.zarr",
+   "start": 1266,
+   "n_latent_frames": 1440,
+   "turn": 0.739,
+   "turn_var": 0.157,
+   "motion": 0.32,
+   "score": 1.041
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322100659.zarr",
+   "start": 117,
+   "n_latent_frames": 1497,
+   "turn": 0.578,
+   "turn_var": 0.169,
+   "motion": 0.539,
+   "score": 1.04
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321135029.zarr",
+   "start": 474,
+   "n_latent_frames": 1494,
+   "turn": 0.33,
+   "turn_var": 0.324,
+   "motion": 0.776,
+   "score": 1.035
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321123236.zarr",
+   "start": 783,
+   "n_latent_frames": 1347,
+   "turn": 0.316,
+   "turn_var": 0.384,
+   "motion": 0.752,
+   "score": 1.034
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240308102745.zarr",
+   "start": 54,
+   "n_latent_frames": 333,
+   "turn": 0.461,
+   "turn_var": 0.514,
+   "motion": 0.45,
+   "score": 1.033
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326105952.zarr",
+   "start": 261,
+   "n_latent_frames": 1497,
+   "turn": 0.489,
+   "turn_var": 0.22,
+   "motion": 0.619,
+   "score": 1.032
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326103335.zarr",
+   "start": 36,
+   "n_latent_frames": 1497,
+   "turn": 0.653,
+   "turn_var": 0.069,
+   "motion": 0.488,
+   "score": 1.029
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319130316.zarr",
+   "start": 933,
+   "n_latent_frames": 1497,
+   "turn": 0.551,
+   "turn_var": 0.099,
+   "motion": 0.611,
+   "score": 1.027
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314122242.zarr",
+   "start": 48,
+   "n_latent_frames": 150,
+   "turn": 0.258,
+   "turn_var": 0.219,
+   "motion": 0.934,
+   "score": 1.021
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320140219.zarr",
+   "start": 1029,
+   "n_latent_frames": 1497,
+   "turn": 0.402,
+   "turn_var": 0.09,
+   "motion": 0.82,
+   "score": 1.021
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426150316.zarr",
+   "start": 0,
+   "n_latent_frames": 1485,
+   "turn": 0.367,
+   "turn_var": 0.288,
+   "motion": 0.728,
+   "score": 1.02
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326132551.zarr",
+   "start": 1041,
+   "n_latent_frames": 1158,
+   "turn": 0.742,
+   "turn_var": 0.077,
+   "motion": 0.341,
+   "score": 1.019
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319111144.zarr",
+   "start": 378,
+   "n_latent_frames": 501,
+   "turn": 0.544,
+   "turn_var": 0.318,
+   "motion": 0.445,
+   "score": 1.014
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321142055.zarr",
+   "start": 21,
+   "n_latent_frames": 1473,
+   "turn": 0.375,
+   "turn_var": 0.175,
+   "motion": 0.788,
+   "score": 1.014
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322125751.zarr",
+   "start": 897,
+   "n_latent_frames": 999,
+   "turn": 0.363,
+   "turn_var": 0.362,
+   "motion": 0.664,
+   "score": 1.01
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327135436.zarr",
+   "start": 258,
+   "n_latent_frames": 517,
+   "turn": 0.742,
+   "turn_var": 0.05,
+   "motion": 0.341,
+   "score": 1.005
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240412082308.zarr",
+   "start": 9,
+   "n_latent_frames": 141,
+   "turn": 0.493,
+   "turn_var": 0.063,
+   "motion": 0.685,
+   "score": 1.004
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321124327.zarr",
+   "start": 207,
+   "n_latent_frames": 1491,
+   "turn": 0.293,
+   "turn_var": 0.359,
+   "motion": 0.758,
+   "score": 1.003
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322144347.zarr",
+   "start": 1299,
+   "n_latent_frames": 1497,
+   "turn": 0.71,
+   "turn_var": 0.067,
+   "motion": 0.368,
+   "score": 1.001
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319122635.zarr",
+   "start": 414,
+   "n_latent_frames": 735,
+   "turn": 0.751,
+   "turn_var": 0.083,
+   "motion": 0.295,
+   "score": 0.999
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320112116.zarr",
+   "start": 270,
+   "n_latent_frames": 1073,
+   "turn": 0.493,
+   "turn_var": 0.546,
+   "motion": 0.333,
+   "score": 0.999
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418115115.zarr",
+   "start": 57,
+   "n_latent_frames": 310,
+   "turn": 0.343,
+   "turn_var": 0.075,
+   "motion": 0.883,
+   "score": 0.999
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240503115252.zarr",
+   "start": 402,
+   "n_latent_frames": 590,
+   "turn": 0.376,
+   "turn_var": 0.107,
+   "motion": 0.809,
+   "score": 0.996
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322124932.zarr",
+   "start": 213,
+   "n_latent_frames": 810,
+   "turn": 0.704,
+   "turn_var": 0.092,
+   "motion": 0.349,
+   "score": 0.994
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322141413.zarr",
+   "start": 9,
+   "n_latent_frames": 1497,
+   "turn": 0.701,
+   "turn_var": 0.168,
+   "motion": 0.298,
+   "score": 0.994
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322163214.zarr",
+   "start": 249,
+   "n_latent_frames": 516,
+   "turn": 0.739,
+   "turn_var": 0.032,
+   "motion": 0.337,
+   "score": 0.991
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321121637.zarr",
+   "start": 423,
+   "n_latent_frames": 1140,
+   "turn": 0.368,
+   "turn_var": 0.116,
+   "motion": 0.804,
+   "score": 0.989
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322145934.zarr",
+   "start": 297,
+   "n_latent_frames": 546,
+   "turn": 0.487,
+   "turn_var": 0.306,
+   "motion": 0.497,
+   "score": 0.988
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322164716.zarr",
+   "start": 0,
+   "n_latent_frames": 1497,
+   "turn": 0.564,
+   "turn_var": 0.52,
+   "motion": 0.231,
+   "score": 0.985
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320070849.zarr",
+   "start": 213,
+   "n_latent_frames": 1353,
+   "turn": 0.351,
+   "turn_var": 0.391,
+   "motion": 0.623,
+   "score": 0.983
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320173636.zarr",
+   "start": 39,
+   "n_latent_frames": 96,
+   "turn": 0.547,
+   "turn_var": 0.233,
+   "motion": 0.454,
+   "score": 0.981
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327145859.zarr",
+   "start": 192,
+   "n_latent_frames": 411,
+   "turn": 0.512,
+   "turn_var": 0.512,
+   "motion": 0.305,
+   "score": 0.981
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319111837.zarr",
+   "start": 78,
+   "n_latent_frames": 175,
+   "turn": 0.336,
+   "turn_var": 0.312,
+   "motion": 0.691,
+   "score": 0.976
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322150221.zarr",
+   "start": 1464,
+   "n_latent_frames": 1497,
+   "turn": 0.708,
+   "turn_var": 0.071,
+   "motion": 0.327,
+   "score": 0.973
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321125927.zarr",
+   "start": 861,
+   "n_latent_frames": 1497,
+   "turn": 0.295,
+   "turn_var": 0.277,
+   "motion": 0.768,
+   "score": 0.971
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319081151.zarr",
+   "start": 192,
+   "n_latent_frames": 336,
+   "turn": 0.42,
+   "turn_var": 0.221,
+   "motion": 0.625,
+   "score": 0.968
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322121744.zarr",
+   "start": 990,
+   "n_latent_frames": 1497,
+   "turn": 0.763,
+   "turn_var": 0.044,
+   "motion": 0.261,
+   "score": 0.968
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322151638.zarr",
+   "start": 1446,
+   "n_latent_frames": 1497,
+   "turn": 0.741,
+   "turn_var": 0.044,
+   "motion": 0.291,
+   "score": 0.966
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313115334.zarr",
+   "start": 90,
+   "n_latent_frames": 393,
+   "turn": 0.438,
+   "turn_var": 0.37,
+   "motion": 0.485,
+   "score": 0.963
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326133012.zarr",
+   "start": 36,
+   "n_latent_frames": 1497,
+   "turn": 0.448,
+   "turn_var": 0.489,
+   "motion": 0.385,
+   "score": 0.962
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321145348.zarr",
+   "start": 876,
+   "n_latent_frames": 1476,
+   "turn": 0.32,
+   "turn_var": 0.217,
+   "motion": 0.76,
+   "score": 0.961
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322122927.zarr",
+   "start": 477,
+   "n_latent_frames": 746,
+   "turn": 0.256,
+   "turn_var": 0.165,
+   "motion": 0.89,
+   "score": 0.961
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322153935.zarr",
+   "start": 510,
+   "n_latent_frames": 825,
+   "turn": 0.661,
+   "turn_var": 0.265,
+   "motion": 0.232,
+   "score": 0.956
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322162614.zarr",
+   "start": 267,
+   "n_latent_frames": 1476,
+   "turn": 0.344,
+   "turn_var": 0.402,
+   "motion": 0.586,
+   "score": 0.956
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327103819.zarr",
+   "start": 99,
+   "n_latent_frames": 1467,
+   "turn": 0.439,
+   "turn_var": 0.048,
+   "motion": 0.704,
+   "score": 0.956
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322135549.zarr",
+   "start": 1260,
+   "n_latent_frames": 1497,
+   "turn": 0.675,
+   "turn_var": 0.12,
+   "motion": 0.31,
+   "score": 0.952
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326104519.zarr",
+   "start": 21,
+   "n_latent_frames": 1497,
+   "turn": 0.639,
+   "turn_var": 0.046,
+   "motion": 0.415,
+   "score": 0.952
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240327115148.zarr",
+   "start": 1371,
+   "n_latent_frames": 1467,
+   "turn": 0.514,
+   "turn_var": 0.233,
+   "motion": 0.459,
+   "score": 0.952
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322161750.zarr",
+   "start": 789,
+   "n_latent_frames": 960,
+   "turn": 0.512,
+   "turn_var": 0.271,
+   "motion": 0.421,
+   "score": 0.942
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319111015.zarr",
+   "start": 342,
+   "n_latent_frames": 393,
+   "turn": 0.536,
+   "turn_var": 0.611,
+   "motion": 0.142,
+   "score": 0.941
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326105604.zarr",
+   "start": 501,
+   "n_latent_frames": 813,
+   "turn": 0.771,
+   "turn_var": 0.091,
+   "motion": 0.177,
+   "score": 0.94
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326111004.zarr",
+   "start": 0,
+   "n_latent_frames": 1497,
+   "turn": 0.556,
+   "turn_var": 0.233,
+   "motion": 0.381,
+   "score": 0.939
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319095539.zarr",
+   "start": 1425,
+   "n_latent_frames": 1497,
+   "turn": 0.325,
+   "turn_var": 0.292,
+   "motion": 0.661,
+   "score": 0.933
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322134402.zarr",
+   "start": 1179,
+   "n_latent_frames": 1497,
+   "turn": 0.486,
+   "turn_var": 0.269,
+   "motion": 0.434,
+   "score": 0.925
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326113224.zarr",
+   "start": 66,
+   "n_latent_frames": 1497,
+   "turn": 0.653,
+   "turn_var": 0.047,
+   "motion": 0.351,
+   "score": 0.922
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322112947.zarr",
+   "start": 12,
+   "n_latent_frames": 162,
+   "turn": 0.398,
+   "turn_var": 0.37,
+   "motion": 0.481,
+   "score": 0.92
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322125121.zarr",
+   "start": 306,
+   "n_latent_frames": 1116,
+   "turn": 0.289,
+   "turn_var": 0.112,
+   "motion": 0.821,
+   "score": 0.92
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326120549.zarr",
+   "start": 852,
+   "n_latent_frames": 1119,
+   "turn": 0.728,
+   "turn_var": 0.044,
+   "motion": 0.243,
+   "score": 0.92
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315091124.zarr",
+   "start": 84,
+   "n_latent_frames": 1125,
+   "turn": 0.217,
+   "turn_var": 0.303,
+   "motion": 0.78,
+   "score": 0.915
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426115809.zarr",
+   "start": 123,
+   "n_latent_frames": 471,
+   "turn": 0.541,
+   "turn_var": 0.196,
+   "motion": 0.384,
+   "score": 0.908
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319104821.zarr",
+   "start": 123,
+   "n_latent_frames": 354,
+   "turn": 0.677,
+   "turn_var": 0.117,
+   "motion": 0.244,
+   "score": 0.907
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319135623.zarr",
+   "start": 30,
+   "n_latent_frames": 930,
+   "turn": 0.659,
+   "turn_var": 0.06,
+   "motion": 0.303,
+   "score": 0.9
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321143754.zarr",
+   "start": 1365,
+   "n_latent_frames": 1497,
+   "turn": 0.324,
+   "turn_var": 0.168,
+   "motion": 0.697,
+   "score": 0.896
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322100855.zarr",
+   "start": 1467,
+   "n_latent_frames": 1497,
+   "turn": 0.483,
+   "turn_var": 0.521,
+   "motion": 0.218,
+   "score": 0.896
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322122806.zarr",
+   "start": 63,
+   "n_latent_frames": 1497,
+   "turn": 0.607,
+   "turn_var": 0.226,
+   "motion": 0.245,
+   "score": 0.892
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240407115933.zarr",
+   "start": 63,
+   "n_latent_frames": 87,
+   "turn": 0.447,
+   "turn_var": 0.474,
+   "motion": 0.297,
+   "score": 0.892
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314113507.zarr",
+   "start": 27,
+   "n_latent_frames": 180,
+   "turn": 0.436,
+   "turn_var": 0.545,
+   "motion": 0.257,
+   "score": 0.888
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322121359.zarr",
+   "start": 66,
+   "n_latent_frames": 135,
+   "turn": 0.596,
+   "turn_var": 0.257,
+   "motion": 0.231,
+   "score": 0.886
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322155258.zarr",
+   "start": 357,
+   "n_latent_frames": 618,
+   "turn": 0.504,
+   "turn_var": 0.372,
+   "motion": 0.274,
+   "score": 0.882
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326131841.zarr",
+   "start": 912,
+   "n_latent_frames": 1497,
+   "turn": 0.699,
+   "turn_var": 0.056,
+   "motion": 0.211,
+   "score": 0.874
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240423105251.zarr",
+   "start": 12,
+   "n_latent_frames": 37,
+   "turn": 0.378,
+   "turn_var": 0.099,
+   "motion": 0.637,
+   "score": 0.873
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315172431.zarr",
+   "start": 600,
+   "n_latent_frames": 909,
+   "turn": 0.36,
+   "turn_var": 0.418,
+   "motion": 0.429,
+   "score": 0.87
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326115007.zarr",
+   "start": 57,
+   "n_latent_frames": 1497,
+   "turn": 0.467,
+   "turn_var": 0.332,
+   "motion": 0.339,
+   "score": 0.87
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322103224.zarr",
+   "start": 1242,
+   "n_latent_frames": 1491,
+   "turn": 0.503,
+   "turn_var": 0.432,
+   "motion": 0.213,
+   "score": 0.868
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322165821.zarr",
+   "start": 654,
+   "n_latent_frames": 1089,
+   "turn": 0.41,
+   "turn_var": 0.406,
+   "motion": 0.35,
+   "score": 0.857
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322152804.zarr",
+   "start": 1401,
+   "n_latent_frames": 1497,
+   "turn": 0.528,
+   "turn_var": 0.266,
+   "motion": 0.279,
+   "score": 0.856
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322092654.zarr",
+   "start": 375,
+   "n_latent_frames": 837,
+   "turn": 0.573,
+   "turn_var": 0.253,
+   "motion": 0.214,
+   "score": 0.849
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321140843.zarr",
+   "start": 297,
+   "n_latent_frames": 777,
+   "turn": 0.216,
+   "turn_var": 0.165,
+   "motion": 0.784,
+   "score": 0.847
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320142705.zarr",
+   "start": 492,
+   "n_latent_frames": 1497,
+   "turn": 0.368,
+   "turn_var": 0.27,
+   "motion": 0.486,
+   "score": 0.844
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322124215.zarr",
+   "start": 948,
+   "n_latent_frames": 1497,
+   "turn": 0.406,
+   "turn_var": 0.228,
+   "motion": 0.46,
+   "score": 0.842
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315173836.zarr",
+   "start": 216,
+   "n_latent_frames": 417,
+   "turn": 0.604,
+   "turn_var": 0.239,
+   "motion": 0.168,
+   "score": 0.841
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322140445.zarr",
+   "start": 1365,
+   "n_latent_frames": 1497,
+   "turn": 0.369,
+   "turn_var": 0.193,
+   "motion": 0.531,
+   "score": 0.837
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425105705.zarr",
+   "start": 990,
+   "n_latent_frames": 1497,
+   "turn": 0.169,
+   "turn_var": 0.272,
+   "motion": 0.755,
+   "score": 0.834
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426080313.zarr",
+   "start": 288,
+   "n_latent_frames": 472,
+   "turn": 0.49,
+   "turn_var": 0.18,
+   "motion": 0.348,
+   "score": 0.824
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319124141.zarr",
+   "start": 393,
+   "n_latent_frames": 1497,
+   "turn": 0.309,
+   "turn_var": 0.368,
+   "motion": 0.461,
+   "score": 0.816
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322142432.zarr",
+   "start": 1329,
+   "n_latent_frames": 1497,
+   "turn": 0.496,
+   "turn_var": 0.264,
+   "motion": 0.269,
+   "score": 0.816
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321154316.zarr",
+   "start": 459,
+   "n_latent_frames": 1419,
+   "turn": 0.213,
+   "turn_var": 0.121,
+   "motion": 0.753,
+   "score": 0.8
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311191628.zarr",
+   "start": 36,
+   "n_latent_frames": 1398,
+   "turn": 0.61,
+   "turn_var": 0.156,
+   "motion": 0.154,
+   "score": 0.796
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322093120.zarr",
+   "start": 894,
+   "n_latent_frames": 1497,
+   "turn": 0.323,
+   "turn_var": 0.209,
+   "motion": 0.521,
+   "score": 0.792
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319133015.zarr",
+   "start": 54,
+   "n_latent_frames": 105,
+   "turn": 0.603,
+   "turn_var": 0.274,
+   "motion": 0.036,
+   "score": 0.765
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404175934.zarr",
+   "start": 849,
+   "n_latent_frames": 1497,
+   "turn": 0.602,
+   "turn_var": 0.157,
+   "motion": 0.119,
+   "score": 0.765
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326122511.zarr",
+   "start": 51,
+   "n_latent_frames": 1497,
+   "turn": 0.344,
+   "turn_var": 0.387,
+   "motion": 0.324,
+   "score": 0.764
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321121531.zarr",
+   "start": 42,
+   "n_latent_frames": 102,
+   "turn": 0.414,
+   "turn_var": 0.465,
+   "motion": 0.157,
+   "score": 0.756
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326150452.zarr",
+   "start": 1431,
+   "n_latent_frames": 1497,
+   "turn": 0.585,
+   "turn_var": 0.105,
+   "motion": 0.167,
+   "score": 0.755
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326150242.zarr",
+   "start": 288,
+   "n_latent_frames": 537,
+   "turn": 0.538,
+   "turn_var": 0.051,
+   "motion": 0.266,
+   "score": 0.75
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326093412.zarr",
+   "start": 75,
+   "n_latent_frames": 190,
+   "turn": 0.408,
+   "turn_var": 0.223,
+   "motion": 0.325,
+   "score": 0.747
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240305115136.zarr",
+   "start": 63,
+   "n_latent_frames": 90,
+   "turn": 0.41,
+   "turn_var": 0.208,
+   "motion": 0.322,
+   "score": 0.74
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313171548.zarr",
+   "start": 189,
+   "n_latent_frames": 247,
+   "turn": 0.321,
+   "turn_var": 0.074,
+   "motion": 0.536,
+   "score": 0.733
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319132540.zarr",
+   "start": 123,
+   "n_latent_frames": 1287,
+   "turn": 0.478,
+   "turn_var": 0.11,
+   "motion": 0.284,
+   "score": 0.732
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426134332.zarr",
+   "start": 225,
+   "n_latent_frames": 435,
+   "turn": 0.37,
+   "turn_var": 0.21,
+   "motion": 0.355,
+   "score": 0.723
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320172026.zarr",
+   "start": 564,
+   "n_latent_frames": 1497,
+   "turn": 0.211,
+   "turn_var": 0.264,
+   "motion": 0.539,
+   "score": 0.72
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426151614.zarr",
+   "start": 36,
+   "n_latent_frames": 86,
+   "turn": 0.242,
+   "turn_var": 0.192,
+   "motion": 0.527,
+   "score": 0.706
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311193715.zarr",
+   "start": 273,
+   "n_latent_frames": 1497,
+   "turn": 0.134,
+   "turn_var": 0.073,
+   "motion": 0.743,
+   "score": 0.69
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326154101.zarr",
+   "start": 33,
+   "n_latent_frames": 1497,
+   "turn": 0.48,
+   "turn_var": 0.078,
+   "motion": 0.244,
+   "score": 0.69
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326152945.zarr",
+   "start": 105,
+   "n_latent_frames": 262,
+   "turn": 0.557,
+   "turn_var": 0.061,
+   "motion": 0.143,
+   "score": 0.688
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319133048.zarr",
+   "start": 783,
+   "n_latent_frames": 1494,
+   "turn": 0.328,
+   "turn_var": 0.321,
+   "motion": 0.281,
+   "score": 0.685
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322073408.zarr",
+   "start": 255,
+   "n_latent_frames": 459,
+   "turn": 0.269,
+   "turn_var": 0.349,
+   "motion": 0.336,
+   "score": 0.678
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326140127.zarr",
+   "start": 441,
+   "n_latent_frames": 1422,
+   "turn": 0.404,
+   "turn_var": 0.394,
+   "motion": 0.111,
+   "score": 0.678
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307094547.zarr",
+   "start": 12,
+   "n_latent_frames": 63,
+   "turn": 0.12,
+   "turn_var": 0.155,
+   "motion": 0.669,
+   "score": 0.666
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325134753.zarr",
+   "start": 387,
+   "n_latent_frames": 435,
+   "turn": 0.232,
+   "turn_var": 0.234,
+   "motion": 0.45,
+   "score": 0.664
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240216103439.zarr",
+   "start": 54,
+   "n_latent_frames": 309,
+   "turn": 0.22,
+   "turn_var": 0.156,
+   "motion": 0.499,
+   "score": 0.647
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326133844.zarr",
+   "start": 684,
+   "n_latent_frames": 1497,
+   "turn": 0.165,
+   "turn_var": 0.136,
+   "motion": 0.583,
+   "score": 0.641
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313172446.zarr",
+   "start": 60,
+   "n_latent_frames": 135,
+   "turn": 0.373,
+   "turn_var": 0.272,
+   "motion": 0.172,
+   "score": 0.629
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312201836.zarr",
+   "start": 666,
+   "n_latent_frames": 1173,
+   "turn": 0.3,
+   "turn_var": 0.379,
+   "motion": 0.197,
+   "score": 0.628
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409120859.zarr",
+   "start": 414,
+   "n_latent_frames": 699,
+   "turn": 0.184,
+   "turn_var": 0.243,
+   "motion": 0.446,
+   "score": 0.618
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311185132.zarr",
+   "start": 39,
+   "n_latent_frames": 1485,
+   "turn": 0.436,
+   "turn_var": 0.246,
+   "motion": 0.083,
+   "score": 0.617
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326142929.zarr",
+   "start": 351,
+   "n_latent_frames": 612,
+   "turn": 0.497,
+   "turn_var": 0.074,
+   "motion": 0.103,
+   "score": 0.605
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425115402.zarr",
+   "start": 51,
+   "n_latent_frames": 210,
+   "turn": 0.292,
+   "turn_var": 0.267,
+   "motion": 0.257,
+   "score": 0.605
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322084111.zarr",
+   "start": 6,
+   "n_latent_frames": 1497,
+   "turn": 0.375,
+   "turn_var": 0.285,
+   "motion": 0.123,
+   "score": 0.604
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322160405.zarr",
+   "start": 102,
+   "n_latent_frames": 1497,
+   "turn": 0.338,
+   "turn_var": 0.262,
+   "motion": 0.188,
+   "score": 0.601
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240425110343.zarr",
+   "start": 537,
+   "n_latent_frames": 802,
+   "turn": 0.167,
+   "turn_var": 0.171,
+   "motion": 0.489,
+   "score": 0.595
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408152052.zarr",
+   "start": 1254,
+   "n_latent_frames": 1437,
+   "turn": 0.212,
+   "turn_var": 0.243,
+   "motion": 0.37,
+   "score": 0.593
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306110938.zarr",
+   "start": 1179,
+   "n_latent_frames": 1497,
+   "turn": 0.366,
+   "turn_var": 0.26,
+   "motion": 0.126,
+   "score": 0.584
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322093712.zarr",
+   "start": 321,
+   "n_latent_frames": 1497,
+   "turn": 0.275,
+   "turn_var": 0.257,
+   "motion": 0.25,
+   "score": 0.579
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311201828.zarr",
+   "start": 213,
+   "n_latent_frames": 1464,
+   "turn": 0.388,
+   "turn_var": 0.193,
+   "motion": 0.108,
+   "score": 0.56
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326143212.zarr",
+   "start": 3,
+   "n_latent_frames": 1497,
+   "turn": 0.386,
+   "turn_var": 0.173,
+   "motion": 0.123,
+   "score": 0.559
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322174322.zarr",
+   "start": 138,
+   "n_latent_frames": 1314,
+   "turn": 0.106,
+   "turn_var": 0.142,
+   "motion": 0.538,
+   "score": 0.553
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320113954.zarr",
+   "start": 459,
+   "n_latent_frames": 1374,
+   "turn": 0.417,
+   "turn_var": 0.199,
+   "motion": 0.049,
+   "score": 0.551
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320160135.zarr",
+   "start": 306,
+   "n_latent_frames": 531,
+   "turn": 0.293,
+   "turn_var": 0.344,
+   "motion": 0.108,
+   "score": 0.541
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321072104.zarr",
+   "start": 93,
+   "n_latent_frames": 1440,
+   "turn": 0.363,
+   "turn_var": 0.17,
+   "motion": 0.118,
+   "score": 0.531
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326124015.zarr",
+   "start": 15,
+   "n_latent_frames": 1497,
+   "turn": 0.377,
+   "turn_var": 0.168,
+   "motion": 0.052,
+   "score": 0.497
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319115712.zarr",
+   "start": 177,
+   "n_latent_frames": 618,
+   "turn": 0.336,
+   "turn_var": 0.255,
+   "motion": 0.039,
+   "score": 0.49
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321102433.zarr",
+   "start": 24,
+   "n_latent_frames": 303,
+   "turn": 0.175,
+   "turn_var": 0.222,
+   "motion": 0.267,
+   "score": 0.473
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319140101.zarr",
+   "start": 0,
+   "n_latent_frames": 62,
+   "turn": 0.146,
+   "turn_var": 0.253,
+   "motion": 0.285,
+   "score": 0.472
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221103244.zarr",
+   "start": 48,
+   "n_latent_frames": 87,
+   "turn": 0.248,
+   "turn_var": 0.238,
+   "motion": 0.121,
+   "score": 0.452
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320064721.zarr",
+   "start": 51,
+   "n_latent_frames": 201,
+   "turn": 0.072,
+   "turn_var": 0.094,
+   "motion": 0.457,
+   "score": 0.438
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322121327.zarr",
+   "start": 69,
+   "n_latent_frames": 102,
+   "turn": 0.17,
+   "turn_var": 0.193,
+   "motion": 0.219,
+   "score": 0.42
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326144447.zarr",
+   "start": 39,
+   "n_latent_frames": 1497,
+   "turn": 0.337,
+   "turn_var": 0.091,
+   "motion": 0.054,
+   "score": 0.42
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240219112319.zarr",
+   "start": 120,
+   "n_latent_frames": 156,
+   "turn": 0.226,
+   "turn_var": 0.232,
+   "motion": 0.105,
+   "score": 0.415
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320113025.zarr",
+   "start": 462,
+   "n_latent_frames": 1491,
+   "turn": 0.299,
+   "turn_var": 0.163,
+   "motion": 0.033,
+   "score": 0.404
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240326135110.zarr",
+   "start": 18,
+   "n_latent_frames": 1497,
+   "turn": 0.257,
+   "turn_var": 0.176,
+   "motion": 0.041,
+   "score": 0.374
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320154214.zarr",
+   "start": 156,
+   "n_latent_frames": 1497,
+   "turn": 0.196,
+   "turn_var": 0.252,
+   "motion": 0.064,
+   "score": 0.367
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240219110914.zarr",
+   "start": 18,
+   "n_latent_frames": 48,
+   "turn": 0.065,
+   "turn_var": 0.104,
+   "motion": 0.343,
+   "score": 0.357
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320065005.zarr",
+   "start": 30,
+   "n_latent_frames": 345,
+   "turn": 0.056,
+   "turn_var": 0.064,
+   "motion": 0.353,
+   "score": 0.335
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321102234.zarr",
+   "start": 105,
+   "n_latent_frames": 132,
+   "turn": 0.176,
+   "turn_var": 0.207,
+   "motion": 0.078,
+   "score": 0.334
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311110323.zarr",
+   "start": 1341,
+   "n_latent_frames": 1497,
+   "turn": 0.196,
+   "turn_var": 0.181,
+   "motion": 0.054,
+   "score": 0.324
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325062811.zarr",
+   "start": 99,
+   "n_latent_frames": 190,
+   "turn": 0.141,
+   "turn_var": 0.208,
+   "motion": 0.1,
+   "score": 0.314
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409115627.zarr",
+   "start": 30,
+   "n_latent_frames": 1497,
+   "turn": 0.149,
+   "turn_var": 0.142,
+   "motion": 0.133,
+   "score": 0.313
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424090312.zarr",
+   "start": 84,
+   "n_latent_frames": 684,
+   "turn": 0.169,
+   "turn_var": 0.188,
+   "motion": 0.066,
+   "score": 0.309
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320134302.zarr",
+   "start": 291,
+   "n_latent_frames": 1497,
+   "turn": 0.079,
+   "turn_var": 0.146,
+   "motion": 0.214,
+   "score": 0.302
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314121821.zarr",
+   "start": 138,
+   "n_latent_frames": 240,
+   "turn": 0.08,
+   "turn_var": 0.056,
+   "motion": 0.268,
+   "score": 0.296
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320100347.zarr",
+   "start": 153,
+   "n_latent_frames": 1481,
+   "turn": 0.064,
+   "turn_var": 0.149,
+   "motion": 0.225,
+   "score": 0.296
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321113852.zarr",
+   "start": 0,
+   "n_latent_frames": 111,
+   "turn": 0.139,
+   "turn_var": 0.154,
+   "motion": 0.084,
+   "score": 0.274
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240220110429.zarr",
+   "start": 345,
+   "n_latent_frames": 381,
+   "turn": 0.136,
+   "turn_var": 0.141,
+   "motion": 0.092,
+   "score": 0.271
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240304110740.zarr",
+   "start": 726,
+   "n_latent_frames": 1497,
+   "turn": 0.113,
+   "turn_var": 0.12,
+   "motion": 0.14,
+   "score": 0.271
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311173008.zarr",
+   "start": 0,
+   "n_latent_frames": 492,
+   "turn": 0.13,
+   "turn_var": 0.124,
+   "motion": 0.087,
+   "score": 0.253
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314122006.zarr",
+   "start": 6,
+   "n_latent_frames": 117,
+   "turn": 0.083,
+   "turn_var": 0.118,
+   "motion": 0.114,
+   "score": 0.222
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311114528.zarr",
+   "start": 45,
+   "n_latent_frames": 366,
+   "turn": 0.113,
+   "turn_var": 0.136,
+   "motion": 0.055,
+   "score": 0.219
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240228121850.zarr",
+   "start": 24,
+   "n_latent_frames": 60,
+   "turn": 0.085,
+   "turn_var": 0.082,
+   "motion": 0.119,
+   "score": 0.209
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221112909.zarr",
+   "start": 240,
+   "n_latent_frames": 591,
+   "turn": 0.038,
+   "turn_var": 0.034,
+   "motion": 0.217,
+   "score": 0.207
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314123701.zarr",
+   "start": 0,
+   "n_latent_frames": 243,
+   "turn": 0.054,
+   "turn_var": 0.063,
+   "motion": 0.162,
+   "score": 0.199
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408154112.zarr",
+   "start": 0,
+   "n_latent_frames": 207,
+   "turn": 0.089,
+   "turn_var": 0.144,
+   "motion": 0.053,
+   "score": 0.198
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240328091903.zarr",
+   "start": 33,
+   "n_latent_frames": 1155,
+   "turn": 0.07,
+   "turn_var": 0.103,
+   "motion": 0.081,
+   "score": 0.178
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240418114050.zarr",
+   "start": 348,
+   "n_latent_frames": 1251,
+   "turn": 0.062,
+   "turn_var": 0.069,
+   "motion": 0.1,
+   "score": 0.166
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321113325.zarr",
+   "start": 51,
+   "n_latent_frames": 576,
+   "turn": 0.051,
+   "turn_var": 0.074,
+   "motion": 0.106,
+   "score": 0.163
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240408151948.zarr",
+   "start": 0,
+   "n_latent_frames": 90,
+   "turn": 0.064,
+   "turn_var": 0.121,
+   "motion": 0.048,
+   "score": 0.158
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322094839.zarr",
+   "start": 480,
+   "n_latent_frames": 1497,
+   "turn": 0.02,
+   "turn_var": 0.023,
+   "motion": 0.178,
+   "score": 0.156
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409115326.zarr",
+   "start": 318,
+   "n_latent_frames": 381,
+   "turn": 0.071,
+   "turn_var": 0.069,
+   "motion": 0.071,
+   "score": 0.155
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318095119.zarr",
+   "start": 96,
+   "n_latent_frames": 450,
+   "turn": 0.036,
+   "turn_var": 0.024,
+   "motion": 0.142,
+   "score": 0.147
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240313112412.zarr",
+   "start": 1257,
+   "n_latent_frames": 1311,
+   "turn": 0.02,
+   "turn_var": 0.039,
+   "motion": 0.152,
+   "score": 0.145
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322164902.zarr",
+   "start": 459,
+   "n_latent_frames": 567,
+   "turn": 0.069,
+   "turn_var": 0.072,
+   "motion": 0.031,
+   "score": 0.127
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240503073640.zarr",
+   "start": 132,
+   "n_latent_frames": 171,
+   "turn": 0.072,
+   "turn_var": 0.025,
+   "motion": 0.031,
+   "score": 0.106
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320120612.zarr",
+   "start": 15,
+   "n_latent_frames": 42,
+   "turn": 0.044,
+   "turn_var": 0.054,
+   "motion": 0.047,
+   "score": 0.104
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240412092350.zarr",
+   "start": 3,
+   "n_latent_frames": 96,
+   "turn": 0.027,
+   "turn_var": 0.047,
+   "motion": 0.067,
+   "score": 0.098
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221112028.zarr",
+   "start": 132,
+   "n_latent_frames": 690,
+   "turn": 0.005,
+   "turn_var": 0.005,
+   "motion": 0.129,
+   "score": 0.097
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314122834.zarr",
+   "start": 288,
+   "n_latent_frames": 327,
+   "turn": 0.02,
+   "turn_var": 0.028,
+   "motion": 0.085,
+   "score": 0.094
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314123929.zarr",
+   "start": 132,
+   "n_latent_frames": 663,
+   "turn": 0.029,
+   "turn_var": 0.045,
+   "motion": 0.06,
+   "score": 0.094
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314114656.zarr",
+   "start": 15,
+   "n_latent_frames": 249,
+   "turn": 0.008,
+   "turn_var": 0.011,
+   "motion": 0.107,
+   "score": 0.089
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325061923.zarr",
+   "start": 216,
+   "n_latent_frames": 267,
+   "turn": 0.004,
+   "turn_var": 0.004,
+   "motion": 0.118,
+   "score": 0.089
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306113021.zarr",
+   "start": 6,
+   "n_latent_frames": 1497,
+   "turn": 0.005,
+   "turn_var": 0.005,
+   "motion": 0.112,
+   "score": 0.086
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322092209.zarr",
+   "start": 0,
+   "n_latent_frames": 66,
+   "turn": 0.018,
+   "turn_var": 0.029,
+   "motion": 0.076,
+   "score": 0.086
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320164115.zarr",
+   "start": 1146,
+   "n_latent_frames": 1497,
+   "turn": 0.008,
+   "turn_var": 0.011,
+   "motion": 0.102,
+   "score": 0.085
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322113451.zarr",
+   "start": 318,
+   "n_latent_frames": 615,
+   "turn": 0.007,
+   "turn_var": 0.005,
+   "motion": 0.108,
+   "score": 0.085
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314114148.zarr",
+   "start": 78,
+   "n_latent_frames": 828,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.109,
+   "score": 0.084
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318101830.zarr",
+   "start": 420,
+   "n_latent_frames": 678,
+   "turn": 0.006,
+   "turn_var": 0.006,
+   "motion": 0.107,
+   "score": 0.083
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322102211.zarr",
+   "start": 1338,
+   "n_latent_frames": 1497,
+   "turn": 0.005,
+   "turn_var": 0.005,
+   "motion": 0.108,
+   "score": 0.083
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318103631.zarr",
+   "start": 672,
+   "n_latent_frames": 1272,
+   "turn": 0.004,
+   "turn_var": 0.004,
+   "motion": 0.108,
+   "score": 0.082
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306090558.zarr",
+   "start": 294,
+   "n_latent_frames": 360,
+   "turn": 0.005,
+   "turn_var": 0.006,
+   "motion": 0.104,
+   "score": 0.081
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307112454.zarr",
+   "start": 336,
+   "n_latent_frames": 525,
+   "turn": 0.005,
+   "turn_var": 0.005,
+   "motion": 0.104,
+   "score": 0.081
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314111804.zarr",
+   "start": 30,
+   "n_latent_frames": 333,
+   "turn": 0.005,
+   "turn_var": 0.006,
+   "motion": 0.105,
+   "score": 0.081
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314123017.zarr",
+   "start": 48,
+   "n_latent_frames": 108,
+   "turn": 0.005,
+   "turn_var": 0.006,
+   "motion": 0.104,
+   "score": 0.081
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325061723.zarr",
+   "start": 60,
+   "n_latent_frames": 93,
+   "turn": 0.005,
+   "turn_var": 0.005,
+   "motion": 0.105,
+   "score": 0.081
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311171032.zarr",
+   "start": 378,
+   "n_latent_frames": 432,
+   "turn": 0.004,
+   "turn_var": 0.004,
+   "motion": 0.106,
+   "score": 0.08
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314113829.zarr",
+   "start": 102,
+   "n_latent_frames": 183,
+   "turn": 0.004,
+   "turn_var": 0.006,
+   "motion": 0.104,
+   "score": 0.08
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314123500.zarr",
+   "start": 102,
+   "n_latent_frames": 318,
+   "turn": 0.004,
+   "turn_var": 0.006,
+   "motion": 0.104,
+   "score": 0.08
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409103459.zarr",
+   "start": 75,
+   "n_latent_frames": 216,
+   "turn": 0.005,
+   "turn_var": 0.006,
+   "motion": 0.102,
+   "score": 0.08
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424113333.zarr",
+   "start": 132,
+   "n_latent_frames": 285,
+   "turn": 0.043,
+   "turn_var": 0.028,
+   "motion": 0.034,
+   "score": 0.08
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307112236.zarr",
+   "start": 222,
+   "n_latent_frames": 288,
+   "turn": 0.005,
+   "turn_var": 0.007,
+   "motion": 0.1,
+   "score": 0.079
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311171323.zarr",
+   "start": 24,
+   "n_latent_frames": 165,
+   "turn": 0.006,
+   "turn_var": 0.006,
+   "motion": 0.1,
+   "score": 0.079
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314122113.zarr",
+   "start": 39,
+   "n_latent_frames": 63,
+   "turn": 0.003,
+   "turn_var": 0.003,
+   "motion": 0.107,
+   "score": 0.079
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322094859.zarr",
+   "start": 42,
+   "n_latent_frames": 192,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.104,
+   "score": 0.079
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240419101753.zarr",
+   "start": 183,
+   "n_latent_frames": 225,
+   "turn": 0.004,
+   "turn_var": 0.006,
+   "motion": 0.102,
+   "score": 0.079
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311172704.zarr",
+   "start": 18,
+   "n_latent_frames": 42,
+   "turn": 0.003,
+   "turn_var": 0.003,
+   "motion": 0.106,
+   "score": 0.078
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318095646.zarr",
+   "start": 15,
+   "n_latent_frames": 243,
+   "turn": 0.004,
+   "turn_var": 0.004,
+   "motion": 0.104,
+   "score": 0.078
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221114225.zarr",
+   "start": 24,
+   "n_latent_frames": 72,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.102,
+   "score": 0.077
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307113752.zarr",
+   "start": 3,
+   "n_latent_frames": 30,
+   "turn": 0.006,
+   "turn_var": 0.006,
+   "motion": 0.096,
+   "score": 0.077
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240318100919.zarr",
+   "start": 48,
+   "n_latent_frames": 93,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.102,
+   "score": 0.077
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322080050.zarr",
+   "start": 18,
+   "n_latent_frames": 69,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.101,
+   "score": 0.077
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240405113417.zarr",
+   "start": 33,
+   "n_latent_frames": 78,
+   "turn": 0.004,
+   "turn_var": 0.006,
+   "motion": 0.1,
+   "score": 0.077
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240321103013.zarr",
+   "start": 1173,
+   "n_latent_frames": 1497,
+   "turn": 0.047,
+   "turn_var": 0.048,
+   "motion": 0.008,
+   "score": 0.076
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322094153.zarr",
+   "start": 6,
+   "n_latent_frames": 33,
+   "turn": 0.006,
+   "turn_var": 0.007,
+   "motion": 0.095,
+   "score": 0.076
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322095052.zarr",
+   "start": 24,
+   "n_latent_frames": 48,
+   "turn": 0.004,
+   "turn_var": 0.006,
+   "motion": 0.098,
+   "score": 0.076
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325145051.zarr",
+   "start": 21,
+   "n_latent_frames": 87,
+   "turn": 0.004,
+   "turn_var": 0.007,
+   "motion": 0.095,
+   "score": 0.075
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240221113551.zarr",
+   "start": 6,
+   "n_latent_frames": 48,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.095,
+   "score": 0.073
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320105215.zarr",
+   "start": 9,
+   "n_latent_frames": 1110,
+   "turn": 0.006,
+   "turn_var": 0.008,
+   "motion": 0.09,
+   "score": 0.073
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240322180147.zarr",
+   "start": 42,
+   "n_latent_frames": 66,
+   "turn": 0.005,
+   "turn_var": 0.006,
+   "motion": 0.093,
+   "score": 0.073
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426080155.zarr",
+   "start": 87,
+   "n_latent_frames": 114,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.095,
+   "score": 0.073
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320105743.zarr",
+   "start": 201,
+   "n_latent_frames": 1032,
+   "turn": 0.003,
+   "turn_var": 0.005,
+   "motion": 0.093,
+   "score": 0.071
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240312161325.zarr",
+   "start": 6,
+   "n_latent_frames": 81,
+   "turn": 0.004,
+   "turn_var": 0.005,
+   "motion": 0.091,
+   "score": 0.07
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320174004.zarr",
+   "start": 480,
+   "n_latent_frames": 630,
+   "turn": 0.008,
+   "turn_var": 0.009,
+   "motion": 0.078,
+   "score": 0.067
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240424112021.zarr",
+   "start": 75,
+   "n_latent_frames": 159,
+   "turn": 0.005,
+   "turn_var": 0.005,
+   "motion": 0.085,
+   "score": 0.067
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320171607.zarr",
+   "start": 3,
+   "n_latent_frames": 27,
+   "turn": 0.004,
+   "turn_var": 0.006,
+   "motion": 0.082,
+   "score": 0.064
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240426081258.zarr",
+   "start": 12,
+   "n_latent_frames": 54,
+   "turn": 0.01,
+   "turn_var": 0.016,
+   "motion": 0.066,
+   "score": 0.064
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240306095439.zarr",
+   "start": 0,
+   "n_latent_frames": 69,
+   "turn": 0.013,
+   "turn_var": 0.006,
+   "motion": 0.064,
+   "score": 0.061
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240311184244.zarr",
+   "start": 0,
+   "n_latent_frames": 24,
+   "turn": 0.01,
+   "turn_var": 0.011,
+   "motion": 0.059,
+   "score": 0.057
+  }
+ ]
+}

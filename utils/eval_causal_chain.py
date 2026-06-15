@@ -286,6 +286,17 @@ def load_per_rank_ride(
         device="cpu",
         ss_vae_device="cpu",
     )
+    # Cap n_lat at the motion-available latents: rides whose motion file is
+    # shorter than the full ride would otherwise overrun encode_z_actions_window
+    # (the normal dataset path caps this; per-rank mode did not).
+    try:
+        from utils.zarr_dataset import _motion_capped_latents
+        _attrs = dict(zarr_lib.open_group(zpath, mode="r").attrs)
+        _cap = _motion_capped_latents(_attrs, Path(motion_root))
+        if _cap > 0:
+            n_lat = min(int(n_lat), int(_cap))
+    except Exception as _e:  # pragma: no cover - defensive
+        log.warning("motion-cap check failed for %s: %s", zpath, _e)
     z_win = z_ds.encode_z_actions_window(
         zpath, n_lat,
         latent_start_offset,
@@ -734,6 +745,22 @@ def main():
             rollout_stem = "final_causal_rollout"
         frames_to_mp4(ann_cat_r, str(out_dir / f"{rollout_stem}_annotated.mp4"))
         frames_to_mp4(rollout_cat, str(out_dir / f"{rollout_stem}_raw.mp4"))
+        # Ground-truth video of the same 24-frame span (seed + real continuation),
+        # decoded with the same pipeline so it aligns frame-for-frame with the
+        # generated rollout: context_np is the real seed; the continuation is the
+        # real latents [off+block .. off+block+NUM_FRAMES).
+        try:
+            import zarr as zarr_lib
+            _g_gt = zarr_lib.open_group(ride_meta["zarr_path"], mode="r")
+            _o2 = latent_start_offset + NUM_FRAME_PER_BLOCK
+            _gt_np = _g_gt["latents"][_o2:_o2 + NUM_FRAMES]
+            _gt_lat = torch.from_numpy(_gt_np.astype(np.float32)).unsqueeze(0).to(seed_lat.device)
+            _gt_rest = pipe.decode_latents(_gt_lat)
+            _gt_cat = np.concatenate([context_np, _gt_rest], axis=0)
+            frames_to_mp4(_gt_cat, str(out_dir / f"{rollout_stem}_gt.mp4"))
+            log.info("[%s] rank=%d GT rollout written: %s_gt.mp4", label, rank, rollout_stem)
+        except Exception as _e:  # pragma: no cover - defensive
+            log.warning("GT rollout write failed: %s", _e)
         log.info(
             "[%s] rank=%d final rollout written: %s (8 chunks = 24 frames, %s)",
             label, rank, rollout_stem, cond_tag,

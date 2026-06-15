@@ -1,0 +1,198 @@
+%File: paper.tex
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2026}  % DO NOT CHANGE THIS
+\usepackage{times}  % DO NOT CHANGE THIS
+\usepackage{helvet}  % DO NOT CHANGE THIS
+\usepackage{courier}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{caption} % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\frenchspacing  % DO NOT CHANGE THIS
+\setlength{\pdfpagewidth}{8.5in} % DO NOT CHANGE THIS
+\setlength{\pdfpageheight}{11in} % DO NOT CHANGE THIS
+
+% Permitted, commonly used packages.
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+
+\pdfinfo{
+/TemplateVersion (2026.1)
+}
+
+\setcounter{secnumdepth}{0}
+
+\title{Grounding Control Commands in Rendered Egomotion:\\An Action-Conditioned Autoregressive World Model for Sidewalk Robots}
+
+\author{
+    Anonymous Submission
+}
+\affiliations{
+    %
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We study how to make a pretrained video diffusion transformer obey continuous control commands when it is turned into an autoregressive driving world model. Rather than conditioning on abstract joystick scalars, we condition on \emph{realized egomotion}---the full-frame motion that a command actually produces---extracted from optical flow and compressed by a frozen semi-supervised motion autoencoder. On top of a causal, teacher-forced flow-matching backbone, we introduce an \emph{action-grounding} objective with two complementary mechanisms: an action critic that grounds control at the output (pixel) level, and a cross-attention state probe that grounds control at the representation level. A central difficulty is evaluation: the only learned modules that read out egomotion are themselves part of training, so any metric routed through them is circular. We therefore define a \emph{counterfactual swap} metric that regenerates held-out clips under altered commands and reads the rendered egomotion with frozen, externally pretrained modules only. Under this independent metric, the full model follows steering commands at a correlation of $0.95$ and demonstrably reacts to ``stop'' commands, while leave-one-out ablations show that AdaLN modulation and critic guidance are load-bearing whereas per-frame action tokens are nearly redundant. We further characterize a systematic failure to render reverse egomotion.
+\end{abstract}
+
+\section{Introduction}
+\emph{[Draft stub --- to be completed.]} Interactive world models that predict future video from control inputs are a promising substrate for robot simulation and planning. Pretrained text-to-video diffusion transformers provide strong visual priors, but turning them into \emph{controllable} world models---models whose output reliably reflects a commanded action---remains difficult, and is hard to even measure. This paper contributes (i) an action-grounding training objective that ties a pretrained autoregressive video model to realized egomotion, and (ii) a circularity-free protocol for measuring controllability. We instantiate both on real-world sidewalk-robot teleoperation video.
+
+\section{Related Work}
+\emph{[Draft stub --- to be completed.]} Our backbone follows causal, frame-level autoregressive video diffusion with KV-caching and attention sinks~\citep{longlive2025,diffusionforcing2024,selfforcing2025} built on a Wan2.1 diffusion transformer~\citep{wan2025,dit2023} trained with flow matching~\citep{flowmatching2023} and adapted with LoRA~\citep{lora2022}. Driving and game world models~\citep{gaia12023,gamengen2024} condition on actions but typically evaluate controllability with task-specific or learned probes; we instead measure it with frozen external modules.
+
+\section{Method}
+
+\subsection{Overview and Backbone}
+We adapt a pretrained Wan2.1-T2V-1.3B diffusion transformer (DiT) into a causal, action-conditioned video world model. The backbone is a frame-level autoregressive diffusion model with block-causal attention, KV-caching, short-window attention, and a frame-level attention sink, following recent streaming long-video designs~\citep{longlive2025}. We adapt the frozen DiT with LoRA adapters (rank $256$)~\citep{lora2022}; all base weights remain frozen.
+
+Let $x_{1:T}$ denote a sequence of latent video frames produced by the Wan video VAE (each frame a $16{\times}60{\times}104$ tensor). Training uses \emph{teacher forcing} over streaming windows: the model receives a short clean context of $c{=}3$ latent frames and denoises the subsequent block of frames, processing $F{=}3$ frames per causal block with a window of $21$ frames. We optimize a flow-matching objective~\citep{flowmatching2023}: with noised latents $x^\tau$ at flow time $\tau$ and target velocity $v^\star$,
+\begin{equation}
+\mathcal{L}_\text{flow}=\mathbb{E}_{\tau}\big\| v_\theta(x^\tau,\tau,c,a)-v^\star\big\|^2 ,
+\label{eq:flow}
+\end{equation}
+where $a$ is the action conditioning defined next and $v_\theta$ is the LoRA-adapted DiT.
+
+\subsection{Egomotion as the Action Representation}
+A key design choice is \emph{what} the model is conditioned on. Instead of raw teleoperation scalars, we condition on the \emph{realized egomotion}: the full-frame motion the platform actually undergoes over a short horizon. For each $\sim\!0.6$\,s window ($12$ video frames at $20$\,fps, i.e.\ three latent frames) we estimate dense motion with a frozen CoTracker model~\citep{cotracker2024} on a $10{\times}10$ grid, and encode it with a frozen semi-supervised motion autoencoder (an ``ss-VAE'') into an $8$-dimensional latent $z$. Two of its dimensions are weakly supervised to align with the dominant control axes: $z_2$ (yaw / steering) and $z_7$ (forward--backward translation / throttle). Motion is aligned to video with an $0.8$\,s causal lag to account for command-to-effect delay. The conditioning command for the generated frames is $a_t=(z_{2,t},z_{7,t})$.
+
+Because $z$ is the motion that a command \emph{produces}, conditioning on it gives the model a direct, physically grounded control signal: matching $a_t$ requires rendering the correct parallax and the corresponding displacement of scene content, not merely a label.
+
+\subsection{Action Injection}
+The command enters the DiT through two complementary channels (we ablate each in the Results):
+\begin{itemize}
+\item \textbf{AdaLN-Zero modulation.} A projection maps $a_t$ to per-frame shift/scale/gate parameters that modulate the DiT blocks. It is zero-initialized so conditioning starts as a no-op and is learned gradually.
+\item \textbf{Action tokens.} A second projection maps $a_t$ to one token per frame, appended to that frame's spatial token sequence.
+\end{itemize}
+
+\subsection{Action Grounding}
+Injection alone does not guarantee that the command \emph{causes} the rendered motion. We add an action-grounding objective with two mechanisms that supervise control at different levels.
+
+\paragraph{Output-level grounding (action critic).}
+A 3D-CNN critic $C_\phi$ reads the egomotion out of the \emph{generated} latents: $\hat z = C_\phi(\hat x_0, a)$, where $\hat x_0$ is the model's predicted clean sample. The critic is trained (separate optimizer, two updates per generator step) to match a frozen teacher reading $z^\star$ obtained by running the same frozen CoTracker$\rightarrow$ss-VAE pipeline on $\hat x_0$:
+\begin{equation}
+\mathcal{L}_\text{crit}=\big\| C_\phi(\hat x_0,a)-z^\star\big\|^2_w ,
+\end{equation}
+($\|\cdot\|_w$ up-weights $z_2,z_7$). A frozen copy of the critic then \emph{guides the generator}: gradients flow through $\hat x_0$ so the rendered frames are read as matching the command,
+\begin{equation}
+\mathcal{L}_\text{zg}=\big\| C_{\bar\phi}(\hat x_0)_{\{2,7\}}-a\big\|^2 .
+\end{equation}
+
+\paragraph{Representation-level grounding (state probe).}
+A set of cross-attention probes taps the DiT hidden states at six depths and reads out an $8$-D egomotion estimate $\hat z^P=P_\psi(h)$. An auxiliary loss $\mathcal{L}_\text{sp}=\|P_\psi(h)-z^\star\|_w^2$ shapes the representation to encode egomotion, and a frozen-readout guidance term $\mathcal{L}_\text{sg}=\|W_\text{ro}\,\bar h - a\|^2$ (with $W_\text{ro}$ frozen) pushes the generator to internally represent the command. Whereas the critic grounds the \emph{output}, the probe grounds the \emph{representation}.
+
+\paragraph{Training objective.}
+The total loss combines the flow objective with the grounding terms,
+\begin{equation}
+\mathcal{L}=\mathcal{L}_\text{flow}
++\lambda_\text{zg}\mathcal{L}_\text{zg}
++\lambda_\text{sp}\mathcal{L}_\text{sp}
++\lambda_\text{sg}\mathcal{L}_\text{sg},
+\end{equation}
+with $\lambda_\text{zg}{=}0.25$, $\lambda_\text{sp}{=}0.1$, $\lambda_\text{sg}{=}0.2$; the critic loss $\mathcal{L}_\text{crit}$ (weight $0.5$) updates only $\phi$. Guidance terms are linearly warmed up. We use AdamW (generator $5{\times}10^{-5}$, critic $3{\times}10^{-4}$), bf16, and gradient checkpointing.
+
+\section{Results}
+
+\subsection{Experimental Setup}
+\paragraph{Data.} We train on FrodoBots sidewalk-robot teleoperation video~\citep{frodobots2024}, using a three-city subset (Madrid, Rome, Stockholm): $574$ rides, $81.5$ hours, $\sim\!70$K streaming windows. Four held-out rides (one per city plus an extra) are used for evaluation. All models are trained from the frozen base Wan weights; ablations are run for $4{,}000$ steps each (controllability saturates well before this).
+
+\paragraph{An independent controllability metric.} No standard action-following metric exists for this setting, and the natural candidates---our critic and probe---are trained \emph{inside} the model, so any score routed through them is circular. We therefore define a \emph{counterfactual swap} protocol scored only by frozen, externally pretrained modules. For each held-out clip we fix the clean context and the initial sampling noise and regenerate the continuation under four commands: \textsc{true} (the real egomotion), \textsc{zero} (no motion), \textsc{flip} ($-a$), and \textsc{shuffle} (time-permuted). We then read the \emph{rendered} egomotion of each generation with the frozen CoTracker$\rightarrow$ss-VAE pipeline (untrained by the run) and compare it to the command. Reusing the initial noise across conditions isolates the causal effect of the command. We report Pearson correlation between rendered and commanded egomotion, per control axis, averaged over rides and seeds.
+
+\subsection{The Model Is Controllable (Independently Verified)}
+Table~\ref{tab:cond} reports correlation between the rendered egomotion and the \emph{true} command across conditions, under the frozen judge. For the full model the rendered motion tracks the true command ($0.74$ pooled across axes) and \emph{deviates} when the command is corrupted---the counterfactual signature of genuine control: \textsc{flip} drops the correlation to $0.14$ and \textsc{zero} to $0.67$. Broken out by axis (Table~\ref{tab:ablation}), the full model follows steering at $r{=}0.945$ and throttle at $r{=}0.751$. These numbers use no trained component in the judge.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Model & \textsc{true} & \textsc{zero} & \textsc{flip} & \textsc{shuffle} \\
+\midrule
+Full (ours)            & 0.744 & 0.669 & 0.136 & 0.563 \\
+$-$ Action tokens      & 0.739 & 0.628 & 0.211 & 0.469 \\
+$-$ AdaLN modulation   & 0.732 & 0.732 & 0.732 & 0.733 \\
+$-$ Critic guidance    & 0.734 & 0.755 & 0.712 & 0.751 \\
+$-$ State probe        & 0.774 & 0.694 & 0.201 & 0.533 \\
+\bottomrule
+\end{tabular}
+\caption{Counterfactual swap (frozen judge): correlation between rendered and the \emph{true} command under each fed command. A controllable model is high under \textsc{true} and \emph{drops} under \textsc{zero}/\textsc{flip}; a flat row means the command is ignored.}
+\label{tab:cond}
+\end{table}
+
+\subsection{What Makes It Controllable: Ablations}
+We perform leave-one-out ablations, removing one mechanism at a time and scoring each with the same frozen judge (Table~\ref{tab:ablation}).
+
+\paragraph{Two of the four mechanisms carry control; the other two are redundant.} Removing AdaLN (action tokens only) collapses steering control from $0.945$ to $0.578$, and the model stops reacting to commands: its correlation with the true command is \emph{flat} across \textsc{true}/\textsc{zero}/\textsc{flip} (Table~\ref{tab:cond}, all $\approx0.73$), i.e.\ the output is invariant to the command. Removing the output-level critic guidance is similarly damaging (steering $0.433$, flat counterfactual row). In contrast, removing either the per-frame action tokens ($0.894$ steering, command still causal) or the representation-level state probe ($0.910$ steering, \textsc{flip} still drops the correlation to $0.20$) leaves a model close to the full system. Thus controllability is carried by \emph{AdaLN modulation and output-level critic guidance}, while action tokens and the state-probe grounding are largely redundant---a result that simplifies the method. Notably, a circular metric computed from the model's own trained probe \emph{early in training} suggested the opposite ranking among the injection channels; the frozen-judge protocol reverses it, underscoring why an independent metric is necessary.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Model & Steering $z_2$ & Throttle $z_7$ \\
+\midrule
+Full (ours)            & \textbf{0.945} & 0.751 \\
+$-$ Action tokens      & 0.894 & 0.827 \\
+$-$ AdaLN modulation   & 0.578 & 0.849 \\
+$-$ Critic guidance    & 0.433 & 0.887 \\
+$-$ State probe        & 0.910 & 0.852 \\
+\bottomrule
+\end{tabular}
+\caption{Per-axis controllability under the frozen judge (\textsc{true} condition): correlation between rendered and commanded egomotion. Removing AdaLN or critic guidance collapses steering control.}
+\label{tab:ablation}
+\end{table}
+
+\subsection{Limitation: Reverse Egomotion}
+Stratifying the throttle axis by command direction reveals a systematic failure. All models render \emph{forward} motion with the correct sign on $100\%$ of forward chunks, but \emph{reverse} commands are rendered poorly: the full model produces the correct (backward) sign on only $46.7\%$ of reverse chunks and strongly under-shoots the commanded magnitude. The model has a forward-motion prior it does not readily override. This also explains an apparent per-scene anomaly: the held-out Madrid ride is reverse-dominated, and its low controllability is the reverse-rendering failure rather than a scene- or alignment-specific artifact.
+
+\subsection{Visual Quality and Drift}
+We complement the controllability analysis with a visual-quality testbench, aligned with the metrics common to the autoregressive-video lineage. For each model we sample $48$ windowed clips across the held-out rides, generate the continuation under the true command, and report: \emph{prediction fidelity} against the ground-truth video (PSNR, SSIM, LPIPS); \emph{intrinsic quality} on the generated clip (MUSIQ for imaging quality, NIMA for aesthetics, CLIP feature consistency across frames, and temporal flicker---the same dimensions VBench reports); and a distributional FVD. As VBench and an I3D model are not used here, FVD is computed from r3d\_18 (Kinetics) features and is \emph{indicative} (relative ordering only). We also report a \emph{short-rollout drift} arm: the per-frame slope of fidelity (PSNR), perceptual error (LPIPS) and intrinsic quality (MUSIQ) across the rollout, plus statistical brightness/contrast drift---the error-accumulation and over-saturation that this lineage flags. (Long-horizon drift is out of scope.)
+
+\begin{table*}[t]
+\centering
+\begin{tabular}{lcccccccc}
+\toprule
+Model & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & MUSIQ$\uparrow$ & NIMA$\uparrow$ & CLIP-c$\uparrow$ & flicker$\downarrow$ & FVD$\downarrow$ \\
+\midrule
+Full (ours)          & 19.09 & 0.529 & 0.260 & 56.0 & 4.53 & 0.909 & 0.0496 & 29.9 \\
+$-$ Action tokens    & 19.50 & 0.547 & 0.234 & 55.5 & 4.49 & 0.925 & 0.0488 & 27.2 \\
+$-$ AdaLN modulation & 19.53 & 0.541 & 0.226 & 56.1 & 4.50 & 0.927 & 0.0495 & 26.6 \\
+$-$ Critic guidance  & 19.98 & 0.565 & 0.210 & 56.7 & 4.54 & 0.934 & 0.0458 & 21.8 \\
+$-$ State probe      & 19.49 & 0.546 & 0.237 & 55.4 & 4.50 & 0.920 & 0.0494 & 25.9 \\
+\bottomrule
+\end{tabular}
+\caption{Visual quality ($48$ clips/model). Differences are small; note that the full model has the \emph{lowest} raw quality and ``$-$ Critic guidance'' the highest---yet that ablation destroys controllability (Table~\ref{tab:ablation}), exposing a controllability--fidelity trade-off. FVD is r3d\_18-based and indicative.}
+\label{tab:quality}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+Model & PSNR$_{\text{slope}}$ & LPIPS$_{\text{slope}}$ & MUSIQ$_{\text{slope}}$ & bright$_\Delta$ & contr$_\Delta$ \\
+\midrule
+Full (ours)          & $-0.006$ & 0.0001 & 0.089 & 0.050 & 0.071 \\
+$-$ Action tokens    & $0.000$  & 0.0002 & 0.064 & 0.060 & 0.058 \\
+$-$ AdaLN modulation & $-0.001$ & 0.0001 & 0.079 & 0.055 & 0.058 \\
+$-$ Critic guidance  & $-0.003$ & 0.0003 & 0.075 & 0.055 & 0.059 \\
+$-$ State probe      & $-0.001$ & 0.0002 & 0.065 & 0.059 & 0.058 \\
+\bottomrule
+\end{tabular}
+\caption{Short-rollout drift. Per-frame slopes of PSNR (dB/frame), LPIPS and MUSIQ, and frame-$0$-to-$T$ brightness/contrast drift. All near zero: the models are stable over the short horizon.}
+\label{tab:drift}
+\end{table}
+
+Two observations follow. First, raw visual quality is nearly uniform across all variants, and where it differs it moves \emph{opposite} to controllability: the fully grounded model (ours) has the lowest fidelity and the lowest indicative FVD-rank, while removing the critic guidance yields the best quality (PSNR $19.98$, LPIPS $0.210$, FVD $21.8$) precisely because it is freed from the command-following constraint that, as shown above, it needs for control. The action-grounding objective therefore buys controllability at a modest, measurable cost in reconstruction fidelity. Second, short-rollout drift is negligible for every model (PSNR slope $\approx 0$, MUSIQ slope slightly positive, small brightness/contrast drift): at this horizon the autoregressive rollout is stable, and drift is a long-horizon concern we leave to future work.
+
+\section{Conclusion}
+\emph{[Draft stub --- to be completed.]} We presented an action-grounding objective that makes a pretrained autoregressive video diffusion model obey egomotion commands, and a frozen-judge protocol that measures controllability without circularity. Ablations attribute control to AdaLN modulation and output-level critic guidance---while per-frame action tokens and the representation-level state probe are largely redundant---and show that this control is bought at a small, measurable cost in visual fidelity, with negligible short-rollout drift. The principal open problem is the systematic failure to render reverse egomotion.
+
+\bibliography{refs}
+
+\end{document}

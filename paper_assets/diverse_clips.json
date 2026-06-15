@@ -1,0 +1,185 @@
+{
+ "n": 20,
+ "windows": [
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240411092748.zarr",
+   "start": 6,
+   "n_latent_frames": 1046,
+   "turn": 0.92,
+   "turn_var": 0.908,
+   "motion": 0.939,
+   "score": 2.031
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307064002.zarr",
+   "start": 141,
+   "n_latent_frames": 1236,
+   "turn": 0.716,
+   "turn_var": 0.744,
+   "motion": 0.795,
+   "score": 1.644
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240430070818.zarr",
+   "start": 687,
+   "n_latent_frames": 1474,
+   "turn": 0.838,
+   "turn_var": 0.839,
+   "motion": 0.945,
+   "score": 1.919
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417114030.zarr",
+   "start": 30,
+   "n_latent_frames": 1272,
+   "turn": 0.758,
+   "turn_var": 0.748,
+   "motion": 0.776,
+   "score": 1.676
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320132958.zarr",
+   "start": 1185,
+   "n_latent_frames": 1497,
+   "turn": 0.773,
+   "turn_var": 0.783,
+   "motion": 0.81,
+   "score": 1.731
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429102849.zarr",
+   "start": 876,
+   "n_latent_frames": 1488,
+   "turn": 0.661,
+   "turn_var": 0.63,
+   "motion": 0.915,
+   "score": 1.616
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240417093408.zarr",
+   "start": 123,
+   "n_latent_frames": 1360,
+   "turn": 0.771,
+   "turn_var": 0.689,
+   "motion": 0.873,
+   "score": 1.727
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240307083945.zarr",
+   "start": 324,
+   "n_latent_frames": 1497,
+   "turn": 0.652,
+   "turn_var": 0.657,
+   "motion": 0.888,
+   "score": 1.602
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319113538.zarr",
+   "start": 45,
+   "n_latent_frames": 1494,
+   "turn": 0.813,
+   "turn_var": 0.82,
+   "motion": 0.915,
+   "score": 1.863
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240404154848.zarr",
+   "start": 189,
+   "n_latent_frames": 366,
+   "turn": 0.657,
+   "turn_var": 0.703,
+   "motion": 0.852,
+   "score": 1.605
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240325145852.zarr",
+   "start": 63,
+   "n_latent_frames": 1374,
+   "turn": 0.727,
+   "turn_var": 0.728,
+   "motion": 0.821,
+   "score": 1.666
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240409125004.zarr",
+   "start": 798,
+   "n_latent_frames": 1026,
+   "turn": 0.688,
+   "turn_var": 0.743,
+   "motion": 0.893,
+   "score": 1.684
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240320103947.zarr",
+   "start": 1284,
+   "n_latent_frames": 1455,
+   "turn": 0.829,
+   "turn_var": 0.837,
+   "motion": 0.914,
+   "score": 1.887
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240319110417.zarr",
+   "start": 429,
+   "n_latent_frames": 1491,
+   "turn": 0.836,
+   "turn_var": 0.774,
+   "motion": 0.912,
+   "score": 1.861
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240502110116.zarr",
+   "start": 1083,
+   "n_latent_frames": 1258,
+   "turn": 0.899,
+   "turn_var": 0.894,
+   "motion": 0.968,
+   "score": 2.024
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240315163459.zarr",
+   "start": 1197,
+   "n_latent_frames": 1491,
+   "turn": 0.748,
+   "turn_var": 0.78,
+   "motion": 0.897,
+   "score": 1.765
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240314120823.zarr",
+   "start": 114,
+   "n_latent_frames": 1491,
+   "turn": 0.843,
+   "turn_var": 0.903,
+   "motion": 0.649,
+   "score": 1.749
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240416105126.zarr",
+   "start": 1299,
+   "n_latent_frames": 1485,
+   "turn": 0.639,
+   "turn_var": 0.663,
+   "motion": 0.928,
+   "score": 1.62
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240219111418.zarr",
+   "start": 1149,
+   "n_latent_frames": 1485,
+   "turn": 0.675,
+   "turn_var": 0.695,
+   "motion": 0.937,
+   "score": 1.678
+  },
+  {
+   "zarr_path": "/projects/u6ex/fbots/frodobots_encoded_weu/20240429111610.zarr",
+   "start": 729,
+   "n_latent_frames": 1476,
+   "turn": 0.779,
+   "turn_var": 0.775,
+   "motion": 0.747,
+   "score": 1.69
+  }
+ ]
+}

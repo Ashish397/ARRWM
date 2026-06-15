@@ -224,9 +224,19 @@ class CausalWanSelfAttention(nn.Module):
                 gs_per_half = (gs_clean, gs_noisy)
                 roped_query = []
                 roped_key = []
-                # ii=0 → clean (positions 0..F-1), ii=1 → noisy (offset by tf_rope_offset)
+                # ii=0 → clean, ii=1 → noisy. ``tf_rope_offset`` is the RoPE
+                # GAP between the halves; RoPE is relative, so only the gap
+                # matters for attention. Distribute it so BOTH halves keep
+                # NON-NEGATIVE absolute positions: ``rope_apply`` indexes
+                # ``freqs[off : off+F]``, which wraps (garbage) on a negative
+                # index. offset>=0 (clean earlier, v14 symmetric / content-
+                # only drift): clean@0, noisy@offset. offset<0 (clean AHEAD —
+                # the faithful forward-clean drift): noisy@0, clean@|offset|.
+                # Backward-compatible: positive offsets are unchanged.
+                _clean_off = max(0, -self.tf_rope_offset)
+                _noisy_off = max(0, self.tf_rope_offset)
                 for ii in range(2):
-                    offset = self.tf_rope_offset if ii == 1 else 0
+                    offset = _noisy_off if ii == 1 else _clean_off
                     rq, rk = _rope_one_chunk(q_chunk[ii], k_chunk[ii], gs_per_half[ii], offset)
                     roped_query.append(rq.type_as(v))
                     roped_key.append(rk.type_as(v))
