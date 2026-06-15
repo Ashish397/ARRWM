@@ -340,23 +340,69 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         debug_fup = bool(getattr(self.config, "debug_find_unused_parameters", False))
         self.generator_ddp: Optional[DDP] = None
         self.fake_score_ddp: Optional[DDP] = None
+        _phase_lora_no_ddp = bool(
+            getattr(self.config, "student_phase_lora_enabled", False)
+        )
         if self.world_size > 1:
-            # Phased DMD K-LoRA: each gen step only one of K adapters
-            # contributes to grads; the inactive K-1 are "unused".
-            # find_unused_parameters=True lets the DDP reducer mark
-            # those as ready-with-zero. Mirrors the real_teacher /
-            # forward_noiser ddp patterns elsewhere in this file.
-            gen_fup = debug_fup or bool(
-                getattr(self.config, "student_phase_lora_enabled", False)
-            )
-            self.generator_ddp = DDP(
-                model.generator.model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=gen_fup,
-                broadcast_buffers=False,
-            )
-            model.generator.model = self.generator_ddp  # type: ignore
+            if _phase_lora_no_ddp:
+                # Phase LoRA: the student is deliberately NOT DDP-
+                # wrapped. Every DDP reducer configuration was tried
+                # and failed — the per-iter-varying autograd graph
+                # (random exit rung selects a different lora branch
+                # each iter) and the ckpt-recompute forwards (which
+                # call DDP _pre_forward MID-backward) together break
+                # all of the reducer's modes:
+                #   * find_unused=True: deferred bucket rebuild fires
+                #     mid-recompute at step 21 (= gan_disc_start_step
+                #     + 1, when rung_flash's first real grad completes
+                #     the rebuild precondition) -> INTERNAL ASSERT
+                #     (j5147634/5/6, j5151298+).
+                #   * find_unused=False + ghost: ghost is a shallow
+                #     loss node, all lora grads arrive at backward
+                #     START, the rebuild precondition completes mid-
+                #     backward at iter 1 -> "Expected to have finished
+                #     reduction" (j5173579).
+                #   * + static_graph: per-iter graph-structure
+                #     variation (different lora branch per exit rung)
+                #     violates the static-graph contract -> "training
+                #     graph has changed in this iteration" at iter 2
+                #     (j5176005/11).
+                # With freeze_base=true the ONLY trainable student
+                # params are the lora matrices (~tens of MB), so
+                # manual gradient sync is cheap and removes the entire
+                # reducer state machine from the problem. Mirrors the
+                # existing ``action_projection`` manual-sync pattern
+                # (see ``_all_reduce_extra_trainable_grads``, which
+                # also syncs the lora grads in this mode).
+                #
+                # DDP's construction-time param broadcast is replaced
+                # by an explicit one-time broadcast: peft initialises
+                # lora_A from per-rank RNG, so ranks MUST be aligned
+                # before the first forward.
+                if dist.is_initialized():
+                    _n_bcast = 0
+                    for _n, _p in model.generator.model.named_parameters():
+                        if "lora_" in _n:
+                            dist.broadcast(_p.data, src=0)
+                            _n_bcast += 1
+                    if self.is_main_process:
+                        logging.info(
+                            "[ActionForcing] phase LoRA no-DDP mode: "
+                            "broadcast %d lora params from rank 0; "
+                            "student grads sync manually in "
+                            "_all_reduce_extra_trainable_grads.",
+                            _n_bcast,
+                        )
+            else:
+                gen_fup = debug_fup
+                self.generator_ddp = DDP(
+                    model.generator.model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=gen_fup,
+                    broadcast_buffers=False,
+                )
+                model.generator.model = self.generator_ddp  # type: ignore
 
             if bool(getattr(self.config, "fake_score_updates_enabled", True)):
                 # v21: fake_alt_head_enabled adds head_alt params that
@@ -1672,7 +1718,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # Phase LoRA: step the K-1 remaining per-rung
                 # optimizers (rung_0 IS self.optimizer above; the
                 # rest each own only their adapter's LoRA params).
+                # Each adapter is clipped INDEPENDENTLY at the same
+                # max_grad_norm as rung_0: per-adapter granularity is
+                # the right unit (a spike on one rung — most likely
+                # rung_flash, which alone absorbs the full
+                # gan_loss_weight adversarial gradient — must not
+                # shrink another rung's legitimate update, which a
+                # single global clip over all lora params would do).
                 for _opt in getattr(self, "phase_lora_optimizers", [])[1:]:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in _opt.param_groups[0]["params"]
+                         if p.grad is not None],
+                        max_norm=getattr(
+                            self, "phase_lora_max_grad_norm",
+                            self.max_grad_norm,
+                        ),
+                    )
                     _opt.step()
                     _opt.zero_grad(set_to_none=True)
                 self._maybe_update_generator_ema()
@@ -8674,6 +8735,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["sc_dmd_weight_effective"] = float(sc_weight)
             out["sc_dmd_loss_weighted"] = float(weighted_sc.detach().item())
 
+        # Phase-LoRA ghost anchor — see ``_phase_lora_ghost_anchor``
+        # for the full rationale (K+1 DDP rebuild fix).
+        generator_loss = self._phase_lora_ghost_anchor(generator_loss)
+
         out["generator_loss"] = float(generator_loss.detach().item())
         # retain_graph=True so the critic backward can walk the shared
         # cond_dict / action_projection subgraph that both losses use.
@@ -9173,6 +9238,72 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
             return None
 
+    def _phase_lora_ghost_anchor(
+        self, loss: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero-weighted touch on EVERY student phase-LoRA param.
+
+        K+1 DDP rebuild fix: each gen step only the active adapter
+        gets a REAL gradient. The dedicated ``rung_flash`` adapter's
+        only real signal is the GAN adversarial loss, which is gated
+        off until ``gan_disc_start_step`` — so for the first ~20 iters
+        its params are NEVER marked ready in DDP's reducer. DDP defers
+        its one-time bucket rebuild until every tracked param has been
+        marked at least once; at the first GAN-active iter (step 21)
+        rung_flash finally fires, the deferred rebuild triggers MID-
+        CKPT-RECOMPUTE (the recompute's ``_pre_forward`` runs inside
+        the outer backward), and the reducer dies with
+        ``!unmarked_param_indices.empty() INTERNAL ASSERT``
+        (reducer.cpp:2035; observed at step=21 on j5147634/5/6 and the
+        j5151298+ Fix-B resubmits — both crashes exactly one step
+        after gan_disc_start_step=20).
+
+        Adding ``0.0 * sum(lora params)`` to the gen loss guarantees
+        every adapter receives an (exactly-zero) grad on every
+        backward from iter 1 → the rebuild completes cleanly at iter 2
+        the same way it does on the no-LoRA baseline. The added
+        gradient is identically zero: per-rung training signal,
+        optimizer state, and rung independence are untouched
+        (weight_decay=0 → idle-rung AdamW steps are pure momentum
+        decay, no shrinkage, no cross-rung pollution).
+
+        In the current no-DDP phase-LoRA mode (the student is not
+        DDP-wrapped; lora grads sync manually in
+        ``_all_reduce_extra_trainable_grads``), the ghost's job is to
+        guarantee every lora param has a non-None grad on every iter,
+        so the manual all-reduce param list is identical across ranks
+        and iters — no divergence risk, no conditional sync logic.
+
+        No-op (returns ``loss`` unchanged) when phase LoRA is off.
+        """
+        if not bool(
+            getattr(self.config, "student_phase_lora_enabled", False)
+        ):
+            return loss
+        gen_mod = self.model.generator.model
+        if hasattr(gen_mod, "module"):
+            gen_mod = gen_mod.module
+        # Re-arm FIRST, then ghost over ALL lora params. The no_grad
+        # dispatch sites use re_arm=False, so whichever dispatch ran
+        # last (typically the Step 3.4 context_noise commit) leaves
+        # only ONE adapter's params requires_grad=True via peft's
+        # set_adapter side-effect. Filtering the ghost by the CURRENT
+        # requires_grad would then cover a single adapter and leave
+        # the other buckets unreduced — find_unused=False DDP dies
+        # with "Expected to have finished reduction in the prior
+        # iteration" at the next iter's first grad-on forward
+        # (observed on j5169482/3/4, ~iter 1-2). Re-arming here also
+        # restores the canonical all-True state before backward, which
+        # both the ckpt recomputes and DDP's tracked-param set expect.
+        ghost: Optional[torch.Tensor] = None
+        for n, p in gen_mod.named_parameters():
+            if "lora_" in n:
+                p.requires_grad = True
+                ghost = p.sum() if ghost is None else ghost + p.sum()
+        if ghost is not None:
+            loss = loss + 0.0 * ghost
+        return loss
+
     def _fwdbwd_streaming_step(
         self,
         train_generator: bool,
@@ -9500,6 +9631,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         weighted_sc.detach().item()
                     )
 
+                generator_loss = self._phase_lora_ghost_anchor(
+                    generator_loss
+                )
                 merged["generator_loss"] = float(generator_loss.detach().item())
                 generator_loss.backward()
                 return merged
@@ -9542,6 +9676,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         weighted_sc.detach().item()
                     )
 
+                generator_loss = self._phase_lora_ghost_anchor(
+                    generator_loss
+                )
                 merged_plain["generator_loss"] = float(
                     generator_loss.detach().item()
                 )

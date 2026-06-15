@@ -690,6 +690,18 @@ class RollingStaircaseDMDTrainer:
                 trainable_params, lr=lr, betas=betas, eps=eps, weight_decay=wd
             )
         self.max_grad_norm = float(getattr(cfg, "max_grad_norm", 1.0))
+        # Phase-LoRA per-rung clip threshold. LoRA adapters have far
+        # fewer params than the full DiT, so their gradient norms are
+        # naturally smaller and the global max_grad_norm (tuned for
+        # full fine-tune) may never bind. A tighter dedicated value
+        # protects each adapter's Adam second-moment memory from GAN
+        # gradient spikes (rung_flash absorbs the full adversarial
+        # gradient alone). Defaults to max_grad_norm when unset.
+        self.phase_lora_max_grad_norm = float(
+            getattr(
+                cfg, "student_phase_lora_max_grad_norm", self.max_grad_norm,
+            )
+        )
 
         # ------------------------------------------------------------------
         # Fake-score optimizer (only when fake-score updates are enabled).
@@ -1425,6 +1437,31 @@ class RollingStaircaseDMDTrainer:
         atp = getattr(self.model, "action_token_projection", None)
         if atp is not None:
             extras.extend(p for p in atp.parameters() if p.requires_grad)
+        # Phase-LoRA no-DDP mode: the student generator is deliberately
+        # NOT DDP-wrapped (its per-iter-varying autograd graph + ckpt-
+        # recompute forwards break every DDP reducer configuration —
+        # see the trainer's DDP-wrap section for the full failure
+        # catalog). The lora grads sync manually here instead. The
+        # trainer's ghost anchor guarantees every lora param has a
+        # (possibly zero) grad on every iter, so this param list is
+        # identical across ranks and iters — no divergence risk.
+        if (
+            getattr(self, "generator_ddp", None) is None
+            and bool(
+                getattr(
+                    getattr(self, "config", None),
+                    "student_phase_lora_enabled",
+                    False,
+                )
+            )
+        ):
+            gen_mod = self.model.generator.model
+            if hasattr(gen_mod, "module"):
+                gen_mod = gen_mod.module
+            extras.extend(
+                p for n, p in gen_mod.named_parameters()
+                if "lora_" in n and p.requires_grad
+            )
         if not extras:
             return
         scale = 1.0 / float(self.world_size)
