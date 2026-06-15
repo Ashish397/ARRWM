@@ -794,6 +794,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         )
                     ),
                 )
+                # wavelet_hf_augment: ADD the wavelet HF view to the raw latent
+                # (preserve BOTH modalities) instead of REPLACING it. Set
+                # post-build so the disc.forward reads it via getattr; default
+                # off => replace (legacy / byte-identical).
+                disc.wavelet_hf_augment = bool(getattr(
+                    self.config, "ladd_wavelet_hf_augment",
+                    getattr(self.model, "ladd_wavelet_hf_augment", False)))
                 # All-fp32 for R1 stability.
                 disc.to(device=self.device, dtype=torch.float32)
                 disc.train()
@@ -5910,6 +5917,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self._ladd_pending_disc = _run_disc_updates
             else:
                 _run_disc_updates()
+
+            # Persist the last-fired R1 grad_sq for the wandb trace. Lazy R1
+            # fires every ladd_r1_every_n_steps, but wandb logs on its own
+            # (coprime) interval, so fire-steps were never sampled and the
+            # r3gan_r1_grad_sq trace read 0 even though R1 was firing. Hold the
+            # most-recent fired value (per pair_mode) so its magnitude is
+            # visible at every log step. LOGGING ONLY — the applied penalty
+            # (last_r1 / the .backward()) is unchanged; this only overrides the
+            # diagnostic last_r1_grad_sq on non-fire steps.
+            if not hasattr(self, "_r1_gsq_hold"):
+                self._r1_gsq_hold = {}
+            if last_r1_fired > 0.0:
+                self._r1_gsq_hold[pair_mode] = last_r1_grad_sq
+            elif pair_mode in self._r1_gsq_hold:
+                last_r1_grad_sq = self._r1_gsq_hold[pair_mode]
 
             # ---- Gen-side ----
             critic_warmup_done = (

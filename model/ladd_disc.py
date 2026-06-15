@@ -807,7 +807,17 @@ class LADDDiscriminator(nn.Module):
         # resolution is preserved (SWT, not DWT) so the projector's
         # forward is in-distribution apart from the channel content.
         if self.wavelet_hf is not None:
-            x_noisy = self.wavelet_hf(x_noisy)
+            _wave = self.wavelet_hf(x_noisy)
+            # wavelet_hf_augment (default off): ADD the wavelet HF view to the
+            # raw latent instead of REPLACING it, so the disc sees BOTH
+            # modalities — raw structure (the view replacing blinded it to) AND
+            # the HF detail — rather than HF-only. Same shape (adapter maps the
+            # HF bands back to in_channels), so the projector is unchanged.
+            x_noisy = (
+                x_noisy + _wave
+                if getattr(self, "wavelet_hf_augment", False)
+                else _wave
+            )
         feats = self.projector(
             x_noisy=x_noisy,
             timestep=timestep,
