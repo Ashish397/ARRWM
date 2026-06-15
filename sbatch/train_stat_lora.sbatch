@@ -43,6 +43,11 @@
 #         now read the band's GT in the clean half (a leak the flag was added
 #         to kill) + clean/noisy halves disagree (OOD vs v14's identical-half
 #         contract); the DMD target is ALREADY GT (gt_target). Testing both.
+#   FN:   carn_recurse=true -> forward noiser trained rollout1->rollout2
+#         (MODEL-based, no GT); applied to the GT former with
+#         forward_noiser_apply_gt_drift_cap (per-row level capped BELOW the
+#         served student's drift -> never a gradient toward MORE causal
+#         noise; later/more-drifted latents allow higher former levels).
 # Judge by gen/dmd_mae_gate_m_fake (student MAE), NOT the (d_real-d_fake) gap.
 # >>> SMOKE FIRST: confirm normalized R1 grad_sq scale (gamma sane) + no OOM
 #     from proj_dim=512 before the full run. <<<
@@ -455,13 +460,14 @@ srun torchrun \
     forward_noiser_enabled=true \
     forward_noiser_loss_mode=teacher_feat \
     forward_noiser_step_unconditioned=false \
-    carn_recurse=false \
+    carn_recurse=true \
     forward_noiser_feat_t=0 \
     forward_noiser_sw_n_proj=64 \
     forward_noiser_sw_max_tokens=4096 \
     fake_alt_rollout2_num_seed_chunks=5 \
     forward_noiser_apply_gt_former=true \
     forward_noiser_apply_gt_level=1 \
+    forward_noiser_apply_gt_drift_cap=true \
     ladd_adjacent_chunks_enabled=false \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \

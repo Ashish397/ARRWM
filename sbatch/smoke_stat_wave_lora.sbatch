@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-smoke-stat
+#SBATCH --job-name=af-smoke-wavelora
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,10 +11,20 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# ============================ stat_main ===============================
-# Fresh baseline (clean naming; was the v8j3g3 lineage). Authoritative
-# config summary — the GAN is FIXED and now being tuned to drive harder:
-#   GAN:  wavelet OFF (the disc-blinding bug), eq OFF, matching ON
+# ========================= stat_wave_lora =============================
+# COMBINES both experiments: stat_main + WAVELET-AUGMENT + STUDENT PHASE-LoRA.
+#   WAVELET-AUGMENT (cf. stat_wave): wavelet ON but ADDED to the raw latent
+#     (x_noisy + wavelet_hf(x)), LL gated off (drop_ll, ll_weight=0) — disc
+#     keeps BOTH modalities (raw structure + HF detail). The stat_wave smoke
+#     showed a STRONGER gap (+2.15) than wavelet-off, so it's stacked here.
+#   PHASE-LoRA (cf. stat_lora / v8e8 phaseLoRA_K4flash_uniform, PR #4): the
+#     one-step DMD student = K=4 frozen-base LoRA rungs + rung_flash (K+1) for
+#     the GAN/flash forward; uniform exit-flag; freeze_base=true (LoRA only).
+#     student_phase_lora_lr_mult=2.0 (LoRA-only 2x lr). 200 steps.
+# Both code features are flag-gated + individually smoke-validated; this is
+# their first COMBINED run. Everything else = stat_main.
+# Authoritative config summary:
+#   GAN:  wavelet AUGMENT (on, added not replacing), eq OFF, matching ON
 #         (match_k=4); ALL generated transition pairs supervised
 #         (pairs_per_step=0) via micro_batch_groups=2 (covers every fake).
 #   R1:   token-NORMALIZED (ladd_r1_normalize_tokens) so gamma is portable
@@ -379,6 +389,14 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     motion_start_threshold=5.0 \
     fake_score_lora_enabled=false \
+    student_phase_lora_enabled=true \
+    student_phase_lora_K=4 \
+    student_phase_lora_rank=32 \
+    student_phase_lora_alpha=32 \
+    student_phase_lora_dropout=0.0 \
+    student_phase_lora_freeze_base=true \
+    student_phase_lora_flash_adapter_enabled=true \
+    student_phase_lora_lr_mult=2.0 \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=1.0 \
@@ -405,10 +423,11 @@ srun torchrun \
     ladd_pairs_per_step=0 \
     ladd_disc_micro_batch_groups=2 \
     ladd_r1_num_samples=6 \
-    ladd_wavelet_hf_enabled=false \
+    ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_ll_weight=0.0 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
+    ladd_wavelet_hf_augment=true \
     ladd_gt_vs_fake_enabled=false \
     ladd_gt_vs_fake_weight=0.0 \
     ladd_gt_transition_enabled=true \
@@ -453,6 +472,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=smoke_stat_main_j${SLURM_JOB_ID}
+    run_name=smoke_stat_wave_lora_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"

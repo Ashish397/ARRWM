@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=af-smoke-stat
+#SBATCH --job-name=af-smoke-lora
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -11,9 +11,20 @@
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# ============================ stat_main ===============================
-# Fresh baseline (clean naming; was the v8j3g3 lineage). Authoritative
-# config summary — the GAN is FIXED and now being tuned to drive harder:
+# ============================ stat_lora ===============================
+# stat_main + STUDENT PHASE-LoRA (the v8e8 phaseLoRA_K4flash_uniform feature,
+# PR #4). The one-step DMD student is now K=4 frozen-base LoRA adapters
+# (rung_0..3, one per ODE denoising rung) + a rung_flash adapter (K+1) that
+# absorbs the GAN/flash-DMD gradient so it never pollutes the ODE rungs;
+# uniform exit-flag sampling. freeze_base=true => only the LoRA trains.
+#   student_phase_lora: enabled, K=4, rank=32, alpha=32, dropout=0,
+#     freeze_base=true, flash_adapter=true.
+#   student_phase_lora_lr_mult=2.0 (NEW knob): the per-rung LoRA optimizers
+#     run at 2x the base lr (LoRA-only; action heads stay at base lr) to
+#     offset the frozen-base capacity drop — this is the "lr2x". 200 steps.
+# Already proven on this lineage (cf. v8i3). Everything else = stat_main.
+# Authoritative config summary — the GAN is FIXED and now being tuned to
+# drive harder:
 #   GAN:  wavelet OFF (the disc-blinding bug), eq OFF, matching ON
 #         (match_k=4); ALL generated transition pairs supervised
 #         (pairs_per_step=0) via micro_batch_groups=2 (covers every fake).
@@ -379,6 +390,14 @@ srun torchrun \
     fake_score_ema_weight=0.95 \
     motion_start_threshold=5.0 \
     fake_score_lora_enabled=false \
+    student_phase_lora_enabled=true \
+    student_phase_lora_K=4 \
+    student_phase_lora_rank=32 \
+    student_phase_lora_alpha=32 \
+    student_phase_lora_dropout=0.0 \
+    student_phase_lora_freeze_base=true \
+    student_phase_lora_flash_adapter_enabled=true \
+    student_phase_lora_lr_mult=2.0 \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=1.0 \
@@ -453,6 +472,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=smoke_stat_main_j${SLURM_JOB_ID}
+    run_name=smoke_stat_lora_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
