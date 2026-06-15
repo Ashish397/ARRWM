@@ -24,6 +24,10 @@
 # moment-preserving CARN restore (_carn_former) + rollout2-hot prebuild
 # now skipped, so the original collapse driver is weakened. Monitor the
 # clean_x_fake brightness over the first ~80 steps.
+# ALSO folds in the R1 tuning from the v8j3g graph analysis: ladd_r1_gamma
+# 0.02 -> 0.1 and ladd_r1_sigma 0.01 -> 0.05. j3g's gap opened (peak +0.93)
+# but DECAYED (tail +0.19) while r3gan_r1_grad_sq exploded to ~4.5M (disc
+# over-sharpening); stronger/smoother R1 should hold the gap open.
 # Everything else identical to v8j3g (wavelet off, all-pairs supervision
 # + FT_v3 micro-batch, matching on).
 # =====================================================================
@@ -322,7 +326,8 @@ srun torchrun \
     ladd_use_prompt_cond=false \
     ladd_cmap_dim=64 \
     ladd_disc_loss_weight=1.0 \
-    ladd_r1_gamma=0.02 \
+    ladd_r1_gamma=0.1 \
+    ladd_r1_sigma=0.05 \
     ladd_r1_every_n_steps=8 \
     ladd_diff_aug_policy=flip \
     ladd_pairs_per_step=0 \
