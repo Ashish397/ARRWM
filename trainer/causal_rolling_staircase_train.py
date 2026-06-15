@@ -659,6 +659,13 @@ class RollingStaircaseDMDTrainer:
                 getattr(cfg, "student_phase_lora_flash_adapter_enabled", False)
             ):
                 adapter_names.append("rung_flash")
+            # student_phase_lora_lr_mult (default 1.0): scale ONLY the LoRA
+            # param groups' lr (the per-rung + flash adapters), leaving any
+            # global trainables (action heads, etc.) at the base lr. Lets the
+            # frozen-base LoRA train faster to offset its lower capacity,
+            # without disturbing the heads. mult=1.0 => byte-identical.
+            _plr_mult = float(getattr(cfg, "student_phase_lora_lr_mult", 1.0))
+            _plr_lr = lr * _plr_mult
             for slot_idx, name in enumerate(adapter_names):
                 rung_params = [
                     p for n, p in gen_module.named_parameters()
@@ -670,16 +677,24 @@ class RollingStaircaseDMDTrainer:
                         f"(check student_phase_lora_K / "
                         f"freeze_base / flash_adapter_enabled)."
                     )
-                # rung_0 also owns any global trainables (action
-                # heads, etc.) so they step exactly once per iter.
+                # rung_0 also owns any global trainables (action heads, etc.)
+                # so they step exactly once per iter — keep THOSE at the base
+                # lr while the LoRA group uses the (multiplied) phase-LoRA lr.
                 if slot_idx == 0 and global_extras:
-                    rung_params = rung_params + global_extras
-                self.phase_lora_optimizers.append(
-                    _AdamW(
-                        rung_params, lr=lr, betas=betas, eps=eps,
-                        weight_decay=wd,
+                    self.phase_lora_optimizers.append(
+                        _AdamW(
+                            [{"params": rung_params, "lr": _plr_lr},
+                             {"params": global_extras, "lr": lr}],
+                            lr=_plr_lr, betas=betas, eps=eps, weight_decay=wd,
+                        )
                     )
-                )
+                else:
+                    self.phase_lora_optimizers.append(
+                        _AdamW(
+                            rung_params, lr=_plr_lr, betas=betas, eps=eps,
+                            weight_decay=wd,
+                        )
+                    )
             # ``self.optimizer`` aliases rung_0 so existing
             # ``.step()`` / ``.zero_grad()`` call sites also drive
             # the global heads + rung_0; the trainer iter loop
