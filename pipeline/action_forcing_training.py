@@ -1468,6 +1468,37 @@ class ActionForcingTrainingPipeline:
         self.kv_cache1 = None
         self.crossattn_cache = None
 
+    # -----------------------------------------------------------------
+    # KV-cache CPU snapshot / restore  (FT_v3 post-build, "option 1").
+    # The rolling KV cache is captured to CPU RAM at a roll boundary so a
+    # POST-roll rollout2 can restore it and regenerate only the TAIL (with
+    # one fewer seed chunk = +1 drift) — instead of prebuilding a full
+    # rollout2 at setup before the dynamic depth is known. CPU RAM (not
+    # GPU) so deep rides can't OOM the device. ``max_frames`` windows the
+    # snapshot to the last N frames' worth of tokens (defaults to the full
+    # buffer); a windowed snapshot keeps the per-snapshot RAM bounded so a
+    # small ring of them (one per recent roll boundary) stays cheap.
+    # -----------------------------------------------------------------
+    def snapshot_kv_cache_cpu(
+        self, max_frames: Optional[int] = None
+    ) -> Optional[dict]:
+        from pipeline.kv_snapshot import snapshot_kv_cache_cpu as _snap
+        return _snap(self.kv_cache1, int(self.frame_seq_length), max_frames)
+
+    def restore_kv_cache_cpu(
+        self, snap: dict, *, batch_size: int, dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """Re-materialise ``kv_cache1`` on ``device`` from a CPU snapshot.
+        Reallocates the full (zero) buffers then copies the snapshot's
+        captured window back per block. ``crossattn_cache`` is the text
+        cross-attn (stable across the roll) and is left as-is.
+        """
+        from pipeline.kv_snapshot import restore_into_kv_cache as _restore
+        self._initialize_kv_cache(
+            batch_size=batch_size, dtype=dtype, device=device)
+        _restore(self.kv_cache1, snap, device=device, dtype=dtype)
+
     def generate_chunk_with_cache(
         self,
         noise: torch.Tensor,

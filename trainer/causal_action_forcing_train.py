@@ -1708,6 +1708,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # Step optimizers.
             if train_generator:
                 self._all_reduce_extra_trainable_grads()
+                # Phase-LoRA full-grad anchor cleanup: the anchor gave inactive
+                # rungs a ZERO grad purely so DDP find_unused=False could finish
+                # its reduction during backward (now complete). Drop those zero
+                # grads so each per-rung AdamW SKIPS its inactive rung (grad is
+                # None) instead of applying a spurious momentum-coast step —
+                # restoring the pre-fix behavior where inactive rungs froze.
+                # Active rungs keep their real (non-zero) accumulated grads.
+                if (getattr(self, "generator_ddp", None) is not None
+                        and bool(getattr(
+                            self.config,
+                            "student_phase_lora_enabled", False))
+                        and bool(getattr(
+                            self.config,
+                            "student_phase_lora_full_grad_anchor", False))):
+                    for _n, _p in self.generator_ddp.named_parameters():
+                        if ("lora_" in _n and _p.grad is not None
+                                and not torch.count_nonzero(_p.grad)):
+                            _p.grad = None
                 gen_grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in self.optimizer.param_groups[0]["params"]
                      if p.grad is not None],
@@ -3875,7 +3893,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # level (forward_noiser_apply_gt_level, default 1) so the FN removes
         # one drift-level's worth of modes. Level-0 chunks carry no drift, so
         # they are skipped (the FN stays identity at step 0) either direction.
-        if not bool(getattr(m, "carn_recurse", True)):
+        # chain_levels (default) SUPERSEDES this branch: training is always the
+        # conditioned rollout1->rollout2 path below (model-based; no clean->drift
+        # GT relation), with the per-pair cond = rollout2 output level.
+        _chain_levels = bool(getattr(m, "forward_noiser_chain_levels", True))
+        if not bool(getattr(m, "carn_recurse", True)) and not _chain_levels:
             ride_win = s.get("ride_latents_window")
             if ride_win is None:
                 return _anchor("no_ride_window_cumulative")
@@ -3966,10 +3988,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
         fn_in = torch.cat(fn_inputs, dim=0)       # [N*B, npb, C, H, W]
         fn_tg = torch.cat(fn_targets, dim=0)
-        # Step-UNCONDITIONED: carn_step=0 always (generic +/-1 shift).
-        carn = torch.zeros(
-            (fn_in.shape[0],), dtype=torch.long, device=fn_in.device,
-        )
+        # Conditioning. chain_levels (default): condition each pair on its
+        # ROLLOUT2 OUTPUT LEVEL L2 = (a0 - r2_abs)//npb + 1 (slot 0 of r2 is
+        # the first generated chunk = level 1), so cond=k learns the increment
+        # that lands at level k (GT->1=1, GT->2=2, 1->3=3, 2->4=4, ...). Each
+        # pair contributes Bc consecutive rows, so repeat its cond Bc times.
+        # Legacy: step-UNCONDITIONED, carn_step=0 (generic +/-1 shift).
+        Bc = int(r1.shape[0])
+        if _chain_levels:
+            _conds = [max(0, (int(_a0) - r2_abs) // npb + 1)
+                      for _a0 in _pair_abs]
+            carn = torch.cat([
+                torch.full((Bc,), int(_c), dtype=torch.long,
+                           device=fn_in.device)
+                for _c in _conds
+            ])
+            if (getattr(self, "is_main_process", True)
+                    and getattr(self, "_fn_chain_train_dbg", 0) < 4):
+                self._fn_chain_train_dbg = getattr(
+                    self, "_fn_chain_train_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    f"[FN-CHAIN-TRAIN] conditioned rollout1->rollout2: "
+                    f"n_pairs={len(_pair_abs)} r2_abs={r2_abs} "
+                    f"conds(L2)={_conds}",
+                    file=_sys.stderr, flush=True,
+                )
+        else:
+            carn = torch.zeros(
+                (fn_in.shape[0],), dtype=torch.long, device=fn_in.device,
+            )
         fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
         loss = self._fn_teacher_feat_loss(fn_out, fn_tg, proj)
         loss.backward()
@@ -3978,6 +4026,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/fn_tf_pairs": float(len(fn_inputs)),
             "train/fn_tf_skipped": 0.0,
             "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
+            "train/fn_tf_chain_levels": 1.0 if _chain_levels else 0.0,
         }
 
     #     "student vs teacher's clean data".
@@ -5616,6 +5665,104 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 if ((_gt_both or _gt_former)
                         and getattr(self.model, "forward_noiser", None)
                         is not None):
+                  # chain_levels drives the FORMER-only forward scheme; any
+                  # gt_both (reverse de-CARN) config falls to legacy below.
+                  _chain_app = bool(getattr(
+                      self.model, "forward_noiser_chain_levels", True)
+                  ) and _gt_former and not _gt_both
+                  if _chain_app:
+                    # ===== CHAINED level-conditioned former (default) =====
+                    # Deterministic per-row former target level, realized by
+                    # COMPOSING the conditioned increments the FN was trained
+                    # on (cond = level reached: GT->1=1, GT->2=2, 1->3=3,
+                    # 2->4=4, ...). L = the real row's LATTER drift level
+                    # (chunk u+1). weak (default): target=(L-1)//2 (0,0,1,1,
+                    # 2,2,...); strong: max(0,L-2). Capped at served-fake
+                    # former drift - 1 (Req-1: never toward MORE noise). A
+                    # single FN call for target<=2; recursion only PAST 2
+                    # (e.g. level 4 = FN(FN(GT,cond2),cond4)). FORMER only
+                    # (forward FN; the latter is the clean target).
+                    _mode = str(getattr(
+                        self.model, "forward_noiser_former_mode", "weak"))
+                    _seed_r1 = int(self.model.dmd_context_clean_frames
+                                   // self.model.num_frame_per_block)
+                    _nuq = int(ru.shape[0])
+                    _BIGc = 1 << 30
+                    _mind = [_BIGc] * _nuq
+                    for _p in range(n_pairs):
+                        _fd = int(pairs[_p][0])
+                        for _b in range(B):
+                            _fr = _p * B + _b
+                            for _k in range(Kk):
+                                _r = int(gm[_fr, _k].item())
+                                if _fd < _mind[_r]:
+                                    _mind[_r] = _fd
+                    _tgt = []
+                    for _r in range(_nuq):
+                        _u = int(rows_bu[_r][1])
+                        _L = max(0, (_u + 1) - (_seed_r1 - 1))
+                        _t = (max(0, _L - 2) if _mode == "strong"
+                              else max(0, (_L - 1) // 2))
+                        # Req-1 cap: _mind = min matched-fake former chunk INDEX
+                        # i. The student former's true drift LEVEL is always
+                        # >= i+1 (drift = i+1+frontier_offset, offset>=0), so
+                        # capping the target at _mind guarantees target < the
+                        # student former drift in EVERY regime (exact for
+                        # stationary; conservative under rolling). NOTE: _mind
+                        # was previously misused as a drift level (cap=_mind-1)
+                        # which is off-by-one (too clean) — fixed here. The name
+                        # _req1cap avoids the _match_select closure var _cap.
+                        _req1cap = _mind[_r] if _mind[_r] < _BIGc else 0
+                        _tgt.append(int(max(0, min(_t, _req1cap))))
+                    _tgt_t = torch.tensor(
+                        _tgt, dtype=torch.long, device=ru.device)
+                    _max_t = int(_tgt_t.max().item()) if _nuq else 0
+                    with torch.no_grad():
+                        _x0 = ru[:, 0:npb]
+                        _cur = _x0.clone()
+                        # Apply cond=c to rows whose chain includes c (target
+                        # >= c and SAME parity) — increasing c feeds each row
+                        # its conditioned increments in order at the right
+                        # input level (clean -> start -> start+2 -> ... -> t).
+                        for _c in range(1, _max_t + 1):
+                            _sel = ((_tgt_t >= _c)
+                                    & ((_tgt_t % 2) == (_c % 2))).nonzero(
+                                        as_tuple=False).flatten()
+                            if _sel.numel() == 0:
+                                continue
+                            _sub = _cur.index_select(0, _sel)
+                            _cs = torch.full(
+                                (_sub.shape[0],), int(_c),
+                                dtype=torch.long, device=_sub.device)
+                            _sub = self.model.forward_noiser(
+                                _sub, _cs, residual=True)
+                            _cur = _cur.index_copy(0, _sel, _sub)
+                        # Moment-preserving (texture-only) restore vs original.
+                        _e = 1e-6
+                        _mci = _x0.mean(dim=[1, 3, 4], keepdim=True)
+                        _mco = _cur.mean(dim=[1, 3, 4], keepdim=True)
+                        _cur = _cur - _mco + _mci
+                        _ai = _x0.abs().mean(
+                            dim=[1, 2, 3, 4], keepdim=True)
+                        _ao = _cur.abs().mean(
+                            dim=[1, 2, 3, 4], keepdim=True)
+                        _cur = _cur * (_ai / (_ao + _e))
+                        # target-0 rows keep the ORIGINAL clean former.
+                        _keep = (_tgt_t > 0).view(-1, 1, 1, 1, 1)
+                        _cur = torch.where(_keep, _cur, _x0)
+                        ru = torch.cat([_cur.detach(), ru[:, npb:]], dim=1)
+                    if (getattr(self, "is_main_process", True)
+                            and getattr(self, "_fn_chain_app_dbg", 0) < 3):
+                        self._fn_chain_app_dbg = getattr(
+                            self, "_fn_chain_app_dbg", 0) + 1
+                        import sys as _sys
+                        print(
+                            "[FN-CHAIN-APP] mode=%s n=%d former targets=%s "
+                            "(cap=served-fake drift-1; single<=2, recurse>2)"
+                            % (_mode, _nuq, _tgt[:12]),
+                            file=_sys.stderr, flush=True,
+                        )
+                  else:
                     # Conditioning level for the application. A step-
                     # UNCONDITIONED FN trained only at carn_step=0, so apply
                     # at 0. A step-CONDITIONED FN (give it the numbers)
@@ -7868,6 +8015,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return setup_s_local_max(
             ride_len, cf, cap, slack, anchor, min_new, npb)
 
+    @staticmethod
+    def _going_gone_gate(
+        frontier_mae, going_threshold, gone_base, gone_factor,
+        min_depth, cur_depth,
+    ):
+        """FT_v3 post-build two-threshold gate (delegate). Returns one of
+        ``"gone"`` / ``"going"`` / ``"roll"`` — see
+        ``trainer.toothpaste.going_gone_gate``. Used ONLY on the
+        ``ftv3_postbuild_enabled`` path; the default-OFF path uses the
+        single ``_toothpaste_gone`` gate unchanged."""
+        from trainer.toothpaste import going_gone_gate
+        return going_gone_gate(
+            frontier_mae, going_threshold, gone_base, gone_factor,
+            min_depth, cur_depth)
+
     # ------------------------------------------------------------------
     # K=1-per-step state machine. Each call rolls one chunk on the
     # current ride (or sets up a fresh ride if reset was triggered last
@@ -7888,6 +8050,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         """
         cfg = self.config
         max_rolls = int(getattr(cfg, "max_rolls_per_ride", 60))
+        # ---- FT_v3 post-build master flag (default OFF = byte-identical) --
+        # When OFF, NONE of the new roll-until-going + post-build branches
+        # are taken and ``_streaming_step`` runs the exact current code.
+        # af-stat (stationary, max_rolls_per_ride=1) never sets this flag,
+        # and even if it did, the going gate is additionally guarded by
+        # ``ftv3_going_min_depth`` (default 4 > 1) so a single-roll ride can
+        # never enter the post-build path. Sub-knobs are read with getattr
+        # defaults so existing YAMLs are unaffected.
+        _ftv3_on = bool(getattr(cfg, "ftv3_postbuild_enabled", False))
+        if _ftv3_on:
+            self._ftv3_going_threshold = float(
+                getattr(cfg, "streaming_mae_going_threshold", 0.0))
+            self._ftv3_going_min_depth = int(
+                getattr(cfg, "ftv3_going_min_depth", 4))
         # ---- Toothpaste rollout-depth curriculum (phase-2 rolling) -------
         # MAE-EARNED depth growth: the rollout depth cap grows by +1 roll
         # ONLY when the running-average frontier MAE at the current depth is
@@ -8148,6 +8324,38 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 _tp_gone_hit = _local_gone
 
+        # ---- FT_v3 post-build going gate --------------------------------
+        # FLAG-GATED: only when ``ftv3_postbuild_enabled``. Default OFF skips
+        # this block entirely (no going flag) so the path below is
+        # byte-identical. When ON we compute a RANK-UNIFORM "going" decision
+        # (MAX-reduced like the GONE gate) used below to force a lockstep
+        # reset; the FN tail pair is produced by the existing frontier-pair
+        # re-roll at teardown.
+        _ftv3_going_hit = False
+        if _ftv3_on:
+            # Rank-uniform going decision. ``gone`` priority is preserved by
+            # the existing GONE gate above (which already MAX-reduced
+            # _tp_gone_hit); here we only add the softer "going" stop. Guard
+            # with min_depth so a tail (band+anchors) can always be formed.
+            _local_going = (
+                not _tp_gone_hit
+                and self._ftv3_going_threshold > 0.0
+                and self._chunks_in_current_ride >= int(
+                    self._ftv3_going_min_depth)
+                and avg_mae > self._ftv3_going_threshold
+            )
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                _gv = torch.tensor(
+                    [1 if _local_going else 0],
+                    device=self.device, dtype=torch.long,
+                )
+                dist.all_reduce(_gv, op=dist.ReduceOp.MAX)
+                _ftv3_going_hit = bool(int(_gv.item()))
+            else:
+                _ftv3_going_hit = _local_going
+            if _ftv3_going_hit:
+                out["streaming_ftv3_going"] = 1.0
+
         # ---- Stage 4: train every active head (skipped if GONE) ----------
         t_train_start = time.monotonic()
         if not _tp_gone_hit:
@@ -8204,9 +8412,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         local_exhausted = not self.model.can_generate_more()
         # Toothpaste GONE forces a reset (already global via the MAX-reduce
         # in the gone gate above, so it agrees across ranks).
+        # FT_v3 going gate forces a reset that designates the tail (the
+        # post-build/FN frontier-pair runs at the teardown below). Already
+        # rank-uniform (MAX-reduced above), so it agrees across ranks; the
+        # final MAX-reduce keeps it lockstep with the other reasons.
         local_should_reset = (
             local_hit_cap or local_exhausted or local_mae_collapse
-            or _tp_gone_hit
+            or _tp_gone_hit or _ftv3_going_hit
         )
         if dist.is_initialized() and dist.get_world_size() > 1:
             flag_t = torch.tensor(
@@ -8267,6 +8479,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 out["streaming_reset_reason_cap"] = 1.0
             elif local_exhausted:
                 out["streaming_reset_reason_end_of_ride"] = 1.0
+            elif _ftv3_on and _ftv3_going_hit:
+                out["streaming_reset_reason_ftv3_going"] = 1.0
             else:
                 out["streaming_reset_reason_peer_triggered"] = 1.0
             # FN frontier pair (phase-2 rolling): train the FN on a fresh

@@ -1,0 +1,18 @@
+{
+ "summary": {
+  "v14": {
+   "psnr": Infinity,
+   "ssim": 0.35509829876889737,
+   "lpips": 0.5052415430545807,
+   "musiq": 55.09077835083008,
+   "psnr_drift": NaN,
+   "lpips_drift": 0.005750319113688475,
+   "musiq_drift": 0.007342630857627597,
+   "n": 4
+  },
+  "loo_adaln": null,
+  "loo_tokens": null,
+  "loo_f3": null,
+  "loo_f2": null
+ }
+}

@@ -352,7 +352,7 @@ srun torchrun \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.02 \
     ladd_r1_every_n_steps=1 \
-    ladd_disc_micro_batch_groups=2 \
+    ladd_disc_micro_batch_groups=4 \
     ladd_r1_num_samples=6 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=4 \

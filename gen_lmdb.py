@@ -225,11 +225,76 @@ def sample_windows(rides_all, num_windows, seed):
     return rng.sample(pool, num_windows)
 
 
+def sample_windows_curated(rides_all, pool_json, num_windows):
+    """Pick windows from a curated high-motion + backward pool JSON.
+
+    ``pool_json`` is paper_assets/v14b_train_windows.json (built by
+    utils/build_curated_pool.py): the most-motion-y windows + backward
+    oversampler. We dedup (the pool oversamples backward), then take ALL
+    backward windows (guarantee reverse coverage) + the top forward windows
+    by score, up to ``num_windows``. Returns ``[(ride_idx, start, n_lat), ...]``
+    matched to ``rides_all`` by zarr basename.
+    """
+    import json
+    with open(pool_json) as f:
+        wm = json.load(f)
+    windows = wm["windows"] if isinstance(wm, dict) else wm
+    # ride basename -> index in rides_all
+    idx_by_base = {Path(_fix_u6ej_path(r["zarr_path"])).name: i for i, r in enumerate(rides_all)}
+    # dedup by (basename, start), keep best score; track backward
+    best = {}
+    for w in windows:
+        base = Path(w["zarr_path"]).name
+        if base not in idx_by_base:
+            continue
+        key = (base, int(w["start"]))
+        if key not in best or w["score"] > best[key]["score"]:
+            best[key] = w
+    uniq = list(best.values())
+    bwd = [w for w in uniq if w.get("backward")]
+    fwd = [w for w in uniq if not w.get("backward")]
+    fwd.sort(key=lambda w: -w["score"])
+    chosen = bwd + fwd[: max(0, num_windows - len(bwd))]
+    log.info(
+        "Curated pool %s: %d unique windows -> chose %d (%d backward + %d forward)",
+        pool_json, len(uniq), len(chosen), len(bwd), len(chosen) - len(bwd),
+    )
+    out = []
+    for w in chosen:
+        i = idx_by_base[Path(w["zarr_path"]).name]
+        out.append((i, int(w["start"]), int(w.get("n_latent_frames", 0))))
+    return out
+
+
+def _parse_args():
+    import argparse
+    ap = argparse.ArgumentParser(description="Generate ODE-trajectory LMDB pairs")
+    ap.add_argument("--config", default=CONFIG_PATH)
+    ap.add_argument("--manifest", default=MANIFEST_PATH)
+    ap.add_argument("--ckpt", default=CKPT_PATH)
+    ap.add_argument("--lmdb_root", default=LMDB_ROOT)
+    ap.add_argument("--lmdb_cf_root", default=LMDB_CF_ROOT)
+    ap.add_argument("--num_windows", type=int, default=NUM_WINDOWS)
+    ap.add_argument("--curated_pool", default=None,
+                    help="if set, sample from this curated high-motion+backward pool JSON "
+                         "instead of uniform-random windows")
+    return ap.parse_args()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    args = _parse_args()
+    global CONFIG_PATH, MANIFEST_PATH, CKPT_PATH, LMDB_ROOT, LMDB_CF_ROOT, NUM_WINDOWS
+    CONFIG_PATH = args.config
+    MANIFEST_PATH = args.manifest
+    CKPT_PATH = args.ckpt
+    LMDB_ROOT = args.lmdb_root
+    LMDB_CF_ROOT = args.lmdb_cf_root
+    NUM_WINDOWS = args.num_windows
+
     from omegaconf import OmegaConf
     from utils.zarr_dataset import ZarrRideDataset
     import zarr as zarr_lib
@@ -265,8 +330,12 @@ def main():
         gpu_rank, len(rides_all), src_key,
     )
 
-    samples = sample_windows(rides_all, NUM_WINDOWS, SAMPLE_SEED)
-    log.info("GPU %d: sampled %d windows (seed=%d)", gpu_rank, len(samples), SAMPLE_SEED)
+    if args.curated_pool:
+        samples = sample_windows_curated(rides_all, args.curated_pool, NUM_WINDOWS)
+        log.info("GPU %d: sampled %d curated high-motion+backward windows", gpu_rank, len(samples))
+    else:
+        samples = sample_windows(rides_all, NUM_WINDOWS, SAMPLE_SEED)
+        log.info("GPU %d: sampled %d windows (seed=%d)", gpu_rank, len(samples), SAMPLE_SEED)
 
     my_samples = samples[gpu_rank::num_gpus]
     log.info(

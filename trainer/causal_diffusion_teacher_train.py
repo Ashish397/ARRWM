@@ -537,6 +537,41 @@ class CausalLoRADiffusionTrainer:
                 logging.info("eval_ride_zarrs override active: %d eval rides (was %d)",
                              len(eval_rides), self.test_num_rides)
 
+        # --- Curated motion-y + backward window pool (v14b) ----------------
+        # If ``train_window_manifest`` is set, replace train_rides with ONE
+        # entry per curated window (forced_offset = window start), so the model
+        # is supervised only on the highest-motion windows + the backward
+        # oversampler. Entries share each ride's prompt_embeds/attrs (by
+        # reference — no tensor copy). Eval rides are never included (their
+        # windows are skipped because they're absent from the train split).
+        win_manifest = getattr(self.config, "train_window_manifest", None)
+        if win_manifest:
+            import json as _json
+            with open(win_manifest) as _f:
+                _wm = _json.load(_f)
+            _windows = _wm["windows"] if isinstance(_wm, dict) else _wm
+            _by_path = {r["zarr_path"]: r for r in train_rides}
+            _expanded = []
+            _skipped = 0
+            for _w in _windows:
+                _base = _by_path.get(_w["zarr_path"])
+                if _base is None:
+                    _skipped += 1
+                    continue
+                _expanded.append({**_base, "forced_offset": int(_w["start"])})
+            if not _expanded:
+                raise RuntimeError(
+                    f"train_window_manifest {win_manifest} produced 0 usable "
+                    f"windows ({_skipped} skipped, not in train split)."
+                )
+            if self.is_main_process:
+                logging.info(
+                    "train_window_manifest=%s: %d curated windows -> %d train "
+                    "entries (%d skipped, not in train split)",
+                    win_manifest, len(_windows), len(_expanded), _skipped,
+                )
+            train_rides = _expanded
+
         self.dataset = ZarrRideDataset.from_manifest(
             rides_data=train_rides,
             motion_root=self.config.motion_root,
@@ -688,6 +723,22 @@ class CausalLoRADiffusionTrainer:
                         "State-token action head: %d chunks, out_dim=%d, weight=%.4f",
                         n_chunks, self.state_head_out_dim, self.state_head_loss_weight,
                     )
+
+        # State-probe tap gradient mode. Default True (detached) preserves the
+        # post-2026-05-06 behavior used for the LOO ablation; the teacher
+        # trainer has no coexisting GAN/DMD graph, so full-graph mode
+        # (detach=False) is safe here and re-attaches the probe so its losses
+        # actually shape the generator (as in the original pre-detach v14).
+        _detach_taps = bool(getattr(self.config, "state_probe_detach_taps", True))
+        wrapper._state_probe_detach_taps = _detach_taps
+        if self.state_head_enabled and self.is_main_process:
+            logging.info(
+                "state_probe_detach_taps=%s (%s)",
+                _detach_taps,
+                "probe DETACHED — no generator gradient (ablation/inert)"
+                if _detach_taps else
+                "probe ATTACHED — gradients flow into the generator",
+            )
 
         wrapper.to(self.device)
         wrapper.train()
@@ -1949,11 +2000,14 @@ class CausalLoRADiffusionTrainer:
 
         def _next_ride() -> dict:
             raw = next(self.data_iter)
-            return {
+            ride = {
                 "zarr_path": raw["zarr_path"][0],
                 "prompt_embeds": raw["prompt_embeds"][0],
                 "n_latent_frames": int(raw["n_latent_frames"][0].item()),
             }
+            if "forced_offset" in raw:
+                ride["forced_offset"] = int(raw["forced_offset"][0].item())
+            return ride
 
         def _refill_exhausted() -> None:
             """Replace only the slots whose rides have run out."""

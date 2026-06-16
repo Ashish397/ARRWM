@@ -85,8 +85,27 @@ class LockstepRideBatcher:
         return (raw // self.num_frame_per_block) * self.num_frame_per_block
 
     def _init_slot(self, idx: int, rd: dict) -> None:
-        """Populate slot *idx* from a ride dict with a fresh random offset."""
+        """Populate slot *idx* from a ride dict.
+
+        If the ride carries ``forced_offset >= 0`` (a curated motion-y /
+        backward window), train on exactly that single window starting at the
+        forced offset. Otherwise pick a random offset and walk the ride's
+        contiguous windows as before.
+        """
         n_lat = int(rd["n_latent_frames"])
+        forced = int(rd.get("forced_offset", -1))
+        if forced >= 0 and forced + self.window_size + self.context_frames <= n_lat:
+            # Single curated window at the forced (block-aligned) start.
+            self._slots[idx] = _RideSlot(
+                zarr_path=rd["zarr_path"],
+                prompt_embeds=rd["prompt_embeds"],
+                n_latent_frames=n_lat,
+                n_windows=1,
+                window_idx=0,
+                start_offset=forced,
+                loaded=True,
+            )
+            return
         offset = self._random_start_offset()
         usable = n_lat - offset - self.context_frames
         if usable < self.window_size:

@@ -705,16 +705,45 @@ def main():
         rollout_gen = torch.cat(committed_chunks, dim=1)
         assert rollout_gen.shape[1] == NUM_FRAMES, rollout_gen.shape
 
+        # --- latent chunk-boundary diagnostic (LATENT_BOUNDARY_DIAG=1) --------
+        # Decode-vs-training discriminator: measure the per-adjacent-frame RMS
+        # delta in LATENT space on the committed rollout. Frame index i is a
+        # chunk boundary iff i % NUM_FRAME_PER_BLOCK == 0 (i>0): frames i-1, i
+        # come from different committed gens. If loo_f3 shows boundary>>interior
+        # but v14 doesn't, the discontinuity is in the model's committed latents
+        # (a real AR chunk-consistency regression) — NOT a decode-stitch seam.
+        if os.environ.get("LATENT_BOUNDARY_DIAG") == "1":
+            with torch.no_grad():
+                rg = rollout_gen[0].float()  # [T, C, H, W]
+                d = (rg[1:] - rg[:-1]).flatten(1).pow(2).mean(1).sqrt()  # [T-1] RMS per gap
+                bnd, intr = [], []
+                for i in range(1, rg.shape[0]):
+                    (bnd if i % NUM_FRAME_PER_BLOCK == 0 else intr).append(float(d[i - 1]))
+                b = float(np.mean(bnd)) if bnd else 0.0
+                it = float(np.mean(intr)) if intr else 0.0
+                log.info(
+                    "[LATENT_BOUNDARY_DIAG] %s rank=%d boundary_rms=%.5f interior_rms=%.5f ratio=%.3f gaps=%s",
+                    label, rank, b, it, (b / it if it else float("nan")),
+                    [round(float(x), 4) for x in d.tolist()],
+                )
+
         context_np = pipe.decode_latents(seed_lat.unsqueeze(0))
         if not prev_video_raws:
             raise RuntimeError("Expected cached decoded videos for final rollout.")
         chunk_px = prev_video_raws[0].shape[0] // NUM_ACTION_CHUNKS
-        rollout_parts = [context_np]
-        for i in range(NUM_ACTION_CHUNKS):
-            lo = i * chunk_px
-            hi = lo + chunk_px
-            rollout_parts.append(prev_video_raws[i][lo:hi])
-        rollout_cat = np.concatenate(rollout_parts, axis=0)
+        if os.environ.get("SMOOTH_DECODE") == "1":
+            # Decode the committed latent rollout in ONE pass so the VAE temporal
+            # conv spans the whole sequence -> no per-chunk decode seams. (The
+            # default per-pass-stitched path below takes chunk i's pixels from a
+            # different generation's decode, leaving a seam every chunk.)
+            rollout_cat = np.concatenate([context_np, pipe.decode_latents(rollout_gen)], axis=0)
+        else:
+            rollout_parts = [context_np]
+            for i in range(NUM_ACTION_CHUNKS):
+                lo = i * chunk_px
+                hi = lo + chunk_px
+                rollout_parts.append(prev_video_raws[i][lo:hi])
+            rollout_cat = np.concatenate(rollout_parts, axis=0)
 
         motion_r, teacher_z_8d_r = pipe.compute_teacher_visuals(rollout_gen)
         n_c_r = teacher_z_8d_r.shape[1]
@@ -752,7 +781,7 @@ def main():
         try:
             import zarr as zarr_lib
             _g_gt = zarr_lib.open_group(ride_meta["zarr_path"], mode="r")
-            _o2 = latent_start_offset + NUM_FRAME_PER_BLOCK
+            _o2 = int(ride_meta["latent_start_offset"]) + NUM_FRAME_PER_BLOCK
             _gt_np = _g_gt["latents"][_o2:_o2 + NUM_FRAMES]
             _gt_lat = torch.from_numpy(_gt_np.astype(np.float32)).unsqueeze(0).to(seed_lat.device)
             _gt_rest = pipe.decode_latents(_gt_lat)

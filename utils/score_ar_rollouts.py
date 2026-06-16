@@ -26,7 +26,7 @@ import lpips, pyiqa
 lpips_fn = lpips.LPIPS(net='alex').to(DEV).eval()
 musiq = pyiqa.create_metric('musiq', device=DEV)
 
-OUT = 'eval/ar_ablation'
+OUT = os.environ.get('AR_OUT', 'eval/ar_ablation')
 CONFIGS = ['v14', 'loo_adaln', 'loo_tokens', 'loo_f3', 'loo_f2']
 
 

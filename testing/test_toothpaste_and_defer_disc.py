@@ -146,3 +146,31 @@ def test_s_local_max_reserves_floor():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---- FT_v3 post-build two-threshold going/gone gate -----------------------
+
+def test_going_gone_gate_gone_takes_priority():
+    # off-manifold collapse wins even when past the going threshold
+    assert T.going_gone_gate(10.0, 0.5, 0.2, 3.0, min_depth=2, cur_depth=5) == "gone"
+
+
+def test_going_gone_gate_min_depth_holds_roll():
+    # below min_depth we keep rolling even if over going (gone still aborts)
+    assert T.going_gone_gate(0.6, 0.5, 1.0, 3.0, min_depth=4, cur_depth=2) == "roll"
+
+
+def test_going_gone_gate_going_stops():
+    assert T.going_gone_gate(0.6, 0.5, 1.0, 3.0, min_depth=2, cur_depth=4) == "going"
+
+
+def test_going_gone_gate_below_going_rolls():
+    assert T.going_gone_gate(0.3, 0.5, 1.0, 3.0, min_depth=2, cur_depth=4) == "roll"
+
+
+def test_going_gone_gate_disabled_never_going():
+    assert T.going_gone_gate(0.9, 0.0, 1.0, 3.0, min_depth=2, cur_depth=4) == "roll"
+
+
+def test_going_gone_gate_no_baseline_not_gone():
+    assert T.going_gone_gate(5.0, 0.5, None, 3.0, min_depth=2, cur_depth=4) == "going"

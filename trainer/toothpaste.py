@@ -43,6 +43,36 @@ def toothpaste_gone(
     return float(frontier_mae) > float(gone_base) * float(gone_factor)
 
 
+def going_gone_gate(
+    frontier_mae: float,
+    going_threshold: float,
+    gone_base: Optional[float],
+    gone_factor: float,
+    min_depth: int,
+    cur_depth: int,
+) -> str:
+    """FT_v3 post-build two-threshold gate, evaluated on each new frontier
+    chunk during a roll. Returns one of:
+      "gone"   — off-manifold (collapse): reject the rollout, no train.
+                 (frontier_mae > gone_base * gone_factor)  [checked FIRST]
+      "going"  — drifting past ``going_threshold``: STOP rolling here and
+                 train. The going chunk + the one before it are the anchors;
+                 the two before those are the DMD band.
+      "roll"   — still on-manifold and below ``going``: keep rolling.
+
+    ``min_depth`` guards against stopping before there are enough chunks to
+    form anchors(2)+band(2): until ``cur_depth >= min_depth`` we keep rolling
+    (but a 'gone' collapse still aborts). ``going_threshold <= 0`` disables
+    the going gate (returns 'gone' or 'roll' only — legacy-ish)."""
+    if toothpaste_gone(frontier_mae, gone_base, gone_factor):
+        return "gone"
+    if int(cur_depth) < int(min_depth):
+        return "roll"
+    if float(going_threshold) > 0.0 and float(frontier_mae) > float(going_threshold):
+        return "going"
+    return "roll"
+
+
 def setup_s_local_max(
     ride_len: int,
     cf: int,

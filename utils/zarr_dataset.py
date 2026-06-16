@@ -544,10 +544,15 @@ class ZarrRideDataset(Dataset):
 
         obj._rides = []
         obj._attrs_by_path = {}
+        # Optional per-entry forced window start (curated motion-y / backward
+        # pool). -1 = no force (batcher picks its usual random offset). Parallel
+        # to _rides so the existing tuple layout is untouched.
+        obj._forced_offsets = []
         for r in rides_data:
             zpath = Path(r["zarr_path"])
             obj._rides.append((zpath, r["prompt_embeds"], r["attrs"], r["n_latent_frames"]))
             obj._attrs_by_path[r["zarr_path"]] = r["attrs"]
+            obj._forced_offsets.append(int(r.get("forced_offset", -1)))
 
         logging.info("ZarrRideDataset.from_manifest: %d rides loaded (no scan)", len(obj._rides))
         return obj
@@ -856,10 +861,12 @@ class ZarrRideDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         zpath, prompt_embeds, _attrs, n_frames = self._rides[idx]
+        forced = self._forced_offsets[idx] if getattr(self, "_forced_offsets", None) else -1
         return {
             "zarr_path": str(zpath),
             "prompt_embeds": prompt_embeds,
             "n_latent_frames": n_frames,
+            "forced_offset": int(forced),
         }
 
     @staticmethod

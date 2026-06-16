@@ -875,6 +875,15 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_enabled = bool(
             getattr(args, "forward_noiser_enabled", False)
         )
+        # FT_v3 post-build master flag (default OFF = byte-identical). When
+        # ON, ``setup_sequence`` SKIPS the setup-time
+        # ``_prebuild_rollout2_for_v24`` call: rollout2 is built POST-roll on
+        # the tail only (the trainer drives this once the dynamic depth is
+        # known via the going gate). Default OFF leaves the setup prebuild
+        # exactly as-is.
+        self.ftv3_postbuild_enabled = bool(
+            getattr(args, "ftv3_postbuild_enabled", False)
+        )
         # Validate ``aux_real_clean_x_source=causal_ar_gt`` has a
         # source available. The override only fires inside the
         # ``_strategy_can_run`` block of
@@ -1130,6 +1139,53 @@ class ActionForcingDMD(SelfForcingModel):
         # FN only.
         self.forward_noiser_apply_gt_drift_cap = bool(
             getattr(args, "forward_noiser_apply_gt_drift_cap", False)
+        )
+        # ===== Level-conditioned CHAINED FN scheme (model-based, default) ====
+        # ``forward_noiser_chain_levels`` (default TRUE): the unified scheme.
+        #   * TRAINING (always, regardless of carn_recurse): conditioned
+        #     rollout1->rollout2 pairs. Each pair at abs chunk position p is
+        #     conditioned on its ROLLOUT2 OUTPUT LEVEL L2(p) = the rollout2
+        #     drift level there. With a 2-fewer-seed rollout2 the pairs are
+        #     exactly  GT->GT(cond0), GT->1(cond1), GT->2(cond2), 1->3(cond3),
+        #     2->4(cond4), 3->5(cond5), 4->6(cond6) ...  so cond=k maps a
+        #     level-(k-2) input (or clean, k<=2) to level k. NO data/GT
+        #     relation (the rejected clean->student-drift pairing); purely
+        #     model rollout1->rollout2.
+        #   * APPLICATION (gt_transition GAN former, Site C): the real former
+        #     is pushed to a DETERMINISTIC per-pair target level, realized by
+        #     COMPOSING the conditioned increments (cond chain). A single call
+        #     for target <= 2 (GT->1 / GT->2); recursion only PAST level 2
+        #     (e.g. level 4 = FN(FN(GT,cond2),cond4)). Target capped by the
+        #     served-fake drift - 1 (Req-1: never a gradient toward MORE noise).
+        #   When False: legacy (unconditioned carn_recurse paths / random cap).
+        self.forward_noiser_chain_levels = bool(
+            getattr(args, "forward_noiser_chain_levels", True)
+        )
+        # ``forward_noiser_former_mode`` (default "weak"): the deterministic
+        # former-target schedule vs the transition's latter level L.
+        #   "weak"  (default): former level = (L-1)//2  -> 0,0,1,1,2,2,3,3,...
+        #       trails the student former (at L-1) by a growing ~half margin
+        #       (strictly below it everywhere; gentle degradation).
+        #   "strong":          former level = max(0, L-2) -> 0,0,1,2,3,4,...
+        #       exactly one level below the student former (recurse throughout).
+        self.forward_noiser_former_mode = str(
+            getattr(args, "forward_noiser_former_mode", "weak")
+        ).lower()
+        if self.forward_noiser_former_mode not in ("weak", "strong"):
+            raise ValueError(
+                "forward_noiser_former_mode must be 'weak' or 'strong'; "
+                f"got {self.forward_noiser_former_mode!r}."
+            )
+        # ``forward_noiser_rollout2_seed_gap`` (default 2): how many FEWER
+        # seed chunks rollout2 uses vs rollout1, i.e. the per-position drift
+        # gap L2(p)-L1(p) in the trained region. 2 gives the GT->1,GT->2,
+        # 1->3,2->4 (+2) structure the chain needs. In the chain-levels regime
+        # (and only when the fake-alt head is OFF, so there is no fake-score
+        # coupling) this OVERRIDES the effective rollout2 seed count in code,
+        # so frozen-config queued runs pick up the +2 geometry without a
+        # resubmit (applied after dmd_context_clean_frames below).
+        self.forward_noiser_rollout2_seed_gap = int(
+            getattr(args, "forward_noiser_rollout2_seed_gap", 2)
         )
         # ``fn_frontier_pairs`` (phase-2 rolling): at every ride RESET,
         # generate a fresh (rollout1', rollout2') chunk pair AT THE RIDE'S
@@ -1692,6 +1748,33 @@ class ActionForcingDMD(SelfForcingModel):
                 f"({self.dmd_context_clean_frames}) must be < "
                 f"num_training_frames ({self.num_training_frames})."
             )
+
+        # CHAIN-LEVELS seed-gap override (code-level, so frozen-config queued
+        # runs pick it up without a resubmit). When the level-conditioned
+        # chained FN scheme is on AND the fake-alt score head is OFF (no
+        # fake-score coupling — the rollout2 prebuild is then FN-only), force
+        # rollout2 to use ``num_seed_r1 - seed_gap`` seed chunks so the FN
+        # trains on the +seed_gap geometry the chain requires (default gap 2 ->
+        # GT->1,GT->2,1->3,2->4). Without this, a config's frozen
+        # ``fake_alt_rollout2_num_seed_chunks`` (e.g. 5 = 1-fewer) would give a
+        # +1 gap that the +2 chain cannot compose.
+        if (self.forward_noiser_enabled
+                and self.forward_noiser_loss_mode == "teacher_feat"
+                and self.forward_noiser_chain_levels
+                and not self.fake_alt_head_enabled):
+            _num_seed_r1 = self.dmd_context_clean_frames // self.num_frame_per_block
+            _gap = max(1, int(self.forward_noiser_rollout2_seed_gap))
+            _n_seed_r2 = max(1, _num_seed_r1 - _gap)
+            if _n_seed_r2 != self.fake_alt_rollout2_num_seed_chunks:
+                print(
+                    "[FN-CHAIN] rollout2 seed-gap override: "
+                    f"fake_alt_rollout2_num_seed_chunks "
+                    f"{self.fake_alt_rollout2_num_seed_chunks} -> {_n_seed_r2} "
+                    f"(num_seed_r1={_num_seed_r1}, gap={_gap}); FN-only "
+                    "(fake_alt head off).",
+                    flush=True,
+                )
+                self.fake_alt_rollout2_num_seed_chunks = _n_seed_r2
 
         # ``dmd_clean_x_anchor_frames``: number of EXTRA frames the
         # student rolls at the START of every ride to anchor batch-1's
@@ -5132,13 +5215,19 @@ class ActionForcingDMD(SelfForcingModel):
         ) or (
             self.forward_noiser_enabled
             and self.forward_noiser_loss_mode == "teacher_feat"
-            # Only the carn_recurse=True FN path composes the prebuilt
-            # rollout2; the carn_recurse=False path trains from the ride
-            # window + flash chunk (see _train_forward_noiser_tf). Skipping
-            # the prebuild here is the FT_v3 / j*f OOM win — the extra
-            # no-grad +1 rollout was built every ride setup and never read.
-            and self.carn_recurse
+            # chain_levels (default): training is ALWAYS conditioned
+            # rollout1->rollout2 regardless of carn_recurse, so the prebuilt
+            # rollout2 is always needed. Legacy: only the carn_recurse=True
+            # path composes rollout2; the carn_recurse=False path trains from
+            # the ride window + flash chunk (the FT_v3 / j*f OOM win — the
+            # extra no-grad +1 rollout was built every setup and never read).
+            and (self.forward_noiser_chain_levels or self.carn_recurse)
         )
+        # FT_v3 post-build: SKIP the setup-time prebuild. Depth is dynamic
+        # (the going gate decides it at roll time), so rollout2 is rebuilt
+        # POST-roll on the tail only. Default OFF keeps the setup prebuild.
+        if getattr(self, "ftv3_postbuild_enabled", False):
+            _need_rollout2 = False
         if _need_rollout2:
             rollout2_x0, rollout2_abs_frame_start = (
                 self._prebuild_rollout2_for_v24(
