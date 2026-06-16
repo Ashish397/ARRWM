@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=af-smoke-stat
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
@@ -404,6 +404,7 @@ srun torchrun \
     ladd_diff_aug_policy=flip \
     ladd_pairs_per_step=0 \
     ladd_disc_micro_batch_groups=2 \
+    ladd_gen_guidance_micro_batch_groups=4 \
     ladd_r1_num_samples=6 \
     ladd_wavelet_hf_enabled=false \
     ladd_wavelet_hf_drop_ll=true \

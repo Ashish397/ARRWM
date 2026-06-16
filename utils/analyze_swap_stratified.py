@@ -14,10 +14,12 @@ from collections import defaultdict
 
 PA = '/scratch/u6ex/as1748.u6ex/ARRWM/paper_assets'
 RUNS = [('v14 (both+full)', 'swap_v14.json'),
+        ('probe2dim (probe z2/z7)', 'swap_probe2dim.json'),   # vs v14
+        ('loo-f3 (no state probe)', 'swap_loo_f3.json'),
+        ('critic8 (8-dim, 6@0.5x)', 'swap_critic8.json'),     # vs loo_f3
         ('loo-tokens (AdaLN only)', 'swap_loo_tokens.json'),
         ('loo-adaln (tokens only)', 'swap_loo_adaln.json'),
-        ('loo-f2 (no critic guid)', 'swap_loo_f2.json'),
-        ('loo-f3 (no state probe)', 'swap_loo_f3.json')]
+        ('loo-f2 (no critic guid)', 'swap_loo_f2.json')]
 THR = 0.10  # |z7| threshold to count a chunk as a real forward/reverse command
 
 

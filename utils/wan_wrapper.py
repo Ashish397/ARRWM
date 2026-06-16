@@ -803,7 +803,12 @@ class WanDiffusionWrapper(torch.nn.Module):
                 probe_module, "num_frame_per_block", 0,
             ) or 0)
             expected_frames = probe_n_chunks * probe_fpb
-            if expected_frames > 0 and num_frames == expected_frames:
+            # Dual-view (AOO) teacher path feeds 2x frames (forward+reverse). The
+            # probe runs on the FORWARD half only: StateProbeModule slices the
+            # first n_chunks*chunk_tokens tokens and forward frames are first, and
+            # frame_seqlen above is computed per-frame, so the reshape stays valid.
+            # Accept exact (single-view) OR 2x (dual-view) the probe window.
+            if expected_frames > 0 and num_frames in (expected_frames, 2 * expected_frames):
                 # Memory-vs-grad-coverage trade: backproping through the
                 # taps into the underlying DiT requires keeping the full
                 # forward graph alive between the model forward and the

@@ -884,6 +884,83 @@ class ZarrRideDataset(Dataset):
         lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
         return torch.from_numpy(lat_np.astype(np.float32))
 
+    # ------------------------------------------------------------------
+    # Dual-view (Study 1 / AOO): rear camera as a simultaneous second view
+    # ------------------------------------------------------------------
+    @staticmethod
+    def load_reverse_latent_chunk(
+        reverse_zarr_path: str,
+        rear_indices: "np.ndarray",
+    ) -> torch.Tensor:
+        """Gather rear latents at WALL-CLOCK-aligned rear indices.
+
+        ``rear_indices`` is one rear dataset-latent index per forward latent in
+        the window (from ``<ride>.align.npy``, see utils/build_rear_alignment.py).
+        We fail LOUD on any -1 (unaligned) entry — callers must constrain windows
+        to the aligned span so this never fires; a silent clamp would misalign
+        the two views. One contiguous read [min..max] then index in numpy
+        (rear indices are monotonic with possible VFR repeats).
+        """
+        assert _LATENT_HEAD_DROP == 0, (
+            "dual-view rear gather assumes _LATENT_HEAD_DROP==0 (current default); "
+            "update gather offsets if it changes."
+        )
+        idx = np.asarray(rear_indices).astype(np.int64)
+        if (idx < 0).any():
+            raise ValueError(
+                "reverse gather hit unaligned (-1) frames; window not constrained "
+                "to the aligned span."
+            )
+        g = zarr_lib.open_group(reverse_zarr_path, mode="r")
+        n_rear = int(g["latents"].shape[0])
+        idx = np.clip(idx, 0, n_rear - 1)
+        rmin, rmax = int(idx.min()), int(idx.max())
+        block = g["latents"][rmin : rmax + 1]
+        out = block[idx - rmin]
+        return torch.from_numpy(out.astype(np.float32))
+
+    @staticmethod
+    def load_alignment_map(reverse_root: str, ride_ts: str) -> "np.ndarray":
+        """Load ``<reverse_root>/<ride_ts>.align.npy`` (int32, len = T_forward)."""
+        return np.load(str(Path(reverse_root) / f"{ride_ts}.align.npy"))
+
+    @staticmethod
+    def aligned_span(amap: "np.ndarray") -> Tuple[int, int]:
+        """Largest contiguous run of aligned (>=0) forward latents -> (start, end).
+
+        The map is built from monotonic wall-clock so the aligned region is a
+        single contiguous interval flanked by -1; we still scan for the longest
+        run to be robust. Returns (0, 0) if nothing is aligned.
+        """
+        valid = np.asarray(amap) >= 0
+        best_s = best_e = 0
+        s = None
+        for i, v in enumerate(valid):
+            if v and s is None:
+                s = i
+            elif not v and s is not None:
+                if i - s > best_e - best_s:
+                    best_s, best_e = s, i
+                s = None
+        if s is not None and len(valid) - s > best_e - best_s:
+            best_s, best_e = s, len(valid)
+        return best_s, best_e
+
+
+def flip_reverse_z(z: torch.Tensor, dims: Tuple[int, ...] = (2, 7)) -> torch.Tensor:
+    """Sign-flip the egomotion dims for the rear/reverse view.
+
+    The rear camera under forward translation sees the world recede (z7 throttle
+    flips) and yaw pans oppositely (z2 steering flips). The reverse view reuses
+    the forward z with these dims negated (NOT a re-extraction). Operates on the
+    raw 8-D ss_vae z BEFORE any action_dims slicing, so it's correct regardless
+    of action_dims ordering. Returns a new tensor; input is not mutated.
+    """
+    z = z.clone()
+    for d in dims:
+        z[..., d] = -z[..., d]
+    return z
+
 
 class ZarrSequentialDataset(Dataset):
     """Sequential video latent dataset backed by frodobots zarr files.

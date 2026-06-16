@@ -356,7 +356,7 @@ srun torchrun \
     state_probe_aux_enabled=false \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
-    max_rolls_per_ride=100000 \
+    max_rolls_per_ride=32 \
     num_chunks_roll_forward=2 \
     streaming_max_length=100 \
     streaming_min_new_frame=6 \
@@ -364,9 +364,9 @@ srun torchrun \
     auto_resume=true \
     ftv3_postbuild_enabled=true \
     fn_frontier_pairs=true \
-    streaming_mae_going_threshold=0.45 \
-    streaming_mae_collapse_threshold=0.6 \
-    ftv3_going_min_depth=4 \
+    streaming_mae_going_threshold=0.7 \
+    streaming_mae_collapse_threshold=0.9 \
+    ftv3_going_min_depth=3 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=24 \
     num_workers=0 \

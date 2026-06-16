@@ -1708,24 +1708,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # Step optimizers.
             if train_generator:
                 self._all_reduce_extra_trainable_grads()
-                # Phase-LoRA full-grad anchor cleanup: the anchor gave inactive
-                # rungs a ZERO grad purely so DDP find_unused=False could finish
-                # its reduction during backward (now complete). Drop those zero
-                # grads so each per-rung AdamW SKIPS its inactive rung (grad is
-                # None) instead of applying a spurious momentum-coast step —
-                # restoring the pre-fix behavior where inactive rungs froze.
-                # Active rungs keep their real (non-zero) accumulated grads.
-                if (getattr(self, "generator_ddp", None) is not None
-                        and bool(getattr(
-                            self.config,
-                            "student_phase_lora_enabled", False))
-                        and bool(getattr(
-                            self.config,
-                            "student_phase_lora_full_grad_anchor", False))):
-                    for _n, _p in self.generator_ddp.named_parameters():
-                        if ("lora_" in _n and _p.grad is not None
-                                and not torch.count_nonzero(_p.grad)):
-                            _p.grad = None
                 gen_grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in self.optimizer.param_groups[0]["params"]
                      if p.grad is not None],
@@ -5915,9 +5897,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if all(s[2] is not None for s in segs):
                         ce["_action_modulation"] = torch.cat(
                             [s[2] for s in segs], dim=0)
-                logits = disc(
-                    x_noisy=x, timestep=t, prompt_embeds=pe,
-                    pooled_prompt=pp, conditional_extra=ce)
+                # Micro-batch the disc forward (EVAL-mode only = the gen-side
+                # guidance path) to cut the checkpointed teacher-recompute
+                # peak that OOMs the gen backward. Splitting the row dim and
+                # concatenating logits is per-row independent -> byte-IDENTICAL
+                # logits + gradients (ZERO performance change); only the
+                # per-recompute activation peak drops to one micro-batch.
+                # EVAL-ONLY: a train-mode disc forward must stay a SINGLE
+                # forward (chunking would run spectral_norm's power-iteration
+                # G times and change _sigma -> a real result change). Flag
+                # ladd_gen_guidance_micro_batch_groups (default 1 = single
+                # forward, byte-identical for every existing config).
+                _gmg = int(getattr(
+                    self.config, "ladd_gen_guidance_micro_batch_groups",
+                    getattr(self.model,
+                            "ladd_gen_guidance_micro_batch_groups", 1)))
+                _Gm = max(1, min(_gmg, n_rows))
+                if _Gm <= 1 or disc.training:
+                    logits = disc(
+                        x_noisy=x, timestep=t, prompt_embeds=pe,
+                        pooled_prompt=pp, conditional_extra=ce)
+                else:
+                    _mb = [(g * n_rows) // _Gm for g in range(_Gm + 1)]
+                    _lps = []
+                    for _gi in range(_Gm):
+                        _lo, _hi = _mb[_gi], _mb[_gi + 1]
+                        if _hi <= _lo:
+                            continue
+                        _cep = ({k: v[_lo:_hi] for k, v in ce.items()}
+                                if ce is not None else None)
+                        _lps.append(disc(
+                            x_noisy=x[_lo:_hi], timestep=t[_lo:_hi],
+                            prompt_embeds=pe[_lo:_hi],
+                            pooled_prompt=(pp[_lo:_hi]
+                                           if pp is not None else None),
+                            conditional_extra=_cep))
+                    logits = torch.cat(_lps, dim=0)
                 out, o = [], 0
                 for c in counts:
                     out.append(logits[o:o + c])

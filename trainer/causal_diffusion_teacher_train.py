@@ -338,6 +338,16 @@ class CausalLoRADiffusionTrainer:
 
         self.streaming_chunk_size = int(getattr(config, "streaming_chunk_size", 21))
 
+        # Study 1 / AOO dual-view: model the rear camera as a simultaneous second
+        # view. forward + reverse latent windows are concatenated on the frame
+        # axis; the reverse view reuses the forward z with z2/z7 sign-flipped, and
+        # the critic/state-probe supervise the FORWARD half only (v1). Off by
+        # default -> byte-identical single-view behaviour.
+        self.dual_view = bool(getattr(config, "dual_view", False))
+        self.reverse_root = getattr(config, "reverse_root", None)
+        if self.dual_view and not self.reverse_root:
+            raise ValueError("dual_view: true requires reverse_root in the config")
+
         set_seed(int(getattr(config, "seed", 0)) + self.global_rank)
 
         if self.is_main_process:
@@ -391,6 +401,20 @@ class CausalLoRADiffusionTrainer:
         self.critic_updates_per_step = int(getattr(config, "critic_updates_per_step", 1))
         critic_dims_cfg = getattr(config, "action_critic_dims", None)
         self.action_critic_dims = list(critic_dims_cfg) if critic_dims_cfg is not None else [2, 7]
+        # Which dims are the (stronger) ACTION dims = z2/z7. Kept separate from
+        # action_critic_dims so the critic can OPERATE on all 8 dims while still
+        # weighting z2/z7 above the other 6 (like the state probe's
+        # state_head_action_dim_weight). Defaults preserve the original
+        # behavior for every existing config (action_critic_dims == [2,7]).
+        emph_cfg = getattr(config, "action_critic_emphasis_dims", None)
+        self.action_critic_emphasis_dims = list(emph_cfg) if emph_cfg is not None else [2, 7]
+        # z2/z7 weight in the critic's training MSE (vs 1.0 for the rest).
+        self.action_critic_emphasis_weight = float(
+            getattr(config, "action_critic_action_dim_weight", 2.0))
+        # Guidance weight applied to the NON-action (6 extra) dims, relative to
+        # 1.0 on z2/z7. 0.5 => the 6 dims get a 2x-smaller guidance term.
+        self.action_critic_extra_dim_weight = float(
+            getattr(config, "action_critic_extra_dim_weight", 0.5))
         self.action_critic_z_loss_weight = float(
             getattr(config, "action_critic_z_loss_weight",
                     getattr(config, "action_critic_reward_loss_weight", 0.1)))
@@ -572,6 +596,28 @@ class CausalLoRADiffusionTrainer:
                 )
             train_rides = _expanded
 
+        # Dual-view (AOO): only rides with BOTH a rear zarr and a wall-clock
+        # alignment map under reverse_root can be trained as dual-view. Most weu
+        # rides have no rear footage (raw gone) — drop them so the batcher never
+        # hits a missing rear/map.
+        if self.dual_view:
+            from pathlib import Path as _P
+            import os as _os
+            def _has_rear(r):
+                ts = _P(r["zarr_path"]).stem
+                return (_os.path.exists(_os.path.join(self.reverse_root, f"{ts}.align.npy"))
+                        and _os.path.isdir(_os.path.join(self.reverse_root, f"{ts}.zarr")))
+            _before = len(train_rides)
+            train_rides = [r for r in train_rides if _has_rear(r)]
+            if not train_rides:
+                raise RuntimeError(
+                    f"dual_view: no train rides have a rear encode + align map under "
+                    f"{self.reverse_root}; run utils/build_rear_alignment.py first."
+                )
+            if self.is_main_process:
+                logging.info("dual_view: %d/%d train rides have rear encode+align map",
+                             len(train_rides), _before)
+
         self.dataset = ZarrRideDataset.from_manifest(
             rides_data=train_rides,
             motion_root=self.config.motion_root,
@@ -641,6 +687,14 @@ class CausalLoRADiffusionTrainer:
         if gradient_checkpointing:
             wrapper.model.enable_gradient_checkpointing()
 
+        # Dual-view (AOO): the noisy sequence carries 2x frames (forward+reverse),
+        # so the DiT forward's seq_len budget (asserted in causal_model.forward)
+        # must be sized for 2x. _base_seq_len is hardcoded for 1x frames.
+        if self.dual_view:
+            wrapper.seq_len = int(wrapper.seq_len) * 2
+            wrapper._base_seq_len = int(wrapper._base_seq_len) * 2
+        eff_train_frames = (2 if self.dual_view else 1) * num_train_frames
+
         self.scheduler = wrapper.get_scheduler()
         self.scheduler.set_timesteps(num_inference_steps=num_train_timestep, denoising_strength=1.0)
 
@@ -675,7 +729,7 @@ class CausalLoRADiffusionTrainer:
                 self.action_token_projection.train()
                 wrapper.model.action_tokens_per_frame = 1
                 wrapper.adjust_seq_len_for_action_tokens(
-                    num_frames=num_train_frames, action_per_frame=1,
+                    num_frames=eff_train_frames, action_per_frame=1,
                 )
 
             self.use_action_conditioning = True
@@ -1481,10 +1535,18 @@ class CausalLoRADiffusionTrainer:
         return (flow_loss * weights).mean()
 
     def _weighted_z_mse(self, pred_z, target_z):
-        """Weighted MSE over 8-D z with 2x weight on action-relevant dims."""
+        """Weighted MSE over z with the ACTION dims (z2/z7) up-weighted.
+
+        z2/z7 (action_critic_emphasis_dims) get action_critic_emphasis_weight
+        (default 2.0); all other dims get 1.0. Decoupled from
+        action_critic_dims so an 8-dim critic still keeps z2/z7 stronger than
+        the 6 extra dims. For configs with action_critic_dims == [2,7] this is
+        byte-identical to the old behavior.
+        """
         w = torch.ones(pred_z.shape[-1], device=pred_z.device, dtype=pred_z.dtype)
-        for dim_idx in self.action_critic_dims:
-            w[dim_idx] = 2.0
+        for dim_idx in self.action_critic_emphasis_dims:
+            if 0 <= dim_idx < w.shape[-1]:
+                w[dim_idx] = self.action_critic_emphasis_weight
         return (w * (pred_z - target_z) ** 2).mean()
 
     def _compute_action_critic_losses(self, pred_x0, target_action_z, timesteps, current_step):
@@ -1558,9 +1620,23 @@ class CausalLoRADiffusionTrainer:
             gen_pred_z = critic_mod(pred_x0, chunk_t, chunk_actions)
             gen_pred_z = gen_pred_z[:, :n_chunks]  # [B, n_chunks, 8]
 
-            gen_z2z7 = gen_pred_z[:, :, self.action_critic_dims]  # [B, n_chunks, 2]
-            target_z2z7 = 1.0 * chunk_actions  # [B, n_chunks, 2]  # v13b: removed 1.1x overshoot
-            gen_z_loss = F.mse_loss(gen_z2z7, target_z2z7)
+            # Guidance keeps the z2/z7 (action) term at full strength and adds
+            # the other 6 dims as a separate, action_critic_extra_dim_weight-
+            # scaled term (default 0.5 => 2x smaller). chunk_actions columns are
+            # ordered like action_critic_dims; map dims->positions accordingly.
+            ac = self.action_critic_dims
+            emph = set(self.action_critic_emphasis_dims)
+            emph_pos = [i for i, d in enumerate(ac) if d in emph]
+            extra_pos = [i for i, d in enumerate(ac) if d not in emph]
+            emph_dims = [ac[i] for i in emph_pos]
+            gen_act = gen_pred_z[:, :, emph_dims]          # z2/z7 from the critic
+            tgt_act = chunk_actions[:, :, emph_pos]        # z2/z7 target
+            gen_z_loss = F.mse_loss(gen_act, tgt_act)
+            if extra_pos:
+                extra_dims = [ac[i] for i in extra_pos]
+                gen_ext = gen_pred_z[:, :, extra_dims]
+                tgt_ext = chunk_actions[:, :, extra_pos]
+                gen_z_loss = gen_z_loss + self.action_critic_extra_dim_weight * F.mse_loss(gen_ext, tgt_ext)
             generator_action_loss = guidance_scale * gen_z_loss
             critic_mod.requires_grad_(True)
         else:
@@ -1984,6 +2060,8 @@ class CausalLoRADiffusionTrainer:
             batch_size=micro_batch,
             max_windows_per_ride=max_windows_per_ride,
             context_frames=self.context_frames,
+            dual_view=self.dual_view,
+            reverse_root=self.reverse_root,
         )
 
         total_batch_size = micro_batch * self.gradient_accumulation * self.world_size
@@ -2052,19 +2130,37 @@ class CausalLoRADiffusionTrainer:
                 )
                 prompt_embeds = batcher.load_prompt_embeds_batch(self.device, dtype=self.dtype)
 
-                context_latents = full_latents[:, :num_frames]
-                target_latents = full_latents[:, cf:]
+                # Single-view: nf == num_frames. Dual-view (AOO): full_latents and
+                # z carry [forward_window | reverse_window] on the frame axis; slice
+                # each view to (clean context, noisy target) then re-concat so the
+                # model sees [fwd | rev] with nf = 2*num_frames. flow loss covers
+                # BOTH views; critic/state-probe supervise the FORWARD half only
+                # (z_actions_full_raw = forward z) — reverse egomotion teacher
+                # targets are a known-unreliable failure mode.
+                if self.dual_view:
+                    wt = num_frames + cf
+                    nf = 2 * num_frames
+                    f_lat, r_lat = full_latents[:, :wt], full_latents[:, wt:2 * wt]
+                    context_latents = torch.cat([f_lat[:, :num_frames], r_lat[:, :num_frames]], dim=1)
+                    target_latents = torch.cat([f_lat[:, cf:], r_lat[:, cf:]], dim=1)
+                    f_z, r_z = z_actions_full[:, :wt], z_actions_full[:, wt:2 * wt]
+                    z_raw_noisy = torch.cat([f_z[:, cf:], r_z[:, cf:]], dim=1)
+                    z_raw_clean = torch.cat([f_z[:, :num_frames], r_z[:, :num_frames]], dim=1)
+                    z_actions_full_raw = f_z
+                else:
+                    nf = num_frames
+                    context_latents = full_latents[:, :num_frames]
+                    target_latents = full_latents[:, cf:]
+                    z_raw_noisy = z_actions_full[:, cf:]
+                    z_raw_clean = z_actions_full[:, :num_frames]
+                    z_actions_full_raw = z_actions_full
 
-                z_actions_full_raw = z_actions_full
-                z_sliced = z_actions_full
-                if self.action_dims is not None:
-                    z_sliced = z_actions_full[..., self.action_dims]
-                z_noisy = z_sliced[:, cf:]
-                z_clean = z_sliced[:, :num_frames]
+                z_noisy = z_raw_noisy[..., self.action_dims] if self.action_dims is not None else z_raw_noisy
+                z_clean = z_raw_clean[..., self.action_dims] if self.action_dims is not None else z_raw_clean
 
-                conditional = self._build_conditional(prompt_embeds, z_noisy, z_clean, num_frames)
+                conditional = self._build_conditional(prompt_embeds, z_noisy, z_clean, nf)
 
-                timesteps = self._sample_timesteps(bsz, num_frames)
+                timesteps = self._sample_timesteps(bsz, nf)
 
                 noise = torch.randn_like(target_latents)
                 noisy_latents = self.scheduler.add_noise(
@@ -2076,7 +2172,7 @@ class CausalLoRADiffusionTrainer:
                 ).view_as(target_latents)
 
                 clean_latent_aug, aug_timestep = self._make_teacher_context(
-                    context_latents, noise, bsz, num_frames, current_step=step,
+                    context_latents, noise, bsz, nf, current_step=step,
                 )
 
                 with autocast(dtype=self.autocast_dtype, enabled=self.use_mixed_precision):
@@ -2094,14 +2190,20 @@ class CausalLoRADiffusionTrainer:
                         state_preds = None
                         state_pooled = None
 
-                    flow_loss = self._compute_flow_loss(flow_pred, training_target, timesteps, bsz, num_frames)
+                    # flow loss covers BOTH views (nf frames).
+                    flow_loss = self._compute_flow_loss(flow_pred, training_target, timesteps, bsz, nf)
                     loss = flow_loss
 
                     teacher_z_8d = None
                     if self.action_critic_enabled and self.action_critic is not None:
+                        # Forward-only critic (v1): supervise the forward half of
+                        # pred_x0 / timesteps; z_actions_full_raw is already the
+                        # forward-view z (reverse egomotion teacher is unreliable).
                         target_action_z = z_actions_full_raw[:, cf:][..., self.action_critic_dims]
+                        pred_x0_sup = pred_x0[:, :num_frames] if self.dual_view else pred_x0
+                        ts_sup = timesteps[:, :num_frames] if self.dual_view else timesteps
                         gen_loss, critic_logs, teacher_z_8d = self._compute_action_critic_losses(
-                            pred_x0, target_action_z, timesteps, step,
+                            pred_x0_sup, target_action_z, ts_sup, step,
                         )
                         loss = loss + gen_loss
 

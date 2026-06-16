@@ -1,22 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=af-stat_main
-#SBATCH --nodes=8
+#SBATCH --job-name=smoke-af-roll-wave
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=03:00:00
+#SBATCH --time=01:30:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# ============================ stat_main ===============================
-# Fresh baseline (clean naming; was the v8j3g3 lineage). Authoritative
-# config summary — the GAN is FIXED and now being tuned to drive harder:
-#   GAN:  wavelet OFF (the disc-blinding bug), eq OFF, matching ON
-#         (match_k=4); ALL generated transition pairs supervised
-#         (pairs_per_step=0) via micro_batch_groups=2 (covers every fake).
+# ============================ stat_wave ===============================
+# stat_main + WAVELET in AUGMENT mode. Authoritative config summary:
+#   GAN:  wavelet ON but AUGMENTING, not replacing — ladd_wavelet_hf_augment
+#         adds the HF wave view to the RAW latent (x_noisy + wavelet_hf(x)) so
+#         the disc keeps BOTH modalities (raw structure + HF detail). LL band
+#         stays gated off (drop_ll=true, ll_weight=0.0) at the same rate as
+#         before. This is the opposite of the old failure: replacing the raw
+#         view with HF-only blinded the disc; augmenting preserves it.
+#         eq OFF, matching ON (match_k=4); ALL generated transition pairs
+#         supervised (pairs_per_step=0) via micro_batch_groups=2.
 #   R1:   token-NORMALIZED (ladd_r1_normalize_tokens) so gamma is portable
 #         -> gamma=10 on the normalized scale; fires 1-of-5 per step
 #         (ladd_r1_once_per_step); sigma=0.01.
@@ -229,8 +233,8 @@
 #     texture/cartoon shift those moments missed. Step-unconditioned
 #     (one generic +1 shift). Separate FN backward, FN optimizer only ->
 #     fully DECOUPLED from fake_score.
-#   * fake_alt_rollout2_num_seed_chunks=4 = (cf/npb)-2 = 6-2, so rollout2
-#     is exactly TWO seed chunks shorter than rollout1 -> a +2 drift
+#   * fake_alt_rollout2_num_seed_chunks=5 = (cf/npb)-1 = 6-1, so rollout2
+#     is exactly ONE seed chunk shorter than rollout1 -> a clean +1 drift
 #     step (matches the prebuild's max_length_r2 = max_length + npb
 #     geometry). rollout2 auto-builds because loss_mode=teacher_feat.
 #   * ladd_gt_transition_carn_former=true (1 step): apply the FN ONCE to
@@ -302,6 +306,30 @@ echo "GPUs per node: $SLURM_GPUS_ON_NODE"
 echo "Total GPUs: $(( SLURM_NNODES * SLURM_GPUS_ON_NODE ))"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
+# ---- Pre-stage the af-stat-wave step-200 checkpoint into THIS run's dir so
+# auto_resume starts the ROLLING fine-tune from the unlocked stat-wave teacher.
+# Prefer a PREVIOUS af-roll-wave rolling checkpoint (continue across resubmits);
+# fall back to the latest af-stat-wave (stat_wave) stationary checkpoint.
+# FATAL if neither exists. RUN_NAME must match the override run_name below.
+RUN_NAME=smoke_af_roll_wave_j${SLURM_JOB_ID}
+RUN_DIR=$LOGDIR/$RUN_NAME
+mkdir -p "$RUN_DIR"
+if ! ls "$RUN_DIR"/phase1_step*.pt >/dev/null 2>&1; then
+  PREV_CKPT=$(ls -t $LOGDIR/af_roll_wave_j*/phase1_step*.pt 2>/dev/null | head -1 || true)
+  if [ -n "$PREV_CKPT" ]; then
+    cp "$PREV_CKPT" "$RUN_DIR/"
+    echo "Pre-staged PREVIOUS rolling checkpoint: $PREV_CKPT -> $RUN_DIR/"
+  else
+    WAVE_CKPT=$(ls -t $LOGDIR/stat_wave_j*/phase1_step*.pt 2>/dev/null | head -1 || true)
+    if [ -z "$WAVE_CKPT" ]; then
+      echo "FATAL: no stat_wave checkpoint under $LOGDIR — af-roll-wave needs an af-stat-wave baseline to roll from. Aborting."
+      exit 1
+    fi
+    cp "$WAVE_CKPT" "$RUN_DIR/"
+    echo "Pre-staged af-stat-wave baseline checkpoint: $WAVE_CKPT -> $RUN_DIR/"
+  fi
+fi
+
 srun torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
@@ -314,7 +342,9 @@ srun torchrun \
     log_dir=$LOGDIR \
     wandb_dir=$WANDB_SAVE_DIR \
     wandb_project=longlive-phase-3 \
-    max_steps=200 \
+    max_steps=420 \
+    checkpoint_interval=1000 \
+    empty_cache_interval=5 \
     encoded_root=/projects/u6ex/fbots/frodobots_encoded_weu \
     holdout_zarr_list=configs/holdout_rides.txt \
     holdout_eval_root=/projects/u6ex/fbots/frodobots_encoded_weu_holdout \
@@ -326,7 +356,17 @@ srun torchrun \
     state_probe_aux_enabled=false \
     generator_action_z_guidance_weight=0.0 \
     lora_action_critic_z_guidance_weight=0.0 \
-    max_rolls_per_ride=1 \
+    max_rolls_per_ride=32 \
+    num_chunks_roll_forward=2 \
+    streaming_max_length=100 \
+    streaming_min_new_frame=6 \
+    dmd_42f_rolling_sup_new=true \
+    auto_resume=true \
+    ftv3_postbuild_enabled=true \
+    fn_frontier_pairs=true \
+    streaming_mae_going_threshold=0.7 \
+    streaming_mae_collapse_threshold=0.9 \
+    ftv3_going_min_depth=3 \
     dfake_gen_update_ratio=5 \
     model_kwargs.local_attn_size=24 \
     num_workers=0 \
@@ -371,10 +411,10 @@ srun torchrun \
     dmd_42f_num_chunks=3 \
     dmd_42f_fix_clean_counterpart=false \
     dmd_42f_clean_drift_enabled=true \
-    dmd_42f_clean_drift_start_step=40 \
-    dmd_42f_clean_drift_full_step=160 \
+    dmd_42f_clean_drift_start_step=0 \
+    dmd_42f_clean_drift_full_step=0 \
     dmd_42f_clean_drift_couple_rope=true \
-    dmd_only_first_chunk_per_ride=true \
+    dmd_only_first_chunk_per_ride=false \
     flash_dmd_enabled=true \
     fake_score_ema_weight=0.95 \
     motion_start_threshold=5.0 \
@@ -403,13 +443,13 @@ srun torchrun \
     ladd_r1_once_per_step=true \
     ladd_diff_aug_policy=flip \
     ladd_pairs_per_step=0 \
-    ladd_disc_micro_batch_groups=2 \
-    ladd_gen_guidance_micro_batch_groups=4 \
+    ladd_disc_micro_batch_groups=4 \
     ladd_r1_num_samples=6 \
-    ladd_wavelet_hf_enabled=false \
+    ladd_wavelet_hf_enabled=true \
     ladd_wavelet_hf_drop_ll=true \
     ladd_wavelet_hf_ll_weight=0.0 \
     ladd_wavelet_hf_adapter_init_gain=0.1 \
+    ladd_wavelet_hf_augment=true \
     ladd_gt_vs_fake_enabled=false \
     ladd_gt_vs_fake_weight=0.0 \
     ladd_gt_transition_enabled=true \
@@ -428,7 +468,7 @@ srun torchrun \
     real_teacher_warmup_steps=20 \
     aux_teacher_lora_rank=32 \
     aux_teacher_lora_alpha=64 \
-    aux_teacher_loss_weight=1.0 \
+    aux_teacher_loss_weight=0.0 \
     aux_teacher_start_step=0 \
     aux_teacher_loss_warmup_steps=20 \
     aux_teacher_separate_backward=true \
@@ -446,7 +486,7 @@ srun torchrun \
     forward_noiser_feat_t=0 \
     forward_noiser_sw_n_proj=64 \
     forward_noiser_sw_max_tokens=4096 \
-    fake_alt_rollout2_num_seed_chunks=4 \
+    fake_alt_rollout2_num_seed_chunks=5 \
     forward_noiser_apply_gt_former=true \
     forward_noiser_apply_gt_level=1 \
     forward_noiser_apply_gt_drift_cap=true \
@@ -454,6 +494,6 @@ srun torchrun \
     ladd_adjacent_chunks_weight=0.0 \
     real_score_gradient_checkpointing=true \
     fake_score_gradient_checkpointing=true \
-    run_name=stat_main_j${SLURM_JOB_ID}
+    run_name=smoke_af_roll_wave_j${SLURM_JOB_ID}
 
 echo "Training completed on $(date)"
