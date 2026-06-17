@@ -185,6 +185,12 @@ def _motion_chunk_offset(attrs: dict) -> int:
     (utils/test_zarr_chunks.py:117) shifts motion by
     ``(action_start_sec - 0.8) * fps`` source-video frames; chunk-grain
     rounds to whole motion windows. Result is non-negative (clamped at 0).
+
+    NOTE: this round+clamp convention is the DELIBERATE, visually-verified
+    alignment from commit 06e14c4 ("fixed the timing bug and verified
+    visually") and is what the entire v14 family trains on. Do NOT change it
+    (e.g. to floor / negative offsets) without re-verifying visually and
+    re-baselining every run — the lags and magic numbers here must match v14.
     """
     action_start_sec = float(attrs.get("action_start_sec", 0.0))
     fps = float(attrs.get("fps", 20.0))
