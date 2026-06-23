@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=v14-14b-smoke
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=64
+#SBATCH --gpus-per-node=4
 #SBATCH --time=01:30:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
@@ -48,8 +48,8 @@ echo "Starting 14B teacher SMOKE on $(date)"
 srun --ntasks-per-node=1 bash -c 'nvidia-smi --query-gpu=index,memory.total,memory.free --format=csv,noheader || true'
 
 srun torchrun \
-  --nnodes=1 \
-  --nproc_per_node=1 \
+  --nnodes=$SLURM_NNODES \
+  --nproc_per_node=4 \
   --rdzv_id=$SLURM_JOB_ID \
   --rdzv_backend=c10d \
   --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \

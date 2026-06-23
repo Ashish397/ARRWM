@@ -305,10 +305,25 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item() + self.action_tokens_per_frame
             current_start_frame = current_start // frame_seqlen
-            roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            _apf = int(getattr(self, "action_tokens_per_frame", 0))
+            if _apf > 0 and getattr(self, "cached_rope_action_aware", False):
+                # Per-frame action tokens are INTERLEAVED ([sp.., act, sp.., act, ...]).
+                # Bare causal_rope_apply ropes x[:f*h*w] as a contiguous (f, h, w)
+                # grid, which — given the interleaving — misaligns the spatial tokens
+                # by ~1 token per frame (a per-chunk spatial shift / glitch). Match the
+                # teacher-forced training path exactly: pull the action tokens out, RoPE
+                # only the spatial tokens, leave the action tokens UNROTATED, re-merge.
+                q_sp, q_act = _separate_action_tokens(q, grid_sizes, _apf)
+                k_sp, k_act = _separate_action_tokens(k, grid_sizes, _apf)
+                rq_sp = causal_rope_apply(q_sp, grid_sizes, freqs, start_frame=current_start_frame)
+                rk_sp = causal_rope_apply(k_sp, grid_sizes, freqs, start_frame=current_start_frame)
+                roped_query = _merge_action_tokens(rq_sp, q_act, grid_sizes, _apf).type_as(v)
+                roped_key = _merge_action_tokens(rk_sp, k_act, grid_sizes, _apf).type_as(v)
+            else:
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
@@ -1774,7 +1789,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 tapped.append(x)
 
         if clean_x is not None:
-            x = x[:, x.shape[1] // 2:]
+            # Strip the clean slab, keep only the noisy tail. Use the clean
+            # half's actual token count (``clean_x.shape[1]``) rather than a
+            # 50/50 split: under the asymmetric layout the clean half may have
+            # more frames than the noisy half (e.g. 21 clean + 3 noisy, or a
+            # growing clean context at inference). In the symmetric path
+            # clean_x.shape[1] == x.shape[1] // 2 exactly, so this is identical.
+            x = x[:, clean_x.shape[1]:]
 
         # Extract state token hidden states before stripping extra tokens
         state_hidden = None

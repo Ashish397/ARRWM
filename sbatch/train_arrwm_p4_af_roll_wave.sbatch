@@ -233,10 +233,11 @@
 #     texture/cartoon shift those moments missed. Step-unconditioned
 #     (one generic +1 shift). Separate FN backward, FN optimizer only ->
 #     fully DECOUPLED from fake_score.
-#   * fake_alt_rollout2_num_seed_chunks=5 = (cf/npb)-1 = 6-1, so rollout2
-#     is exactly ONE seed chunk shorter than rollout1 -> a clean +1 drift
-#     step (matches the prebuild's max_length_r2 = max_length + npb
-#     geometry). rollout2 auto-builds because loss_mode=teacher_feat.
+#   * fake_alt_rollout2_num_seed_chunks=4 = (cf/npb)-2 = 6-2, so rollout2
+#     is TWO seed chunks shorter than rollout1 -> +2 AR drift steps
+#     (delta=2 in generate_fn_frontier_pair: r1' @1 AR step, r2' @1+delta=3
+#     AR steps, so the FN learns the +2-step drift). rollout2 auto-builds
+#     because loss_mode=teacher_feat.
 #   * ladd_gt_transition_carn_former=true (1 step): apply the FN ONCE to
 #     the FIRST GT chunk of each transition pair -> real anchor =
 #     [cartoon-shifted GT former -> clean GT latter] = a SELF-CORRECTING
@@ -486,7 +487,7 @@ srun torchrun \
     forward_noiser_feat_t=0 \
     forward_noiser_sw_n_proj=64 \
     forward_noiser_sw_max_tokens=4096 \
-    fake_alt_rollout2_num_seed_chunks=5 \
+    fake_alt_rollout2_num_seed_chunks=4 \
     forward_noiser_apply_gt_former=true \
     forward_noiser_apply_gt_level=1 \
     forward_noiser_apply_gt_drift_cap=true \

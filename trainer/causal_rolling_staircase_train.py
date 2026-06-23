@@ -795,6 +795,46 @@ class RollingStaircaseDMDTrainer:
                     weight_decay=fn_wd,
                 )
 
+        # CARN-cycle: separate optimizer for the REVERSE noiser G (its own
+        # LR, defaults to forward_noiser_lr). Built only when the cycle is
+        # enabled AND G exists => default-off allocates nothing.
+        self.reverse_noiser_optimizer = None
+        self.reverse_noiser_max_grad_norm = float(
+            getattr(cfg, "reverse_noiser_max_grad_norm",
+                    self.forward_noiser_max_grad_norm)
+        )
+        if (
+            bool(getattr(cfg, "forward_noiser_cycle_enabled", False))
+            and getattr(self.model, "reverse_noiser", None) is not None
+        ):
+            rn_lr = float(getattr(cfg, "reverse_noiser_lr",
+                                  getattr(cfg, "forward_noiser_lr", 5e-5)))
+            rn_wd = float(getattr(cfg, "reverse_noiser_weight_decay",
+                                  getattr(cfg, "forward_noiser_weight_decay", 0.0)))
+            rn_betas = tuple(
+                getattr(cfg, "reverse_noiser_betas",
+                        getattr(cfg, "forward_noiser_betas",
+                                getattr(cfg, "fake_betas",
+                                        getattr(cfg, "betas", [0.9, 0.999]))))
+            )
+            rn_eps = float(
+                getattr(cfg, "reverse_noiser_eps",
+                        getattr(cfg, "forward_noiser_eps",
+                                getattr(cfg, "eps", 1e-8)))
+            )
+            rn_params = [
+                p for p in self.model.reverse_noiser.parameters()
+                if p.requires_grad
+            ]
+            if rn_params:
+                self.reverse_noiser_optimizer = torch.optim.AdamW(
+                    rn_params,
+                    lr=rn_lr,
+                    betas=rn_betas,
+                    eps=rn_eps,
+                    weight_decay=rn_wd,
+                )
+
         # ------------------------------------------------------------------
         # Generator EMA (mirrors Causal-Forcing's ``EMA_FSDP`` API but uses
         # a CPU fp32 shadow over the unwrapped DiT's trainable params, since
@@ -1604,6 +1644,15 @@ class RollingStaircaseDMDTrainer:
             if getattr(self, "forward_noiser_optimizer", None) is not None:
                 state["forward_noiser_optimizer"] = (
                     self.forward_noiser_optimizer.state_dict()
+                )
+        # CARN-cycle: persist the reverse noiser G + its optimizer.
+        _rn = getattr(self.model, "reverse_noiser", None)
+        if _rn is not None:
+            _rn_mod = _rn.module if hasattr(_rn, "module") else _rn
+            state["reverse_noiser"] = _rn_mod.state_dict()
+            if getattr(self, "reverse_noiser_optimizer", None) is not None:
+                state["reverse_noiser_optimizer"] = (
+                    self.reverse_noiser_optimizer.state_dict()
                 )
         if self.generator_ema is not None:
             state["generator_ema"] = self.generator_ema.state_dict()

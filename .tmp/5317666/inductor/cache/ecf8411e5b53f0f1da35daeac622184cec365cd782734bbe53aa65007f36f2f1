@@ -1,0 +1,27 @@
+{
+    "system": {
+        "device": {
+            "name": "NVIDIA GH200 120GB"
+        },
+        "version": {
+            "triton": "3.6.00355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040-c8b82f70c83ad10bc0190fa67864348b895f733d67658a3becaf13746198f778-2a063bb7909777d3659945244277e900d9f7cfc35de9a758578469ee4b90fce9-23d635e690d670bf61798e1259674b78c0ed5ba222ab6a455f329f27a758fc2d-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-62556f905349ceed6286f9926f72ced9c5e990807e0791873945e93ca8e287d2-8f6569a35754508b27d2a70e1034d33ee19f0ef9f24a9eaa5e4ff999cddf2044-c5d3403b88b5bb728f8ac78c55163198e418430f126c842892c68cb4b6baaa78-25cb0bee9547488335de2d495af738298ba6d4c20f1d37941dc17751c57a211e-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-eea55698bab00c726b3d1d495b390b72a63aaa8d167781a65ea5212d394d76f6-4ad4b4440aa4a5ee15ac2382ae78a7aa8029986c22ec2acbd072a91810e85e94-6636eff143de784be2ec0b85f1b3e6209008e0b62c563963f0bfb4c18558e59a-9394c60071ea0bbca6c290c44a5a371b8b4a02683d529debc3be04401d93e198-5d15c5bebef8d7aa51b21fd187e5faa95eba4a213254355bc69e0648013599f7-30106ed84518c6ca7aca08e2c0ee188755f512cc0cb2d7da8914cc48c1ad6dcc-adb54e71d0ffc3bdac437fbc97929769fbbe4ebd03e6361c6357f2a24f7c5954-27b2a5d1e8db008bacefe6019f63922bbd65926de90bb1b527ee597477d2f365-a610dc5c215589aab7a784e1c07acef3e16d53ef00f08de793899964956f4e2a-18572e33e474a820799036f2b2f8c3e54d8a526386356716cccf2bf32a832376-2cdca74c4297804dcf499a7e9d4315ab87edfe2d72f536a8fdc02f28a3e7dacd-b53abe93473eb37d88bc378692065c9a8b1bf54b6417cb1911a13d10918c6d20-f60c2bb2d8eebe1c191f4b8b819844414dd1bce243645635a094f9f92665a58e-08abee21ce6230a873ed0831f70f9570b7ce39969dbf9b2f28ae1a1992ee1cc7-f44a43511b97420e82438746d1730db6aea312619032077687fb36ffe23727ba-be3429f6d069a22ddc2ca048d80e1616df85de51a4b0e1e20e3054264a58f1f8-1a2a7b1706fe99659dd86b29d6397d603d7d0cfef4f827fe902a494728ccddc1-5305890c3b133def44e2f3d3405e0fb1fd6ce78d0a28b2127670a195bbe11c66",
+            "cuda": "12.8"
+        },
+        "hash": "ecf8411e5b53f0f1da35daeac622184cec365cd782734bbe53aa65007f36f2f1"
+    },
+    "cache": {
+        "flex_attention": {
+            "[('cuda', 'torch.bfloat16', 1, 12, 37504, 128, 57606144, 128, 1536, 1, 0), ('cuda', 'torch.bfloat16', 1, 12, 37504, 128, 57606144, 128, 1536, 1, 0), ('cuda', 'torch.bfloat16', 1, 12, 37504, 128, 57606144, 128, 1536, 1, 0), ('cuda', 'torch.float32', 1, 12, 37504, 450048, 37504, 1, 0), ('cuda', 'torch.float32', 1, 12, 37504, 450048, 37504, 1, 0), ('cuda', 'torch.int32', 1, 1, 293, 293, 293, 1, 0), ('cuda', 'torch.int32', 1, 1, 293, 293, 85849, 85849, 293, 1, 0), ('cuda', 'torch.int32', 1, 1, 293, 293, 293, 1, 0), ('cuda', 'torch.int32', 1, 1, 293, 293, 85849, 85849, 293, 1, 0), ('cuda', 'torch.int64', 37504, 1, 0), ('cuda', 'torch.int64', 37504, 1, 0), ('cuda', 'torch.int64', 37504, 1, 0), ('cuda', 'torch.int64', 37504, 1, 0), ('cuda', 'torch.int64', 37504, 1, 0)]": {
+                "highest": {
+                    "triton_flex_attention-cnnz7kyxl3jl3qvx3aeampvjs3bu5dkpcrz6awuen55c3duzqnj4": 219.4798126220703,
+                    "triton_flex_attention-cymbtapyuz6kulqb3s4tyk6o6cx3uxdwkftwwmngltgtdhpipnql": 205.03173828125,
+                    "triton_flex_attention-caxbo262c5ou5qc6qkgj6hkio37bbmoo2pqgiygzzifmtrt2jfug": 61.55001449584961,
+                    "triton_flex_attention-cyyocgk2tt2xcedroh47tl3rmftkek5kqtuy26m3t7m2wgtzapk6": 72.81689453125,
+                    "triton_flex_attention-cditt7j2qa5joowvsy7537xp2eqrzqqanbimeqhtfsulncm2kr5x": 64.39167785644531,
+                    "triton_flex_attention-cpzeuvlcf32hqb3juiodyefaszp5ivxrifqglyemn7tkbo7f4bh4": 58.3480339050293,
+                    "triton_flex_attention-cmepj7pyxcitz6alxl3nxu5pnp7tggr7bjwy5xr5fphjurok3scx": 60.0109748840332
+                }
+            }
+        }
+    }
+}

@@ -1044,8 +1044,23 @@ def load_per_rank_ride_ar(
         device="cpu",
         ss_vae_device="cpu",
     )
+    # ``encode_z_actions_window`` aligns motion for the WHOLE ``n_latent_frames``
+    # it is handed and raises if that exceeds the motion-file coverage
+    # (head-drop + chunk_offset). The manifest path is pre-capped via
+    # ``_index_single_zarr``; the disk-fallback path (manifest_path="") returns
+    # the UNcapped full ride length, so cap it here to the motion-capped length.
+    # We only ever slice ``[latent_start_offset : latent_start_offset+total_frames)``
+    # (= ``need``), which is far below the cap, so this never starves the window.
+    from utils.zarr_dataset import _motion_capped_latents
+    _mcap = _motion_capped_latents(ride_dict["attrs"], Path(motion_root))
+    n_lat_enc = min(n_lat, _mcap) if _mcap > 0 else n_lat
+    if n_lat_enc < need:
+        raise RuntimeError(
+            f"Motion-capped ride length {n_lat_enc} (cap={_mcap}) < required "
+            f"window {need} for {zarr_basename}; cannot encode z-actions."
+        )
     z_win = z_ds.encode_z_actions_window(
-        zpath, n_lat, latent_start_offset, latent_start_offset + total_frames,
+        zpath, n_lat_enc, latent_start_offset, latent_start_offset + total_frames,
     )
     noisy_fa_full = z_win[:total_frames, action_dims].unsqueeze(0).float()
 

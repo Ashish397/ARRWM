@@ -144,18 +144,48 @@ class WanVAEWrapper(torch.nn.Module):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
-    def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+    def decode_to_pixel(
+        self,
+        latent: torch.Tensor,
+        use_cache: bool = False,
+        seed_first: bool = False,
+    ) -> torch.Tensor:
+        """Decode latents ``[B, F_lat, C, H, W]`` -> pixels ``[B, F_pix, 3, H, W]``.
+
+        ``use_cache`` routes to ``cached_decode``, which does NOT clear the WAN
+        VAE temporal-conv ``feat_map`` between calls — correct ONLY for genuine
+        sequential continuation of the SAME video (the cache carries the real
+        left-context). For an INDEPENDENT clip it is a bug: the decoder's first
+        frame is convolved with whatever the previous (unrelated) decode left in
+        the cache, so a ghost of another frame bleeds into frame 0.
+
+        ``seed_first`` is the correct mode for any standalone render/grad decode.
+        It SELF-SEEDS: prepend a replica of the clip's OWN first latent frame as
+        a dummy, decode through the cache-clearing ``decode`` (so no stale
+        cross-clip context survives), and slice the dummy's single special-first
+        pixel frame off the front. The dummy is consumed as the WAN VAE
+        "special first" (1 pixel frame) and seeds the temporal cache so the real
+        first frame has a FAITHFUL (self) predecessor — no cross-clip ghost AND
+        no plain-decode init-frame brightness anomaly. ``seed_first`` overrides
+        ``use_cache``.
+        """
+        if seed_first:
+            # Prepend a replica of the clip's own first latent frame (frame dim).
+            latent = torch.cat([latent[:, 0:1], latent], dim=1)
         zs = latent.permute(0, 2, 1, 3, 4)
-        if use_cache:
+        if use_cache and not seed_first:
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
 
         device, dtype = latent.device, latent.dtype
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
 
-        if use_cache:
+        if use_cache and not seed_first:
             decode_function = self.model.cached_decode
         else:
+            # ``decode`` brackets the loop with ``clear_cache()`` (start + end),
+            # so each clip is isolated; under ``seed_first`` the prepended dummy
+            # seeds the cache within this single call.
             decode_function = self.model.decode
 
         output = []
@@ -165,6 +195,9 @@ class WanVAEWrapper(torch.nn.Module):
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
+        if seed_first:
+            # Drop the dummy's single special-first pixel frame.
+            output = output[:, 1:]
         return output
 
 

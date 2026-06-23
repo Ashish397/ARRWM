@@ -147,6 +147,28 @@ $-$ State probe        & 0.910 & 0.852 \\
 \label{tab:ablation}
 \end{table}
 
+\subsection{Dimensionality of the Action Representation}
+Both grounding heads are trained against the full $8$-D realized-motion latent, with the two commanded axes (steering $z_2$, throttle $z_7$) up-weighted and the remaining six dimensions encoding scene motion that is not directly commanded. We test whether those six dimensions contribute to control. \emph{Probe-2D} reduces the state probe's target to $z_2/z_7$ only (compare to the full model); \emph{Critic-8D} instead \emph{adds} the six dimensions to the action critic---which otherwise grounds only $z_2/z_7$---at half the guidance weight of the commanded axes (compare to ``$-$ State probe'', whose critic already uses $z_2/z_7$ only). These two runs were stopped once controllability had saturated and are therefore trained for fewer steps than the leave-one-out models (Table~\ref{tab:dims}, ``Steps''); the comparison is indicative rather than budget-matched.
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+Model & Steps & $z_2$ & $z_7$ & PSNR$\uparrow$ & LPIPS$\downarrow$ & FVD$\downarrow$ \\
+\midrule
+Full ($8$-D probe)            & 6600 & \textbf{0.945} & 0.751 & 19.09 & 0.260 & 29.9 \\
+\quad Probe-2D ($z_2/z_7$)    & 2150 & 0.870 & 0.787 & 19.18 & 0.236 & 29.4 \\
+$-$ State probe ($z_2/z_7$ critic) & 3700 & 0.910 & 0.852 & 19.49 & 0.237 & 25.9 \\
+\quad Critic-8D ($+6$\,@\,$0.5$)  & 2150 & 0.862 & 0.836 & 19.45 & 0.223 & 26.3 \\
+\bottomrule
+\end{tabular}
+\caption{Dimensionality of the grounding heads. \emph{Probe-2D} removes the six non-commanded latent dimensions from the state probe (vs.\ Full); \emph{Critic-8D} adds them to the action critic at half guidance weight (vs.\ ``$-$ State probe'', a critic on $z_2/z_7$ only). $z_2/z_7$ are frozen-judge correlations; PSNR/LPIPS/FVD as in Table~\ref{tab:quality}. ``Steps'' is the training budget: these two runs are shorter than the $4{,}000$-step leave-one-out models, so the comparison is indicative.}
+\label{tab:dims}
+\end{table}
+
+\noindent Neither edit helps control. Dropping the six probe dimensions costs a little steering ($0.945\!\to\!0.870$) while marginally improving fidelity (LPIPS $0.260\!\to\!0.236$, FVD $29.9\!\to\!29.4$); \emph{adding} the six dimensions to the critic does not improve grounding either---steering is no higher than the $z_2/z_7$ critic ($0.910\!\to\!0.862$) and visual quality is essentially unchanged. In both directions the six non-commanded motion dimensions appear largely redundant for control, consistent with grounding being carried by the commanded axes---though the shorter, unmatched training budget of these two runs (Table~\ref{tab:dims}, ``Steps'') warrants a budget-matched confirmation.
+
 \subsection{Limitation: Reverse Egomotion}
 Stratifying the throttle axis by command direction reveals a systematic failure. All models render \emph{forward} motion with the correct sign on $100\%$ of forward chunks, but \emph{reverse} commands are rendered poorly: the full model produces the correct (backward) sign on only $46.7\%$ of reverse chunks and strongly under-shoots the commanded magnitude. The model has a forward-motion prior it does not readily override. This also explains an apparent per-scene anomaly: the held-out Madrid ride is reverse-dominated, and its low controllability is the reverse-rendering failure rather than a scene- or alignment-specific artifact.
 

@@ -166,6 +166,7 @@ class PairedTrajectoryDataset(Dataset):
         max_pair: Optional[int] = None,
         require_cf: bool = True,
         allow_cf_fallback: bool = False,
+        clean_only: bool = False,
         max_consecutive_same_fail: int = 5,
         max_consecutive_skips_total: int = 64,
     ) -> None:
@@ -174,6 +175,11 @@ class PairedTrajectoryDataset(Dataset):
         self.cf_root = Path(cf_root)
         self.caption_root = Path(caption_root)
         self.allow_cf_fallback = bool(allow_cf_fallback)
+        # clean_only: the LMDB has NO counterfactual files (CF dropped). The
+        # CF "branch" is then a duplicate of the clean branch (z_noisy_cf =
+        # z_noisy, trajectory_cf = trajectory_clean) — set lambda_cf=0 so it
+        # contributes nothing to the loss. No cf_root dir is needed.
+        self.clean_only = bool(clean_only)
         # Soft-fail bookkeeping: per-worker counters for consecutive
         # skip-to-next-sample events. On any successful load the counters
         # reset. A systematic data issue (same check tripping N times in a
@@ -191,12 +197,15 @@ class PairedTrajectoryDataset(Dataset):
         self._consec_fails_total: int = 0
         if not self.clean_root.is_dir():
             raise FileNotFoundError(f"clean_root not found: {self.clean_root}")
-        if not self.cf_root.is_dir():
+        if not self.clean_only and not self.cf_root.is_dir():
             raise FileNotFoundError(f"cf_root not found: {self.cf_root}")
 
         clean_files = sorted(p.name for p in self.clean_root.glob("*.pt"))
         paired: List[str] = []
         for name in clean_files:
+            if self.clean_only:
+                paired.append(name)
+                continue
             cf_path = self.cf_root / name
             if cf_path.exists():
                 paired.append(name)
@@ -357,11 +366,14 @@ class PairedTrajectoryDataset(Dataset):
             raise _SkipSample(
                 "clean_pt_load", f"torch.load failed for clean/{fname}: {e!r}"
             ) from e
-        try:
+        if self.clean_only:
+            cf_pt = clean_pt   # no CF file: the cf branch duplicates clean
+        else:
+          try:
             cf_pt = torch.load(
                 self.cf_root / fname, map_location="cpu", weights_only=False
             )
-        except Exception as e:
+          except Exception as e:
             raise _SkipSample(
                 "cf_pt_load", f"torch.load failed for cf/{fname}: {e!r}"
             ) from e
@@ -411,7 +423,7 @@ class PairedTrajectoryDataset(Dataset):
         # clean branch, killing CF supervision without any error.
         if "z_noisy_cf" in cf_pt:
             z_noisy_cf = cf_pt["z_noisy_cf"].to(torch.float32)
-        elif self.allow_cf_fallback:
+        elif self.allow_cf_fallback or self.clean_only:
             log.warning(
                 "CF pt %s missing 'z_noisy_cf'; using clean z_noisy "
                 "(allow_cf_fallback=True).", fname,
@@ -454,8 +466,11 @@ class PairedTrajectoryDataset(Dataset):
 
         # The whole point of the CF branch is to edit the action signal.
         # If ``z_noisy_cf`` ever equals ``z_noisy`` exactly the CF pass
-        # degenerates into a duplicate clean pass.
-        if torch.equal(z_noisy_cf, z_noisy):
+        # degenerates into a duplicate clean pass. Under clean_only this is
+        # EXPECTED (cf branch IS a duplicate of clean, lambda_cf=0), so skip
+        # the guard — otherwise it fires for every sample and the dataset
+        # loads zero windows.
+        if not self.clean_only and torch.equal(z_noisy_cf, z_noisy):
             raise _SkipSample(
                 "z_noisy_cf_equals_z_noisy",
                 f"z_noisy_cf == z_noisy for {fname}: CF pt has an "

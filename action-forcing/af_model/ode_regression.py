@@ -378,6 +378,26 @@ class ODERegression(nn.Module):
             [round(float(x), 2) for x in self.denoising_step_list.tolist()],
         )
 
+        # CD rung list = ALL saved snapshot rungs (the dual-CD steps between
+        # ADJACENT saved rungs, independent of the 4 ODE training rungs). 7
+        # rungs: SNAPSHOT_STEPS timesteps ~= [1000, 893, 625, 500, 312.5,
+        # 178.6, 0]. The student-CD/teacher-CD sample an adjacent (n, n+1)
+        # pair from this list so they cover the full denoising path at the
+        # finest saved granularity.
+        cd_list = resolve_denoising_step_list(
+            usable_stored_indices=list(range(len(SNAPSHOT_STEPS))),
+            num_inference_steps=int(getattr(config, "eval_inference_steps", 48)),
+            shift=float(model_kwargs.get("timestep_shift", 5.0)),
+        )
+        self.register_buffer(
+            "cd_rung_list", cd_list.to(torch.float32).to(device), persistent=False,
+        )
+        log.info(
+            "ODERegression[CD]: cd_rung_list (all %d saved rungs) timesteps=%s",
+            len(SNAPSHOT_STEPS),
+            [round(float(x), 2) for x in self.cd_rung_list.tolist()],
+        )
+
         # ------------------------------------------------------------------
         # 7) Frozen motion pipeline (VAE + co-tracker + ss_vae)
         # ------------------------------------------------------------------
@@ -392,6 +412,73 @@ class ODERegression(nn.Module):
         ckpt_path = getattr(config, "generator_ckpt", None)
         if ckpt_path:
             self.load_teacher_checkpoint(str(ckpt_path))
+
+        # ------------------------------------------------------------------
+        # 9) Online CD losses (ODE-F dual-CD). Two consistency regularizers
+        #    riding on the GT-anchored ODE loss (collapse-safe):
+        #      * teacher-CD: a FROZEN-14d teacher takes the Euler step
+        #        x_n -> x_{n+1} on the 4-step schedule; the live student's
+        #        x0 at x_n must match the EMA-student's x0 at x_{n+1}.
+        #      * student-CD: same, but the STUDENT's own x0 drives the step
+        #        (self-consistency: "denoise from rung n == rung n+1").
+        #    The frozen-14d teacher == a deepcopy of the student taken at
+        #    the FIRST CD call (the student is initialized AS merged-14d by
+        #    load_teacher_checkpoint above, before any optimizer step). The
+        #    EMA-student is a second deepcopy, EMA-updated in place. Both
+        #    are held OFF the nn.Module registry (object.__setattr__) so
+        #    they never enter the optimizer / DDP wrap / checkpoint. Default
+        #    OFF -> byte-identical. See [[project_ode_distill_dual_cd]].
+        self.cd_teacher_loss_enabled = bool(
+            getattr(config, "cd_teacher_loss_enabled", False))
+        self.cd_student_loss_enabled = bool(
+            getattr(config, "cd_student_loss_enabled", False))
+        self.cd_teacher_loss_weight = float(
+            getattr(config, "cd_teacher_loss_weight", 0.5))
+        self.cd_student_loss_weight = float(
+            getattr(config, "cd_student_loss_weight", 0.25))
+        self.cd_loss_warmup_steps = int(
+            getattr(config, "cd_loss_warmup_steps", 100))
+        self.cd_ema_decay = float(getattr(config, "cd_ema_decay", 0.99))
+        if not (0.0 <= self.cd_ema_decay <= 1.0):
+            raise ValueError(
+                f"cd_ema_decay must be in [0, 1]; got {self.cd_ema_decay}")
+        # When False, the CD *target* readout uses the LIVE student (stop-grad
+        # via the no_grad block in _compute_cd_losses) instead of an EMA copy.
+        # The stop-grad is what prevents collapse; the EMA is only an extra
+        # smoother. For teacher-CD (target input anchored by the frozen-14d
+        # teacher's step + the ODE regression anchor) the EMA is largely
+        # redundant, so this saves a resident DiT copy (~5GB) + its update.
+        self.cd_ema_enabled = bool(getattr(config, "cd_ema_enabled", True))
+        # Off-registry placeholders (object.__setattr__ keeps them out of
+        # ._modules so .parameters()/.state_dict()/DDP never see them).
+        object.__setattr__(self, "_cd_teacher", None)
+        object.__setattr__(self, "_cd_ema", None)
+        # Capture the FROZEN-14d teacher NOW — right after load_teacher_checkpoint
+        # (above), while the generator == merged-14d and on device — NOT lazily
+        # at the first CD step. A lazy capture would, on a --requeue/resume,
+        # deepcopy the RESUMED (drifted) weights instead of 14d, silently
+        # corrupting the teacher-CD anchor (it is supposed to be a FIXED 14d
+        # reference). The trainer's _try_resume overwrites the LIVE generator
+        # but never this separate frozen copy, so it stays 14d across restarts.
+        # (EMA-student stays lazy: it is meant to track the live student, so
+        # seeding it from the resumed student on restart is acceptable.)
+        if self.cd_teacher_loss_enabled:
+            import copy as _copy
+            # self.generator is still the BARE wrapper here (the trainer wraps
+            # it in DDP only after model construction), so deepcopy it directly.
+            _tea = _copy.deepcopy(self.generator)
+            _tea.requires_grad_(False)
+            _tea.eval()
+            object.__setattr__(self, "_cd_teacher", _tea)
+        if (self.cd_teacher_loss_enabled or self.cd_student_loss_enabled):
+            logging.info(
+                "[ODE-F] dual-CD ENABLED: teacher=%s(w=%.3f) student=%s(w=%.3f) "
+                "warmup=%d ema_decay=%.4f (frozen-14d teacher + EMA-student, "
+                "resident, off-registry).",
+                self.cd_teacher_loss_enabled, self.cd_teacher_loss_weight,
+                self.cd_student_loss_enabled, self.cd_student_loss_weight,
+                self.cd_loss_warmup_steps, self.cd_ema_decay,
+            )
 
     # ------------------------------------------------------------------
     # Checkpoint loading
@@ -483,15 +570,43 @@ class ODERegression(nn.Module):
                 log.info("Loaded state_probe")
 
         if self.action_critic is not None and "action_critic" in ck:
+            # Shape-filtered load: the teacher checkpoint may carry a critic
+            # whose ``action_embed`` input width differs from ours (e.g. the
+            # v14d ``critic8`` has action_dim=8 because it conditions on the
+            # full 8-dim action-z, whereas the ODE student commands only the
+            # 2-dim [z2,z7] stream -> action_dim=2). ``load_state_dict`` with
+            # strict=False still *raises* on a size mismatch, so we drop the
+            # shape-incompatible tensors here. Everything action-dim-INDEPENDENT
+            # -- the visual trunk (stem/down1/down2/trunk), time_embed and
+            # z_head -- is identical shape and warm-starts from the teacher;
+            # only ``action_embed.0.weight`` (the action input projection)
+            # re-initialises fresh and is learned during distillation.
+            ck_critic = ck["action_critic"]
+            own = self.action_critic.state_dict()
+            filtered = {
+                k: v for k, v in ck_critic.items()
+                if k in own and own[k].shape == v.shape
+            }
+            skipped = [
+                k for k, v in ck_critic.items()
+                if not (k in own and own[k].shape == v.shape)
+            ]
             missing, unexpected = self.action_critic.load_state_dict(
-                ck["action_critic"], strict=False,
+                filtered, strict=False,
             )
+            if skipped:
+                log.warning(
+                    "action_critic: skipped %d shape-mismatched key(s) %s "
+                    "(re-init fresh -- expected when teacher critic action_dim "
+                    "!= student's); loaded %d/%d tensors.",
+                    len(skipped), skipped[:4], len(filtered), len(ck_critic),
+                )
             if missing or unexpected:
                 log.warning(
                     "action_critic partial load: %d missing, %d unexpected",
                     len(missing), len(unexpected),
                 )
-            else:
+            if not skipped and not missing and not unexpected:
                 log.info("Loaded action_critic")
 
         self.loaded_from_step = int(ck.get("step", -1))
@@ -1049,6 +1164,180 @@ class ODERegression(nn.Module):
     # Main training entrypoint (packed clean+CF forward).
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Online dual-CD losses (ODE-F): frozen-14d teacher-CD + student self-CD
+    # ------------------------------------------------------------------
+    def _cd_unwrapped_generator(self):
+        """The bare WanDiffusionWrapper under ``self.generator`` (which the
+        ODE trainer replaces with a DDP wrapper). CD forwards MUST use the
+        bare module: a second DDP forward would re-arm the reducer and trip
+        'marked ready only once'. Grads from the bare student-CD forward
+        still land on the shared leaf params and are all-reduced by the
+        reducer armed during the MAIN DDP forward (single combined
+        backward)."""
+        g = self.generator
+        return g.module if hasattr(g, "module") else g
+
+    def _cd_current_weight(self, step: int) -> float:
+        """Linear 0->1 warmup ramp over ``cd_loss_warmup_steps`` (then 1.0).
+        Holds the consistency regularizers sub-ODE until the student makes
+        meaningful x0 predictions."""
+        w = int(self.cd_loss_warmup_steps)
+        if w <= 0:
+            return 1.0
+        return min(1.0, max(0, int(step)) / float(w))
+
+    def _cd_sample_rung_pair(self):
+        """Adjacent rung pair (t_n > t_next) from ``cd_rung_list`` — ALL saved
+        snapshot rungs (high->low), index broadcast from rank 0 for DDP
+        lockstep. Returns (t_n, t_next) float timesteps, or None if <2 rungs."""
+        import torch.distributed as dist
+        ds = self.cd_rung_list
+        K = int(ds.shape[0])
+        if K < 2:
+            return None
+        idx = torch.empty(1, dtype=torch.long, device=self.device)
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            idx[0] = int(torch.randint(0, K - 1, (1,), device=self.device).item())
+        if dist.is_initialized():
+            dist.broadcast(idx, src=0)
+        i = int(idx[0].item())
+        return float(ds[i].item()), float(ds[i + 1].item())
+
+    def _cd_partial_denoise(self, x_ts, x0_hat, t_s_tensor, t_e_tensor):
+        """One Euler step from level ``t_s`` to ``t_e`` using the model's
+        clean-space x0 prediction, in the FlowMatchScheduler's sigma space
+        (respects timestep_shift). Mirrors the DMD ``_flow_partial_denoise``.
+        ``t_*_tensor``: [B, F] timestep values."""
+        sched = self.scheduler
+        sched.sigmas = sched.sigmas.to(x_ts.device)
+        sched.timesteps = sched.timesteps.to(x_ts.device)
+        B, F = t_s_tensor.shape
+        flat_s = t_s_tensor.flatten().float()
+        flat_e = t_e_tensor.flatten().float()
+        id_s = torch.argmin((sched.timesteps.unsqueeze(0) - flat_s.unsqueeze(1)).abs(), dim=1)
+        id_e = torch.argmin((sched.timesteps.unsqueeze(0) - flat_e.unsqueeze(1)).abs(), dim=1)
+        sigma_s = sched.sigmas[id_s].float().view(B, F, 1, 1, 1)
+        sigma_e = sched.sigmas[id_e].float().view(B, F, 1, 1, 1)
+        ratio = sigma_e / sigma_s.clamp(min=1e-8)
+        coef_x0 = (1.0 - sigma_e) - ratio * (1.0 - sigma_s)
+        return ratio.to(x_ts.dtype) * x_ts + coef_x0.to(x_ts.dtype) * x0_hat
+
+    @torch.no_grad()
+    def _update_cd_ema_and_teacher(self) -> None:
+        """Lazily create the frozen-14d teacher + EMA-student (first call),
+        then EMA-update the EMA-student toward the live generator. Both are
+        deepcopies of the bare (merged-14d at first call) generator, frozen,
+        eval, and held off the module registry."""
+        # No EMA target requested: the frozen teacher is already captured in
+        # __init__, and the CD target uses the live student (stop-grad) — so
+        # there is nothing to create/update here. Skip (saves a resident DiT).
+        if not self.cd_ema_enabled:
+            return
+        import copy as _copy
+        base = self._cd_unwrapped_generator()
+        if self._cd_ema is None:
+            # Teacher is normally captured in __init__ (frozen-14d, resume-safe);
+            # only fall back to a lazy capture here if it is somehow still None.
+            if self.cd_teacher_loss_enabled and self._cd_teacher is None:
+                tea = _copy.deepcopy(base)
+                tea.requires_grad_(False)
+                tea.eval()
+                object.__setattr__(self, "_cd_teacher", tea)
+            ema = _copy.deepcopy(base)
+            ema.requires_grad_(False)
+            ema.eval()
+            object.__setattr__(self, "_cd_ema", ema)
+            return  # first call: EMA == live; nothing to blend yet
+        d = self.cd_ema_decay
+        live = dict(base.named_parameters())
+        for n, p_ema in self._cd_ema.named_parameters():
+            p_live = live.get(n, None)
+            if p_live is not None and p_live.shape == p_ema.shape:
+                p_ema.mul_(d).add_(p_live.detach().to(p_ema.dtype), alpha=1.0 - d)
+        live_buf = dict(base.named_buffers())
+        for n, b_ema in self._cd_ema.named_buffers():
+            b_live = live_buf.get(n, None)
+            if b_live is not None and b_live.shape == b_ema.shape:
+                b_ema.copy_(b_live)
+
+    def _cd_forward_x0(self, module, x_t, t_tensor, conditional, clean_x, aug_t):
+        """Forward a CD module (bare student / frozen teacher / EMA) and
+        return its x0 prediction (element [1] of the 4-tuple)."""
+        out = module(
+            noisy_image_or_video=x_t,
+            conditional_dict=conditional,
+            timestep=t_tensor,
+            clean_x=clean_x,
+            aug_t=aug_t,
+        )
+        return out[1] if isinstance(out, tuple) else out
+
+    def _compute_cd_losses(self, x0_cd, conditional, clean_x, aug_t):
+        """Teacher-CD + student-CD on one branch.
+
+        x0_cd: [B, F, C, H, W] clean target (teacher final x0). Both CDs:
+          x_n = noise(x0_cd, t_n); p_n = student(x_n, t_n)            [grad]
+          teacher-CD: x_{n+1} = teacher-step(x_n); target EMA(x_{n+1}) [no_grad]
+          student-CD: x_{n+1} = student-step(x_n); target EMA(x_{n+1}) [no_grad]
+          loss = MSE(p_n, target)
+        Returns (cd_teacher, cd_student, logs); zeros for disabled halves.
+        """
+        device, dtype = self.device, self.dtype
+        zero = torch.zeros((), device=device, dtype=dtype)
+        pair = self._cd_sample_rung_pair()
+        if pair is None:
+            return zero, zero, {"cd_skipped": 1.0}
+        t_n, t_next = pair
+        B, F_ = x0_cd.shape[:2]
+        x0_cd = x0_cd.to(dtype=dtype, device=device).detach()
+        eps = torch.randn_like(x0_cd)
+        # Use the EXACT fp32 rung timesteps (e.g. 312.5, 178.6) — NOT int64.
+        # The main ODE path feeds float ``denoising_step_list`` values to the
+        # DiT + scheduler.add_noise; rounding to int here (312.5->312) would
+        # make the CD student see a different timestep than it is trained on at
+        # the same rung, biasing the consistency target. add_noise and the DiT
+        # both accept float timesteps (and _cd_partial_denoise floats internally).
+        t_n_t = torch.full([B, F_], float(t_n), device=device, dtype=torch.float32)
+        t_next_t = torch.full([B, F_], float(t_next), device=device, dtype=torch.float32)
+        x_n = self.scheduler.add_noise(
+            x0_cd.flatten(0, 1), eps.flatten(0, 1), t_n_t.flatten(0, 1),
+        ).unflatten(0, x0_cd.shape[:2]).to(dtype).contiguous()
+
+        bare = self._cd_unwrapped_generator()
+        # Shared grad-carrying student x0 at (x_n, t_n).
+        p_n = self._cd_forward_x0(bare, x_n, t_n_t, conditional, clean_x, aug_t)
+
+        # CD *target* network: EMA-student if enabled, else the LIVE student.
+        # Either way the readout runs inside ``torch.no_grad()`` below, so the
+        # target branch is stop-gradient (the property that actually prevents
+        # consistency collapse) regardless of which module is used.
+        tgt_mod = self._cd_ema if self.cd_ema_enabled else bare
+
+        cd_teacher, cd_student = zero, zero
+        logs = {"cd_t_n": float(t_n), "cd_t_next": float(t_next), "cd_skipped": 0.0}
+
+        if self.cd_teacher_loss_enabled and self._cd_teacher is not None:
+            with torch.no_grad():
+                tea_x0 = self._cd_forward_x0(
+                    self._cd_teacher, x_n, t_n_t, conditional, clean_x, aug_t)
+                x_next_T = self._cd_partial_denoise(x_n, tea_x0, t_n_t, t_next_t)
+                p_next_T = self._cd_forward_x0(
+                    tgt_mod, x_next_T, t_next_t, conditional, clean_x, aug_t)
+            cd_teacher = (p_n.float() - p_next_T.float()).pow(2).mean().to(dtype)
+            logs["cd_teacher_loss_raw"] = float(cd_teacher.detach().item())
+
+        if self.cd_student_loss_enabled:
+            with torch.no_grad():
+                x_next_S = self._cd_partial_denoise(
+                    x_n, p_n.detach(), t_n_t, t_next_t)
+                p_next_S = self._cd_forward_x0(
+                    tgt_mod, x_next_S, t_next_t, conditional, clean_x, aug_t)
+            cd_student = (p_n.float() - p_next_S.float()).pow(2).mean().to(dtype)
+            logs["cd_student_loss_raw"] = float(cd_student.detach().item())
+
+        return cd_teacher, cd_student, logs
+
     def generator_loss(
         self,
         trajectory_clean: torch.Tensor,      # [B_pair, T_snap, F, C, H, W]
@@ -1109,6 +1398,9 @@ class ODERegression(nn.Module):
         noisy_clean = noisy_clean.to(dtype)
         noisy_cf    = noisy_cf.to(dtype)
         clean_x_in  = clean_x_gt.to(dtype)
+        # The teacher-forced context is ALWAYS truly clean. The clean context is
+        # NEVER noised under any config (hard user rule) — there is no
+        # context-augmentation path. ``aug_t`` is always None.
         prompt_cast = prompt_embeds.to(dtype)
         z_clean_c   = z_clean.to(dtype)
         z_noisy_c   = z_noisy.to(dtype)
@@ -1124,6 +1416,7 @@ class ODERegression(nn.Module):
         z_clean_pack = torch.cat([z_clean_c,    z_clean_c],    dim=0)
         noisy_pack   = torch.cat([noisy_clean,  noisy_cf],     dim=0)
         t_pack       = torch.cat([t_clean,      t_cf],         dim=0)
+        aug_t_pack   = None   # clean context is never noised
 
         conditional = self._build_conditional(
             prompt_pack, z_noisy_pack, z_clean_pack, num_frames=F_,
@@ -1135,7 +1428,7 @@ class ODERegression(nn.Module):
             conditional_dict=conditional,
             timestep=t_pack,
             clean_x=clean_x_pack,
-            aug_t=None,
+            aug_t=aug_t_pack,
         )
         # Dead-code removal (teacher parity): ``__init__`` enforces
         # ``state_probe_mode=True``, so the wrapper must return a 4-tuple
@@ -1251,6 +1544,28 @@ class ODERegression(nn.Module):
         )
         loss = loss_clean + lam_cf * loss_cf
 
+        # ---- Online dual-CD (ODE-F): frozen-14d teacher-CD + student
+        # self-CD, computed on the CLEAN branch (the GT-anchored target).
+        # Riding on the ODE loss above so neither can collapse. Warmup-ramped.
+        _cd_logs: Dict[str, Any] = {}
+        if self.cd_teacher_loss_enabled or self.cd_student_loss_enabled:
+            self._update_cd_ema_and_teacher()
+            cond_cd = self._build_conditional(
+                prompt_cast, z_noisy_c, z_clean_c, num_frames=F_,
+            )
+            cd_teacher, cd_student, _cd_logs = self._compute_cd_losses(
+                x0_cd=target_clean, conditional=cond_cd,
+                clean_x=clean_x_in, aug_t=None,
+            )
+            cd_w = self._cd_current_weight(step)
+            cd_term = (
+                self.cd_teacher_loss_weight * cd_teacher
+                + self.cd_student_loss_weight * cd_student
+            )
+            loss = loss + cd_w * cd_term
+            _cd_logs["cd_weight_effective"] = float(cd_w)
+            _cd_logs["cd_term_weighted"] = float((cd_w * cd_term).detach().item())
+
         # ---- Per-chunk ODE MSE diagnostic (for dashboard) — clean branch.
         with torch.no_grad():
             per_frame_sq = (pred_clean.float() - target_clean.float()).pow(2).mean(dim=(2, 3, 4))  # [B_pair, F]
@@ -1305,4 +1620,5 @@ class ODERegression(nn.Module):
             "per_chunk_ode_mse": per_chunk_sq.detach(),
             "flow_pred_norm":    flow_norm,
         }
+        log_dict.update(_cd_logs)
         return loss, log_dict

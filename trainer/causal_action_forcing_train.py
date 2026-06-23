@@ -477,9 +477,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     broadcast_buffers=False,
                 )
                 model.forward_noiser = self.forward_noiser_ddp  # type: ignore
+
+            # CARN-cycle: DDP-wrap the REVERSE noiser G exactly like F.
+            # find_unused_parameters=True for the same reason — the cycle
+            # training has bail paths (no rollout2, misaligned pairs) that the
+            # dual zero-anchor covers, but =True is the zero-hang-risk default.
+            self.reverse_noiser_ddp: Optional[DDP] = None
+            if (
+                bool(getattr(self.config, "forward_noiser_cycle_enabled", False))
+                and getattr(model, "reverse_noiser", None) is not None
+            ):
+                # MUST stay in lockstep with F's dtype derivation above: G's
+                # output feeds F's grad-on ``fn_out`` graph in L_cyc, so a
+                # dtype/device divergence would throw inside G(...) on one rank
+                # and hang its peers in the collective. Keep these two blocks
+                # identical if either is edited.
+                noiser_dtype = torch.float32
+                fs_model = getattr(model.fake_score, "model", None)
+                if fs_model is not None:
+                    fs_param = next(fs_model.parameters(), None)
+                    if fs_param is not None:
+                        noiser_dtype = fs_param.dtype
+                model.reverse_noiser = model.reverse_noiser.to(
+                    device=self.device, dtype=noiser_dtype,
+                )
+                self.reverse_noiser_ddp = DDP(
+                    model.reverse_noiser,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=True,
+                    broadcast_buffers=False,
+                )
+                model.reverse_noiser = self.reverse_noiser_ddp  # type: ignore
         else:
             self.real_score_ddp = None
             self.forward_noiser_ddp = None
+            self.reverse_noiser_ddp = None
 
         # ------------------------------------------------------------------
         # Auxiliary action critic (CF-parity ActionCritic, frozen teacher
@@ -962,6 +995,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
 
         # ------------------------------------------------------------------
+        # Online causal-CD loss (Causal-Forcing++, arXiv 2605.15141). The
+        # consistency math lives in ``ActionForcingDMD.cd_loss`` (single
+        # chunk, teacher-forced clean_x=GT, resident-GPU EMA target); this
+        # trainer just calls it once per ride and folds the weighted loss
+        # into the unified generator backward (mirrors SC-DMD). Default off.
+        # ------------------------------------------------------------------
+        self.cd_loss_enabled = bool(
+            getattr(self.config, "cd_loss_enabled", False)
+        )
+        self.cd_loss_weight = float(
+            getattr(self.config, "cd_loss_weight", 1.0)
+        )
+        self.cd_loss_warmup_steps = int(
+            getattr(self.config, "cd_loss_warmup_steps", 0)
+        )
+        if self.cd_loss_enabled and self.is_main_process:
+            logging.info(
+                "[ActionForcing] causal-CD loss ENABLED: weight=%.4f "
+                "warmup_steps=%d (CD pass costs 3 extra DiT forwards "
+                "[frozen-teacher ODE step + student + EMA-student] on a "
+                "``num_frame_per_block``-frame teacher-forced chunk per "
+                "gen step; resident-GPU EMA student adds ~2.6GB).",
+                self.cd_loss_weight,
+                self.cd_loss_warmup_steps,
+            )
+
+        # ------------------------------------------------------------------
         # dmd_context (hardcoded "self") — single source of truth
         # is the model. ``self.model.dmd_context_clean_frames`` is the
         # KV-cache seed prefill size (= 9 by default, configurable via
@@ -1311,6 +1371,46 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_loss_weight = float(getattr(cfg, "gan_loss_weight", 0.05))
         self.gan_r1_gamma = float(getattr(cfg, "gan_r1_gamma", 1.0))
         self.gan_r2_gamma = float(getattr(cfg, "gan_r2_gamma", 1.0))
+        # GAN-vs-DMD rebalancing under the MAE gate. When the MAE gate cuts the
+        # DMD weight (teacher unreliable, esp. at high t), the GAN otherwise runs
+        # at full strength and can drag the student off the teacher manifold onto
+        # the (possibly overtrained) discriminator's. When enabled, the gen-side
+        # GAN weight follows the gate DOWN, but gentler (``gate_w**beta``, beta<1
+        # => sqrt), never below a floor, and kept >= ``min_ratio`` x the gated
+        # DMD weight so the GAN still carries when DMD is bad. Default off =>
+        # byte-identical.
+        self.gan_gate_couple_enabled = bool(
+            getattr(cfg, "gan_gate_couple_enabled", False))
+        self.gan_gate_couple_beta = float(
+            getattr(cfg, "gan_gate_couple_beta", 0.5))
+        self.gan_gate_couple_floor_frac = float(
+            getattr(cfg, "gan_gate_couple_floor_frac", 0.3))
+        self.gan_gate_couple_min_ratio = float(
+            getattr(cfg, "gan_gate_couple_min_ratio", 2.0))
+        # Scale sanity for the coupling: the ``>= min_ratio x gated-DMD`` floor
+        # is only satisfiable while gan_full >= min_ratio*dmd_eff. With gan_full
+        # = gan_loss_weight*ladd_disc_loss_weight and dmd_eff = dmd_base*gate_w,
+        # the floor saturates (-> GAN pinned at base, no reduction) for all
+        # gate_w >= gan_full/(min_ratio*dmd_base). If that threshold is tiny
+        # (gan_full << dmd_base, e.g. the default gan_loss_weight=0.05 vs
+        # dmd_loss_weight=1.0) the coupling is effectively inert. Surface it once
+        # so it's never a SILENT no-op (per code review).
+        if self.gan_gate_couple_enabled and self.is_main_process:
+            _gan_full = self.gan_loss_weight * float(
+                getattr(cfg, "ladd_disc_loss_weight", 1.0))
+            _dmd_base = float(getattr(cfg, "dmd_loss_weight", 1.0))
+            _denom = self.gan_gate_couple_min_ratio * max(_dmd_base, 1e-9)
+            _gate_thresh = _gan_full / _denom if _denom > 0 else 0.0
+            logging.info(
+                "[GAN-GATE-COUPLE] enabled (beta=%.2f floor_frac=%.2f "
+                "min_ratio=%.2f): gan_full=%.4f dmd_base=%.4f -> GAN reduces "
+                "only when gate_w < %.3f (floor saturates above that). %s",
+                self.gan_gate_couple_beta, self.gan_gate_couple_floor_frac,
+                self.gan_gate_couple_min_ratio, _gan_full, _dmd_base, _gate_thresh,
+                ("WARNING: threshold < 0.1 -> coupling is effectively INERT; "
+                 "raise gan_loss_weight or lower gan_gate_couple_min_ratio."
+                 if _gate_thresh < 0.1 else ""),
+            )
         # ``gan_warmup_steps``: ramp the *generator-side* RpGAN-G loss
         # weight from 0 → ``gan_loss_weight`` over this many steps so
         # the gen doesn't see noise from a freshly-initialised D.
@@ -1465,6 +1565,38 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 getattr(cfg, "real_teacher_warmup_steps", 200)
             )
             self._real_teacher_base_lr = rt_lr
+            # ``real_teacher_lr_decay_end_step`` (0 = off): linearly decay the
+            # real-teacher LR from base at step 0 to 0 at this step, then FREEZE
+            # the teacher entirely (no optimizer step, no anchor, no EMA) for the
+            # rest of the run. The 'froz' experiment: train the teacher hard
+            # early under the low-noise stabilisers, then stop, to test whether
+            # late teacher training helps or hurts. Set real_teacher_warmup_steps
+            # =0 alongside it so the LR truly starts at base ("from its starting
+            # value"). 0 => byte-identical to the standard warmup-then-hold path.
+            self.real_teacher_lr_decay_end_step = int(
+                getattr(cfg, "real_teacher_lr_decay_end_step", 0)
+            )
+            if self.real_teacher_lr_decay_end_step < 0:
+                raise ValueError(
+                    "real_teacher_lr_decay_end_step must be >= 0, got "
+                    f"{self.real_teacher_lr_decay_end_step}"
+                )
+            # Light v14 anchor: after each online-teacher LoRA update, pull the
+            # LoRA params a small fraction toward 0 (= toward the merged-v14
+            # base). WEIGHT-space (not output-space): v14 is causal with a
+            # different clean_x contract, so matching its OUTPUTS would fight
+            # the bidir adaptation; shrinking the delta only keeps the teacher
+            # NEAR v14 without forcing its behaviour. lr-independent, so it bites
+            # even at small rt_lr (unlike AdamW weight_decay). 0.0 => off
+            # (byte-identical). e.g. 0.003 ~= 0.3% pull-to-v14 per update.
+            self.real_teacher_anchor_lambda = float(
+                getattr(cfg, "real_teacher_anchor_lambda", 0.0)
+            )
+            if self.real_teacher_anchor_lambda < 0.0:
+                raise ValueError(
+                    "real_teacher_anchor_lambda must be >= 0, got "
+                    f"{self.real_teacher_anchor_lambda}"
+                )
             if self.is_main_process:
                 n_params = sum(p.numel() for p in rt_params)
                 logging.info(
@@ -1479,6 +1611,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self.real_teacher_max_grad_norm = 1.0
             self.real_teacher_warmup_steps = 0
             self._real_teacher_base_lr = 0.0
+            self.real_teacher_lr_decay_end_step = 0
 
         # ``fake_score_ema_weight`` (0.0 = off, current behavior; e.g.
         # 0.95 = engage). After each generator optimizer.step(), the
@@ -1782,6 +1915,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         forward_noiser_grad_norm_val
                     )
 
+            # CARN-cycle: reverse noiser G optimizer step (mirror F).
+            reverse_noiser_grad_norm_val = 0.0
+            if getattr(self, "reverse_noiser_optimizer", None) is not None:
+                rn_params_with_grad = [
+                    p for p in
+                    self.reverse_noiser_optimizer.param_groups[0]["params"]
+                    if p.grad is not None
+                ]
+                if rn_params_with_grad:
+                    rngn = torch.nn.utils.clip_grad_norm_(
+                        rn_params_with_grad,
+                        max_norm=self.reverse_noiser_max_grad_norm,
+                    )
+                    reverse_noiser_grad_norm_val = (
+                        float(rngn.item()) if torch.is_tensor(rngn)
+                        else float(rngn)
+                    )
+                    self.reverse_noiser_optimizer.step()
+                self.reverse_noiser_optimizer.zero_grad(set_to_none=True)
+                if isinstance(generator_log_dict, dict):
+                    generator_log_dict["reverse_noiser_grad_norm"] = (
+                        reverse_noiser_grad_norm_val
+                    )
+
             # ----- State-probe optimizer step (LoRA-side aux loss) -----
             # Mirrors the fake/real_teacher pattern: clip → step → zero.
             # Probe gets gradient ONLY when the LoRA aux pass populated
@@ -1838,36 +1995,80 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if p.grad is not None
                 ]
                 if rt_params_with_grad:
-                    # Linear LR warmup over the first
-                    # ``real_teacher_warmup_steps`` steps.
-                    if (
-                        self.real_teacher_warmup_steps > 0
-                        and self.step < self.real_teacher_warmup_steps
-                    ):
-                        warm_factor = (
-                            (self.step + 1) / self.real_teacher_warmup_steps
+                    # LR schedule: linear warmup over real_teacher_warmup_steps,
+                    # then (if real_teacher_lr_decay_end_step>0) a linear decay
+                    # to 0 by that step, after which the teacher is FROZEN -- no
+                    # optimizer step, no anchor, no EMA -- a truly fixed target
+                    # (the 'froz' experiment). decay_end=0 => original behaviour.
+                    _rt_decay = self.real_teacher_lr_decay_end_step
+                    _rt_frozen = (_rt_decay > 0 and self.step >= _rt_decay)
+                    if _rt_frozen:
+                        for pg in self.real_teacher_optimizer.param_groups:
+                            pg["lr"] = 0.0
+                        # (grad_norm left at its prior value; no update logged)
+                    else:
+                        if _rt_decay > 0:
+                            # base * warmup_factor * linear-decay_factor
+                            _wf = 1.0
+                            if (
+                                self.real_teacher_warmup_steps > 0
+                                and self.step < self.real_teacher_warmup_steps
+                            ):
+                                _wf = (self.step + 1) / self.real_teacher_warmup_steps
+                            _df = max(0.0, (_rt_decay - self.step) / float(_rt_decay))
+                            for pg in self.real_teacher_optimizer.param_groups:
+                                pg["lr"] = self._real_teacher_base_lr * _wf * _df
+                        elif (
+                            self.real_teacher_warmup_steps > 0
+                            and self.step < self.real_teacher_warmup_steps
+                        ):
+                            warm_factor = (
+                                (self.step + 1) / self.real_teacher_warmup_steps
+                            )
+                            for pg in self.real_teacher_optimizer.param_groups:
+                                pg["lr"] = self._real_teacher_base_lr * warm_factor
+                        elif self.real_teacher_warmup_steps > 0:
+                            # Restore base LR once warmup completes (no-op
+                            # after first post-warmup step but harmless).
+                            for pg in self.real_teacher_optimizer.param_groups:
+                                pg["lr"] = self._real_teacher_base_lr
+                        rtgn = torch.nn.utils.clip_grad_norm_(
+                            rt_params_with_grad,
+                            max_norm=self.real_teacher_max_grad_norm,
                         )
-                        for pg in self.real_teacher_optimizer.param_groups:
-                            pg["lr"] = self._real_teacher_base_lr * warm_factor
-                    elif self.real_teacher_warmup_steps > 0:
-                        # Restore base LR once warmup completes (no-op
-                        # after first post-warmup step but harmless).
-                        for pg in self.real_teacher_optimizer.param_groups:
-                            pg["lr"] = self._real_teacher_base_lr
-                    rtgn = torch.nn.utils.clip_grad_norm_(
-                        rt_params_with_grad,
-                        max_norm=self.real_teacher_max_grad_norm,
-                    )
-                    real_teacher_grad_norm_val = (
-                        float(rtgn.item()) if torch.is_tensor(rtgn) else float(rtgn)
-                    )
-                    self.real_teacher_optimizer.step()
-                    # Target-network EMA pull on the LoRA adapter
-                    # (no-op when real_score_ema_weight == 0). Fires
-                    # AFTER optim.step on every LoRA update so the
-                    # EMA tracks the post-step weights, including
-                    # the just-clipped gradient's effect.
-                    self.model.ema_update_real_score_lora()
+                        real_teacher_grad_norm_val = (
+                            float(rtgn.item()) if torch.is_tensor(rtgn) else float(rtgn)
+                        )
+                        # NaN/inf guard: clip_grad_norm_ does NOT sanitize a
+                        # non-finite grad (it returns a non-finite norm). Stepping
+                        # would poison the AdamW moments AND the EMA shadow
+                        # irrecoverably (the teacher target is dead for the rest
+                        # of the run). Skip step+anchor+EMA on a non-finite norm;
+                        # grads are zeroed below. Finite path is byte-identical.
+                        if torch.isfinite(torch.as_tensor(real_teacher_grad_norm_val)):
+                            self.real_teacher_optimizer.step()
+                            # Light v14 anchor: shrink the LoRA delta toward 0 (= v14
+                            # base) by a small fraction each update. Fires AFTER
+                            # optim.step so it acts on the post-step weights. Default
+                            # lambda 0 => skipped (byte-identical). Not run once frozen
+                            # (above) so the frozen teacher is genuinely fixed.
+                            if self.real_teacher_anchor_lambda > 0.0:
+                                _keep = 1.0 - self.real_teacher_anchor_lambda
+                                with torch.no_grad():
+                                    for _p in self.real_teacher_optimizer.param_groups[0]["params"]:
+                                        _p.mul_(_keep)
+                            # Target-network EMA pull on the LoRA adapter
+                            # (no-op when real_score_ema_weight == 0). Fires
+                            # AFTER optim.step on every LoRA update so the
+                            # EMA tracks the post-step weights, including
+                            # the just-clipped gradient's effect.
+                            self.model.ema_update_real_score_lora()
+                        elif self.is_main_process:
+                            logging.warning(
+                                "[ActionForcing] real_teacher grad norm non-finite "
+                                "(%.3e) at step %d -> skipped teacher step+anchor+EMA",
+                                real_teacher_grad_norm_val, self.step,
+                            )
                 self.real_teacher_optimizer.zero_grad(set_to_none=True)
             elif self.real_teacher_optimizer is not None:
                 # Below start_step (or aux gate closed for any other
@@ -2523,6 +2724,31 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         logging.warning(
                             "resume: forward_noiser_optimizer load failed: %s. "
                             "Starting FN optim from fresh state.", exc,
+                        )
+        # CARN-cycle: restore the reverse noiser G + its optimizer.
+        _rn = getattr(self.model, "reverse_noiser", None)
+        if _rn is not None and "reverse_noiser" in state:
+            _rn_mod = _rn.module if hasattr(_rn, "module") else _rn
+            rn_missing, rn_unexpected = _rn_mod.load_state_dict(
+                state["reverse_noiser"], strict=False,
+            )
+            if self.is_main_process:
+                logging.info(
+                    "resume: reverse_noiser missing=%d unexpected=%d",
+                    len(rn_missing), len(rn_unexpected),
+                )
+            _rn_opt = getattr(self, "reverse_noiser_optimizer", None)
+            if _rn_opt is not None and "reverse_noiser_optimizer" in state:
+                try:
+                    _rn_opt.load_state_dict(state["reverse_noiser_optimizer"])
+                    if self.is_main_process:
+                        logging.info("resume: reverse_noiser_optimizer restored")
+                except Exception as exc:
+                    if self.is_main_process:
+                        logging.warning(
+                            "resume: reverse_noiser_optimizer load failed: %s. "
+                            "Starting reverse-noiser optim from fresh state.",
+                            exc,
                         )
         if self.real_teacher_train_online:
             # FAIL-LOUD on resume: silently rolling the LoRA back to
@@ -3396,18 +3622,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             raise RuntimeError(
                 "_vae_decode_grad requires self.model.vae."
             )
-        # Cached-decode path: avoids the init-frame brightness anomaly
-        # that plain decode injects at every call (see ``_decode_no_grad``
-        # docstring above for the full rationale).
+        # Self-seeding decode (``seed_first``): clears the temporal cache (no
+        # cross-clip ghost in frame 0) AND seeds it with the clip's own first
+        # latent so frame 0 has a faithful predecessor (no init-frame
+        # brightness anomaly). This finally makes the code match the
+        # "prepend a dummy frame and slice" geometry described above, and is
+        # self-contained so checkpoint recompute is deterministic.
         if use_checkpoint:
             from torch.utils.checkpoint import checkpoint as _ckpt
 
             def _decode(z):
-                return vae.decode_to_pixel(z, use_cache=True)
+                return vae.decode_to_pixel(z, seed_first=True)
 
             pix = _ckpt(_decode, latent, use_reentrant=False)
         else:
-            pix = vae.decode_to_pixel(latent, use_cache=True)
+            pix = vae.decode_to_pixel(latent, seed_first=True)
         return pix
 
     def _compute_pixel_perceptual_losses(
@@ -3526,6 +3755,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if self.gan_warmup_shape == "cosine":
             return 0.5 * (1.0 - math.cos(math.pi * t))
         return t  # "linear"
+
+    def _couple_gan_weight_to_gate(self, gen_gan_weight: float) -> float:
+        """Rebalance the gen-side GAN weight against the MAE-gated DMD weight.
+
+        When the gate cuts DMD (gate_w < 1), pull the GAN weight down too but
+        gentler (``gate_w**beta``, beta<1 => sqrt), never below a floor, and keep
+        it >= ``min_ratio`` x the gated DMD weight so the GAN still carries the
+        student when the teacher (DMD) is unreliable, without running free.
+        ``min(floor, gan_base)`` ensures we never force GAN ABOVE its base at
+        full DMD. No-op when disabled / no gating. See ``__init__`` comment.
+        """
+        if not self.gan_gate_couple_enabled or gen_gan_weight <= 0.0:
+            return gen_gan_weight
+        gate_w = float(getattr(self.model, "_last_dmd_mae_gate_weight", 1.0))
+        if gate_w >= 1.0:
+            return gen_gan_weight  # DMD not gated -> leave GAN at full
+        gan_base = float(gen_gan_weight)
+        dmd_base = float(getattr(self.model, "dmd_loss_weight", 1.0))
+        dmd_eff = dmd_base * gate_w
+        coupled = gan_base * (gate_w ** self.gan_gate_couple_beta)
+        floor = max(self.gan_gate_couple_min_ratio * dmd_eff,
+                    self.gan_gate_couple_floor_frac * gan_base)
+        floor = min(floor, gan_base)
+        return float(min(max(coupled, floor), gan_base))
 
     # ==================================================================
     # LADD discriminator (v28)
@@ -3703,6 +3956,170 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             loss = loss + (pf_s - pr_s).pow(2).mean()
         return loss / max(1, len(idxs))
 
+    def _fn_recon_loss(self, a, b):
+        """Paired reconstruction norm for the CARN-cycle (L_rev / L_cyc).
+        L1 by default (the CycleGAN convention), L2 when configured."""
+        if str(getattr(self.model, "cycle_recon_loss_type", "l1")) == "l2":
+            return (a - b).pow(2).mean()
+        return (a - b).abs().mean()
+
+    def _reverse_noiser_zero_anchor(self) -> None:
+        """DDP balance for the CARN-cycle: fire G's reducer with a zero
+        backward so the reverse-noiser DDP bucket all-reduce happens on EVERY
+        rank, even when this rank bailed before the real cycle backward.
+        Mirrors the forward-noiser ``_anchor`` discipline. On the real path G
+        is forwarded once (L_rev) inside the summed backward; on a bail path
+        this stand-alone zero-backward gives G's reducer the same single
+        firing -> bucket counts stay matched across ranks. No-op when the
+        cycle is off (G is None)."""
+        m = self.model
+        G = getattr(m, "reverse_noiser", None)
+        if not (
+            bool(getattr(m, "forward_noiser_cycle_enabled", False))
+            and G is not None
+        ):
+            return
+        g_inner = G.module if hasattr(G, "module") else G
+        p0 = next(G.parameters())
+        C = int(getattr(g_inner, "latent_channels", 16))
+        x0 = torch.zeros(
+            (1, int(getattr(m, "num_frame_per_block", 3)), C, 8, 8),
+            device=p0.device, dtype=p0.dtype,
+        )
+        cz = torch.zeros((1,), dtype=torch.long, device=x0.device)
+        (G(x0, cz, residual=True).sum() * 0.0).backward()
+
+    def _fn_cycle_terms(self, fn_out, fn_in, carn, proj):
+        """CARN-cycle reverse + cycle losses for one (fn_in -> fn_out=F(fn_in))
+        batch, where ``carn`` is the per-row rung label ℓ (the SHARED upper-
+        endpoint level used to condition BOTH F and G) and ``fn_in`` is
+        detached (FN inputs always are). Returns ``(L_rev, L_cyc)`` or
+        ``(None, None)`` when the cycle is off.
+
+          L_rev = recon( G(sg(F(x1)); ℓ), sg(x1) )   -> trains θ_G only
+                  (recover rollout1 from F's OWN output distribution; the
+                   input to G is DETACHED so this term never drags F).
+          L_cyc = recon( G(F(x1); ℓ),    sg(x1) )    -> trains θ_F
+                  (forward pushed to be invertible by G; G's PARAMETERS are
+                   frozen for this forward when cycle_freeze_g_in_cycle so G
+                   acts as a fixed invertibility critic — the transform stays
+                   differentiable w.r.t. its INPUT so grad still reaches θ_F.
+                   Same freeze-params-but-keep-input-grad pattern as the
+                   wavelet handling in _fn_teacher_feat_loss.)
+        Identity collapse (F=G=I) is blocked elsewhere by L_fwd (the SW
+        forward match): identity fails it because rollout1≠rollout2 in the
+        teacher's feature marginals.
+
+        RUNG LABEL ℓ vs STEP GAP g (why one scalar suffices for G): in the
+        chain-levels geometry ``cond=k`` maps a level-(k-2) input to level k
+        (GT->1=1, GT->2=2, 1->3=3, 2->4=4 ...), so the per-pair gap g is a
+        DETERMINISTIC function of ℓ (g=1 at ℓ=1, g=2 at ℓ>=2) — ℓ alone pins
+        the (source,dest) pair, so G's inverse target is well-posed per ℓ even
+        though g is not separately encoded. We condition G on ℓ = the UPPER
+        endpoint = G's own INPUT level (F(x1) sits at level ℓ), which is the
+        natural "tell the denoiser its input level" conditioning. At the
+        frontier (carn=0 for both F and G) the pair is step-unconditioned, so
+        the cycle is internally consistent there too.
+        """
+        m = self.model
+        if not (
+            bool(getattr(m, "forward_noiser_cycle_enabled", False))
+            and getattr(m, "reverse_noiser", None) is not None
+        ):
+            return None, None
+        G = m.reverse_noiser                       # DDP-wrapped reverse net
+        G_inner = G.module if hasattr(G, "module") else G
+        fn_in_det = fn_in.detach()
+        # ---- L_rev: the ONLY DDP forward of G this step ----
+        # G recovers x1 from F's OWN (detached) output -> trains+syncs θ_G.
+        # CRITICAL DDP INVARIANT: G is forwarded through its DDP wrapper
+        # EXACTLY ONCE per step. Forwarding a DDP module twice before a
+        # single backward corrupts the reducer (only the last forward's
+        # prepare_for_backward survives), so the L_cyc term below must NOT
+        # go through the DDP wrapper.
+        g_rev = G(fn_out.detach(), carn, residual=True)
+        L_rev = self._fn_recon_loss(g_rev, fn_in_det)
+        if float(getattr(m, "cycle_rev_feat_weight", 0.0)) > 0.0:
+            L_rev = L_rev + float(m.cycle_rev_feat_weight) * (
+                self._fn_teacher_feat_loss(g_rev, fn_in_det, proj)
+            )
+        # ---- L_cyc: grad flows F -> G -> loss; G is a FROZEN critic ----
+        # Run through the INNER module (bypasses DDP, so no second DDP
+        # forward) with G's params frozen, so the gradient reaches θ_F via
+        # ``fn_out`` only and NOT θ_G (and never bypasses the reducer with an
+        # un-synced θ_G contribution). The transform stays differentiable
+        # w.r.t. its input — same freeze-params/keep-input-grad trick as the
+        # wavelet handling in _fn_teacher_feat_loss.
+        freeze = bool(getattr(m, "cycle_freeze_g_in_cycle", True))
+        if not freeze:
+            # CycleGAN-style (cycle trains BOTH nets) would need a SECOND
+            # synced DDP forward of G -> the multi-forward reducer hazard.
+            # Not supported under DDP in this implementation; the recommended
+            # and default mode is freeze=True (G as a fixed invertibility
+            # critic). Fail loud rather than silently de-sync θ_G.
+            raise NotImplementedError(
+                "cycle_freeze_g_in_cycle=False (CycleGAN-style cycle training "
+                "of G) is not supported under DDP: it would require a second "
+                "synced DDP forward of the reverse noiser. Use the default "
+                "freeze=True (G trained only by L_rev; L_cyc updates θ_F)."
+            )
+        g_params = list(G_inner.parameters())
+        saved_req = [p.requires_grad for p in g_params]
+        for _p in g_params:
+            _p.requires_grad_(False)
+        try:
+            g_cyc = G_inner(fn_out, carn, residual=True)
+        finally:
+            for _p, _r in zip(g_params, saved_req):
+                _p.requires_grad_(_r)
+        L_cyc = self._fn_recon_loss(g_cyc, fn_in_det)
+        return L_rev, L_cyc
+
+    def _fn_forward_backward_with_cycle(
+        self, fn_in, fn_tg, carn, proj, base_logs,
+    ) -> dict:
+        """Run F's forward + the (optional) CARN-cycle reverse/cycle terms,
+        sum into ONE backward, and return merged logs. When the cycle is OFF
+        this is byte-identical to the legacy ``fn_out=F(...); loss=L_fwd;
+        loss.backward()`` (no weight on L_fwd — matching the pre-cycle code).
+        """
+        m = self.model
+        fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
+        L_fwd = self._fn_teacher_feat_loss(fn_out, fn_tg, proj)
+        L_rev, L_cyc = self._fn_cycle_terms(fn_out, fn_in, carn, proj)
+        logs = dict(base_logs)
+        logs["train/fn_fwd_loss"] = float(L_fwd.detach().item())
+        if L_rev is None:
+            total = L_fwd
+        else:
+            w_rev = float(getattr(m, "cycle_rev_loss_weight", 1.0))
+            w_cyc = float(getattr(m, "cycle_consistency_loss_weight", 0.5))
+            # F-only warmup: hold the cycle term at 0 until F's SW match is
+            # established (so F isn't pulled toward inverting a random map).
+            step_now = int(getattr(self, "step", 0))
+            warm = int(getattr(m, "cycle_warmup_steps", 0))
+            w_cyc_eff = 0.0 if step_now < warm else w_cyc
+            # NOTE: L_fwd keeps an implicit weight of 1.0 (the pre-cycle code
+            # never scaled it) so it stays the dominant anti-collapse anchor
+            # (1.0 >= w_cyc default 0.5).
+            total = L_fwd + w_rev * L_rev + w_cyc_eff * L_cyc
+            logs["train/fn_rev_loss"] = float(L_rev.detach().item())
+            logs["train/fn_cyc_loss"] = float(L_cyc.detach().item())
+            logs["train/fn_cyc_weight_eff"] = float(w_cyc_eff)
+            # Movement diagnostics: ‖F(x1)-x1‖ vs ‖x2-x1‖ (identity-collapse
+            # detector — the former must stay > 0 and track the latter).
+            with torch.no_grad():
+                logs["train/fn_fwd_move"] = float(
+                    (fn_out.detach() - fn_in.detach()).abs().mean().item()
+                )
+                logs["train/fn_pair_gap"] = float(
+                    (fn_tg.detach() - fn_in.detach()).abs().mean().item()
+                )
+        total.backward()
+        # Keep the legacy primary metric for dashboards.
+        logs["train/fn_tf_loss"] = float(L_fwd.detach().item())
+        return logs
+
     def _train_fn_frontier_pair(self) -> dict:
         """FN frontier training (phase-2 rolling): consume the
         (rollout1', rollout2') chunk pair generated at the ride's
@@ -3744,6 +4161,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             cz = torch.zeros((1,), dtype=torch.long, device=x0.device)
             (fn(x0, cz, residual=True).sum() * 0.0).backward()
+            self._reverse_noiser_zero_anchor()
             return {
                 "train/fn_frontier_skipped": 1.0,
             }
@@ -3764,23 +4182,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         cs = torch.zeros(
             (r1c.shape[0],), dtype=torch.long, device=r1c.device,
         )
-        fn_out = m.forward_noiser(r1c, cs, residual=True)  # grad-on
-        loss = self._fn_teacher_feat_loss(fn_out, r2c, proj)
-        loss.backward()
+        # Forward (+ optional CARN-cycle reverse/cycle) in ONE backward. The
+        # frontier conditions on cs (=0, the existing frontier convention) for
+        # both F and G.
+        cyc_logs = self._fn_forward_backward_with_cycle(
+            r1c, r2c, cs, proj, {"train/fn_frontier_pairs": 1.0},
+        )
+        _floss = float(cyc_logs.get("train/fn_fwd_loss", 0.0))
         if (getattr(self, "is_main_process", True)
                 and getattr(self, "_fn_frontier_dbg", 0) < 3):
             self._fn_frontier_dbg = getattr(self, "_fn_frontier_dbg", 0) + 1
             import sys as _sys
             print(
                 f"[FN-FRONTIER] trained on frontier pair at ride depth "
-                f"{self._chunks_in_current_ride} (loss="
-                f"{float(loss.detach().item()):.5f})",
+                f"{self._chunks_in_current_ride} (fwd_loss="
+                f"{_floss:.5f}"
+                + (f" rev={cyc_logs.get('train/fn_rev_loss'):.5f}"
+                   f" cyc={cyc_logs.get('train/fn_cyc_loss'):.5f}"
+                   if 'train/fn_rev_loss' in cyc_logs else "")
+                + ")",
                 file=_sys.stderr, flush=True,
             )
-        return {
-            "train/fn_frontier_loss": float(loss.detach().item()),
-            "train/fn_frontier_pairs": 1.0,
-        }
+        out = {"train/fn_frontier_loss": _floss}
+        out.update(cyc_logs)
+        return out
 
     def _train_forward_noiser_tf(self, rollout1_chunk, info) -> dict:
         """teacher_feat FN training step (separate FN backward). Builds the
@@ -3828,6 +4253,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             z = fn(x0, cz, residual=True)
             (z.sum() * 0.0).backward()
+            self._reverse_noiser_zero_anchor()
             return {"train/fn_tf_loss": 0.0, "train/fn_tf_pairs": 0.0,
                     "train/fn_tf_skipped": 1.0}
 
@@ -3913,16 +4339,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 torch.full((Bc,), lvl, dtype=torch.long, device=fn_in.device)
                 for lvl in carn_levels
             ])
-            fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
-            loss = self._fn_teacher_feat_loss(fn_out, cum_tg, proj)
-            loss.backward()
-            return {
-                "train/fn_tf_loss": float(loss.detach().item()),
-                "train/fn_tf_pairs": float(len(cum_inputs)),
-                "train/fn_tf_skipped": 0.0,
-                "train/fn_tf_cumulative": 1.0,
-                "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
-            }
+            return self._fn_forward_backward_with_cycle(
+                fn_in, cum_tg, carn, proj,
+                {
+                    "train/fn_tf_pairs": float(len(cum_inputs)),
+                    "train/fn_tf_skipped": 0.0,
+                    "train/fn_tf_cumulative": 1.0,
+                    "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
+                },
+            )
 
         # carn_recurse=True (+1 composition) path: this is the ONLY consumer
         # of the prebuilt rollout2. Fetch + require it here (the False branch
@@ -4000,16 +4425,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             carn = torch.zeros(
                 (fn_in.shape[0],), dtype=torch.long, device=fn_in.device,
             )
-        fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
-        loss = self._fn_teacher_feat_loss(fn_out, fn_tg, proj)
-        loss.backward()
-        return {
-            "train/fn_tf_loss": float(loss.detach().item()),
-            "train/fn_tf_pairs": float(len(fn_inputs)),
-            "train/fn_tf_skipped": 0.0,
-            "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
-            "train/fn_tf_chain_levels": 1.0 if _chain_levels else 0.0,
-        }
+        return self._fn_forward_backward_with_cycle(
+            fn_in, fn_tg, carn, proj,
+            {
+                "train/fn_tf_pairs": float(len(fn_inputs)),
+                "train/fn_tf_skipped": 0.0,
+                "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
+                "train/fn_tf_chain_levels": 1.0 if _chain_levels else 0.0,
+            },
+        )
 
     #     "student vs teacher's clean data".
     #   * "adjacent_chunks" (ASD-style): real = chunk_i, fake =
@@ -6177,6 +6601,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 gen_gan_weight = 0.0
             gen_gan_weight = gen_gan_weight * float(
                 getattr(self.model, "ladd_disc_loss_weight", 1.0))
+            gen_gan_weight = self._couple_gan_weight_to_gate(gen_gan_weight)
 
             generator_gan_loss = zero
             gen_gan_main_value = 0.0
@@ -6556,6 +6981,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         gen_gan_weight = gen_gan_weight * float(
             getattr(self.model, "ladd_disc_loss_weight", 1.0)
         )
+        gen_gan_weight = self._couple_gan_weight_to_gate(gen_gan_weight)
 
         gen_gan_main_value = 0.0
         gen_gan_stat_value = 0.0
@@ -6792,6 +7218,52 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return ramp * self.sc_dmd_loss_weight
 
     # ------------------------------------------------------------------
+    # Causal-CD warmup helper + per-ride loss fold-in.
+    # ------------------------------------------------------------------
+    def _cd_loss_current_weight(self, current_step: int) -> float:
+        """Linear-ramp the CD weight from 0 → ``cd_loss_weight`` over the
+        first ``cd_loss_warmup_steps`` steps (0 default = full strength
+        from step 0). Same rationale as the SC-DMD ramp: hold the
+        consistency regularizer sub-DMD until the student produces
+        meaningful x0 predictions.
+        """
+        if not self.cd_loss_enabled:
+            return 0.0
+        if self.cd_loss_warmup_steps <= 0:
+            return self.cd_loss_weight
+        if current_step >= self.cd_loss_warmup_steps:
+            return self.cd_loss_weight
+        ramp = float(current_step) / float(max(1, self.cd_loss_warmup_steps))
+        return ramp * self.cd_loss_weight
+
+    def _maybe_add_cd_loss(
+        self,
+        generator_loss: torch.Tensor,
+        conditional_dict: dict,
+        clean_latent: torch.Tensor,
+        seed_frames: int,
+        out: dict,
+    ) -> torch.Tensor:
+        """Compute the weighted causal-CD loss (once per ride) and fold it
+        into ``generator_loss``. No-op (returns input) when CD is off.
+        Mirrors the SC-DMD fold-in; logs raw/weighted/effective-weight.
+        """
+        if not self.cd_loss_enabled:
+            return generator_loss
+        cd_loss_raw, cd_logs = self.model.cd_loss(
+            conditional_dict=conditional_dict,
+            clean_latent=clean_latent,
+            seed_frames=int(seed_frames),
+        )
+        cd_weight = self._cd_loss_current_weight(int(self.step))
+        weighted_cd = cd_loss_raw * cd_weight
+        generator_loss = generator_loss + weighted_cd
+        out.update(cd_logs)
+        out["cd_loss_weight_effective"] = float(cd_weight)
+        out["cd_loss_weighted"] = float(weighted_cd.detach().item())
+        return generator_loss
+
+    # ------------------------------------------------------------------
     # Periodic pred_image -> wandb.Video sampling.
     # ------------------------------------------------------------------
     def _video_sample_due(self, current_step: int) -> bool:
@@ -6906,18 +7378,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 if F_total > self.sample_max_frames:
                     latents = latents[:, -self.sample_max_frames:]
             lat = latents[0:1]
-            # Cached-decode path: WAN VAE's plain ``decode`` re-runs
-            # its unconditioned init at the first latent of every
-            # call, leaving a brightness anomaly in the rendered
-            # video. ``cached_decode`` keeps the temporal-conv
-            # feat_map populated across calls so the init is encoded
-            # at most once per streaming sequence. The cache is
-            # cleared at ``setup_sequence`` time (= when a new ride
-            # / video is loaded) — within the same sequence, calls
-            # SHARE cache so successive renders / boundary decodes
-            # of the same video flow smoothly through one another's
-            # left-context.
-            pixels = vae.decode_to_pixel(lat, use_cache=True)
+            # Self-seeding decode (``seed_first``): each logged clip
+            # (pred_image / pred_real / pred_fake / clean_x_*) is an
+            # INDEPENDENT window, so the old ``use_cache=True`` path
+            # left a ghost of the previously-rendered clip in frame 0
+            # (the warm ``cached_decode`` feat_map is never cleared
+            # between these back-to-back renders). ``seed_first`` clears
+            # the cache and seeds it with this clip's OWN first latent
+            # frame, so frame 0 is faithful — no cross-clip ghost and
+            # no plain-decode init-frame brightness anomaly.
+            pixels = vae.decode_to_pixel(lat, seed_first=True)
             video = (0.5 * (pixels.float() + 1.0)).clamp(0.0, 1.0)
             vid_np = (video[0].cpu().numpy() * 255.0).astype(np.uint8)
             if vid_np.ndim != 4:
@@ -7353,7 +7823,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         m = getattr(self, "model", None)
         names_trainer = [
             "r3gan_disc", "r3gan_disc_ddp", "r3gan_optimizer",
-            "forward_noiser_optimizer", "state_probe_optimizer",
+            "forward_noiser_optimizer", "reverse_noiser_optimizer",
+            "state_probe_optimizer",
             "real_teacher_optimizer", "critic_optimizer",
             "fake_optimizer", "optimizer",
             "_frozen_cotracker", "_frozen_ss_vae", "_frozen_vae",
@@ -7362,7 +7833,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "generator", "fake_score", "real_score", "real_score_frozen",
             "action_projection", "action_token_projection",
             "action_critic", "state_probe", "forward_noiser",
-            "vae",
+            "reverse_noiser", "vae",
         ]
         logging.info("[mem-inventory] === Trainer-side attributes ===")
         for n in names_trainer:
@@ -8046,6 +8517,78 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             min_depth, cur_depth)
 
     # ------------------------------------------------------------------
+    # af-all: IQA (MUSIQ/NIQE) agreement gate
+    # ------------------------------------------------------------------
+    def _af_all_iqa_metrics(self, latent_chunk: torch.Tensor):
+        """Decode a latent chunk and return ``(musiq_per_frame[list],
+        niqe_mean[float])`` — both no_grad. MUSIQ ↑good (~0..100), NIQE
+        ↓good. Returns ``(None, None)`` on any decode/metric failure so
+        the caller treats the window as 'not agreeing' (conservative)."""
+        vae = getattr(self.model, "vae", None)
+        if vae is None:
+            return None, None
+        if self._iqa_musiq is None:
+            import pyiqa
+            dev = self.device
+            self._iqa_musiq = pyiqa.create_metric("musiq", device=dev)
+            self._iqa_niqe = pyiqa.create_metric("niqe", device=dev)
+        # Defrag before the decode: the VAE decoder peaks at a large
+        # contiguous workspace (~1GB) and a fragmented allocator can fail
+        # the alloc even with enough total free memory (mirrors the
+        # graph-on decode's pre-decode empty_cache).
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # The VAE params are fp32 (its conv biases are float); the rollout
+        # latents are bf16. Cast the latent to the VAE's own dtype before
+        # decode or conv3d raises "Input type/bias type should be the same".
+        try:
+            _vae_dtype = next(vae.parameters()).dtype
+        except StopIteration:
+            _vae_dtype = torch.float32
+        with torch.no_grad():
+            pix = vae.decode_to_pixel(
+                latent_chunk.to(device=self.device, dtype=_vae_dtype),
+                seed_first=True,
+            )
+            v = (0.5 * (pix.float() + 1.0)).clamp(0.0, 1.0)[0]  # [F,3,H,W]
+            musiq = [float(self._iqa_musiq(v[i:i + 1]).item())
+                     for i in range(v.shape[0])]
+            niqe = [float(self._iqa_niqe(v[i:i + 1]).item())
+                    for i in range(v.shape[0])]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        niqe_mean = sum(niqe) / float(max(1, len(niqe)))
+        return musiq, niqe_mean
+
+    def _af_all_iqa_agreement(
+        self,
+        gen_chunk: torch.Tensor,
+        gt_seed_chunk: torch.Tensor,
+    ) -> float:
+        """Binary local agreement (1.0/0.0) between the most-recent
+        generated frontier chunk and the last GT seed chunk:
+          * gen mean-MUSIQ ≥ GT mean-MUSIQ − ``musiq_tol``  (no worse), AND
+          * gen mean-NIQE ≤ GT mean-NIQE + ``niqe_tol``     (no worse), AND
+          * within the generated chunk, MUSIQ(late) − MUSIQ(early) ≥
+            −``late_early_drop`` (no intra-chunk collapse).
+        Conservative: any decode/metric failure → 0.0 (not agreeing)."""
+        g_musiq, g_niqe = self._af_all_iqa_metrics(gen_chunk)
+        if g_musiq is None:
+            return 0.0
+        s_musiq, s_niqe = self._af_all_iqa_metrics(gt_seed_chunk)
+        if s_musiq is None:
+            return 0.0
+        g_mu = sum(g_musiq) / float(len(g_musiq))
+        s_mu = sum(s_musiq) / float(len(s_musiq))
+        late_early = g_musiq[-1] - g_musiq[0]
+        ok = (
+            (g_mu >= s_mu - self._iqa_musiq_tol)
+            and (g_niqe <= s_niqe + self._iqa_niqe_tol)
+            and (late_early >= -self._iqa_late_early_drop)
+        )
+        return 1.0 if ok else 0.0
+
+    # ------------------------------------------------------------------
     # K=1-per-step state machine. Each call rolls one chunk on the
     # current ride (or sets up a fresh ride if reset was triggered last
     # step), trains every active head, and decides whether to reset
@@ -8105,6 +8648,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 getattr(cfg, "rolling_windows_per_ride", 8))
             self._tp_windows_this_ride = 0
             self._tp_held_ride: Optional[Dict[str, Any]] = None
+            # af-all: IQA (MUSIQ/NIQE) agreement gate. When enabled it
+            # REPLACES the MAE window as the depth-grow signal. Once per
+            # ride (at reset) decode the most-recent generated frontier
+            # chunk + the last GT seed chunk, score both with MUSIQ
+            # (↑good) and NIQE (↓good), form a binary "agree" indicator
+            # (gen within tol of the GT seed on BOTH metrics AND no
+            # late−early MUSIQ collapse within the generated chunk),
+            # MEAN-reduce it across ranks (DDP lockstep) and EMA it. When
+            # the EMA clears ``agree_threshold`` the depth ratchets +1 and
+            # the EMA resets, so the next +1 must be re-earned at the
+            # deeper depth ("roll one more chunk … until the metrics agree
+            # again"). Monotonic; per-ride roll_cap is still the ceiling.
+            self._iqa_on = bool(
+                getattr(cfg, "af_all_iqa_gate_enabled", False))
+            self._iqa_musiq_tol = float(
+                getattr(cfg, "af_all_iqa_musiq_tol", 5.0))
+            self._iqa_niqe_tol = float(
+                getattr(cfg, "af_all_iqa_niqe_tol", 0.5))
+            self._iqa_late_early_drop = float(
+                getattr(cfg, "af_all_iqa_late_early_drop", 5.0))
+            self._iqa_ema_decay = float(
+                getattr(cfg, "af_all_iqa_ema_decay", 0.9))
+            self._iqa_agree_threshold = float(
+                getattr(cfg, "af_all_iqa_agree_threshold", 0.5))
+            self._iqa_agree_ema: Optional[float] = None
+            self._iqa_musiq = None   # lazy pyiqa metric
+            self._iqa_niqe = None    # lazy pyiqa metric
+            if self._iqa_on and self.is_main_process:
+                logging.info(
+                    "[af-all] IQA depth-gate ENABLED (MUSIQ/NIQE replace "
+                    "MAE): musiq_tol=%.2f niqe_tol=%.2f late_early_drop=%.2f "
+                    "ema_decay=%.3f agree_threshold=%.2f.",
+                    self._iqa_musiq_tol, self._iqa_niqe_tol,
+                    self._iqa_late_early_drop, self._iqa_ema_decay,
+                    self._iqa_agree_threshold,
+                )
         if _tp_on:
             max_rolls = int(self._tp_depth)
         else:
@@ -8279,6 +8858,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         avg_mae = float(
             (chunk.detach().float() - gt_slice.float()).abs().mean().item()
         )
+        # Matched-clean-x: select the GT offset that best aligns the DMD band,
+        # stash it for ``_build_42f_scoring_inputs`` (clean_x / gt_target), and
+        # make the gate MAE follow the SAME offset. No-op (returns 0, None) when
+        # ``dmd_42f_clean_match_enabled`` is off, so avg_mae is unchanged then.
+        _cm_off, _cm_mae = self.model.compute_clean_match_offset(
+            chunk, info, chunks_in_ride=int(self._chunks_in_current_ride),
+        )
+        if _cm_mae is not None:
+            avg_mae = float(_cm_mae)
         t_rollout_ms = (time.monotonic() - t_rollout_start) * 1000.0
 
         # Rolling: accumulate the student's WHOLE ride rollout (rank 0,
@@ -8468,7 +9056,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     [_fr_mae], device=self.device, dtype=torch.float32)
                 dist.all_reduce(_ft, op=dist.ReduceOp.SUM)
                 _fr_mae = float(_ft.item()) / float(dist.get_world_size())
-            if not _tp_gone_hit:
+            if not _tp_gone_hit and getattr(self, "_iqa_on", False):
+                # af-all IQA-agreement ratchet (REPLACES the MAE window).
+                # Local binary agreement (most-recent generated frontier
+                # chunk vs last GT seed chunk), MEAN-reduced for DDP
+                # lockstep, then EMA'd. EMA ≥ threshold → depth +1, EMA
+                # reset (re-earn at the deeper depth). Monotonic.
+                _npb = int(self.model.num_frame_per_block)
+                _seed_lo = max(0, cf_state - _npb)
+                _agree = self._af_all_iqa_agreement(
+                    chunk, ride_window[:, _seed_lo:cf_state],
+                )
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    _at = torch.tensor(
+                        [_agree], device=self.device, dtype=torch.float32)
+                    dist.all_reduce(_at, op=dist.ReduceOp.SUM)
+                    _agree = float(_at.item()) / float(dist.get_world_size())
+                if self._iqa_agree_ema is None:
+                    self._iqa_agree_ema = _agree
+                else:
+                    _d = self._iqa_ema_decay
+                    self._iqa_agree_ema = (
+                        _d * self._iqa_agree_ema + (1.0 - _d) * _agree
+                    )
+                out["streaming_iqa_agree"] = float(_agree)
+                out["streaming_iqa_agree_ema"] = float(self._iqa_agree_ema)
+                if self._iqa_agree_ema >= self._iqa_agree_threshold:
+                    self._tp_depth += 1
+                    self._iqa_agree_ema = None  # re-earn at the new depth
+            elif not _tp_gone_hit:
                 self._tp_cur.append(_fr_mae)
                 if len(self._tp_cur) > self._tp_win:
                     self._tp_cur.pop(0)
@@ -8964,6 +9580,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["sc_dmd_weight_effective"] = float(sc_weight)
             out["sc_dmd_loss_weighted"] = float(weighted_sc.detach().item())
 
+        generator_loss = self._maybe_add_cd_loss(
+            generator_loss,
+            conditional_dict=train_info["conditional_dict"],
+            clean_latent=state["ride_latents_window"][:, cf_state:],
+            seed_frames=cf_state,
+            out=out,
+        )
+
         # Phase-LoRA ghost anchor — see ``_phase_lora_ghost_anchor``
         # for the full rationale (K+1 DDP rebuild fix).
         generator_loss = self._phase_lora_ghost_anchor(generator_loss)
@@ -9101,7 +9725,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             if _aux_open and n_total >= 1:
                 # Match the outer loop's LR-warmup schedule so every
                 # in-loop step uses the same LR that the outer loop
-                # would have applied.
+                # would have applied. Also honour the frozen-teacher schedule
+                # (linear decay to 0 by real_teacher_lr_decay_end_step, then
+                # freeze) so teacher_cadence='fake' can't silently bypass the
+                # freeze. decay_end=0 => byte-identical to before.
+                _rt_decay_f = self.real_teacher_lr_decay_end_step
+                _rt_frozen_f = (_rt_decay_f > 0 and self.step >= _rt_decay_f)
                 warm_lr = self._real_teacher_base_lr
                 if (
                     self.real_teacher_warmup_steps > 0
@@ -9110,11 +9739,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     warm_lr = self._real_teacher_base_lr * (
                         (self.step + 1) / self.real_teacher_warmup_steps
                     )
+                if _rt_decay_f > 0:
+                    warm_lr = warm_lr * max(
+                        0.0, (_rt_decay_f - self.step) / float(_rt_decay_f)
+                    )
+                if _rt_frozen_f:
+                    warm_lr = 0.0
+                    # clear the main-pass aux grad so it can't leak forward
+                    self.real_teacher_optimizer.zero_grad(set_to_none=True)
                 for pg in self.real_teacher_optimizer.param_groups:
                     pg["lr"] = warm_lr
 
                 _fired = 0
-                for i in range(n_total):
+                for i in range(0 if _rt_frozen_f else n_total):
                     if i > 0:
                         aux_loss_extra, aux_log_extra = (
                             self.model.run_extra_aux_pass(
@@ -9139,6 +9776,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             max_norm=self.real_teacher_max_grad_norm,
                         )
                         self.real_teacher_optimizer.step()
+                        # Light v14 anchor (same as the outer-loop step): pull
+                        # the LoRA delta toward 0 (= v14) after EVERY LoRA update
+                        # so teacher_cadence='fake' gets the anchor too (the
+                        # outer-loop anchor never fires under this cadence — grads
+                        # are already zeroed). Default lambda 0 => skipped.
+                        if self.real_teacher_anchor_lambda > 0.0:
+                            _keep = 1.0 - self.real_teacher_anchor_lambda
+                            with torch.no_grad():
+                                for _p in self.real_teacher_optimizer.param_groups[0]["params"]:
+                                    _p.mul_(_keep)
                         # Target-network EMA pull after every LoRA
                         # update inside the teacher_cadence='fake'
                         # inner loop. With dfake_gen_update_ratio=5
@@ -9860,6 +10507,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         weighted_sc.detach().item()
                     )
 
+                generator_loss = self._maybe_add_cd_loss(
+                    generator_loss,
+                    conditional_dict=conditional_dict,
+                    clean_latent=latents,
+                    seed_frames=cf_dmdctx,
+                    out=merged,
+                )
+
                 generator_loss = self._phase_lora_ghost_anchor(
                     generator_loss
                 )
@@ -9904,6 +10559,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     merged_plain["sc_dmd_loss_weighted"] = float(
                         weighted_sc.detach().item()
                     )
+
+                generator_loss = self._maybe_add_cd_loss(
+                    generator_loss,
+                    conditional_dict=conditional_dict,
+                    clean_latent=latents,
+                    seed_frames=cf_dmdctx,
+                    out=merged_plain,
+                )
 
                 generator_loss = self._phase_lora_ghost_anchor(
                     generator_loss

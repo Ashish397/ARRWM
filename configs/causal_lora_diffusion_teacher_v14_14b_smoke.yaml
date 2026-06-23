@@ -57,7 +57,10 @@ action_dims: [2, 7]
 enable_adaln_zero: true
 action_conditioning_mode: both
 
-# LoRA adapter settings -- identical to v14 (rank 256, real target)
+# LoRA adapter settings -- real v14 rank 256. The earlier OOM was NOT the LoRA
+# (rank 256->32 freed only 0.86GB): from_pretrained loads the base in fp32 (56GB
+# at 14B). base_weight_dtype: bf16 below holds the frozen base in bf16 (28GB),
+# freeing ~28GB -> rank-256 now fits (~66GB).
 adapter:
   type: lora
   rank: 256
@@ -76,6 +79,8 @@ warmup_steps: 200
 
 # Model settings -- THE BACKBONE SWITCH
 model_name: Wan2.1-T2V-14B
+# Hold the frozen base DiT in bf16 (28GB) not fp32 (56GB) — the actual OOM cause.
+base_weight_dtype: bf16
 num_training_frames: 21
 num_train_timestep: 1000
 denoising_loss_type: flow

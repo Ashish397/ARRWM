@@ -119,6 +119,33 @@ log = logging.getLogger(__name__)
 
 NUM_CAUSAL_VIDEOS = NUM_ACTION_CHUNKS  # 7: one video per non-anchor slot to fully commit the rollout.
 
+
+def _sharpness_retention(frames_thwc, context_len):
+    """Rollout sharpness-retention metric: does the few-step AR rollout hold
+    structure or collapse to blur? Per-frame spatial sharpness = variance of a
+    finite-difference Laplacian (high-freq energy). Returns early/late means over
+    the GENERATED portion (after the seed context) and their ratio. A healthy
+    rollout keeps retention ~1.0; a collapse-to-mush drops it toward 0.
+    Pure numpy (no cv2) so it never hits the login-node thread cap.
+    """
+    g = np.asarray(frames_thwc, dtype=np.float32)
+    if g.ndim == 4:
+        g = g.mean(axis=-1)  # [T,H,W] grayscale
+    if g.ndim != 3 or g.shape[0] < 8:
+        return None
+    lap = (g[:, 2:, 1:-1] + g[:, :-2, 1:-1] + g[:, 1:-1, 2:] + g[:, 1:-1, :-2]
+           - 4.0 * g[:, 1:-1, 1:-1])
+    sharp = lap.reshape(lap.shape[0], -1).var(axis=1)            # [T] per-frame
+    roll = sharp[context_len:] if 0 < context_len < len(sharp) else sharp
+    if len(roll) < 4:
+        return None
+    q = max(1, len(roll) // 4)
+    early = float(roll[:q].mean())
+    late = float(roll[-q:].mean())
+    return {"early": early, "late": late,
+            "retention": (late / early) if early > 1e-6 else float("nan"),
+            "min": float(roll.min())}
+
 # Used only in legacy (v12 fixed-action) mode.
 FIXED_ACTION_Z2 = 0.5
 FIXED_ACTION_Z7 = 0.5
@@ -448,7 +475,30 @@ def main():
                         help="Fallback encoded-zarr root for rides not in manifest.")
     parser.add_argument("--caption_root", type=str, default=DEFAULT_CAPTION_ROOT,
                         help="Caption root (for prompt embeds + ts→ride_dir map).")
+    parser.add_argument("--ckpt_override", type=str, default=None,
+                        help="If set, use this checkpoint path instead of "
+                             "MODEL_ASSIGNMENTS[idx]['ckpt'] (keeps the arch flags "
+                             "from the assignment). Lets a watcher point ar_chain at "
+                             "an arbitrary mid-training checkpoint.")
+    parser.add_argument("--eval_steps", type=int, default=None,
+                        help="Override EVAL_STEPS (default 48) — number of uniform-in-"
+                             "shifted-sigma denoising steps. Use --denoising_step_list "
+                             "for an explicit schedule instead.")
+    parser.add_argument("--denoising_step_list", type=str, default=None,
+                        help="Comma-sep explicit timesteps high->low (e.g. "
+                             "'1000,625,312.5,178.6'). Few-step regime: overrides the "
+                             "shift=5.0 auto schedule which bunches at high t.")
     args = parser.parse_args()
+
+    # Few-step schedule overrides (mutate the eval_chain module globals that
+    # ChainPipeline.generate reads live).
+    import utils.eval_chain as _ec
+    if args.denoising_step_list:
+        _ec.EVAL_DENOISING_STEP_LIST = [float(x) for x in args.denoising_step_list.split(",")]
+        log.info("EVAL_DENOISING_STEP_LIST override: %s", _ec.EVAL_DENOISING_STEP_LIST)
+    elif args.eval_steps:
+        _ec.EVAL_STEPS = int(args.eval_steps)
+        log.info("EVAL_STEPS override: %d", _ec.EVAL_STEPS)
 
     rank = int(os.environ.get("LOCAL_RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
@@ -472,6 +522,8 @@ def main():
         assignment = MODEL_ASSIGNMENTS[args.assignment_index]
     else:
         assignment = V12_ASSIGNMENT
+    if args.ckpt_override:
+        assignment = {**assignment, "ckpt": args.ckpt_override}
     label = assignment["label"]
 
     log.info(
@@ -745,6 +797,23 @@ def main():
                 rollout_parts.append(prev_video_raws[i][lo:hi])
             rollout_cat = np.concatenate(rollout_parts, axis=0)
 
+        # SHARPNESS RETENTION — the metric the flow/ODE loss is blind to: does the
+        # few-step AR rollout keep structure or collapse to gray mush? Reported for
+        # every ar_chain run alongside ROLLOUT_METRICS, tagged with the step count
+        # so 4-step vs 48-step collapse is directly comparable.
+        try:
+            import utils.eval_chain as _ec
+            _nsteps = (len(_ec.EVAL_DENOISING_STEP_LIST)
+                       if _ec.EVAL_DENOISING_STEP_LIST is not None else _ec.EVAL_STEPS)
+            _sr = _sharpness_retention(rollout_cat, int(context_np.shape[0]))
+            if _sr is not None:
+                log.info("[SHARPNESS_RETENTION] %s %s | steps=%s sharp_early=%.1f "
+                         "late=%.1f retention=%.3f min=%.1f",
+                         label, (args.rank_tag or ""), _nsteps,
+                         _sr["early"], _sr["late"], _sr["retention"], _sr["min"])
+        except Exception as _sr_exc:
+            log.warning("sharpness retention failed: %s", _sr_exc)
+
         motion_r, teacher_z_8d_r = pipe.compute_teacher_visuals(rollout_gen)
         n_c_r = teacher_z_8d_r.shape[1]
         teacher_z2z7_r = teacher_z_8d_r[:, :, CRITIC_ACTION_DIMS]
@@ -754,6 +823,27 @@ def main():
             if cp_r is not None:
                 critic_z2z7_r = cp_r[:, :, CRITIC_ACTION_DIMS]
         target_z_r = chunk_dev_all[:, :n_c_r].contiguous()
+
+        # Per-chunk rollout metrics: do the COMMAND (target), the RENDERED
+        # egomotion (frozen CoTracker->ss_vae judge), and the CRITIC read agree?
+        try:
+            _t = target_z_r[0].float().cpu(); _r = teacher_z2z7_r[0].float().cpu()
+            _c = critic_z2z7_r[0].float().cpu() if critic_z2z7_r is not None else None
+            def _cc(a, b):
+                a = a - a.mean(); b = b - b.mean()
+                d = (a.norm() * b.norm()).clamp_min(1e-8)
+                return float((a * b).sum() / d)
+            _msg = ("[ROLLOUT_METRICS] %s %s | corr(rend,cmd) z2=%.3f z7=%.3f | "
+                    "z2 cmd=%s rend=%s | z7 cmd=%s rend=%s" % (
+                        label, (args.rank_tag or ""),
+                        _cc(_r[:, 0], _t[:, 0]), _cc(_r[:, 1], _t[:, 1]),
+                        [round(float(x), 2) for x in _t[:, 0]], [round(float(x), 2) for x in _r[:, 0]],
+                        [round(float(x), 2) for x in _t[:, 1]], [round(float(x), 2) for x in _r[:, 1]]))
+            if _c is not None:
+                _msg += " | corr(critic,judge) z2=%.3f z7=%.3f" % (_cc(_c[:, 0], _r[:, 0]), _cc(_c[:, 1], _r[:, 1]))
+            log.info(_msg)
+        except Exception as _e:  # pragma: no cover
+            log.warning("rollout metrics log failed: %s", _e)
 
         title_bits_r = [label, f"r{rank}", "rollout", cond_tag]
         if per_rank_mode and args.rank_tag:

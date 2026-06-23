@@ -60,7 +60,7 @@ def per_latent_wallclock(wall: np.ndarray, n_latents: int) -> np.ndarray:
 
 
 def build_one(ride_ts: str, forward_root: str, rear_root: str, ride_dir: str,
-              tol: float) -> dict:
+              tol: float, rear_shift_sec: float = 0.0) -> dict:
     fz = os.path.join(forward_root, f"{ride_ts}.zarr")
     rz = os.path.join(rear_root, f"{ride_ts}.zarr")
     rid = os.path.basename(ride_dir.rstrip("/")).split("_")[1]
@@ -80,16 +80,21 @@ def build_one(ride_ts: str, forward_root: str, rear_root: str, ride_dir: str,
     wc_f = per_latent_wallclock(WF, Tf)
     wc_r = per_latent_wallclock(WR, Tr)
 
+    # Apply a constant rear time-shift: the rear view lags the forward by ~0.8s
+    # (observed in the overlay videos), so match each forward latent to the rear
+    # frame at (t_forward + shift) — i.e. advance the rear so the lag is removed.
+    wc_f_match = wc_f + float(rear_shift_sec)
+
     # nearest rear latent per forward latent (wc_r is monotonic non-decreasing)
-    idx = np.searchsorted(wc_r, wc_f)
+    idx = np.searchsorted(wc_r, wc_f_match)
     idx = np.clip(idx, 1, Tr - 1)
     left = idx - 1
-    choose_left = np.abs(wc_f - wc_r[left]) <= np.abs(wc_f - wc_r[idx])
+    choose_left = np.abs(wc_f_match - wc_r[left]) <= np.abs(wc_f_match - wc_r[idx])
     j = np.where(choose_left, left, idx).astype(np.int32)
-    resid = np.abs(wc_f - wc_r[j])
+    resid = np.abs(wc_f_match - wc_r[j])
 
     lo, hi = wc_r[0] - tol, wc_r[-1] + tol
-    outside = (wc_f < lo) | (wc_f > hi) | (resid > tol)
+    outside = (wc_f_match < lo) | (wc_f_match > hi) | (resid > tol)
     j[outside] = -1
 
     n_aligned = int((j >= 0).sum())
@@ -115,6 +120,8 @@ def main() -> None:
                     help="CSV (ride_ts, video_path, ride_dir) selecting which rides to align.")
     ap.add_argument("--tol", type=float, default=0.15,
                     help="Max wall-clock residual (s) to accept a forward<->rear latent pair.")
+    ap.add_argument("--rear_shift_sec", type=float, default=0.8,
+                    help="Advance the rear view by this many seconds (rear lags forward ~0.8s).")
     ap.add_argument("--summary_json", default="data/rear_encode/alignment_summary.json")
     args = ap.parse_args()
 
@@ -122,7 +129,7 @@ def main() -> None:
     results = []
     for r in rows:
         res = build_one(r["ride_ts"], args.forward_root, args.rear_root,
-                        remap(r["ride_dir"]), args.tol)
+                        remap(r["ride_dir"]), args.tol, args.rear_shift_sec)
         results.append(res)
         tag = "OK " if res["ok"] else "SKIP"
         extra = (f"Tf={res.get('Tf')} Tr={res.get('Tr')} aligned={res.get('frac_aligned')} "

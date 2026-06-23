@@ -24,13 +24,14 @@ python utils/build_rear_alignment.py \
   --forward_root /projects/u6ex/fbots/frodobots_encoded_weu \
   --rear_root /projects/u6ex/fbots/frodobots_encoded_weu_rear \
   --csv data/rear_encode/weu_rear_smoke.csv \
-  --tol 0.15
+  --tol 0.15 \
+  --rear_shift_sec 0.8
 
 echo "== rendering overlay videos for a few good-overlap rides =="
 mkdir -p eval/dual_view
 for RT in 20240221112028 20240221112909 20240307112454 20240216103439; do
   echo "-- viz $RT --"
-  python utils/visualise_dual_view.py --ride_ts "$RT" --start 0 --n_latents 90 --fps 10 \
+  python utils/visualise_dual_view.py --ride_ts "$RT" --start 0 --n_latents 90 --fps 20 \
     || echo "viz failed for $RT (continuing)"
 done
 echo "done $(date); outputs in eval/dual_view/"

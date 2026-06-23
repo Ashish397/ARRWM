@@ -1,24 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=v14b-weunz-64gpu
+#SBATCH --job-name=v14b-critic8-curated-64
 #SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=12:00:00
+#SBATCH --time=08:00:00
 #SBATCH --requeue
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 
 # =====================================================================
-# v14b — "v14 done again, better". FRESH start from base Wan2.1-T2V-1.3B.
-#   * STATE PROBE RE-ATTACHED (state_probe_detach_taps: false) — teacher-only;
-#     DMD runs keep the detached default.
-#   * Probe guidance dialed down 0.2 -> 0.1.
-#   * 16 nodes / 64 GPUs => global batch 64 (reaches the ~0.25-epoch
-#     plateau in ~500-1000 steps; max_iters 2500, pick best ckpt).
-#   * Data: motion-curated + backward-augmented pool (wired after
-#     score-all-windows lands — until then this trains on the full manifest).
+# v14b — the critic8 winner, scaled up. FRESH start from base Wan2.1-T2V-1.3B.
+#   * Mechanism = critic8: STATE PROBE OFF, action critic ON (all 8 dims,
+#     z2/z7 up-weighted, 6 non-action dims @0.5x guidance), AdaLN + tokens ON.
+#   * 16 nodes / 64 GPUs => global batch 64. At the 2000-step cap that is
+#     ~2 passes over the 63k-window pool (vs ~1 at 8 nodes) -> more thorough
+#     use of the big high-motion+backward dataset. Step count (and thus
+#     over-training risk) is unchanged.
+#   * HARD CAP 2000 steps — more training degrades image quality.
+#   * Data: highest-motion (top ~7%) + backward-augmented curated pool
+#     (train_window_manifest = paper_assets/v14b_train_windows.json) on weunz.
 # =====================================================================
 
 set -e -o pipefail
@@ -26,7 +28,7 @@ set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
 CONFIG=configs/causal_lora_diffusion_teacher_v14b.yaml
-LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v14b_weunz
+LOGDIR=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v14b_critic8_curated
 WANDB_SAVE_DIR=wandb
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate

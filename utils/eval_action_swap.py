@@ -121,7 +121,11 @@ def main():
     num_frames = trainer.streaming_chunk_size
     cf = trainer.context_frames
     window_total = num_frames + cf
-    acrit = trainer.action_critic_dims
+    # Controllability is always measured on the commanded action dims (z2/z7 =
+    # action_dims), NOT the critic's operating dims. They coincide for every
+    # standard config; they differ for critic8 (action_critic_dims=[0..7]),
+    # where using action_critic_dims would 8-vs-2 mismatch the fed command.
+    acrit = trainer.action_dims if trainer.action_dims is not None else trainer.action_critic_dims
 
     n_rides = len(trainer.eval_dataset)
     ride_names = []

@@ -14,6 +14,7 @@ import argparse
 import logging
 import math
 import os
+import signal
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -684,6 +685,18 @@ class CausalLoRADiffusionTrainer:
             is_causal=True,
             **model_kwargs,
         )
+        # Hold the FROZEN base DiT in bf16 when requested. from_pretrained loads
+        # fp32; mixed_precision/autocast only affects compute, not stored weights.
+        # At 1.3B that's 5 vs 2.6GB (irrelevant), but at 14B it's 56 vs 28GB — the
+        # ~28GB that OOMs a 14B LoRA run. The base is frozen (LoRA-trained), so
+        # bf16 is lossless for training. Gated -> existing 1.3B runs unchanged.
+        # Done BEFORE action patches / LoRA / aux heads so only the base is cast;
+        # trainable adapters/projections/probe stay fp32 (with fp32 Adam).
+        base_wdtype = getattr(self.config, "base_weight_dtype", None)
+        if base_wdtype in ("bf16", "bfloat16"):
+            wrapper.model = wrapper.model.to(torch.bfloat16)
+            if self.is_main_process:
+                logging.info("Base DiT cast to bfloat16 (frozen-base memory saving).")
         if gradient_checkpointing:
             wrapper.model.enable_gradient_checkpointing()
 
@@ -1895,6 +1908,18 @@ class CausalLoRADiffusionTrainer:
         saved_mask = getattr(causal_model, "block_mask", None)
         causal_model.block_mask = None
 
+        # Watchdog: this eval runs on rank 0 ONLY; if its mp4-encode or W&B upload
+        # hangs (it has — job 5290964 deadlocked at the step-50 eval), the other
+        # ranks block forever at the next collective. SIGALRM converts any hang
+        # into a TimeoutError that the except-block below catches, so rank 0 always
+        # aborts the eval and rejoins the collectives. Main-thread / main-process
+        # only (which is exactly where _maybe_eval runs).
+        _eval_timeout = int(getattr(self.config, "eval_timeout_sec", 300))
+        def _eval_alarm(_sig, _frm):
+            raise TimeoutError(f"held-out eval exceeded {_eval_timeout}s — aborting to avoid DDP deadlock")
+        _prev_alarm = signal.signal(signal.SIGALRM, _eval_alarm)
+        signal.alarm(_eval_timeout)
+
         try:
             _eval_ivl = max(1, int(self.eval_interval))
             ride_idx = (step // _eval_ivl) % len(self.eval_dataset)
@@ -2027,6 +2052,8 @@ class CausalLoRADiffusionTrainer:
         except Exception as exc:
             logging.warning("Eval failed at step %d: %s", step + 1, exc, exc_info=True)
         finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, _prev_alarm)
             causal_model.block_mask = saved_mask
             if was_training:
                 wrapper.train()

@@ -1,12 +1,12 @@
-config_name: v14b-weunz
-load_checkpoint_config_name: v14b-weunz
+config_name: v14b-critic8-curated
+load_checkpoint_config_name: v14b-critic8-curated
 
 trainer: causal_lora_diffusion
 
 seed: 0
 mixed_precision: true
 autocast_dtype: bf16
-max_iters: 2500            # plateau ~500-1000 steps at global 64 (16 nodes); run long, pick best ckpt via eval
+max_iters: 2000            # HARD CAP at the sweet spot — more training degrades image quality
 log_interval: 10
 ckpt_interval: 50
 max_grad_norm: 1.0
@@ -15,7 +15,7 @@ allow_checkpoint_config_mismatch: true
 wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
 wandb_entity: ashish397-university-of-exeter
 wandb_project: frodobots_wm
-wandb_run_name: v14b-weunz
+wandb_run_name: v14b-critic8-curated
 wandb_group: causal-lora-teacher
 wandb_tags:
   - causal
@@ -25,8 +25,10 @@ wandb_tags:
   - z-critic
   - v14b
   - weunz
-  - probe-reattached
+  - critic8
+  - no-state-probe
   - motion-curated
+  - backward-augmented
 
 # Causal-specific settings
 teacher_forcing: true
@@ -99,47 +101,42 @@ model_kwargs:
   sink_size: 0
 
 # =========================================================================
-# v14b — "v14 done again, better": fresh start from base Wan2.1-T2V-1.3B.
-# Three deliberate changes vs v14:
-#   1. STATE PROBE RE-ATTACHED. The 2026-05-06 detach (state_probe_detach_taps)
-#      was the LOO-ablation mechanism and wrongly became the default, silently
-#      severing the probe from the generator in every teacher run after it.
-#      v14b sets state_probe_detach_taps: false so the probe's gradients shape
-#      the generator again (as in the original pre-detach v14). DMD runs keep
-#      the detached default (memory) — this flag is teacher-trainer only.
-#   2. Probe strength dialed DOWN from v14 (0.1/0.2) — v14's probe felt a touch
-#      over-constraining (less expressive, suppressed up/down motion).
-#   3. Data: trained on the motion-heaviest windows + backward-augmented set
-#      (curated window pool — wired after score-all-windows completes).
+# v14b — the critic8 winner, scaled up: fresh start from base Wan2.1-T2V-1.3B.
+# Mechanism = the best ablation (critic8): STATE PROBE OFF, action critic ON
+# (all 8 dims, z2/z7 up-weighted), AdaLN + action tokens ON. critic8 looked &
+# felt visually better than full v14. Paired with the highest-motion + backward
+# curated training pool (top ~7% by motion + 6x backward oversampler), and
+# capped at 2000 steps (the sweet spot — more training degrades image quality).
 # =========================================================================
 
-# Z-predictor critic (load-bearing grounding — unchanged from v14)
+# Z-predictor critic — critic8 config: ALL 8 dims, z2/z7 up-weighted in the
+# training MSE (2x), the 6 non-action dims at half guidance weight (0.5x).
 action_critic_enabled: true
-action_critic_dims: [2, 7]
+action_critic_dims: [0, 1, 2, 3, 4, 5, 6, 7]   # critic operates on all 8 dims
+action_critic_emphasis_dims: [2, 7]            # z2/z7 are the up-weighted action dims
+action_critic_action_dim_weight: 2.0           # z2/z7 weight in critic training MSE (rest 1.0)
+action_critic_extra_dim_weight: 0.25           # 0.35 x 0.25 = 0.0875 absolute guidance on the 6 scene dims (4:1 ratio)
 action_critic_z_out_dim: 8
 action_critic_z_loss_weight: 0.5
-generator_action_z_guidance_weight: 0.25
+generator_action_z_guidance_weight: 0.35  # z2/z7 guidance = 0.35 ; scene dims = 0.35 x 0.25 = 0.0875 (4:1)
 z_guidance_warmup_steps: 200
 critic_lr: 3.0e-04
 critic_updates_per_step: 2
 action_critic_base_channels: 128
 action_critic_num_blocks: 4
 
-# State action head — cross-attention probes (RE-ATTACHED + retuned)
-state_head_enabled: true
-state_probe_mode: true
-state_probe_detach_taps: false     # <-- RE-ATTACH the probe to the generator
+# State action head — FULLY OFF (the critic8 ablation: probe + guidance removed)
+state_head_enabled: false
+state_probe_mode: false
 state_probe_dim: 256
 state_probe_n_taps: 6
 state_probe_num_heads: 8
-state_head_loss_weight: 0.1         # keep supervision scaffold
+state_head_loss_weight: 0.0
 state_head_action_dim_weight: 3.0
 state_head_out_dim: 8
-
-# Frozen-readout generator guidance (dialed down vs v14's 0.2)
-state_guidance_weight: 0.1          # v14: 0.2 -> 0.1 (relax the probe's grip)
+state_guidance_weight: 0.0
 state_guidance_warmup_steps: 200
 state_guidance_action_scale: 1.0
 
 # Logging
-logdir: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14b_weunz
+logdir: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14b_critic8_curated

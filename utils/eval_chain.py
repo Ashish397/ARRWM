@@ -57,6 +57,10 @@ NUM_FRAME_PER_BLOCK = 3
 CONTEXT_FRAMES = 3
 NUM_FRAMES = 21
 EVAL_STEPS = 48
+# If set (list of timesteps high->low, e.g. [1000, 625, 312.5, 178.6]), generate()
+# uses this explicit few-step schedule instead of the shift=5.0 auto schedule
+# (which at low step counts bunches all evals at high t and never reaches clean).
+EVAL_DENOISING_STEP_LIST = None
 VIDEO_NOISE_BASE = 1_000_003
 # Training uses window_size + context_frames latents per step; need offset+24.
 STREAM_LATENT_SPAN = CONTEXT_FRAMES + NUM_FRAMES
@@ -166,6 +170,33 @@ MODEL_ASSIGNMENTS = [
     {  # index 9: v14 with critic guidance loss ablated (loo_f2); injection unchanged
         "ckpt": "logs/v14_loo_f2/causal_lora_step0004000.pt",
         "label": "v14_loo_f2",
+        "has_critic": True,
+        "has_adaln": True,
+        "has_action_tokens": True,
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
+    {  # index 10: critic8 — probe OFF, action critic on ALL 8 dims (6 @0.5x guid)
+        "ckpt": "logs/v14_loo_critic8_noprobe/causal_lora_step0002150.pt",
+        "label": "v14_loo_critic8_noprobe",
+        "has_critic": True,
+        "has_adaln": True,
+        "has_action_tokens": True,
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
+    {  # index 11: probe2dim — FULL v14 with state probe target reduced to z2/z7
+        "ckpt": "logs/v14_loo_probe2dim/causal_lora_step0002150.pt",
+        "label": "v14_loo_probe2dim",
+        "has_critic": True,
+        "has_adaln": True,
+        "has_action_tokens": True,
+        "critic_base_ch": 128,
+        "critic_res_blocks": 4,
+    },
+    {  # index 12: v14b — critic8 mechanism (probe OFF, 8-dim critic @0.35 guid) + curated high-motion+backward weunz data
+        "ckpt": "logs/v14b_critic8_curated/causal_lora_step0002000.pt",
+        "label": "v14b_critic8_curated",
         "has_critic": True,
         "has_adaln": True,
         "has_action_tokens": True,
@@ -482,7 +513,14 @@ class ChainPipeline:
     def generate(self, conditional, clean_x):
         from utils.scheduler import FlowMatchScheduler
         sched = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
-        sched.set_timesteps(num_inference_steps=EVAL_STEPS, denoising_strength=1.0)
+        if EVAL_DENOISING_STEP_LIST is not None:
+            # Explicit few-step schedule. sigma = t/1000 (the scheduler's own
+            # invariant, line 133); step() auto-finishes the last step to sigma=0.
+            ts = torch.tensor(list(EVAL_DENOISING_STEP_LIST), dtype=torch.float32)
+            sched.timesteps = ts
+            sched.sigmas = ts / float(sched.num_train_timesteps)
+        else:
+            sched.set_timesteps(num_inference_steps=EVAL_STEPS, denoising_strength=1.0)
         sched.sigmas = sched.sigmas.to(self.device)
 
         B = clean_x.shape[0]
@@ -555,10 +593,16 @@ class ChainPipeline:
         if self.action_critic is None:
             return None
         nc = latents.shape[1] // NUM_FRAME_PER_BLOCK
-        return self.action_critic(
-            latents, torch.zeros(1, nc, device=self.device),
-            chunk_z2z7[:, :nc].to(self.device),
-        )[:, :nc]
+        try:
+            return self.action_critic(
+                latents, torch.zeros(1, nc, device=self.device),
+                chunk_z2z7[:, :nc].to(self.device),
+            )[:, :nc]
+        except Exception:
+            # e.g. critic8: an 8-dim action critic vs the 2-dim z2/z7 fed here.
+            # The critic readout is an optional annotation overlay; skip it
+            # rather than aborting the whole rollout video.
+            return None
 
 
 # ---------------------------------------------------------------------------

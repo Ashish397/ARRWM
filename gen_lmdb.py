@@ -65,6 +65,7 @@ NUM_WINDOWS    = 1500
 SNAPSHOT_STEPS = [0, 18, 36, 40, 44, 46, -1]
 SAMPLE_SEED    = 20260419
 CF_Z7_THRESH   = -0.2
+CLEAN_ONLY     = False   # --clean_only: skip the counterfactual pass entirely
 
 from utils.eval_chain import (  # noqa: E402
     NUM_FRAME_PER_BLOCK,
@@ -241,6 +242,12 @@ def sample_windows_curated(rides_all, pool_json, num_windows):
     windows = wm["windows"] if isinstance(wm, dict) else wm
     # ride basename -> index in rides_all
     idx_by_base = {Path(_fix_u6ej_path(r["zarr_path"])).name: i for i, r in enumerate(rides_all)}
+    # Window ranking score: older curated pools carry an explicit "score";
+    # the v14d pool (paper_assets/v14d_train_windows.json) ranks by "motion"
+    # only. Fall back motion -> 0.0 so either schema works (the v14d pool has
+    # no "score" key and would otherwise KeyError here).
+    def _w_score(w):
+        return float(w.get("score", w.get("motion", 0.0)))
     # dedup by (basename, start), keep best score; track backward
     best = {}
     for w in windows:
@@ -248,13 +255,17 @@ def sample_windows_curated(rides_all, pool_json, num_windows):
         if base not in idx_by_base:
             continue
         key = (base, int(w["start"]))
-        if key not in best or w["score"] > best[key]["score"]:
+        if key not in best or _w_score(w) > _w_score(best[key]):
             best[key] = w
     uniq = list(best.values())
     bwd = [w for w in uniq if w.get("backward")]
     fwd = [w for w in uniq if not w.get("backward")]
-    fwd.sort(key=lambda w: -w["score"])
-    chosen = bwd + fwd[: max(0, num_windows - len(bwd))]
+    fwd.sort(key=lambda w: -_w_score(w))
+    # All backward first (guarantee reverse coverage), then top forward by
+    # score, then a FINAL hard cap at num_windows — without the cap a small
+    # num_windows (< #backward, e.g. a 5-window smoke) would return ALL
+    # backward and blow the budget.
+    chosen = (bwd + fwd[: max(0, num_windows - len(bwd))])[: num_windows]
     log.info(
         "Curated pool %s: %d unique windows -> chose %d (%d backward + %d forward)",
         pool_json, len(uniq), len(chosen), len(bwd), len(chosen) - len(bwd),
@@ -278,6 +289,16 @@ def _parse_args():
     ap.add_argument("--curated_pool", default=None,
                     help="if set, sample from this curated high-motion+backward pool JSON "
                          "instead of uniform-random windows")
+    ap.add_argument("--clean_only", action="store_true",
+                    help="generate ONLY the clean pass (no counterfactual twin). "
+                         "Spends the whole budget on distinct clean windows.")
+    ap.add_argument("--analyze_actions", action="store_true",
+                    help="don't generate; just encode z-actions for the selected "
+                         "windows and print the fwd/bwd/left/right/stationary "
+                         "breakdown, then exit (skips the teacher pipe load).")
+    ap.add_argument("--analyze_dump", default=None,
+                    help="with --analyze_actions: write per-window class rows to "
+                         "<path>.<gpu_rank>.json (for building a balanced pool).")
     return ap.parse_args()
 
 
@@ -287,21 +308,26 @@ def _parse_args():
 
 def main():
     args = _parse_args()
-    global CONFIG_PATH, MANIFEST_PATH, CKPT_PATH, LMDB_ROOT, LMDB_CF_ROOT, NUM_WINDOWS
+    global CONFIG_PATH, MANIFEST_PATH, CKPT_PATH, LMDB_ROOT, LMDB_CF_ROOT, NUM_WINDOWS, CLEAN_ONLY
     CONFIG_PATH = args.config
     MANIFEST_PATH = args.manifest
     CKPT_PATH = args.ckpt
     LMDB_ROOT = args.lmdb_root
     LMDB_CF_ROOT = args.lmdb_cf_root
     NUM_WINDOWS = args.num_windows
+    CLEAN_ONLY = bool(args.clean_only)
+    ANALYZE_ACTIONS = bool(args.analyze_actions)
+    ANALYZE_DUMP = args.analyze_dump
 
     from omegaconf import OmegaConf
-    from utils.zarr_dataset import ZarrRideDataset
+    from utils.zarr_dataset import ZarrRideDataset, _motion_capped_latents
     import zarr as zarr_lib
 
     gpu_rank = int(os.environ.get("GPU_RANK", 0))
     num_gpus = int(os.environ.get("NUM_GPUS", 4))
-    device = torch.device("cuda:0")
+    # Auto-detect: analyze-only runs (no teacher pipe) work fine on CPU,
+    # which avoids the GPU queue. Generation requires CUDA.
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     cfg = OmegaConf.load(CONFIG_PATH)
     motion_root = str(cfg.get("motion_root", "")).replace("u6ej", "u6ex")
@@ -347,15 +373,18 @@ def main():
     # -----------------------------------------------------------------------
     # Build pipeline
     # -----------------------------------------------------------------------
-    log.info("GPU %d: building v14 pipeline...", gpu_rank)
-    pipe = ChainPipeline(device)
-    pipe.build(CONFIG_PATH, use_action_tokens=True)
-    step = pipe.load_checkpoint(CKPT_PATH, {
-        "has_critic": True,
-        "has_adaln": True,
-        "has_action_tokens": True,
-    })
-    log.info("GPU %d: pipeline ready (checkpoint step %s)", gpu_rank, step)
+    pipe = None
+    step = None
+    if not ANALYZE_ACTIONS:
+        log.info("GPU %d: building v14 pipeline...", gpu_rank)
+        pipe = ChainPipeline(device)
+        pipe.build(CONFIG_PATH, use_action_tokens=True)
+        step = pipe.load_checkpoint(CKPT_PATH, {
+            "has_critic": True,
+            "has_adaln": True,
+            "has_action_tokens": True,
+        })
+        log.info("GPU %d: pipeline ready (checkpoint step %s)", gpu_rank, step)
 
     # -----------------------------------------------------------------------
     # ZarrRideDataset for z-action encoding (only over the rides this rank touches)
@@ -382,6 +411,116 @@ def main():
         ss_vae_device=str(device),
     )
     log.info("GPU %d: ZarrRideDataset ready (%d rides)", gpu_rank, len(z_ds))
+
+    # -----------------------------------------------------------------------
+    # Action-distribution analysis (no generation). Encodes z-actions for the
+    # selected windows and reports the fwd/bwd/left/right/stationary split.
+    # z[:,0]=z2 (steer), z[:,1]=z7 (throttle). Per-frame classification:
+    #   stationary: |z7|<0.1 and |z2|<0.1
+    #   forward:    |z7|>|z2| and z7> 0.1     backward: |z7|>|z2| and z7<-0.1
+    #   left:       |z2|>=|z7| and z2> 0.1    right:    |z2|>=|z7| and z2<-0.1
+    # -----------------------------------------------------------------------
+    if ANALYZE_ACTIONS:
+        import collections
+        n_lat_by_ri = {
+            ri: rides_for_ds[k]["n_latent_frames"]
+            for k, ri in enumerate(unique_ride_idxs)
+        }
+        attrs_by_ri = {
+            ri: rides_for_ds[k]["attrs"]
+            for k, ri in enumerate(unique_ride_idxs)
+        }
+        frame_ct = collections.Counter()
+        win_ct = collections.Counter()
+        zstat = collections.Counter()   # raw z2/z7 sign distribution (diagnostic)
+        dump_rows = []
+        n_win = 0
+        n_beyond = 0
+        for j, (ri, offset, _n) in enumerate(my_samples):
+            zp = rides_all[ri]["zarr_path"]
+            # Cap n_latent_frames at the MOTION-file length: encode_z_actions_window
+            # raises if asked for more latents than the motion supports. Most
+            # windows sit within the (often-shorter) motion; skip only those
+            # whose span runs past it.
+            n_cap = _motion_capped_latents(attrs_by_ri[ri], Path(motion_root))
+            if offset + STREAM_LATENT_SPAN > n_cap:
+                n_beyond += 1
+                continue
+            try:
+                z_win = z_ds.encode_z_actions_window(
+                    zp, min(n_lat_by_ri[ri], n_cap), offset, offset + STREAM_LATENT_SPAN,
+                )
+            except Exception as exc:
+                log.warning("analyze: skip %s@%d: %s", zp, offset, exc)
+                continue
+            z = z_win[:NUM_FRAMES, action_dims].float()  # [F,2]
+            z2, z7 = z[:, 0], z[:, 1]
+            a2, a7 = z2.abs(), z7.abs()
+            # Raw sign diagnostic (independent of throttle-vs-steer dominance):
+            zstat["steer_left(z2>0.1)"] += int((z2 > 0.1).sum().item())
+            zstat["steer_right(z2<-0.1)"] += int((z2 < -0.1).sum().item())
+            zstat["steer_none(|z2|<0.1)"] += int((a2 < 0.1).sum().item())
+            zstat["thr_fwd(z7>0.1)"] += int((z7 > 0.1).sum().item())
+            zstat["thr_bwd(z7<-0.1)"] += int((z7 < -0.1).sum().item())
+            zstat["thr_none(|z7|<0.1)"] += int((a7 < 0.1).sum().item())
+            zstat["TOTAL_frames"] += int(z2.numel())
+            # Turn = significant steering relative to throttle (|z2| > 0.5|z7|
+            # and |z2|>0.1), taking PRIORITY over fwd/bwd so a moving turn
+            # counts as a turn (not "forward"). Was |z2|>|z7| which dropped
+            # nearly all moving turns into 'forward'.
+            stat = (a7 < 0.1) & (a2 < 0.1)
+            turn = (~stat) & (a2 > 0.5 * a7) & (a2 > 0.1)
+            left = turn & (z2 > 0)
+            right = turn & (z2 < 0)
+            fwd = (~stat) & (~turn) & (z7 > 0.1)
+            bwd = (~stat) & (~turn) & (z7 < -0.1)
+            other = ~(stat | left | right | fwd | bwd)
+            cls = {"forward": fwd, "backward": bwd, "left": left,
+                   "right": right, "stationary": stat, "other": other}
+            for name, mask in cls.items():
+                frame_ct[name] += int(mask.sum().item())
+            # per-window dominant class (by frame count)
+            per_cls = {name: int(mask.sum().item()) for name, mask in cls.items()}
+            dom = max(per_cls.items(), key=lambda kv: kv[1])[0]
+            win_ct[dom] += 1
+            n_win += 1
+            if ANALYZE_DUMP:
+                dump_rows.append({
+                    "zarr_path": zp, "start": int(offset),
+                    "n_latent_frames": int(n_lat_by_ri[ri]),
+                    "dom": dom, "counts": per_cls,
+                })
+            if (j + 1) % 200 == 0:
+                log.info("analyze: %d/%d windows", j + 1, len(my_samples))
+        order = ["forward", "backward", "left", "right", "stationary", "other"]
+        tot_f = sum(frame_ct.values()) or 1
+        tot_w = sum(win_ct.values()) or 1
+        print("\n===== ACTION DISTRIBUTION (%d windows, %d frames; "
+              "%d skipped: span past motion) ====="
+              % (n_win, tot_f, n_beyond), flush=True)
+        print(f"{'class':<12}{'per-frame %':>14}{'(count)':>12}"
+              f"{'per-window %':>16}{'(count)':>12}", flush=True)
+        for name in order:
+            print(f"{name:<12}{100.0*frame_ct[name]/tot_f:>13.2f}%"
+                  f"{frame_ct[name]:>12}{100.0*win_ct[name]/tot_w:>15.2f}%"
+                  f"{win_ct[name]:>12}", flush=True)
+        print("=" * 66, flush=True)
+        zt = zstat.get("TOTAL_frames", 0) or 1
+        print("\n--- RAW z-sign distribution (per-frame, independent of "
+              "throttle-vs-steer dominance) ---", flush=True)
+        for k in ["steer_left(z2>0.1)", "steer_right(z2<-0.1)", "steer_none(|z2|<0.1)",
+                  "thr_fwd(z7>0.1)", "thr_bwd(z7<-0.1)", "thr_none(|z7|<0.1)"]:
+            print(f"  {k:<24}{100.0*zstat[k]/zt:>8.2f}%  ({zstat[k]})", flush=True)
+        print(f"  steer L/R ratio: {zstat['steer_left(z2>0.1)']/max(1,zstat['steer_right(z2<-0.1)']):.2f}",
+              flush=True)
+        if ANALYZE_DUMP:
+            import json as _json
+            dpath = f"{ANALYZE_DUMP}.{gpu_rank}.json"
+            with open(dpath, "w") as _f:
+                _json.dump(dump_rows, _f)
+            log.info("GPU %d: wrote %d class rows -> %s",
+                     gpu_rank, len(dump_rows), dpath)
+        return
 
     # -----------------------------------------------------------------------
     # Per-ride lazy cache (zarr group, prompt_embeds on GPU)
@@ -430,17 +569,25 @@ def main():
         clean_path = os.path.join(LMDB_ROOT,    fname)
         cf_path    = os.path.join(LMDB_CF_ROOT, fname)
 
-        if os.path.exists(clean_path) and os.path.exists(cf_path):
+        if os.path.exists(clean_path) and (CLEAN_ONLY or os.path.exists(cf_path)):
             skipped += 1
             continue
 
         try:
+            # Cap n_latent_frames at the motion-file length (encode_z_actions_window
+            # raises if asked for more latents than the motion supports). Skip the
+            # window only if its span runs past the usable motion.
+            n_cap = _motion_capped_latents(info["attrs"], Path(motion_root))
+            if offset + STREAM_LATENT_SPAN > n_cap:
+                skipped += 1
+                continue
+
             g = info["zarr_group"]
             lat_np = g["latents"][offset:offset + NUM_FRAMES]
             clean_x = torch.from_numpy(lat_np.astype(np.float32)).unsqueeze(0).to(device)
 
             z_win = z_ds.encode_z_actions_window(
-                info["zarr_path"], info["n_lat"],
+                info["zarr_path"], min(info["n_lat"], n_cap),
                 offset, offset + STREAM_LATENT_SPAN,
             )
             z_clean = z_win[:NUM_FRAMES, action_dims].unsqueeze(0).to(
@@ -484,7 +631,7 @@ def main():
                 )
 
             # ---- Counterfactual pass (shares noise_seed with clean pass) ----
-            if not os.path.exists(cf_path):
+            if not CLEAN_ONLY and not os.path.exists(cf_path):
                 z_cf = apply_counterfactual(z_noisy)
                 cond_cf = pipe.build_conditional(
                     info["prompt_embeds"], z_cf, z_clean,

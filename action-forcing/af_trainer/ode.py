@@ -81,7 +81,16 @@ def _init_distributed() -> tuple:
         local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
         torch.cuda.set_device(local_rank)
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://")
+            # Generous timeout: rank 0 runs a long in-loop eval (2x generate +
+            # VAE decode + cotracker + the Madrid AR rollout + per-frame IQA +
+            # wandb upload) while ranks 1..N wait at the post-eval barrier. The
+            # NCCL/c10d default (~10 min) can expire during a slow first eval
+            # and abort the group; 60 min is comfortably above worst-case.
+            from datetime import timedelta
+            dist.init_process_group(
+                backend="nccl", init_method="env://",
+                timeout=timedelta(minutes=60),
+            )
         return rank, world_size, local_rank, True
     return 0, 1, 0, False
 
@@ -221,6 +230,16 @@ class Trainer:
         if self.model.use_motion_pipeline:
             self.model.ensure_motion_pipeline(distributed=self.is_distributed)
 
+        # Pre-warm pyiqa MUSIQ/NIQE on rank 0 OUTSIDE any barrier. These weights
+        # download lazily on first use; if that first use is the in-loop Madrid
+        # eval (under the post-eval barrier), the download can push rank-0 past
+        # the NCCL barrier timeout while the other ranks wait. Warm it here.
+        if self.is_main and bool(getattr(config, "madrid_chain_eval_enabled", False)):
+            try:
+                self._ensure_iqa_metrics()
+            except Exception as _iqa_exc:  # noqa: BLE001 — optional diagnostic
+                log.warning("pyiqa pre-warm failed (non-fatal): %r", _iqa_exc)
+
         # ------------------------------------------------------------------
         # Optimisers
         # ------------------------------------------------------------------
@@ -241,6 +260,7 @@ class Trainer:
             max_pair=int(getattr(config, "max_pair", 0)) or None,
             require_cf=bool(getattr(config, "require_cf", True)),
             allow_cf_fallback=bool(getattr(config, "allow_cf_fallback", False)),
+            clean_only=bool(getattr(config, "clean_only", False)),
             max_consecutive_same_fail=int(
                 getattr(config, "dataset_max_consecutive_same_fail", 5)
             ),
@@ -699,11 +719,18 @@ class Trainer:
         """
         critic_ddp = self.model.action_critic
         cm = self._critic_base()
+        # NOTE: do NOT short-circuit on ``not chunk_mask.any()``. The critic is
+        # a SEPARATELY DDP-wrapped module whose forward+backward launches an
+        # all-reduce collective. ``chunk_mask`` is drawn from a per-rank random
+        # pool_idx, so an empty mask on ONE rank (while others are non-empty)
+        # would make that rank skip the collective -> 32-rank deadlock. The
+        # masked-mean below uses ``denom.clamp_min(1.0)``, so an all-empty mask
+        # yields a well-defined 0 loss / 0 grad — safe to run unconditionally.
+        # Only the config-level (rank-symmetric) None checks may early-return.
         if (
             critic_ddp is None
             or teacher_z_8d is None
             or self.critic_optimizer is None
-            or not chunk_mask.any()
         ):
             return {}
 
@@ -847,6 +874,25 @@ class Trainer:
         if isinstance(per_chunk_clean, torch.Tensor):
             for i in range(per_chunk_clean.shape[0]):
                 out[f"train/per_chunk_ode_mse_c{i}"] = float(per_chunk_clean[i].item())
+
+        # Online dual-CD losses (Causal-Forcing++ teacher-CD + student self-CD).
+        # These keep tightening even when the ODE-regression MSE plateaus early,
+        # so they're the clearest training-time progress signal. Computed in the
+        # model's generator_loss; surface them here.
+        for _k in ("cd_teacher_loss_raw", "cd_student_loss_raw",
+                   "cd_term_weighted", "cd_weight_effective"):
+            if _k in logs:
+                out[f"train/{_k}"] = float(logs[_k])
+
+        # Latent high-frequency energy of the predicted x0 (clean branch): a
+        # cheap, no-decode sharpness proxy. ODE-MSE is low-freq-dominated and
+        # flattens fast; this keeps rising as the student learns fine detail.
+        _px = logs.get("pred_x0_detached_clean")
+        if isinstance(_px, torch.Tensor) and _px.dim() == 5:
+            _f = _px.float()
+            _dh = (_f[..., 1:, :] - _f[..., :-1, :]).abs().mean()
+            _dw = (_f[..., :, 1:] - _f[..., :, :-1]).abs().mean()
+            out["train/pred_x0_hf_energy"] = float((_dh + _dw).item())
 
         # Teacher-z per-dim mean diagnostics (motion-pipeline signal sanity).
         def _tz_mean(tz: Any, dim: int) -> float:
@@ -994,6 +1040,299 @@ class Trainer:
         self._run_eval_with_barriers(tag="smoke_eval")
         self._log("Startup smoke: OK.")
 
+    # ------------------------------------------------------------------
+    # Optional: in-loop causal-chain (AR rollout) eval on the Madrid ride
+    # ------------------------------------------------------------------
+
+    def _ensure_iqa_metrics(self):
+        """Lazily build + cache the pyiqa MUSIQ/NIQE metrics on ``self``.
+
+        Built once on the eval device and reused across evals. Returns the
+        ``(musiq, niqe)`` tuple, or ``(None, None)`` if pyiqa is unavailable
+        (in which case the chain eval still logs the video, just no IQA).
+        """
+        if getattr(self, "_iqa_metrics", None) is not None:
+            return self._iqa_metrics
+        musiq = niqe = None
+        try:
+            import pyiqa  # local import: not a hard dependency for import-time
+            musiq = pyiqa.create_metric("musiq", device=self.device)
+            niqe = pyiqa.create_metric("niqe", device=self.device)
+        except Exception as exc:
+            log.warning("[madrid_chain] pyiqa metrics unavailable (%r); "
+                        "skipping IQA, will still log the rollout video.", exc)
+        self._iqa_metrics = (musiq, niqe)
+        return self._iqa_metrics
+
+    @torch.no_grad()
+    def _madrid_ar_rollout(
+        self,
+        prompt_embeds: torch.Tensor,    # [1, L, D]
+        noisy_fa_full: torch.Tensor,    # [1, total_frames, A]
+        initial_latents: torch.Tensor,  # [1, npb, C, H, W]  (1 GT chunk seed)
+        num_gen_chunks: int,
+        fifo_size: int = 3,
+    ) -> torch.Tensor:
+        """Minimal per-pass AR-refresh rollout on the LIVE student model.
+
+        Mirrors ``utils/eval_causal_AR_chain.py``'s ``per_pass`` recipe but
+        runs against the in-memory ``self.model.generator`` (DDP-wrapped
+        student DiT) — NO checkpoint is reloaded. Every denoise step runs
+        the train-path forward (``clean_x=None``, ``kv_cache=None``) over a
+        ``(N+1)*npb``-frame window so context K/V are recomputed from raw
+        latents each pass (chain-style freshness). Returns
+        ``[1, npb + num_gen_chunks*npb, C, H, W]`` (GT seed at the front).
+        """
+        model = self.model
+        npb = int(model.num_frame_per_block)
+        device = self.device
+        dtype = self.dtype
+
+        # The generator is DDP-wrapped (see __init__), but this eval is
+        # RANK-0 ONLY: calling the DDP forward here would launch a collective
+        # with no peers and hang, and ``DDP.model`` doesn't exist. Unwrap to
+        # the raw generator module for both attribute access and forward.
+        gen = self._gen_base()
+        base_dit = gen.model
+        if hasattr(base_dit, "get_base_model"):
+            base_dit = base_dit.get_base_model()
+
+        ts = model.denoising_step_list.detach().to(device=device, dtype=torch.float32)
+        ts, _ = torch.sort(ts, descending=True)
+        scheduler = model.scheduler
+        scheduler.sigmas = scheduler.sigmas.to(device)
+
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        noisy_fa_full = noisy_fa_full.to(device=device, dtype=dtype)
+        seed = initial_latents.to(device=device, dtype=dtype)
+        B = 1
+        C, H, W = int(seed.shape[2]), int(seed.shape[3]), int(seed.shape[4])
+
+        fifo = [seed]                       # list of [1, npb, C, H, W]
+        generated = []
+        prev_window_blocks = -1
+
+        for chunk_idx in range(num_gen_chunks):
+            n_ctx = min(len(fifo), fifo_size)
+            window_blocks = n_ctx + 1
+            window_frames = window_blocks * npb
+
+            cur_lo = (1 + chunk_idx) * npb              # 1 seed chunk in front
+            cur_hi = cur_lo + npb
+            ctx_lo = cur_lo - n_ctx * npb
+
+            # Force block_mask rebuild when the window size changes (warmup
+            # while the FIFO fills). The DiT keys its cached mask only on
+            # frame_seqlen, not frame count, so we must invalidate manually.
+            if window_blocks != prev_window_blocks:
+                base_dit.block_mask = None
+                prev_window_blocks = window_blocks
+
+            ctx_cat = torch.cat(fifo[-n_ctx:], dim=1)  # [1, n_ctx*npb, C, H, W]
+            fa_window = noisy_fa_full[:, ctx_lo:cur_hi].contiguous()
+
+            # z-conditioning over the full window; the "noisy" branch keys
+            # are what the plain (clean_x=None) train path consumes.
+            cond = {"prompt_embeds": prompt_embeds}
+            if model.use_adaln and model.action_projection is not None:
+                cond["_action_modulation"] = model.action_projection(
+                    fa_window, num_frames=window_frames,
+                )
+            if model.use_action_tokens and model.action_token_projection is not None:
+                cond["_action_tokens"] = model.action_token_projection(fa_window)
+
+            t_ctx = torch.zeros(B, n_ctx * npb, device=device, dtype=torch.float32)
+            x_cur = torch.randn(B, npb, C, H, W, device=device, dtype=torch.float32).to(dtype)
+
+            pred_window = None
+            for d_idx in range(int(ts.shape[0])):
+                t_val = float(ts[d_idx].item())
+                t_cur = torch.full((B, npb), t_val, device=device, dtype=torch.float32)
+                tt = torch.cat([t_ctx, t_cur], dim=1)
+                x_full = torch.cat([ctx_cat, x_cur], dim=1)
+                with torch.amp.autocast("cuda", dtype=dtype):
+                    out = gen(
+                        noisy_image_or_video=x_full,
+                        conditional_dict=cond,
+                        timestep=tt,
+                        clean_x=None,
+                        aug_t=None,
+                    )
+                pred_window = out[1]
+                if d_idx < int(ts.shape[0]) - 1:
+                    next_t = float(ts[d_idx + 1].item())
+                    cur_pred = pred_window[:, n_ctx * npb:]
+                    flat = cur_pred.flatten(0, 1).float()
+                    flat_noise = torch.randn_like(flat)
+                    flat_t = torch.full((flat.shape[0],), next_t,
+                                        device=device, dtype=torch.float32)
+                    x_cur = (
+                        scheduler.add_noise(flat, flat_noise, flat_t)
+                        .view(B, npb, C, H, W).to(dtype)
+                    )
+
+            cur_pred = pred_window[:, n_ctx * npb:].detach()
+            generated.append(cur_pred.float())
+            if len(fifo) >= fifo_size:
+                fifo.pop(0)
+            fifo.append(cur_pred.to(dtype))
+
+        # Invalidate the mask we built — the training forward owns it.
+        base_dit.block_mask = None
+        full = torch.cat([seed.float()] + generated, dim=1)
+        return full
+
+    def _run_madrid_chain_eval(self) -> None:
+        """Roll the live student AR-refresh on the Madrid ride and log a
+        rollout video + IQA metrics to the same wandb run/step.
+
+        SAFETY: wrapped in its own try/except — logs a warning and returns
+        on ANY error. It must NEVER raise (the trainer aborts after 2
+        consecutive eval failures, and this addition must not contribute).
+        """
+        try:
+            import numpy as np
+
+            cfg = self.config
+            npb = int(self.model.num_frame_per_block)
+            num_gen_chunks = int(getattr(cfg, "madrid_chain_gen_chunks", 7))
+            fifo_size = int(getattr(cfg, "madrid_chain_fifo_size", 3))
+            offset = int(getattr(cfg, "madrid_chain_offset", 0))
+            zarr_name = str(getattr(
+                cfg, "madrid_chain_zarr", "20240216101235.zarr"))
+            encoded_root = str(getattr(
+                cfg, "madrid_chain_encoded_root",
+                "/projects/u6ex/fbots/frodobots_encoded_weunz"))
+            caption_root = str(getattr(
+                cfg, "caption_root",
+                "/projects/u6ex/fbots/frodobots_captions/train"))
+            motion_root = str(getattr(
+                cfg, "madrid_chain_motion_root",
+                "/projects/u6ex/fbots/frodobots_motion"))
+            ss_vae_ckpt = str(getattr(
+                cfg, "ss_vae_checkpoint",
+                "action_query/checkpoints/ss_vae_8free.pt"))
+            action_dims = list(getattr(cfg, "action_dims", [2, 7]))
+            fps = int(getattr(cfg, "madrid_chain_fps", 12))
+
+            total_frames = (1 + num_gen_chunks) * npb
+
+            # Load 1 GT seed chunk + the real Madrid z-action stream. This
+            # path builds its own CPU ss_vae and reads latents directly from
+            # the zarr — NO student checkpoint is reloaded.
+            import sys
+            from pathlib import Path as _Path
+            _repo = _Path(__file__).resolve().parents[2]
+            for p in (str(_repo), str(_repo / "utils")):
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            from utils.eval_causal_AR import load_per_rank_ride_ar
+
+            (
+                initial_latents_full,  # [1, total_frames, C, H, W]
+                prompt_embeds,         # [1, L, D]
+                noisy_fa_full,         # [1, total_frames, A]
+                _ride_meta,
+            ) = load_per_rank_ride_ar(
+                zarr_basename=zarr_name,
+                latent_start_offset=offset,
+                total_frames=total_frames,
+                manifest_path="",  # force disk fallback; no manifest dependency
+                encoded_root=encoded_root,
+                caption_root=caption_root,
+                motion_root=motion_root,
+                ss_vae_checkpoint=ss_vae_ckpt,
+                action_dims=action_dims,
+                device=self.device,
+            )
+
+            seed = initial_latents_full[:, :npb]
+            # Deterministic rollout noise; the outer _run_eval_once guard
+            # restores training RNG afterwards.
+            torch.manual_seed(self.global_step + 777)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.global_step + 777)
+
+            # Eval-only: the 7-chunk rollout + VAE decode must NOT build an
+            # autograd graph (it would waste ~GBs and risk OOM on the full
+            # 1.3B run). Everything here is inference; outputs are detached.
+            with torch.no_grad():
+                full_latents = self._madrid_ar_rollout(
+                    prompt_embeds=prompt_embeds,
+                    noisy_fa_full=noisy_fa_full,
+                    initial_latents=seed,
+                    num_gen_chunks=num_gen_chunks,
+                    fifo_size=fifo_size,
+                )
+                gen_latents = full_latents[:, npb:]  # drop the GT seed for scoring
+
+                # Decode to pixels (reuse the eval decode convention: prepend a
+                # dummy frame, drop it after decode; output [F, H, W, 3] uint8).
+                frozen_vae = self.model._frozen_vae
+                dummy = gen_latents[:, 0:1]
+                lat_wd = torch.cat([dummy, gen_latents], dim=1)
+                px = frozen_vae.decode_to_pixel(lat_wd.float())[:, 1:, ...]
+                vid01 = (0.5 * (px.float() + 1.0)).clamp(0, 1)  # [1, F, 3, H, W]
+                vid01 = vid01[0]                                 # [F, 3, H, W]
+            vid_np = (vid01.cpu().numpy() * 255).astype(np.uint8)
+            if vid_np.shape[1] != 3:
+                vid_np = vid_np.transpose(0, 3, 1, 2)        # ensure [F,3,H,W]
+
+            payload = {"eval/step": self.global_step}
+
+            # IQA on the decoded rollout frames ([F, 3, H, W] in [0,1]).
+            musiq, niqe = self._ensure_iqa_metrics()
+            frames01 = vid01.to(self.device)  # [F, 3, H, W]
+            n_f = int(frames01.shape[0])
+            if musiq is not None and n_f > 0:
+                try:
+                    ms = []
+                    for i in range(n_f):
+                        ms.append(float(musiq(frames01[i:i + 1]).item()))
+                    ms_arr = np.asarray(ms, dtype=np.float64)
+                    third = max(1, n_f // 3)
+                    early = float(ms_arr[:third].mean())
+                    late = float(ms_arr[-third:].mean())
+                    payload["eval/madrid_chain_musiq"] = float(ms_arr.mean())
+                    payload["eval/madrid_chain_musiq_late_minus_early"] = late - early
+                except Exception as iqa_exc:
+                    log.warning("[madrid_chain] MUSIQ failed: %r", iqa_exc)
+            if niqe is not None and n_f > 0:
+                try:
+                    ns = []
+                    for i in range(n_f):
+                        ns.append(float(niqe(frames01[i:i + 1]).item()))
+                    payload["eval/madrid_chain_niqe"] = float(
+                        np.asarray(ns, dtype=np.float64).mean())
+                except Exception as iqa_exc:
+                    log.warning("[madrid_chain] NIQE failed: %r", iqa_exc)
+
+            # Rollout video.
+            try:
+                payload["eval/madrid_causal_chain"] = wandb.Video(
+                    vid_np, fps=fps, format="mp4",
+                )
+            except Exception as vexc:
+                log.warning("[madrid_chain] video encode failed: %r", vexc)
+
+            if self._wandb_run is not None:
+                self._wandb_run.log(payload, step=self.global_step)
+            log.info(
+                "[madrid_chain step=%d] gen_chunks=%d frames=%d musiq=%s "
+                "niqe=%s late-early=%s",
+                self.global_step, num_gen_chunks, n_f,
+                payload.get("eval/madrid_chain_musiq"),
+                payload.get("eval/madrid_chain_niqe"),
+                payload.get("eval/madrid_chain_musiq_late_minus_early"),
+            )
+        except Exception as exc:
+            # NEVER propagate — this is an optional diagnostic.
+            log.warning(
+                "[madrid_chain step=%d] skipped (error: %r)",
+                getattr(self, "global_step", -1), exc,
+            )
+            return
+
     def _run_eval_once(self) -> None:
         """Actual eval body. See ``_maybe_eval`` for orchestration.
 
@@ -1012,6 +1351,14 @@ class Trainer:
         cuda_rng = torch.cuda.get_rng_state(device) if torch.cuda.is_available() else None
         try:
             self._run_eval_once_inner(pair, device)
+            # Optional in-loop causal-chain (AR-rollout) eval on the Madrid
+            # ride. Flag-gated and fully self-contained: it has its OWN
+            # try/except inside ``_run_madrid_chain_eval`` and NEVER raises,
+            # so a failure here can't trip the trainer's consecutive-eval-
+            # failure abort. Runs inside this RNG save/restore guard so its
+            # deterministic seeding cannot leak into rank-0's training RNG.
+            if getattr(self.config, "madrid_chain_eval_enabled", False):
+                self._run_madrid_chain_eval()
         finally:
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:

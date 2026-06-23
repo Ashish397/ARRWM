@@ -1,0 +1,292 @@
+config_name: action_ode_distill_F_smoke
+
+# ---------------------------------------------------------------------------
+# Action ODE distillation config (full-rank DiT, packed clean+CF forward).
+#
+# Distils the v14 teacher into an action-aware, few-step student. The
+# teacher's rank-256 LoRA is folded into the base DiT at load time via
+# ``PeftModel.merge_and_unload()`` — after that the student trains the
+# full 1.3B-parameter DiT directly (no PEFT wrapper at train time). Each
+# training step runs a *packed* clean+CF paired forward of size
+# ``2 * batch_size`` through a single DiT call; the model's
+# ``generator_loss`` returns ``L = L_clean + lambda_cf * L_cf``.
+#
+# Checkpoints saved here (``action_ode_step*.pt``) carry the full DiT
+# ``state_dict`` under the ``generator`` key and remain compatible with
+# ``utils/eval_chain.py`` (the heads share the teacher's byte layout).
+# Optimiser settings below mirror causal-forcing's ODE stage
+# (``Causal-Forcing/trainer/ode.py``) for parity.
+# ---------------------------------------------------------------------------
+
+# ---- Student training recipe ----
+trainer: ode
+
+# Random-mode denoising pool (ODE-step-value vocabulary). Aligned with
+# the Causal-Forcing teacher's ``denoising_step_list: [1000, 750, 500, 250]``
+# (see ``Causal-Forcing/configs/causal_ode_framewise.yaml``). On the
+# FlowMatchScheduler(shift=5.0, extra_one_step=True, N=48) axis used by
+# ``gen_lmdb.py`` for its 7-step trajectory, the closest stored
+# snapshots to those raw timesteps are:
+#   0  -> t = 1000.0  (pure noise;  CF=1000)
+#   36 -> t =  625.0  (near CF=750)
+#   40 -> t =  500.0  (exact CF=500)
+#   44 -> t =  312.5  (near CF=250)
+#   46 -> t =  178.6  (extra near-clean finishing step; not in CF pool
+#                      but kept so the student also trains on the
+#                      final-polish regime it will hit at eval time.)
+# ``-1`` / teacher_x0 is intentionally still omitted (timestep 0 is a
+# zero-loss identity).
+random_steps: [0, 36, 44, 46]   # 4 default rungs (was 5: dropped the eccentric t=500)
+
+# CF branch weight in the packed dual-forward loss.
+lambda_cf: 0.0   # clean_only: CF branch duplicates clean -> zero weight
+
+# How many chunks the action critic supervises per branch (top-K cleanest
+# pool entries). The critic is NEVER trained on high-noise chunks to avoid
+# corrupting its reader.
+critic_num_chunks: 3
+
+# Motion pipeline (VAE + cotracker + ss_vae) for teacher_z_8d supervision.
+use_motion_pipeline: true
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+# Warm-start the LoRA adapter (folded into the base immediately after load)
+# + action projections + state probe + critic from the v14 teacher
+# checkpoint. Re-initialising from a fresh Wan2.1 base is never desired at
+# this stage — ``load_teacher_checkpoint`` raises loudly if this path is
+# invalid or missing the 'lora' key.
+# ODE-F: distill the FIXED v14d teacher (stationary + backward work), not v14.
+generator_ckpt: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14d_critic8_natural/causal_lora_step0002150.pt
+
+# ---- Data ----
+# ODE-F: regenerated from the v14d teacher on the NATURAL-motion + backward pool
+# (gen_lmdb --config v14d --ckpt v14d --curated_pool paper_assets/v14d_train_windows.json),
+# so the ODE student finally sees stationary/backward trajectories. (prereq job)
+clean_root:   /projects/u6ex/fbots/frodobots_lmdb/v14d
+cf_root:      /projects/u6ex/fbots/frodobots_lmdb_counterfac/v14d
+caption_root: /projects/u6ex/fbots/frodobots_captions/train
+require_cf:   false
+clean_only:   true   # LMDB has no counterfactuals (clean-only gen)
+max_pair:     8                  # SMOKE: cap windows for fast data load
+
+# Per-sample data checks are soft-fail: if a single pt pair fails a
+# sanity assert (e.g. ``z_clean`` drift, ``z_noisy_cf == z_noisy``,
+# corrupt torch.load) the dataset logs a warning and advances to the
+# next sample. A systematic issue escalates to a fatal error when:
+#   - the same check tag trips ``dataset_max_consecutive_same_fail``
+#     samples in a row (default 5), or
+#   - total consecutive skips exceed
+#     ``dataset_max_consecutive_skips_total`` (default 64).
+# Either condition means the upstream data is broken; failing loud
+# avoids silently burning GPU-hours on a mostly-empty loader.
+dataset_max_consecutive_same_fail: 5
+dataset_max_consecutive_skips_total: 64
+
+# ---- Distributed / precision / housekeeping ----
+# Defaults tuned for 8 nodes x 4 GPUs = 32 ranks
+# (see sbatch/run_action_ode_distill_8n.sbatch).
+#
+# ``batch_size`` here is the number of *paired* dataset items per rank.
+# Each pair is packed into 2 DiT slots (clean + CF) inside a single
+# DiT forward, so the DiT itself sees a mini-batch of
+# ``2 * batch_size`` per step. Effective sample-views per step across
+# the cluster = ``2 * batch_size * world_size``.
+#
+# Start at ``batch_size: 1`` (DiT-B=2). Run ``action-forcing/bin/mem_probe.py``
+# on one GH200 first to see how much headroom we have: if the probe
+# shows ≥30 GB headroom at DiT-B=2, bump to ``batch_size: 2`` (DiT-B=4);
+# if it shows ≥60 GB headroom, try ``batch_size: 3`` (DiT-B=6). There is
+# no silent OOM fallback: the packed forward raises
+# ``torch.cuda.OutOfMemoryError`` loudly if the chosen value doesn't fit.
+seed: 0
+mixed_precision: true
+autocast_dtype: bf16
+batch_size: 1
+num_workers: 2
+# grad_accum is not supported (previously a silently-broken loss
+# divisor). The trainer refuses anything other than 1; use larger
+# batch_size or more DDP ranks to grow the effective batch.
+grad_accum: 1
+# Causal-forcing ODE uses max_grad_norm=10.0; full-rank gradients early
+# in training can spike well above 1.0 and would be over-clipped
+# otherwise.
+grad_clip: 10.0
+
+# ---- Schedule ----
+# With 1500 paired samples / effective batch (2*32) = 64 sample-views
+# per step, that's ~24 steps/epoch at batch_size=1. 3000 steps
+# ~= 125 epochs, healthy for a warm-start distill. Warmup is disabled
+# (critic + DiT both inherit from v14 step 6600, no cold-start to guard
+# against). Set ``warmup_steps>0`` and/or ``z_guidance_warmup_steps>0``
+# to re-enable the teacher's critic-guidance ramp; the dormant knob
+# code path is still in place.
+total_steps: 15            # SMOKE: past startup-smoke + a few train steps + one eval
+warmup_steps: 0
+z_guidance_warmup_steps: 0
+log_interval: 5
+# Unified 100-step cadence for both permanent checkpoint save and
+# distilled eval. The trainer also runs a ``_startup_smoke`` once
+# before the training loop that dry-runs both side-effects on step 0
+# so any broken eval/save path crashes in minutes rather than after
+# hours of training. With 100-step cadence over 3000 steps we'd
+# accumulate ~30 x ~17 GB = ~510 GB of snapshots; ``keep_last_ckpts``
+# rotates that down to the most recent N so we don't blow the scratch
+# quota. Set it higher if you want longer checkpoint history.
+save_interval: 1000        # SMOKE: skip mid-run saves (startup smoke dry-runs the save path)
+keep_last_ckpts: 5
+# Rolling-latest snapshot (``latest_*.pt``) is redundant when
+# ``save_interval == rolling_interval`` — the permanent save already
+# provides a snapshot at the same cadence. Leaving this at 0 disables
+# the feature to avoid a duplicate write that would only slow things
+# down. Re-enable if you later raise ``save_interval`` above 100.
+rolling_interval: 0
+auto_resume: true
+
+# ---- Distilled eval (rank-0 only, drives a 5-step student inference
+#      through clean + CF, logs side-by-side video + action diagnostics).
+eval_interval: 10   # SMOKE: one Madrid causal-chain eval + IQA at step 10
+eval_num_samples: 4
+eval_fps: 5
+
+# ---- In-loop causal-chain (AR-rollout) eval on the Madrid ride ----
+# Flag-gated, rank-0-only, fully wrapped in its own try/except (never
+# raises -> cannot trip the trainer's consecutive-eval-failure abort).
+# Rolls the LIVE in-memory student (no checkpoint reload) AR-refresh on a
+# 1-GT-chunk Madrid seed for ``madrid_chain_gen_chunks`` chunks, then logs
+# eval/madrid_causal_chain (wandb.Video), eval/madrid_chain_musiq,
+# eval/madrid_chain_niqe, eval/madrid_chain_musiq_late_minus_early.
+madrid_chain_eval_enabled: true
+madrid_chain_gen_chunks: 7
+madrid_chain_fifo_size: 3
+madrid_chain_offset: 0
+madrid_chain_fps: 12
+madrid_chain_zarr: "20240216101235.zarr"
+madrid_chain_encoded_root: /projects/u6ex/fbots/frodobots_encoded_weunz
+madrid_chain_motion_root: /projects/u6ex/fbots/frodobots_motion
+
+# ---- W&B ----
+disable_wandb: false
+wandb_project: frodobots_wm
+wandb_entity:  ashish397-university-of-exeter
+wandb_name:    action_ode_distill_F_smoke
+wandb_group:   action-forcing
+wandb_key:     998657fa4d2f50cc5d5cd33330f94255137a1221
+
+# ---- Logging ----
+logdir: /scratch/u6ex/as1748.u6ex/ARRWM/logs/action_ode_distill_F_smoke
+
+# ---------------------------------------------------------------------------
+# Mirror the teacher architecture (do not change without reason — affects
+# checkpoint compatibility with utils/eval_chain.py).
+# ---------------------------------------------------------------------------
+
+# Causal DiT settings
+num_frame_per_block: 3
+context_frames: 3
+streaming_chunk_size: 21
+num_training_frames: 21
+
+# Infinity-RoPE (Block-Relativistic RoPE) on the KV-cache inference path.
+# When true, the eval scripts (``utils/eval_causal_AR.py``,
+# ``utils/eval_causal_AR_chain.py``) install a monkey-patch on
+# ``CausalWanSelfAttention.forward`` that stores un-roped K in the cache
+# and rotates Q/cached-K with bounded window-relative indices at attention
+# time. Fixes the chunk-boundary stutter from the default cache-stale-
+# rotation path. No effect on training or chain-mode inference (those
+# don't use kv_cache). CLI flag: --infinity_rope / --no-infinity_rope.
+infinity_rope: true
+
+# Model / scheduler
+model_name: Wan2.1-T2V-1.3B
+num_train_timestep: 1000
+eval_inference_steps: 48
+gradient_checkpointing: true
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: -1
+  sink_size: 0
+
+# Action conditioning
+model_variant: action-injection
+raw_action_dim: 2
+action_dims: [2, 7]
+action_activation: silu
+enable_adaln_zero: true
+action_conditioning_mode: both
+
+# Teacher LoRA adapter descriptor.
+# TRANSIENT: consumed exactly once in ``load_teacher_checkpoint`` to
+# size + wrap the DiT with a PEFT adapter, load the teacher's rank-256
+# state into it, then call ``merge_and_unload()`` to fold the delta
+# into the base weights and strip the wrapper. Nothing below this
+# comment block is touched at train time.
+teacher_lora:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+
+# Z-predictor critic
+action_critic_enabled: true
+action_critic_dims: [2, 7]   # ODE student action stream (z_noisy) is 2-dim [z2,z7]; 14d critic8's 8-dim action_embed is shape-filtered out at load (trunk warm-starts, action_embed re-inits fresh)
+action_critic_z_out_dim: 8
+action_critic_z_loss_weight: 0.25
+generator_action_z_guidance_weight: 0.15   # half of v14d teacher (0.3), same halving convention as ODE z_loss (0.25 = half of 0.5)
+critic_lr: 3.0e-04
+critic_updates_per_step: 2
+action_critic_base_channels: 128
+action_critic_num_blocks: 4
+
+# State probe
+state_head_enabled: true
+state_probe_mode: true
+state_probe_dim: 256
+state_probe_n_taps: 6
+state_probe_num_heads: 8
+state_head_loss_weight: 0.0   # state probe OFF (zero gradient influence; module still built b/c ODE student hard-requires it)
+state_head_action_dim_weight: 0.0   # state probe is OFF
+state_head_out_dim: 8
+
+# Frozen-readout state guidance (teacher parity).
+# Pushes the DiT's pooled hidden features toward action-readable
+# content by regressing ``readout(probe_hidden).detach()`` against
+# ``state_guidance_action_scale * commanded_z``. Gradients flow only
+# through the DiT/probe backbone; the readout weights are frozen for
+# this loss path. v14 used ``state_guidance_weight: 0.5`` with a
+# linear warmup. Dormant at 0.0 (ODE-only distill); match the teacher
+# by setting to 0.5 with a 500-step warmup once we've confirmed the
+# student's base distill tracks stably.
+state_guidance_weight: 0.0   # state guidance OFF (dormant when <= 0)
+state_guidance_warmup_steps: 3      # SMOKE
+state_guidance_action_scale: 1.0
+
+# Optimiser (mirrors causal-forcing ODE stage). If training is visibly
+# too slow after the first ~500 steps and/or we bump ``batch_size``
+# above 1, consider scaling as ``sqrt(new_effective_batch / 64) * 2e-6``.
+# Don't pre-emptively change — flag first.
+lr: 2.0e-06
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+
+# ------------------------------------------------------------------
+# Online dual-CD (ODE-F): two consistency regularizers riding on the
+# GT-anchored ODE loss above (collapse-safe). See ode_regression.py
+# ``_compute_cd_losses``.
+#   * teacher-CD: a FROZEN-14d teacher (deepcopy of the merged-14d
+#     student init) takes the Euler step x_n -> x_{n+1} on the 4-step
+#     schedule; the live student's x0 at x_n must match the EMA-student's
+#     x0 at x_{n+1}. Distils the teacher's denoising path step-by-step
+#     (the ODE loss only regresses the endpoint x0).
+#   * student-CD: the STUDENT's own x0 drives the step (self-consistency:
+#     "denoise from rung n == rung n+1"). Smaller weight (riskier).
+# Frozen-14d teacher + EMA-student are resident (~+5GB), held off the
+# nn.Module registry (no optimizer / DDP / checkpoint pickup). Warmup-ramped.
+cd_teacher_loss_enabled: true
+cd_teacher_loss_weight: 0.5
+cd_student_loss_enabled: true
+cd_student_loss_weight: 0.25
+cd_loss_warmup_steps: 3      # SMOKE: activate dual-CD within the short run to exercise it
+cd_ema_decay: 0.99
