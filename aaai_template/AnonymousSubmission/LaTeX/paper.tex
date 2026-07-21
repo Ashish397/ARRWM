@@ -18,6 +18,7 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{booktabs}
+\usepackage{subcaption}
 
 \pdfinfo{
 /TemplateVersion (2026.1)
@@ -25,10 +26,12 @@
 
 \setcounter{secnumdepth}{0}
 
-\title{Grounding Control Commands in Rendered Egomotion:\\An Action-Conditioned Autoregressive World Model for Sidewalk Robots}
+\title{Action Forcing}
 
 \author{
     Anonymous Submission
+    % Please add: Prof Zhong Fan (Z.Fan@exeter.ac.uk)
+    % Please acknowledge the Isambard project(s) where appropriate
 }
 \affiliations{
     %
@@ -39,182 +42,748 @@
 \maketitle
 
 \begin{abstract}
-We study how to make a pretrained video diffusion transformer obey continuous control commands when it is turned into an autoregressive driving world model. Rather than conditioning on abstract joystick scalars, we condition on \emph{realized egomotion}---the full-frame motion that a command actually produces---extracted from optical flow and compressed by a frozen semi-supervised motion autoencoder. On top of a causal, teacher-forced flow-matching backbone, we introduce an \emph{action-grounding} objective with two complementary mechanisms: an action critic that grounds control at the output (pixel) level, and a cross-attention state probe that grounds control at the representation level. A central difficulty is evaluation: the only learned modules that read out egomotion are themselves part of training, so any metric routed through them is circular. We therefore define a \emph{counterfactual swap} metric that regenerates held-out clips under altered commands and reads the rendered egomotion with frozen, externally pretrained modules only. Under this independent metric, the full model follows steering commands at a correlation of $0.95$ and demonstrably reacts to ``stop'' commands, while leave-one-out ablations show that AdaLN modulation and critic guidance are load-bearing whereas per-frame action tokens are nearly redundant. We further characterize a systematic failure to render reverse egomotion.
+We adapt a pretrained Wan2.1 1.3B diffusion transformer (DiT) into an action conditioned world model using effectively unsupervised pedestrian real world data. World model literature largely relies on precise and accurate action labels obtained from video game controllers, driving logs, or camera rigs. An alternative family of methods choose to derive latent actions that explain changes from one latent frame to the next using complex models that lack cross context grounding. In this work we present a simple alternative - we derive our abstracted egomotion vector as principal components of simple, chunked, noisy pixel tracking outputs. PCA is linear, additive, and interpretable, offering us a myriad of benefits over more complex transformation spaces. We use teacher forcing to train multiple chunks (${\sim}0.75$\,s video chunks) simultaneously in the interest of efficiency. Decoding multiple videos and passing gradient through them is prohibitive in memory and invites the model to game the pixel tracking signal. Instead we introduce a 3D CNN based critic that learns to supervise egomotion entirely in the latent space. We train this online critic using localised samples aided by the frozen and PCA-abstracted pixel tracking pipeline.
+After training for 5000 steps, we report a resultant $r>0.98$ action following score while largely preserving underlying scene content for videos of up to 6 seconds.
 \end{abstract}
 
 \section{Introduction}
-\emph{[Draft stub --- to be completed.]} Interactive world models that predict future video from control inputs are a promising substrate for robot simulation and planning. Pretrained text-to-video diffusion transformers provide strong visual priors, but turning them into \emph{controllable} world models---models whose output reliably reflects a commanded action---remains difficult, and is hard to even measure. This paper contributes (i) an action-grounding training objective that ties a pretrained autoregressive video model to realized egomotion, and (ii) a circularity-free protocol for measuring controllability. We instantiate both on real-world sidewalk-robot teleoperation video.
+
+Video DiTs have recently found great success in generating high resolution video given some input conditions after having been trained on internet scale video for thousands of hours. While impressive, we naturally want to upgrade these models from video makers into world makers that adapt their generation to abstract egomotion inputs. World models have widely been hailed as the next level of intelligence leading to applications such as training agents / humans in silico, intelligent planning, and expansive digital twins. However, the scale of training that unsupervised training bought LLM models are hard to achieve with world models as they currently need meticulously labelled data to function, data that simply does not exist naturally - new data either needs to be painstakingly collected \cite{navwormod, cameracontrol2, cosmos2, uniwm, xworld, gaia2}, or training is relegated to the domain of videogames: \cite{gamengen2024, diamond, olafworld, mineworld, gamefactory, oasis2} synthesised worlds that can never cover the complexity and stochasticity of the real world. While some use latent action models to bridge the gap, these often prove to be complex models whose action spaces lack any meaningful grounding (cross context identifiability) \cite{genie, gamengen2024, olafworld, adaworld}. The open question thus is not whether this conversion of pretrained video models to world models is possible --- several recent systems demonstrate that it is --- but under what initial supervision this transition can be realised.
+
+Real-world data is the harder path: videogame corpora offer clean, rigid action spaces but uncanny worlds, and even high-performing navigation systems retreat to synthetic data when they can, because real egocentric motion is dominated by forward travel and, when it is not, entangled across dimensions~\cite{relic}. We instead embrace the mess. Frodobots \cite{frodobots} consists of low speed pedestrian rover footage that operate in real cities across the globe. These rovers are teleoperated across vast distances, leading to the dataset coupled commands proving unreliable and significantly laggy. Realized egomotion also diverges from commanded egomotion when collisions, bad internet, and uneven ground are met. Scenes are often full of pedestrians and actors that behave in inexplicable ways that only the real world can produce; street furniture is complex, unique, and varied. In this work we train on Frodobots but we discard the noisy action labels provided as we find that it hurts WM training more than it helps. We instead assume the videos are unsupervised and recover action signals directly from pixels instead.
+
+Doing so well rests on three simple ideas, that when adopted together we find materially improves WM training. First, we derive an interpretable action space directly from video motion: a frozen point tracker \cite{cotracker} over each chunk (lasting ${\sim}0.75$\,s) yields displacement fields whose principal components (PCA) form a linear, additive, and interpretable egomotion basis. We find that the two principal components that represent the highest variance recover the two control dimensions afforded by the ground robot. Prior flow- and track-conditioned generators recover motion from video too, but then go on to condition on raw, dense optical flow or pixel tracks~\cite{flovd, motionprompt, onlyflow}, an un-abstracted control surface that would require a translator to turn an abstract command such as go straight into a full motion field. Using PCA we sidestep the need for this complex conditioning and subsequent translation at the inference stage. 
+
+At training we use the principal components of the pixel tracks to determine the abstracted egomotion directions and we use this to train the model, obtaining the best of both worlds. We perform this supervision without ever decoding to pixels: an action critic learns how to map the generated latents' motion to the two abstracted PCA dimensions and subsequently uses the same action critic to supervise the DiT such that it learns to produce the correct egomotion. This avoids the memory cost of passing decoder gradients for tens of pixel frames simultaneously while also avoiding the model cheating by learning to control just the pixels we track. 
+
+We inject these egomotion commands simultaneously through two complementary conditioning pathways: AdaLN-zero and sideband action tokens. We show in our ablations that removing either degrades the model. AdaLN proves crucial in that ablating it removes the ability to influence the model, while action tokens are shown to make the whole model more robust and less prone to collapsing while actions become more expressive and powerful. To our knowledge, we are the first work that mixes AdaLN and action tokens as a form of dual conditioning, although dual conditioning at the time of writing has been used in two other works \cite{wovr, dexac}, albeit combining AdaLN with cross attention.
+
+We note one simplification in our setting: our rover has no neck nor a free moving camera decoupled from its body, so camera motion and agent egomotion coincide, making our control space smaller than an embodiment with an independent viewpoint. The additive structure of our basis, however, does not exclude adding further degrees of freedom to it, which we leave to future work.
+
+We therefore present a framework through which pretrained video DiTs can be transitioned into action following world models through the following contributions:
+\begin{enumerate}
+
+\item An unsupervised, interpretable egomotion action space recovered from real video via point tracking and PCA, requiring no action labels and no learned latent action model, whose additive basis cleanly separates and recombines the often entangled real world motion.
+
+\item An online latent egomotion critic that supervises action-following entirely in latent space, distilling PCA abstracted pixel tracks without backpropagating through the decoder or the tracker itself.
+
+\item A formalisation of how action conditioning perturbs a pretrained flow map, together with extended, counterfactual evaluation methods for action-forcing models.
+
+\end{enumerate}
+
+We instantiate these ideas on ${\sim}88$ hours of FrodoBots footage and adapt the Wan base model on it. We evaluate by giving the model ground truth actions as well as flipped ground truth actions and assess both the quality and the action following. We also provide the outputs from a 360 degree rotation to show consistency.
 
 \section{Related Work}
-\emph{[Draft stub --- to be completed.]} Our backbone follows causal, frame-level autoregressive video diffusion with KV-caching and attention sinks~\citep{longlive2025,diffusionforcing2024,selfforcing2025} built on a Wan2.1 diffusion transformer~\citep{wan2025,dit2023} trained with flow matching~\citep{flowmatching2023} and adapted with LoRA~\citep{lora2022}. Driving and game world models~\citep{gaia12023,gamengen2024} condition on actions but typically evaluate controllability with task-specific or learned probes; we instead measure it with frozen external modules.
 
+\paragraph{World models from pretrained video generators.}
+While earlier literature focussed on training up world models from scratch \cite{mineworld, navwormod}, contemporary literature tends to focus on adapting pretrained video DiTs \cite{wan2025, cogvid, skyreels} into action-conditioned world models. Closest to our setting are recent autoregressive egomotion or camera-action systems such as minWM, WorldCam, Astra, Matrix-Game 2.0, HY-WorldPlay, and Yume, which demonstrate that pretrained video models can be converted into controllable rollout models when supplied with camera poses, keyboard/mouse controls, game actions, or curated action annotations~\cite{minwm, worldcam, astra, matrixgame2, hyworldplay, yume}. The work closest to the foundation-model style is Cosmos-Predict2.5, which augments large-scale video pretraining with action post-training on smaller robot and driving datasets~\cite{cosmos}. Other works \cite{dws, vid2world} train action conditioning modules against well supervised action labels. To ground their actions better, some turn to video games and synthesised worlds \cite{gamefactory, matrixgame2}, trading the complexity of the real world for the well behaved action space. Others turn to instrumented camera movement trajectories \cite{cameracontrol2} and instrumented physics quantities \cite{aeroworld} derived through an onboard IMU, resulting in much better behaved action spaces but relying heavily on instrumented data.
+
+\paragraph{Latent action models}
+An alternative family of methods remove labels by learning a latent action space from video via inverse dynamics~\cite{genie, lapo, lapa, adaworld}. These are powerful without supervision, but the learned codes tend to be opaque and poorly aligned across scenes: recent analysis notes that independently learned latent actions entangle scene-specific cues and lack a shared coordinate system across contexts~\cite{olafworld}.
+
+\paragraph{Motion-conditioned generation from recovered motion.}
+There also exist other work that attempt to use unsupervised video albeit with caveats. Most works in this space largely use overactuated pixel tracks \cite{motionprompt} or high detail optical flow \cite{flovd, onlyflow} that lead to difficulties when only abstracted motion is input - whole videos or track generators then need to be used to provide an input to the model in order for it to generate videos. Videos generated with these when underactuated inputs are provided often end up looking rigid where motion tracks are not given, and overall generalisation to extended egomotion (such as constant turning for 5 seconds) are not provided. These methods also largely target interpolation via in frame object motion rather than shifting entire poses that egomotion based conditioning affords, which forces extrapolation in both time and space as new plausible content is actively generated.
+
+\paragraph{Conditioning and latent supervision.}
+Action conditioning in this space arrives through cross-attention or in-block action modules~\cite{gamefactory, matrixgame2, aeroworld}, or through geometry-specific adapters and camera-aware positional encodings~\cite{prope, cpa, cameractrl, motionctrl}. We instead route our low-dimensional egomotion through the DiT's native AdaLN pathway together with sideband action tokens; the two prior world models we are aware of with more than one action pathway pair AdaLN with cross-attention rather than tokens~\cite{wovr, dexac}. Our latent critic relates to guidance from auxiliary readouts: Aero-World is closest, using a latent probe for differentiable supervision without decoding~\cite{aeroworld}, but its probe is trained in full (on ground-truth IMU) \emph{before} use, whereas our critic is trained online alongside the generator, against the frozen PCA-abstracted pixel tracks.
 \section{Method}
 
-\subsection{Overview and Backbone}
-We adapt a pretrained Wan2.1-T2V-1.3B diffusion transformer (DiT) into a causal, action-conditioned video world model. The backbone is a frame-level autoregressive diffusion model with block-causal attention, KV-caching, short-window attention, and a frame-level attention sink, following recent streaming long-video designs~\citep{longlive2025}. We adapt the frozen DiT with LoRA adapters (rank $256$)~\citep{lora2022}; all base weights remain frozen.
-
-Let $x_{1:T}$ denote a sequence of latent video frames produced by the Wan video VAE (each frame a $16{\times}60{\times}104$ tensor). Training uses \emph{teacher forcing} over streaming windows: the model receives a short clean context of $c{=}3$ latent frames and denoises the subsequent block of frames, processing $F{=}3$ frames per causal block with a window of $21$ frames. We optimize a flow-matching objective~\citep{flowmatching2023}: with noised latents $x^\tau$ at flow time $\tau$ and target velocity $v^\star$,
+We adapt a pretrained Wan2.1-T2V-1.3B DiT into an egomotion conditioned world model using the FrodoBots dataset \cite{frodobots}, which consists of real world data taken by rovers moving about in urban cityscapes. The base model is trained by flow matching: a velocity field $v_\theta$ transports Gaussian noise $x_0$ to data $x_1$ along the rectified interpolation $x_\tau=(1-\tau)x_0+\tau x_1$ by minimising the conditional flow-matching loss
 \begin{equation}
-\mathcal{L}_\text{flow}=\mathbb{E}_{\tau}\big\| v_\theta(x^\tau,\tau,c,a)-v^\star\big\|^2 ,
-\label{eq:flow}
+    \mathcal{L}_{\mathrm{CFM}}
+    =
+    \mathbb{E}_{\tau,x_0,x_1}
+    \left[\left\| v_\theta(x_\tau,\tau) - (x_1 - x_0) \right\|_2^2\right],
+    \label{eq:cfm_loss}
 \end{equation}
-where $a$ is the action conditioning defined next and $v_\theta$ is the LoRA-adapted DiT.
+whose minimiser is the marginal velocity $\mathbb{E}[x_1-x_0 \mid x_\tau]$; a video DiT conditions this field on past frames and text. Our method has two parts: an unsupervised egomotion action space recovered from video (\S\ref{sec:pca}) and a latent critic that supervises egomotion without decoding (\S\ref{sec:critic}). The recovered action is injected into the generator through a combination of zero-initialised adaptive layer normalisation (AdaLN-Zero) and per-chunk action tokens (\S\ref{sec:planar}). Throughout, the model generates video autoregressively in short chunks, each chunk conditioned on the preceding context and a per-chunk action.
 
-\subsection{Egomotion as the Action Representation}
-A key design choice is \emph{what} the model is conditioned on. Instead of raw teleoperation scalars, we condition on the \emph{realized egomotion}: the full-frame motion the platform actually undergoes over a short horizon. For each $\sim\!0.6$\,s window ($12$ video frames at $20$\,fps, i.e.\ three latent frames) we estimate dense motion with a frozen CoTracker model~\citep{cotracker2024} on a $10{\times}10$ grid, and encode it with a frozen semi-supervised motion autoencoder (an ``ss-VAE'') into an $8$-dimensional latent $z$. Two of its dimensions are weakly supervised to align with the dominant control axes: $z_2$ (yaw / steering) and $z_7$ (forward--backward translation / throttle). Motion is aligned to video with an $0.8$\,s causal lag to account for command-to-effect delay. The conditioning command for the generated frames is $a_t=(z_{2,t},z_{7,t})$.
+\subsection{Action-Conditioned Flow}
+\label{sec:planar}
 
-Because $z$ is the motion that a command \emph{produces}, conditioning on it gives the model a direct, physically grounded control signal: matching $a_t$ requires rendering the correct parallax and the corresponding displacement of scene content, not merely a label.
+A pretrained video DiT already models a rich conditional flow: given a context $c$ of past frames, it transports sampled noise to a plausible continuation of $c$. Our goal is not to relearn this flow but to \emph{steer} it, so that the same context under different commanded egomotions produces different, controllable futures. The central premise of our method is that the action should act as a small perturbation of an already competent flow, not as a new flow learned from scratch: changing the context $c$ selects an entirely different flow path whereas changing the action $a$ only mildly redirects a given flow path. We therefore ask the model to learn a mapping from noise into a sample that follows the context \emph{and} the action, while leaving the base flow as intact as possible.
 
-\subsection{Action Injection}
-The command enters the DiT through two complementary channels (we ablate each in the Results):
-\begin{itemize}
-\item \textbf{AdaLN-Zero modulation.} A projection maps $a_t$ to per-frame shift/scale/gate parameters that modulate the DiT blocks. It is zero-initialized so conditioning starts as a no-op and is learned gradually.
-\item \textbf{Action tokens.} A second projection maps $a_t$ to one token per frame, appended to that frame's spatial token sequence.
-\end{itemize}
-
-\subsection{Action Grounding}
-Injection alone does not guarantee that the command \emph{causes} the rendered motion. We add an action-grounding objective with two mechanisms that supervise control at different levels.
-
-\paragraph{Output-level grounding (action critic).}
-A 3D-CNN critic $C_\phi$ reads the egomotion out of the \emph{generated} latents: $\hat z = C_\phi(\hat x_0, a)$, where $\hat x_0$ is the model's predicted clean sample. The critic is trained (separate optimizer, two updates per generator step) to match a frozen teacher reading $z^\star$ obtained by running the same frozen CoTracker$\rightarrow$ss-VAE pipeline on $\hat x_0$:
+We write this action-conditioned velocity field as a base flow plus an action dependent residual. Let $c$ denote the conditioning context, a short history of frames. $a$ denotes the action we pass in and let $t$ be diffusion time while $x\_t$ equals the initial sample we pass in.
 \begin{equation}
-\mathcal{L}_\text{crit}=\big\| C_\phi(\hat x_0,a)-z^\star\big\|^2_w ,
-\end{equation}
-($\|\cdot\|_w$ up-weights $z_2,z_7$). A frozen copy of the critic then \emph{guides the generator}: gradients flow through $\hat x_0$ so the rendered frames are read as matching the command,
-\begin{equation}
-\mathcal{L}_\text{zg}=\big\| C_{\bar\phi}(\hat x_0)_{\{2,7\}}-a\big\|^2 .
+    \begin{aligned}
+        v_\theta(x_t,t,c,a)
+        \;=\;&
+        \underbrace{v_0(x_t,t,c)}_{\text{context flow}} \\
+        &+\;
+        \underbrace{r_\theta(x_t,t,c,a)}_{\text{action residual}}, \\[4pt]
+    \end{aligned}
+    \label{eq:residual_flow}
 \end{equation}
 
-\paragraph{Representation-level grounding (state probe).}
-A set of cross-attention probes taps the DiT hidden states at six depths and reads out an $8$-D egomotion estimate $\hat z^P=P_\psi(h)$. An auxiliary loss $\mathcal{L}_\text{sp}=\|P_\psi(h)-z^\star\|_w^2$ shapes the representation to encode egomotion, and a frozen-readout guidance term $\mathcal{L}_\text{sg}=\|W_\text{ro}\,\bar h - a\|^2$ (with $W_\text{ro}$ frozen) pushes the generator to internally represent the command. Whereas the critic grounds the \emph{output}, the probe grounds the \emph{representation}.
+Here we restrict $r_\theta(x_t,t,c,0)=0$, thereby not diverting the flow from the underlying model when $a=0$. $v_0$ thus represents the continuation the pretrained model already produces under a no-op command. $r_\theta$ thus carries the entire effect of the action. This split is not imposed architecturally. We instead theorise that a model which learns an efficient understanding of the action space will learn an implicit $r_\theta$ that redirects the flow without disrupting the maps it acquired during pretraining. We study this implicit model and the conditions under which it can be optimised. We insert actions through a dual pathway of per-chunk action tokens and zero-initialised adaptive layer normalisation.
 
-\paragraph{Training objective.}
-The total loss combines the flow objective with the grounding terms,
+In order that $r_\theta$ redirects the flow smoothly and predictably, the action space needs to be smooth and differentiable. This is preferable to a discrete action space as it allows for $r_\theta$ to be interpolatable, whereas a discrete action space would result in the model having to learn multiple disparate instantiations of $r_\theta$. Locally,
 \begin{equation}
-\mathcal{L}=\mathcal{L}_\text{flow}
-+\lambda_\text{zg}\mathcal{L}_\text{zg}
-+\lambda_\text{sp}\mathcal{L}_\text{sp}
-+\lambda_\text{sg}\mathcal{L}_\text{sg},
+    r_\theta(x_t,t,c,a) \;\approx\; B_\theta(x_t,t,c)\,a,
+    \label{eq:local_linear_residual}
 \end{equation}
-with $\lambda_\text{zg}{=}0.25$, $\lambda_\text{sp}{=}0.1$, $\lambda_\text{sg}{=}0.2$; the critic loss $\mathcal{L}_\text{crit}$ (weight $0.5$) updates only $\phi$. Guidance terms are linearly warmed up. We use AdamW (generator $5{\times}10^{-5}$, critic $3{\times}10^{-4}$), bf16, and gradient checkpointing.
+where $B_\theta$ is a scene conditioned operator mapping a change in the action to a change in the velocity field. A linear response of this form is not strictly necessary, but it lets a single $B_\theta$ serve the whole action space rather than a separately-tuned response per command, yielding a globally consistent residual and the sample efficiency that follows from it. This same linearity makes actions composable: a compound command is the sum of its parts, $a_{FR} = a_F + a_R$, and the induced redirection decomposes accordingly, so the two basis fields $\{b^{\mathrm{fwd}}_\theta, b^{\mathrm{yaw}}_\theta\}$ span the whole action space rather than one field per command.
 
-\section{Results}
+Whether $r_\theta$ responds linearly to the action is not a property of the network but of how we \emph{parametrise} the action. A poorly chosen coordinate space (for example nonlinear in the underlying motion or entangling separate egomotions) would force $B_\theta$ to vary sharply with $a$, collapsing the local model of Eq.~\eqref{eq:local_linear_residual} and returning us to a distinct redirection per command. We therefore design the action space (\S\ref{sec:pca}) so that a linear response is \emph{possible}, and treat its realisation as an empirical claim to be verified rather than assumed.
 
-\subsection{Experimental Setup}
-\paragraph{Data.} We train on FrodoBots sidewalk-robot teleoperation video~\citep{frodobots2024}, using a three-city subset (Madrid, Rome, Stockholm): $574$ rides, $81.5$ hours, $\sim\!70$K streaming windows. Four held-out rides (one per city plus an extra) are used for evaluation. All models are trained from the frozen base Wan weights; ablations are run for $4{,}000$ steps each (controllability saturates well before this).
+\paragraph{Invertibility.} Because the action is a linear projection of zero-mean tracked motion, the reverse of any egomotion projects to the negated action: if $a=U_2^\top\tilde m$ then the reversed motion $-\tilde m$ maps to $-a$. Every command therefore has an inverse, and that inverse is the physically reversed egomotion. Under the local model of Eq.~\eqref{eq:local_linear_residual} this transfers to the flow,
+\begin{equation}
+    r_\theta(x_t,t,c,-a) \;\approx\; -\,r_\theta(x_t,t,c,a),
+    \label{eq:residual_antisymmetry}
+\end{equation}
+so the redirection induced by $-a$ opposes that induced by $a$. We stress that this is a property that can emerge out of any action coordinate system defined in such a way: around a zero centered mean while preserving proportionality and smoothness. Whether our trained $v_\theta$ recovers it, particularly for the scarce reverse motion, is an empirical question we test in \S\ref{sec:eval}. The possibility thus to interpolate between different actions is afforded by this definition of the action space. This symmetry also allows us to recover rarer or less represented actions by learning their more popular inverse actions, in theory the abundant forward data can already define the reverse response by interpolation through negation.
 
-\paragraph{An independent controllability metric.} No standard action-following metric exists for this setting, and the natural candidates---our critic and probe---are trained \emph{inside} the model, so any score routed through them is circular. We therefore define a \emph{counterfactual swap} protocol scored only by frozen, externally pretrained modules. For each held-out clip we fix the clean context and the initial sampling noise and regenerate the continuation under four commands: \textsc{true} (the real egomotion), \textsc{zero} (no motion), \textsc{flip} ($-a$), and \textsc{shuffle} (time-permuted). We then read the \emph{rendered} egomotion of each generation with the frozen CoTracker$\rightarrow$ss-VAE pipeline (untrained by the run) and compare it to the command. Reusing the initial noise across conditions isolates the causal effect of the command. We report Pearson correlation between rendered and commanded egomotion, per control axis, averaged over rides and seeds.
+\subsection{Data Derived Action Space}
+\label{sec:pca}
 
-\subsection{The Model Is Controllable (Independently Verified)}
-Table~\ref{tab:cond} reports correlation between the rendered egomotion and the \emph{true} command across conditions, under the frozen judge. For the full model the rendered motion tracks the true command ($0.74$ pooled across axes) and \emph{deviates} when the command is corrupted---the counterfactual signature of genuine control: \textsc{flip} drops the correlation to $0.14$ and \textsc{zero} to $0.67$. Broken out by axis (Table~\ref{tab:ablation}), the full model follows steering at $r{=}0.945$ and throttle at $r{=}0.751$. These numbers use no trained component in the judge.
+Section~\ref{sec:planar} required an action space that is grounded, smooth, linear, and invertible. We now construct one directly from video motion. Grounding, linearity, and invertibility follow by construction from projecting centred motion onto a linear basis; what the data must supply is that egomotion is recoverable at all and that it forms a coherent, dominant direction of variance, which we show it does.
+
+In order to get fundamental movement signals, we use a pretrained off-the-shelf pixel tracking model \cite{cotracker} on a fixed $10\times10$ grid of starting pixels indexed by $j=1,\dots,100$. For every $0.75$\,s chunk, represented by 3 latent frames spanning 12 pixel frames, the tracker follows each grid point across the chunk and we record its net displacement, given by the change in the point's image position from the start to the end of the chunk.
+\begin{equation}
+    \delta_j \in \mathbb{R}^2 ,
+    \qquad j = 1,\dots,100,
+\end{equation}
+We concatenate these into a single movement vector
+\begin{equation}
+    m =
+    \begin{bmatrix}
+        \delta_1 & \delta_2 & \cdots & \delta_{100}
+    \end{bmatrix}^{\top}
+    \in \mathbb{R}^{200}.
+    \label{eq:movement_vector}
+\end{equation}
+The chunk length trades off two pressures: it must be long enough that displacement rises clearly above tracker noise and expresses the egomotion, yet short enough that motion is approximately constant within the chunk, so a single action describes it and consecutive chunks compose. We find $0.75$\,s satisfies both.
+
+When taken over a single chunk, $m$ describes how 100 grid points move as the video evolves. Semantically however, these points lie on underlying objects, surfaces, and scene regions, each with their own motion. This entanglement of egomotion with independent object motion is precisely why trajectory- and object-control methods often suppress or filter out camera motion, isolating in-frame object motion against a near-static background~\cite{tora, dragnuwa}. We take the opposite view though: egomotion is the signal we want, and independent object motion is the signal we would like to discard. The two can be separated statistically. Egomotion imposes a frame global displacement pattern whereas independent object motion and tracking noise are specific and local to objects, differing from point to point and scene to scene. Thus, the variance present in pixel motion at a dataset level produces concentrates into a few dominant directions, directions of travel naturally present in the dataset. The motions local to specific chunks tend to disappear as the analysed dataset grows larger. 
+
+We formalise this below. Writing the displacement of grid point $j$ in chunk $n$ of scene $s$ as a sum of an egomotion-induced term and terms independent of the rover,
+\begin{equation}
+    \delta_{s,n,j}
+    =
+    E_j(c_{s,n})\, a_{s,n}
+    \;+\;
+    \rho_{s,n,j}
+    \;+\;
+    \varepsilon_{s,n,j},
+    \label{eq:point_motion_decomposition}
+\end{equation}
+where $a_{s,n}$ is the underlying rover egomotion, $E_j(c_{s,n})$ maps it into the image-plane displacement of point $j$ given the scene, $\rho_{s,n,j}$ is displacement from motion independent of the rover (a moving pedestrian, a swaying tree), and $\varepsilon_{s,n,j}$ is tracking noise.
+The operator $E_j$ carries the scene-dependent geometry of this projection: depth and parallax (near points move more than far ones), ground-plane foreshortening, and the sign inversion of egomotion (all points sweep left when the rover yaws right). It is linear in $a$ but strongly dependent on the scene $c$, consistent with the scene-conditioned operator of \S\ref{sec:planar}.
+
+We overload $\delta_{s,n}$ to denote the stacked vector of $\delta_{s,n,j}$ over all $j$, and
+centre it,
+\begin{equation}
+    \tilde \delta_{s,n} = \delta_{s,n} - \delta_0,
+    \qquad \delta_0 = \mathbb{E}_{s,n,j}\!\left[\delta_{s,n,j}\right] .
+\end{equation}
+then form the covariance pooled over the dataset. Substituting the decomposition and dropping
+cross terms, where independent motion is uncorrelated with egomotion, gives
+\begin{equation}
+    \begin{aligned}
+        C
+        &= \mathbb{E}\!\left[\tilde \delta\,\tilde \delta^{\top}\right] \\[4pt]
+        &\approx
+        \underbrace{\mathbb{E}\!\left[E(c)\,a a^{\top} E(c)^{\top}\right]}_{\text{egomotion}}
+        \;+\;
+        \underbrace{\Sigma_\rho}_{\text{object motion}}
+        \;+\;
+        \underbrace{\Sigma_\varepsilon}_{\text{noise}} .
+    \end{aligned}
+    \label{eq:motion_covariance_decomposition}
+\end{equation}
+Note the modelling choice embedded in Eq.~\eqref{eq:point_motion_decomposition}: the map is linear in the action $a$ by construction, so every nonlinearity of the imaging process---depth, parallax, foreshortening---is confined to the scene dependence of $E_j(c)$. The action-to-motion map stays linear at every scene while the scene carries the nonlinearity, which is exactly the structure the local model of Eq.~\eqref{eq:local_linear_residual} requires.
+The egomotion term recurs across the dataset and is low-rank, concentrating its variance into a
+few directions, while the residual terms spread across many. The leading eigenvectors of $C$ are
+therefore egomotion-induced:
+\begin{equation}
+    C u_k = \lambda_k u_k .
+\end{equation}
+
+On Frodobots the leading two components emerge as forward/backward (${\sim}60\%$ of the variance)
+and yaw (${\sim}20\%$), together spanning the rover's two commanded degrees of freedom. About 1\% or less are backwards moving data but the action framing allows us to look beyond this imbalance and at a more favourable 60/20 axis-based split.
+
+\subsection{Latent Egomotion Critic without Decoder Gradients}
+\label{sec:critic}
+
+Action conditioning alone does not guarantee that the model uses the action. A rectified-flow objective can be minimized by predicting a likely continuation while partially ignoring the command. We therefore add an egomotion grounding loss which evaluates whether the generated latent video actually renders the commanded motion.
+
+A naive solution would be to decode generated latents to pixels, run the same pixel-tracking pipeline used to define the PCA action space, compare the measured motion to the command, and backpropagate through both the decoder and the tracker. This is undesirable both computationally and as an optimization target. Computationally, in our setting, differentiating through decoded pixels expands the loss interface from \(21\times16\times60\times104\) latent values to \(81\times3\times480\times832\) RGB values, a \(46\times\) increase before accounting for the additional VAE decoder and tracker activations. Optimization-wise, gradients through pixel tracking can encourage shortcut pixel-moving solutions rather than coherent holistic egomotion. We therefore do not pass generator gradients through the decoder or tracking pipeline. Instead, we use this visual pipeline only as a frozen no-gradient teacher, and distil it online into a lightweight latent-space critic.
+
+Let $c$ denote the clean latent context, $a\in\mathbb{R}^2$ the two-dimensional PCA action used
+for conditioning, and $z\in\mathbb{R}^{r}$ the retained PCA motion code used for supervision, whose
+first two dimensions are the action,
+\begin{equation}
+    a = P_2\,z,
+\end{equation}
+with $P_2:\mathbb{R}^{r}\to\mathbb{R}^{2}$ selecting the top two PCA dimensions. The generator is
+trained with the conditional flow-matching objective of Eq.~\eqref{eq:cfm_loss}, with
+$v_\theta(x_\tau,\tau,c,a)$, under the rectified-flow interpolation
+$x_\tau=(1-\tau)x_0+\tau x_1$, $x_0\sim\mathcal{N}(0,I)$. At each step the model also yields a
+clean-latent estimate, either from a short sampled rollout or, cheaply, in closed form from the
+predicted velocity:
+\begin{equation}
+    \hat{x}_0
+    =
+    x_\tau + (1-\tau)\,v_\theta(x_\tau,\tau,c,a).
+    \label{eq:predicted_clean_latent}
+\end{equation}
+
+To supervise this estimate, we reuse the action-space pipeline of \S\ref{sec:pca} as a frozen
+visual teacher: it decodes $\hat{x}_0$, tracks the pixel grid, forms the movement vector, and
+projects it into the retained PCA subspace,
+\begin{equation}
+    z^{\mathrm{teach}}
+    =
+    U_r^\top
+    \Big(
+        M\big(\mathrm{Track}(\mathrm{Dec}(\mathrm{sg}(\hat{x}_0)))\big)
+        - m_0
+    \Big)
+    \in\mathbb{R}^{r},
+    \label{eq:teacher_readout}
+\end{equation}
+where $M(\cdot)$ assembles the $200$-dimensional movement vector from the tracked grid. Noisy latents when decoded are also able to represent motion as the motion conditioning is present through a lot of the flow map. The stop-gradient $\mathrm{sg}(\cdot)$ makes the decoder, tracker, and projection forward-only label
+machinery: they produce the egomotion actually rendered by the current sample, but carry no
+generator gradient.
+
+We train a lightweight latent critic $D_\phi$ to imitate this teacher directly in latent space. The critic takes the detached generated clean latents, the current flow timestep, and the commanded action, and predicts the retained PCA motion code:
+\begin{equation}
+    \hat{z}_{\phi}
+    =
+    D_\phi(\mathrm{sg}(\hat{x}_0),\tau,a).
+\end{equation}
+It is optimized with a weighted regression loss
+\begin{equation}
+    \mathcal{L}_{\mathrm{crit}}
+    =
+    \left\|
+        W_c
+        \left(
+            \hat{z}_{\phi}
+            -
+            \mathrm{sg}(z^{\mathrm{teach}})
+        \right)
+    \right\|_2^2 .
+    \label{eq:critic_loss}
+\end{equation}
+The critic is trained online on the current generator distribution: it is not trained in a separate pass over real videos. Real data enters through the PCA basis fitted on real trajectories and through the pretrained tracker. The timestep input is included because \(\hat{x}_0\) varies in quality across the denoising trajectory; we form the teacher label only below a noise threshold \(\tau<\tau^\star\), so the critic is never trained against readouts of latents too noisy to track.
+Generator guidance then applies an exponential-moving-average copy \(D_{\bar{\phi}}\), held fixed within each generator step, to the non-detached generated latents:
+\begin{equation}
+    \hat{z}_{\mathrm{gen}}
+    =
+    D_{\bar{\phi}}(\hat{x}_0,\tau,a).
+\end{equation}
+The generator is encouraged to produce latents whose critic-predicted motion matches the commanded PCA code:
+\begin{equation}
+    \mathcal{L}_{\mathrm{act}}
+    =
+    \left\|
+        W_g
+        \left(
+            \hat{z}_{\mathrm{gen}}
+            -
+            z
+        \right)
+    \right\|_2^2 .
+    \label{eq:latent_action_loss}
+\end{equation}
+The weighting \(W_g\) places full weight on the two commanded action dimensions and lower weight on the remaining retained PCA dimensions, which regularize the generated motion without overwhelming the primary control objective.
+
+The generator gradient therefore follows only the latent critic path
+$\theta \!\rightarrow\! \hat{x}_0 \!\rightarrow\! D_{\bar{\phi}} \!\rightarrow\! \mathcal{L}_{\mathrm{act}}$,
+and never the visual teacher path through
+$\mathrm{Dec}$, $\mathrm{Track}$, and the PCA projection. The full generator objective is
+\begin{equation}
+    \mathcal{L}_{\mathrm{gen}}
+    =
+    \mathcal{L}_{\mathrm{flow}}
+    +
+    \lambda_{\mathrm{act}}
+    \mathcal{L}_{\mathrm{act}},
+    \label{eq:generator_objective}
+\end{equation}
+with the critic objective \(\mathcal{L}_{\mathrm{crit}}\) updating only \(\phi\). The decoder and
+tracker thus provide an online visual teacher of rendered egomotion but never receive or transmit
+generator gradients; the critic distils this teacher into latent space, giving the generator a
+cheap differentiable action loss while preserving the stability of the pretrained flow.
+
+Because the critic is trained on the generator's current samples before it scores them, its
+gradient is always evaluated on-distribution: it never extrapolates to latents unlike those it was
+fit on, as a judge trained once on real data or on stale generations would. This is the tracking
+property distribution-matching distillation identifies as necessary for stable
+supervision~\cite{dmd2}, and it recurs in adversarial distillation of image and video
+generators~\cite{add, apt}. 
+
+The signal remains well-posed rather than self-reinforcing because the
+critic's target is the frozen teacher's reading of the sample---an external label---not the
+critic's own response, so the generator is pushed toward the teacher-measured motion with the
+critic serving only as a continually-recalibrated differentiable proxy for it. In practice this
+keeps a dense, non-stationary signal on repeatedly-seen data, of particular use for the scarce
+reverse commands, under 1\% of the data (oversampled to ${\sim}6\%$), which are re-scored under an
+evolving critic rather than seen once.
+
+\section{Evaluation}
+\label{sec:eval}
+
+We train on a FrodoBots subset spanning eleven cities (predominantly Wellington, Blekinge, Perth, Madrid, Rome, Stockholm, and Auckland): $2{,}577$ rides and ${\sim}61$K training windows (${\sim}88$ hours of video). Backward motion is incredibly rare in most naturally collected robot data: scouring the full ${\sim}2{,}000$-hour corpus yielded barely one hour of genuine reversing ($632$ windows), which we oversample $6\times$ during training. For evaluation during training, a held-out pool of $105$ rides is reserved; the action-forcing protocol below uses stationary windows from $32$ of them, one per ride. Training-time control tests roll out from four fixed rides \emph{within} the training set, for both ground truth actions and flipped actions.
+
+We compare against sequential, interactive, action-conditioned baselines: minWM~\cite{minwm}, WorldCam~\cite{worldcam}, Astra~\cite{astra}, Matrix-Game 2.0~\cite{matrixgame2}, HY-World 1.5 WorldPlay~\cite{hyworldplay}, and Yume-1.5~\cite{yume}. None accept a low-dimensional egomotion command. minWM, WorldCam, WorldPlay and Astra are conditioned on SE(3) camera poses (standard SfM/SLAM extrinsics per frame or per latent) internally the first three convert these to per-pixel Pl\"ucker ray maps, while Astra embeds a flattened $3{\times}4$ relative pose as a 13-D per-frame token. Matrix-Game takes keyboard/mouse streams; Yume a sentence from its training-caption vocabulary. Full interface details, unit provenance, and the command files we authored are given in Appendix~\ref{app:interfaces}.
+
+We translate each compass command into each baseline's native interface at its own shipped constants and hold it constant over the rollout; realized motion for every model is read out by the same frozen pixel-space judge, making the comparison independent of the conditioning encoding.
+
+Backward commands are expressed in each model's native vocabulary at its native strength; where a released demo lacked a direction we authored the missing command files from the model's own primitives (Appendix~\ref{app:interfaces}).
+
+We ablate our model along three axes: global training batch ($16/32/64$, i.e.\ our 4-, 8-, and 16-node configurations); the number of supervised action-PCA dimensions ($2/4/8$); and the conditioning pathway, where adaptive layer norm proves load-bearing for action learning while action tokens alone are insufficient and add only a marginal benefit on top.
+
+We evaluate by action forcing: $32$ stationary windows from the held-out rides are continued under $8$ constant compass commands ($|a|{=}0.5$; $256$ rollouts per model), and the rollouts are scored for controllability and quality.
+
+For controllability we measure command following across all models, with particular attention to backward motion as this is an area of notable difficulty with real world datasets. We also track action learning through training: the flow-matching loss appears to acquire actions almost immediately, but early action following is in fact just video continuation that happens to match the commanded motion and we find that genuine command obedience emerges considerably later. Response curves showing interpolation across command strengths complete the picture, illustrating the downstream effects of having a continuous action space.
+
+Quality is harder: forced rollouts have no reference video. We split it into high-frequency collapse (blur and haze), low-frequency collapse (sharp but mangled lines and edges), and plausibility (whether generated objects belong in the scene or are merely easy to generate).
+
+\subsection{Controllability Losses}
+
+We quantify controllability as agreement between the commanded action and the
+motion actually rendered, read out for every model and every rollout by the same
+frozen pixel-space judge (CoTracker tracks projected through the fixed motion-PCA;
+\S\ref{sec:pca}). The recovered component flow fields are visualised in Fig.~\ref{fig:pca_act} (appendix). 
+
+
+
+Two complementary
+data sources are used here and two different evaluation methods follow. 
+The first is the training-time control tests, which roll out from
+fixed scenes under the ride's real command sequence (GT) and its sign-flip
+(FLIP), tracking action following as a function of training step. The second is the action forcing
+evaluation, which drives the final model checkpoints by providing as input $32$ held-out stationary scenes
+under $8$ constant compass commands. From these we report response curves across different action commands and their combinations here and we report 8-direction response stats through wedge graphs in Appendix~\ref{app:wedges}. We also perform ablations over batch scale, action-PCA
+dimensionality, and the conditioning pathway and report controllability for them as well as external baselines.
+
+\subsubsection{Training time Emergence of Command Following}
+
+We find the plain flow-matching loss is a misleading progress signal for
+control. When looking at just GT commands, the actions that naturally accompany the underlying video, the model appears to follow them almost immediately
+(Fig.~\ref{fig:following_dir}, blue). We also note that when we ablate adaptive layer norm as an action injection mechanism, the model is no longer responsive to actions but it appears on ground truth action following metrics (in Fig.~\ref{fig:abl_ada}) as though it does. We think this is because flow matching on video latents naturally reproduces the ride's
+continuation, which happens to match the commands that produced it. For yaw
+this is largely true as steering is indeed learned quickly, a testament to
+the simplicity of the action space. The FLIP branch (red), which replays the
+same rollouts with sign-flipped commands, shows the throttle axis is different:
+genuine forward--backward following emerges thousands of steps later, and only
+the counterfactual branch reveals when the command channel rather than scene
+momentum is steering generation.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/following_8node8pca_by_REALdir.png}
+\caption{Cosine agreement between commanded action and teacher-read realized motion over training (batch size 32 model); panels pool generated chunks by the real ride's direction ($n$ = chunks). Blue: GT commands; red: the same rollouts under sign-flipped (FLIP) commands. GT agreement is high immediately because flow matching reproduces the ride's continuation; genuine, counterfactual following emerges thousands of steps later. 9-point centred rolling mean.}
+\label{fig:following_dir}
+\end{figure*}
+
+The Backward panel exposes the mechanism by which this Wan 2.1 flow based model has learnt actions. Early checkpoints score highly there
+not because they obey the action commands but because continuing a backward-moving video looks like obedience, an inheritance of video-continuation pretraining. Once the action channel becomes causal, the model first averages toward the data prior, rendering every throttle command as forward motion: GT backward following starts to collapse around step ${\sim}200$ while flipped forward commands on the
+same scenes score near-perfectly, and genuine backward control is recovered
+last. Again we see that tracking purely GT actions can be deceptive: judged by GT, backward following plateaus by step
+${\sim}2{,}500$, but the counterfactual branch keeps improving until
+${\sim}3{,}500$; likewise GT dates left-steering as learned by step
+${\sim}500$, while the flipped commands show it is only genuinely obeyed from
+${\sim}1{,}800$. The diagonal panels track their commands well, showing that composability of actions is emergent from a naturally composable action space. 
+
+\textbf{Ablations}
+For this reason, we use solely flipped directional actions to quantify the ablation performance. 
+
+The conditioning pathway ablation (Fig.~\ref{fig:abl_injection}) is the
+sharpest result. With tokens only (\emph{noadaln}), the model never becomes a
+controller: counterfactual forward following is pinned near $-0.5$, indicating that it is doing the scene derived motion as the model becomes a video completor instead of a world generator. The steering
+panels oscillate around zero to the end of training. With AdaLN only
+(\emph{noatok}), following does emerge, but consistently later and lower than
+the full model: on counterfactual forward commands it crosses from
+anti-following to following roughly $700$ steps after the dual-injection
+model and converges ${\sim}0.1$ lower. Dual injection wins on both criteria
+because the two pathways are complementary: AdaLN applies the action globally,
+modulating every spatial token's normalization at every block, its ablation performance proving its importance, while the action tokens let attention condition
+locally on the command, sharpening and accelerating what AdaLN makes
+possible. Actions are a global property of the scene's motion but their visual
+evidence is local; injecting them at both scopes matches that structure.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/following_FAMILY_injection_by_REALdir.png}
+\caption{Conditioning-pathway ablation, counterfactual (FLIP) following by
+real ride direction. Dual injection (blue) converges fastest and highest on
+every axis; AdaLN-only (green) lags by hundreds of steps and converges lower;
+tokens-only (red) never learns control. Panels and smoothing as in
+Fig.~\ref{fig:following_dir}.}
+\label{fig:abl_injection}
+\end{figure*}
+
+It is interesting to note in Fig.~\ref{fig:abl_ada} that ablating Adaptive LN, while not being able to actually learn action conditioning, appears as though it has when tested on just GT actions as action tokens aid in video completion. It does not learn backwards except in short bursts but it begins to learn some relationship between the actions and the video's natural end, shown by its choppy training curve on left (which is somewhat undersampled) and its insistence on changing the original backward videos to instead go forwards, which it seems to have learnt a little bit.
+
+
+
+Interestingly, reducing the batch scale (Fig.~\ref{fig:abl_nodes}) and action PCA dimensionality separately (Fig.~\ref{fig:abl_encoders}) do not stop us from recovering the rarer backwards action; instead, they slow convergence and they reduce the speed with which the model goes backwards. The fact that all the models except the Adaptive Layer Norm ablation all recover the direction of backwards shows that the combination of the surrogate action critic based supervision and the linear and composable action dimension enable the rarer backwards actions to be learnt and these mechanisms accelerate the process to be within 5000 steps. We show the Forward and Left panels in Fig.~\ref{fig:abl_directional_control}; the full eight-direction versions are Figs.~\ref{fig:abl_nodes_full} and~\ref{fig:abl_encoders_full} in the appendix. We do however find that quality is impacted by both of these levers, as we will show in \S\ref{sec:quality}.
+
+\begin{figure}[t]
+    \centering
+
+    \begin{subfigure}[t]{0.48\columnwidth}
+        \centering
+        \includegraphics[
+            width=\linewidth
+        ]{images/following_FAMILY_nodes_by_REALdir_halved.png}
+        \caption{Batch-scale ablation.}
+        \label{fig:abl_nodes}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\columnwidth}
+        \centering
+        \includegraphics[
+            width=\linewidth
+        ]{images/following_FAMILY_encoders_by_REALdir_halved.png}
+        \caption{Action-PCA dimensionality ablation.}
+        \label{fig:abl_encoders}
+    \end{subfigure}
+
+    \caption{
+        Directional-control ablations for batch scale and action-PCA
+        dimensionality. Reducing either batch scale or action dimensionality
+        slows convergence and reduces the magnitude of backward motion, but
+        does not prevent recovery of the backward direction within
+        $5{,}000$ training steps.
+    }
+    \label{fig:abl_directional_control}
+\end{figure}
+
+The response curves (Fig.~\ref{fig:response_flip}) probe the settled response
+across the full command range; dotted lines mark the action range observed in
+the dataset. The two halves of the throttle axis come from different
+counterfactual probes: negative commands are the sign-flipped real ride
+commands of the control tests (rides are almost exclusively forward, so
+flipping yields backward), while positive commands are forced directly---
+stationary held-out seeds commanded at eight magnitudes ($0.1$--$0.8$, $132$
+rollouts per point, matched to the counterfactual bin sizes). The steer
+curves come from flipped rides, which cover both directions. Steering is
+close to linear for every ablation. Throttle is asymmetric: forward realized
+throttle rises monotonically with fitted gains of $0.94$ (batch size 64) and
+$0.79$ (batch size 32), extrapolating past the dataset ceiling of $+0.5$
+with only mild flattening (batch size 64 realizes $0.40$ at a commanded
+$0.5$ and $0.66$ at $0.8$). Backward gains are $2$--$3\times$ weaker
+($0.37$ and $0.29$): batch size 64 plateaus near $-0.2$, batch size 32 near
+$-0.1$, the remaining ablations fade toward zero (PCA2 even drifts slightly
+forward), and the tokens-only model drives forward regardless of command,
+completing the picture from Fig.~\ref{fig:abl_injection}. The asymmetry
+mirrors the near-absence of backward footage in the corpus. Per-direction
+rosettes with full per-scene distributions are in Appendix~\ref{app:wedges}.
+
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/response_complete.png}
+        \caption{Throttle response.}
+        \label{fig:response_forward}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/response_complete_steer.png}
+        \caption{Steering response.}
+        \label{fig:response_steer}
+    \end{subfigure}
+    \caption{
+        Settled counterfactual response curves: realized motion
+        (CoTracker--PCA readout) against the commanded action. Negative
+        throttle comes from sign-flipped real ride commands, positive
+        throttle from forced commands on stationary held-out seeds; steer
+        comes from flipped rides, with the sparse moderate-left band filled
+        by flip-evals on mined held-out windows. Shaded bands are $\pm 1$
+        SEM; dotted lines mark the dataset-observed action range.
+    }
+    \label{fig:response_flip}
+\end{figure*}
+
+\textbf{Other Models}
+
+Cross-model comparisons use the action-forcing protocol: the same $32$
+held-out stationary seeds, the same $8$ constant commands, and the same frozen
+pixel-space judge for every model. Because the baselines' interfaces are
+fixed-strength (\S\ref{sec:eval}), we compare at the level of direction and
+within-model asymmetries instead of raw magnitude.
+
+Every baseline is competent in steering so we move that plot to the appendix  (Fig.~\ref{fig:wedge_all_g1}), but it is backward that is interesting and some of the other models seem to struggle on, as shown by Fig.~\ref{fig:wedge_all_g0}. We also show roll behaviour in Fig.~\ref{fig:wedge_all_g6} in the appendix, as one of our PCA dimensions tracks roll well. 
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/wedge_all_g0.png}
+\caption{Throttle response ($g_0$) by commanded direction, all models. One
+translucent wedge per video (32 scenes; blue $=$ forward, red $=$ backward;
+shading depth $=$ distribution density), solid outline $=$ median, dashed
+arcs $=$ IQR; per-panel scale with the rim value in each title, so panels
+compare as shapes. Backward learning is not universal: red petals under the
+backward commands appear for ours and minWM, weakly for Matrix-Game and
+WorldPlay, and not at all for WorldCam and Astra, whose backward cells are
+forward-signed.}
+\label{fig:wedge_all_g0}
+\end{figure*}
+
+We see in Fig.~\ref{fig:response_gain_all} that backward learning is not possible across a lot of the models. Some models do exhibit capacity to learn backwards actions and respond to it but at a low strength. We show that through just changing to a smoother invertible and composable action space we end up learning backwards actions.
+
+At a commanded $-0.5$, only four of the eight models produce net reversal:
+ours ($-0.20$, $-0.17$), minWM ($-0.16$), Matrix-Game ($-0.15$) and
+WorldPlay ($-0.13$); Yume and WorldCam realize no net motion ($+0.02$,
+$0.00$) and Astra drives forward under the backward command ($+0.06$).
+Moreover, where our backward response is balanced against forward
+(${\sim}$half the forward magnitude, on both diagonals as well as the pure
+command), the reversing baselines hold it only as an isolated primitive:
+composed into a backward diagonal it collapses or flips sign
+(Fig.~\ref{fig:wedge_all_g0}). Steering, by contrast, is directionally
+correct for every model (Fig.~\ref{fig:response_eval_steer}).
+
+The graph here in Fig.~\ref{fig:response_gain_all} appears sparse when compared to the earlier response curve graph in Fig.~\ref{fig:response_flip}. This is because the other models do not have a continous action space like we do: Matrix-Game is driven by discrete keyboard flags whose magnitude is a
+hard-coded constant, Yume by text captions that carry no magnitude at all,
+and minWM, WorldPlay, WorldCam and Astra by pose steps whose sizes are fixed
+constants of their shipped interfaces. None of these admits an intermediate
+dose: each baseline can only be probed at the handful of strengths its
+interface defines, so its curve is a set of fixed clusters rather than a
+line. Our models are the exception but here we probe them at the same five
+levels as everyone else for parity.
+
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/response_curves_eval_throttle.png}
+        \caption{Throttle response.}
+        \label{fig:response_eval_forward}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/response_curves_eval_steer.png}
+        \caption{Steering response.}
+        \label{fig:response_eval_steer}
+    \end{subfigure}
+    \caption{
+        Action-forcing response curves, all models: realized motion
+        (CoTracker--PCA readout) against the commanded action, from $32$
+        stationary held-out seeds at the five signed levels of the
+        eight-direction protocol (shaded bands $\pm 1$ SEM). The baselines'
+        fixed-strength interfaces are probed at the same levels; the dotted
+        diagonal is gain $1$.
+    }
+    \label{fig:response_gain_all}
+\end{figure*}
+
+
+\subsection{Quality Losses}
+\label{sec:quality}
+
+We separate quality losses into a high-frequency component (blur, haze, contrast), which pixel statistics track well, and low-frequency failures of content, which evade them: a rollout can preserve sharpness, colour distribution, edges, and even global embeddings while its content is mangled. We therefore measure three low-frequency failure modes with dedicated instruments---corrupted \emph{geometry} (the localised over-warping egomotion models produce when re-rendering a 3D scene), \emph{implausible or relocated content} (VLM probes and a geometric place verifier), and \emph{novelty} (a generation-rate meter that catches the degenerate model which passes every check by generating nothing).
+
+\subsubsection{High Frequency Losses}
+
+We measure per-frame pixel statistics (intensity moments, dark-channel veiling \cite{darkchannel}, Laplacian-variance sharpness) at a $t{=}1$\,s baseline and at the end of generation, taking deltas relative to sibling rollouts of the same scene so that legitimate content changes and source defects (lens water, present in ${\sim}12\%$ of clips) cancel out. Scored against a human-annotated subset (84 rollouts), sibling-relative sharpness loss is the strongest haze correlate ($0.86$ AUC, ahead of veiling $0.83$ and contrast $0.79$), and we adopt it as the haze metric. It cleanly separates the ablations (Table~\ref{tab:quality_ablation}): batch size 16 hazes in $47\%$ of rollouts and \texttt{pca2} in $20\%$, while the full-capacity variants stay below $3\%$.
+
+
+
+The external baselines do not haze---untrained on this noise, they either shed it or collapse outright---so the low-frequency instruments below carry their comparison.
+
+\subsubsection{Low Frequency Quality - Geometry}
+
+Egomotion models constantly re-render a 3D scene under motion; their characteristic corruption is localised over-warping of newly generated content, which mimics the statistics of intact content (right colours, right edge density, right overall shape) and so evades pixel-level metrics while remaining obvious to the eye. Against $80$ hand-annotated rollouts, every whole-frame drift feature we tried (embedding drift, no-reference IQA, warping error, pixel statistics) scores $0.40$--$0.62$ AUC---chance---and purpose-built geometric measures fail in the opposite direction: strong learned 3D priors reconcile corrupted structure rather than flag it (monocular depth hallucinates plausible fields over melted scenes; DUSt3R \cite{DUSTER} returns confident pointmaps on rollouts a human calls mangled).
+
+Models trained to \emph{find} artifacts rather than explain them away succeed. We ensemble three votes: a VLM \cite{QWEN} asked directly whether structures are melted or impossible, read from answer-token probabilities ($0.74$ AUC); a generative-artifact segmenter's worst-frame fraction (PAL4VST \cite{pal}, $0.70$); and depth-field curvature \cite{depthanything} ($0.75$). Their unweighted z-scored mean reaches $0.89$ AUC for severe structural corruption, the three votes firing on complementary failures; subtle single-object errors remain invisible to every detector tested, so the instrument targets severe damage. Scoring is relational: each vote is taken relative to the sibling group of the same scene (all models' rollouts plus real footage), and a rollout is flagged when it exceeds the 95th percentile of the real-footage spread, fixing the false-positive rate at ${\sim}5\%$ by construction. No real clip scores within an order of magnitude of the corrupted rollouts.
+
+Fleet-wide (Tables~\ref{tab:quality_ablation},~\ref{tab:quality_baselines}), the low-capacity action encodings mangle most within our grid and the full models are cleanest, while the external baselines occupy a different regime, with failures concentrating overwhelmingly in backward and diagonal egomotion ($0.66$--$0.94$ flag rates there)---reverse motion is where external geometry collapses. The two clean externals validate the instrument's specificity: Yume trades geometry failures for scene drift and minWM fails by spawning objects and under-moving rather than melting; both are caught by the plausibility instruments instead.
+
+
+
+
+
+\subsubsection{Low Frequency Quality - Plausibility}
+
+We qualify plausibility along four axes, each measured by the instrument we found actually competent at it. For content questions we use a VLM (Qwen3-VL-8B) anchored on the one reference every rollout contains: the last real frame of the $0.56$\,s context is shown labelled as the reference, the continuation labelled as generated, and the judge answers narrow yes/no questions read out as token probabilities rather than generated text, which we find fragile. \emph{Style} asks whether the rendering departs from the reference (painted, game-like, cartoonish; lighting changes excluded). \emph{Novelty} asks whether new objects appear that were not in the reference (content revealed by driving excluded) - this is not an error measure but a generation-rate meter, there to catch the degenerate model that passes every check by producing nothing. \emph{Uncanny} asks for significant reality-breaking failure - impossible geometry, surfaces dissolving into polygons - that a casual viewer would notice within one second; we find the severity bar essential, as without it the judge cannot separate a small artifact from a world made of triangles. For \emph{scene relocation} we verify place identity geometrically - ORB keypoint matches between the rollout's horizon frame and the reference or any sibling rollout's horizon frame, RANSAC-verified against a single homography; the same place keeps hundreds of geometrically consistent matches even when corrupted, while a lookalike keeps almost none. A rollout is relocated below 50 inliers, and \emph{static} above 600 inliers between its own first and last generated frames. Sixteen of the 256 scenes fall below the keypoint floor of the verifier and are excluded from relocation rates.
+
+We validated the instruments before trusting them: the relocation verifier agrees with $80$ hand-labelled rollouts at $87.5\%$ (stable across thresholds), a blind nine-video test scored 8/9, and a $28$-video stratified audit found $89$--$96\%$ flag-level agreement per instrument with every high-confidence flag correct.
+
+The probes work when the implausibility is categorical: the summed probes separate baseline rollouts from our full-capacity variants at $0.88$ AUC, and the per-question profile localises each model's characteristic failure. Their limit is nuance: on our own ablations, where the implausible content is a single wrong object in an otherwise correct scene, the probes are blind, so within-distribution plausibility falls to the geometry metric.
+
+Table~\ref{tab:quality_ablation} separates our ablation family on the same instruments.
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lcccc}
-\toprule
-Model & \textsc{true} & \textsc{zero} & \textsc{flip} & \textsc{shuffle} \\
-\midrule
-Full (ours)            & 0.744 & 0.669 & 0.136 & 0.563 \\
-$-$ Action tokens      & 0.739 & 0.628 & 0.211 & 0.469 \\
-$-$ AdaLN modulation   & 0.732 & 0.732 & 0.732 & 0.733 \\
-$-$ Critic guidance    & 0.734 & 0.755 & 0.712 & 0.751 \\
-$-$ State probe        & 0.774 & 0.694 & 0.201 & 0.533 \\
-\bottomrule
+\small
+\setlength{\tabcolsep}{3pt}
+\caption{Quality per ablation variant, all columns \% of rollouts flagged:
+haze (excess sibling-relative sharpness loss $\mathcal{B}>150$), geometry
+(ensemble score above the real-footage 95th percentile), VLM probes (style
+shift, novel objects, uncanny content), scene relocation ($<50$ RANSAC
+inliers), and static ($>600$ inliers first-to-last generated frame).}
+\label{tab:quality_ablation}
+\begin{tabular}{lccccccc}
+\hline
+Variant & Haze & Geo & Style & Novel & Uncanny & Reloc & Static \\
+\hline
+batch 64 (16node) & $2$  & $16$ & $6$ & $23$ & $25$ & $8$  & $2$  \\
+batch 32 (pca8)   & $2$  & $16$ & $3$ & $21$ & $15$ & $10$ & $1$  \\
+pca4              & $2$  & $29$ & $9$ & $24$ & $36$ & $14$ & $1$  \\
+pca2              & $20$ & $31$ & $8$ & $32$ & $39$ & $14$ & $3$  \\
+batch 16 (4node)  & $47$ & $23$ & $7$ & $19$ & $28$ & $24$ & $1$  \\
+no action tokens  & $17$ & $23$ & $7$ & $27$ & $27$ & $14$ & $4$  \\
+no AdaLN          & $59$ & $15$ & $4$ & $1$  & $10$ & $23$ & $16$ \\
+\hline
 \end{tabular}
-\caption{Counterfactual swap (frozen judge): correlation between rendered and the \emph{true} command under each fed command. A controllable model is high under \textsc{true} and \emph{drops} under \textsc{zero}/\textsc{flip}; a flat row means the command is ignored.}
-\label{tab:cond}
 \end{table}
 
-\subsection{What Makes It Controllable: Ablations}
-We perform leave-one-out ablations, removing one mechanism at a time and scoring each with the same frozen judge (Table~\ref{tab:ablation}).
-
-\paragraph{Two of the four mechanisms carry control; the other two are redundant.} Removing AdaLN (action tokens only) collapses steering control from $0.945$ to $0.578$, and the model stops reacting to commands: its correlation with the true command is \emph{flat} across \textsc{true}/\textsc{zero}/\textsc{flip} (Table~\ref{tab:cond}, all $\approx0.73$), i.e.\ the output is invariant to the command. Removing the output-level critic guidance is similarly damaging (steering $0.433$, flat counterfactual row). In contrast, removing either the per-frame action tokens ($0.894$ steering, command still causal) or the representation-level state probe ($0.910$ steering, \textsc{flip} still drops the correlation to $0.20$) leaves a model close to the full system. Thus controllability is carried by \emph{AdaLN modulation and output-level critic guidance}, while action tokens and the state-probe grounding are largely redundant---a result that simplifies the method. Notably, a circular metric computed from the model's own trained probe \emph{early in training} suggested the opposite ranking among the injection channels; the frozen-judge protocol reverses it, underscoring why an independent metric is necessary.
+Table~\ref{tab:quality_baselines} gives the baseline comparison. Every heavy baseline fails in its own characteristic way: WorldPlay dissolves the world into polygonal shards (uncanny $78\%$); Matrix-Game repaints it (style $75\%$) and, once its backward-diagonal interface is exercised, abandons it ($95\%$ relocation); WorldCam invents a new world in a new style; Astra is intermittently unstable on every axis; Yume is stylistically and structurally clean but somewhere else in $60\%$ of rollouts. minWM is the instructive opposite: cleanest on every damage axis, but partly by refusing the task---it has the only heavy static tail, and its novelty is action-blind, firing equally in every commanded direction, where ours tracks the action demand ($0$--$8\%$ forward against $36$--$46\%$ backward and lateral). Ours are the only models that generate action-conditioned novel content while staying in the commanded scene, at the cost of a mid-tier uncanny rate concentrated exactly where the action forces the model to imagine unseen content.
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lcc}
-\toprule
-Model & Steering $z_2$ & Throttle $z_7$ \\
-\midrule
-Full (ours)            & \textbf{0.945} & 0.751 \\
-$-$ Action tokens      & 0.894 & 0.827 \\
-$-$ AdaLN modulation   & 0.578 & 0.849 \\
-$-$ Critic guidance    & 0.433 & 0.887 \\
-$-$ State probe        & 0.910 & 0.852 \\
-\bottomrule
-\end{tabular}
-\caption{Per-axis controllability under the frozen judge (\textsc{true} condition): correlation between rendered and commanded egomotion. Removing AdaLN or critic guidance collapses steering control.}
-\label{tab:ablation}
-\end{table}
-
-\subsection{Dimensionality of the Action Representation}
-Both grounding heads are trained against the full $8$-D realized-motion latent, with the two commanded axes (steering $z_2$, throttle $z_7$) up-weighted and the remaining six dimensions encoding scene motion that is not directly commanded. We test whether those six dimensions contribute to control. \emph{Probe-2D} reduces the state probe's target to $z_2/z_7$ only (compare to the full model); \emph{Critic-8D} instead \emph{adds} the six dimensions to the action critic---which otherwise grounds only $z_2/z_7$---at half the guidance weight of the commanded axes (compare to ``$-$ State probe'', whose critic already uses $z_2/z_7$ only). These two runs were stopped once controllability had saturated and are therefore trained for fewer steps than the leave-one-out models (Table~\ref{tab:dims}, ``Steps''); the comparison is indicative rather than budget-matched.
-
-\begin{table}[t]
-\centering
-\setlength{\tabcolsep}{4pt}
+\small
+\setlength{\tabcolsep}{3pt}
+\caption{Same instruments on the external baselines (haze omitted: baselines
+do not exhibit it), with our best and worst ablations for reference. External
+geometry failures concentrate in backward and diagonal egomotion.}
+\label{tab:quality_baselines}
 \begin{tabular}{lcccccc}
-\toprule
-Model & Steps & $z_2$ & $z_7$ & PSNR$\uparrow$ & LPIPS$\downarrow$ & FVD$\downarrow$ \\
-\midrule
-Full ($8$-D probe)            & 6600 & \textbf{0.945} & 0.751 & 19.09 & 0.260 & 29.9 \\
-\quad Probe-2D ($z_2/z_7$)    & 2150 & 0.870 & 0.787 & 19.18 & 0.236 & 29.4 \\
-$-$ State probe ($z_2/z_7$ critic) & 3700 & 0.910 & 0.852 & 19.49 & 0.237 & 25.9 \\
-\quad Critic-8D ($+6$\,@\,$0.5$)  & 2150 & 0.862 & 0.836 & 19.45 & 0.223 & 26.3 \\
-\bottomrule
+\hline
+Model & Geo & Style & Novel & Uncanny & Reloc & Static \\
+\hline
+WorldPlay   & $57$ & $68$ & $43$ & $78$ & $79$ & $1$  \\
+Matrix-Game & $51$ & $75$ & $45$ & $71$ & $95$ & $0$  \\
+WorldCam    & $71$ & $83$ & $68$ & $70$ & $80$ & $9$  \\
+Astra       & $45$ & $27$ & $36$ & $50$ & $60$ & $10$ \\
+Yume        & $26$ & $7$  & $34$ & $7$  & $60$ & $1$  \\
+minWM       & $18$ & $0$  & $50$ & $1$  & $4$  & $21$ \\
+\hline
+ours (pca8)   & $16$ & $3$ & $21$ & $15$ & $13$ & $1$ \\
+ours (16node) & $16$ & $6$ & $23$ & $25$ & $25$ & $2$ \\
+\hline
 \end{tabular}
-\caption{Dimensionality of the grounding heads. \emph{Probe-2D} removes the six non-commanded latent dimensions from the state probe (vs.\ Full); \emph{Critic-8D} adds them to the action critic at half guidance weight (vs.\ ``$-$ State probe'', a critic on $z_2/z_7$ only). $z_2/z_7$ are frozen-judge correlations; PSNR/LPIPS/FVD as in Table~\ref{tab:quality}. ``Steps'' is the training budget: these two runs are shorter than the $4{,}000$-step leave-one-out models, so the comparison is indicative.}
-\label{tab:dims}
 \end{table}
 
-\noindent Neither edit helps control. Dropping the six probe dimensions costs a little steering ($0.945\!\to\!0.870$) while marginally improving fidelity (LPIPS $0.260\!\to\!0.236$, FVD $29.9\!\to\!29.4$); \emph{adding} the six dimensions to the critic does not improve grounding either---steering is no higher than the $z_2/z_7$ critic ($0.910\!\to\!0.862$) and visual quality is essentially unchanged. In both directions the six non-commanded motion dimensions appear largely redundant for control, consistent with grounding being carried by the commanded axes---though the shorter, unmatched training budget of these two runs (Table~\ref{tab:dims}, ``Steps'') warrants a budget-matched confirmation.
+Some of this gap is expected---our model is trained on this dataset and the baselines are not---but the pattern supports three claims: (1) training on clean or synthetic data does not readily transfer to real-world video; (2) training on real-world video transfers to unseen real locations with different noise and artefacts (raindrops, leaves on the lens); and (3) real-world training is not materially harder than synthetic training, making it the better option for avoiding style-shift and relocation failures.
 
-\subsection{Limitation: Reverse Egomotion}
-Stratifying the throttle axis by command direction reveals a systematic failure. All models render \emph{forward} motion with the correct sign on $100\%$ of forward chunks, but \emph{reverse} commands are rendered poorly: the full model produces the correct (backward) sign on only $46.7\%$ of reverse chunks and strongly under-shoots the commanded magnitude. The model has a forward-motion prior it does not readily override. This also explains an apparent per-scene anomaly: the held-out Madrid ride is reverse-dominated, and its low controllability is the reverse-rendering failure rather than a scene- or alignment-specific artifact.
 
-\subsection{Visual Quality and Drift}
-We complement the controllability analysis with a visual-quality testbench, aligned with the metrics common to the autoregressive-video lineage. For each model we sample $48$ windowed clips across the held-out rides, generate the continuation under the true command, and report: \emph{prediction fidelity} against the ground-truth video (PSNR, SSIM, LPIPS); \emph{intrinsic quality} on the generated clip (MUSIQ for imaging quality, NIMA for aesthetics, CLIP feature consistency across frames, and temporal flicker---the same dimensions VBench reports); and a distributional FVD. As VBench and an I3D model are not used here, FVD is computed from r3d\_18 (Kinetics) features and is \emph{indicative} (relative ordering only). We also report a \emph{short-rollout drift} arm: the per-frame slope of fidelity (PSNR), perceptual error (LPIPS) and intrinsic quality (MUSIQ) across the rollout, plus statistical brightness/contrast drift---the error-accumulation and over-saturation that this lineage flags. (Long-horizon drift is out of scope.)
+\bibliography{aaai2026}
 
-\begin{table*}[t]
+\appendix
+
+
+\section{Baseline Command Interfaces}
+\label{app:interfaces}
+
+None of the pose units are metric: minWM and WorldPlay inherit scale from their shared synthetic trajectory generator ($0.08$ translation, $3^\circ$ yaw per step), Astra from its demo constant ($0.03$), and WorldCam's ViPE-estimated training poses have arbitrary per-clip scale.
+
+We translate each compass command into each baseline's native interface and hold it constant over the rollout, composing the running pose with a fixed per-step increment at each model's own constants where they exist (minWM/WorldPlay: their training-generator constants; Astra: its demo constant; Matrix-Game: its benchmark key/mouse values; WorldCam ships no generator, so its step was calibrated visually). While this means that we cannot evaluate different strengths of action conditions with other models, we provide this for our own as our action space is continuous and our trajectories are model generated, leading to greater flexibility and interpolation in our model. We do however compare the magnitude of actions taken as this is indicative of ability to generate and the speed with which it can be done. We use our CoTracker-PCA pipeline to quantify the strengths of followed actions, we primarily do this to check on the models that are hesitant to act or move.
+
+Backward motion is natively expressible in minWM, WorldPlay, Yume, and Matrix-Game's interface (though Matrix-Game's own benchmark never exercises it). We authored three extensions, each composed from the model's own primitives at its own constants: backward and backward-diagonal pose generators for Astra, backward-plus-mouse-yaw combinations for Matrix-Game's diagonals, and WorldCam's entire eight-direction generator; WorldPlay's diagonals use its JSON pose interface, as its pose strings cannot express simultaneous translation and yaw. Whether a model honours a request is part of what we measure: realized motion for every model is read out by the same frozen pixel-space judge, making the comparison independent of the conditioning encoding.
+
+\section{More Action Controllability Metrics}
+\label{app:wedges}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[
+        width=0.9\columnwidth
+    ]{images/pca_components_flowfields.png}
+    \caption{
+        Projected action-space directions recovered by the fixed
+        CoTracker-PCA motion pipeline. Each flow field visualizes a principal
+        motion component used to measure agreement between commanded actions
+        and motion rendered by the model. g0 is forwards/backwards, g1 is yaw and g6 is roll. A variety of other details and information is encoded in the other dimensions.
+    }
+    \label{fig:pca_act}
+\end{figure}
+
+\begin{figure*}[t]
 \centering
-\begin{tabular}{lcccccccc}
-\toprule
-Model & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & MUSIQ$\uparrow$ & NIMA$\uparrow$ & CLIP-c$\uparrow$ & flicker$\downarrow$ & FVD$\downarrow$ \\
-\midrule
-Full (ours)          & 19.09 & 0.529 & 0.260 & 56.0 & 4.53 & 0.909 & 0.0496 & 29.9 \\
-$-$ Action tokens    & 19.50 & 0.547 & 0.234 & 55.5 & 4.49 & 0.925 & 0.0488 & 27.2 \\
-$-$ AdaLN modulation & 19.53 & 0.541 & 0.226 & 56.1 & 4.50 & 0.927 & 0.0495 & 26.6 \\
-$-$ Critic guidance  & 19.98 & 0.565 & 0.210 & 56.7 & 4.54 & 0.934 & 0.0458 & 21.8 \\
-$-$ State probe      & 19.49 & 0.546 & 0.237 & 55.4 & 4.50 & 0.920 & 0.0494 & 25.9 \\
-\bottomrule
-\end{tabular}
-\caption{Visual quality ($48$ clips/model). Differences are small; note that the full model has the \emph{lowest} raw quality and ``$-$ Critic guidance'' the highest---yet that ablation destroys controllability (Table~\ref{tab:ablation}), exposing a controllability--fidelity trade-off. FVD is r3d\_18-based and indicative.}
-\label{tab:quality}
-\end{table*}
+\includegraphics[width=0.8\textwidth]{images/following_noadaln_by_REALdir.png}
+\caption{The no-AdaLN (tokens-only) variant, GT (blue) vs.\ counterfactual
+FLIP (red) following by real ride direction. On GT commands it scores like a
+controller because video continuation happens to match the commands that
+produced the ride; the FLIP branch reveals that no genuine control is ever
+acquired. Panels and smoothing as in Fig.~\ref{fig:following_dir}.}
+\label{fig:abl_ada}
+\end{figure*}
 
-\begin{table}[t]
+At convergence the wedges (Figs.~\ref{fig:wedge_g0},~\ref{fig:wedge_g1}) add
+three observations to the training curves. On the throttle axis, batch scale
+is what seems to increase backward magnitude: the batch-$16$ model is markedly weaker in
+reverse (median backward $g_0$ of $-0.11$, and essentially zero on
+backward-right, against $-0.20$ and $-0.21$ for batches $32$ and $64$), and
+the top-2 PCA model is very slightly weaker ($-0.18$) than its deeper
+counterparts. Steering is unaffected by any of these choices --- the $g_1$
+rosettes are interchangeable across every functional variant. The tokens-only
+model learns nothing: its throttle rosette is forward in every commanded
+direction and its steering never organizes, completing the picture from
+Fig.~\ref{fig:abl_injection}.
+
+\begin{figure*}[t]
 \centering
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{lccccc}
-\toprule
-Model & PSNR$_{\text{slope}}$ & LPIPS$_{\text{slope}}$ & MUSIQ$_{\text{slope}}$ & bright$_\Delta$ & contr$_\Delta$ \\
-\midrule
-Full (ours)          & $-0.006$ & 0.0001 & 0.089 & 0.050 & 0.071 \\
-$-$ Action tokens    & $0.000$  & 0.0002 & 0.064 & 0.060 & 0.058 \\
-$-$ AdaLN modulation & $-0.001$ & 0.0001 & 0.079 & 0.055 & 0.058 \\
-$-$ Critic guidance  & $-0.003$ & 0.0003 & 0.075 & 0.055 & 0.059 \\
-$-$ State probe      & $-0.001$ & 0.0002 & 0.065 & 0.059 & 0.058 \\
-\bottomrule
-\end{tabular}
-\caption{Short-rollout drift. Per-frame slopes of PSNR (dB/frame), LPIPS and MUSIQ, and frame-$0$-to-$T$ brightness/contrast drift. All near zero: the models are stable over the short horizon.}
-\label{tab:drift}
-\end{table}
+\includegraphics[width=0.8\textwidth]{images/wedge_g0.png}
+\caption{Throttle response ($g_0$) by commanded direction at step $5{,}000$,
+ablation set. One translucent wedge per evaluation video (32 scenes; blue
+$=$ forward, red $=$ backward; shading depth $=$ distribution density),
+outline $=$ median; per-panel scale with the rim value (p95) in each title.
+All functional variants show the same signature: forward at full strength,
+backward at roughly half with high per-scene variance. The tokens-only model
+(noadaln) renders every command, including backward, as forward motion.}
+\label{fig:wedge_g0}
+\end{figure*}
 
-Two observations follow. First, raw visual quality is nearly uniform across all variants, and where it differs it moves \emph{opposite} to controllability: the fully grounded model (ours) has the lowest fidelity and the lowest indicative FVD-rank, while removing the critic guidance yields the best quality (PSNR $19.98$, LPIPS $0.210$, FVD $21.8$) precisely because it is freed from the command-following constraint that, as shown above, it needs for control. The action-grounding objective therefore buys controllability at a modest, measurable cost in reconstruction fidelity. Second, short-rollout drift is negligible for every model (PSNR slope $\approx 0$, MUSIQ slope slightly positive, small brightness/contrast drift): at this horizon the autoregressive rollout is stable, and drift is a long-horizon concern we leave to future work.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/wedge_g1.png}
+\caption{Steer response ($g_1$) by commanded direction at step $5{,}000$,
+ablation set (rendering as in Fig.~\ref{fig:wedge_g0}). Every functional
+variant shows the same four-lobe antisymmetry with near-rim cardinal
+steering; left-family responses are uniformly ${\sim}30\%$ weaker than right,
+an asymmetry present in the raw pixel rotation as well and thus a property of
+the learned motion rather than the action readout.}
+\label{fig:wedge_g1}
+\end{figure*}
 
-\section{Conclusion}
-\emph{[Draft stub --- to be completed.]} We presented an action-grounding objective that makes a pretrained autoregressive video diffusion model obey egomotion commands, and a frozen-judge protocol that measures controllability without circularity. Ablations attribute control to AdaLN modulation and output-level critic guidance---while per-frame action tokens and the representation-level state probe are largely redundant---and show that this control is bought at a small, measurable cost in visual fidelity, with negligible short-rollout drift. The principal open problem is the systematic failure to render reverse egomotion.
 
-\bibliography{refs}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/following_FAMILY_nodes_by_REALdir.png}
+\caption{Batch-scale ablation (global batch $16/32/64$), counterfactual
+following by real ride direction. All scales converge to the same directional
+control by step $5{,}000$; larger batches acquire the hardest axis
+(counterfactual forward) earliest, with batch $64$ crossing into following
+${\sim}2{,}000$ steps before batch $16$.}
+\label{fig:abl_nodes_full}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/following_FAMILY_encoders_by_REALdir.png}
+\caption{Action-PCA supervision ablation (top-$2$/$4$/$8$ components),
+counterfactual following by real ride direction. Even two supervised
+dimensions suffice for directional control; differences between depths are
+marginal at this level and only appear in finer dynamics metrics
+(\S~Wedges).}
+\label{fig:abl_encoders_full}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/wedge_all_g1.png}
+\caption{Steer response ($g_1$) by commanded direction, all models (rendering
+as in Fig.~\ref{fig:wedge_all_g0}). Steering direction is universally
+correct: every model shows the four-lobe antisymmetry, with per-scene
+consistency (shading density and IQR width) varying by model.}
+\label{fig:wedge_all_g1}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{images/wedge_all_g6.png}
+\caption{Roll response ($g_6$) by commanded direction, all models (rendering
+as in Fig.~\ref{fig:wedge_all_g0}). Roll direction should be minimised but we see in some models that it is somewhat high, leading to compounding out of control dynamics.}
+\label{fig:wedge_all_g6}
+\end{figure*}
+
 
 \end{document}

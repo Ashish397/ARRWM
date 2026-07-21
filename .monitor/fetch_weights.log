@@ -1,0 +1,88 @@
+[fetch] OK Skywork/Matrix-Game-2.0/base_distilled_model/base_distill.safetensors 6477MB 69s
+[fetch] OK Skywork/Matrix-Game-2.0/base_model/diffusion_pytorch_model.safetensors 6660MB 685s
+[fetch] OK Skywork/Matrix-Game-2.0/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth 5946MB 937s
+[fetch] REPO DONE Skywork/Matrix-Game-2.0
+[fetch] OK OpenDriveLab/Vista/vista.safetensors 11499MB 1589s
+[fetch] REPO DONE OpenDriveLab/Vista
+[fetch] OK tencent/HunyuanVideo-1.5/transformer/480p_i2v/diffusion_pytorch_model.safetensors 42317MB 3227s
+[fetch] OK tencent/HunyuanVideo-1.5/vae/config.json 0MB 0s
+[fetch] OK tencent/HunyuanVideo-1.5/vae/diffusion_pytorch_model.safetensors 5043MB 64s
+[fetch] REPO DONE tencent/HunyuanVideo-1.5
+[fetch] OK google/byt5-small/config.json 0MB 0s
+[fetch] OK google/byt5-small/flax_model.msgpack 1199MB 15s
+[fetch] OK google/byt5-small/generation_config.json 0MB 0s
+[fetch] OK google/byt5-small/pytorch_model.bin 1199MB 17s
+[fetch] OK google/byt5-small/special_tokens_map.json 0MB 0s
+[fetch] OK google/byt5-small/tf_model.h5 1199MB 15s
+[fetch] OK google/byt5-small/tokenizer_config.json 0MB 0s
+[fetch] REPO DONE google/byt5-small
+[fetch] OK tencent/HY-WorldPlay/ar_rl_model/diffusion_pytorch_model.safetensors 34232MB 1893s
+[fetch] REPO DONE tencent/HY-WorldPlay
+[fetch] OK google/siglip-so400m-patch14-384/config.json 0MB 0s
+[fetch] OK google/siglip-so400m-patch14-384/model.safetensors 3512MB 126s
+[fetch] OK google/siglip-so400m-patch14-384/preprocessor_config.json 0MB 0s
+[fetch] OK google/siglip-so400m-patch14-384/special_tokens_map.json 0MB 0s
+[fetch] OK google/siglip-so400m-patch14-384/spiece.model 1MB 1s
+[fetch] OK google/siglip-so400m-patch14-384/tokenizer.json 2MB 0s
+[fetch] OK google/siglip-so400m-patch14-384/tokenizer_config.json 0MB 0s
+[fetch] REPO DONE google/siglip-so400m-patch14-384
+[fetch] OK stdstu123/Yume-5B-720P/.msc 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/.mv 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/Wan2.2_VAE.pth 2819MB 95s
+[fetch] OK stdstu123/Yume-5B-720P/config.json 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/config.yaml 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/configuration.json 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/diffusion_pytorch_model.safetensors 20802MB 317s
+[fetch] OK stdstu123/Yume-5B-720P/google/umt5-xxl/special_tokens_map.json 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/google/umt5-xxl/spiece.model 5MB 1s
+[fetch] OK stdstu123/Yume-5B-720P/google/umt5-xxl/tokenizer.json 17MB 1s
+[fetch] OK stdstu123/Yume-5B-720P/google/umt5-xxl/tokenizer_config.json 0MB 0s
+[fetch] OK stdstu123/Yume-5B-720P/models_t5_umt5-xxl-enc-bf16.pth 11362MB 228s
+[fetch] REPO DONE stdstu123/Yume-5B-720P
+[fetch] OK stdstu123/Yume-I2V-540P/LICENSE.txt 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/Wan2.1_VAE.pth 508MB 7s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/config.json 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00001-of-00007.safetensors 9619MB 442s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00002-of-00007.safetensors 9771MB 639s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00003-of-00007.safetensors 9523MB 426s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00004-of-00007.safetensors 9729MB 651s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00005-of-00007.safetensors 10066MB 661s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00006-of-00007.safetensors 10122MB 641s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model-00007-of-00007.safetensors 9494MB 652s
+[fetch] OK stdstu123/Yume-I2V-540P/Yume-Dit/diffusion_pytorch_model.safetensors.index.json 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/config.json 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/google/umt5-xxl/special_tokens_map.json 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/google/umt5-xxl/spiece.model 5MB 1s
+[fetch] OK stdstu123/Yume-I2V-540P/google/umt5-xxl/tokenizer.json 17MB 2s
+[fetch] OK stdstu123/Yume-I2V-540P/google/umt5-xxl/tokenizer_config.json 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth 4772MB 401s
+[fetch] OK stdstu123/Yume-I2V-540P/models_t5_umt5-xxl-enc-bf16.pth 11362MB 106s
+[fetch] OK stdstu123/Yume-I2V-540P/xlm-roberta-large/sentencepiece.bpe.model 5MB 1s
+[fetch] OK stdstu123/Yume-I2V-540P/xlm-roberta-large/special_tokens_map.json 0MB 0s
+[fetch] OK stdstu123/Yume-I2V-540P/xlm-roberta-large/tokenizer.json 17MB 1s
+[fetch] OK stdstu123/Yume-I2V-540P/xlm-roberta-large/tokenizer_config.json 0MB 0s
+[fetch] REPO DONE stdstu123/Yume-I2V-540P
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/added_tokens.json 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/config.json 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/configuration_intern_vit.py 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/configuration_internvl_chat.py 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/conversation.py 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/examples/image1.jpg 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/examples/image2.jpg 0MB 1s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/examples/red-panda.mp4 2MB 1s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/generation_config.json 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/merges.txt 2MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/model.safetensors 4178MB 94s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/modeling_intern_vit.py 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/modeling_internvl_chat.py 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/preprocessor_config.json 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/special_tokens_map.json 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/tokenizer.json 7MB 1s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/tokenizer_config.json 0MB 0s
+[fetch] OK OpenGVLab/InternVL3-2B-Instruct/vocab.json 3MB 0s
+[fetch] REPO DONE OpenGVLab/InternVL3-2B-Instruct
+[fetch] OK OpenGVLab/InternVL3-8B/modeling_intern_vit.py 0MB 0s
+[fetch] REPO DONE OpenGVLab/InternVL3-8B
+[fetch] OK ByteDance/Sa2VA-4B/modeling_intern_vit.py 0MB 0s
+[fetch] REPO DONE ByteDance/Sa2VA-4B
+[fetch] ALL DONE

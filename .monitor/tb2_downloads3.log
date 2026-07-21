@@ -1,0 +1,6 @@
+Fetching 25 files:   0%|          | 0/25 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+bash: line 1: 134010 Killed                  hf download Qwen/Qwen3-VL-30B-A3B-Instruct --max-workers 4
+=== Qwen3-VL-30B exit 137 Thu Jul 16 09:44:07 AM UTC 2026 ===
+Fetching 34 files:   0%|          | 0/34 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+bash: line 3: 136928 Killed                  hf download OpenGVLab/InternVL3_5-38B-HF --max-workers 4
+=== InternVL3.5-38B exit 137 Thu Jul 16 09:44:22 AM UTC 2026 ===

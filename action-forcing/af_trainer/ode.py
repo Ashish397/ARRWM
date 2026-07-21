@@ -252,22 +252,43 @@ class Trainer:
         # ------------------------------------------------------------------
         # Dataset + sampler
         # ------------------------------------------------------------------
-        self._log("Building PairedTrajectoryDataset ...")
-        self.dataset = PairedTrajectoryDataset(
-            clean_root=str(getattr(config, "clean_root")),
-            cf_root=str(getattr(config, "cf_root")),
-            caption_root=str(getattr(config, "caption_root")),
-            max_pair=int(getattr(config, "max_pair", 0)) or None,
-            require_cf=bool(getattr(config, "require_cf", True)),
-            allow_cf_fallback=bool(getattr(config, "allow_cf_fallback", False)),
-            clean_only=bool(getattr(config, "clean_only", False)),
-            max_consecutive_same_fail=int(
-                getattr(config, "dataset_max_consecutive_same_fail", 5)
-            ),
-            max_consecutive_skips_total=int(
-                getattr(config, "dataset_max_consecutive_skips_total", 64)
-            ),
-        )
+        if bool(getattr(config, "chunked_lmdb", False)):
+            # ARRWM 14e pilot: chained chunk-level LMDBs (gen_lmdb_14e.py).
+            # Set AF_SNAPSHOT_STEPS/AF_EVAL_STEPS + random_steps to the
+            # pinned 20-step grid in the same config.
+            from af_utils.chunked_ode_dataset import ChunkedODEDataset
+            from af_utils.dataset import _load_prompt_embeds, _build_ts_to_caption_json
+            from utils.zarr_dataset import ZarrRideDataset as _ZRD
+            self._log("Building ChunkedODEDataset ...")
+            _cap = _build_ts_to_caption_json(str(getattr(config, "caption_root")))
+            _pcache = {}
+            def _prompt(ts):
+                if ts not in _pcache:
+                    _pcache[ts] = _load_prompt_embeds(_cap[ts])
+                return _pcache[ts]
+            self.dataset = ChunkedODEDataset(
+                root=str(getattr(config, "clean_root")),
+                zarr_loader=_ZRD.load_latent_chunk,
+                prompt_loader=_prompt,
+                clean_only=bool(getattr(config, "clean_only", False)),
+            )
+        else:
+            self._log("Building PairedTrajectoryDataset ...")
+            self.dataset = PairedTrajectoryDataset(
+                clean_root=str(getattr(config, "clean_root")),
+                cf_root=str(getattr(config, "cf_root")),
+                caption_root=str(getattr(config, "caption_root")),
+                max_pair=int(getattr(config, "max_pair", 0)) or None,
+                require_cf=bool(getattr(config, "require_cf", True)),
+                allow_cf_fallback=bool(getattr(config, "allow_cf_fallback", False)),
+                clean_only=bool(getattr(config, "clean_only", False)),
+                max_consecutive_same_fail=int(
+                    getattr(config, "dataset_max_consecutive_same_fail", 5)
+                ),
+                max_consecutive_skips_total=int(
+                    getattr(config, "dataset_max_consecutive_skips_total", 64)
+                ),
+            )
         sampler = (
             DistributedSampler(self.dataset, shuffle=True, drop_last=True)
             if self.is_distributed else None

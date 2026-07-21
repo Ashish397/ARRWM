@@ -1,0 +1,89 @@
+"""Record few-step trajectories of an ODE-distilled student — window r08.
+
+Same protocol as utils/flow_record.py's teacher recording (8 compass dirs x
+FR_NSEEDS seeds, real 3-frame seed context, 2 generated chunks) but through
+the student's own streaming sampler (ODEChainPipeline.generate_ar: per chunk,
+fresh noise -> denoising_step_list [1000,750,500,250] with pred_x0 re-noised
+between rungs). The env-gated hook in utils/eval_causal_AR.py pins the block
+noise to the SAME generator stream as the teacher recorder (seed_base + block
+index), so student chunk-0 initial noise is IDENTICAL to the teacher's
+block-0 noise -> teacher-ODE vs student paths share their starting point.
+
+Recorded per (dir, seed): flow_{run}/r{W}_{d}_s{sd}/steps.npz with
+sdt=[(chunk, rung, t)] rows (rung=-1 initial noise; t>0 pred_x0 at rung;
+t<0 re-noised input at |t|) + x{j} fp16 latents [1, 3, C, H, W].
+
+Env: FR_RUN, FR_CONFIG (student action_ode_* yaml), FR_CKPT, FR_WINDOW
+(def 8), FR_NSEEDS (def 4), FR_OUT, FR_TAG (suffix on the output dir, e.g.
+"_det"), FR_CHUNKS (def 2), FR_DET=1 (deterministic straight-path re-noise
+via the ODE_FLOW_DET hook), FR_VIDEO=1 (also decode the full rollout and
+save an mp4 under .motion_check/ for realized-egomotion checks).
+"""
+import os, json
+os.environ.setdefault("WORLD_SIZE", "1"); os.environ.setdefault("RANK", "0"); os.environ.setdefault("LOCAL_RANK", "0")
+import torch
+
+ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"
+RUN = os.environ["FR_RUN"]
+CONFIG = os.environ["FR_CONFIG"]
+CKPT = os.environ["FR_CKPT"]
+WINDOW = int(os.environ.get("FR_WINDOW", "8"))
+NSEEDS = int(os.environ.get("FR_NSEEDS", "4"))
+OUT = os.environ.get("FR_OUT", f"{ARR}/analysis/eval_final/flow_viz")
+TAG = os.environ.get("FR_TAG", "")
+VIDEO = bool(os.environ.get("FR_VIDEO"))
+if os.environ.get("FR_DET"):
+    os.environ["ODE_FLOW_DET"] = "1"
+
+M = 0.5; Dv = M / (2 ** 0.5)
+DIRS = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),
+        "B": (-M, 0.0), "BL": (-Dv, -Dv), "L": (0.0, -M), "FL": (Dv, -Dv)}   # (throttle, steer)
+NFB = 3
+GEN_CHUNKS = int(os.environ.get("FR_CHUNKS", "2"))
+
+
+def main():
+    from utils.eval_causal_AR import ODEChainPipeline
+    from utils.zarr_dataset import ZarrRideDataset
+
+    device = "cuda"
+    pipe = ODEChainPipeline(device)
+    pipe.build(config_path=CONFIG)
+    step = pipe.load_checkpoint(CKPT)
+    print(f"[rec-ode] {RUN}: loaded {CKPT} (step {step}), "
+          f"denoise steps {pipe.denoising_step_list.tolist()}", flush=True)
+
+    windows = json.load(open(f"{ARR}/analysis/eval_final/phaseA_windows.json"))
+    w = windows[WINDOW]
+    zp, off = w["zarr_path"], int(w["offset"])
+    seed = ZarrRideDataset.load_latent_chunk(zp, off, off + NFB).unsqueeze(0).to(device, torch.float32)
+    manifest = torch.load(f"{ARR}/analysis/eval_final/manifest_unseen.pt", map_location="cpu")
+    pe = {r["zarr_path"]: r["prompt_embeds"] for r in manifest}[zp].unsqueeze(0)
+
+    tot_f = NFB * (1 + GEN_CHUNKS)
+    for dname, (thr, ste) in DIRS.items():
+        for sd in range(NSEEDS):
+            dst = f"{OUT}/flow_{RUN}{TAG}/r{WINDOW:02d}_{dname}_s{sd}"
+            vid = f"{OUT}/.motion_check/{RUN}{TAG}/r{WINDOW:02d}_{dname}_s{sd}.mp4"
+            if os.path.exists(f"{dst}/steps.npz") and (not VIDEO or os.path.exists(vid)):
+                print(f"[rec-ode] {dst} exists, skipping", flush=True)
+                continue
+            z = torch.zeros(1, tot_f, 2, device=device, dtype=torch.float32)
+            z[:, NFB:, 0] = thr; z[:, NFB:, 1] = ste
+            os.environ["ODE_FLOW_REC"] = dst
+            os.environ["ODE_FLOW_SEED"] = str(1234 + sd * 7919)
+            full = pipe.generate_ar(prompt_embeds=pe, noisy_fa_full=z,
+                                    initial_latents=seed, num_gen_chunks=GEN_CHUNKS)
+            os.environ.pop("ODE_FLOW_REC", None)
+            if VIDEO:
+                import imageio
+                os.makedirs(os.path.dirname(vid), exist_ok=True)
+                frames = pipe.decode_latents(full.to(device))
+                imageio.mimsave(vid, frames, fps=5, quality=7)
+                print(f"[rec-ode] saved {vid} ({frames.shape[0]}f)", flush=True)
+            print(f"[rec-ode] {RUN} {dname} seed{sd} done", flush=True)
+    print(f"[rec-ode] {RUN} ALL DONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()

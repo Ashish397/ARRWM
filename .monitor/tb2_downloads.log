@@ -1,0 +1,13 @@
+A new version of huggingface_hub (1.23.0) is available! You are using version 1.7.2.
+To update, run: pip install -U huggingface_hub
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 4 files:  25%|██▌       | 1/4 [00:00<00:01,  2.69it/s]Fetching 4 files: 100%|██████████| 4/4 [00:15<00:00,  4.10s/it]Fetching 4 files: 100%|██████████| 4/4 [00:15<00:00,  3.82s/it]
+/scratch/u6ex/as1748.u6ex/frodobots/hf_cache/hub/models--tomg-group-umd--CSD-ViT-L/snapshots/5bc26a6fb0487f3f00a2a7313135103a005b1b67
+=== CSD done, starting Qwen3-VL-30B ===
+Fetching 25 files:   0%|          | 0/25 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 25 files:   4%|▍         | 1/25 [00:00<00:03,  6.66it/s]Fetching 25 files:  24%|██▍       | 6/25 [00:00<00:00, 26.89it/s]bash: line 3: 55429 Killed                  hf download Qwen/Qwen3-VL-30B-A3B-Instruct 2>&1
+=== Qwen3-VL-30B done, starting InternVL3.5-38B-HF ===
+Fetching 34 files:   0%|          | 0/34 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 34 files:   3%|▎         | 1/34 [00:00<00:15,  2.16it/s]Fetching 34 files:  21%|██        | 7/34 [00:01<00:04,  6.50it/s]bash: line 5: 59093 Killed                  hf download OpenGVLab/InternVL3_5-38B-HF 2>&1
+=== all downloads done ===

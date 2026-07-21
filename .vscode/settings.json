@@ -1,0 +1,26 @@
+{
+  "files.watcherExclude": {
+    "**/logs/**": true,
+    "**/wandb/**": true,
+    "**/analysis/**": true,
+    "**/paper_assets/**": true,
+    "**/*.mp4": true,
+    "**/*.pt": true,
+    "**/*.zarr/**": true
+  },
+  "search.exclude": {
+    "**/logs/**": true,
+    "**/wandb/**": true,
+    "**/analysis/**": true,
+    "**/*.mp4": true,
+    "**/*.pt": true
+  },
+  "files.exclude": {
+    "logs": true,
+    "wandb": true
+  },
+  "git.autorefresh": false,
+  "git.autofetch": false,
+  "git.enabled": false,
+  "python.analysis.exclude": ["**/logs/**", "**/wandb/**", "**/*.mp4", "**/*.pt"]
+}

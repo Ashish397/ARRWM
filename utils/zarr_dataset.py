@@ -282,6 +282,45 @@ def _encode_motion_ss_vae(
     return np.concatenate(zs, axis=0)  # (n, latent_ch)
 
 
+# --- PCA action-vector encoder (drop-in alternative to the SS-VAE) ----------
+# The SS-VAE's z2/z7 are each ~0.99 a SINGLE PCA component (z2<-PC1, z7<-PC0);
+# the VAE was literally PCA-regularised. These affine maps put the PCA coords
+# back into the VAE's z-space so the SAME tanh scales (25/10) apply and a
+# VAE-trained model sees a near-identical conditioning signal (squashed-action
+# MAE ~1.5-2%). Constants fit on 80k real motion windows.
+_PCA_SLOT_COMP = {2: 1, 7: 0}                                  # action slot -> PCA component
+_PCA_SLOT_AFFINE = {2: (0.34343, 0.3876), 7: (0.19748, 0.5047)}  # z_slot = a*PC + b
+
+
+def _encode_motion_pca(motion_per_frame, pca_mean, pca_comp, latent_ch):
+    """Encode motion (n,100,3) -> (n, latent_ch) via PCA + affine into VAE z-space.
+    Drop-in for _encode_motion_ss_vae: only the action slots (2,7) are populated;
+    the model selects action_dims=[2,7] downstream. dx/dy used; visibility ignored."""
+    n = motion_per_frame.shape[0]
+    flat = motion_per_frame[:, :, :2].reshape(n, 200).astype(np.float64)
+    P = (flat - pca_mean) @ pca_comp.T                         # (n, n_pca)
+    out = np.zeros((n, latent_ch), dtype=np.float32)
+    for slot, comp in _PCA_SLOT_COMP.items():
+        a, b = _PCA_SLOT_AFFINE[slot]
+        out[:, slot] = (a * P[:, comp] + b).astype(np.float32)
+    return out
+
+
+# Raw-PCA (14e): NO affine, NO slot-remap. Dim i = PCA component i (pca_0=throttle,
+# pca_1=steer, ...). tanh(P/scale) squash, scale = 2.5*std per component (saturation
+# ~1%, squashed std ~0.3). The model conditions on dims [0,1]; the critic supervises
+# the top-N. Pre-squash raw values returned here; squash applied by the caller.
+_PCA_RAW_SCALES = np.array([93.7, 57.7, 22.5, 21.2, 18.1, 14.5, 12.6, 10.8], dtype=np.float32)
+
+
+def _encode_motion_pca_raw(motion_per_frame, pca_mean, pca_comp, n_out=8):
+    """Encode motion (n,100,3) -> (n, n_out) RAW top-n_out PCA projections (pre-squash)."""
+    n = motion_per_frame.shape[0]
+    flat = motion_per_frame[:, :, :2].reshape(n, 200).astype(np.float64)
+    P = (flat - pca_mean) @ pca_comp.T                         # (n, n_pca)
+    return P[:, :n_out].astype(np.float32)
+
+
 def _tanh_squash(z_raw: torch.Tensor) -> torch.Tensor:
     """Apply per-dimension tanh squash.  Output is in (-1, 1)."""
     scales = _ZACTION_SCALES.to(z_raw.device)
@@ -509,6 +548,18 @@ class ZarrRideDataset(Dataset):
         self._ss_scale = float(ss_scale)
         self._ss_dev = ss_dev
 
+        # Action-vector encoder: "ss_vae" (default; PCA-regularised VAE) or "pca"
+        # (pure-PCA drop-in, affine-mapped into VAE z-space). PCA basis lives in
+        # the ss_vae checkpoint, so both modes load the same file.
+        self._action_encoder = os.environ.get("ARRWM_ACTION_ENCODER", "ss_vae").lower()
+        _ss_ck = torch.load(ss_vae_checkpoint, map_location="cpu", weights_only=False)
+        self._pca_mean = np.asarray(_ss_ck["pca_mean"], dtype=np.float64)
+        self._pca_comp = np.asarray(_ss_ck["pca_comp"], dtype=np.float64)
+        self._latent_ch = int(_ss_ck["hparams"]["LATENT_CH"])
+        if getattr(self, "_action_encoder", "ss_vae") == "pca":
+            logging.info("ACTION ENCODER = PCA drop-in (slots %s <- PCA comps %s, affine->VAE z-space)",
+                         list(_PCA_SLOT_COMP), [_PCA_SLOT_COMP[s] for s in _PCA_SLOT_COMP])
+
         self._rides: List[Tuple[Path, torch.Tensor, dict, int]] = []
         self._attrs_by_path: dict = {}
         self._build_index()
@@ -547,6 +598,22 @@ class ZarrRideDataset(Dataset):
             obj._ss_vae = ss_vae_model
             obj._ss_scale = float(ss_scale)
             obj._ss_dev = ss_dev
+
+        # Action-vector encoder (see __init__): "ss_vae" default or "pca" drop-in.
+        # from_manifest bypasses __init__, so set it here too.
+        obj._action_encoder = os.environ.get("ARRWM_ACTION_ENCODER", "ss_vae").lower()
+        if _share_ss_vae is not None and hasattr(_share_ss_vae, "_pca_mean"):
+            obj._pca_mean = _share_ss_vae._pca_mean
+            obj._pca_comp = _share_ss_vae._pca_comp
+            obj._latent_ch = _share_ss_vae._latent_ch
+        else:
+            _ss_ck = torch.load(ss_vae_checkpoint, map_location="cpu", weights_only=False)
+            obj._pca_mean = np.asarray(_ss_ck["pca_mean"], dtype=np.float64)
+            obj._pca_comp = np.asarray(_ss_ck["pca_comp"], dtype=np.float64)
+            obj._latent_ch = int(_ss_ck["hparams"]["LATENT_CH"])
+        if obj._action_encoder == "pca":
+            logging.info("ACTION ENCODER = PCA drop-in (from_manifest): slots %s <- PCA %s",
+                         list(_PCA_SLOT_COMP), [_PCA_SLOT_COMP[s] for s in _PCA_SLOT_COMP])
 
         obj._rides = []
         obj._attrs_by_path = {}
@@ -810,9 +877,19 @@ class ZarrRideDataset(Dataset):
             : _LATENTS_PER_MOTION_CHUNK
         ]  # one motion entry per chunk in [chunk_lo, chunk_hi)
 
-        z_chunks = _encode_motion_ss_vae(
-            chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
-        )  # [n_chunks_window, 8]
+        _enc = getattr(self, "_action_encoder", "ss_vae")
+        if _enc == "pca":
+            z_chunks = _encode_motion_pca(
+                chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
+            )  # [n_chunks_window, latent_ch] (affine into VAE z-space)
+        elif _enc == "pca_raw":
+            z_chunks = _encode_motion_pca_raw(
+                chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
+            )  # [n_chunks_window, latent_ch] RAW top-N PCA (pre-squash)
+        else:
+            z_chunks = _encode_motion_ss_vae(
+                chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
+            )  # [n_chunks_window, 8]
         t_encoded = time.perf_counter()
 
         # Per-latent broadcast of chunk-grain z, then slice to the
@@ -824,7 +901,11 @@ class ZarrRideDataset(Dataset):
         z_window = z_per_latent_full[rel_start:rel_end]
 
         z_tensor = torch.from_numpy(z_window)
-        z_squashed = _tanh_squash(z_tensor)
+        if getattr(self, "_action_encoder", "ss_vae") == "pca_raw":
+            scales = torch.from_numpy(_PCA_RAW_SCALES[:z_tensor.shape[-1]]).to(z_tensor.dtype)
+            z_squashed = torch.tanh(z_tensor / scales)             # per-component squash
+        else:
+            z_squashed = _tanh_squash(z_tensor)
 
         logging.info(
             "  z_actions [%d:%d]: encode %d chunks (%d latents) | "
@@ -1017,6 +1098,17 @@ class ZarrSequentialDataset(Dataset):
         self._ss_scale = float(ss_scale)
         self._ss_dev = ss_dev
 
+        # Action-vector encoder: "ss_vae" (default) or "pca" drop-in. See the
+        # other constructor for the rationale; PCA basis is in the ss_vae ckpt.
+        self._action_encoder = os.environ.get("ARRWM_ACTION_ENCODER", "ss_vae").lower()
+        _ss_ck = torch.load(ss_vae_checkpoint, map_location="cpu", weights_only=False)
+        self._pca_mean = np.asarray(_ss_ck["pca_mean"], dtype=np.float64)
+        self._pca_comp = np.asarray(_ss_ck["pca_comp"], dtype=np.float64)
+        self._latent_ch = int(_ss_ck["hparams"]["LATENT_CH"])
+        if getattr(self, "_action_encoder", "ss_vae") == "pca":
+            logging.info("ACTION ENCODER = PCA drop-in (slots %s <- PCA comps %s, affine->VAE z-space)",
+                         list(_PCA_SLOT_COMP), [_PCA_SLOT_COMP[s] for s in _PCA_SLOT_COMP])
+
         # Build index: list of (zarr_path, prompt_embeds_tensor, z_actions_tensor, window_start)
         self._samples: List[Tuple[Path, torch.Tensor, torch.Tensor, int]] = []
         self._build_index()
@@ -1136,9 +1228,14 @@ class ZarrSequentialDataset(Dataset):
             attrs, n_latent_frames, self.motion_root,
         )
         chunk_motion = motion_per_latent[::_LATENTS_PER_MOTION_CHUNK]
-        z_chunks = _encode_motion_ss_vae(
-            chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
-        )  # (n_chunks, 8)
+        if getattr(self, "_action_encoder", "ss_vae") == "pca":
+            z_chunks = _encode_motion_pca(
+                chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
+            )  # (n_chunks, latent_ch)
+        else:
+            z_chunks = _encode_motion_ss_vae(
+                chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
+            )  # (n_chunks, 8)
         z_per_latent = np.repeat(
             z_chunks, _LATENTS_PER_MOTION_CHUNK, axis=0,
         )[:n_latent_frames]

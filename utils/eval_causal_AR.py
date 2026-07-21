@@ -775,6 +775,7 @@ class ODEChainPipeline(ChainPipeline):
         #                         denoise step.
         # ------------------------------------------------------------------
         generated: List[torch.Tensor] = []
+        _fr_steps: list = []                       # ARRWM flow-viz hook records
 
         # FIFO state used only by cache_refresh="full_fifo". Entries are
         # (latent_block [B, num_frame_per_block, C, H, W], global frame
@@ -847,11 +848,24 @@ class ODEChainPipeline(ChainPipeline):
                 prompt_embeds_dev, block_fa, num_frames=num_frame_per_block,
             )
 
+            # ARRWM flow-viz hook (env-gated ODE_FLOW_REC): pin the block
+            # noise to the SAME generator stream as utils/flow_record.py's
+            # teacher recording (seed_base + block index) so student and
+            # teacher trajectories share their initial noise exactly, and
+            # record x_t / pred_x0 at every few-step iteration.
+            _fr_dir = os.environ.get("ODE_FLOW_REC")
+            _fr_gen = None
+            if _fr_dir:
+                _fr_gen = torch.Generator(device=self.device).manual_seed(
+                    int(os.environ.get("ODE_FLOW_SEED", "1234")) + step_idx)
             noise = torch.randn(
                 [B, num_frame_per_block, C, H, W],
-                dtype=torch.float32, device=self.device,
+                dtype=torch.float32, device=self.device, generator=_fr_gen,
             )
             x = noise.to(self.dtype)
+            if _fr_dir:
+                _fr_steps.append((step_idx, -1, float(ts[0].item()),
+                                  x.detach().float().to(torch.float16).cpu().numpy()))
 
             pred_x0: Optional[torch.Tensor] = None
             for d_idx in range(int(ts.shape[0])):
@@ -870,10 +884,22 @@ class ODEChainPipeline(ChainPipeline):
                         current_start=current_start_frame * frame_seq_length,
                     )
                 pred_x0 = out[1]
+                if _fr_dir:                        # x0 prediction at this rung
+                    _fr_steps.append((step_idx, d_idx, t_val,
+                                      pred_x0.detach().float().to(torch.float16).cpu().numpy()))
                 if d_idx < int(ts.shape[0]) - 1:
                     next_t = float(ts[d_idx + 1].item())
                     flat = pred_x0.flatten(0, 1).float()
-                    flat_noise = torch.randn_like(flat)
+                    if _fr_dir and os.environ.get("ODE_FLOW_DET"):
+                        # deterministic (rectified-flow straight-path) chaining:
+                        # re-noise with the block's ORIGINAL noise instead of a
+                        # fresh draw, so rung k+1 stays on rung k's path
+                        flat_noise = noise.flatten(0, 1).float()
+                    elif _fr_gen is not None:
+                        flat_noise = torch.randn(flat.shape, device=flat.device,
+                                                 dtype=flat.dtype, generator=_fr_gen)
+                    else:
+                        flat_noise = torch.randn_like(flat)
                     flat_t = torch.full(
                         (flat.shape[0],), next_t,
                         device=self.device, dtype=torch.float32,
@@ -883,6 +909,9 @@ class ODEChainPipeline(ChainPipeline):
                         .view(B, num_frame_per_block, C, H, W)
                         .to(self.dtype)
                     )
+                    if _fr_dir:                    # re-noised input for next rung
+                        _fr_steps.append((step_idx, d_idx, -next_t,
+                                          x.detach().float().to(torch.float16).cpu().numpy()))
             assert pred_x0 is not None
 
             generated.append(pred_x0.detach().to(torch.float32))
@@ -939,6 +968,15 @@ class ODEChainPipeline(ChainPipeline):
                 [initial_latents_dev.to(torch.float32)] + generated, dim=1,
             )
         assert int(full.shape[1]) == total_frames, (full.shape, total_frames)
+        if _fr_steps:                              # ARRWM flow-viz hook save
+            import numpy as _np
+            _d = os.environ["ODE_FLOW_REC"]
+            os.makedirs(_d, exist_ok=True)
+            _np.savez_compressed(
+                os.path.join(_d, "steps.npz"),
+                sdt=_np.array([(s, d, t) for s, d, t, _ in _fr_steps], dtype=_np.float64),
+                **{f"x{j}": x for j, (_, _, _, x) in enumerate(_fr_steps)})
+            log.info("[flowrec] saved %s/steps.npz (%d records)", _d, len(_fr_steps))
         del kv_cache, crossattn_cache
         torch.cuda.empty_cache()
         return full

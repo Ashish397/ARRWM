@@ -22,7 +22,13 @@ import torch
 
 # Full 7-entry snapshot pool. Each entry is the ODE step index the
 # snapshot latent was captured at; ``-1`` is aliased as "after step N".
-SNAPSHOT_STEPS: List[int] = [0, 18, 36, 40, 44, 46, -1]
+import os as _os
+# ARRWM 14e pilot: env overrides for the chained 20-step LMDBs
+# (AF_SNAPSHOT_STEPS="0,15,18,19,-1" AF_EVAL_STEPS=20); defaults
+# unchanged for the v14/v14d 48-step datasets.
+SNAPSHOT_STEPS: List[int] = (
+    [int(x) for x in _os.environ["AF_SNAPSHOT_STEPS"].split(",")]
+    if "AF_SNAPSHOT_STEPS" in _os.environ else [0, 18, 36, 40, 44, 46, -1])
 
 # Default: use ALL 7 stored snapshots.
 DEFAULT_USABLE_INDICES: List[int] = [0, 1, 2, 3, 4, 5, 6]
@@ -35,7 +41,7 @@ DEFAULT_USABLE_INDICES: List[int] = [0, 1, 2, 3, 4, 5, 6]
 # keeping it in the pool wastes ~1/N of the batch on identity frames.
 DEFAULT_RANDOM_STEPS: List[int] = [0, 36, 44, 46]
 
-EVAL_STEPS: int = 48
+EVAL_STEPS: int = int(_os.environ.get("AF_EVAL_STEPS", "48"))
 TIMESTEP_SHIFT: float = 5.0
 
 # Number of chunks / block in the 21-frame window.

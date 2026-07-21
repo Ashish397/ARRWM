@@ -1,4 +1,4 @@
-%File: anonymous-submission-latex-2026.tex
+%File: paper.tex
 \documentclass[letterpaper]{article} % DO NOT CHANGE THIS
 \usepackage[submission]{aaai2026}  % DO NOT CHANGE THIS
 \usepackage{times}  % DO NOT CHANGE THIS
@@ -13,804 +13,720 @@
 \frenchspacing  % DO NOT CHANGE THIS
 \setlength{\pdfpagewidth}{8.5in} % DO NOT CHANGE THIS
 \setlength{\pdfpageheight}{11in} % DO NOT CHANGE THIS
-%
-% These are recommended to typeset algorithms but not required. See the subsubsection on algorithms. Remove them if you don't have algorithms in your paper.
-\usepackage{algorithm}
-\usepackage{algorithmic}
 
-%
-% These are are recommended to typeset listings but not required. See the subsubsection on listing. Remove this block if you don't have listings in your paper.
-\usepackage{newfloat}
-\usepackage{listings}
-\DeclareCaptionStyle{ruled}{labelfont=normalfont,labelsep=colon,strut=off} % DO NOT CHANGE THIS
-\lstset{%
-	basicstyle={\footnotesize\ttfamily},% footnotesize acceptable for monospace
-	numbers=left,numberstyle=\footnotesize,xleftmargin=2em,% show line numbers, remove this entire line if you don't want the numbers.
-	aboveskip=0pt,belowskip=0pt,%
-	showstringspaces=false,tabsize=2,breaklines=true}
-\floatstyle{ruled}
-\newfloat{listing}{tb}{lst}{}
-\floatname{listing}{Listing}
-%
-% Keep the \pdfinfo as shown here. There's no need
-% for you to add the /Title and /Author tags.
+% Permitted, commonly used packages.
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+
 \pdfinfo{
 /TemplateVersion (2026.1)
 }
 
-% DISALLOWED PACKAGES
-% \usepackage{authblk} -- This package is specifically forbidden
-% \usepackage{balance} -- This package is specifically forbidden
-% \usepackage{color (if used in text)
-% \usepackage{CJK} -- This package is specifically forbidden
-% \usepackage{float} -- This package is specifically forbidden
-% \usepackage{flushend} -- This package is specifically forbidden
-% \usepackage{fontenc} -- This package is specifically forbidden
-% \usepackage{fullpage} -- This package is specifically forbidden
-% \usepackage{geometry} -- This package is specifically forbidden
-% \usepackage{grffile} -- This package is specifically forbidden
-% \usepackage{hyperref} -- This package is specifically forbidden
-% \usepackage{navigator} -- This package is specifically forbidden
-% (or any other package that embeds links such as navigator or hyperref)
-% \indentfirst} -- This package is specifically forbidden
-% \layout} -- This package is specifically forbidden
-% \multicol} -- This package is specifically forbidden
-% \nameref} -- This package is specifically forbidden
-% \usepackage{savetrees} -- This package is specifically forbidden
-% \usepackage{setspace} -- This package is specifically forbidden
-% \usepackage{stfloats} -- This package is specifically forbidden
-% \usepackage{tabu} -- This package is specifically forbidden
-% \usepackage{titlesec} -- This package is specifically forbidden
-% \usepackage{tocbibind} -- This package is specifically forbidden
-% \usepackage{ulem} -- This package is specifically forbidden
-% \usepackage{wrapfig} -- This package is specifically forbidden
-% DISALLOWED COMMANDS
-% \nocopyright -- Your paper will not be published if you use this command
-% \addtolength -- This command may not be used
-% \balance -- This command may not be used
-% \baselinestretch -- Your paper will not be published if you use this command
-% \clearpage -- No page breaks of any kind may be used for the final version of your paper
-% \columnsep -- This command may not be used
-% \newpage -- No page breaks of any kind may be used for the final version of your paper
-% \pagebreak -- No page breaks of any kind may be used for the final version of your paperr
-% \pagestyle -- This command may not be used
-% \tiny -- This is not an acceptable font size.
-% \vspace{- -- No negative value may be used in proximity of a caption, figure, table, section, subsection, subsubsection, or reference
-% \vskip{- -- No negative value may be used to alter spacing above or below a caption, figure, table, section, subsection, subsubsection, or reference
+\setcounter{secnumdepth}{0}
 
-\setcounter{secnumdepth}{0} %May be changed to 1 or 2 if section numbers are desired.
+\title{Action Forcing}
 
-% The file aaai2026.sty is the style file for AAAI Press
-% proceedings, working notes, and technical reports.
-%
-
-% Title
-
-% Your title must be in mixed case, not sentence case.
-% That means all verbs (including short verbs like be, is, using,and go),
-% nouns, adverbs, adjectives should be capitalized, including both words in hyphenated terms, while
-% articles, conjunctions, and prepositions are lower case unless they
-% directly follow a colon or long dash
-\title{AAAI Press Anonymous Submission\\Instructions for Authors Using \LaTeX{}}
 \author{
-    %Authors
-    % All authors must be in the same font size and format.
-    Written by AAAI Press Staff\textsuperscript{\rm 1}\thanks{With help from the AAAI Publications Committee.}\\
-    AAAI Style Contributions by Pater Patel Schneider,
-    Sunil Issar,\\
-    J. Scott Penberthy,
-    George Ferguson,
-    Hans Guesgen,
-    Francisco Cruz\equalcontrib,
-    Marc Pujol-Gonzalez\equalcontrib
+    Anonymous Submission
+    % Please add: Prof Zhong Fan (Z.Fan@exeter.ac.uk)
+    % Please acknowledge the Isambard project(s) where appropriate
 }
 \affiliations{
-    %Afiliations
-    \textsuperscript{\rm 1}Association for the Advancement of Artificial Intelligence\\
-    % If you have multiple authors and multiple affiliations
-    % use superscripts in text and roman font to identify them.
-    % For example,
-
-    % Sunil Issar\textsuperscript{\rm 2},
-    % J. Scott Penberthy\textsuperscript{\rm 3},
-    % George Ferguson\textsuperscript{\rm 4},
-    % Hans Guesgen\textsuperscript{\rm 5}
-    % Note that the comma should be placed after the superscript
-
-    1101 Pennsylvania Ave, NW Suite 300\\
-    Washington, DC 20004 USA\\
-    % email address must be in roman text type, not monospace or sans serif
-    proceedings-questions@aaai.org
-%
-% See more examples next
+    %
 }
-
-%Example, Single Author, ->> remove \iffalse,\fi and place them surrounding AAAI title to use it
-\iffalse
-\title{My Publication Title --- Single Author}
-\author {
-    Author Name
-}
-\affiliations{
-    Affiliation\\
-    Affiliation Line 2\\
-    name@example.com
-}
-\fi
-
-\iffalse
-%Example, Multiple Authors, ->> remove \iffalse,\fi and place them surrounding AAAI title to use it
-\title{My Publication Title --- Multiple Authors}
-\author {
-    % Authors
-    First Author Name\textsuperscript{\rm 1},
-    Second Author Name\textsuperscript{\rm 2},
-    Third Author Name\textsuperscript{\rm 1}
-}
-\affiliations {
-    % Affiliations
-    \textsuperscript{\rm 1}Affiliation 1\\
-    \textsuperscript{\rm 2}Affiliation 2\\
-    firstAuthor@affiliation1.com, secondAuthor@affilation2.com, thirdAuthor@affiliation1.com
-}
-\fi
-
-
-% REMOVE THIS: bibentry
-% This is only needed to show inline citations in the guidelines document. You should not need it and can safely delete it.
-\usepackage{bibentry}
-% END REMOVE bibentry
 
 \begin{document}
 
 \maketitle
 
 \begin{abstract}
-AAAI creates proceedings, working notes, and technical reports directly from electronic source furnished by the authors. To ensure that all papers in the publication have a uniform appearance, authors must adhere to the following instructions.
+We adapt a pretrained Wan2.1 1.3B diffusion transformer (DiT) into an action conditioned world model using effectively unsupervised pedestrian real world data. World model literature largely relies on precise and accurate action labels obtained from video game controllers, driving logs, or camera rigs. An alternative family of methods choose to derive latent actions that explain changes from one latent frame to the next using complex models that lack cross context grounding. In this work we present a simple alternative - we derive our abstracted egomotion vector as principal components of simple, chunked, noisy pixel tracking outputs. PCA is linear, additive, and interpretable, offering us a myriad of benefits over more complex transformation spaces. We use teacher forcing to train multiple chunks (~0.5 second videos) simultaneously in the interest of efficiency. Decoding multiple videos and passing gradient through them is prohibitive in memory and invites the model to game the pixel tracking signal. Instead we introduce a 3D CNN based critic that learns to supervise egomotion entirely in the latent space. We train this online critic using localised samples aided by the frozen and PCA-abstracted pixel tracking pipeline.
+After training for 5000 steps, we report a resultant $r>0.98$ action following score while largely preserving underlying scene content for videos of up to 5 seconds.
 \end{abstract}
 
-% Uncomment the following to link to your code, datasets, an extended version or similar.
-% You must keep this block between (not within) the abstract and the main body of the paper.
-% \begin{links}
-%     \link{Code}{https://aaai.org/example/code}
-%     \link{Datasets}{https://aaai.org/example/datasets}
-%     \link{Extended version}{https://aaai.org/example/extended-version}
-% \end{links}
+\section{Introduction}
 
-\section{Preparing an Anonymous Submission}
+1) Backwards + PCA
+2) Real World + PCA + Unsupervised
+3) Evaluation + Formalism? 
 
-This document details the formatting requirements for anonymous submissions. The requirements are the same as for camera ready papers but with a few notable differences:
+Messages we want to send:
 
-\begin{itemize}
-    \item Anonymous submissions must not include the author names and affiliations. Write ``Anonymous Submission'' as the ``sole author'' and leave the affiliations empty.
-    \item The PDF document's metadata should be cleared with a metadata-cleaning tool before submitting it. This is to prevent leaked information from revealing your identity.
-    \item References must be anonymized whenever the reader can infer that they are to the authors' previous work.
-    \item AAAI's copyright notice should not be included as a footer in the first page.
-    \item Only the PDF version is required at this stage. No source versions will be requested, nor any copyright transfer form.
-\end{itemize}
-
-You can remove the copyright notice and ensure that your names aren't shown by including \texttt{submission} option when loading the \texttt{aaai2026} package:
-
-\begin{quote}\begin{scriptsize}\begin{verbatim}
-\documentclass[letterpaper]{article}
-\usepackage[submission]{aaai2026}
-\end{verbatim}\end{scriptsize}\end{quote}
-
-The remainder of this document are the original camera-
-ready instructions. Any contradiction of the above points
-ought to be ignored while preparing anonymous submis-
-sions.
-
-\section{Camera-Ready Guidelines}
-
-Congratulations on having a paper selected for inclusion in an AAAI Press proceedings or technical report! This document details the requirements necessary to get your accepted paper published using PDF\LaTeX{}. If you are using Microsoft Word, instructions are provided in a different document. AAAI Press does not support any other formatting software.
-
-The instructions herein are provided as a general guide for experienced \LaTeX{} users. If you do not know how to use \LaTeX{}, please obtain assistance locally. AAAI cannot provide you with support and the accompanying style files are \textbf{not} guaranteed to work. If the results you obtain are not in accordance with the specifications you received, you must correct your source file to achieve the correct result.
-
-These instructions are generic. Consequently, they do not include specific dates, page charges, and so forth. Please consult your specific written conference instructions for details regarding your submission. Please review the entire document for specific instructions that might apply to your particular situation. All authors must comply with the following:
-
-\begin{itemize}
-\item You must use the 2026 AAAI Press \LaTeX{} style file and the aaai2026.bst bibliography style files, which are located in the 2026 AAAI Author Kit (aaai2026.sty, aaai2026.bst).
-\item You must complete, sign, and return by the deadline the AAAI copyright form (unless directed by AAAI Press to use the AAAI Distribution License instead).
-\item You must read and format your paper source and PDF according to the formatting instructions for authors.
-\item You must submit your electronic files and abstract using our electronic submission form \textbf{on time.}
-\item You must pay any required page or formatting charges to AAAI Press so that they are received by the deadline.
-\item You must check your paper before submitting it, ensuring that it compiles without error, and complies with the guidelines found in the AAAI Author Kit.
-\end{itemize}
-
-\section{Copyright}
-All papers submitted for publication by AAAI Press must be accompanied by a valid signed copyright form. They must also contain the AAAI copyright notice at the bottom of the first page of the paper. There are no exceptions to these requirements. If you fail to provide us with a signed copyright form or disable the copyright notice, we will be unable to publish your paper. There are \textbf{no exceptions} to this policy. You will find a PDF version of the AAAI copyright form in the AAAI AuthorKit. Please see the specific instructions for your conference for submission details.
-
-\section{Formatting Requirements in Brief}
-We need source and PDF files that can be used in a variety of ways and can be output on a variety of devices. The design and appearance of the paper is strictly governed by the aaai style file (aaai2026.sty).
-\textbf{You must not make any changes to the aaai style file, nor use any commands, packages, style files, or macros within your own paper that alter that design, including, but not limited to spacing, floats, margins, fonts, font size, and appearance.} AAAI imposes requirements on your source and PDF files that must be followed. Most of these requirements are based on our efforts to standardize conference manuscript properties and layout. All papers submitted to AAAI for publication will be recompiled for standardization purposes. Consequently, every paper submission must comply with the following requirements:
-
-\begin{itemize}
-\item Your .tex file must compile in PDF\LaTeX{} --- (you may not include .ps or .eps figure files.)
-\item All fonts must be embedded in the PDF file --- including your figures.
-\item Modifications to the style file, whether directly or via commands in your document may not ever be made, most especially when made in an effort to avoid extra page charges or make your paper fit in a specific number of pages.
-\item No type 3 fonts may be used (even in illustrations).
-\item You may not alter the spacing above and below captions, figures, headings, and subheadings.
-\item You may not alter the font sizes of text elements, footnotes, heading elements, captions, or title information (for references and mathematics, please see the limited exceptions provided herein).
-\item You may not alter the line spacing of text.
-\item Your title must follow Title Case capitalization rules (not sentence case).
-\item \LaTeX{} documents must use the Times or Nimbus font package (you may not use Computer Modern for the text of your paper).
-\item No \LaTeX{} 209 documents may be used or submitted.
-\item Your source must not require use of fonts for non-Roman alphabets within the text itself. If your paper includes symbols in other languages (such as, but not limited to, Arabic, Chinese, Hebrew, Japanese, Thai, Russian and other Cyrillic languages), you must restrict their use to bit-mapped figures. Fonts that require non-English language support (CID and Identity-H) must be converted to outlines or 300 dpi bitmap or removed from the document (even if they are in a graphics file embedded in the document).
-\item Two-column format in AAAI style is required for all papers.
-\item The paper size for final submission must be US letter without exception.
-\item The source file must exactly match the PDF.
-\item The document margins may not be exceeded (no overfull boxes).
-\item The number of pages and the file size must be as specified for your event.
-\item No document may be password protected.
-\item Neither the PDFs nor the source may contain any embedded links or bookmarks (no hyperref or navigator packages).
-\item Your source and PDF must not have any page numbers, footers, or headers (no pagestyle commands).
-\item Your PDF must be compatible with Acrobat 5 or higher.
-\item Your \LaTeX{} source file (excluding references) must consist of a \textbf{single} file (use of the ``input" command is not allowed.
-\item Your graphics must be sized appropriately outside of \LaTeX{} (do not use the ``clip" or ``trim'' command) .
-\end{itemize}
-
-If you do not follow these requirements, your paper will be returned to you to correct the deficiencies.
-
-\section{What Files to Submit}
-You must submit the following items to ensure that your paper is published:
-\begin{itemize}
-\item A fully-compliant PDF file.
-\item Your \LaTeX{} source file submitted as a \textbf{single} .tex file (do not use the ``input" command to include sections of your paper --- every section must be in the single source file). (The only allowable exception is .bib file, which should be included separately).
-\item The bibliography (.bib) file(s).
-\item Your source must compile on our system, which includes only standard \LaTeX{} 2020 TeXLive support files.
-\item Only the graphics files used in compiling paper.
-\item The \LaTeX{}-generated files (e.g. .aux,  .bbl file, PDF, etc.).
-\end{itemize}
-
-Your \LaTeX{} source will be reviewed and recompiled on our system (if it does not compile, your paper will be returned to you. \textbf{Do not submit your source in multiple text files.} Your single \LaTeX{} source file must include all your text, your bibliography (formatted using aaai2026.bst), and any custom macros.
-
-Your files should work without any supporting files (other than the program itself) on any computer with a standard \LaTeX{} distribution.
-
-\textbf{Do not send files that are not actually used in the paper.} Avoid including any files not needed for compiling your paper, including, for example, this instructions file, unused graphics files, style files, additional material sent for the purpose of the paper review, intermediate build files and so forth.
-
-\textbf{Obsolete style files.} The commands for some common packages (such as some used for algorithms), may have changed. Please be certain that you are not compiling your paper using old or obsolete style files.
-
-\textbf{Final Archive.} Place your source files in a single archive which should be compressed using .zip. The final file size may not exceed 10 MB.
-Name your source file with the last (family) name of the first author, even if that is not you.
+1) Do action space better (more grounded in reality, more grounded in theory + science) 
+2) Do eval better
 
 
-\section{Using \LaTeX{} to Format Your Paper}
 
-The latest version of the AAAI style file is available on AAAI's website. Download this file and place it in the \TeX\ search path. Placing it in the same directory as the paper should also work. You must download the latest version of the complete AAAI Author Kit so that you will have the latest instruction set and style file.
+Video DiTs have recently found great success in generating high resolution video given some input conditions after having been trained on internet scale video for thousands of hours. While impressive, we naturally want to upgrade these models from video makers into world makers that adapt their generation to abstract egomotion inputs. World models have widely been hailed as the next level of intelligence leading to applications such as training agents / humans in silico, intelligent planning, and expansive digital twins. However, the scale of training that unsupervised training bought LLM models are hard to achieve with world models as they currently need meticulously labelled data to function, data that simply does not exist naturally - new data either needs to be painstakingly collected \cite{navwormod, cameracontrol2, cosmos2, uniwm, xworld, gaia2}, or training is relegated to the domain of videogames: \cite{gamengen2024, diamond, olafworld, mineworld, gamefactory, oasis2} synthesised worlds that can never cover the complexity and stochasticity of the real world. While some use latent action models to bridge the gap, these often prove to be complex models whose action spaces lack any meaningful grounding (cross context identifiability) \cite{genie, gamengen2024, olafworld, adaworld}. The open question thus is not whether this conversion of pretrained video models to world models is possible --- several recent systems demonstrate that it is --- but under what initial supervision this transition can be realised.
 
-\subsection{Document Preamble}
+When it comes to egomotion world models, the nature of the data itself is a point of differentiation: videogame data offers handmade worlds with simple rules of interaction, cloned features, and an ever consistent rigid motion + camera representation. These data lead to the models struggling to produce the depth of texture present in the real world and are thus consigned to generating uncanny looking videos. Real world driving datasets are another popular approach that trade handmade environments for real roads but often involve backgrounds that evolve slowly with actors that behave predictably. Sometimes real world low speed data is also used \cite{navwormod} but it is often manually collected, limiting scale and inviting overfitting. They are also sometimes augmented with videogame data to provide grounded action supervision \cite{diffusionworldmodels}. Tellingly, even high performing systems built to handle navigation retreat from messy data when they can: a recent Wan based world model abandons real world walking and drone data for unreal engine generated data, because real egocentric motion is dominated by forward travel and when it is not, entangled across different dimensions ~\cite{relic}.
 
-In the \LaTeX{} source for your paper, you \textbf{must} place the following lines as shown in the example in this subsection. This command set-up is for three authors. Add or subtract author and address lines as necessary, and uncomment the portions that apply to you. In most instances, this is all you need to do to format your paper in the Times font. The helvet package will cause Helvetica to be used for sans serif. These files are part of the PSNFSS2e package, which is freely available from many Internet sites (and is often part of a standard installation).
+We use one of these messy real world datasets that prove to be insightful, brilliant, and interesting. Frodobots \cite{frodobots} consists of low speed pedestrian rover footage that operate in real cities across the globe. These rovers are teleoperated across vast distances, leading to the dataset coupled commands proving unreliable and significantly laggy. Realized egomotion also diverges from commanded egomotion when collisions, bad internet, and uneven ground are met. Scenes are often full of pedestrians and actors that behave in inexplicable ways that only the real world can produce; street furniture is complex, unique, and varied. In this work we train on Frodobots but we discard the noisy action labels provided as we find that it hurts WM training more than it helps. We instead assume the videos are unsupervised and recover action signals directly from pixels instead.
 
-Leave the setcounter for section number depth commented out and set at 0 unless you want to add section numbers to your paper. If you do add section numbers, you must uncomment this line and change the number to 1 (for section numbers), or 2 (for section and subsection numbers). The style file will not work properly with numbering of subsubsections, so do not use a number higher than 2.
+Doing so well rests on three simple ideas, that when adopted together we find materially improves WM training. First, we derive an interpretable action space directly from video motion: a frozen point tracker \cite{cotracker} over each chunk (lasting \~0.5 seconds) yields displacement fields whose principal components (PCA) form a linear, additive, and interpretable egomotion basis. We find that the two principal components that represent the highest variance recover the two control dimensions afforded by the ground robot. Prior flow- and track-conditioned generators recover motion from video too, but then go on to condition on raw, dense optical flow or pixel tracks~\cite{flovd, motionprompting, onlyflow}, an un-abstracted control surface that would require a translator to turn an abstract command such as go straight into a full motion field. Using PCA we sidestep the need for this complex conditioning and subsequent translation at the inference stage. 
 
-\subsubsection{The Following Must Appear in Your Preamble}
-\begin{quote}
-\begin{scriptsize}\begin{verbatim}
-\documentclass[letterpaper]{article}
-% DO NOT CHANGE THIS
-\usepackage[submission]{aaai2026} % DO NOT CHANGE THIS
-\usepackage{times} % DO NOT CHANGE THIS
-\usepackage{helvet} % DO NOT CHANGE THIS
-\usepackage{courier} % DO NOT CHANGE THIS
-\usepackage[hyphens]{url} % DO NOT CHANGE THIS
-\usepackage{graphicx} % DO NOT CHANGE THIS
-\urlstyle{rm} % DO NOT CHANGE THIS
-\def\UrlFont{\rm} % DO NOT CHANGE THIS
-\usepackage{graphicx}  % DO NOT CHANGE THIS
-\usepackage{natbib}  % DO NOT CHANGE THIS
-\usepackage{caption}  % DO NOT CHANGE THIS
-\frenchspacing % DO NOT CHANGE THIS
-\setlength{\pdfpagewidth}{8.5in} % DO NOT CHANGE THIS
-\setlength{\pdfpageheight}{11in} % DO NOT CHANGE THIS
-%
-% Keep the \pdfinfo as shown here. There's no need
-% for you to add the /Title and /Author tags.
-\pdfinfo{
-/TemplateVersion (2026.1)
-}
-\end{verbatim}\end{scriptsize}
-\end{quote}
+At training we use the principal components of the pixel tracks to determine the abstracted egomotion directions and we use this to train the model, obtaining the best of both worlds. We perform this supervision without ever decoding to pixels: an action critic learns how to map the generated latents' motion to the two abstracted PCA dimensions and subsequently uses the same action critic to supervise the DiT such that it learns to produce the correct egomotion. This avoids the memory cost of passing decoder gradients for tens of pixel frames simultaenously while also avoiding the model cheating by learning to control just the pixels we track. 
 
-\subsection{Preparing Your Paper}
+We inject these egomotion commands simultaenously through two complementary conditioning pathways: AdaLN-zero and sideband action tokens. We show in our ablations that removing either degrades the model. AdaLN proves crucial in that ablating it removes the ability to influence the model, while action tokens are shown to make the whole model more robust and less prone to collapsing while actions become more expressive and powerful. To our knowledge, we are the first work that mixes AdaLN and action tokens as a form of dual conditioning, although dual conditioning at the time of writing has been used in two other works \cite{wovr, dexac}, albeit combining AdaLN with cross attention.
 
-After the preamble above, you should prepare your paper as follows:
-\begin{quote}
-\begin{scriptsize}\begin{verbatim}
-\begin{document}
-\maketitle
-\begin{abstract}
-%...
-\end{abstract}\end{verbatim}\end{scriptsize}
-\end{quote}
+We note one simplification in our setting: our rover has no neck nor a free moving camera decoupled from its body, so camera motion and agent egomotion coincide, making our control space smaller than an embodiment with an independent viewpoint. The additive structure of our basis, however, does not exclude adding further degrees of freedom to it, which we leave to future work.
 
-\noindent If you want to add links to the paper's code, dataset(s), and extended version or similar this is the place to add them, within a \emph{links} environment:
-\begin{quote}%
-\begin{scriptsize}\begin{verbatim}
-\begin{links}
-  \link{Code}{https://aaai.org/example/guidelines}
-  \link{Datasets}{https://aaai.org/example/datasets}
-  \link{Extended version}{https://aaai.org/example}
-\end{links}\end{verbatim}\end{scriptsize}
-\end{quote}
-\noindent Make sure that you do not de-anonymize yourself with these links.
+We therefore present a framework through which pretrained video DiTs can be transitioned into action following world models through the following contributions:
+\begin{enumerate}
 
-\noindent You should then continue with the body of your paper. Your paper must conclude with the references, which should be inserted as follows:
-\begin{quote}
-\begin{scriptsize}\begin{verbatim}
-% References and End of Paper
-% These lines must be placed at the end of your paper
-\bibliography{Bibliography-File}
-\end{document}
-\end{verbatim}\end{scriptsize}
-\end{quote}
+\item An unsupervised, interpretable egomotion action space recovered from real video via point tracking and PCA, requiring no action labels and no learned latent action model, whose additive basis cleanly separates and recombines the often entangled real world motion.
 
-\begin{quote}
-\begin{scriptsize}\begin{verbatim}
-\begin{document}\\
-\maketitle\\
-...\\
-\bibliography{Bibliography-File}\\
-\end{document}\\
-\end{verbatim}\end{scriptsize}
-\end{quote}
+\item An online latent egomotion critic that supervises action-following entirely in latent space, distilling PCA abstracted pixel tracks without backpropagating through the decoder or the tracker itself.
 
-\subsection{Commands and Packages That May Not Be Used}
+\item A dual conditioning scheme that injects egomotion through both AdaLN-Zero and sideband action tokens, where AdaLN carries crucial action information while action tokens provide valuable support by stabilising video generation and strengthening action response.
+
+\end{enumerate}
+
+We instantiate these ideas on 80 hours of Frodobots and adapt the Wan base model over five passes of this dataset. We evaluate by giving the model ground truth actions as well as flipped ground truth actions and assess both the quality and the action following. We also provide the outputs from a 360 degree rotation to show consistency.
+
+\section{Related Work}
+
+\paragraph{World models from pretrained video generators.}
+While earlier literature focussed on training up world models from scratch \cite{mineworld, navwormod}, contemporary literature tends to focus on adapting pretrained video DiTs \cite{wan2025, cogvid, skyreels} into action-conditioned world models. Closest to our setting are recent autoregressive egomotion or camera-action systems such as minWM, WorldCam, Astra, Matrix-Game 2.0, HY-WorldPlay, and Yume, which demonstrate that pretrained video models can be converted into controllable rollout models when supplied with camera poses, keyboard/mouse controls, game actions, or curated action annotations~\cite{minwm, worldcam, astra, matrixgame2, hyworldplay, yume}. The work closest to the foundation-model style is Cosmos-Predict2.5, which augments large-scale video pretraining with action post-training on smaller robot and driving datasets~\cite{cosmos}. Other works \cite{dws, vid2world} train action conditioning modules against well supervised action labels. To ground their actions better, some turn to video games and synthesised worlds \cite{gamefactory, matrixgame2}, trading the complexity of the real world for the well behaved action space. Others turn to instrumented camera movement trajectories \cite{cameracontrol2} and instrumented physics quantities \cite{aeroworld} derived through an onboard IMU, resulting in much better behaved action spaces but relying heavily on instrumented data.
+
+\paragraph{Latent action models}
+An alternative family of methods remove labels by learning a latent action space from video via inverse dynamics~\cite{genie, lapo, lapa, adaworld}. These are powerful without supervision, but the learned codes tend to be opaque and poorly aligned across scenes: recent analysis notes that independently learned latent actions entangle scene-specific cues and lack a shared coordinate system across contexts~\cite{olafworld}.
+
+\paragraph{Motion-conditioned generation from recovered motion.}
+There also exist other work that attempt to use unsupervised video albeit with caveats. Most works in this space largely use overactuated pixel tracks \cite{motionprompt} or high detail optical flow \cite{flovd, onlyflow} that lead to difficulties when only abstracted motion is input - whole videos or track generators then need to be used to provide an input to the model in order for it to generate videos. Videos generated with these when underactuated inputs are provided often end up looking rigid where motion tracks are not given, and overall generalisation to extended egomotion (such as constant turning for 5 seconds) are not provided. These methods also largely target interpolation via in frame object motion rather than shifting entire poses that egomotion based conditioning affords, which forces extrapolation in both time and space as new plausible content is actively generated.
+
+\paragraph{Conditioning and latent supervision.}
+Works in this space largely use one of three different conditioning methods: cross attention, ControlNet style adapters, and AdaLN or RoPE style modulation. GameFactory and Matrix-Game 2.0 add explicit action modules inside the DiT blocks: continuous mouse or viewpoint actions are concatenated to latent features and processed with an MLP followed by temporal self-attention, while discrete keyboard actions are injected through cross-attention~\cite{gamefactory, matrixgame2}. Aero-World embeds its inertial controls with an MLP and injects them as a separate action-token stream through cross-attention~\cite{aeroworld}. Camera-control methods instead often use geometry-specific adapters or positional encodings, such as PRoPE/CPA-style camera-aware attention~\cite{prope, cpa} or Pl"ucker/feature branches~\cite{cameractrl, motionctrl}. We instead route our low-dimensional egomotion through the DiT's native AdaLN pathway together with sideband action tokens; the two prior world models we are aware of that use more than one action pathway pair AdaLN with cross-attention rather than tokens~\cite{wovr, dexac}. Our latent critic, finally, relates to guidance from auxiliary readouts: Aero-World is the closest, using a frozen latent probe for differentiable supervision without decoding~\cite{aeroworld}, however its probe is trained (on ground-truth IMU) in it's entirety \emph{before} it is used for supervision, whereas our action critic is trained online alongside the generator. Our action critic is trained against the frozen PCA abstracted pixel tracks. 
+\section{Preliminaries}
+
+\subsection{Flow Matching}
+
+Let $p_0$ denote a simple base distribution, typically a standard Gaussian, and let $p_1$ denote the data distribution. Flow matching learns a time-dependent vector field that transports samples from $p_0$ to $p_1$ through an ordinary differential equation (ODE)
+\begin{equation} 
+    d x_t = v_\theta(x_t,t)\,dt, 
+    \qquad t\in[0,1]. 
+    \label{eq:flow_ode_differential} 
+\end{equation}
+where $x_0 \sim p_0$ and the terminal sample $x_1$ is distributed according to $p_1$ after integration.
+
+The central object in flow matching is a probability path $\{p_t\}_{t\in[0,1]}$ connecting the base and data distributions. If $x_t \sim p_t$ evolves under a velocity field $u_t(x)$, then the density satisfies the continuity equation
+\begin{equation}
+    \frac{\partial p_t(x)}{\partial t}
+    =
+    - \nabla \cdot \left(p_t(x) u_t(x)\right).
+    \label{eq:continuity}
+\end{equation}
+Flow matching trains a neural vector field $v_\theta$ to approximate $u_t$ by minimizing
+\begin{equation}
+    \mathcal{L}_{\mathrm{FM}}
+    =
+    \mathbb{E}_{t,x_t}
+    \left[
+        \left\|
+            v_\theta(x_t,t) - u_t(x_t)
+        \right\|_2^2
+    \right].
+    \label{eq:fm_loss}
+\end{equation}
+In practice, the marginal velocity $u_t(x)$ is usually not available in closed form. Conditional flow matching therefore constructs a tractable conditional path from paired variables and regresses the corresponding conditional velocity. Given samples $x_0 \sim p_0$ and $x_1 \sim p_1$, one defines an interpolation
+\begin{equation}
+    x_t = \psi_t(x_0,x_1),
+    \label{eq:general_path}
+\end{equation}
+with target velocity
+\begin{equation}
+    u_t = \frac{d}{dt}\psi_t(x_0,x_1).
+    \label{eq:general_velocity}
+\end{equation}
+The model is then trained using
+\begin{equation}
+    \mathcal{L}_{\mathrm{CFM}}
+    =
+    \mathbb{E}_{t,x_0,x_1}
+    \left[
+        \left\|
+            v_\theta(x_t,t) - u_t
+        \right\|_2^2
+    \right].
+    \label{eq:cfm_loss}
+\end{equation}
+Although the loss is written using conditional velocities, the optimal predictor recovers the corresponding marginal velocity through conditional expectation:
+\begin{equation}
+    v^\star(x,t)
+    =
+    \mathbb{E}
+    \left[
+        u_t
+        \mid
+        x_t=x
+    \right].
+    \label{eq:optimal_fm_velocity}
+\end{equation}
+
+\subsection{Rectified Flow}
+
+Rectified flow is a particular instance of flow matching that uses straight-line interpolants between base samples and data samples. Given $x_0 \sim p_0$ and $x_1 \sim p_1$, the path is
+\begin{equation}
+    x_t = (1-t)x_0 + t x_1.
+    \label{eq:rf_path}
+\end{equation}
+The corresponding velocity is constant along each pairwise path:
+\begin{equation}
+    \frac{d x_t}{dt} = x_1 - x_0.
+    \label{eq:rf_velocity}
+\end{equation}
+The rectified-flow objective is therefore
+\begin{equation}
+    \mathcal{L}_{\mathrm{RF}}
+    =
+    \mathbb{E}_{t,x_0,x_1}
+    \left[
+        \left\|
+            v_\theta((1-t)x_0+t x_1,t)
+            -
+            (x_1-x_0)
+        \right\|_2^2
+    \right].
+    \label{eq:rf_loss}
+\end{equation}
+At sampling time, one draws $x_0 \sim p_0$ and integrates
+\begin{equation}
+    \frac{d x_t}{dt}=v_\theta(x_t,t)
+\end{equation}
+from $t=0$ to $t=1$. The resulting sample is
+\begin{equation}
+    x_1
+    =
+    x_0
+    +
+    \int_0^1 v_\theta(x_t,t)\,dt.
+    \label{eq:rf_sample}
+\end{equation}
+
+The rectified-flow formulation is attractive because the training paths are linear, and the learned dynamics are encouraged to be as straight as possible. In contrast to diffusion models, which are often motivated by reversing a stochastic noising process, rectified flow directly learns a deterministic transport field. This does not require changing the output space of the model: the network always predicts a velocity in the same space as $x_t$.
+
+\section{Method}
+
+We adapt a pretrained Wan2.1-T2V-1.3B DiT into an egomotion conditioned world model using the FrodoBots dataset, which consists of real world data of a rover moving about in urban cityscapes. Our method has two parts: an unsupervised egomotion action space recovered from video (\S\ref{sec:pca}) and a latent critic that supervises egomotion without decoding (\S\ref{sec:critic}). The recovered action is injected into the generator through a combination of zero-initialised adaptive layer normalisation (AdaLN-Zero) and per-chunk action tokens (\S\ref{sec:planar}). Throughout, the model generates video autoregressively in short chunks, each chunk conditioned on the preceding context and a per-chunk action.
+
+\subsection{Planar Action-Conditioned Rectified Flow}
+\label{sec:planar}
+
+While action conditioning has been engineered into video DiTs many times, it is rarely stated \emph{what} the action is expected to do to the learned flow. We give a minimal formalisation of action conditioning as a residual redirection of a context-conditioned flow. The formalisation is an analysis model, not an architectural constraint: it yields testable predictions---scene-independence, approximate linearity, and composability of the action's effect on the generative trajectory---which we test on the trained model rather than impose on it.
+
+We consider a rover moving on a locally planar surface, so its controllable egomotion has two degrees of freedom: forward displacement and yaw. We condition generation on the data-derived action coordinates of \S\ref{sec:pca},
+\begin{equation}
+    a =
+    \begin{bmatrix}
+        a_{\mathrm{fwd}} \\
+        a_{\mathrm{yaw}}
+    \end{bmatrix}
+    \in \mathbb{R}^2,
+    \label{eq:planar_action}
+\end{equation}
+the two leading principal components of tracked image motion, which emerge aligned with forward displacement and yaw respectively. This action space is scene-independent by construction: the same $a$ denotes the same rover egomotion regardless of the visual scene, while scene-dependent image effects such as parallax, occlusion, and object-scale changes must be inferred from the visual context. Note that $a=0$ is not the \emph{absence} of control but a genuine command---remain stationary---and stationary segments are deliberately retained in the training distribution so that a zero command brakes the rover rather than letting the generator coast on its motion prior.
+
+Let $c$ denote the conditioning context, a short history of frames, and $a$ the commanded action of Eq.~\eqref{eq:planar_action}. Let $t\in[0,1]$ be diffusion time, $x_0\sim\mathcal{N}(0,I)$ the initial sample, and $x_t$ the state at time $t$. We write generation as a context- and action-conditioned flow
+\begin{equation}
+    d x_t = v(x_t,t,c,a)\,dt,
+    \label{eq:conditioned_flow}
+\end{equation}
+which models plausible future frames under action control. The generated latent is recovered by integrating this flow from the initial sample,
+\begin{equation}
+    x_1
+    =
+    x_0
+    +
+    \int_0^1 v(x_t,t,c,a)\,dt,
+    \label{eq:flow_integral}
+\end{equation}
+in practice with a discrete solver over a finite step schedule.
+
+To reason about \emph{what the action does} to this flow, we decompose the conditioned field into the zero-command base flow $v_0(x_t,t,c) := v(x_t,t,c,0)$ and an action-driven residual redirection:
+\begin{equation}
+    d x_t
+    =
+    \left[
+        v_0(x_t,t,c)
+        +
+        r_\phi(x_t,t,c,a)
+    \right]dt.
+    \label{eq:residual_action_flow_differential}
+\end{equation}
+The action $a$ is held fixed during integration, so the ODE evolves only the latent state $x_t$. The effect of changing the action is instead described by the action-space differential of the residual field:
+\begin{equation}
+    d_a r_\phi(x,t,c,a)
+    =
+    B_\phi(x,t,c,a)\,da,
+    \label{eq:action_differential_residual}
+\end{equation}
+where $B_\phi$ maps infinitesimal changes in the action coordinates to infinitesimal changes in the velocity field. For a locally linear and additive action space, we approximate this by
+\begin{equation}
+    r_\phi(x,t,c,a)
+    \approx
+    B_\phi(x,t,c)a.
+    \label{eq:linear_action_redirection}
+\end{equation}
+In the two-dimensional rover setting, this reads
+\begin{equation}
+    r_\phi(x,t,c,a)
+    =
+    a_{\mathrm{fwd}}\, b^{\mathrm{fwd}}_\phi(x,t,c)
+    +
+    a_{\mathrm{yaw}}\, b^{\mathrm{yaw}}_\phi(x,t,c),
+    \label{eq:linear_action_residual}
+\end{equation}
+where $b^{\mathrm{fwd}}_\phi$ and $b^{\mathrm{yaw}}_\phi$ are scene-conditioned basis vector fields: the first captures how forward motion redirects the generative trajectory, the second how yaw does. Under this model, arbitrary actions are additive combinations of two reusable motion fields rather than separately learned flows.
+
+\paragraph{Realisation.} We emphasise that neither the split into $v_0$ and $r_\phi$ nor the linearity of Eq.~\eqref{eq:linear_action_residual} is enforced architecturally. A single conditioned velocity field $v_\theta(x,t,c,a)$ is realised by adapting the pretrained DiT with low-rank adaptation and injecting $a$ through AdaLN-Zero modulation and per-chunk action tokens. Because the modulation is zero-initialised, the injection is exactly the identity at the start of training---the residual of Eq.~\eqref{eq:residual_action_flow_differential} is exactly zero at initialisation and grows only as the data demands. Thereafter the residual is implicit,
+\begin{equation}
+    r_\theta(x,t,c,a) \;:=\; v_\theta(x,t,c,a) - v_\theta(x,t,c,0),
+    \label{eq:implicit_residual}
+\end{equation}
+and whether it behaves like the linear model of Eq.~\eqref{eq:linear_action_residual} is an empirical question, which we return to below.
+
+We stress that $r$ is not a module of our system: no separate residual network exists anywhere in the architecture or the losses. It is the \emph{idealised} object---the decomposition an ideal action-conditioned flow would admit---and Eq.~\eqref{eq:implicit_residual} merely gives it an operational definition as a difference of the single learned field. Accordingly, our empirical program is not to inspect a network but to measure a perturbation: the action changes the flow only slightly relative to the flow itself (context and denoising dominate the latent trajectory), yet it changes it \emph{as a whole}---coherently across scenes, noise draws, and denoising steps. It is precisely this small-but-global character that the residual model predicts and that our latent-space analyses test.
+
+Given a training tuple $(c,a,x_1)$ with
+\begin{equation}
+    x_1 \sim p_{\mathrm{data}}(x_1 \mid c,a),
+\end{equation}
+we sample $x_0 \sim \mathcal{N}(0,I)$ and use the rectified-flow interpolation
+\begin{equation}
+    x_t=(1-t)x_0+t x_1.
+\end{equation}
+The action-conditioned training objective is the standard conditional flow-matching loss on the single field,
+\begin{equation}
+    \mathcal{L}_{\mathrm{flow}}
+    =
+    \mathbb{E}_{t,x_0,x_1,c,a}
+    \left[
+        \left\|
+        v_\theta(x_t,t,c,a)
+        -
+        (x_1-x_0)
+        \right\|_2^2
+    \right],
+    \label{eq:action_conditioned_loss}
+\end{equation}
+optionally augmented with the latent egomotion critic of \S\ref{sec:critic}. At inference time, the action is held fixed and the sample is generated by integrating
+\begin{equation}
+    \frac{d x_t}{dt}
+    =
+    v_\theta(x_t,t,c,a),
+    \qquad
+    x_0 \sim \mathcal{N}(0,I).
+\end{equation}
+
+\paragraph{Predictions of the residual model.} The residual-field model makes three testable predictions. First, \emph{scene-independence}: the same action should redirect the latent trajectory along a consistent direction across different scenes, acting as a relative displacement operator rather than pulling different scenes toward a common destination. Second, \emph{antisymmetry}: opposing commands should produce opposing redirections. Third, \emph{composability}: for short prediction intervals consecutive controls approximately satisfy
+\begin{equation}
+    a_{1 \rightarrow 3}
+    \approx
+    a_{1 \rightarrow 2}
+    +
+    a_{2 \rightarrow 3},
+    \label{eq:additive_action_composition}
+\end{equation}
+and under Eq.~\eqref{eq:linear_action_residual} the residual inherits this additivity,
+\begin{equation}
+    r_\theta(x,t,c,a+a')
+    \approx
+    r_\theta(x,t,c,a)
+    +
+    r_\theta(x,t,c,a'),
+    \label{eq:additive_residual}
+\end{equation}
+so that, e.g., a diagonal command should redirect the flow like the sum of its cardinal components.
+
+\paragraph{Empirical support.} Although nothing enforces the decomposition, the trained model realises most of it. Rolling out held-out contexts under matched initial noise and varying only the command (8 commands $\times$ 32 scenes), the latent displacement induced by a given action correlates positively across scenes (mean same-action displacement cosine $+0.12$ against a cross-action baseline of $-0.02$), opposing commands displace oppositely, and rollout endpoints remain grouped by scene---the action behaves as a \emph{relative} operator on the latent state while the context determines where in latent space the trajectory lives. The operator is strong enough to be read back out: a 5-NN classifier over held-out scenes recovers the commanded direction from the final-chunk latent residual at $71\%$ accuracy (chance $12.5\%$); removing the AdaLN injection collapses this to $31\%$. Composability (Eq.~\eqref{eq:additive_residual}) holds at the level of \emph{realised motion} but not as raw-latent vector addition: diagonal commands realise both cardinal motion components with the total realised magnitude conserved at the commanded magnitude (diagonal-to-cardinal motion-norm ratio $1.08$, against $\sqrt{2}\!\approx\!1.41$ if the axes responded independently), yet the diagonal's latent displacement is not parallel to the sum of the two cardinal displacements (cosine $\approx 0$). The residual composes in the scene's local coordinates, not in a global latent frame---consistent with the scene-relative character of the operator above.
+% TODO(fig): latent flow-field / world-tree figure with (i) same-action
+% cross-scene displacement-cosine vs cross-action baseline (+0.12 vs -0.02),
+% (ii) endpoint grouping by scene, (iii) endpoint->action 5-NN bar chart
+% (grove_endpoint_separability.png: ours 0.71-0.75, noadaln 0.31, chance
+% 0.125), (iv) composition: motion-norm ratio 1.08 vs comp_cos ~0.
+The counterfactual-swap protocol (\S Evaluation, Table~\ref{tab:cond}) confirms the redirection is causal: corrupting the command changes the rendered motion, and removing the AdaLN injection makes the output invariant to the command. The main place the linear model breaks is magnitude asymmetry under reverse commands, which we analyse as a limitation.
+
+This makes the action a low-dimensional control over the generative dynamics: the base flow remains responsible for image formation, while the (learned, implicit) action residual redirects the trajectory toward the future induced by the commanded egomotion.
+
+\subsection{Data Derived Action Space}
+\label{sec:pca}
+
+Reiterating from the previous section, we require an action space that is grounded (zero motion in the video maps to the zero action, i.e.\ commanded stationarity), smooth, approximately invertible, and linearly composable. In order to get fundamental movement signals, we use a pixel tracking model \cite{cotracker} on a fixed $10\times10$ grid of starting pixels. For every $0.5$s chunk, composed of 3 latent frames which represent 12 pixel frames, we track
+\begin{equation}
+    \mathcal{G}=\{p_j\}_{j=1}^{100},
+    \qquad
+    p_j\in\mathbb{R}^2,
+\end{equation}
+and compute the displacement of each point:
+\begin{equation}
+    \delta_j = q_j(T)-q_j(0)\in\mathbb{R}^2.
+\end{equation}
+We concatenate these into a single movement vector
+\begin{equation}
+    m =
+    \begin{bmatrix}
+        \delta_1 & \delta_2 & \cdots & \delta_{100}
+    \end{bmatrix}^{\top}
+    \in \mathbb{R}^{200}.
+    \label{eq:movement_vector}
+\end{equation}
+Some minimal level of time needs to be present in order to capture the action occurring in the frame, but a small enough unit of time such that the actions can be modular and composable in sequences. We thus choose $0.5$ seconds.
+
+
+When taken over a single chunk, $m$ literally describes how 100 pixels spread across the video move. Semantically, however, these pixels belong to a set of underlying objects, surfaces, or scene regions. Let
+\begin{equation}
+    \mathcal{O}=\{O_\ell\}_{\ell=1}^{L}
+\end{equation}
+denote the latent set of objects or regions in the frame, and let
+\begin{equation}
+    \Omega_\ell \subset \{1,\ldots,100\}
+\end{equation}
+be the set of tracked grid points lying on object $O_\ell$. The average observed motion of object $O_\ell$ over the chunk is then
+\begin{equation}
+    \bar{\delta}_\ell
+    =
+    \frac{1}{|\Omega_\ell|}
+    \sum_{j\in\Omega_\ell}
+    \delta_j.
+    \label{eq:object_average_motion}
+\end{equation}
+Thus the grid motion descriptor can be viewed as a sparse measurement of how a set of scene objects move. In this case, the observed motion of each tracked object contains both egomotion induced motion and scene and object specific motion. We write
+\begin{equation}
+    \bar{\delta}_{s,n,\ell}
+    =
+    E_\ell(c_{s,n})\, a_{s,n}
+    +
+    \rho_{s,n,\ell}
+    +
+    \varepsilon_{s,n,\ell},
+    \label{eq:object_motion_decomposition}
+\end{equation}
+where $s$ indexes the scene, $n$ indexes the chunk, $a_{s,n}$ is the underlying rover egomotion, $E_\ell(c_{s,n})$ maps this egomotion into the image-plane motion of object $O_\ell$, $\rho_{s,n,\ell}$ is the independent motion of that object, and $\varepsilon_{s,n,\ell}$ is tracking noise.
+
+For a single object, egomotion is ambiguous because $\bar{\delta}_{s,n,\ell}$ depends strongly on depth, object identity, and local motion. However, across many objects, chunks, and scenes, the object-specific terms are not coherent:
+\begin{equation}
+    \mathbb{E}_{s,n,\ell}[\rho_{s,n,\ell}]
+    \approx 0,
+    \qquad
+    \mathbb{E}_{s,n,\ell}[\varepsilon_{s,n,\ell}]
+    \approx 0.
+\end{equation}
+The egomotion term, in contrast, induces a shared correlated pattern across the tracked points. Stacking all object or grid-point motions gives
+\begin{equation}
+    m_{s,n}
+    =
+    E(c_{s,n})a_{s,n}
+    +
+    \rho_{s,n}
+    +
+    \varepsilon_{s,n},
+    \label{eq:stacked_motion_decomposition}
+\end{equation}
+where $E(c_{s,n})$ is the scene-dependent egomotion-to-image-motion operator. After centering,
+\begin{equation}
+    \tilde m_{s,n}=m_{s,n}-m_0,
+\end{equation}
+the covariance of the movement vectors is
+\begin{equation}
+    C
+    =
+    \mathbb{E}\left[\tilde m_{s,n}\tilde m_{s,n}^{\top}\right].
+\end{equation}
+Substituting Eq.~\eqref{eq:stacked_motion_decomposition}, and assuming the object-specific residuals are weakly correlated with egomotion, gives
+\begin{equation}
+    C
+    \approx
+    \mathbb{E}\left[
+        E(c)a a^\top E(c)^\top
+    \right]
+    +
+    \Sigma_{\rho}
+    +
+    \Sigma_{\varepsilon}.
+    \label{eq:motion_covariance_decomposition}
+\end{equation}
+The first term is the shared egomotion-induced covariance, while $\Sigma_{\rho}$ and $\Sigma_{\varepsilon}$ correspond to object-specific motion and tracking noise. When motion is aggregated over many chunks and scenes, the incoherent residual terms are spread across many directions, while egomotion contributes coherent high-variance directions. PCA therefore recovers the dominant shared motion components:
+\begin{equation}
+    C u_k = \lambda_k u_k.
+\end{equation}
+
+This is the sense in which individual diversions disappear and egomotion emerges. A single tracked point or object is scene dependent, but the common reflex motion across many objects and scenes produces a stable low-dimensional subspace. We use the top two PCA directions as the action input,
+\begin{equation}
+    a_i = U_2^\top \tilde m_i,
+    \qquad
+    U_2=[u_1,u_2],
+\end{equation}
+while retaining a larger PCA subspace for supervision:
+\begin{equation}
+    z_i = U_r^\top \tilde m_i,
+    \qquad
+    \hat m_i = m_0 + U_r z_i.
+\end{equation}
+Thus, the two-dimensional action captures the dominant shared egomotion, while the retained PCA code $z$ (with $U_r=[u_1,\ldots,u_r]$ chosen to explain approximately $90\%$ of the motion variance) preserves a cleaner and approximately invertible representation of the full tracked motion, used for supervision in \S\ref{sec:critic}.
+
+Using PCA also ensures that the components are additive and composable. For two short chunks,
+\begin{equation}
+    \tilde m_{1:2}\approx \tilde m_1+\tilde m_2,
+\end{equation}
+and by linearity,
+\begin{equation}
+    a_{1:2}=U_2^\top \tilde m_{1:2}
+    \approx a_1+a_2.
+\end{equation}
+Alternatively, when there is no overall motion, $\tilde m_i\approx0$, so the PCA components also correspond to near $0$. This also means that action dimensions that are \emph{not} present in the video \emph{cannot} be recovered by this method as it is entirely data driven. Conversely, actions which are present but imbalanced can still be recovered if they form a coherent direction of variance: the principal component corresponding to yawing left will be the inverted component of yawing right, for example.
+
+In Frodobots data, the leading 2 components emerge as the forward/backward dimension (holds \~60\% of the variance) and the yaw dimension (holds \~20\% of the variance).
+
+\subsection{Latent Egomotion Critic without Decoder Gradients}
+\label{sec:critic}
+
+Action conditioning alone does not guarantee that the model uses the action. A rectified-flow objective can be minimized by predicting a likely continuation while partially ignoring the command. We therefore add an egomotion grounding loss which evaluates whether the generated latent video actually renders the commanded motion.
+
+A naive solution would be to decode generated latents to pixels, run the same pixel-tracking pipeline used to define the PCA action space, compare the measured motion to the command, and backpropagate through both the decoder and the tracker. This is undesirable both computationally and as an optimization target. Computationally, in our setting, differentiating through decoded pixels expands the loss interface from \(21\times16\times60\times104\) latent values to \(81\times3\times480\times832\) RGB values, a \(46\times\) increase before accounting for the additional VAE decoder and tracker activations. Optimization-wise, gradients through pixel tracking can encourage shortcut pixel-moving solutions rather than coherent holistic egomotion. We therefore do not pass generator gradients through the decoder or tracking pipeline. Instead, we use this visual pipeline only as a frozen no-gradient teacher, and distil it online into a lightweight latent-space critic.
+
+Let \(c\) denote the clean latent context, \(a\in\mathbb{R}^2\) the two-dimensional PCA action used for conditioning, and \(z\in\mathbb{R}^{r}\) the retained PCA motion code used for supervision. The first two dimensions of \(z\) correspond to the action input,
+\begin{equation}
+    a = P_2 z,
+\end{equation}
+where \(P_2:\mathbb{R}^{r}\to\mathbb{R}^{2}\) selects the top two PCA dimensions. With rectified-flow interpolation
+\begin{equation}
+    x_\tau=(1-\tau)x_0+\tau x_1,
+    \qquad
+    x_0\sim\mathcal{N}(0,I),
+\end{equation}
+the generator is trained with the standard action-conditioned flow objective $\mathcal{L}_{\mathrm{flow}}$ of Eq.~\eqref{eq:action_conditioned_loss}. During training, the model also produces a clean latent prediction \(\hat{x}_0\). For a rectified-flow model this can be estimated from the current noisy latent and predicted velocity as
+\begin{equation}
+    \hat{x}_0
+    =
+    x_\tau + (1-\tau)v_\theta(x_\tau,\tau,c,a),
+    \label{eq:predicted_clean_latent}
+\end{equation}
+or obtained from a short sampled rollout.
+
+We define a frozen visual egomotion teacher using the same pipeline as in the previous section. Given a generated latent video \(\hat{x}_0\), the teacher decodes it, runs the pixel tracker, constructs the movement vector, and projects it into the retained PCA subspace:
+\begin{equation}
+    T(\hat{x}_0)
+    =
+    U_r^\top
+    \left(
+        M\left(
+            \mathrm{Track}
+            \left(
+                \mathrm{Dec}(\hat{x}_0)
+            \right)
+        \right)
+        -
+        m_0
+    \right)
+    \in\mathbb{R}^{r},
+    \label{eq:visual_teacher}
+\end{equation}
+where \(M(\cdot)\) denotes the construction of the \(200\)-dimensional movement vector from the tracked grid. This gives the PCA motion code rendered by the current generated sample. Crucially, this teacher is evaluated under stop-gradient:
+\begin{equation}
+    z^{\mathrm{teach}} = T(\mathrm{sg}(\hat{x}_0)).
+    \label{eq:teacher_readout}
+\end{equation}
+Thus, the decoder, tracker, and PCA projection are forward-only label machinery.
+
+We train a lightweight latent critic \(C_\phi\) to imitate this teacher directly in latent space. The critic takes the detached generated clean latents, the current flow timestep, and the commanded action, and predicts the retained PCA motion code:
+\begin{equation}
+    \hat{z}_{\phi}
+    =
+    C_\phi(\mathrm{sg}(\hat{x}_0),\tau,a).
+\end{equation}
+It is optimized with a weighted regression loss
+\begin{equation}
+    \mathcal{L}_{\mathrm{crit}}
+    =
+    \left\|
+        W_c
+        \left(
+            C_\phi(\mathrm{sg}(\hat{x}_0),\tau,a)
+            -
+            \mathrm{sg}(z^{\mathrm{teach}})
+        \right)
+    \right\|_2^2 .
+    \label{eq:critic_loss}
+\end{equation}
+The critic is trained online on the current generator distribution: it is not trained in a separate pass over real videos. Real data enters through the PCA basis fitted on real trajectories and through the pretrained tracker. The timestep input is included because \(\hat{x}_0\) varies in quality across the denoising trajectory; early predictions can be blurrier or less stable than late predictions.
+
+Generator guidance then freezes the critic, or uses an exponential-moving-average copy \(C_{\bar{\phi}}\), and applies it to the non-detached generated latents:
+\begin{equation}
+    \hat{z}_{\mathrm{gen}}
+    =
+    C_{\bar{\phi}}(\hat{x}_0,\tau,a).
+\end{equation}
+The generator is encouraged to produce latents whose critic-predicted motion matches the commanded PCA code:
+\begin{equation}
+    \mathcal{L}_{\mathrm{act}}
+    =
+    \left\|
+        W_g
+        \left(
+            C_{\bar{\phi}}(\hat{x}_0,\tau,a)
+            -
+            z
+        \right)
+    \right\|_2^2 .
+    \label{eq:latent_action_loss}
+\end{equation}
+The weighting \(W_g\) places full weight on the two commanded action dimensions and lower weight on the remaining retained PCA dimensions, which regularize the generated motion without overwhelming the primary control objective.
+
+The generator gradient therefore follows only the latent critic path
+\begin{equation}
+    \theta
+    \rightarrow
+    \hat{x}_0
+    \rightarrow
+    C_{\bar{\phi}}(\hat{x}_0,\tau,a)
+    \rightarrow
+    \mathcal{L}_{\mathrm{act}},
+\end{equation}
+and never follows the visual teacher path
+\begin{equation}
+    \theta
+    \rightarrow
+    \hat{x}_0
+    \rightarrow
+    \mathrm{Dec}(\hat{x}_0)
+    \rightarrow
+    \mathrm{Track}
+    \rightarrow
+    \mathrm{PCA}.
+\end{equation}
+The critic therefore supervises the generated latents directly to be read as the commanded motion; it does not supervise a difference between generated and real latents.
+
+The full generator objective is
+\begin{equation}
+    \mathcal{L}_{\mathrm{gen}}
+    =
+    \mathcal{L}_{\mathrm{flow}}
+    +
+    \lambda_{\mathrm{act}}
+    \mathcal{L}_{\mathrm{act}}.
+    \label{eq:generator_objective}
+\end{equation}
+The critic objective \(\mathcal{L}_{\mathrm{crit}}\) updates only \(\phi\). Thus, the decoder and tracker provide an online visual teacher of rendered egomotion, but they never receive or transmit generator gradients. The critic distils this teacher into latent space, giving the generator a cheap differentiable action loss while preserving the stability and efficiency of the pretrained flow model.
+
+We borrow this trick from GAN literature which trains the discriminator on local gradients to aid in stability while providing an online discriminative signal. We find that this approach works to add dense supervision signal that is constantly shifting, leading to new gradients on old data, refreshing the limited amount (~6\%) of backward data that we have with new movement signal.
+
+\section{Evaluation}
+
+\subsection{Experimental Setup}
+\paragraph{Data.} We train on the FrodoBots dataset as previously mentioned. We subselect in this dataset using a three-city subset (Madrid, Rome, Stockholm): $574$ rides, $81.5$ hours, $\sim\!70$K streaming windows. Four held-out rides (one per city plus an extra) are used for evaluation. All models are trained from the frozen base Wan weights; ablations are run for $4{,}000$ steps each (controllability saturates well before this).
+
+\paragraph{An independent controllability metric.} No standard action-following metric exists for this setting, and the natural candidates---our critic and probe---are trained \emph{inside} the model, so any score routed through them is circular. We therefore define a \emph{counterfactual swap} protocol scored only by frozen, externally pretrained modules. For each held-out clip we fix the clean context and the initial sampling noise and regenerate the continuation under four commands: \textsc{true} (the real egomotion), \textsc{zero} (no motion), \textsc{flip} ($-a$), and \textsc{shuffle} (time-permuted). We then read the \emph{rendered} egomotion of each generation with the frozen CoTracker$\rightarrow$ss-VAE pipeline (untrained by the run) and compare it to the command. Reusing the initial noise across conditions isolates the causal effect of the command. We report Pearson correlation between rendered and commanded egomotion, per control axis, averaged over rides and seeds.
+
+\subsection{The Model Is Controllable (Independently Verified)}
+Table~\ref{tab:cond} reports correlation between the rendered egomotion and the \emph{true} command across conditions, under the frozen judge. For the full model the rendered motion tracks the true command ($0.74$ pooled across axes) and \emph{deviates} when the command is corrupted---the counterfactual signature of genuine control: \textsc{flip} drops the correlation to $0.14$ and \textsc{zero} to $0.67$. Broken out by axis (Table~\ref{tab:ablation}), the full model follows steering at $r{=}0.945$ and throttle at $r{=}0.751$. These numbers use no trained component in the judge.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Model & \textsc{true} & \textsc{zero} & \textsc{flip} & \textsc{shuffle} \\
+\midrule
+Full (ours)            & 0.744 & 0.669 & 0.136 & 0.563 \\
+$-$ Action tokens      & 0.739 & 0.628 & 0.211 & 0.469 \\
+$-$ AdaLN modulation   & 0.732 & 0.732 & 0.732 & 0.733 \\
+$-$ Critic guidance    & 0.734 & 0.755 & 0.712 & 0.751 \\
+$-$ State probe        & 0.774 & 0.694 & 0.201 & 0.533 \\
+\bottomrule
+\end{tabular}
+\caption{Counterfactual swap (frozen judge): correlation between rendered and the \emph{true} command under each fed command. A controllable model is high under \textsc{true} and \emph{drops} under \textsc{zero}/\textsc{flip}; a flat row means the command is ignored.}
+\label{tab:cond}
+\end{table}
+
+\subsection{What Makes It Controllable: Ablations}
+We perform leave-one-out ablations, removing one mechanism at a time and scoring each with the same frozen judge (Table~\ref{tab:ablation}).
+
+\paragraph{Two of the four mechanisms carry control; the other two are redundant.} Removing AdaLN (action tokens only) collapses steering control from $0.945$ to $0.578$, and the model stops reacting to commands: its correlation with the true command is \emph{flat} across \textsc{true}/\textsc{zero}/\textsc{flip} (Table~\ref{tab:cond}, all $\approx0.73$), i.e.\ the output is invariant to the command. Removing the output-level critic guidance is similarly damaging (steering $0.433$, flat counterfactual row). In contrast, removing either the per-frame action tokens ($0.894$ steering, command still causal) or the representation-level state probe ($0.910$ steering, \textsc{flip} still drops the correlation to $0.20$) leaves a model close to the full system. Thus controllability is carried by \emph{AdaLN modulation and output-level critic guidance}, while action tokens and the state-probe grounding are largely redundant---a result that simplifies the method. Notably, a circular metric computed from the model's own trained probe \emph{early in training} suggested the opposite ranking among the injection channels; the frozen-judge protocol reverses it, underscoring why an independent metric is necessary.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Model & Steering $z_2$ & Throttle $z_7$ \\
+\midrule
+Full (ours)            & \textbf{0.945} & 0.751 \\
+$-$ Action tokens      & 0.894 & 0.827 \\
+$-$ AdaLN modulation   & 0.578 & 0.849 \\
+$-$ Critic guidance    & 0.433 & 0.887 \\
+$-$ State probe        & 0.910 & 0.852 \\
+\bottomrule
+\end{tabular}
+\caption{Per-axis controllability under the frozen judge (\textsc{true} condition): correlation between rendered and commanded egomotion. Removing AdaLN or critic guidance collapses steering control.}
+\label{tab:ablation}
+\end{table}
+
+\subsection{Dimensionality of the Action Representation}
+Both grounding heads are trained against the full $8$-D realized-motion latent, with the two commanded axes (steering $z_2$, throttle $z_7$) up-weighted and the remaining six dimensions encoding scene motion that is not directly commanded. We test whether those six dimensions contribute to control. \emph{Probe-2D} reduces the state probe's target to $z_2/z_7$ only (compare to the full model); \emph{Critic-8D} instead \emph{adds} the six dimensions to the action critic---which otherwise grounds only $z_2/z_7$---at half the guidance weight of the commanded axes (compare to ``$-$ State probe'', whose critic already uses $z_2/z_7$ only). These two runs were stopped once controllability had saturated and are therefore trained for fewer steps than the leave-one-out models (Table~\ref{tab:dims}, ``Steps''); the comparison is indicative rather than budget-matched.
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+Model & Steps & $z_2$ & $z_7$ & PSNR$\uparrow$ & LPIPS$\downarrow$ & FVD$\downarrow$ \\
+\midrule
+Full ($8$-D probe)            & 6600 & \textbf{0.945} & 0.751 & 19.09 & 0.260 & 29.9 \\
+\quad Probe-2D ($z_2/z_7$)    & 2150 & 0.870 & 0.787 & 19.18 & 0.236 & 29.4 \\
+$-$ State probe ($z_2/z_7$ critic) & 3700 & 0.910 & 0.852 & 19.49 & 0.237 & 25.9 \\
+\quad Critic-8D ($+6$\,@\,$0.5$)  & 2150 & 0.862 & 0.836 & 19.45 & 0.223 & 26.3 \\
+\bottomrule
+\end{tabular}
+\caption{Dimensionality of the grounding heads. \emph{Probe-2D} removes the six non-commanded latent dimensions from the state probe (vs.\ Full); \emph{Critic-8D} adds them to the action critic at half guidance weight (vs.\ ``$-$ State probe'', a critic on $z_2/z_7$ only). $z_2/z_7$ are frozen-judge correlations; PSNR/LPIPS/FVD as in Table~\ref{tab:quality}. ``Steps'' is the training budget: these two runs are shorter than the $4{,}000$-step leave-one-out models, so the comparison is indicative.}
+\label{tab:dims}
+\end{table}
+
+\noindent Neither edit helps control. Dropping the six probe dimensions costs a little steering ($0.945\!\to\!0.870$) while marginally improving fidelity (LPIPS $0.260\!\to\!0.236$, FVD $29.9\!\to\!29.4$); \emph{adding} the six dimensions to the critic does not improve grounding either---steering is no higher than the $z_2/z_7$ critic ($0.910\!\to\!0.862$) and visual quality is essentially unchanged. In both directions the six non-commanded motion dimensions appear largely redundant for control, consistent with grounding being carried by the commanded axes---though the shorter, unmatched training budget of these two runs (Table~\ref{tab:dims}, ``Steps'') warrants a budget-matched confirmation.
+
+\subsection{Limitation: Reverse Egomotion}
+Stratifying the throttle axis by command direction reveals a systematic failure. All models render \emph{forward} motion with the correct sign on $100\%$ of forward chunks, but \emph{reverse} commands are rendered poorly: the full model produces the correct (backward) sign on only $46.7\%$ of reverse chunks and strongly under-shoots the commanded magnitude. The model has a forward-motion prior it does not readily override. This also explains an apparent per-scene anomaly: the held-out Madrid ride is reverse-dominated, and its low controllability is the reverse-rendering failure rather than a scene- or alignment-specific artifact.
+
+\subsection{Visual Quality and Drift}
+We complement the controllability analysis with a visual-quality testbench, aligned with the metrics common to the autoregressive-video lineage. For each model we sample $48$ windowed clips across the held-out rides, generate the continuation under the true command, and report: \emph{prediction fidelity} against the ground-truth video (PSNR, SSIM, LPIPS); \emph{intrinsic quality} on the generated clip (MUSIQ for imaging quality, NIMA for aesthetics, CLIP feature consistency across frames, and temporal flicker---the same dimensions VBench reports); and a distributional FVD. As VBench and an I3D model are not used here, FVD is computed from r3d\_18 (Kinetics) features and is \emph{indicative} (relative ordering only). We also report a \emph{short-rollout drift} arm: the per-frame slope of fidelity (PSNR), perceptual error (LPIPS) and intrinsic quality (MUSIQ) across the rollout, plus statistical brightness/contrast drift---the error-accumulation and over-saturation that this lineage flags. (Long-horizon drift is out of scope.)
+
 \begin{table*}[t]
 \centering
-
-\begin{tabular}{l|l|l|l}
-\textbackslash abovecaption &
-\textbackslash abovedisplay &
-\textbackslash addevensidemargin &
-\textbackslash addsidemargin \\
-\textbackslash addtolength &
-\textbackslash baselinestretch &
-\textbackslash belowcaption &
-\textbackslash belowdisplay \\
-\textbackslash break &
-\textbackslash clearpage &
-\textbackslash clip &
-\textbackslash columnsep \\
-\textbackslash float &
-\textbackslash input &
-\textbackslash input &
-\textbackslash linespread \\
-\textbackslash newpage &
-\textbackslash pagebreak &
-\textbackslash renewcommand &
-\textbackslash setlength \\
-\textbackslash text height &
-\textbackslash tiny &
-\textbackslash top margin &
-\textbackslash trim \\
-\textbackslash vskip\{- &
-\textbackslash vspace\{- \\
+\begin{tabular}{lcccccccc}
+\toprule
+Model & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & MUSIQ$\uparrow$ & NIMA$\uparrow$ & CLIP-c$\uparrow$ & flicker$\downarrow$ & FVD$\downarrow$ \\
+\midrule
+Full (ours)          & 19.09 & 0.529 & 0.260 & 56.0 & 4.53 & 0.909 & 0.0496 & 29.9 \\
+$-$ Action tokens    & 19.50 & 0.547 & 0.234 & 55.5 & 4.49 & 0.925 & 0.0488 & 27.2 \\
+$-$ AdaLN modulation & 19.53 & 0.541 & 0.226 & 56.1 & 4.50 & 0.927 & 0.0495 & 26.6 \\
+$-$ Critic guidance  & 19.98 & 0.565 & 0.210 & 56.7 & 4.54 & 0.934 & 0.0458 & 21.8 \\
+$-$ State probe      & 19.49 & 0.546 & 0.237 & 55.4 & 4.50 & 0.920 & 0.0494 & 25.9 \\
+\bottomrule
 \end{tabular}
-%}
-\caption{Commands that must not be used}
-\label{table1}
+\caption{Visual quality ($48$ clips/model). Differences are small; note that the full model has the \emph{lowest} raw quality and ``$-$ Critic guidance'' the highest---yet that ablation destroys controllability (Table~\ref{tab:ablation}), exposing a controllability--fidelity trade-off. FVD is r3d\_18-based and indicative.}
+\label{tab:quality}
 \end{table*}
 
 \begin{table}[t]
 \centering
-%\resizebox{.95\columnwidth}{!}{
-\begin{tabular}{l|l|l|l}
-    authblk & babel & cjk & dvips \\
-    epsf & epsfig & euler & float \\
-    fullpage & geometry & graphics & hyperref \\
-    layout & linespread & lmodern & maltepaper \\
-    navigator & pdfcomment & pgfplots & psfig \\
-    pstricks & t1enc & titlesec & tocbind \\
-    ulem
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+Model & PSNR$_{\text{slope}}$ & LPIPS$_{\text{slope}}$ & MUSIQ$_{\text{slope}}$ & bright$_\Delta$ & contr$_\Delta$ \\
+\midrule
+Full (ours)          & $-0.006$ & 0.0001 & 0.089 & 0.050 & 0.071 \\
+$-$ Action tokens    & $0.000$  & 0.0002 & 0.064 & 0.060 & 0.058 \\
+$-$ AdaLN modulation & $-0.001$ & 0.0001 & 0.079 & 0.055 & 0.058 \\
+$-$ Critic guidance  & $-0.003$ & 0.0003 & 0.075 & 0.055 & 0.059 \\
+$-$ State probe      & $-0.001$ & 0.0002 & 0.065 & 0.059 & 0.058 \\
+\bottomrule
 \end{tabular}
-\caption{LaTeX style packages that must not be used.}
-\label{table2}
+\caption{Short-rollout drift. Per-frame slopes of PSNR (dB/frame), LPIPS and MUSIQ, and frame-$0$-to-$T$ brightness/contrast drift. All near zero: the models are stable over the short horizon.}
+\label{tab:drift}
 \end{table}
 
-There are a number of packages, commands, scripts, and macros that are incompatable with aaai2026.sty. The common ones are listed in tables \ref{table1} and \ref{table2}. Generally, if a command, package, script, or macro alters floats, margins, fonts, sizing, linespacing, or the presentation of the references and citations, it is unacceptable. Note that negative vskip and vspace may not be used except in certain rare occurances, and may never be used around tables, figures, captions, sections, subsections, subsubsections, or references.
+Two observations follow. First, raw visual quality is nearly uniform across all variants, and where it differs it moves \emph{opposite} to controllability: the fully grounded model (ours) has the lowest fidelity and the lowest indicative FVD-rank, while removing the critic guidance yields the best quality (PSNR $19.98$, LPIPS $0.210$, FVD $21.8$) precisely because it is freed from the command-following constraint that, as shown above, it needs for control. The action-grounding objective therefore buys controllability at a modest, measurable cost in reconstruction fidelity. Second, short-rollout drift is negligible for every model (PSNR slope $\approx 0$, MUSIQ slope slightly positive, small brightness/contrast drift): at this horizon the autoregressive rollout is stable, and drift is a long-horizon concern we leave to future work.
 
-
-\subsection{Page Breaks}
-For your final camera ready copy, you must not use any page break commands. References must flow directly after the text without breaks. Note that some conferences require references to be on a separate page during the review process. AAAI Press, however, does not require this condition for the final paper.
-
-
-\subsection{Paper Size, Margins, and Column Width}
-Papers must be formatted to print in two-column format on 8.5 x 11 inch US letter-sized paper. The margins must be exactly as follows:
-\begin{itemize}
-\item Top margin: 1.25 inches (first page), .75 inches (others)
-\item Left margin: .75 inches
-\item Right margin: .75 inches
-\item Bottom margin: 1.25 inches
-\end{itemize}
-
-
-The default paper size in most installations of \LaTeX{} is A4. However, because we require that your electronic paper be formatted in US letter size, the preamble we have provided includes commands that alter the default to US letter size. Please note that using any other package to alter page size (such as, but not limited to the Geometry package) will result in your final paper being returned to you for correction.
-
-
-\subsubsection{Column Width and Margins.}
-To ensure maximum readability, your paper must include two columns. Each column should be 3.3 inches wide (slightly more than 3.25 inches), with a .375 inch (.952 cm) gutter of white space between the two columns. The aaai2026.sty file will automatically create these columns for you.
-
-\subsection{Overlength Papers}
-If your paper is too long and you resort to formatting tricks to make it fit, it is quite likely that it will be returned to you. The best way to retain readability if the paper is overlength is to cut text, figures, or tables. There are a few acceptable ways to reduce paper size that don't affect readability. First, turn on \textbackslash frenchspacing, which will reduce the space after periods. Next, move all your figures and tables to the top of the page. Consider removing less important portions of a figure. If you use \textbackslash centering instead of \textbackslash begin\{center\} in your figure environment, you can also buy some space. For mathematical environments, you may reduce fontsize {\bf but not below 6.5 point}.
-
-
-Commands that alter page layout are forbidden. These include \textbackslash columnsep,  \textbackslash float, \textbackslash topmargin, \textbackslash topskip, \textbackslash textheight, \textbackslash textwidth, \textbackslash oddsidemargin, and \textbackslash evensizemargin (this list is not exhaustive). If you alter page layout, you will be required to pay the page fee. Other commands that are questionable and may cause your paper to be rejected include \textbackslash parindent, and \textbackslash parskip. Commands that alter the space between sections are forbidden. The title sec package is not allowed. Regardless of the above, if your paper is obviously ``squeezed" it is not going to to be accepted. Options for reducing the length of a paper include reducing the size of your graphics, cutting text, or paying the extra page charge (if it is offered).
-
-
-\subsection{Type Font and Size}
-Your paper must be formatted in Times Roman or Nimbus. We will not accept papers formatted using Computer Modern or Palatino or some other font as the text or heading typeface. Sans serif, when used, should be Courier. Use Symbol or Lucida or Computer Modern for \textit{mathematics only. }
-
-Do not use type 3 fonts for any portion of your paper, including graphics. Type 3 bitmapped fonts are designed for fixed resolution printers. Most print at 300 dpi even if the printer resolution is 1200 dpi or higher. They also often cause high resolution imagesetter devices to crash. Consequently, AAAI will not accept electronic files containing obsolete type 3 fonts. Files containing those fonts (even in graphics) will be rejected. (Authors using blackboard symbols must avoid packages that use type 3 fonts.)
-
-Fortunately, there are effective workarounds that will prevent your file from embedding type 3 bitmapped fonts. The easiest workaround is to use the required times, helvet, and courier packages with \LaTeX{}2e. (Note that papers formatted in this way will still use Computer Modern for the mathematics. To make the math look good, you'll either have to use Symbol or Lucida, or you will need to install type 1 Computer Modern fonts --- for more on these fonts, see the section ``Obtaining Type 1 Computer Modern.")
-
-If you are unsure if your paper contains type 3 fonts, view the PDF in Acrobat Reader. The Properties/Fonts window will display the font name, font type, and encoding properties of all the fonts in the document. If you are unsure if your graphics contain type 3 fonts (and they are PostScript or encapsulated PostScript documents), create PDF versions of them, and consult the properties window in Acrobat Reader.
-
-The default size for your type must be ten-point with twelve-point leading (line spacing). Start all pages (except the first) directly under the top margin. (See the next section for instructions on formatting the title page.) Indent ten points when beginning a new paragraph, unless the paragraph begins directly below a heading or subheading.
-
-
-\subsubsection{Obtaining Type 1 Computer Modern for \LaTeX{}.}
-
-If you use Computer Modern for the mathematics in your paper (you cannot use it for the text) you may need to download type 1 Computer fonts. They are available without charge from the American Mathematical Society:
-http://www.ams.org/tex/type1-fonts.html.
-
-\subsubsection{Nonroman Fonts.}
-If your paper includes symbols in other languages (such as, but not limited to, Arabic, Chinese, Hebrew, Japanese, Thai, Russian and other Cyrillic languages), you must restrict their use to bit-mapped figures.
-
-\subsection{Title and Authors}
-Your title must appear centered over both text columns in sixteen-point bold type (twenty-four point leading). The title must be written in Title Case according to the Chicago Manual of Style rules. The rules are a bit involved, but in general verbs (including short verbs like be, is, using, and go), nouns, adverbs, adjectives, and pronouns should be capitalized, (including both words in hyphenated terms), while articles, conjunctions, and prepositions are lower case unless they directly follow a colon or long dash. You can use the online tool \url{https://titlecaseconverter.com/} to double-check the proper capitalization (select the "Chicago" style and mark the "Show explanations" checkbox).
-
-Author's names should appear below the title of the paper, centered in twelve-point type (with fifteen point leading), along with affiliation(s) and complete address(es) (including electronic mail address if available) in nine-point roman type (the twelve point leading). You should begin the two-column format when you come to the abstract.
-
-\subsubsection{Formatting Author Information.}
-Author information has to be set according to the following specification depending if you have one or more than one affiliation. You may not use a table nor may you employ the \textbackslash authorblk.sty package. For one or several authors from the same institution, please separate them with commas and write all affiliation directly below (one affiliation per line) using the macros \textbackslash author and \textbackslash affiliations:
-
-\begin{quote}\begin{scriptsize}\begin{verbatim}
-\author{
-    Author 1, ..., Author n\\
-}
-\affiliations {
-    Address line\\
-    ... \\
-    Address line\\
-}
-\end{verbatim}\end{scriptsize}\end{quote}
-
-
-\noindent For authors from different institutions, use \textbackslash textsuperscript \{\textbackslash rm x \} to match authors and affiliations. Notice that there should not be any spaces between the author name (or comma following it) and the superscript.
-
-\begin{quote}\begin{scriptsize}\begin{verbatim}
-\author{
-    AuthorOne\equalcontrib\textsuperscript{\rm 1,\rm 2},
-    AuthorTwo\equalcontrib\textsuperscript{\rm 2},
-    AuthorThree\textsuperscript{\rm 3},\\
-    AuthorFour\textsuperscript{\rm 4},
-    AuthorFive \textsuperscript{\rm 5}}
-}
-\affiliations {
-    \textsuperscript{\rm 1}AffiliationOne,\\
-    \textsuperscript{\rm 2}AffiliationTwo,\\
-    \textsuperscript{\rm 3}AffiliationThree,\\
-    \textsuperscript{\rm 4}AffiliationFour,\\
-    \textsuperscript{\rm 5}AffiliationFive\\
-    \{email, email\}@affiliation.com,
-    email@affiliation.com,
-    email@affiliation.com,
-    email@affiliation.com
-}
-\end{verbatim}\end{scriptsize}\end{quote}
-
-You can indicate that some authors contributed equally using the \textbackslash equalcontrib command. This will add a marker after the author names and a footnote on the first page.
-
-Note that you may want to  break the author list for better visualization. You can achieve this using a simple line break (\textbackslash  \textbackslash).
-
-\subsection{\LaTeX{} Copyright Notice}
-The copyright notice automatically appears if you use aaai2026.sty. It has been hardcoded and may not be disabled.
-
-\subsection{Credits}
-Any credits to a sponsoring agency should appear in the acknowledgments section, unless the agency requires different placement. If it is necessary to include this information on the front page, use
-\textbackslash thanks in either the \textbackslash author or \textbackslash title commands.
-For example:
-\begin{quote}
-\begin{small}
-\textbackslash title\{Very Important Results in AI\textbackslash thanks\{This work is
- supported by everybody.\}\}
-\end{small}
-\end{quote}
-Multiple \textbackslash thanks commands can be given. Each will result in a separate footnote indication in the author or title with the corresponding text at the botton of the first column of the document. Note that the \textbackslash thanks command is fragile. You will need to use \textbackslash protect.
-
-Please do not include \textbackslash pubnote commands in your document.
-
-\subsection{Abstract}
-Follow the example commands in this document for creation of your abstract. The command \textbackslash begin\{abstract\} will automatically indent the text block. Please do not indent it further. {Do not include references in your abstract!}
-
-\subsection{Page Numbers}
-
-Do not print any page numbers on your paper. The use of \textbackslash pagestyle is forbidden.
-
-\subsection{Text}
-The main body of the paper must be formatted in black, ten-point Times Roman with twelve-point leading (line spacing). You may not reduce font size or the linespacing. Commands that alter font size or line spacing (including, but not limited to baselinestretch, baselineshift, linespread, and others) are expressly forbidden. In addition, you may not use color in the text.
-
-\subsection{Citations}
-Citations within the text should include the author's last name and year, for example (Newell 1980). Append lower-case letters to the year in cases of ambiguity. Multiple authors should be treated as follows: (Feigenbaum and Engelmore 1988) or (Ford, Hayes, and Glymour 1992). In the case of four or more authors, list only the first author, followed by et al. (Ford et al. 1997).
-
-\subsection{Extracts}
-Long quotations and extracts should be indented ten points from the left and right margins.
-
-\begin{quote}
-This is an example of an extract or quotation. Note the indent on both sides. Quotation marks are not necessary if you offset the text in a block like this, and properly identify and cite the quotation in the text.
-
-\end{quote}
-
-\subsection{Footnotes}
-Use footnotes judiciously, taking into account that they interrupt the reading of the text. When required, they should be consecutively numbered throughout with superscript Arabic numbers. Footnotes should appear at the bottom of the page, separated from the text by a blank line space and a thin, half-point rule.
-
-\subsection{Headings and Sections}
-When necessary, headings should be used to separate major sections of your paper. Remember, you are writing a short paper, not a lengthy book! An overabundance of headings will tend to make your paper look more like an outline than a paper. The aaai2026.sty package will create headings for you. Do not alter their size nor their spacing above or below.
-
-\subsubsection{Section Numbers.}
-The use of section numbers in AAAI Press papers is optional. To use section numbers in \LaTeX{}, uncomment the setcounter line in your document preamble and change the 0 to a 1. Section numbers should not be used in short poster papers and/or extended abstracts.
-
-\subsubsection{Section Headings.}
-Sections should be arranged and headed as follows:
-\begin{enumerate}
-\item Main content sections
-\item Appendices (optional)
-\item Ethical Statement (optional, unnumbered)
-\item Acknowledgements (optional, unnumbered)
-\item References (unnumbered)
-\end{enumerate}
-
-\subsubsection{Appendices.}
-Any appendices must appear after the main content. If your main sections are numbered, appendix sections must use letters instead of arabic numerals. In \LaTeX{} you can use the \texttt{\textbackslash appendix} command to achieve this effect and then use \texttt{\textbackslash section\{Heading\}} normally for your appendix sections.
-
-\subsubsection{Ethical Statement.}
-You can write a statement about the potential ethical impact of your work, including its broad societal implications, both positive and negative. If included, such statement must be written in an unnumbered section titled \emph{Ethical Statement}.
-
-\subsubsection{Acknowledgments.}
-The acknowledgments section, if included, appears right before the references and is headed ``Acknowledgments". It must not be numbered even if other sections are (use \texttt{\textbackslash section*\{Acknowledgements\}} in \LaTeX{}). This section includes acknowledgments of help from associates and colleagues, credits to sponsoring agencies, financial support, and permission to publish. Please acknowledge other contributors, grant support, and so forth, in this section. Do not put acknowledgments in a footnote on the first page. If your grant agency requires acknowledgment of the grant on page 1, limit the footnote to the required statement, and put the remaining acknowledgments at the back. Please try to limit acknowledgments to no more than three sentences.
-
-\subsubsection{References.}
-The references section should be labeled ``References" and must appear at the very end of the paper (don't end the paper with references, and then put a figure by itself on the last page). A sample list of references is given later on in these instructions. Please use a consistent format for references. Poorly prepared or sloppy references reflect badly on the quality of your paper and your research. Please prepare complete and accurate citations.
-
-\subsection{Illustrations and  Figures}
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.9\columnwidth]{figure1} % Reduce the figure size so that it is slightly narrower than the column. Don't use precise values for figure width.This setup will avoid overfull boxes.
-\caption{Using the trim and clip commands produces fragile layers that can result in disasters (like this one from an actual paper) when the color space is corrected or the PDF combined with others for the final proceedings. Crop your figures properly in a graphics program -- not in LaTeX.}
-\label{fig1}
-\end{figure}
-
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.8\textwidth]{figure2} % Reduce the figure size so that it is slightly narrower than the column.
-\caption{Adjusting the bounding box instead of actually removing the unwanted data resulted multiple layers in this paper. It also needlessly increased the PDF size. In this case, the size of the unwanted layer doubled the paper's size, and produced the following surprising results in final production. Crop your figures properly in a graphics program. Don't just alter the bounding box.}
-\label{fig2}
-\end{figure*}
-
-% Using the \centering command instead of \begin{center} ... \end{center} will save space
-% Positioning your figure at the top of the page will save space and make the paper more readable
-% Using 0.95\columnwidth in conjunction with the
-
-
-Your paper must compile in PDF\LaTeX{}. Consequently, all your figures must be .jpg, .png, or .pdf. You may not use the .gif (the resolution is too low), .ps, or .eps file format for your figures.
-
-Figures, drawings, tables, and photographs should be placed throughout the paper on the page (or the subsequent page) where they are first discussed. Do not group them together at the end of the paper. If placed at the top of the paper, illustrations may run across both columns. Figures must not invade the top, bottom, or side margin areas. Figures must be inserted using the \textbackslash usepackage\{graphicx\}. Number figures sequentially, for example, figure 1, and so on. Do not use minipage to group figures.
-
-If you normally create your figures using pgfplots, please create the figures first, and then import them as pdfs with proper bounding boxes, as the bounding and trim boxes created by pfgplots are fragile and not valid.
-
-When you include your figures, you must crop them \textbf{outside} of \LaTeX{}. The command \textbackslash includegraphics*[clip=true, viewport 0 0 10 10]{...} might result in a PDF that looks great, but the image is \textbf{not really cropped.} The full image can reappear (and obscure whatever it is overlapping) when page numbers are applied or color space is standardized. Figures \ref{fig1}, and \ref{fig2} display some unwanted results that often occur.
-
-If your paper includes illustrations that are not compatible with PDF\TeX{} (such as .eps or .ps documents), you will need to convert them. The epstopdf package will usually work for eps files. You will need to convert your ps files to PDF in either case.
-
-\subsubsection {Figure Captions.}The illustration number and caption must appear \textit{under} the illustration. Labels and other text with the actual illustration must be at least nine-point type. However, the font and size of figure captions must be 10 point roman. Do not make them smaller, bold, or italic. (Individual words may be italicized if the context requires differentiation.)
-
-\subsection{Tables}
-
-\subsection{Tables}
-
-Tables should be presented in 10 point roman type. If necessary, they may be altered to 9 point type. You must not use \texttt{\textbackslash resizebox} or other commands that resize the entire table to make it smaller, because you can't control the final font size this way.
-If your table is too large you can use \texttt{\textbackslash setlength\{\textbackslash tabcolsep\}\{1mm\}} to compress the columns a bit or you can adapt the content (e.g.: reduce the decimal precision when presenting numbers, use shortened column titles, make some column duble-line to get it narrower).
-
-Tables that do not fit in a single column must be placed across double columns. If your table won't fit within the margins even when spanning both columns and using the above techniques, you must split it in two separate tables.
-
-\subsubsection {Table Captions.} The number and caption for your table must appear \textit{under} (not above) the table.  Additionally, the font and size of table captions must be 10 point roman and must be placed beneath the figure. Do not make them smaller, bold, or italic. (Individual words may be italicized if the context requires differentiation.)
-
-
-
-\subsubsection{Low-Resolution Bitmaps.}
-You may not use low-resolution (such as 72 dpi) screen-dumps and GIF files---these files contain so few pixels that they are always blurry, and illegible when printed. If they are color, they will become an indecipherable mess when converted to black and white. This is always the case with gif files, which should never be used. The resolution of screen dumps can be increased by reducing the print size of the original file while retaining the same number of pixels. You can also enlarge files by manipulating them in software such as PhotoShop. Your figures should be 300 dpi when incorporated into your document.
-
-\subsubsection{\LaTeX{} Overflow.}
-\LaTeX{} users please beware: \LaTeX{} will sometimes put portions of the figure or table or an equation in the margin. If this happens, you need to make the figure or table span both columns. If absolutely necessary, you may reduce the figure, or reformat the equation, or reconfigure the table.{ \bf Check your log file!} You must fix any overflow into the margin (that means no overfull boxes in \LaTeX{}). \textbf{Nothing is permitted to intrude into the margin or gutter.}
-
-
-\subsubsection{Using Color.}
-Use of color is restricted to figures only. It must be WACG 2.0 compliant. (That is, the contrast ratio must be greater than 4.5:1 no matter the font size.) It must be CMYK, NOT RGB. It may never be used for any portion of the text of your paper. The archival version of your paper will be printed in black and white and grayscale. The web version must be readable by persons with disabilities. Consequently, because conversion to grayscale can cause undesirable effects (red changes to black, yellow can disappear, and so forth), we strongly suggest you avoid placing color figures in your document. If you do include color figures, you must (1) use the CMYK (not RGB) colorspace and (2) be mindful of readers who may happen to have trouble distinguishing colors. Your paper must be decipherable without using color for distinction.
-
-\subsubsection{Drawings.}
-We suggest you use computer drawing software (such as Adobe Illustrator or, (if unavoidable), the drawing tools in Microsoft Word) to create your illustrations. Do not use Microsoft Publisher. These illustrations will look best if all line widths are uniform (half- to two-point in size), and you do not create labels over shaded areas. Shading should be 133 lines per inch if possible. Use Times Roman or Helvetica for all figure call-outs. \textbf{Do not use hairline width lines} --- be sure that the stroke width of all lines is at least .5 pt. Zero point lines will print on a laser printer, but will completely disappear on the high-resolution devices used by our printers.
-
-\subsubsection{Photographs and Images.}
-Photographs and other images should be in grayscale (color photographs will not reproduce well; for example, red tones will reproduce as black, yellow may turn to white, and so forth) and set to a minimum of 300 dpi. Do not prescreen images.
-
-\subsubsection{Resizing Graphics.}
-Resize your graphics \textbf{before} you include them with LaTeX. You may \textbf{not} use trim or clip options as part of your \textbackslash includegraphics command. Resize the media box of your PDF using a graphics program instead.
-
-\subsubsection{Fonts in Your Illustrations.}
-You must embed all fonts in your graphics before including them in your LaTeX document.
-
-\subsubsection{Algorithms.}
-Algorithms and/or programs are a special kind of figures. Like all illustrations, they should appear floated to the top (preferably) or bottom of the page. However, their caption should appear in the header, left-justified and enclosed between horizontal lines, as shown in Algorithm~\ref{alg:algorithm}. The algorithm body should be terminated with another horizontal line. It is up to the authors to decide whether to show line numbers or not, how to format comments, etc.
-
-In \LaTeX{} algorithms may be typeset using the {\tt algorithm} and {\tt algorithmic} packages, but you can also use one of the many other packages for the task.
-
-\begin{algorithm}[tb]
-\caption{Example algorithm}
-\label{alg:algorithm}
-\textbf{Input}: Your algorithm's input\\
-\textbf{Parameter}: Optional list of parameters\\
-\textbf{Output}: Your algorithm's output
-\begin{algorithmic}[1] %[1] enables line numbers
-\STATE Let $t=0$.
-\WHILE{condition}
-\STATE Do some action.
-\IF {conditional}
-\STATE Perform task A.
-\ELSE
-\STATE Perform task B.
-\ENDIF
-\ENDWHILE
-\STATE \textbf{return} solution
-\end{algorithmic}
-\end{algorithm}
-
-\subsubsection{Listings.}
-Listings are much like algorithms and programs. They should also appear floated to the top (preferably) or bottom of the page. Listing captions should appear in the header, left-justified and enclosed between horizontal lines as shown in Listing~\ref{lst:listing}. Terminate the body with another horizontal line and avoid any background color. Line numbers, if included, must appear within the text column.
-
-\begin{listing}[tb]%
-\caption{Example listing {\tt quicksort.hs}}%
-\label{lst:listing}%
-\begin{lstlisting}[language=Haskell]
-quicksort :: Ord a => [a] -> [a]
-quicksort []     = []
-quicksort (p:xs) = (quicksort lesser) ++ [p] ++ (quicksort greater)
-	where
-		lesser  = filter (< p) xs
-		greater = filter (>= p) xs
-\end{lstlisting}
-\end{listing}
-
-\subsection{References}
-The AAAI style includes a set of definitions for use in formatting references with BibTeX. These definitions make the bibliography style fairly close to the ones  specified in the Reference Examples appendix below. To use these definitions, you also need the BibTeX style file ``aaai2026.bst," available in the AAAI Author Kit on the AAAI web site. Then, at the end of your paper but before \textbackslash end{document}, you need to put the following lines:
-
-\begin{quote}
-\begin{small}
-\textbackslash bibliography\{bibfile1,bibfile2,...\}
-\end{small}
-\end{quote}
-
-Please note that the aaai2026.sty class already sets the bibliographystyle for you, so you do not have to place any \textbackslash bibliographystyle command in the document yourselves. The aaai2026.sty file is incompatible with the hyperref and navigator packages. If you use either, your references will be garbled and your paper will be returned to you.
-
-References may be the same size as surrounding text.
-However, in this section (only), you may reduce the size to {\em \textbackslash small} (9pt) if your paper exceeds the allowable number of pages. Making it any smaller than 9 point with 10 point linespacing, however, is not allowed.
-
-The list of files in the \textbackslash bibliography command should be the names of your BibTeX source files (that is, the .bib files referenced in your paper).
-
-The following commands are available for your use in citing references:
-\begin{quote}
-{\em \textbackslash cite:} Cites the given reference(s) with a full citation. This appears as ``(Author Year)'' for one reference, or ``(Author Year; Author Year)'' for multiple references.\smallskip\\
-{\em \textbackslash shortcite:} Cites the given reference(s) with just the year. This appears as ``(Year)'' for one reference, or ``(Year; Year)'' for multiple references.\smallskip\\
-{\em \textbackslash citeauthor:} Cites the given reference(s) with just the author name(s) and no parentheses.\smallskip\\
-{\em \textbackslash citeyear:} Cites the given reference(s) with just the date(s) and no parentheses.
-\end{quote}
-You may also use any of the \emph{natbib} citation commands.
-
-
-\section{Proofreading Your PDF}
-Please check all the pages of your PDF file. The most commonly forgotten element is the acknowledgements --- especially the correct grant number. Authors also commonly forget to add the metadata to the source, use the wrong reference style file, or don't follow the capitalization rules or comma placement for their author-title information properly. A final common problem is text (expecially equations) that runs into the margin. You will need to fix these common errors before submitting your file.
-
-\section{Improperly Formatted Files }
-In the past, AAAI has corrected improperly formatted files submitted by the authors. Unfortunately, this has become an increasingly burdensome expense that we can no longer absorb). Consequently, if your file is improperly formatted, it will be returned to you for correction.
-
-\section{Naming Your Electronic File}
-We require that you name your \LaTeX{} source file with the last name (family name) of the first author so that it can easily be differentiated from other submissions. Complete file-naming instructions will be provided to you in the submission instructions.
-
-\section{Submitting Your Electronic Files to AAAI}
-Instructions on paper submittal will be provided to you in your acceptance letter.
-
-\section{Inquiries}
-If you have any questions about the preparation or submission of your paper as instructed in this document, please contact AAAI Press at the address given below. If you have technical questions about implementation of the aaai style file, please contact an expert at your site. We do not provide technical support for \LaTeX{} or any other software package. To avoid problems, please keep your paper simple, and do not incorporate complicated macros and style files.
-
-\begin{quote}
-\noindent AAAI Press\\
-1101 Pennsylvania Ave, NW Suite 300\\
-Washington, DC 20004 USA\\
-\textit{Telephone:} 1-202-360-4062\\
-\textit{E-mail:} See the submission instructions for your particular conference or event.
-\end{quote}
-
-\section{Additional Resources}
-\LaTeX{} is a difficult program to master. If you've used that software, and this document didn't help or some items were not explained clearly, we recommend you read Michael Shell's excellent document (testflow doc.txt V1.0a 2002/08/13) about obtaining correct PS/PDF output on \LaTeX{} systems. (It was written for another purpose, but it has general application as well). It is available at www.ctan.org in the tex-archive.
-
-\appendix
-\section{Reference Examples}
-\label{sec:reference_examples}
-
-\nobibliography*
-Formatted bibliographies should look like the following examples. You should use BibTeX to generate the references. Missing fields are unacceptable when compiling references, and usually indicate that you are using the wrong type of entry (BibTeX class).
-
-\paragraph{Book with multiple authors~\nocite{em:86}} Use the \texttt{@book} class.\\[.2em]
-\bibentry{em:86}.
-
-\paragraph{Journal and magazine articles~\nocite{r:80, hcr:83}} Use the \texttt{@article} class.\\[.2em]
-\bibentry{r:80}.\\[.2em]
-\bibentry{hcr:83}.
-
-\paragraph{Proceedings paper published by a society, press or publisher~\nocite{c:83, c:84}} Use the \texttt{@inproceedings} class. You may abbreviate the \emph{booktitle} field, but make sure that the conference edition is clear.\\[.2em]
-\bibentry{c:84}.\\[.2em]
-\bibentry{c:83}.
-
-\paragraph{University technical report~\nocite{r:86}} Use the \texttt{@techreport} class.\\[.2em]
-\bibentry{r:86}.
-
-\paragraph{Dissertation or thesis~\nocite{c:79}} Use the \texttt{@phdthesis} class.\\[.2em]
-\bibentry{c:79}.
-
-\paragraph{Forthcoming publication~\nocite{c:21}} Use the \texttt{@misc} class with a \texttt{note="Forthcoming"} annotation.
-\begin{quote}
-\begin{footnotesize}
-\begin{verbatim}
-@misc(key,
-  [...]
-  note="Forthcoming",
-)
-\end{verbatim}
-\end{footnotesize}
-\end{quote}
-\bibentry{c:21}.
-
-\paragraph{ArXiv paper~\nocite{c:22}} Fetch the BibTeX entry from the "Export Bibtex Citation" link in the arXiv website. Notice it uses the \texttt{@misc} class instead of the \texttt{@article} one, and that it includes the \texttt{eprint} and \texttt{archivePrefix} keys.
-\begin{quote}
-\begin{footnotesize}
-\begin{verbatim}
-@misc(key,
-  [...]
-  eprint="xxxx.yyyy",
-  archivePrefix="arXiv",
-)
-\end{verbatim}
-\end{footnotesize}
-\end{quote}
-\bibentry{c:22}.
-
-\paragraph{Website or online resource~\nocite{c:23}} Use the \texttt{@misc} class. Add the url in the \texttt{howpublished} field and the date of access in the \texttt{note} field:
-\begin{quote}
-\begin{footnotesize}
-\begin{verbatim}
-@misc(key,
-  [...]
-  howpublished="\url{http://...}",
-  note="Accessed: YYYY-mm-dd",
-)
-\end{verbatim}
-\end{footnotesize}
-\end{quote}
-\bibentry{c:23}.
-
-\vspace{.2em}
-For the most up to date version of the AAAI reference style, please consult the \textit{AI Magazine} Author Guidelines at \url{https://aaai.org/ojs/index.php/aimagazine/about/submissions#authorGuidelines}
-
-\section{Acknowledgments}
-AAAI is especially grateful to Peter Patel Schneider for his work in implementing the original aaai.sty file, liberally using the ideas of other style hackers, including Barbara Beeton. We also acknowledge with thanks the work of George Ferguson for his guide to using the style and BibTeX files --- which has been incorporated into this document --- and Hans Guesgen, who provided several timely modifications, as well as the many others who have, from time to time, sent in suggestions on improvements to the AAAI style. We are especially grateful to Francisco Cruz, Marc Pujol-Gonzalez, and Mico Loretan for the improvements to the Bib\TeX{} and \LaTeX{} files made in 2020.
-
-The preparation of the \LaTeX{} and Bib\TeX{} files that implement these instructions was supported by Schlumberger Palo Alto Research, AT\&T Bell Laboratories, Morgan Kaufmann Publishers, The Live Oak Press, LLC, and AAAI Press. Bibliography style changes were added by Sunil Issar. \verb+\+pubnote was added by J. Scott Penberthy. George Ferguson added support for printing the AAAI copyright slug. Additional changes to aaai2026.sty and aaai2026.bst have been made by Francisco Cruz and Marc Pujol-Gonzalez.
-
-\bigskip
-\noindent Thank you for reading these instructions carefully. We look forward to receiving your electronic files!
+\section{Conclusion}
+\emph{[Draft stub --- to be completed.]} We presented an action-grounding objective that makes a pretrained autoregressive video diffusion model obey egomotion commands, and a frozen-judge protocol that measures controllability without circularity. Ablations attribute control to AdaLN modulation and output-level critic guidance---while per-frame action tokens and the representation-level state probe are largely redundant \emph{for control}, though the action tokens separately serve as a spatiotemporal memory that preserves scene content under camera motion---and show that this control is bought at a small, measurable cost in visual fidelity, with negligible short-rollout drift. The principal open problem is the systematic failure to render reverse egomotion.
 
 \bibliography{aaai2026}
 

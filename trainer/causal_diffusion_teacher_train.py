@@ -468,11 +468,20 @@ class CausalLoRADiffusionTrainer:
         self.eval_inference_steps = int(getattr(config, "eval_inference_steps", 48))
         self.grad_norm_interval = int(getattr(config, "grad_norm_interval", 50))
 
-        if self.is_main_process:
-            logging.info("Building training dataloader...")
-        self._build_dataloader()
-        if self.is_main_process:
-            logging.info("Training dataloader ready (world_size=%s)", self.world_size)
+        if getattr(config, "skip_train_dataloader", False):
+            # Eval drivers (utils/inject_eval.py) never touch the training
+            # data; building it means every WORLD_SIZE=1 shard loads AND
+            # re-saves the ~22GB ride manifest on one shared path — the
+            # lustre pile-up that hung the sweep jobs. eval_dataset users
+            # are all None-guarded.
+            logging.info("skip_train_dataloader=True — eval-driver mode, no training data.")
+            self.eval_dataset = None
+        else:
+            if self.is_main_process:
+                logging.info("Building training dataloader...")
+            self._build_dataloader()
+            if self.is_main_process:
+                logging.info("Training dataloader ready (world_size=%s)", self.world_size)
 
         self._init_wandb()
 
@@ -886,8 +895,42 @@ class CausalLoRADiffusionTrainer:
         self._frozen_ss_vae = ss_vae
         self._frozen_ss_vae_scale = scale
 
+        # Teacher action encoder: ss_vae (default) or pca_raw (14e: VAE OFF, the
+        # critic teacher target + eval read use raw top-8 PCA of the CoTracker
+        # grid, squashed with pca_raw_scales). Must match the dataset's
+        # conditioning encoder (ARRWM_ACTION_ENCODER=pca_raw).
+        self._teacher_action_encoder = str(getattr(self.config, "teacher_action_encoder", "ss_vae")).lower()
+        if self._teacher_action_encoder == "pca_raw":
+            _ck = torch.load(ss_vae_ckpt, map_location="cpu", weights_only=False)
+            self._pca_mean = torch.tensor(np.asarray(_ck["pca_mean"]), dtype=torch.float32, device=self.device)
+            self._pca_comp_T = torch.tensor(np.asarray(_ck["pca_comp"]).T, dtype=torch.float32, device=self.device)  # [200,16]
+            _scales = getattr(self.config, "pca_raw_scales",
+                              [93.7, 57.7, 22.5, 21.2, 18.1, 14.5, 12.6, 10.8])
+            self._pca_scales = torch.tensor(list(_scales)[:8], dtype=torch.float32, device=self.device)
+            if self.is_main_process:
+                logging.info("Teacher action encoder = pca_raw (VAE off); scales=%s", list(_scales)[:8])
+
         if self.is_main_process:
-            logging.info("Frozen evaluator modules ready (VAE, CoTracker, ss_vae)")
+            logging.info("Frozen evaluator modules ready (VAE, CoTracker, %s)", self._teacher_action_encoder)
+
+    def _motion_to_action_z(self, est_motion: torch.Tensor) -> torch.Tensor:
+        """[raw_n,100,3] CoTracker motion -> [raw_n,8] action z.
+
+        ss_vae: encode the 10x10 dx/dy grid through the frozen VAE.
+        pca_raw (14e): project the flattened (200-D) dx/dy onto the top-8 PCA
+        components and tanh-squash with per-component scales -- identical
+        pipeline to the dataset's conditioning encoder, so teacher target and
+        command live in the same space.
+        """
+        raw_n = est_motion.shape[0]
+        if getattr(self, "_teacher_action_encoder", "ss_vae") == "pca_raw":
+            flat = est_motion[:, :, :2].reshape(raw_n, 200).float()
+            P = (flat - self._pca_mean) @ self._pca_comp_T            # [raw_n,16]
+            return torch.tanh(P[:, :8] / self._pca_scales)            # top-8, squashed
+        xy = est_motion[:, :, :2].reshape(raw_n, 10, 10, 2)
+        x_in = xy.permute(0, 3, 1, 2).float() / self._frozen_ss_vae_scale
+        mu, _ = self._frozen_ss_vae.encoder(x_in.to(self.device))
+        return _tanh_squash(mu.squeeze(-1).squeeze(-1))
 
     @torch.no_grad()
     def _compute_action_teacher_targets(
@@ -956,12 +999,7 @@ class CausalLoRADiffusionTrainer:
                 continue
 
             est_motion = torch.cat(motion_windows, dim=0)
-            raw_n = est_motion.shape[0]
-            xy = est_motion[:, :, :2].reshape(raw_n, 10, 10, 2)
-            x_in = xy.permute(0, 3, 1, 2).float() / self._frozen_ss_vae_scale
-            mu, _ = self._frozen_ss_vae.encoder(x_in.to(self.device))
-            z_full_8d = mu.squeeze(-1).squeeze(-1)
-            z_full_8d = _tanh_squash(z_full_8d)
+            z_full_8d = self._motion_to_action_z(est_motion)
 
             z_chunked = self._reduce_to_segments(z_full_8d, n_chunks)
             all_teacher_z.append(z_chunked)
@@ -1034,10 +1072,7 @@ class CausalLoRADiffusionTrainer:
 
             est_motion = torch.cat(mws, dim=0)
             raw_n = est_motion.shape[0]
-            xy = est_motion[:, :, :2].reshape(raw_n, 10, 10, 2)
-            x_in = xy.permute(0, 3, 1, 2).float() / self._frozen_ss_vae_scale
-            mu, _ = self._frozen_ss_vae.encoder(x_in.to(self.device))
-            z8 = _tanh_squash(mu.squeeze(-1).squeeze(-1))
+            z8 = self._motion_to_action_z(est_motion)
 
             z8_chunked = self._reduce_to_segments(z8, n_chunks)
             motion_chunked = self._reduce_to_segments(
@@ -1432,6 +1467,9 @@ class CausalLoRADiffusionTrainer:
                             logging.info("No %s in checkpoint (new modules will be trained from scratch)", key)
 
     def _save_checkpoint(self, step: int, keep_last: int = 3) -> None:
+        if not getattr(self.config, "save_checkpoints", True):
+            return  # control-test runs only want videos, no checkpoints on disk
+        keep_last = int(getattr(self.config, "ckpt_keep_last", keep_last))
         path = self._checkpoint_path(step)
         if path is None:
             return
@@ -1541,11 +1579,16 @@ class CausalLoRADiffusionTrainer:
             conditional["_action_tokens_clean"] = self.action_token_projection(z_clean)
         return conditional
 
-    def _compute_flow_loss(self, flow_pred, training_target, timesteps, bsz, num_frames):
+    def _compute_flow_loss(self, flow_pred, training_target, timesteps, bsz, num_frames, glitch_mask=None):
         flow_loss = F.mse_loss(flow_pred.float(), training_target.float(), reduction="none")
         flow_loss = flow_loss.mean(dim=(2, 3, 4))
         weights = self.scheduler.training_weight(timesteps.flatten(0, 1)).view(bsz, num_frames)
-        return (flow_loss * weights).mean()
+        wl = flow_loss * weights
+        if glitch_mask is not None:
+            # zero the gradient on encoder-glitch latent frames (kept frames'
+            # gradient scale is unchanged: glitched frames just contribute 0).
+            wl = wl * glitch_mask
+        return wl.mean()
 
     def _weighted_z_mse(self, pred_z, target_z):
         """Weighted MSE over z with the ACTION dims (z2/z7) up-weighted.
@@ -1592,6 +1635,10 @@ class CausalLoRADiffusionTrainer:
         # Teacher targets: full 8D z from motion pipeline (computed once)
         teacher_z_8d = self._compute_action_teacher_targets(pred_x0.detach())
         teacher_z_8d = teacher_z_8d[:, :n_chunks]  # [B, n_chunks, 8]
+        # The critic predicts len(action_critic_dims) (= z_out_dim) dims; slice the
+        # 8-D teacher to those dims so the critic loss matches. No-op when
+        # action_critic_dims == [0..7] (top-8 / v14d), required for top-4 / top-2.
+        teacher_targets = teacher_z_8d[..., self.action_critic_dims]
 
         pred_x0_detached = pred_x0.detach()
 
@@ -1601,7 +1648,7 @@ class CausalLoRADiffusionTrainer:
             pred_z = self.action_critic(pred_x0_detached, chunk_t, chunk_actions)
             pred_z = pred_z[:, :n_chunks]
 
-            critic_z_loss = self._weighted_z_mse(pred_z, teacher_z_8d)
+            critic_z_loss = self._weighted_z_mse(pred_z, teacher_targets)
             critic_loss_k = self.action_critic_z_loss_weight * critic_z_loss
 
             if self.scaler.is_enabled():
@@ -1619,7 +1666,10 @@ class CausalLoRADiffusionTrainer:
                 self.critic_optimizer.step()
 
         # --- Generator guidance: frozen critic, gradient through pred_x0 ---
-        warmup_start = self.warmup_steps
+        # Guidance start is DECOUPLED from the LR warmup (z_guidance_start_step;
+        # defaults to warmup_steps for back-compat). 14e: LR warmup stays 200,
+        # but guidance starts at 50 and ramps over z_guidance_warmup_steps(=50).
+        warmup_start = int(getattr(self.config, "z_guidance_start_step", self.warmup_steps))
         if current_step < warmup_start:
             guidance_scale = 0.0
         elif self.z_guidance_warmup_steps > 0:
@@ -1884,6 +1934,9 @@ class CausalLoRADiffusionTrainer:
         return vid_np
 
     def _maybe_eval(self, step: int) -> None:
+        if getattr(self.config, "control_test", False):
+            self._control_test_eval(step)
+            return
         if not self.is_main_process:
             return
         if self.eval_dataset is None:
@@ -2060,6 +2113,187 @@ class CausalLoRADiffusionTrainer:
             self._restore_training_state()
             torch.cuda.empty_cache()
 
+    @torch.no_grad()
+    def _control_test_eval(self, step: int) -> None:
+        """All-rank GT-vs-FLIPPED causal-chain controllability eval.
+
+        Every ``eval_interval`` steps (only at/after ``control_eval_start``),
+        each rank r < ``control_n_videos`` rolls out the hardened KV-cache
+        causal chain (action-aware cached RoPE; ``utils.causal_chain_rollout``)
+        from a distinct held-out start TWICE, from the IDENTICAL starting state:
+          * GT branch   -- the ride's real per-frame actions,
+          * FLIP branch -- the same actions sign-flipped after the seed.
+        GT looks controllable because flow-matching reproduces GT motion; the
+        FLIP branch reveals whether the model actually OBEYS commands. For each
+        branch we read the rendered egomotion (frozen CoTracker->SS-VAE = the
+        teacher) and score it against the command (corr / sign-match / mse over
+        the generated chunks), writing both videos @16fps (+ annotated) and one
+        paired metric line to ``<logdir>/control_test/metrics_rRR.jsonl``.
+
+        z2/z7 are SS-VAE dims given by ``action_dims`` (=[2,7]); do NOT use
+        ``action_critic_dims[0:2]`` (=0,1 in v14d) -- that mislabel is exactly
+        what made the logged critic_z2/z7 meaningless.  No collectives during
+        generation: idle ranks (r >= control_n_videos) return at once.
+        """
+        if self.eval_dataset is None or self._frozen_vae is None:
+            return
+        sp1 = step + 1
+        start = int(getattr(self.config, "control_eval_start", 0))
+        if sp1 < start or (sp1 - start) % self.eval_interval != 0:
+            return
+        n_videos = int(getattr(self.config, "control_n_videos", 32))
+        if self.global_rank >= n_videos:
+            return  # idle GPU (16-node: 1 video per 2 GPUs)
+
+        from utils.causal_chain_rollout import stream_causal_chain
+        nfb = self.num_frame_per_block
+        gen_chunks = int(getattr(self.config, "control_gen_chunks", 8))
+        flip_mode = str(getattr(self.config, "control_flip_mode", "both"))
+        eval_steps = int(getattr(self.config, "eval_inference_steps", 48))
+        tot_f = nfb * (1 + gen_chunks)
+        ego = list(self.action_dims) if self.action_dims is not None else [2, 7]
+        z2_idx, z7_idx = ego[0], ego[1]
+
+        n_rides = len(self.eval_dataset)
+        ride_idx = self.global_rank % n_rides
+        offset_level = self.global_rank // n_rides
+        out_dir = os.path.join(self.logdir, "control_test")
+        os.makedirs(out_dir, exist_ok=True)
+
+        self._offload_training_state()
+        wrapper = self.model.module if isinstance(self.model, DDP) else self.model
+        was_training = wrapper.training
+        wrapper.eval()
+        causal_model = wrapper.model
+        if hasattr(causal_model, "base_model"):
+            causal_model = causal_model.base_model.model
+        saved_mask = getattr(causal_model, "block_mask", None)
+        causal_model.block_mask = None
+
+        _timeout = int(getattr(self.config, "eval_timeout_sec", 600))
+        def _alarm(_sig, _frm):
+            raise TimeoutError(f"control-test eval exceeded {_timeout}s")
+        _prev_alarm = signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(_timeout)
+        try:
+            ride = self.eval_dataset[ride_idx]
+            zarr_path = ride["zarr_path"]
+            n_lat = ride["n_latent_frames"]
+            prompt_embeds_eval = ride["prompt_embeds"].unsqueeze(0).to(self.device, dtype=self.dtype)
+            if n_lat < tot_f:
+                logging.warning("[control] rank %d ride too short (%d<%d), skip",
+                                self.global_rank, n_lat, tot_f)
+                return
+            offset = max(0, min(offset_level * tot_f, n_lat - tot_f))
+
+            seed_lat = ZarrRideDataset.load_latent_chunk(zarr_path, offset, offset + nfb)
+            seed_lat = seed_lat.unsqueeze(0).to(self.device, dtype=torch.float32)  # [1,nfb,C,H,W]
+
+            z8 = self.eval_dataset.encode_z_actions_window(zarr_path, n_lat, offset, offset + tot_f)
+            z8 = z8.unsqueeze(0).to(self.device, dtype=self.dtype)                 # [1,tot_f,8] GT
+            z_cond_gt = z8[..., ego]                                               # [1,tot_f,2] rollout cond
+            # flipped command: seed (frames < nfb) untouched -> identical start;
+            # only the generated portion is sign-flipped.
+            z_cond_flip = z_cond_gt.clone()
+            if flip_mode in ("both", "steer"):
+                z_cond_flip[:, nfb:, 0] *= -1.0
+            if flip_mode in ("both", "throttle"):
+                z_cond_flip[:, nfb:, 1] *= -1.0
+
+            critic_mod = None
+            if self.action_critic is not None:
+                critic_mod = self.action_critic.module if isinstance(self.action_critic, DDP) else self.action_critic
+                critic_mod.eval()
+
+            def chunk_pool(perframe):  # [1,F,D] -> [1, F//nfb, D] mean per chunk
+                F_ = perframe.shape[1]; nc = F_ // nfb
+                return perframe[:, :nc * nfb].reshape(1, nc, nfb, perframe.shape[2]).mean(2)
+
+            def _corr(a, b):
+                a = a - a.mean(); b = b - b.mean()
+                return (a @ b / (a.norm() * b.norm()).clamp_min(1e-8)).item()
+
+            def run_branch(z_cond, cmd8, label):
+                full_lat = stream_causal_chain(
+                    wrapper, self.action_projection, self.action_token_projection,
+                    prompt_embeds_eval, seed_lat, z_cond,
+                    gen_chunks=gen_chunks, eval_steps=eval_steps,
+                    dtype=self.dtype, device=self.device, nfb=nfb)
+                video_np = self._decode_latents(full_lat)
+                motion, teacher_z_8d = self._compute_teacher_visuals(full_lat)     # [1,nc,8]
+                nc = teacher_z_8d.shape[1]
+                cmd_chunks = chunk_pool(z_cond)[:, :nc]                            # [1,nc,2] command z2/z7
+                teacher_2d = teacher_z_8d[:, :, [z2_idx, z7_idx]]                  # [1,nc,2] rendered
+                g0 = 1                                                            # drop the seed chunk
+                t_gen = teacher_2d[0, g0:].float()
+                c_gen = cmd_chunks[0, g0:].float()
+                metric = {
+                    "tz2": [round(x, 4) for x in t_gen[:, 0].tolist()],
+                    "tz7": [round(x, 4) for x in t_gen[:, 1].tolist()],
+                    "cz2": [round(x, 4) for x in c_gen[:, 0].tolist()],
+                    "cz7": [round(x, 4) for x in c_gen[:, 1].tolist()],
+                    "corr_z2": _corr(t_gen[:, 0], c_gen[:, 0]),
+                    "corr_z7": _corr(t_gen[:, 1], c_gen[:, 1]),
+                    "mse": F.mse_loss(t_gen, c_gen).item(),
+                    "sign_z2": ((t_gen[:, 0] > 0) == (c_gen[:, 0] > 0)).float().mean().item(),
+                    "sign_z7": ((t_gen[:, 1] > 0) == (c_gen[:, 1] > 0)).float().mean().item(),
+                }
+                annotated = video_np
+                try:
+                    critic_2d = teacher_2d
+                    if critic_mod is not None:
+                        eval_t = torch.zeros(1, nc, device=self.device)
+                        tgt8 = chunk_pool(cmd8[..., self.action_critic_dims])[:, :nc]
+                        cpred = critic_mod(full_lat, eval_t, tgt8)[:, :nc]
+                        critic_2d = cpred[:, :, [z2_idx, z7_idx]]
+                    annotated = _annotate_action_video(
+                        video_np, motion, teacher_2d, critic_2d, cmd_chunks[:, :nc],
+                        title=f"{label} step{sp1} corr_z2={metric['corr_z2']:+.2f} "
+                              f"corr_z7={metric['corr_z7']:+.2f} sgn_z2={metric['sign_z2']:.2f}")
+                except Exception as exc:
+                    logging.warning("[control] rank %d annotate(%s) failed: %s", self.global_rank, label, exc)
+                tag = f"step{sp1:05d}_r{self.global_rank:02d}_{label}"
+                for frames, sfx in ((video_np, "raw"), (annotated, "annot")):
+                    mp4 = _frames_to_mp4_bytes(frames, fps=16.0)
+                    if mp4 is not None:
+                        with open(os.path.join(out_dir, f"{tag}_{sfx}.mp4"), "wb") as fh:
+                            fh.write(mp4)
+                return metric
+
+            # 8-D commands for the critic input (flip indices z2_idx/z7_idx after the seed)
+            cmd8_flip = z8.clone()
+            if flip_mode in ("both", "steer"):
+                cmd8_flip[:, nfb:, z2_idx] *= -1.0
+            if flip_mode in ("both", "throttle"):
+                cmd8_flip[:, nfb:, z7_idx] *= -1.0
+
+            m_gt = run_branch(z_cond_gt, z8, "gt")
+            m_flip = run_branch(z_cond_flip, cmd8_flip, "flip")
+            if critic_mod is not None:
+                critic_mod.train()
+
+            import json
+            line = {"step": sp1, "rank": self.global_rank,
+                    "ride": os.path.basename(str(zarr_path)), "offset": offset,
+                    "flip_mode": flip_mode, "gt": m_gt, "flip": m_flip}
+            with open(os.path.join(out_dir, f"metrics_r{self.global_rank:02d}.jsonl"), "a") as mf:
+                mf.write(json.dumps(line) + "\n")
+            logging.info("[control] rank %d step%d GT corr(z2,z7)=(%.2f,%.2f) sgn_z2=%.2f | "
+                         "FLIP corr=(%.2f,%.2f) sgn_z2=%.2f",
+                         self.global_rank, sp1, m_gt["corr_z2"], m_gt["corr_z7"], m_gt["sign_z2"],
+                         m_flip["corr_z2"], m_flip["corr_z7"], m_flip["sign_z2"])
+        except Exception as exc:
+            logging.warning("[control] eval failed rank %d step %d: %s",
+                            self.global_rank, sp1, exc, exc_info=True)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, _prev_alarm)
+            causal_model.block_mask = saved_mask
+            if was_training:
+                wrapper.train()
+            self._restore_training_state()
+            torch.cuda.empty_cache()
+
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
@@ -2124,11 +2358,21 @@ class CausalLoRADiffusionTrainer:
             if self.is_main_process:
                 logging.info("Refilled %d slot(s): %s", len(needs), batcher.summary())
 
+        _stop_at = int(getattr(self.config, "stop_at_step", 0))
         for step in range(self.start_step, self.max_steps):
+            if _stop_at and step >= _stop_at:
+                logging.info("Reached stop_at_step=%d; ending run (LR schedule kept at max_iters).", _stop_at)
+                break
             if self.is_distributed:
                 sampler = self.dataloader.sampler
                 if isinstance(sampler, DistributedSampler):
-                    sampler.set_epoch(step)
+                    # fixed_shuffle: seed the shuffle with a CONSTANT epoch so the data
+                    # order is deterministic and identical across resumes (no reshuffle
+                    # on resume). `cycle(dataloader)` caches the first pass, so only the
+                    # first-pull epoch matters; pinning it to 0 makes every run/resume
+                    # use the same order (same windows -- fixed manifest -- same order).
+                    _fixed = bool(getattr(self.config, "fixed_shuffle", False))
+                    sampler.set_epoch(0 if _fixed else step)
 
             self._update_lr(step)
             self.optimizer.zero_grad(set_to_none=True)
@@ -2202,6 +2446,25 @@ class CausalLoRADiffusionTrainer:
                     context_latents, noise, bsz, nf, current_step=step,
                 )
 
+                # Encoder-glitch gradient mask (flag-gated; default off => byte-identical).
+                # The encode is block-structured: a 1-latent-wide artifact sits at every
+                # `glitch_mask_period`-th ride latent (zarr index % period == 0, e.g. 151).
+                # Zero the flow-loss gradient on those frames so the model is not trained to
+                # reproduce the block-boundary glitch. Noisy loss-frame k = ride-latent
+                # (window_start + cf + k); window_start from the batcher's get_window_bounds.
+                glitch_mask = None
+                _gp = int(getattr(self.config, "glitch_mask_period", 0))
+                if _gp > 0 and not self.dual_view:
+                    _starts = torch.tensor([b[0] for b in batcher.get_window_bounds()],
+                                           device=self.device, dtype=torch.long)        # [bsz]
+                    _k = torch.arange(num_frames, device=self.device, dtype=torch.long)
+                    _abs = _starts[:, None] + cf + _k[None, :]                           # [bsz, num_frames]
+                    glitch_mask = (_abs % _gp != 0).float()                              # 0 on glitch frames
+                    if self.is_main_process:
+                        _nm = int((glitch_mask == 0).sum().item())
+                        if _nm and (step < self.start_step + 25 or step % 100 == 0):
+                            logging.info("[glitch-mask] step %d: zeroed %d glitch latent frame(s) this batch (period=%d)", step, _nm, _gp)
+
                 with autocast(dtype=self.autocast_dtype, enabled=self.use_mixed_precision):
                     model_out = forward_model(
                         noisy_latents, conditional, timesteps,
@@ -2218,7 +2481,7 @@ class CausalLoRADiffusionTrainer:
                         state_pooled = None
 
                     # flow loss covers BOTH views (nf frames).
-                    flow_loss = self._compute_flow_loss(flow_pred, training_target, timesteps, bsz, nf)
+                    flow_loss = self._compute_flow_loss(flow_pred, training_target, timesteps, bsz, nf, glitch_mask=glitch_mask)
                     loss = flow_loss
 
                     teacher_z_8d = None
@@ -2371,8 +2634,14 @@ class CausalLoRADiffusionTrainer:
 
                     self._wandb_log(payload, step=step + 1)
 
-            # Checkpoint
-            if self.ckpt_interval > 0 and (step + 1) % self.ckpt_interval == 0:
+            # Checkpoint: periodic (ckpt_interval) and/or explicit steps
+            # (ckpt_at_steps -- e.g. [250, 600]: a 250-step canary to prove the
+            # save path works before committing the full run, then the final).
+            _ckpt_at = getattr(self.config, "ckpt_at_steps", None)
+            _do_ckpt = (self.ckpt_interval > 0 and (step + 1) % self.ckpt_interval == 0)
+            if _ckpt_at is not None and (step + 1) in {int(x) for x in _ckpt_at}:
+                _do_ckpt = True
+            if _do_ckpt:
                 barrier()
                 self._save_checkpoint(step + 1)
                 barrier()
@@ -2384,10 +2653,14 @@ class CausalLoRADiffusionTrainer:
                 torch.cuda.empty_cache()
 
         barrier()
-        self._save_checkpoint(self.max_steps)
+        if not _stop_at:
+            # stop_at_step runs already saved their final ckpt via ckpt_at_steps;
+            # this max_steps(=30000) save would be a spurious mislabeled file.
+            self._save_checkpoint(self.max_steps)
         barrier()
 
-        self._maybe_eval(self.max_steps - 1)
+        if not _stop_at:
+            self._maybe_eval(self.max_steps - 1)
 
 
 def main():

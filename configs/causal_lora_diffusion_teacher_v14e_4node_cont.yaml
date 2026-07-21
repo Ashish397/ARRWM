@@ -1,0 +1,183 @@
+config_name: v14e-pca8-4node
+load_checkpoint_config_name: v14e-pca8-4node
+
+trainer: causal_lora_diffusion
+
+seed: 0
+mixed_precision: true
+autocast_dtype: bf16
+max_iters: 30000          # MATCH v14 so the cosine LR schedule is identical (near-flat through the useful region); stop early at the visual sweet spot via the step-50 ckpts
+log_interval: 10
+ckpt_interval: 100        # save every 100 steps
+max_grad_norm: 1.0
+auto_resume: true
+allow_checkpoint_config_mismatch: true
+wandb_key: 998657fa4d2f50cc5d5cd33330f94255137a1221
+wandb_entity: ashish397-university-of-exeter
+wandb_project: frodobots_wm
+wandb_run_name: v14e-pca8-4node
+wandb_group: causal-lora-teacher
+wandb_tags:
+  - causal
+  - teacher-forcing
+  - ar-diffusion
+  - streaming
+  - z-critic
+  - v14
+  - weunz
+  - fresh-wan
+  - ablation
+  - loo
+  - critic-8d
+  - no-state-probe
+  - backward-augmented
+  - natural-motion
+
+# Causal-specific settings
+teacher_forcing: true
+num_frame_per_block: 3
+context_frames: 3
+noise_augmentation_max_timestep: 0
+noise_augmentation_warmup_steps: 0
+
+# Streaming training — shuffle windows across rides
+streaming_chunk_size: 21
+
+# Held-out evaluation
+test_start_index: 0
+test_num_rides: 20
+eval_inference_steps: 48
+grad_norm_interval: 50
+
+eval_ride_zarrs:
+  - 20240216101235.zarr  # Madrid, 1564 latents
+  - 20240314084739.zarr  # Rome,   2190 latents
+  - 20240319133048.zarr  # Stockholm, 1752 latents
+  - 20240314090046.zarr  # Rome,   3895 latents
+
+# Data -- v14d FIX: NATURAL motion distribution (uniform tiling start%21==0, NO
+# motion floor) on weunz + the SAME backward oversampler. 60k forward windows,
+# motion median 0.486, ~38% STATIONARY/slow windows (vs v14c's 0% — that 0% is
+# why v14c/v14b always rolled forward on a stop command). Same scale/structure
+# as v14c (60k fwd + 632 bwd x6 = 63792); ONLY change vs v14c = swap the
+# high-motion-curated forward pool for the natural one (= v14's threshold).
+encoded_root: /projects/u6ex/fbots/frodobots_encoded_weunz
+train_window_manifest: paper_assets/v14d_train_windows.json
+caption_root: /projects/u6ex/fbots/frodobots_captions/train
+motion_root: /projects/u6ex/fbots/frodobots_motion
+ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+
+# Action conditioning  (UNCHANGED from v14 — full injection: both channels)
+model_variant: action-injection
+raw_action_dim: 2
+action_dims: [0, 1]       # pca_0=throttle, pca_1=steer
+enable_adaln_zero: true
+action_conditioning_mode: both
+
+# LoRA adapter settings
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+
+# Optimizer
+lr: 3.5e-05             # global batch 16 (4 nodes)
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+gradient_accumulation_steps: 1
+warmup_steps: 200
+
+# Model settings
+model_name: Wan2.1-T2V-1.3B
+num_training_frames: 21
+num_train_timestep: 1000
+denoising_loss_type: flow
+gradient_checkpointing: true
+num_workers: 8
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: -1
+  sink_size: 0
+
+# =========================================================================
+# v14d = v14c VERBATIM except the training-data motion distribution. v14c trained
+# on high-motion-curated windows (motion_min 0.3 => 0% stationary), which is why
+# it (and v14b) always rolled forward / railed throttle on a stop command — the
+# model never saw a stationary segment. v14d swaps in the NATURAL distribution
+# (uniform tiling, no motion floor, ~38% stationary) + the same backward
+# oversampler. Everything else is identical to v14c: critic8 mechanism (probe
+# OFF, 8-dim critic, guidance 0.30/3:1), weunz, lr 7e-5, max_iters 30000.
+# In-training eval is re-enabled (watchdog-guarded) — no separate eval scripts.
+# NOTE: the logged train/critic_z2_mse,z7_mse use action_critic_dims[0],[1]
+# (= dims 0,1 here, mislabeled) — the comparison uses the external swap/quality
+# eval, not these logs, so it doesn't affect the result.
+# =========================================================================
+
+# Z-predictor critic — ALL 8 DIMS (vs v14's [2,7])
+action_critic_enabled: true
+action_critic_dims: [0, 1, 2, 3, 4, 5, 6, 7]
+action_critic_z_out_dim: 8
+action_critic_z_loss_weight: 0.5
+generator_action_z_guidance_weight: 0.3    # z2/z7 guidance (critic8 was 0.25)
+action_critic_extra_dim_weight: 0.3333     # scene-dim ratio (critic8 default 0.5); scene dims = 0.3 x 0.3333 = 0.1 absolute (3:1)
+z_guidance_warmup_steps: 50    # guidance RAMP length
+critic_lr: 1.5e-04
+critic_updates_per_step: 2
+action_critic_base_channels: 128
+action_critic_num_blocks: 4
+
+# State action head — REMOVED (left out, as loo_f3)
+state_head_enabled: false
+state_probe_mode: false
+state_probe_dim: 256
+state_probe_n_taps: 6
+state_probe_num_heads: 8
+state_head_loss_weight: 0.0
+state_head_action_dim_weight: 3.0
+state_head_out_dim: 8
+
+# Frozen-readout generator guidance — DISABLED (no probe)
+state_guidance_weight: 0.0
+state_guidance_warmup_steps: 200
+state_guidance_action_scale: 1.0
+
+# Logging
+logdir: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14e_4node
+
+# =========================================================================
+# v14e = v14d recipe, but VAE OFF -> raw top-8 PCA actions (pca_0=throttle,
+# pca_1=steer). Critic supervises top-8 PCA (test run; 2/4 are config-only later).
+# Guidance start DECOUPLED from LR warmup: LR warmup stays 200, guidance starts
+# at 50 and ramps over 50. Eval = GT-vs-flip fast causal chain. Checkpoints at
+# step 1 + every 100. Cut by sbatch --time (4h), schedule (max_iters) untouched.
+# =========================================================================
+teacher_action_encoder: pca_raw      # trainer critic-target + eval read use raw PCA (must match ARRWM_ACTION_ENCODER=pca_raw)
+pca_raw_scales: [93.7, 57.7, 22.5, 21.2, 18.1, 14.5, 12.6, 10.8]   # 2.5*std per PCA component
+action_critic_emphasis_dims: [0, 1]  # the 2 controllable PCA axes get the higher critic weight
+z_guidance_start_step: 50            # guidance ON at 50 (decoupled from warmup_steps=200)
+
+# Checkpointing (videos + resumable weights)
+save_checkpoints: true
+ckpt_keep_last: 100                  # keep ALL (step 1 + every 100), don't prune to 3
+ckpt_at_steps: [1]                   # step-1 canary in addition to the every-100 cadence
+
+# Default eval = GT-vs-flipped lightweight causal chain
+control_test: true
+control_n_videos: 16                 # 4 nodes x4 = 16 ranks
+control_gen_chunks: 8
+control_flip_mode: both
+control_eval_start: 50               # first eval at guidance onset
+eval_interval: 25
+
+# === CONTINUATION (resume same logdir via auto_resume): the ONE allowed change ===
+# encoder-glitch filter ON + deterministic data order (no reshuffle on resume).
+# Everything else byte-identical to the parent config; config_name/logdir unchanged
+# so auto_resume picks up the latest checkpoint and the config-name check matches.
+glitch_mask_period: 151
+fixed_shuffle: true
+stop_at_step: 5000            # cap continuation at step 5000

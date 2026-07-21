@@ -82,3 +82,9 @@ papers/
 
 pav.txt
 *.pt
+
+# Heavyweight untracked working dirs — hundreds of GB of model weights,
+# checkpoints, and rendered outputs. Staging these makes ``git add`` hash
+# ~581 GB and hang; never belong in the repo.
+third_party/
+analysis/

@@ -1353,6 +1353,44 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_feat_t = int(
             getattr(args, "forward_noiser_feat_t", 0)
         )
+        # FN/cycle SW *feature space* (Change-1: GT-grounded metric).
+        #   "teacher" (default, legacy/byte-identical): match in the frozen
+        #     teacher/disc projector's feature space — limited to the teacher's
+        #     representational SPAN, so drift orthogonal to the teacher is
+        #     INVISIBLE to it.
+        #   "latent": match the rollout1->rollout2 differential directly in the
+        #     raw 16-ch Wan-latent space (channel = feature axis, every
+        #     (B,F,H,W) position = a token). Teacher-INDEPENDENT, so the SW now
+        #     sees ALL drift directions (incl. orthogonal-to-teacher), and it
+        #     skips the projector forward entirely (cheaper, no teacher pass).
+        #     The endpoints stay rollout1<->rollout2 (drift differential only),
+        #     so this re-grounds the METRIC without anchoring to any GT value.
+        #   "combined" (v2): weighted sum of the teacher SW and the raw-latent
+        #     SW -> KEEPS teacher semantics while ADDING raw-latent sensitivity
+        #     (removes the teacher-feature-kernel blind spot at the channel
+        #     level) instead of replacing the teacher metric entirely. Weights
+        #     ``forward_noiser_sw_teacher_weight`` / ``..._latent_weight``.
+        self.forward_noiser_feat_space = str(
+            getattr(args, "forward_noiser_feat_space", "teacher")
+        ).lower()
+        if self.forward_noiser_feat_space not in ("teacher", "latent", "combined"):
+            raise ValueError(
+                "forward_noiser_feat_space must be 'teacher'|'latent'|'combined'; "
+                f"got {self.forward_noiser_feat_space!r}."
+            )
+        self.forward_noiser_sw_teacher_weight = float(
+            getattr(args, "forward_noiser_sw_teacher_weight", 1.0)
+        )
+        self.forward_noiser_sw_latent_weight = float(
+            getattr(args, "forward_noiser_sw_latent_weight", 1.0)
+        )
+        # Per-channel whiten the raw latents (using the detached real side's
+        # mean/std) before the SW when feat_space='latent', so high-variance
+        # channels don't dominate / low-level latent noise doesn't dilute the
+        # structured drift signal. Default ON; only consulted in latent mode.
+        self.forward_noiser_latent_normalize = bool(
+            getattr(args, "forward_noiser_latent_normalize", True)
+        )
         # Sliced-Wasserstein knobs for the teacher_feat FN loss.
         #   sw_n_proj: number of random 1D projections per feature tap
         #     (more = lower-variance Wasserstein estimate, linear cost).
@@ -1438,6 +1476,60 @@ class ActionForcingDMD(SelfForcingModel):
         # rather than silently no-opping.
         self.cycle_reverse_cycle_enabled = bool(
             getattr(args, "cycle_reverse_cycle_enabled", False)
+        )
+        # --- Change-2/3: reverse-noiser DE-DRIFT CONSUMER (Option 2) ---
+        # Consume the trained reverse noiser G to de-drift the student's fake
+        # toward the GT manifold BEFORE the DMD/GAN scoring ("de-drift-then-
+        # score": the GT-grounded score-difference gradient flows back through
+        # G into the student; the F-Jacobian is implicit in G's backward — the
+        # principled velocity-transform form doesn't fit DMD's no_grad score
+        # gradient). DDP-safe: G runs via its INNER module with theta_G frozen
+        # (G's single DDP forward this step is L_rev). Asymmetric/decelerating:
+        # iterate G level-by-level with a geometrically-decaying step so it
+        # slows as it nears the manifold (no overshoot); the fixed point is
+        # defined by the distribution-level DMD+GAN losses, not a value target.
+        # Default OFF -> byte-identical (helper returns its input unchanged).
+        self.reverse_noiser_dedrift_enabled = bool(
+            getattr(args, "reverse_noiser_dedrift_enabled", False)
+        )
+        self.reverse_noiser_dedrift_level = int(
+            getattr(args, "reverse_noiser_dedrift_level", 1)
+        )
+        self.reverse_noiser_dedrift_min_level = int(
+            getattr(args, "reverse_noiser_dedrift_min_level", 1)
+        )
+        self.reverse_noiser_dedrift_steps = int(
+            getattr(args, "reverse_noiser_dedrift_steps", 1)
+        )
+        self.reverse_noiser_dedrift_alpha0 = float(
+            getattr(args, "reverse_noiser_dedrift_alpha0", 1.0)
+        )
+        self.reverse_noiser_dedrift_alpha_decay = float(
+            getattr(args, "reverse_noiser_dedrift_alpha_decay", 0.5)
+        )
+        self.reverse_noiser_dedrift_apply_to_flash = bool(
+            getattr(args, "reverse_noiser_dedrift_apply_to_flash", False)
+        )
+        # v2-B: self-rollout paired drift loss for F — ground F as the actual
+        # causal-drift emulator (F(z_l)~=z_{l+1}) via an L1 to the student's OWN
+        # next rollout state (NOT GT: pure system-identification of the
+        # student's drift, no value anchoring). Added alongside the SW term.
+        # 0 (default) = off -> byte-identical.
+        self.forward_noiser_pair_loss_weight = float(
+            getattr(args, "forward_noiser_pair_loss_weight", 0.0)
+        )
+        # v2-E: confidence-gated INTERNALIZATION — make the STUDENT ALONE
+        # drift-free (not just G(student)) by using the de-drifted output as a
+        # pseudo-target: L_int = w(z)*||z - sg(G(z))||_1, with the gate
+        # w(z)=exp(-cycle_residual(z)^2 / tau) so the correction is only
+        # internalized where G is behaving consistently (cycle-invertible).
+        # Solves the "crutch" issue (composite G.student on-manifold vs student
+        # alone). 0 (default) = off -> byte-identical.
+        self.reverse_noiser_internalize_weight = float(
+            getattr(args, "reverse_noiser_internalize_weight", 0.0)
+        )
+        self.reverse_noiser_internalize_tau = float(
+            getattr(args, "reverse_noiser_internalize_tau", 1.0)
         )
         if self.forward_noiser_cycle_enabled:
             # Cycle is built on the teacher-feat SW forward loss (L_fwd reuses
@@ -5805,6 +5897,112 @@ class ActionForcingDMD(SelfForcingModel):
             "rollout2_abs_frame_start": rollout2_abs_frame_start,
         }
 
+    def _dedrift_with_reverse_noiser(self, z, start_level):
+        """Change-2/3: de-drift a student latent ``z`` toward the GT manifold
+        via the FROZEN reverse noiser G, applied iteratively with a
+        geometrically-decaying step (decelerating as it approaches the
+        manifold, so no overshoot). Returns ``z`` UNCHANGED (byte-identical
+        graph) when disabled / cycle off / G absent / level < min_level.
+
+        DDP-safety: G is forwarded through its INNER module (``G.module``) with
+        theta_G frozen — G's single per-step DDP forward is L_rev in
+        ``_fn_cycle_terms``; a second DDP forward would corrupt the reducer, so
+        the consumer must bypass the wrapper. theta_G frozen => grad reaches the
+        student via G's differentiable transform but NOT theta_G (same
+        freeze-params/keep-input-grad pattern as L_cyc). The Jacobian of F is
+        IMPLICIT in G's backward (the principled velocity-transform form does
+        not fit DMD's no_grad score-difference gradient — see Change-2 notes).
+
+        Distribution-level: the decay schedule only controls HOW FAR G moves z;
+        WHETHER z is on-manifold is judged solely by the GT-grounded DMD+GAN
+        losses downstream, never by a value-level distance to a GT sample.
+        """
+        if not bool(getattr(self, "reverse_noiser_dedrift_enabled", False)):
+            return z
+        if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
+            return z
+        G = getattr(self, "reverse_noiser", None)
+        if G is None:
+            return z
+        start_level = int(start_level)
+        min_level = int(getattr(self, "reverse_noiser_dedrift_min_level", 1))
+        if start_level < min_level:
+            # R ~= I near the manifold (zero-init out_proj => F(x,0)~=x): skip
+            # the ~30M-param conv and keep the low-drift path byte-identical.
+            return z
+        G_inner = G.module if hasattr(G, "module") else G
+        n_steps = max(1, int(getattr(self, "reverse_noiser_dedrift_steps", 1)))
+        a0 = float(getattr(self, "reverse_noiser_dedrift_alpha0", 1.0))
+        decay = float(getattr(self, "reverse_noiser_dedrift_alpha_decay", 0.5))
+        g_params = list(G_inner.parameters())
+        saved = [p.requires_grad for p in g_params]
+        for _p in g_params:
+            _p.requires_grad_(False)
+        try:
+            g_dtype = next(G_inner.parameters()).dtype
+            cur = z
+            for k in range(n_steps):
+                lvl = max(0, start_level - k)
+                if lvl < min_level:
+                    break
+                alpha = a0 * (decay ** k)
+                cs = torch.full(
+                    (cur.shape[0],), lvl, dtype=torch.long, device=cur.device,
+                )
+                # residual=False -> raw increment delta; cur + alpha*delta is an
+                # explicit relaxed (decelerating) Euler step toward the manifold.
+                delta = G_inner(cur.to(dtype=g_dtype), cs, residual=False)
+                cur = cur + alpha * delta.to(dtype=cur.dtype)
+            return cur
+        finally:
+            for _p, _r in zip(g_params, saved):
+                _p.requires_grad_(_r)
+
+    def _reverse_noiser_internalize_loss(self, z_raw, z_dedrifted):
+        """v2-E: confidence-gated INTERNALIZATION. Pull the RAW student output
+        ``z_raw`` toward its de-drifted version ``z_dedrifted`` (used as a
+        stop-grad pseudo-target) so the STUDENT ALONE becomes drift-free, not
+        just the composite G(student) — solving the crutch issue. Grad flows to
+        the student via ``z_raw`` only (target detached).
+
+        Gate: w = exp(-||G(F(z'))-z'||^2 / tau), the cycle-consistency residual
+        at z'=z_dedrifted, computed under no_grad with the INNER F/G (no extra
+        DDP forward, no reducer involvement). The correction is internalized
+        only where G is behaving consistently (invertible) -> avoids forcing
+        z_raw toward an unreliable de-drift. Returns a 0 scalar when disabled /
+        cycle off / de-drift was a no-op (z_dedrifted is z_raw)."""
+        w_int = float(getattr(self, "reverse_noiser_internalize_weight", 0.0))
+        if w_int <= 0.0:
+            return z_raw.new_zeros(())
+        if z_dedrifted is z_raw:
+            # de-drift was a no-op (disabled / level<min) -> nothing to pull to.
+            return z_raw.new_zeros(())
+        if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
+            return z_raw.new_zeros(())
+        G = getattr(self, "reverse_noiser", None)
+        F = getattr(self, "forward_noiser", None)
+        if G is None or F is None:
+            return z_raw.new_zeros(())
+        G_inner = G.module if hasattr(G, "module") else G
+        F_inner = F.module if hasattr(F, "module") else F
+        lvl = int(getattr(self, "reverse_noiser_dedrift_level", 1))
+        tau = max(float(getattr(self, "reverse_noiser_internalize_tau", 1.0)), 1e-6)
+        with torch.no_grad():
+            zp = z_dedrifted.detach()
+            cs = torch.full((zp.shape[0],), lvl, dtype=torch.long, device=zp.device)
+            gd = next(F_inner.parameters()).dtype
+            f_zp = F_inner(zp.to(gd), cs, residual=True)
+            gf_zp = G_inner(f_zp, cs, residual=True).to(zp.dtype)
+            resid = (gf_zp - zp).flatten(1).pow(2).mean(dim=1)        # [B]
+            w = torch.exp(-resid / tau).view(-1, *([1] * (z_raw.dim() - 1)))
+            # Diagnostics: if gate_mean ~= 1.0 the gate is SATURATED (tau too
+            # large vs the cycle residual) and internalization is effectively
+            # ungated — lower reverse_noiser_internalize_tau toward resid_mean.
+            self._internalize_resid_mean = float(resid.mean().item())
+            self._internalize_gate_mean = float(w.mean().item())
+        l1 = (z_raw - z_dedrifted.detach()).abs()                     # grad via z_raw
+        return w_int * (w * l1).mean()
+
     def _forward_noiser_ddp_anchor(
         self, src: torch.Tensor, npb: int,
     ) -> torch.Tensor:
@@ -8471,6 +8669,24 @@ class ActionForcingDMD(SelfForcingModel):
                     "info['flash_dmd_gan_chunk'] is None — the "
                     "rollout must run with flash_dmd_enabled=True so "
                     "the pipeline emits the t=flash_dmd_gan_t output."
+                )
+            # Stash the RAW (pre-de-drift) flash slab for FN/cycle training.
+            # The FN must learn the raw student->rollout2 drift map; if it
+            # trained on the de-drifted G(student) output (the GAN's slab below)
+            # it would learn G(student)->rollout2 — the wrong map / a feedback
+            # loop (G inverts F). The two consumers of this slab have opposite
+            # needs: GAN scoring wants de-drifted, FN training wants raw. When
+            # de-drift / apply_to_flash is OFF this is the SAME object as
+            # flash_dmd_gan_x0 below (byte-identical).
+            info["flash_dmd_gan_x0_raw"] = last_rung_chunk
+            # Change-2: under flash_dmd the GAN's gradient-bearing fake is this
+            # separate slab (not train_chunk), so de-drift it here too when
+            # requested, to keep the GAN's GT-grounded gradient flowing through
+            # G into the student. No-op unless both dedrift + apply_to_flash on.
+            if bool(getattr(self, "reverse_noiser_dedrift_apply_to_flash", False)):
+                last_rung_chunk = self._dedrift_with_reverse_noiser(
+                    last_rung_chunk,
+                    int(getattr(self, "reverse_noiser_dedrift_level", 1)),
                 )
             info["flash_dmd_gan_x0"] = last_rung_chunk
             # v29: also anchor std/mean on the flash-DMD t=gan_t rung's

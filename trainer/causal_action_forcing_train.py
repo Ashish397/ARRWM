@@ -3900,61 +3900,87 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         cond_extra = self._fn_action_blind_cond(
             n_rows, n_frames, device, pe_eff.dtype,
         )
-        for _p in _wav_params:
-            _p.requires_grad_(False)
-        try:
-            feats_fake = projector(
-                x_noisy=_prep(fn_out), timestep=t, prompt_embeds=pe_eff,
-                conditional_extra=cond_extra,
-            )
-            with torch.no_grad():
-                feats_real = projector(
-                    x_noisy=_prep(r2_target), timestep=t,
-                    prompt_embeds=pe_eff, conditional_extra=cond_extra,
-                )
-        finally:
-            for _p, _r in zip(_wav_params, _wav_req):
-                _p.requires_grad_(_r)
-        # Sliced-Wasserstein per-token: treat the LAST feature dim as the
-        # channel and every (row, token) as a sample; project onto random
-        # unit directions and L2 the SORTED 1D marginals (= 1D Wasserstein-2
-        # per direction, averaged). Captures the full distribution shape
-        # (all moments), not just the first two -> the texture/cartoon shift
-        # survives where mean+std collapsed to ~0.
+        feat_space = str(getattr(m, "forward_noiser_feat_space", "teacher"))
         n_proj = int(getattr(m, "forward_noiser_sw_n_proj", 64))
         max_tok = int(getattr(m, "forward_noiser_sw_max_tokens", 4096))
-        idxs = list(feats_fake.keys())
-        loss = fn_out.new_zeros(())
-        for idx in idxs:
-            ff = feats_fake[idx].float().reshape(-1, int(feats_fake[idx].shape[-1]))
-            fr = feats_real[idx].float().reshape(
-                -1, int(feats_real[idx].shape[-1])).detach()
-            D = ff.shape[-1]
-            M = min(int(ff.shape[0]), int(fr.shape[0]))
-            if M == 0:
-                # Empty tap (no tokens) -> skip; mean() over empty = NaN.
-                # Unreachable for real latents, but cheap to bulletproof.
-                continue
-            if max_tok > 0 and M > max_tok:
-                # Independent subsample per side: a sorted-marginal match
-                # needs only equal COUNTS, not paired indices. Caps sort
-                # cost + variance. FN grad flows through the gathered fake
-                # tokens (differentiable index_select).
-                sel_f = torch.randperm(int(ff.shape[0]), device=ff.device)[:max_tok]
-                sel_r = torch.randperm(int(fr.shape[0]), device=fr.device)[:max_tok]
-                ff = ff[sel_f]
-                fr = fr[sel_r]
-            elif int(ff.shape[0]) != int(fr.shape[0]):
-                # Shapes should match (fn_out and r2_target are same shape);
-                # guard anyway so the sorted L2 has equal lengths.
-                ff = ff[:M]
-                fr = fr[:M]
-            dirs = torch.randn(D, n_proj, device=ff.device, dtype=ff.dtype)
-            dirs = dirs / dirs.norm(dim=0, keepdim=True).clamp_min(1e-8)
-            pf_s, _ = torch.sort(ff @ dirs, dim=0)
-            pr_s, _ = torch.sort(fr @ dirs, dim=0)
-            loss = loss + (pf_s - pr_s).pow(2).mean()
-        return loss / max(1, len(idxs))
+
+        def _latent_feats():
+            # RAW-LATENT (teacher-INDEPENDENT): channel = feature axis, every
+            # (B,F,H,W) position is a token. ``_noise`` respects feat_t (0=raw);
+            # the disc wavelet is teacher-owned and intentionally skipped.
+            # Optional per-channel whiten (real side's stats) so high-variance
+            # channels / low-level latent noise don't dominate the SW.
+            def _lat_tok(x):
+                xn = _noise(x)
+                return xn.permute(0, 1, 3, 4, 2).reshape(-1, int(xn.shape[2]))
+            _ff = _lat_tok(fn_out)
+            _fr = _lat_tok(r2_target).detach()
+            if bool(getattr(m, "forward_noiser_latent_normalize", True)):
+                _mu = _fr.mean(dim=0, keepdim=True)
+                _sd = _fr.std(dim=0, keepdim=True).clamp_min(1e-6)
+                _ff = (_ff - _mu) / _sd
+                _fr = (_fr - _mu) / _sd
+            return {0: _ff}, {0: _fr}
+
+        def _teacher_feats():
+            # Frozen teacher/disc projector feature space (legacy).
+            for _p in _wav_params:
+                _p.requires_grad_(False)
+            try:
+                ff_ = projector(
+                    x_noisy=_prep(fn_out), timestep=t, prompt_embeds=pe_eff,
+                    conditional_extra=cond_extra,
+                )
+                with torch.no_grad():
+                    fr_ = projector(
+                        x_noisy=_prep(r2_target), timestep=t,
+                        prompt_embeds=pe_eff, conditional_extra=cond_extra,
+                    )
+            finally:
+                for _p, _r in zip(_wav_params, _wav_req):
+                    _p.requires_grad_(_r)
+            return ff_, fr_
+
+        def _sw(feats_fake, feats_real):
+            # Sliced-Wasserstein per-token: last dim = channel, every
+            # (row, token) = a sample; project onto random unit directions and
+            # L2 the SORTED 1D marginals (= 1D Wasserstein-2 per direction,
+            # averaged). Captures the full distribution shape (all moments).
+            idxs = list(feats_fake.keys())
+            loss = fn_out.new_zeros(())
+            for idx in idxs:
+                ff = feats_fake[idx].float().reshape(-1, int(feats_fake[idx].shape[-1]))
+                fr = feats_real[idx].float().reshape(
+                    -1, int(feats_real[idx].shape[-1])).detach()
+                D = ff.shape[-1]
+                M = min(int(ff.shape[0]), int(fr.shape[0]))
+                if M == 0:
+                    continue
+                if max_tok > 0 and M > max_tok:
+                    sel_f = torch.randperm(int(ff.shape[0]), device=ff.device)[:max_tok]
+                    sel_r = torch.randperm(int(fr.shape[0]), device=fr.device)[:max_tok]
+                    ff = ff[sel_f]
+                    fr = fr[sel_r]
+                elif int(ff.shape[0]) != int(fr.shape[0]):
+                    ff = ff[:M]
+                    fr = fr[:M]
+                dirs = torch.randn(D, n_proj, device=ff.device, dtype=ff.dtype)
+                dirs = dirs / dirs.norm(dim=0, keepdim=True).clamp_min(1e-8)
+                pf_s, _ = torch.sort(ff @ dirs, dim=0)
+                pr_s, _ = torch.sort(fr @ dirs, dim=0)
+                loss = loss + (pf_s - pr_s).pow(2).mean()
+            return loss / max(1, len(idxs))
+
+        if feat_space == "latent":
+            return _sw(*_latent_feats())
+        if feat_space == "teacher":
+            return _sw(*_teacher_feats())
+        # v2-A "combined": keep teacher semantics AND add raw-latent
+        # sensitivity (remove the teacher-feature-kernel blind spot) via a
+        # weighted sum, rather than replacing the teacher metric entirely.
+        w_t = float(getattr(m, "forward_noiser_sw_teacher_weight", 1.0))
+        w_l = float(getattr(m, "forward_noiser_sw_latent_weight", 1.0))
+        return w_t * _sw(*_teacher_feats()) + w_l * _sw(*_latent_feats())
 
     def _fn_recon_loss(self, a, b):
         """Paired reconstruction norm for the CARN-cycle (L_rev / L_cyc).
@@ -4086,9 +4112,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         m = self.model
         fn_out = m.forward_noiser(fn_in, carn, residual=True)  # grad-on
         L_fwd = self._fn_teacher_feat_loss(fn_out, fn_tg, proj)
+        # v2-B: self-rollout paired drift loss — ground F as the student's own
+        # causal-drift map (F(z_l) ~= z_{l+1}). fn_tg is the student's NEXT
+        # rollout state (detached) — system identification of the student's
+        # drift, NOT GT supervision (no value anchoring). Reuses fn_out, so no
+        # extra F forward (DDP-safe). 0-weight (default) => byte-identical.
+        _w_pair = float(getattr(m, "forward_noiser_pair_loss_weight", 0.0))
+        L_pair = None
+        if _w_pair > 0.0:
+            L_pair = (fn_out - fn_tg.detach()).abs().mean()
+            L_fwd = L_fwd + _w_pair * L_pair
         L_rev, L_cyc = self._fn_cycle_terms(fn_out, fn_in, carn, proj)
         logs = dict(base_logs)
         logs["train/fn_fwd_loss"] = float(L_fwd.detach().item())
+        if L_pair is not None:
+            logs["train/fn_pair_loss"] = float(L_pair.detach().item())
         if L_rev is None:
             total = L_fwd
         else:
@@ -4271,7 +4309,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # see the _need_rollout2 gate in dmd_action_forcing).
         # rollout1 input: prefer the t=60 flash chunk (cleaner) like the
         # MSE path; both are detached (FN input is never grad-on upstream).
-        flash = info.get("flash_dmd_gan_x0")
+        # Use the RAW (pre-de-drift) flash slab — the FN/cycle must learn the
+        # raw student->rollout2 map, NOT G's de-drifted output (that corrupts
+        # the training pairs / creates a feedback loop since G inverts F). The
+        # _raw key is the pre-de-drift slab; when de-drift/apply_to_flash is OFF
+        # it IS flash_dmd_gan_x0 (byte-identical fallback).
+        flash = info.get("flash_dmd_gan_x0_raw")
+        if flash is None:
+            flash = info.get("flash_dmd_gan_x0")
         r1 = flash.detach() if flash is not None else rollout1_chunk
         if r1 is None or int(r1.shape[1]) % npb != 0:
             return _anchor("bad_r1")
@@ -9359,6 +9404,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         train_info["chunks_in_current_ride"] = int(
             getattr(self, "_chunks_in_current_ride", 1)
         )
+        # Change-2: de-drift the student fake toward the GT manifold via the
+        # frozen reverse noiser G BEFORE DMD scoring. Covers DMD + anti-collapse
+        # + stat-anchor + the GAN's fallback fake (one de-drift at the boundary
+        # since score_image=chunk=train_chunk downstream). No-op (byte-identical)
+        # when reverse_noiser_dedrift_enabled=False. (Under flash_dmd the GAN's
+        # gradient fake is a separate slab — de-drifted inside the model rollout
+        # when reverse_noiser_dedrift_apply_to_flash=True.)
+        # Preserve the RAW student rollout1 for FN/cycle training below — the
+        # cycle must learn the raw rollout1->rollout2 map, NOT G's de-drifted
+        # output (that would corrupt the training pairs / create a feedback
+        # loop). Only the SCORING path (DMD/GAN/critic) sees the de-drift. When
+        # de-drift is OFF the helper returns the SAME object => byte-identical.
+        _raw_train_chunk = train_chunk
+        train_chunk = self.model._dedrift_with_reverse_noiser(
+            train_chunk,
+            int(getattr(self.model, "reverse_noiser_dedrift_level", 1)),
+        )
         gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
             train_chunk, train_info,
         )
@@ -9406,6 +9468,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["student_pred_mean"] = float(_tc.mean().item())
 
         generator_loss = gen_loss_dmd
+        # v2-E: confidence-gated internalization — pull the RAW student toward
+        # its de-drifted version so the STUDENT ALONE becomes drift-free (not
+        # just G(student)). Grad to the student via _raw_train_chunk; target is
+        # the de-drifted train_chunk (stop-grad inside the helper). Skipped
+        # (byte-identical) when reverse_noiser_internalize_weight=0.
+        if float(getattr(self.model, "reverse_noiser_internalize_weight", 0.0)) > 0.0:
+            _l_int = self.model._reverse_noiser_internalize_loss(
+                _raw_train_chunk, train_chunk,
+            )
+            generator_loss = generator_loss + _l_int
+            out["reverse_noiser_internalize_loss"] = float(_l_int.detach().item())
+            # Gate diagnostics (see _reverse_noiser_internalize_loss): gate_mean
+            # ~= 1.0 => saturated gate (tau too large), term is ungated.
+            _ri = getattr(self.model, "_internalize_resid_mean", None)
+            _rg = getattr(self.model, "_internalize_gate_mean", None)
+            if _ri is not None:
+                out["reverse_noiser_internalize_resid_mean"] = _ri
+            if _rg is not None:
+                out["reverse_noiser_internalize_gate_mean"] = _rg
 
         # Aux / GAN / SC-DMD chunk geometry. ``state["current_length"]``
         # has already advanced past train_chunk by the time we get
@@ -9667,7 +9748,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             and getattr(self.model, "forward_noiser_loss_mode", "mse")
             == "teacher_feat"
         ):
-            fn_tf_logs = self._train_forward_noiser_tf(train_chunk, train_info)
+            # RAW rollout1 (pre-de-drift) — the cycle learns the student's true
+            # rollout1->rollout2 drift, not G's own de-drifted output.
+            fn_tf_logs = self._train_forward_noiser_tf(_raw_train_chunk, train_info)
             out.update(fn_tf_logs)
             self._mem_step_snapshot("6b_after_fn_tf_backward")
 
