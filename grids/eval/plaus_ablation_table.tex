@@ -1,0 +1,20 @@
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Plausibility per ablation variant over 240 scenes. Each column is the percentage of rollouts flagged: VLM probes fire at $P(\text{yes})>0.5$ (style shift, novel objects, uncanny content); Scene inl.\ is the median count of RANSAC-verified keypoint matches between the rollout's final frame and the reference or any sibling (hundreds $=$ same place preserved even under corruption; ${\sim}15$ $=$ geometric noise floor, the scene is gone); static at $>600$ inliers first-to-last generated frame.}
+\label{tab:plaus-ablation}
+\begin{tabular}{lccccc}
+\hline
+Variant & Style\,\% & Novel\,\% & Uncanny\,\% & Scene inl. & Static\,\% \\
+\hline
+16node  & $6$ & $23$ & $25$ & $311$ & $2$  \\
+pca8    & $3$ & $21$ & $15$ & $318$ & $1$  \\
+pca4    & $9$ & $24$ & $36$ & $266$ & $1$  \\
+pca2    & $8$ & $32$ & $39$ & $228$ & $3$  \\
+4node   & $7$ & $19$ & $28$ & $166$ & $1$  \\
+noatok  & $7$ & $27$ & $27$ & $275$ & $4$  \\
+noadaln & $4$ & $1$  & $10$ & $272$ & $16$ \\
+\hline
+\end{tabular}
+\end{table}

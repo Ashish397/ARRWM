@@ -1,0 +1,16 @@
+{
+ "features": [
+  "rel__ss_csd_drift",
+  "rel__ss_d_dark_frac",
+  "rel__dino_consistency",
+  "rel__niqe",
+  "rel__warping_error",
+  "rel__unique",
+  "rel__s_dark_channel",
+  "rel__liqe",
+  "rel__p_csd_drift_spread",
+  "ss_csd_drift"
+ ],
+ "global": 0.6866717332234363,
+ "within": 0.7329321926334231
+}

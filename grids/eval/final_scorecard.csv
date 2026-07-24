@@ -1,0 +1,9 @@
+model,p_style,p_novel,p_uncanny,reloc_pct,static_pct
+astra,0.27,0.36,0.5,62,10
+matrixgame,0.74,0.45,0.71,95,0
+minwm,0.0,0.51,0.01,9,21
+ours_16node,0.06,0.25,0.25,17,2
+ours_pca8,0.04,0.22,0.17,17,1
+worldcam,0.83,0.68,0.69,80,9
+worldplay,0.67,0.44,0.79,80,1
+yume,0.07,0.35,0.08,60,1

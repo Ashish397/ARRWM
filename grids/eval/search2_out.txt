@@ -1,0 +1,77 @@
+  df[f"rel__{m}"] = df.groupby("grid")[m].transform(lambda s: s - s.median())
+  df[f"rel__{m}"] = df.groupby("grid")[m].transform(lambda s: s - s.median())
+  return _methods._mean(a, axis=axis, dtype=dtype,
+  ret = ret.dtype.type(ret / rcount)
+  return _methods._mean(a, axis=axis, dtype=dtype,
+  ret = ret.dtype.type(ret / rcount)
+42 videos, 196 features
+
+top-15 singles (within-grid rho):
+  unique_w_drift                      -0.461
+  rel__unique_w_drift                 -0.461
+  unique_w_end                        +0.455
+  rel__unique_w_end                   +0.455
+  ss_csd_drift                        -0.382
+  rel__ss_csd_drift                   -0.382
+  niqe                                +0.371
+  rel__niqe                           +0.371
+  topiq_nr_w_start                    +0.334
+  rel__topiq_nr_w_start               +0.334
+  unique                              +0.329
+  rel__unique                         +0.329
+  warp1_p95_max                       +0.305
+  rel__warp1_p95_max                  +0.305
+  brisque_w_end                       +0.288
+
+exhaustive pairs over top-30:
+  within=+0.539 global=+0.401  ('rel__unique_w_drift', 'warp1_p95_max')
+  within=+0.524 global=+0.184  ('unique_w_end', 'warp1_p95_max')
+  within=+0.514 global=+0.422  ('ss_csd_drift', 'rel__niqe')
+  within=+0.512 global=+0.425  ('unique_w_drift', 'rel__niqe')
+  within=+0.505 global=+0.414  ('rel__unique_w_end', 'warp1_p95_max')
+
+exhaustive triples over top-20:
+  within=+0.554 global=+0.381  ('unique_w_end', 'unique', 'warp1_p95_max')
+  within=+0.545 global=+0.514  ('rel__unique_w_drift', 'rel__ss_csd_drift', 'rel__niqe')
+  within=+0.543 global=+0.402  ('unique_w_end', 'niqe', 'rel__niqe')
+  within=+0.541 global=+0.426  ('ss_csd_drift', 'rel__niqe', 'paq2piq_w_drift')
+  within=+0.539 global=+0.513  ('rel__unique_w_end', 'rel__ss_csd_drift', 'rel__niqe')
+
+greedy to k=8 (objective: within-grid):
+  k=1: within=+0.461 global=+0.320  + unique_w_drift
+  k=2: within=+0.572 global=+0.366  + rel__s_saturation
+  k=3: within=+0.598 global=+0.371  + rel__unique_w_drift
+
+BEST: ['unique_w_drift', 'rel__s_saturation', 'rel__unique_w_drift']
+ global=+0.371 within=+0.598
+ pairwise accuracy (GT gap>=1): 76.3%
+ remaining misordered pairs:
+  r01_BR: 4node (GT 6.0) should beat pca4 (GT 4.5)
+  r01_BR: 4node (GT 6.0) should beat pca2 (GT 3.5)
+  r01_BR: 16node (GT 8.0) should beat noadaln (GT 6.5)
+  r01_BR: 4node (GT 6.0) should beat noatok (GT 4.0)
+  r02_BR: pca4 (GT 6.0) should beat pca2 (GT 3.0)
+  r02_BR: 16node (GT 6.0) should beat pca2 (GT 3.0)
+  r02_BR: 4node (GT 6.5) should beat pca2 (GT 3.0)
+  r02_BR: noadaln (GT 5.0) should beat pca2 (GT 3.0)
+  r02_BR: noadaln (GT 5.0) should beat noatok (GT 2.0)
+  r04_BR: pca4 (GT 7.0) should beat 16node (GT 6.0)
+  r04_BR: 4node (GT 4.0) should beat pca2 (GT 3.0)
+  r04_BR: noadaln (GT 7.0) should beat 16node (GT 6.0)
+  r05_BR: pca8 (GT 8.0) should beat noadaln (GT 3.0)
+  r05_BR: pca4 (GT 5.0) should beat noadaln (GT 3.0)
+  r05_BR: pca2 (GT 8.0) should beat noatok (GT 5.0)
+  r05_BR: pca2 (GT 8.0) should beat noadaln (GT 3.0)
+  r05_BR: 4node (GT 5.0) should beat noadaln (GT 3.0)
+  r05_BR: noatok (GT 5.0) should beat noadaln (GT 3.0)
+  r10_BR: pca8 (GT 7.5) should beat pca4 (GT 3.0)
+  r10_BR: pca8 (GT 7.5) should beat 16node (GT 6.0)
+  r10_BR: 4node (GT 5.0) should beat pca4 (GT 3.0)
+  r10_BR: 4node (GT 5.0) should beat pca2 (GT 3.5)
+  r10_BR: noatok (GT 9.0) should beat 16node (GT 6.0)
+ r01_BR: rho=+0.65
+ r02_BR: rho=+0.45
+ r04_BR: rho=+0.67
+ r05_BR: rho=+0.30
+ r06_BR: rho=+0.94
+ r10_BR: rho=+0.58

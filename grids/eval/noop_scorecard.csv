@@ -1,0 +1,14 @@
+model,held,drift,style,imp,hazy
+pca8,75,3,0,0,0
+pca4,81,3,0,0,22
+pca2,84,3,6,3,0
+16node,78,3,0,0,34
+4node,81,3,0,0,3
+noatok,84,3,0,0,0
+noadaln,31,6,3,3,0
+astra,16,41,38,41,31
+matrixgame,0,9,100,84,75
+minwm,84,3,0,0,3
+worldcam,69,16,34,16,16
+worldplay,84,12,19,16,3
+yume,38,19,9,3,19

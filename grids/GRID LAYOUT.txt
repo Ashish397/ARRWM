@@ -1,0 +1,90 @@
+GRID LAYOUT
+
+8NODE_8PCA   8NODE_4PCA   8NODE_2PCA   16NODE_8PCA
+4NODE_8PCA   8NODE_8PCA_NO_ACT_TOKENS   8NODE_8PCA_NO_ADALN
+
+results
+- R01_BR
+8pca looks good but upon a closer look it has weird lines that make it look like the picture is melting in lines
+
+4pca has stronger melt
+
+2pca is jumbled and shapes are all warped in little circles but no melt
+
+16node is good
+
+4node has haze but it is not bad
+
+noatok looks quite different to the rest, it is a lot more black but the shapes everywhere look correct and there is no working. It just left a lot as black which is quite uncanny.
+
+no adaln has some style shift and it is a bit worse but it is the best as it can only move forward thus it does not warp.
+
+02-BR
+
+8node 8pca is good, it makes a building on the side and the building's details are a little bit blurry but it is good.
+
+4pca makes a building but it is a bit more blurry
+
+2pca makes buildings like 8pca does but a lot mashier, mangled and strange and melted.
+
+16node is hallucinates a blue tarp on the floor and the building it makes looks strange and is a little bit uncanny even though everything about it looks good ish
+
+4node makes nothing and the resulting landscape looks good and low error but it didn't make anything
+
+noatok is mangled black and weird and wrong
+
+noada moves forwrad and gets blurry and a bit hazy
+
+4-BR
+
+8node8pca looks ok but the tree it makes has some curved space warping on it which is an artefact.
+
+4pca looks good but the tree is smaller and there is some curved warping, but it looks the best here
+
+2pca gets hazy blurry and mashy - you can see the artefacts
+
+16node makes a weird tree which is wrong, otherwise it looks good.
+
+4node is hazy and missing large parts (like the trunk of trees and the like)
+
+noatok is black but looks good in terms of style and warping and the rest, but the generated building looks a bit strange and uncanny
+
+noada looks good but it doesnt follow the action given
+
+5_BR
+
+8node 8pca looks good
+
+4pca is a bit blurry and hazy - the shapes of the scooters have been warped
+
+2pca is good
+
+16node is excellent
+
+4node is warped (building right)
+
+noact tokens also has warped building with missing sides
+
+no ada still doesnt follow directions but warping is really bad
+
+6_BR
+
+everything here looks good except 4pca and 2pca which both have significant temporal shimmer and blurring artefacts
+
+10_BR
+
+8node 8pca looks good, little bit of artefacts
+
+4pca is very blurry on it's new generation, this is bad
+
+2pca is blurry too, also bad
+
+16node has some blurring artefacts but it makes a building, 8node is better than it
+
+4node is hazy but it makes a building albeit with lots of holes and a bit uncanny
+
+no act tok is excellent here
+
+no adaln is the best here but it doesnt move back or right.
+
+

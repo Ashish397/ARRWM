@@ -1,0 +1,31 @@
+\section{Quality Losses}
+
+\subsection{High Frequency Losses}
+
+Tracking per-frame pixel statistics over each rollout (mean, standard deviation, and median intensity, together with dark-channel and Laplacian-variance measurements at $t{=}1$\,s and at the end of generation) reveals a family of degradations whose common signature is the loss of high-frequency content: Laplacian sharpness collapses relative to sibling rollouts of the same scene --- edges soften and texture smears. Within this family we distinguish two severities by what happens to tone. In the milder form, which we label \textit{blur}, the tonal distribution is preserved. In the stronger form, \textit{haze}, sharpness loss is accompanied by rising median intensity and dark-channel value with falling contrast: a bright, low-saturation veil accumulating over the rollout. Haze is thus a strict subset of the blur phenomenon; each rollout is assigned a single label by priority, with haze taking precedence, so the haze and blur columns of Table~\ref{tab:hf-losses} partition the high-frequency-loss family into its veiled and unveiled cases. Measurements are taken relative to the $t{=}1$\,s baseline so that source-video artefacts (e.g.\ water or smudges on the lens, present in ${\sim}12\%$ of source clips) are not misattributed to the model.
+
+Both severities are the visual fingerprint of \emph{hedging}: as autoregressive errors accumulate, an under-conditioned model averages over many plausible futures rather than committing to one. The mean of many sharp images is blurry, and --- when hedging extends to the tonal distribution itself --- the average washes toward bright gray, which is why high-frequency content, where commitment lives, degrades first. This is in instructive contrast to structural corruption (melting, mangled geometry), which is the opposite pathology of \emph{confident mis-commitment}: those failures remain crisp, leave pixel statistics healthy, and must be detected by embedding-drift measures instead.
+
+Table~\ref{tab:hf-losses} reports per-variant rates over all 256 rollout scenes. The capacity story is direct: the 4-node model hedges earliest and hardest (43\% of rollouts in the high-frequency-loss family, 36\% reaching full haze), the reduced action encoding \texttt{pca2} follows (26\%), while the full-capacity variants remain ${\sim}70\%$ clean. The \texttt{noadaln} variant instead exhibits a distinct darkening drift (murk, 31\%), consistent with the absence of adaptive normalization anchoring its tonal statistics; we treat this low-frequency drift separately (Sec.~\ref{sec:lf-losses}).
+
+\begin{table}[t]
+\centering
+\caption{High-frequency loss rates per ablation variant over 256 rollout scenes, classified from per-rollout pixel statistics (baseline-corrected at $t{=}1$\,s, measured relative to sibling rollouts of the same scene). Labels are mutually exclusive: haze takes precedence over blur, so HF total $=$ haze $+$ blur covers the full high-frequency-loss family. Murk (a low-frequency tonal drift) is shown for contrast.}
+\label{tab:hf-losses}
+\begin{tabular}{lcccccc}
+\hline
+Variant & Clean & Haze & Blur & HF total & Murk & Dirty source \\
+\hline
+pca8            & 72\% & 3\%  & 0\% & 3\%  & 12\% & 13\% \\
+16node          & 71\% & 7\%  & 0\% & 7\%  & 11\% & 11\% \\
+noatok          & 69\% & 10\% & 2\% & 12\% & 7\%  & 12\% \\
+pca4            & 63\% & 2\%  & 0\% & 2\%  & 22\% & 12\% \\
+pca2            & 60\% & 22\% & 4\% & 26\% & 3\%  & 12\% \\
+noadaln         & 45\% & 5\%  & 7\% & 12\% & 31\% & 10\% \\
+4node           & 35\% & 36\% & 7\% & 43\% & 7\%  & 13\% \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Low Frequency Losses}
+\label{sec:lf-losses}

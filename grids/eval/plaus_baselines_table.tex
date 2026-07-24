@@ -1,0 +1,22 @@
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Plausibility per model over 240 scenes. Each column is the percentage of rollouts flagged: VLM probes fire at $P(\text{yes})>0.5$ (style shift, novel objects, uncanny content); Transported at $<50$ RANSAC-verified matches between the rollout's final frame and the reference or any sibling ($87.5\%$ agreement with hand labels); Static at $>600$ matches first-to-last generated frame.}
+\label{tab:plaus-baselines}
+\begin{tabular}{lccccc}
+\hline
+Model & Style\,\% & Novel\,\% & Uncanny\,\% & Transp.\,\% & Static\,\% \\
+\hline
+WorldPlay   & $68$ & $43$ & $78$ & $79$ & $1$  \\
+Matrix-Game & $75$ & $45$ & $71$ & $95$ & $0$  \\
+WorldCam    & $83$ & $68$ & $70$ & $80$ & $9$  \\
+Astra       & $27$ & $36$ & $50$ & $59$ & $10$ \\
+Yume        & $7$  & $34$ & $7$  & $59$ & $1$  \\
+minWM       & $0$  & $50$ & $1$  & $4$  & $21$ \\
+\hline
+ours (pca8)   & $3$ & $21$ & $15$ & $10$ & $1$ \\
+ours (16node) & $6$ & $23$ & $25$ & $8$  & $2$ \\
+\hline
+\end{tabular}
+\end{table}

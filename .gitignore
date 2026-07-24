@@ -88,3 +88,30 @@ pav.txt
 # ~581 GB and hang; never belong in the repo.
 third_party/
 analysis/
+# Local-only working directories (not present on remote but contain
+# investigation outputs we want to keep)
+brightness_shifts/
+warping/
+
+# grids/: commit the eval scripts/tables/results only. The generic eval/
+# rule above also catches grids/eval (a code dir), so re-include it, then
+# exclude all heavy video, zips, python envs, cloned repos, tiles, weights.
+!grids/eval/
+grids/*.zip
+grids/grids_A/
+grids/grids_B/
+grids/baselines/
+grids/noop/
+grids/eval/venv/
+grids/eval/venv_vlm/
+grids/eval/venv_qwen3/
+grids/eval/DOVER/
+grids/eval/MS-SWD/
+grids/eval/tiles/
+grids/eval/tiles_new/
+grids/eval/pretrained_weights/
+grids/eval/examples/
+grids/eval/*.mp4
+grids/eval/*.png
+grids/eval/*.pth
+grids/eval/*.pt

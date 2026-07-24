@@ -1,0 +1,43 @@
+grid,variant,gt_quality,pred_quality,gt_rank,pred_rank,gt_style_shift,style_z,pred_style_shift,note
+r01_BR,16node,8.0,9.69,1,1,0,-1.49,0,good
+r01_BR,noadaln,6.5,6.88,2,2,1,0.81,0,"some style shift, a bit worse, but no warp since it only moves forward"
+r01_BR,4node,6.0,5.16,3,4,1,3.81,1,haze but not bad
+r01_BR,pca8,6.0,6.34,3,3,0,-1.4,0,looks good but weird melting lines
+r01_BR,pca4,4.5,2.11,5,7,0,-1.13,0,stronger melt
+r01_BR,noatok,4.0,4.76,6,6,1,1.97,1,"a lot more black, shapes correct, left a lot as black, uncanny"
+r01_BR,pca2,3.5,5.05,7,5,0,-1.9,0,"jumbled, shapes warped in little circles, no melt"
+r02_BR,pca8,7.5,7.02,1,1,0,-2.31,0,"good, builds building, slightly blurry details"
+r02_BR,4node,6.5,6.42,2,3,0,1.29,0,makes nothing; landscape looks good and low error
+r02_BR,16node,6.0,6.38,3,4,0,-0.8,0,"hallucinates blue tarp, building strange/uncanny but good-ish"
+r02_BR,pca4,6.0,6.96,3,2,0,-1.86,0,building but more blurry
+r02_BR,noadaln,5.0,4.98,5,6,1,5.1,1,"moves forward, gets blurry and a bit hazy"
+r02_BR,pca2,3.0,6.28,6,5,0,-2.37,0,"buildings but mashier, mangled, melted"
+r02_BR,noatok,2.0,4.73,7,7,1,3.48,1,mangled black weird and wrong
+r04_BR,pca4,7.0,7.0,1,2,0,-1.31,0,"good, smaller tree, some curved warping, best here"
+r04_BR,noadaln,7.0,5.54,1,5,0,0.62,0,looks good but does not follow the action
+r04_BR,pca8,6.5,6.4,3,3,0,-3.66,0,"ok, tree has curved space warping artefact"
+r04_BR,16node,6.0,7.56,4,1,0,-3.29,0,"weird wrong tree, otherwise good"
+r04_BR,noatok,5.0,6.35,5,4,1,-1.31,0,"black but style/warping fine; generated building strange, uncanny"
+r04_BR,4node,4.0,3.17,6,7,1,2.21,1,hazy and missing large parts (tree trunks)
+r04_BR,pca2,3.0,4.97,7,6,1,-1.48,0,"hazy blurry mashy, visible artefacts"
+r05_BR,16node,9.0,7.4,1,1,0,1.19,0,excellent
+r05_BR,pca8,8.0,6.44,2,2,0,-0.68,0,looks good
+r05_BR,pca2,8.0,5.03,2,5,0,-2.31,0,good
+r05_BR,pca4,5.0,4.74,4,6,0,0.22,0,"bit blurry and hazy, scooter shapes warped"
+r05_BR,4node,5.0,5.82,4,3,0,2.08,1,warped (building right)
+r05_BR,noatok,5.0,4.36,4,7,0,2.37,1,warped building with missing sides
+r05_BR,noadaln,3.0,5.7,7,4,0,-1.52,0,"does not follow directions, warping really bad"
+r06_BR,pca8,8.0,7.08,1,2,0,-1.49,0,good
+r06_BR,16node,8.0,7.01,1,3,0,-1.49,0,good
+r06_BR,noatok,7.5,7.66,3,1,0,4.15,1,good
+r06_BR,4node,7.5,6.74,3,4,0,0.23,0,good
+r06_BR,noadaln,7.5,5.76,3,5,0,-1.01,0,good
+r06_BR,pca4,4.0,4.91,6,6,0,-0.06,0,significant temporal shimmer and blurring artefacts
+r06_BR,pca2,4.0,3.88,6,7,0,-2.19,0,significant temporal shimmer and blurring artefacts
+r10_BR,noadaln,9.0,7.82,1,1,0,1.33,0,best here but does not move back or right
+r10_BR,noatok,9.0,6.75,1,2,0,0.31,0,excellent here
+r10_BR,pca8,7.5,5.17,3,4,0,-1.1,0,"good, little bit of artefacts"
+r10_BR,16node,6.0,6.6,4,3,0,-1.67,0,"some blurring artefacts, makes building, 8node better"
+r10_BR,4node,5.0,2.87,5,7,1,6.62,1,"hazy, building with holes, bit uncanny"
+r10_BR,pca2,3.5,3.69,6,6,0,1.63,0,"blurry too, also bad"
+r10_BR,pca4,3.0,4.77,7,5,0,-1.58,0,"very blurry on new generation, bad"
