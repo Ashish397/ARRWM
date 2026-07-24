@@ -668,6 +668,63 @@ Some of this gap is expected---our model is trained on this dataset and the base
 
 \appendix
 
+\section{Example Rollouts}
+\label{app:rollouts}
+
+Each rollout below is a filmstrip: six frames sampled across the $6.75$\,s
+generation (one real seed chunk followed by eight generated chunks), read
+left to right. All rollouts start from a stationary held-out seed and are
+driven by a single constant command.
+
+\subsection{Best Rollouts}
+\label{app:best_rollouts}
+
+Figures~\ref{fig:gallery1} and~\ref{fig:gallery2} show representative
+rollouts from our two full-capacity models (batch size $32$ and $64$),
+selected for strong action following and preserved sharpness across distinct
+held-out scenes. Egomotion (forward advance, in-place yaw, and their
+combinations) is coherent across the full horizon, with scene geometry,
+palette, and fine structure held steady from seed to final chunk.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{images/rollout_gallery_1.png}
+\caption{Example rollouts (part 1). Each row is one rollout; six frames span
+the $6.75$\,s generation. Label gives model, held-out window, command, the
+realized-along-command following score, and the end/seed sharpness ratio.}
+\label{fig:gallery1}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{images/rollout_gallery_2.png}
+\caption{Example rollouts (part 2). Rendering as in Fig.~\ref{fig:gallery1}.}
+\label{fig:gallery2}
+\end{figure*}
+
+\subsection{Matched-Scene Comparison}
+\label{app:matched_rollouts}
+
+Because every model is driven from the same held-out seeds under the same
+commands, we can hold the scene and command fixed and vary only the model.
+Figure~\ref{fig:matched} does this for one backward-diagonal command: our
+models keep the plaza coherent and reverse as commanded, while the baselines
+fail in their characteristic ways---Matrix-Game darkens and collapses,
+WorldCam relocates to a different environment and restyles, and WorldPlay and
+Yume drift to unrelated scenes. This matched view isolates model behaviour
+from scene difficulty in a way that unmatched failure galleries cannot.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{images/failure_compare_w24_BR.png}
+\caption{Matched-scene comparison: identical held-out seed and
+backward-right command, one row per model (five frames each). Our two models
+(top) hold scene identity and execute the reverse; the ablations degrade
+mildly; the external baselines (bottom four) diverge---darkening,
+relocation, and style shift---despite receiving the same command.}
+\label{fig:matched}
+\end{figure*}
+
 
 \section{Baseline Command Interfaces}
 \label{app:interfaces}

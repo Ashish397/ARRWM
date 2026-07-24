@@ -260,7 +260,7 @@ class Trainer:
             from af_utils.dataset import _load_prompt_embeds, _build_ts_to_caption_json
             from utils.zarr_dataset import ZarrRideDataset as _ZRD
             self._log("Building ChunkedODEDataset ...")
-            _cap = _build_ts_to_caption_json(str(getattr(config, "caption_root")))
+            _cap = _build_ts_to_caption_json(Path(str(getattr(config, "caption_root"))))
             _pcache = {}
             def _prompt(ts):
                 if ts not in _pcache:

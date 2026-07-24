@@ -82,7 +82,15 @@ def main():
     cfg = OmegaConf.merge(OmegaConf.load(f"{ARR}/configs/default_config.yaml"),
                           OmegaConf.load(CONFIG))
     os.environ["ARRWM_ACTION_ENCODER"] = str(cfg.get("teacher_action_encoder", "pca_raw"))
-    cfg.logdir = f"{OUT}/.gen_scratch"; cfg.auto_resume = False; cfg.control_test = False
+    # per-shard scratch (4 shards sharing one dir would collide on the
+    # ~22GB manifest write, cf. jobs 5736570/5736740); pre-seed the ride
+    # manifest via symlink so the trainer never rebuilds/rescans it.
+    _scratch = f"{OUT}/.gen_scratch_s{SHARD}"
+    os.makedirs(_scratch, exist_ok=True)
+    _cache = f"{ARR}/analysis/eval_final/flow_viz/.rec_scratch/.ride_manifest.pt"
+    if not os.path.exists(f"{_scratch}/.ride_manifest.pt") and os.path.exists(_cache):
+        os.symlink(_cache, f"{_scratch}/.ride_manifest.pt")
+    cfg.logdir = _scratch; cfg.auto_resume = False; cfg.control_test = False
     cfg.save_checkpoints = False; cfg.stop_at_step = 0
     trainer = CausalLoRADiffusionTrainer(cfg)
     trainer.config.resume_from = CKPT; trainer.start_step = 0
@@ -98,18 +106,22 @@ def main():
     device, dtype = trainer.device, trainer.dtype
 
     pool = json.load(open(POOL))
+    if isinstance(pool, dict):                 # balanced-pool wrapper
+        pool = pool["windows"]
     windows = pool[SHARD::NSHARDS][:NUM]
     print(f"[gen14e] shard {SHARD}/{NSHARDS}: {len(windows)} contexts, "
           f"{GEN_CHUNKS} chunks, snap {SNAP_REC}", flush=True)
 
-    manifest = torch.load(f"{ARR}/logs/v14_balanced_weunz/.ride_manifest.pt",
-                          map_location="cpu")
-    pe_by_zarr = {r["zarr_path"]: r["prompt_embeds"] for r in manifest}
+    manifest = torch.load(
+        f"{ARR}/analysis/eval_final/flow_viz/.rec_scratch/.ride_manifest.pt",
+        map_location="cpu")
+    rides = manifest["rides"] if isinstance(manifest, dict) else manifest
+    pe_by_zarr = {r["zarr_path"]: r["prompt_embeds"] for r in rides}
     # z-action dataset: mirrors gen_lmdb.py:380-415 (from_manifest with
     # motion_root + ss_vae ckpt); restricted to the pool's rides.
     pool_zarrs = {w["zarr_path"] for w in windows}
     rides_for_ds, n_lat_by_zarr = [], {}
-    for r in manifest:
+    for r in rides:
         if r["zarr_path"] not in pool_zarrs:
             continue
         n_lat = int(r["attrs"]["n_latent_frames"]) if "attrs" in r and \
@@ -130,7 +142,7 @@ def main():
     tot_f = seed_f + NFB * GEN_CHUNKS
     qa = open(f"{OUT}/qa_shard{SHARD}.jsonl", "a")
     for w in windows:
-        zp, off = w["zarr_path"], int(w["offset"])
+        zp, off = w["zarr_path"], int(w.get("offset", w.get("start")))
         ts_id = os.path.basename(zp).replace(".zarr", "")
         seedlat = ZarrRideDataset.load_latent_chunk(zp, off, off + seed_f) \
             .unsqueeze(0).to(device, torch.float32)

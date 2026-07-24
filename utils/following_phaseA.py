@@ -69,8 +69,10 @@ def per_model(df, m):
         a.bar([1], [s["realized"].mean()], width=0.42, color="crimson", alpha=0.35)
         a.set_xticks([0, 1], ["cos agreement", "realized |·|"])
         a.set_ylim(-1.15, 1.15)
-        a.set_title(f"commanded {D} (n={len(s)})  cos={s['cos'].mean():.2f}  "
-                    f"real={s['realized'].mean():.2f}")
+        # headtohead rows are whole windows (6s of generation each), not the
+        # 0.75s chunks used in the by-REALdir curves
+        a.set_title(f"commanded {D} ({len(s) * 6.0 / 60:.0f} min)  "
+                    f"cos={s['cos'].mean():.2f}  real={s['realized'].mean():.2f}")
         a.grid(alpha=0.3)
         if i == 0:
             a.legend(fontsize=9)

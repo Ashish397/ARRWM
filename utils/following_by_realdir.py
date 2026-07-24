@@ -24,6 +24,7 @@ DIRS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]
 DNAME = {"F": "Forward", "FR": "Forward-Right", "R": "Right", "BR": "Backward-Right",
          "B": "Backward", "BL": "Backward-Left", "L": "Left", "FL": "Forward-Left"}
 TH = 0.1
+CHUNK_SEC = 0.75  # one chunk = 3 latent frames = 12 px @16fps = 0.75s of video
 
 
 def build(cdir):
@@ -73,7 +74,7 @@ def plot_direction(df, title, out):
             if len(g):
                 a.plot(g.index, g.rolling(9, center=True, min_periods=3).mean().values, ls, color=col, lw=2.5, label=br)
         a.axhline(0, color="gray", lw=.6); a.set_ylim(-1.05, 1.05)
-        a.set_title(f"{DNAME[D]} (n={len(sub)})", fontsize=17)
+        a.set_title(f"{DNAME[D]} ({len(sub) * CHUNK_SEC / 60:.0f} min)", fontsize=17)
         a.set_xlabel("step", fontsize=16)
         if i % 4 == 0:
             a.set_ylabel("direction agreement (cosine)", fontsize=16)
@@ -100,7 +101,7 @@ def plot_strength(df, title, out):
                 a.plot(g.index, g.rolling(9, center=True, min_periods=3).mean().values, ls, color=col,
                        lw=2.5, label=br)
         a.axhline(0, color="gray", lw=.6); a.set_ylim(-0.5, 1.15)
-        a.set_title(f"{DNAME[D]} (n={len(sub)})", fontsize=17)
+        a.set_title(f"{DNAME[D]} ({len(sub) * CHUNK_SEC / 60:.0f} min)", fontsize=17)
         a.set_xlabel("step", fontsize=16)
         if i % 4 == 0:
             a.set_ylabel("strength of followed action", fontsize=16)

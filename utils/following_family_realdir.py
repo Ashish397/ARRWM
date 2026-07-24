@@ -13,7 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.following_by_realdir import build, DIRS, DNAME
+from utils.following_by_realdir import build, DIRS, DNAME, CHUNK_SEC
 
 FAMILIES = {
     "nodes": [("logs/v14e_4node/control_test", "batch size 16", "#4393c3"),
@@ -56,7 +56,7 @@ def plot_family(name, members):
         a.axhline(0, color="gray", lw=0.6)
         a.set_ylim(-0.5, 1.15)
         nD = sum(len(df[(df["dir"] == D) & (df.branch == "flip")]) for df, _ in dfs.values())
-        a.set_title(f"{DNAME[D]} (n={nD})", fontsize=17)
+        a.set_title(f"{DNAME[D]} ({nD * CHUNK_SEC / 60:.0f} min)", fontsize=17)
         a.set_xlabel("step", fontsize=16)
         if i % 4 == 0:
             a.set_ylabel("strength of followed action", fontsize=16)
@@ -90,7 +90,7 @@ def plot_family_direction(name, members):
         a.axhline(0, color="gray", lw=0.6)
         a.set_ylim(-1.05, 1.05)
         nD = sum(len(df[(df["dir"] == D) & (df.branch == "flip")]) for df, _ in dfs.values())
-        a.set_title(f"{DNAME[D]} (n={nD})", fontsize=17)
+        a.set_title(f"{DNAME[D]} ({nD * CHUNK_SEC / 60:.0f} min)", fontsize=17)
         a.set_xlabel("step", fontsize=16)
         if i % 4 == 0:
             a.set_ylabel("direction agreement (cosine)", fontsize=16)
@@ -124,7 +124,7 @@ def plot_family_direction_halved(name, members):
         a.axhline(0, color="gray", lw=0.6)
         a.set_ylim(-1.05, 1.05)
         nD = sum(len(df[(df["dir"] == D) & (df.branch == "flip")]) for df, _ in dfs.values())
-        a.set_title(f"{DNAME[D]} (n={nD})", fontsize=17)
+        a.set_title(f"{DNAME[D]} ({nD * CHUNK_SEC / 60:.0f} min)", fontsize=17)
         a.set_xlabel("step", fontsize=16)
         a.set_ylabel("direction agreement (cosine)", fontsize=16)
         a.tick_params(labelsize=14)
