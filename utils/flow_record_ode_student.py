@@ -50,6 +50,12 @@ def main():
     pipe = ODEChainPipeline(device)
     pipe.build(config_path=CONFIG)
     step = pipe.load_checkpoint(CKPT)
+    if os.environ.get("FR_RUNGS"):                # pinned-grid override (14e pilots)
+        _rungs = torch.tensor(
+            [float(x) for x in os.environ["FR_RUNGS"].split(",")],
+            dtype=torch.float32)
+        pipe.denoising_step_list = _rungs
+        pipe.ode_model.denoising_step_list = _rungs.clone()  # keep set_denoising_steps consistent
     print(f"[rec-ode] {RUN}: loaded {CKPT} (step {step}), "
           f"denoise steps {pipe.denoising_step_list.tolist()}", flush=True)
 
@@ -72,9 +78,24 @@ def main():
             z[:, NFB:, 0] = thr; z[:, NFB:, 1] = ste
             os.environ["ODE_FLOW_REC"] = dst
             os.environ["ODE_FLOW_SEED"] = str(1234 + sd * 7919)
-            full = pipe.generate_ar(prompt_embeds=pe, noisy_fa_full=z,
-                                    initial_latents=seed, num_gen_chunks=GEN_CHUNKS)
-            os.environ.pop("ODE_FLOW_REC", None)
+            # CRITICAL: production AR evals wrap generate_ar in the
+            # Infinity-RoPE context (un-roped K in cache); without it the
+            # bare cached-RoPE path drifts ~1 token/frame per chunk
+            # (staircase-left artifact). Match production exactly.
+            from utils.infinity_rope import infinity_rope_active
+            _base = pipe.wrapper.model
+            if hasattr(_base, "get_base_model"):
+                _base = _base.get_base_model()
+            try:
+                with infinity_rope_active(True, _base):
+                    # cache_chunks=6 pins the attention span to the trained
+                    # 21-frame window (= teacher local_attn_chunks=7)
+                    full = pipe.generate_ar(prompt_embeds=pe, noisy_fa_full=z,
+                                            initial_latents=seed,
+                                            num_gen_chunks=GEN_CHUNKS,
+                                            cache_chunks=6)
+            finally:
+                os.environ.pop("ODE_FLOW_REC", None)
             if VIDEO:
                 import imageio
                 os.makedirs(os.path.dirname(vid), exist_ok=True)

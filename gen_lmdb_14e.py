@@ -10,6 +10,12 @@ Differences vs gen_lmdb.py (the v14/v14d generator), per the ODE-step audit:
   2. GT + FLIP pair per context (apply_counterfactual), same noise seed —
      counterfactual coverage on the weak backward/mirror axis at half the
      cost of the old 8-dir plan.
+
+  ACTION CONVENTION (canonical, follows 14e — legacy z2/z7 names retired):
+     action vector column 0 = THROTTLE (forward/backward), column 1 = STEER.
+     Empirically calibrated on the 14e teacher (col-0 command -> pure forward
+     motion; col-1 command -> pure turn). ``action_dims`` still selects the
+     same two components from the ss_vae vector; only the naming changes.
   3. 5 snapshots per chunk at the PINNED rung grid [1000, 625, 312.5, 178.6]
      + final x0 (SNAP_REC below; grid must match training random_steps AND
      the eval denoising_step_list — one list everywhere).
@@ -50,6 +56,7 @@ NSHARDS = int(os.environ.get("GL_NSHARDS", "1"))
 GEN_CHUNKS = int(os.environ.get("GL_CHUNKS", "6"))
 SEED_CHUNKS = int(os.environ.get("GL_SEED_CHUNKS", "3"))  # real-context chunks
 STEPS = int(os.environ.get("GL_STEPS", "20"))    # validated vs 48 (flow_step_fidelity)
+assert STEPS == 20, "SNAP_REC indices are only valid for the 20-step schedule"
 
 # recorder si -> stored rung state; si=-1 is the initial noise (t=1000);
 # post-step record si sits at the step's target sigma -> state at schedule
@@ -124,8 +131,9 @@ def main():
     for r in rides:
         if r["zarr_path"] not in pool_zarrs:
             continue
-        n_lat = int(r["attrs"]["n_latent_frames"]) if "attrs" in r and \
-            "n_latent_frames" in r["attrs"] else int(r.get("n_latent_frames", 0))
+        if "n_latent_frames" not in r:
+            raise SystemExit(f"manifest ride missing n_latent_frames: {r['zarr_path']}")
+        n_lat = int(r["n_latent_frames"])
         rides_for_ds.append({"zarr_path": r["zarr_path"],
                              "prompt_embeds": r["prompt_embeds"],
                              "attrs": r.get("attrs", {}),
@@ -136,14 +144,21 @@ def main():
         motion_root=str(cfg.get("motion_root", "/projects/u6ex/fbots/frodobots_motion")),
         ss_vae_checkpoint=str(cfg.ss_vae_checkpoint),
         device="cpu", ss_vae_device=str(device))
-    action_dims = list(cfg.get("action_dims", [2, 7]))
+    action_dims = list(cfg.get("action_dims", [2, 7]))   # -> (throttle, steer) order, 14e convention
 
     seed_f = NFB * SEED_CHUNKS
     tot_f = seed_f + NFB * GEN_CHUNKS
     qa = open(f"{OUT}/qa_shard{SHARD}.jsonl", "a")
+    n_skipped = 0
     for w in windows:
         zp, off = w["zarr_path"], int(w.get("offset", w.get("start")))
         ts_id = os.path.basename(zp).replace(".zarr", "")
+        cap = min(n_lat_by_zarr.get(zp, 0), int(w.get("n_latent_frames", 1 << 30)))
+        if zp not in pe_by_zarr or off + tot_f > cap:
+            n_skipped += 1
+            print(f"[gen14e] SKIP {ts_id}_o{off:05d} (span {off + tot_f} > cap {cap} "
+                  f"or missing prompt)", flush=True)
+            continue
         seedlat = ZarrRideDataset.load_latent_chunk(zp, off, off + seed_f) \
             .unsqueeze(0).to(device, torch.float32)
         pe = pe_by_zarr[zp].unsqueeze(0).to(device, dtype)
@@ -186,7 +201,9 @@ def main():
                         "zarr_path": zp, "window_offset": off, "variant": variant,
                         "noise_seed": window_noise_seed(ts_id, off),
                         "snap_rec": SNAP_REC, "gen_chunks": GEN_CHUNKS,
-                        "committed_stats": stats}, dst)
+                        "seed_chunks": SEED_CHUNKS,
+                        "committed_stats": stats}, dst + ".tmp")
+            os.rename(dst + ".tmp", dst)      # atomic: no truncated files on kill
             qa.write(json.dumps({"w": f"{ts_id}_o{off}", "v": variant, **stats}) + "\n")
             qa.flush()
             print(f"[gen14e] {ts_id}_o{off:05d}_{variant} "

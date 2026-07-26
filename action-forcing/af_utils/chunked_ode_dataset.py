@@ -7,7 +7,9 @@ so af_trainer/ode.py trains unchanged. See flow_viz/ODE_CAMPAIGN_STATE.md.
 Stored file (one per (context, action-variant)):
   trajectory [GEN_CHUNKS=6, 5, 3, C, H, W] fp16  (5 snapshots per gen chunk,
       rungs t=[1000,625,357,208]+final on the 20-step shift-5 grid;
-      slot -1 = committed), z [27, 2], zarr_path, window_offset, noise_seed.
+      slot -1 = committed), z [27, 2] in (throttle, steer) order (14e
+      convention; legacy z2/z7 names retired), zarr_path, window_offset,
+      noise_seed.
   Seed context (3 chunks) is NOT stored — loaded from zarr.
 
 Sample = target gen-chunk c in {3,4,5}; its 6 preceding chunks (real seed +
@@ -31,7 +33,10 @@ from torch.utils.data import Dataset
 NFB = 3
 CTX_CHUNKS = 6
 NUM_FRAMES = 21
-TARGETS = (3, 4, 5)                       # gen-chunk indices with full context
+# Target chunks: clean_x must be the window shifted back ONE chunk (v14
+# contract: mask context_shift=1 + rope_offset assume clean = noisy - 1
+# chunk). c=3 would need zarr[off-3:off]; restrict to {4,5} instead.
+TARGETS = (4, 5)
 
 
 class ChunkedODEDataset(Dataset):
@@ -62,10 +67,17 @@ class ChunkedODEDataset(Dataset):
 
     @staticmethod
     def _window(pt: Dict[str, Any], c: int, seed_lat: torch.Tensor):
-        """-> (traj [5, 21, C, H, W], committed_ctx [21, C, H, W], frame_lo)."""
+        """-> (traj [5, 21, C, H, W], clean_x [21, C, H, W], frame_lo).
+
+        clean_x follows the v14 teacher-forcing contract: the CLEAN window
+        is the noisy window shifted back ONE chunk (global chunks c-4..c+2),
+        so the noisy target block never sees its own answer through the
+        clean-attention path (reviewed label-leak fix). Requires c >= 4.
+        """
+        assert c >= 4, f"target chunk {c} needs a one-chunk clean lead-in"
         traj = pt["trajectory"].to(torch.float32)          # [6, 5, 3, C, H, W]
         committed = traj[:, -1]                            # [6, 3, C, H, W]
-        # global chunk list: 3 seed + generated 0..c-1, keep the last 6
+        # global chunk list: 3 seed + generated 0..c-1 (committed)
         chunks = [seed_lat[i * NFB:(i + 1) * NFB] for i in range(3)] + \
                  [committed[g] for g in range(c)]
         ctx = torch.cat(chunks[-CTX_CHUNKS:], dim=0)       # [18, C, H, W]
@@ -73,8 +85,11 @@ class ChunkedODEDataset(Dataset):
         t_snap = snap.shape[0]
         traj_win = torch.cat(
             [ctx.unsqueeze(0).expand(t_snap, -1, -1, -1, -1), snap], dim=1)
-        clean_x = torch.cat([ctx, committed[c]], dim=0)    # [21, C, H, W]
-        frame_lo = NFB * (c - 3)                           # global frame of window start
+        clean_x = torch.cat(chunks[-(CTX_CHUNKS + 1):], dim=0)  # [21, C, H, W]
+        # chunks list covers global chunks 0..c+2 (3 seed + c gen); the last
+        # CTX_CHUNKS+1 = 7 entries are global chunks c-4..c+2 = the clean
+        # window (one chunk BEHIND the noisy window c-3..c+3).
+        frame_lo = NFB * (c - 3)                           # global frame of noisy window start
         return traj_win, clean_x, frame_lo
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -86,9 +101,11 @@ class ChunkedODEDataset(Dataset):
         seed_lat = self.zarr_loader(zp, off, off + 3 * NFB).to(torch.float32)
 
         traj_c, clean_x, lo = self._window(cpt, c, seed_lat)
-        traj_f, _, _ = self._window(fpt, c, seed_lat)
+        traj_f, clean_x_cf, _ = self._window(fpt, c, seed_lat)   # cf gets ITS OWN chain's clean window
         z_c = cpt["z"].to(torch.float32)[lo:lo + NUM_FRAMES]
         z_f = fpt["z"].to(torch.float32)[lo:lo + NUM_FRAMES]
+        # clean-branch actions follow the clean window (shifted back 1 chunk)
+        z_clean_w = cpt["z"].to(torch.float32)[lo - NFB:lo - NFB + NUM_FRAMES]
 
         ride_ts = os.path.basename(zp).replace(".zarr", "")
         return {
@@ -96,8 +113,9 @@ class ChunkedODEDataset(Dataset):
             "trajectory_cf": traj_f,
             "z_noisy": z_c,
             "z_noisy_cf": z_f,
-            "z_clean": z_c,
+            "z_clean": z_clean_w,
             "clean_x_gt": clean_x,
+            "clean_x_gt_cf": clean_x_cf,
             "prompt_embeds": self.prompt_loader(ride_ts),
             "meta": {"filename": os.path.basename(clean_f), "ride_ts": ride_ts,
                      "window_offset": off, "target_chunk": c,

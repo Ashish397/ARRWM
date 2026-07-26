@@ -264,6 +264,8 @@ class Trainer:
             _pcache = {}
             def _prompt(ts):
                 if ts not in _pcache:
+                    if len(_pcache) > 256:            # bound worker RSS
+                        _pcache.clear()
                     _pcache[ts] = _load_prompt_embeds(_cap[ts])
                 return _pcache[ts]
             self.dataset = ChunkedODEDataset(
@@ -841,6 +843,7 @@ class Trainer:
                 z_noisy=batch["z_noisy"],
                 z_noisy_cf=batch["z_noisy_cf"],
                 clean_x_gt=batch["clean_x_gt"],
+                clean_x_gt_cf=batch.get("clean_x_gt_cf"),
                 step=self.global_step,
             )
         loss.backward()

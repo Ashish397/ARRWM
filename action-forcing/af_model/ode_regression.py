@@ -355,6 +355,10 @@ class ODERegression(nn.Module):
         # ------------------------------------------------------------------
         # 6) Resolve denoising_step_list from the user's ``random_steps`` pool
         # ------------------------------------------------------------------
+        self.ode_chunked_supervision = bool(
+            getattr(config, "ode_chunked_supervision",
+                    getattr(config, "chunked_lmdb", False))
+        )
         random_steps = list(getattr(config, "random_steps", DEFAULT_RANDOM_STEPS))
         if len(random_steps) == 0:
             raise ValueError("random_steps must contain at least one entry")
@@ -837,6 +841,11 @@ class ODERegression(nn.Module):
         B, T_snap, F_, C, H, W = trajectory.shape
         K = int(self.denoising_step_list.shape[0])
         pool_idx = self._get_random_blockwise_index(B, F_, K)
+        # ode_chunked_supervision (chained-LMDB mode): context frames are
+        # COMMITTED/clean states tiled across snapshot slots — labeling them
+        # with noisy rungs teaches an identity shortcut (observed pilot
+        # collapse). The post-gather block below pins context to the clean
+        # committed state at t=0; only the last block carries a sampled rung.
 
         pool_table = torch.tensor(
             self.usable_stored_indices, device=self.device, dtype=torch.long,
@@ -849,6 +858,15 @@ class ODERegression(nn.Module):
         ).squeeze(1)
 
         timestep = self.denoising_step_list[pool_idx]
+        if getattr(self, "ode_chunked_supervision", False):
+            nfb = self.num_frame_per_block
+            ctx = F_ - nfb
+            committed = trajectory[:, -1, :ctx]            # final snapshot = clean
+            noisy_input = torch.cat([committed, noisy_input[:, ctx:]], dim=1)
+            timestep = timestep.clone()
+            timestep[:, :ctx] = 0.0
+            pool_idx = pool_idx.clone()
+            pool_idx[:, :ctx] = -1        # exclude context from critic chunk masks
         return noisy_input, timestep, pool_idx
 
     @torch.no_grad()
@@ -1347,6 +1365,7 @@ class ODERegression(nn.Module):
         z_noisy: torch.Tensor,               # [B_pair, F, 2]   (clean-branch action)
         z_noisy_cf: torch.Tensor,            # [B_pair, F, 2]   (CF-branch action)
         clean_x_gt: torch.Tensor,            # [B_pair, F, C, H, W]
+        clean_x_gt_cf: torch.Tensor = None,  # optional CF-chain clean window
         step: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Run a full paired training-forward pass (random-timestep recipe).
@@ -1411,7 +1430,9 @@ class ODERegression(nn.Module):
         # *per-branch* action streams before calling it; the projections
         # run on the packed [2*B_pair, ...] in one shot.
         prompt_pack  = torch.cat([prompt_cast,  prompt_cast],  dim=0)
-        clean_x_pack = torch.cat([clean_x_in,   clean_x_in],   dim=0)
+        clean_x_cf_in = (clean_x_gt_cf.to(dtype)
+                         if clean_x_gt_cf is not None else clean_x_in)
+        clean_x_pack = torch.cat([clean_x_in,   clean_x_cf_in], dim=0)
         z_noisy_pack = torch.cat([z_noisy_c,    z_noisy_cfc],  dim=0)
         z_clean_pack = torch.cat([z_clean_c,    z_clean_c],    dim=0)
         noisy_pack   = torch.cat([noisy_clean,  noisy_cf],     dim=0)
@@ -1455,12 +1476,23 @@ class ODERegression(nn.Module):
         probe_hidden_cf    = probe_hidden[B_pair:]
 
         # ---- ODE regression per slot ----
-        ode_loss_clean = self._compute_ode_loss(
-            pred_clean, target_clean.to(dtype), t_clean,
-        )
-        ode_loss_cf = self._compute_ode_loss(
-            pred_cf,    target_cf.to(dtype),    t_cf,
-        )
+        if getattr(self, "ode_chunked_supervision", False):
+            _nfb = self.num_frame_per_block
+            ode_loss_clean = self._compute_ode_loss(
+                pred_clean[:, -_nfb:], target_clean[:, -_nfb:].to(dtype),
+                t_clean[:, -_nfb:],
+            )
+            ode_loss_cf = self._compute_ode_loss(
+                pred_cf[:, -_nfb:],    target_cf[:, -_nfb:].to(dtype),
+                t_cf[:, -_nfb:],
+            )
+        else:
+            ode_loss_clean = self._compute_ode_loss(
+                pred_clean, target_clean.to(dtype), t_clean,
+            )
+            ode_loss_cf = self._compute_ode_loss(
+                pred_cf,    target_cf.to(dtype),    t_cf,
+            )
 
         # ---- Motion pipeline: batched call over the full 2*B_pair pack.
         # Slicing afterward keeps the state-probe and critic targets per slot.

@@ -1,0 +1,85 @@
+scene,model,tier,note,p_yes
+r01_BR,pca8,6.0,looks good but weird melting lines,0.07861328125
+r01_BR,pca4,4.5,stronger melt,0.202880859375
+r01_BR,pca2,3.5,"jumbled, shapes warped in little circles, no melt",0.09222412109375
+r01_BR,16node,8.0,good,0.141082763671875
+r01_BR,4node,6.0,haze but not bad,0.07269287109375
+r01_BR,noatok,4.0,"a lot more black, shapes correct, left a lot as black, uncanny",0.12646484375
+r01_BR,noadaln,6.5,"some style shift, a bit worse, but no warp since it only moves forward",0.0340728759765625
+r02_BR,pca8,7.5,"good, builds building, slightly blurry details",0.09393310546875
+r02_BR,pca4,6.0,building but more blurry,0.04586029052734375
+r02_BR,pca2,3.0,"buildings but mashier, mangled, melted",0.2255859375
+r02_BR,16node,6.0,"hallucinates blue tarp, building strange/uncanny but good-ish",0.03265380859375
+r02_BR,4node,6.5,makes nothing; landscape looks good and low error,0.0089111328125
+r02_BR,noatok,2.0,mangled black weird and wrong,0.391357421875
+r02_BR,noadaln,5.0,"moves forward, gets blurry and a bit hazy",0.0635986328125
+r04_BR,pca8,6.5,"ok, tree has curved space warping artefact",0.02356719970703125
+r04_BR,pca4,7.0,"good, smaller tree, some curved warping, best here",0.317626953125
+r04_BR,pca2,3.0,"hazy blurry mashy, visible artefacts",0.12027931213378906
+r04_BR,16node,6.0,"weird wrong tree, otherwise good",0.22999191284179688
+r04_BR,4node,4.0,hazy and missing large parts (tree trunks),0.1009521484375
+r04_BR,noatok,5.0,"black but style/warping fine; generated building strange, uncanny",0.0148773193359375
+r04_BR,noadaln,7.0,looks good but does not follow the action,0.01166534423828125
+r05_BR,pca8,8.0,looks good,0.0753173828125
+r05_BR,pca4,5.0,"bit blurry and hazy, scooter shapes warped",0.193115234375
+r05_BR,pca2,8.0,good,0.0794677734375
+r05_BR,16node,9.0,excellent,0.080810546875
+r05_BR,4node,5.0,warped (building right),0.07037353515625
+r05_BR,noatok,5.0,warped building with missing sides,0.177978515625
+r05_BR,noadaln,3.0,"does not follow directions, warping really bad",0.2139434814453125
+r06_BR,pca8,8.0,good,0.0038776397705078125
+r06_BR,pca4,4.0,significant temporal shimmer and blurring artefacts,0.0046405792236328125
+r06_BR,pca2,4.0,significant temporal shimmer and blurring artefacts,0.004764556884765625
+r06_BR,16node,8.0,good,0.004093170166015625
+r06_BR,4node,7.5,good,0.005501747131347656
+r06_BR,noatok,7.5,good,0.04335784912109375
+r06_BR,noadaln,7.5,good,0.0042362213134765625
+r10_BR,pca8,7.5,"good, little bit of artefacts",0.04921722412109375
+r10_BR,pca4,3.0,"very blurry on new generation, bad",0.1082763671875
+r10_BR,pca2,3.5,"blurry too, also bad",0.134429931640625
+r10_BR,16node,6.0,"some blurring artefacts, makes building, 8node better",0.09912872314453125
+r10_BR,4node,5.0,"hazy, building with holes, bit uncanny",0.2361297607421875
+r10_BR,noatok,9.0,excellent here,0.074066162109375
+r10_BR,noadaln,9.0,best here but does not move back or right,0.014319419860839844
+r15_R,pca8,8.0,really good,0.0025119781494140625
+r15_R,16node,8.0,really good,0.005344390869140625
+r15_R,4node,6.5,good but hazy,0.04003143310546875
+r15_R,noadaln,5.5,hazy,0.0093231201171875
+r15_R,pca2,4.0,"kind of bad, mangles on the right side",0.07642936706542969
+r15_R,pca4,4.0,"kind of bad, mangles on the right side",0.009674072265625
+r15_R,noatok,2.0,mangled and horrid,0.10417938232421875
+r17_BL,16node,8.0,"best, nothing bad on it",0.08856201171875
+r17_BL,noatok,7.0,good,0.0180816650390625
+r17_BL,noadaln,7.0,good,0.002765655517578125
+r17_BL,4node,6.5,good but hazy,0.32080078125
+r17_BL,pca8,5.0,"kind of weak, right building hazy",0.05389404296875
+r17_BL,pca2,4.0,"big messy structure on the right, not right",0.0576171875
+r17_BL,pca4,4.0,messy structure on the right,0.0897216796875
+r18_BR,noadaln,7.0,generates nothing new or cool but good,0.0015058517456054688
+r18_BR,4node,6.5,good but hazy,0.0013904571533203125
+r18_BR,pca8,4.5,"right building is a load of shite, looks so bad",0.0018444061279296875
+r18_BR,pca4,3.5,even worse than pca8,0.0176544189453125
+r18_BR,16node,3.5,"sucks, black mass on the right",0.0882568359375
+r18_BR,noatok,3.0,"quite bad, big black mess",0.256988525390625
+r18_BR,pca2,3.0,somehow even worse,0.221160888671875
+r22_BL,noatok,8.0,top tier,0.0052490234375
+r22_BL,noadaln,8.0,top tier,0.0013341903686523438
+r22_BL,16node,6.0,next tier; shadows better than pca8,0.02309417724609375
+r22_BL,pca8,6.0,next tier; wall much better than 16node,0.0247344970703125
+r22_BL,pca2,4.0,"a bit mangled/mashed but crisp, plausible even if different",0.185791015625
+r22_BL,4node,2.0,"bad, implausible content generated (washed out)",0.118896484375
+r22_BL,pca4,2.0,"bad, implausible content generated",0.107513427734375
+r04_BL,16node,9.0,best,0.06672477722167969
+r04_BL,noatok,9.0,very good,0.2379150390625
+r04_BL,noadaln,9.0,very good,0.0015583038330078125
+r04_BL,pca8,7.0,blobs (trees),0.0033664703369140625
+r04_BL,pca4,7.0,blobs,0.1014862060546875
+r04_BL,pca2,7.0,blobs,0.002803802490234375
+r04_BL,4node,5.0,a bit hazy and washed out,0.0093994140625
+r14_B,noadaln,7.0,mangles its wires but the van is ok,0.0085601806640625
+r14_B,pca8,7.0,acceptable,0.014892578125
+r14_B,16node,7.0,acceptable,0.029998779296875
+r14_B,noatok,5.0,"changes van front into a box, not right",0.0026178359985351562
+r14_B,4node,5.0,same van-front box issue,0.016103744506835938
+r14_B,pca4,5.0,same,0.0069732666015625
+r14_B,pca2,5.0,backpacker addition not bad but its low render quality is; van front box,0.015285491943359375

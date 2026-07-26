@@ -27,7 +27,7 @@ ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"
 FV = f"{ARR}/analysis/eval_final/flow_viz"
 OUT = os.environ.get("FDD_OUT", FV)
 DIRS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]
-NSEEDS = 4
+NSEEDS = int(os.environ.get("FDD_NSEEDS", "4"))
 IU = np.triu_indices(len(DIRS), 1)
 STEPS = 48; SHIFT = 5.0
 PAIRS = dict(kv.split("=") for kv in os.environ.get(
@@ -35,7 +35,7 @@ PAIRS = dict(kv.split("=") for kv in os.environ.get(
 FIGNAME = os.environ.get("FDD_FIGNAME", "flow_diverge_dmd3")
 _SCPOOL = ["#d62728", "#9467bd", "#ff7f0e", "#8c564b"]
 SC = {s: _SCPOOL[i % 4] for i, s in enumerate(PAIRS)}
-TC = {"14d2": "#1f77b4", "14": "#2ca02c"}
+TC = {"14d2": "#1f77b4", "14": "#2ca02c", "14e8": "#17becf"}
 
 
 def teacher_ts():
