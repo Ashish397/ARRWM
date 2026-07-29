@@ -37,4 +37,17 @@ for V in gt flip2 dir4 dir8 mixed; do
       python utils/flow_diverge_dmd3.py || echo "SCORE-FAIL $V"
   fi
 done
+
+# Postmortem matrix closure: old-gt@250 (buggy-v1 objective) through the FIXED
+# probe. flip2@250 collapsed (12%) while teacher-init scored 94% at ~equal
+# weight drift; this cell confirms the damage generalizes beyond flip2.
+OLD_GT=logs/ode14e_pilot/run_gt_cap/action_ode_step0000250.pt
+if [ -f "$OLD_GT" ] && [ ! -f analysis/eval_final/flow_viz/flow_pilot_gtold/r08_FL_s1/steps.npz ]; then
+  echo "=== postmortem probe: old gt@250 ==="
+  FR_RUN=pilot_gtold FR_CONFIG=configs/ar_eval_dmd_student.yaml FR_CKPT=$OLD_GT \
+    FR_RUNGS="1000,625,357.142857,208.333333" FR_VIDEO=1 FR_CHUNKS=6 FR_NSEEDS=2 \
+    python utils/flow_record_ode_student.py || echo "PROBE-FAIL gtold"
+  FDD_NSEEDS=2 FDD_PAIRS="pilot_gtold=14e8" FDD_FIGNAME=flow_pilot_gtold_scorecard \
+    python utils/flow_diverge_dmd3.py || echo "SCORE-FAIL gtold"
+fi
 echo "TRAIN-PILOTS-SEQ done"

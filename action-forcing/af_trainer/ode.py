@@ -622,13 +622,20 @@ class Trainer:
             # Full DiT state (LoRA has been folded at load time; this is
             # the full-rank merged model).
             "generator": base.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
             "config_name": self.config_name,
         }
+        # ckpt_skip_optimizer=true drops optimizer states (~12GB of a
+        # 17.9GB checkpoint). Weight-only saves (~6GB) are for probe-only
+        # runs that never resume (e.g. short pilots) — during the
+        # 2026-07-27 Lustre instability every 17.9GB save wedged while
+        # every ~6GB save succeeded, so this is also a reliability lever.
+        if not bool(getattr(self.config, "ckpt_skip_optimizer", False)):
+            state["optimizer"] = self.optimizer.state_dict()
         cm = self._critic_base()
         if cm is not None:
             state["action_critic"] = cm.state_dict()
-        if self.critic_optimizer is not None:
+        if (self.critic_optimizer is not None
+                and not bool(getattr(self.config, "ckpt_skip_optimizer", False))):
             state["critic_optimizer"] = self.critic_optimizer.state_dict()
         if self.model.action_projection is not None:
             state["action_projection"] = self.model.action_projection.state_dict()
@@ -643,7 +650,31 @@ class Trainer:
             return
         path = self._checkpoint_path(step)
         state = self._build_checkpoint_state(step)
-        torch.save(state, path)
+        # Atomic write: a wedged/killed torch.save must never leave a
+        # truncated file under the final name (a Lustre write stall
+        # corrupted a resume source in place on 2026-07-27). The .tmp
+        # name does not match _CKPT_GLOB, so rotation never sees it.
+        tmp = path.with_name(path.name + ".tmp")
+        if bool(getattr(self.config, "ckpt_local_stage", False)):
+            # Stage on node-local disk first: during the 2026-07-27
+            # Lustre client instability, torch.save's write pattern
+            # wedged repeatedly on Lustre while plain sequential copies
+            # (dd/cp-style) succeeded — so serialize locally, then
+            # stream the finished file out.
+            import shutil
+            local_dir = os.environ.get("TMPDIR", "/tmp")
+            local_tmp = os.path.join(local_dir, path.name + ".tmp")
+            torch.save(state, local_tmp)
+            try:
+                shutil.copyfile(local_tmp, str(tmp))
+            finally:
+                try:
+                    os.unlink(local_tmp)
+                except OSError:
+                    pass
+        else:
+            torch.save(state, tmp)
+        os.replace(tmp, path)
         log.info("Saved checkpoint to %s", path)
         self._cleanup_old_ckpts()
 

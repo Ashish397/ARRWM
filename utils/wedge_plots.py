@@ -30,15 +30,15 @@ os.makedirs(OUT, exist_ok=True)
 
 ANG = {"F": 90, "FR": 45, "R": 0, "BR": -45, "B": -90, "BL": -135, "L": 180, "FL": 135}
 METRICS = ["recession", "tx", "g0", "g1", "rot", "g2", "g3", "g4", "g5", "g6", "g7"]
-ALL_SET = [("pca8_8node", "Ours (batch size 32)"), ("16node", "Ours (batch size 64)"),
+ALL_SET = [("pca8_8node", "Ours (Default)"), ("16node", "Ours (batch 64)"),
            ("minwm", "minWM"), ("matrixgame", "Matrix-Game"), ("worldcam", "WorldCam"),
            ("yume", "Yume"), ("worldplay", "WorldPlay"), ("astra", "Astra")]
 # (run, display label); row 1 = encoder family + noatok, row 2 = node family
 # + noadaln; pca8_8node appears in both rows as the shared reference model
-ABL_SET = [("pca8_8node", "PCA8 8node"), ("pca4", "PCA4"), ("pca2", "PCA2"),
+ABL_SET = [("pca8_8node", "Default"), ("pca4", "PCA4"), ("pca2", "PCA2"),
            ("noatok", "No Action Tokens"),
-           ("16node", "16node"), ("pca8_8node", "8node"), ("4node", "4node"),
-           ("noadaln", "No Adaptive Layer Norm")]
+           ("16node", "batch 64"), ("pca8_8node", "Default"), ("4node", "batch 16"),
+           ("noadaln", "No AdaLN")]
 
 frames = [pd.read_csv(f"{EF}/headtohead_motion.csv")]
 for f in sorted(glob.glob(f"{EF}/headtohead_*.csv")):

@@ -453,6 +453,38 @@ class ODERegression(nn.Module):
         # teacher's step + the ODE regression anchor) the EMA is largely
         # redundant, so this saves a resident DiT copy (~5GB) + its update.
         self.cd_ema_enabled = bool(getattr(config, "cd_ema_enabled", True))
+        # --- On-policy teacher supervision (chunked mode) ---------------
+        # The student's OWN target-block x0 prediction is re-noised to a
+        # mid rung and handed to the FROZEN teacher (same forward, same
+        # pinned committed context); the teacher's one-step x0 correction
+        # of the student's content becomes an extra regression target.
+        # Differs from ODE regression (pregenerated teacher rungs) and
+        # dual-CD (noising anchored on the TEACHER's x0): here the anchor
+        # is the student's x0, so gradients target the student's actual
+        # error modes. At step 0 student == teacher, so the loss starts
+        # ~0 and grows only as generations drift — self-calibrating, no
+        # warmup needed. Default OFF -> byte-identical.
+        self.ode_teachersup_enabled = bool(
+            getattr(config, "ode_teachersup_enabled", False))
+        self.ode_teachersup_weight = float(
+            getattr(config, "ode_teachersup_weight", 0.5))
+        self.ode_teachersup_rungs = [float(v) for v in getattr(
+            config, "ode_teachersup_rungs",
+            [625.0, 357.142857, 208.333333])]
+        # steps=1: single teacher x0 readout (a conditional MEAN — measured
+        # to halve stat drift but blur actions, see flip2ts A/B). steps>1:
+        # the teacher WALKS the real 20-step shift-5 grid tail below the
+        # renoise rung (Euler steps via _cd_partial_denoise), so the target
+        # is an actual teacher SAMPLE — sharp — still anchored on the
+        # student's content. steps caps the number of teacher forwards.
+        self.ode_teachersup_steps = int(
+            getattr(config, "ode_teachersup_steps", 1))
+        # Arm-D structural change: replace the committed-x0 regression
+        # target on rung frames with the progressive-distillation target
+        # implied by the teacher's stored NEXT trajectory state (see
+        # _nextrung_targets). Default OFF -> byte-identical.
+        self.ode_nextrung_targets = bool(
+            getattr(config, "ode_nextrung_targets", False))
         # Off-registry placeholders (object.__setattr__ keeps them out of
         # ._modules so .parameters()/.state_dict()/DDP never see them).
         object.__setattr__(self, "_cd_teacher", None)
@@ -466,10 +498,11 @@ class ODERegression(nn.Module):
         # but never this separate frozen copy, so it stays 14d across restarts.
         # (EMA-student stays lazy: it is meant to track the live student, so
         # seeding it from the resumed student on restart is acceptable.)
-        if self.cd_teacher_loss_enabled:
+        if self.cd_teacher_loss_enabled or self.ode_teachersup_enabled:
             import copy as _copy
             # self.generator is still the BARE wrapper here (the trainer wraps
             # it in DDP only after model construction), so deepcopy it directly.
+            # (Shared by teacher-CD and on-policy teacher supervision.)
             _tea = _copy.deepcopy(self.generator)
             _tea.requires_grad_(False)
             _tea.eval()
@@ -888,6 +921,54 @@ class ODERegression(nn.Module):
             trajectory, dim=1,
             index=tgt_snap.reshape(B, 1, F_, 1, 1, 1).expand(-1, -1, -1, C, H, W),
         ).squeeze(1)
+
+    @torch.no_grad()
+    def _nextrung_targets(
+        self,
+        trajectory: torch.Tensor,     # [B, T_snap, F, C, H, W]
+        base_target: torch.Tensor,    # [B, F, C, H, W] committed x0
+        noisy_input: torch.Tensor,    # [B, F, C, H, W] gathered rung states
+        pool_idx: torch.Tensor,       # [B, F] rung pool index (-1 = context)
+    ) -> torch.Tensor:
+        """Arm-D (next-rung state regression): on rung-labeled frames, swap
+        the committed-x0 target for the progressive-distillation target the
+        teacher's stored NEXT trajectory state implies:
+
+            x0_hat_k = x_k - sigma_k * (x_k - x_{k+1}) / (sigma_k - sigma_{k+1})
+
+        x_{k+1} is the next stored snapshot of the SAME chain (final slot =
+        the committed sample, sigma=0). Because stored states straddle
+        MULTI-step segments of the teacher's 20-step schedule, x0_hat is a
+        segment extrapolation — a sample-consistent tangent of the teacher's
+        actual path — not a one-step conditional mean. At the last rung the
+        formula reduces exactly to the committed target (v1 continuity);
+        context frames (pool_idx = -1) keep base_target.
+        """
+        B, T_snap, F_, C, H, W = trajectory.shape
+        K = int(self.denoising_step_list.shape[0])
+        stored = list(self.usable_stored_indices)
+        if stored != list(range(K)) or T_snap != K + 1:
+            raise RuntimeError(
+                "ode_nextrung_targets assumes contiguous rung slots "
+                f"[0..{K-1}] + committed final; got usable_stored_indices="
+                f"{stored}, T_snap={T_snap}")
+        pool = pool_idx.clamp(min=0)
+        next_slot = (pool + 1).clamp(max=T_snap - 1)
+        x_next = torch.gather(
+            trajectory, dim=1,
+            index=next_slot.reshape(B, 1, F_, 1, 1, 1).expand(-1, -1, -1, C, H, W),
+        ).squeeze(1).float()
+        sig = self.denoising_step_list.to(
+            device=pool.device, dtype=torch.float32) / 1000.0
+        sig_pad = torch.cat([sig, torch.zeros(1, device=pool.device)])
+        sig_k = sig_pad[pool]
+        sig_n = sig_pad[(pool + 1).clamp(max=K)]
+        w = (sig_k / (sig_k - sig_n).clamp(min=1e-6)).reshape(B, F_, 1, 1, 1)
+        x_k = noisy_input.float()
+        x0_hat = x_k - w * (x_k - x_next)
+        mask = (pool_idx >= 0).reshape(B, F_, 1, 1, 1)
+        return torch.where(
+            mask, x0_hat, base_target.float()).to(base_target.dtype)
 
     # ------------------------------------------------------------------
     # Losses
@@ -1410,6 +1491,11 @@ class ODERegression(nn.Module):
 
         target_clean = self._resolve_target(trajectory_clean)
         target_cf    = self._resolve_target(trajectory_cf)
+        if getattr(self, "ode_nextrung_targets", False):
+            target_clean = self._nextrung_targets(
+                trajectory_clean, target_clean, noisy_clean, pool_idx_clean)
+            target_cf = self._nextrung_targets(
+                trajectory_cf, target_cf, noisy_cf, pool_idx_cf)
 
         # ---- Casts (every cast happens exactly once; these are the
         # tensors the DiT actually consumes).
@@ -1598,6 +1684,76 @@ class ODERegression(nn.Module):
             _cd_logs["cd_weight_effective"] = float(cd_w)
             _cd_logs["cd_term_weighted"] = float((cd_w * cd_term).detach().item())
 
+        # ---- On-policy teacher supervision (chunked mode only) ----
+        # Re-noise the student's own target-block x0 to a sampled mid rung,
+        # keep the committed context + its pinned t=0 timesteps untouched,
+        # and let the FROZEN teacher produce a one-step x0 correction of the
+        # student's content under the same commanded actions. The student
+        # regresses toward that correction — gradients flow only through
+        # p_pack (the main forward's pred), so this costs one extra no-grad
+        # DiT forward per step.
+        ts_sup_clean = torch.zeros((), device=self.device, dtype=dtype)
+        ts_sup_cf = torch.zeros((), device=self.device, dtype=dtype)
+        ts_t_corr = 0.0
+        if (self.ode_teachersup_enabled
+                and getattr(self, "ode_chunked_supervision", False)
+                and self._cd_teacher is not None):
+            _nfb = self.num_frame_per_block
+            _ri = int(torch.randint(len(self.ode_teachersup_rungs), (1,)).item())
+            ts_t_corr = self.ode_teachersup_rungs[_ri]
+            p_pack = pred_x0[:, -_nfb:]                    # [2B, nfb, C, H, W], grad
+            B2 = p_pack.shape[0]
+            with torch.no_grad():
+                eps_ts = torch.randn_like(p_pack.float())
+                t_blk = torch.full(
+                    (B2, _nfb), float(ts_t_corr),
+                    device=p_pack.device, dtype=torch.float32)
+                x_ren = self.scheduler.add_noise(
+                    p_pack.detach().float().flatten(0, 1),
+                    eps_ts.flatten(0, 1), t_blk.flatten(0, 1),
+                ).unflatten(0, (B2, _nfb)).to(dtype)
+                corr_pack = noisy_pack.clone()
+                t_corr_pack = t_pack.clone()
+                # steps=1: single x0 readout (conditional mean). steps>1:
+                # walk the teacher down the REAL 20-step shift-5 grid tail
+                # below t_corr — the final x0 readout is then an actual
+                # teacher sample of the student's content, sharp.
+                _grid = [1000.0 * (5.0 * u) / (1.0 + 4.0 * u)
+                         for u in (1.0 - i / 20.0 for i in range(20))]
+                _tail = [t for t in _grid if t < ts_t_corr - 1e-4]
+                _tail = _tail[: max(self.ode_teachersup_steps - 1, 0)]
+                x_cur, t_cur = x_ren, float(ts_t_corr)
+                tea_x0 = None
+                for t_nxt in _tail + [None]:
+                    corr_pack[:, -_nfb:] = x_cur
+                    t_corr_pack[:, -_nfb:] = torch.full(
+                        (B2, _nfb), t_cur,
+                        device=p_pack.device, dtype=torch.float32,
+                    ).to(t_pack.dtype)
+                    tea_out = self._cd_teacher(
+                        noisy_image_or_video=corr_pack,
+                        conditional_dict=conditional,
+                        timestep=t_corr_pack,
+                        clean_x=clean_x_pack,
+                        aug_t=aug_t_pack,
+                    )
+                    tea_x0 = tea_out[1] if isinstance(tea_out, tuple) else tea_out
+                    if t_nxt is None:
+                        break
+                    _tf = torch.full((B2, _nfb), t_cur,
+                                     device=p_pack.device, dtype=torch.float32)
+                    _tt = torch.full((B2, _nfb), float(t_nxt),
+                                     device=p_pack.device, dtype=torch.float32)
+                    x_cur = self._cd_partial_denoise(
+                        x_cur, tea_x0[:, -_nfb:].to(x_cur.dtype), _tf, _tt)
+                    t_cur = float(t_nxt)
+                tea_tgt = tea_x0[:, -_nfb:].float()
+            ts_all = (p_pack.float() - tea_tgt).pow(2).mean(dim=(1, 2, 3, 4))
+            ts_sup_clean = ts_all[:B_pair].mean().to(dtype)
+            ts_sup_cf = ts_all[B_pair:].mean().to(dtype)
+            loss = loss + self.ode_teachersup_weight * (
+                ts_sup_clean + lam_cf * ts_sup_cf)
+
         # ---- Per-chunk ODE MSE diagnostic (for dashboard) — clean branch.
         with torch.no_grad():
             per_frame_sq = (pred_clean.float() - target_clean.float()).pow(2).mean(dim=(2, 3, 4))  # [B_pair, F]
@@ -1615,6 +1771,10 @@ class ODERegression(nn.Module):
             # ODE losses
             "ode_loss_clean": ode_loss_clean.detach(),
             "ode_loss_cf":    ode_loss_cf.detach(),
+            # On-policy teacher supervision (zeros when disabled)
+            "ode_teachersup_clean": ts_sup_clean.detach(),
+            "ode_teachersup_cf":    ts_sup_cf.detach(),
+            "ode_teachersup_t":     ts_t_corr,
             # State-probe losses
             "state_loss_clean": state_loss_clean.detach() if isinstance(state_loss_clean, torch.Tensor) else torch.tensor(0.0),
             "state_loss_cf":    state_loss_cf.detach()    if isinstance(state_loss_cf, torch.Tensor)    else torch.tensor(0.0),

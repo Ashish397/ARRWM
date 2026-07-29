@@ -27,7 +27,7 @@ CMD = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),
 ORDER = ["pca8_8node", "16node",
          "minwm", "matrixgame", "worldcam", "yume", "worldplay", "astra"]
 OURS = {"pca8_8node", "16node"}
-LABEL = {"pca8_8node": "ours pca8", "16node": "ours batch size 64"}
+LABEL = {"pca8_8node": "ours Default", "16node": "ours batch size 64"}
 STYLE = {  # ours = blues/solid lines, external = warm markers
     "pca8_8node": ("#08306b", "-", 2.6), "16node": ("#2166ac", "-", 2.6),
     "minwm": ("#7f7f7f", "o", 1.8), "matrixgame": ("#b2182b", "s", 1.8),
@@ -64,7 +64,7 @@ for fname, ccol, gcol in [("response_curves_eval_throttle.png", "c0", "g0"),
     ax.set_xlabel("commanded value"); ax.set_ylabel("teacher-read response (CoTracker→PCA)")
     ax.grid(alpha=0.3)
     ax.set_xlim(lo, hi)
-    ax.legend(ncol=2, fontsize=8, loc="upper left")
+    ax.legend(ncol=2, fontsize=13, loc="upper left")
     fig.tight_layout()
     fig.savefig(f"{OUT}/{fname}", dpi=130)
     plt.close(fig)

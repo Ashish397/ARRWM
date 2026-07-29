@@ -1,0 +1,1896 @@
+# Adopted from https://github.com/guandeh17/Self-Forcing
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+from typing import Optional
+
+from wan.modules.attention import attention
+from wan.modules.model import (
+    WanRMSNorm,
+    rope_apply,
+    WanLayerNorm,
+    WAN_CROSSATTENTION_CLASSES,
+    rope_params,
+    MLPProj,
+    sinusoidal_embedding_1d,
+)
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from torch.nn.attention.flex_attention import BlockMask
+from diffusers.models.modeling_utils import ModelMixin
+import torch.nn as nn
+import torch
+import math
+import torch.distributed as dist
+from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+
+from utils.debug_option import DEBUG
+
+# wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
+# see https://github.com/pytorch/pytorch/issues/133254
+# change to default for other models
+flex_attention = torch.compile(
+    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+
+def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+    n, c = x.size(2), x.size(3) // 2
+
+    # split freqs
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    # loop over samples
+    output = []
+
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        # precompute multipliers
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+            seq_len, n, -1, 2))
+        freqs_i = torch.cat([
+            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+            dim=-1).reshape(seq_len, 1, -1)
+
+        # apply rotary embedding
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        # append to collection
+        output.append(x_i)
+    return torch.stack(output).type_as(x)
+
+
+def _separate_action_tokens(x, grid_sizes, action_per_frame):
+    """Pull appended non-spatial tokens out of the sequence before RoPE.
+
+    ``action_per_frame`` is the total count of *all* non-spatial tokens
+    appended after the spatial tokens in each frame — this includes both
+    action-conditioning tokens and state tokens.  RoPE is applied only to
+    the spatial portion; the non-spatial tokens are left unrotated and
+    re-merged afterwards via ``_merge_action_tokens``.
+
+    Layout per frame: [spatial_0 … spatial_{hw-1}, extra_0 … extra_{a-1}]
+    Returns (spatial_flat, extras_flat) where spatial has shape
+    [B, F*H*W, ...] and extras has [B, F*a, ...].
+    """
+    f, h, w = grid_sizes[0].tolist()
+    spatial = h * w
+    frame_seq = spatial + action_per_frame
+    # [B, F*frame_seq, ...] -> [B, F, frame_seq, ...]
+    x_framed = x.unflatten(1, (f, frame_seq))
+    return x_framed[:, :, :spatial].flatten(1, 2), x_framed[:, :, spatial:].flatten(1, 2)
+
+
+def _merge_action_tokens(spatial, action, grid_sizes, action_per_frame):
+    """Re-interleave non-spatial tokens back into the per-frame sequence after RoPE."""
+    f, h, w = grid_sizes[0].tolist()
+    spatial_per_frame = h * w
+    sp = spatial.unflatten(1, (f, spatial_per_frame))
+    ac = action.unflatten(1, (f, action_per_frame))
+    return torch.cat([sp, ac], dim=2).flatten(1, 2)
+
+
+class CausalWanSelfAttention(nn.Module):
+
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 local_attn_size=-1,
+                 sink_size=0,
+                 qk_norm=True,
+                 eps=1e-6):
+        assert dim % num_heads == 0
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.qk_norm = qk_norm
+        self.eps = eps
+        self.action_tokens_per_frame = 0
+        # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
+        if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
+            values = list(local_attn_size)
+        else:
+            values = [int(local_attn_size)]
+        non_neg_vals = [int(v) for v in values if int(v) != -1]
+        max_local = max(non_neg_vals) if len(non_neg_vals) > 0 else -1
+        self.max_attention_size = 32760 if max_local == -1 else max_local * 1560
+        # layers
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.tf_rope_offset = 0
+
+    def forward(
+        self,
+        x,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        block_mask,
+        kv_cache=None,
+        current_start=0,
+        cache_start=None
+    ):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            seq_lens(Tensor): Shape [B]
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            block_mask (BlockMask)
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        if cache_start is None:
+            cache_start = current_start
+
+        # query, key, value function
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+            return q, k, v
+
+        q, k, v = qkv_fn(x)
+
+        a_per_f = self.action_tokens_per_frame
+
+        def _rope_one_chunk(q_c, k_c, gs, offset=0):
+            """Apply RoPE to spatial tokens only; non-spatial tokens are excluded."""
+            if a_per_f > 0:
+                q_sp, q_act = _separate_action_tokens(q_c, gs, a_per_f)
+                k_sp, k_act = _separate_action_tokens(k_c, gs, a_per_f)
+                rq_sp = rope_apply(q_sp, gs, freqs, temporal_offset=offset)
+                rk_sp = rope_apply(k_sp, gs, freqs, temporal_offset=offset)
+                return (
+                    _merge_action_tokens(rq_sp, q_act, gs, a_per_f),
+                    _merge_action_tokens(rk_sp, k_act, gs, a_per_f),
+                )
+            return rope_apply(q_c, gs, freqs, temporal_offset=offset), \
+                   rope_apply(k_c, gs, freqs, temporal_offset=offset)
+
+        if kv_cache is None:
+            # Asymmetric-aware TF detection. ``tf_num_clean_frames`` and
+            # ``tf_num_noisy_frames`` are set by ``_forward_train`` before
+            # the blocks are called whenever clean_x is supplied. When
+            # the two are equal we are in v14's symmetric training contract
+            # (clean + noisy of the same size); the split logic below
+            # collapses to the legacy ``torch.chunk(q, 2)``. When they
+            # differ we are in the asymmetric scoring path (e.g. the
+            # dmd_one_step "21 GT clean + 3 student noisy" layout); the
+            # split happens at ``clean_seqlen`` rather than the midpoint.
+            nc = getattr(self, "tf_num_clean_frames", None)
+            nn_ = getattr(self, "tf_num_noisy_frames", None)
+            if nc is not None and nn_ is not None and (nc + nn_) > 0:
+                # ``frame_seqlen`` here is inferred from the joint
+                # length ``s`` and the explicit frame counts — the
+                # attention block doesn't otherwise carry frame_seqlen.
+                # When ``a_per_f > 0`` the per-frame extra tokens were
+                # already absorbed into ``s`` by _forward_train, so the
+                # inferred ``frame_seqlen`` includes them automatically.
+                frame_seqlen_local = s // (nc + nn_)
+                clean_seqlen = nc * frame_seqlen_local
+                noisy_seqlen = nn_ * frame_seqlen_local
+                is_tf = (
+                    s == clean_seqlen + noisy_seqlen
+                    and clean_seqlen > 0 and noisy_seqlen > 0
+                )
+            else:
+                # Legacy: assume symmetric halves and infer F from
+                # seq_lens. ``grid_sizes[0, 0]`` is also F (= noisy
+                # frame count), and we treat clean F = noisy F here.
+                is_tf = (s == seq_lens[0].item() * 2)
+                clean_seqlen = s // 2
+                noisy_seqlen = s - clean_seqlen
+                if is_tf:
+                    nc = int(grid_sizes[0, 0].item())
+                    nn_ = nc
+            if is_tf:
+                q_chunk = (q[:, :clean_seqlen], q[:, clean_seqlen:])
+                k_chunk = (k[:, :clean_seqlen], k[:, clean_seqlen:])
+                # Per-half grid_sizes — same spatial dims, different F.
+                # In the symmetric case both clones equal ``grid_sizes``.
+                gs_clean = grid_sizes.clone()
+                gs_clean[:, 0] = int(nc)
+                gs_noisy = grid_sizes.clone()
+                gs_noisy[:, 0] = int(nn_)
+                gs_per_half = (gs_clean, gs_noisy)
+                roped_query = []
+                roped_key = []
+                # ii=0 → clean, ii=1 → noisy. ``tf_rope_offset`` is the RoPE
+                # GAP between the halves; RoPE is relative, so only the gap
+                # matters for attention. Distribute it so BOTH halves keep
+                # NON-NEGATIVE absolute positions: ``rope_apply`` indexes
+                # ``freqs[off : off+F]``, which wraps (garbage) on a negative
+                # index. offset>=0 (clean earlier, v14 symmetric / content-
+                # only drift): clean@0, noisy@offset. offset<0 (clean AHEAD —
+                # the faithful forward-clean drift): noisy@0, clean@|offset|.
+                # Backward-compatible: positive offsets are unchanged.
+                _clean_off = max(0, -self.tf_rope_offset)
+                _noisy_off = max(0, self.tf_rope_offset)
+                for ii in range(2):
+                    offset = _noisy_off if ii == 1 else _clean_off
+                    rq, rk = _rope_one_chunk(q_chunk[ii], k_chunk[ii], gs_per_half[ii], offset)
+                    roped_query.append(rq.type_as(v))
+                    roped_key.append(rk.type_as(v))
+
+                roped_query = torch.cat(roped_query, dim=1)
+                roped_key = torch.cat(roped_key, dim=1)
+
+                padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
+                padded_roped_query = torch.cat(
+                    [roped_query,
+                     torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
+                                 device=q.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                padded_roped_key = torch.cat(
+                    [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
+                                            device=k.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                padded_v = torch.cat(
+                    [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
+                                    device=v.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                x = flex_attention(
+                    query=padded_roped_query.transpose(2, 1),
+                    key=padded_roped_key.transpose(2, 1),
+                    value=padded_v.transpose(2, 1),
+                    block_mask=block_mask
+                )[:, :, :-padded_length].transpose(2, 1)
+
+            else:
+                rq, rk = _rope_one_chunk(q, k, grid_sizes)
+                roped_query = rq.type_as(v)
+                roped_key = rk.type_as(v)
+
+                padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
+                padded_roped_query = torch.cat(
+                    [roped_query,
+                     torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
+                                 device=q.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                padded_roped_key = torch.cat(
+                    [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
+                                            device=k.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                padded_v = torch.cat(
+                    [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
+                                    device=v.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                x = flex_attention(
+                    query=padded_roped_query.transpose(2, 1),
+                    key=padded_roped_key.transpose(2, 1),
+                    value=padded_v.transpose(2, 1),
+                    block_mask=block_mask
+                )[:, :, :-padded_length].transpose(2, 1)
+        else:
+            frame_seqlen = math.prod(grid_sizes[0][1:]).item() + self.action_tokens_per_frame
+            current_start_frame = current_start // frame_seqlen
+            _apf = int(getattr(self, "action_tokens_per_frame", 0))
+            if _apf > 0 and getattr(self, "cached_rope_action_aware", False):
+                # Per-frame action tokens are INTERLEAVED ([sp.., act, sp.., act, ...]).
+                # Bare causal_rope_apply ropes x[:f*h*w] as a contiguous (f, h, w)
+                # grid, which — given the interleaving — misaligns the spatial tokens
+                # by ~1 token per frame (a per-chunk spatial shift / glitch). Match the
+                # teacher-forced training path exactly: pull the action tokens out, RoPE
+                # only the spatial tokens, leave the action tokens UNROTATED, re-merge.
+                q_sp, q_act = _separate_action_tokens(q, grid_sizes, _apf)
+                k_sp, k_act = _separate_action_tokens(k, grid_sizes, _apf)
+                rq_sp = causal_rope_apply(q_sp, grid_sizes, freqs, start_frame=current_start_frame)
+                rk_sp = causal_rope_apply(k_sp, grid_sizes, freqs, start_frame=current_start_frame)
+                roped_query = _merge_action_tokens(rq_sp, q_act, grid_sizes, _apf).type_as(v)
+                roped_key = _merge_action_tokens(rk_sp, k_act, grid_sizes, _apf).type_as(v)
+            else:
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+
+            current_end = current_start + roped_query.shape[1]
+            sink_tokens = self.sink_size * frame_seqlen
+            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
+            kv_cache_size = kv_cache["k"].shape[1]
+            num_new_tokens = roped_query.shape[1]
+            # Determinism-under-checkpoint fix:
+            # ``kv_cache["local_end_index"]`` and ``kv_cache["global_end_index"]``
+            # are mutable 0-d tensors that the rolling pipeline updates between
+            # a checkpointed live forward (``skip_cache_update=True``) and its
+            # backward recompute (via the subsequent clean-x0 commit forward +
+            # ``_trim_committed_kv_cache``). Reading them here would yield
+            # different slice sizes at recompute time, triggering
+            # ``CheckpointError: Recomputed values ... have different metadata``.
+            # The outer ``_forward_inference`` now snapshots both scalars into
+            # ``self._frozen_local_end_index`` / ``self._frozen_global_end_index``
+            # before each checkpointed block call; if they are present we use
+            # them, otherwise we fall back to the legacy live read.
+            _frozen_le = getattr(self, "_frozen_local_end_index", None)
+            _frozen_ge = getattr(self, "_frozen_global_end_index", None)
+            if _frozen_le is not None:
+                _cached_local_end_index = int(_frozen_le)
+            else:
+                _cached_local_end_index = int(kv_cache["local_end_index"].item())
+            if _frozen_ge is not None:
+                _cached_global_end_index = int(_frozen_ge)
+            else:
+                _cached_global_end_index = int(kv_cache["global_end_index"].item())
+            # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+            #     print("***********before attention***********")
+            #     print(f"kv_cache_size = {kv_cache_size / frame_seqlen}")
+            #     print(f"torch.is_grad_enabled() = {torch.is_grad_enabled()}")
+            #     print(f"current_end = {current_end / frame_seqlen}")
+            #     print(f"current_start = {current_start / frame_seqlen}")
+            #     print(f"kv_cache['global_end_index'] = {kv_cache['global_end_index']}")
+            #     print(f"kv_cache['local_end_index'] = {kv_cache['local_end_index']}")
+            #     print(f"num_new_tokens = {num_new_tokens}")
+
+            # Compute cache update parameters without modifying kv_cache directly
+            cache_update_info = None
+            is_recompute = current_end <= _cached_global_end_index and current_start > 0
+            if self.local_attn_size != -1 and (current_end > _cached_global_end_index) and (
+                    num_new_tokens + _cached_local_end_index > kv_cache_size):
+                # Calculate the number of new tokens added in this step
+                # Shift existing cache content left to discard oldest tokens
+                num_evicted_tokens = num_new_tokens + _cached_local_end_index - kv_cache_size
+                num_rolled_tokens = _cached_local_end_index - num_evicted_tokens - sink_tokens
+                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                #     print(f"need roll")
+                #     print(f"num_rolled_tokens: {num_rolled_tokens / frame_seqlen}")
+                #     print(f"num_evicted_tokens: {num_evicted_tokens / frame_seqlen}")
+                #     print(f"sink_tokens: {sink_tokens / frame_seqlen}")
+
+                # Compute updated local indices
+                local_end_index = _cached_local_end_index + current_end - \
+                    _cached_global_end_index - num_evicted_tokens
+                local_start_index = local_end_index - num_new_tokens
+
+                # Construct full k, v for attention computation (without modifying the original cache)
+                # Create temporary k, v for computation
+                temp_k = kv_cache["k"].clone()
+                temp_v = kv_cache["v"].clone()
+                
+                # Apply rolling update to the temporary cache
+                temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                    temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                    temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                
+                # Insert new key/value into the temporary cache
+                # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
+                write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
+                roped_offset = max(0, write_start_index - local_start_index)
+                write_len = max(0, local_end_index - write_start_index)
+                if write_len > 0:
+                    temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
+                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+                # Save cache update info for later use
+                cache_update_info = {
+                    "action": "roll_and_insert",
+                    "sink_tokens": sink_tokens,
+                    "num_rolled_tokens": num_rolled_tokens,
+                    "num_evicted_tokens": num_evicted_tokens,
+                    "local_start_index": local_start_index,
+                    "local_end_index": local_end_index,
+                    "write_start_index": write_start_index,
+                    "write_end_index": local_end_index,
+                    "new_k": roped_key[:, roped_offset:roped_offset + write_len],
+                    "new_v": v[:, roped_offset:roped_offset + write_len],
+                    "current_end": current_end,
+                    "is_recompute": is_recompute
+                }
+
+                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                #     print(f"used kv cache size: local_end_index - local_start_index = {local_end_index - local_start_index}")
+            else:
+                # Assign new keys/values directly up to current_end
+                local_end_index = _cached_local_end_index + current_end - _cached_global_end_index
+                local_start_index = local_end_index - num_new_tokens
+
+                # Construct full k, v for attention computation (without modifying the original cache)
+                temp_k = kv_cache["k"].clone()
+                temp_v = kv_cache["v"].clone()
+                # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
+                write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
+                roped_offset = max(0, write_start_index - local_start_index)
+                write_len = max(0, local_end_index - write_start_index)
+                if write_len > 0:
+                    temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
+                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+                # Save cache update info for later use
+                cache_update_info = {
+                    "action": "direct_insert",
+                    "local_start_index": local_start_index,
+                    "local_end_index": local_end_index,
+                    "write_start_index": write_start_index,
+                    "write_end_index": local_end_index,
+                    "new_k": roped_key[:, roped_offset:roped_offset + write_len],
+                    "new_v": v[:, roped_offset:roped_offset + write_len],
+                    "current_end": current_end,
+                    "is_recompute": is_recompute
+                }
+
+            # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+            #     print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
+
+            # Use temporary k, v to compute attention
+            if sink_tokens > 0:
+                # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
+                local_budget = self.max_attention_size - sink_tokens
+                k_sink = temp_k[:, :sink_tokens]
+                v_sink = temp_v[:, :sink_tokens]
+                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                #     print(f"local_budget: {local_budget}")
+                if local_budget > 0:
+                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
+                    k_local = temp_k[:, local_start_for_window:local_end_index]
+                    v_local = temp_v[:, local_start_for_window:local_end_index]
+                    k_cat = torch.cat([k_sink, k_local], dim=1)
+                    v_cat = torch.cat([v_sink, v_local], dim=1)
+                else:
+                    k_cat = k_sink
+                    v_cat = v_sink
+                x = attention(
+                    roped_query,
+                    k_cat,
+                    v_cat
+                )
+            else:
+                window_start = max(0, local_end_index - self.max_attention_size)
+                x = attention(
+                    roped_query,
+                    temp_k[:, window_start:local_end_index],
+                    temp_v[:, window_start:local_end_index]
+                )
+
+        # output
+        x = x.flatten(2)
+        x = self.o(x)
+        
+        # Return both output and cache update info
+        if kv_cache is not None:
+            return x, (current_end, local_end_index, cache_update_info)
+        else:
+            return x
+
+
+class CausalWanAttentionBlock(nn.Module):
+
+    def __init__(self,
+                 cross_attn_type,
+                 dim,
+                 ffn_dim,
+                 num_heads,
+                 local_attn_size=-1,
+                 sink_size=0,
+                 qk_norm=True,
+                 cross_attn_norm=False,
+                 eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.ffn_dim = ffn_dim
+        self.num_heads = num_heads
+        self.local_attn_size = local_attn_size
+        self.qk_norm = qk_norm
+        self.cross_attn_norm = cross_attn_norm
+        self.eps = eps
+
+        # layers
+        self.norm1 = WanLayerNorm(dim, eps)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.norm3 = WanLayerNorm(
+            dim, eps,
+            elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
+                                                                      num_heads,
+                                                                      (-1, -1),
+                                                                      qk_norm,
+                                                                      eps)
+        self.norm2 = WanLayerNorm(dim, eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
+            nn.Linear(ffn_dim, dim))
+
+        # modulation
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def forward(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        context_lens,
+        block_mask,
+        kv_cache=None,
+        crossattn_cache=None,
+        current_start=0,
+        cache_start=None
+    ):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, C]
+            e(Tensor): Shape [B, F, 6, C]
+            seq_lens(Tensor): Shape [B], length of each sequence in batch
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+        """
+        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+        # assert e.dtype == torch.float32
+        # with amp.autocast(dtype=torch.float32):
+        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
+        # assert e[0].dtype == torch.float32
+
+        # self-attention
+        self_attn_result = self.self_attn(
+            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
+            seq_lens, grid_sizes,
+            freqs, block_mask, kv_cache, current_start, cache_start)
+        
+        if kv_cache is not None:
+            y, cache_update_info = self_attn_result
+        else:
+            y = self_attn_result
+            cache_update_info = None
+
+        # with amp.autocast(dtype=torch.float32):
+        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+
+        # cross-attention & ffn function
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
+            x = x + self.cross_attn(self.norm3(x), context,
+                                    context_lens, crossattn_cache=crossattn_cache)
+            y = self.ffn(
+                (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
+                 frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
+            )
+            # with amp.autocast(dtype=torch.float32):
+            x = x + (y.unflatten(dim=1, sizes=(num_frames,
+                     frame_seqlen)) * e[5]).flatten(1, 2)
+            return x
+
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+        
+        if cache_update_info is not None:
+            # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
+            return x, cache_update_info
+        else:
+            return x
+
+
+class CausalHead(nn.Module):
+
+    def __init__(self, dim, out_dim, patch_size, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.out_dim = out_dim
+        self.patch_size = patch_size
+        self.eps = eps
+
+        # layers
+        out_dim = math.prod(patch_size) * out_dim
+        self.norm = WanLayerNorm(dim, eps)
+        self.head = nn.Linear(dim, out_dim)
+
+        # modulation
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+
+    def forward(self, x, e):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            e(Tensor): Shape [B, F, 1, C]
+        """
+        # assert e.dtype == torch.float32
+        # with amp.autocast(dtype=torch.float32):
+        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+        e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
+        x = (self.head(self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]))
+        return x
+
+
+class StateProbeLayer(nn.Module):
+    """Cross-attention layer that reads transformer features into probe queries."""
+
+    def __init__(self, model_dim: int, probe_dim: int, num_heads: int = 8, ffn_mult: int = 2):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(probe_dim)
+        self.norm_kv = nn.LayerNorm(model_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=probe_dim, num_heads=num_heads,
+            kdim=model_dim, vdim=model_dim, batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(probe_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(probe_dim, probe_dim * ffn_mult),
+            nn.GELU(),
+            nn.Linear(probe_dim * ffn_mult, probe_dim),
+        )
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        q_n = self.norm_q(q)
+        kv_n = self.norm_kv(kv)
+        attn_out, _ = self.cross_attn(q_n, kv_n, kv_n)
+        q = q + attn_out
+        q = q + self.ffn(self.norm_ff(q))
+        return q
+
+
+class StateProbeModule(nn.Module):
+    """Chunk-local cross-attention probe for extracting per-chunk action state.
+
+    A single learned query is applied independently to each temporal chunk's
+    features, tapped at multiple transformer depths.  Because every chunk
+    sees the *same* query, the probe transfers directly to causal inference
+    where only the current chunk's features are available.
+
+    During teacher-forcing training all chunks are processed in parallel by
+    folding them into the batch dimension.
+
+    Only *spatial* tokens are used as KV for cross-attention; any per-frame
+    action tokens are stripped so the probe must learn to read video content
+    rather than shortcutting through the action conditioning embedding.
+    """
+
+    def __init__(
+        self,
+        n_chunks: int,
+        model_dim: int,
+        probe_dim: int = 256,
+        z_out_dim: int = 2,
+        num_heads: int = 8,
+        n_taps: int = 6,
+        num_frame_per_block: int = 3,
+        action_tokens_per_frame: int = 0,
+    ):
+        super().__init__()
+        self.n_chunks = n_chunks
+        self.probe_dim = probe_dim
+        self.num_frame_per_block = num_frame_per_block
+        self.action_tokens_per_frame = action_tokens_per_frame
+
+        self.query_init = nn.Parameter(torch.randn(1, probe_dim) * 0.02)
+        self.probe_layers = nn.ModuleList([
+            StateProbeLayer(model_dim, probe_dim, num_heads)
+            for _ in range(n_taps)
+        ])
+        self.readout = nn.Linear(probe_dim, z_out_dim)
+        nn.init.normal_(self.readout.weight, std=1e-3)
+        nn.init.zeros_(self.readout.bias)
+
+    def forward(self, tapped_features: list, noisy_start: int, frame_seqlen: int):
+        """
+        Args:
+            tapped_features: list of ``[B, total_seq, model_dim]`` at each tap.
+                             Must have exactly ``len(self.probe_layers)`` entries.
+            noisy_start:     token index where the noisy-side begins
+            frame_seqlen:    tokens per frame (spatial + action tokens)
+        Returns:
+            ``(state_preds, probe_hidden)`` with shapes
+            ``[B, n_chunks, z_out_dim]`` and ``[B, n_chunks, probe_dim]``
+        """
+        assert len(tapped_features) == len(self.probe_layers), (
+            f"StateProbeModule expected {len(self.probe_layers)} tapped features "
+            f"(one per probe layer), but got {len(tapped_features)}"
+        )
+
+        B = tapped_features[0].shape[0]
+        C = self.n_chunks
+        fpb = self.num_frame_per_block
+        chunk_tokens = fpb * frame_seqlen
+        a_per_f = self.action_tokens_per_frame
+        spatial_per_frame = frame_seqlen - a_per_f
+
+        # Shared query expanded for all batch×chunk pairs
+        q = self.query_init.unsqueeze(0).expand(B * C, -1, -1)          # [B*C, 1, D]
+        q = q.to(dtype=tapped_features[0].dtype, device=tapped_features[0].device)
+
+        for feat, layer in zip(tapped_features, self.probe_layers):
+            # Slice noisy side then reshape into per-chunk KV
+            noisy = feat[:, noisy_start:]                                # [B, noisy_seq, D]
+            noisy_chunked = noisy[:, :C * chunk_tokens]
+            kv = noisy_chunked.reshape(B * C, chunk_tokens, -1)         # [B*C, chunk_tok, D]
+
+            if a_per_f > 0:
+                # Strip action tokens so the probe only sees spatial features.
+                # Layout per frame: [spatial_0..spatial_{s-1}, action_0..action_{a-1}]
+                kv = kv.unflatten(1, (fpb, frame_seqlen))               # [B*C, fpb, frame_seqlen, D]
+                kv = kv[:, :, :spatial_per_frame].flatten(1, 2)          # [B*C, fpb*spatial, D]
+
+            q = layer(q, kv)
+
+        q = q.reshape(B, C, self.probe_dim)                             # [B, C, probe_dim]
+        preds = torch.nn.functional.linear(
+            q.float(), self.readout.weight.float(), self.readout.bias.float(),
+        )
+        return preds, q
+
+
+class CausalWanModel(ModelMixin, ConfigMixin):
+    r"""
+    Wan diffusion backbone supporting both text-to-video and image-to-video.
+    """
+
+    ignore_for_config = [
+        'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim'
+    ]
+    _no_split_modules = ['WanAttentionBlock']
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(self,
+                 model_type='t2v',
+                 patch_size=(1, 2, 2),
+                 text_len=512,
+                 in_dim=16,
+                 dim=2048,
+                 ffn_dim=8192,
+                 freq_dim=256,
+                 text_dim=4096,
+                 out_dim=16,
+                 num_heads=16,
+                 num_layers=32,
+                 local_attn_size=-1,
+                 sink_size=0,
+                 qk_norm=True,
+                 cross_attn_norm=True,
+                 eps=1e-6):
+        r"""
+        Initialize the diffusion model backbone.
+
+        Args:
+            model_type (`str`, *optional*, defaults to 't2v'):
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
+            patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
+                3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
+            text_len (`int`, *optional*, defaults to 512):
+                Fixed length for text embeddings
+            in_dim (`int`, *optional*, defaults to 16):
+                Input video channels (C_in)
+            dim (`int`, *optional*, defaults to 2048):
+                Hidden dimension of the transformer
+            ffn_dim (`int`, *optional*, defaults to 8192):
+                Intermediate dimension in feed-forward network
+            freq_dim (`int`, *optional*, defaults to 256):
+                Dimension for sinusoidal time embeddings
+            text_dim (`int`, *optional*, defaults to 4096):
+                Input dimension for text embeddings
+            out_dim (`int`, *optional*, defaults to 16):
+                Output video channels (C_out)
+            num_heads (`int`, *optional*, defaults to 16):
+                Number of attention heads
+            num_layers (`int`, *optional*, defaults to 32):
+                Number of transformer blocks
+            local_attn_size (`int`, *optional*, defaults to -1):
+                Window size for temporal local attention (-1 indicates global attention)
+            sink_size (`int`, *optional*, defaults to 0):
+                Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
+            qk_norm (`bool`, *optional*, defaults to True):
+                Enable query/key normalization
+            cross_attn_norm (`bool`, *optional*, defaults to False):
+                Enable cross-attention normalization
+            eps (`float`, *optional*, defaults to 1e-6):
+                Epsilon value for normalization layers
+        """
+
+        super().__init__()
+
+        assert model_type in ['t2v', 'i2v']
+        self.model_type = model_type
+
+        self.patch_size = patch_size
+        self.text_len = text_len
+        self.in_dim = in_dim
+        self.dim = dim
+        self.ffn_dim = ffn_dim
+        self.freq_dim = freq_dim
+        self.text_dim = text_dim
+        self.out_dim = out_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.local_attn_size = local_attn_size
+        self.qk_norm = qk_norm
+        self.cross_attn_norm = cross_attn_norm
+        self.eps = eps
+
+        # embeddings
+        self.patch_embedding = nn.Conv3d(
+            in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
+            nn.Linear(dim, dim))
+
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.time_projection = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim, dim * 6))
+
+        # blocks
+        cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+        self.blocks = nn.ModuleList([
+            CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
+            for _ in range(num_layers)
+        ])
+
+        # head
+        self.head = CausalHead(dim, out_dim, patch_size, eps)
+        # Optional alt head — built lazily via ``enable_alt_head()``.
+        # Same architecture as ``self.head`` (a tiny ~135K-param
+        # projection that maps backbone features to flow-space output)
+        # but learns a different target. In v21 the alt head is trained
+        # to predict the EMA-real teacher's x0 (instead of the student's
+        # x0 the normal head predicts). At inference time, the alt
+        # output produces a "causal_AR_GT" estimate when fed a noised
+        # GT — used to shape the aux teacher's clean reference so the
+        # online LoRA teacher learns to denoise AR-noise back to true GT.
+        # The alt head's input is detached during forward so its loss
+        # never propagates into the backbone (preserving the existing
+        # fake_score training contract).
+        self.head_alt: Optional[CausalHead] = None
+
+        # buffers (don't use register_buffer otherwise dtype will be changed in to())
+        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+        d = dim // num_heads
+        # RoPE temporal table size. Upstream used 1024, which caps rides at
+        # ~1024 frames (~334 rolling staircase steps at npb=3). Phase-1 rolls
+        # to the natural end of each ride and can exceed that. We bump the
+        # table to 10000 positions: bit-identical at positions [0..1023]
+        # (same theta=10000, same torch.arange(i) formula) and safe up to
+        # ~theta before frequency aliasing would appear. This is the "naive
+        # RoPE" extension; it doesn't touch any learned weights.
+        _ROPE_MAX_SEQ_LEN = 10000
+        self.freqs = torch.cat([
+            rope_params(_ROPE_MAX_SEQ_LEN, d - 4 * (d // 6)),
+            rope_params(_ROPE_MAX_SEQ_LEN, 2 * (d // 6)),
+            rope_params(_ROPE_MAX_SEQ_LEN, 2 * (d // 6))
+        ],
+            dim=1)
+        self.rope_max_seq_len = _ROPE_MAX_SEQ_LEN
+
+        if model_type == 'i2v':
+            self.img_emb = MLPProj(1280, dim)
+
+        # initialize weights
+        self.init_weights()
+
+        self.gradient_checkpointing = False
+
+        self.block_mask = None
+
+        self.num_frame_per_block = 1
+        self.independent_first_frame = False
+        self.context_shift = 0
+        # Single source of truth for the joint-TF noisy-half RoPE
+        # offset. ``None`` is the "not set" sentinel — the
+        # ``CausalWanModel.forward`` clean_x branch falls back to the
+        # legacy ``context_shift * num_frame_per_block`` derivation in
+        # that case so ODE-distill / eval pipelines continue to work
+        # unchanged. The action-forcing trainer sets this attribute
+        # explicitly to lock in v14's training-time convention; an
+        # explicit value (including ``0``) wins over the derivation.
+        self.tf_rope_offset_frames: Optional[int] = None
+        # Total non-spatial tokens appended per frame (action + state).
+        # RoPE is applied only to spatial tokens; this count tells the
+        # separation helpers how many trailing tokens to skip.
+        self.action_tokens_per_frame = 0
+        self.state_tokens_per_frame = 0
+
+    def enable_alt_head(self) -> None:
+        """Build the alt head (warm-init from the main head's weights).
+
+        Idempotent — calling twice is a no-op. Should be called AFTER
+        the main head's weights are loaded (e.g. from a pretrained
+        checkpoint) so the alt head starts from the same parameter
+        values, then diverges via its own training loss.
+        """
+        if self.head_alt is not None:
+            return
+        self.head_alt = CausalHead(
+            self.dim, self.out_dim, self.patch_size, self.eps,
+        )
+        # Warm-init from main head. Move to the same device/dtype
+        # before copying state_dict so the deep-copy is type-safe.
+        main_state = self.head.state_dict()
+        # Move alt to main's device/dtype first.
+        sample_param = next(self.head.parameters())
+        self.head_alt.to(device=sample_param.device, dtype=sample_param.dtype)
+        self.head_alt.load_state_dict(main_state)
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        self.gradient_checkpointing = value
+
+    @staticmethod
+    def _prepare_blockwise_causal_attn_mask(
+        device: torch.device | str, num_frames: int = 21,
+        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1
+    ) -> BlockMask:
+        """
+        we will divide the token sequence into the following format
+        [1 latent frame] [1 latent frame] ... [1 latent frame]
+        We use flexattention to construct the attention mask
+        """
+        total_length = num_frames * frame_seqlen
+
+        # we do right padding to get to a multiple of 128
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        torch.cuda.empty_cache()
+
+        ends = torch.zeros(total_length + padded_length,
+                           device=device, dtype=torch.long)
+
+        # Block-wise causal mask will attend to all elements that are before the end of the current chunk
+        frame_indices = torch.arange(
+            start=0,
+            end=total_length,
+            step=frame_seqlen * num_frame_per_block,
+            device=device
+        )
+
+        for tmp in frame_indices:
+            ends[tmp:tmp + frame_seqlen * num_frame_per_block] = tmp + \
+                frame_seqlen * num_frame_per_block
+
+        def attention_mask(b, h, q_idx, kv_idx):
+            if local_attn_size == -1:
+                return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
+            else:
+                return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (q_idx == kv_idx)
+
+        block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
+                                       KV_LEN=total_length + padded_length, _compile=True, device=device)
+
+        return block_mask
+
+    @staticmethod
+    def _prepare_teacher_forcing_mask(
+        device: torch.device | str, num_frames: int = 21,
+        frame_seqlen: int = 1560, num_frame_per_block=1,
+        context_shift: int = 0,
+        causal: bool = True,
+        num_noisy_frames: Optional[int] = None,
+    ) -> BlockMask:
+        """
+        Joint-TF attention mask over ``[clean | noisy]``. When
+        ``num_noisy_frames`` is ``None`` the noisy half is the same
+        size as the clean half (v14's symmetric training contract).
+        Pass an explicit ``num_noisy_frames`` (< ``num_frames``) to
+        score a smaller noisy slab against a full clean context — the
+        dmd_one_step path uses this for "1 noisy chunk vs 7 GT clean
+        chunks". In that asymmetric case the noisy half is placed
+        AFTER the clean range in sequence; the bidirectional mask
+        still has the noisy chunk attend to all clean.
+
+        When ``causal=True`` (default; v14 parity) the mask is
+        block-causal on the joint [clean | noisy] sequence: clean
+        attends to preceding clean; noisy attends to its own block
+        plus preceding (block_index + context_shift) clean blocks.
+
+        When ``causal=False`` the mask is FULLY BIDIRECTIONAL — every
+        position attends to every other position across the joint
+        sequence. Padding is still respected via ``total_length``.
+        """
+        num_clean_frames = num_frames
+        if num_noisy_frames is None:
+            num_noisy_frames = num_clean_frames
+
+        total_length = (num_clean_frames + num_noisy_frames) * frame_seqlen
+
+        # we do right padding to get to a multiple of 128
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        # Free cached GPU memory before the large transient allocation
+        # needed by create_block_mask (~4 GiB dense intermediate).
+        torch.cuda.empty_cache()
+
+        clean_ends = num_clean_frames * frame_seqlen
+        # for clean context frames, we can construct their flex attention mask based on a [start, end] interval
+        context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        # for noisy frames, we need two intervals to construct the flex attention mask [context_start, context_end] [noisy_start, noisy_end]
+        noise_context_starts = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        noise_context_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        noise_noise_starts = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        noise_noise_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+
+        # Block-wise causal mask will attend to all elements that are before the end of the current chunk
+        attention_block_size = frame_seqlen * num_frame_per_block
+        frame_indices = torch.arange(
+            start=0,
+            end=clean_ends,
+            step=attention_block_size,
+            device=device, dtype=torch.long
+        )
+
+        # attention for clean context frames
+        for start in frame_indices:
+            context_ends[start:start + attention_block_size] = start + attention_block_size
+
+        noisy_image_start_list = torch.arange(
+            clean_ends, total_length,
+            step=attention_block_size,
+            device=device, dtype=torch.long
+        )
+        noisy_image_end_list = noisy_image_start_list + attention_block_size
+
+        # attention for noisy frames. In the asymmetric case the
+        # noisy slab is conceptually anchored to the END of v14's
+        # 7-chunk noisy layout (i.e. the "last noisy chunk" position).
+        # Shift the block_index by ``(num_clean_chunks - num_noisy_chunks)``
+        # so a single noisy chunk sees all 7 clean chunks via the
+        # ``(block_index + context_shift) * attention_block_size``
+        # upper bound. When ``num_noisy_frames == num_clean_frames``
+        # the shift is zero and the formula collapses to v14's
+        # symmetric training contract.
+        num_clean_chunks = num_clean_frames // num_frame_per_block
+        num_noisy_chunks = num_noisy_frames // num_frame_per_block
+        noisy_block_offset = num_clean_chunks - num_noisy_chunks
+        for block_index, (start, end) in enumerate(zip(noisy_image_start_list, noisy_image_end_list)):
+            # attend to noisy tokens within the same block
+            noise_noise_starts[start:end] = start
+            noise_noise_ends[start:end] = end
+            # attend to context tokens in previous blocks
+            # noise_context_starts[start:end] = 0
+            effective_block_index = block_index + noisy_block_offset
+            noise_context_ends[start:end] = (effective_block_index + context_shift) * attention_block_size
+
+        if causal:
+            def attention_mask(b, h, q_idx, kv_idx):
+                # first design the mask for clean frames
+                clean_mask = (q_idx < clean_ends) & (kv_idx < context_ends[q_idx])
+                # then design the mask for noisy frames
+                # noisy frames will attend to all clean preceeding clean frames + itself
+                C1 = (kv_idx < noise_noise_ends[q_idx]) & (kv_idx >= noise_noise_starts[q_idx])
+                C2 = (kv_idx < noise_context_ends[q_idx]) & (kv_idx >= noise_context_starts[q_idx])
+                noise_mask = (q_idx >= clean_ends) & (C1 | C2)
+
+                eye_mask = q_idx == kv_idx
+                return eye_mask | clean_mask | noise_mask
+        else:
+            # Full-bidirectional joint sequence (real_teacher_causal_mask=false).
+            # Every position attends to every other position; padding is
+            # still respected because the BlockMask is built only over
+            # ``total_length + padded_length`` and downstream attention
+            # implementations honour the padding extents.
+            def attention_mask(b, h, q_idx, kv_idx):
+                return q_idx >= 0  # always-True mask (q_idx is non-negative by construction)
+
+        block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
+                                       KV_LEN=total_length + padded_length, _compile=True, device=device)
+
+        if DEBUG:
+            import imageio
+            import numpy as np
+            from torch.nn.attention.flex_attention import create_mask
+
+            mask = create_mask(attention_mask, B=None, H=None, Q_LEN=total_length +
+                               padded_length, KV_LEN=total_length + padded_length, device=device)
+            import cv2
+            mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
+            imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
+
+        return block_mask
+
+    @staticmethod
+    def _prepare_blockwise_causal_attn_mask_i2v(
+        device: torch.device | str, num_frames: int = 21,
+        frame_seqlen: int = 1560, num_frame_per_block=4, local_attn_size=-1
+    ) -> BlockMask:
+        """
+        we will divide the token sequence into the following format
+        [1 latent frame] [N latent frame] ... [N latent frame]
+        The first frame is separated out to support I2V generation
+        We use flexattention to construct the attention mask
+        """
+        total_length = num_frames * frame_seqlen
+
+        # we do right padding to get to a multiple of 128
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        ends = torch.zeros(total_length + padded_length,
+                           device=device, dtype=torch.long)
+
+        # special handling for the first frame
+        ends[:frame_seqlen] = frame_seqlen
+
+        # Block-wise causal mask will attend to all elements that are before the end of the current chunk
+        frame_indices = torch.arange(
+            start=frame_seqlen,
+            end=total_length,
+            step=frame_seqlen * num_frame_per_block,
+            device=device
+        )
+
+        for idx, tmp in enumerate(frame_indices):
+            ends[tmp:tmp + frame_seqlen * num_frame_per_block] = tmp + \
+                frame_seqlen * num_frame_per_block
+
+        def attention_mask(b, h, q_idx, kv_idx):
+            if local_attn_size == -1:
+                return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
+            else:
+                return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | \
+                    (q_idx == kv_idx)
+
+        block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
+                                       KV_LEN=total_length + padded_length, _compile=False, device=device)
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            pass
+
+        # import imageio
+        # import numpy as np
+        # from torch.nn.attention.flex_attention import create_mask
+
+        # mask = create_mask(attention_mask, B=None, H=None, Q_LEN=total_length +
+        #                    padded_length, KV_LEN=total_length + padded_length, device=device)
+        # import cv2
+        # mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
+        # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
+
+        return block_mask
+
+    def _apply_cache_updates(self, kv_cache, cache_update_infos):
+        """
+        Applies cache updates collected from multiple blocks.
+        Args:
+            kv_cache: List of cache dictionaries for each block
+            cache_update_infos: List of (block_index, cache_update_info) tuples
+        """
+        for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
+            if update_info is not None:
+                cache = kv_cache[block_index]
+                
+                if update_info["action"] == "roll_and_insert":
+                    # Apply rolling update
+                    sink_tokens = update_info["sink_tokens"]
+                    num_rolled_tokens = update_info["num_rolled_tokens"]
+                    num_evicted_tokens = update_info["num_evicted_tokens"]
+                    local_start_index = update_info["local_start_index"]
+                    local_end_index = update_info["local_end_index"]
+                    write_start_index = update_info.get("write_start_index", local_start_index)
+                    write_end_index = update_info.get("write_end_index", local_end_index)
+                    new_k = update_info["new_k"]
+                    new_v = update_info["new_v"]
+                    
+                    # Perform the rolling operation
+                    cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    
+                    # Insert new key/value
+                    if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
+                        cache["k"][:, write_start_index:write_end_index] = new_k
+                        cache["v"][:, write_start_index:write_end_index] = new_v
+                    
+                elif update_info["action"] == "direct_insert":
+                    # Direct insert
+                    local_start_index = update_info["local_start_index"]
+                    local_end_index = update_info["local_end_index"]
+                    write_start_index = update_info.get("write_start_index", local_start_index)
+                    write_end_index = update_info.get("write_end_index", local_end_index)
+                    new_k = update_info["new_k"]
+                    new_v = update_info["new_v"]
+                    
+                    # Insert new key/value
+                    if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
+                        cache["k"][:, write_start_index:write_end_index] = new_k
+                        cache["v"][:, write_start_index:write_end_index] = new_v
+            
+            # Update indices: do not roll back pointers during recomputation
+            is_recompute = False if update_info is None else update_info.get("is_recompute", False)
+            if not is_recompute:
+                kv_cache[block_index]["global_end_index"].fill_(current_end)
+                kv_cache[block_index]["local_end_index"].fill_(local_end_index)
+
+    def _forward_inference(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        clip_fea=None,
+        y=None,
+        kv_cache: dict = None,
+        crossattn_cache: dict = None,
+        current_start: int = 0,
+        cache_start: int = 0,
+        action_tokens=None,
+        state_tokens=None,
+        compute_alt_head: bool = False,
+    ):
+        r"""
+        Run the diffusion model with kv caching.
+        See Algorithm 2 of CausVid paper https://arxiv.org/abs/2412.07772 for details.
+        This function will be run for num_frame times.
+        Process the latent frames one by one (1560 tokens each)
+
+        Args:
+            x (List[Tensor]):
+                List of input video tensors, each with shape [C_in, F, H, W]
+            t (Tensor):
+                Diffusion timesteps tensor of shape [B]
+            context (List[Tensor]):
+                List of text embeddings each with shape [L, C]
+            seq_len (`int`):
+                Maximum sequence length for positional encoding
+            clip_fea (Tensor, *optional*):
+                CLIP image features for image-to-video mode
+            y (List[Tensor], *optional*):
+                Conditional video inputs for image-to-video mode, same shape as x
+
+        Returns:
+            List[Tensor]:
+                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+        """
+
+        if self.model_type == 'i2v':
+            assert clip_fea is not None and y is not None
+        # params
+        device = self.patch_embedding.weight.device
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
+        s_per_f = self.state_tokens_per_frame
+        a_per_f = self.action_tokens_per_frame
+        for block in self.blocks:
+            block.self_attn.action_tokens_per_frame = a_per_f
+
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        
+        # print(f"x.device: {x[0].device}, t.device: {t.device}, context.device: {context.device}, seq_len: {seq_len}")
+
+        # embeddings
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # print("patch embedding done")
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+
+        spatial_seqlen = math.prod(grid_sizes[0][1:]).item()
+        num_frames_local = grid_sizes[0, 0].item()
+        if a_per_f > 0:
+            x = [u[:, :num_frames_local * spatial_seqlen].unflatten(1, (num_frames_local, spatial_seqlen)) for u in x]
+            x_with_extras = []
+            for batch_idx, u in enumerate(x):
+                extras = []
+                if action_tokens is not None:
+                    extras.append(action_tokens[batch_idx:batch_idx + 1].unsqueeze(2).to(dtype=u.dtype, device=u.device))
+                if state_tokens is not None:
+                    extras.append(state_tokens[batch_idx:batch_idx + 1].unsqueeze(2).to(dtype=u.dtype, device=u.device))
+                if extras:
+                    u = torch.cat([u] + extras, dim=2).flatten(1, 2)
+                else:
+                    u = u.flatten(1, 2)
+                x_with_extras.append(u)
+            x = x_with_extras
+
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        assert seq_lens.max() <= seq_len + num_frames_local * a_per_f
+        x = torch.cat(x)
+        """
+        torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in x
+        ])
+        """
+
+        # time embeddings
+        # with amp.autocast(dtype=torch.float32):
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        e0 = self.time_projection(e).unflatten(
+            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+        # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        # print("time embedding done")
+        # context
+        context_lens = None
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+        # print("text embedding done")
+        if clip_fea is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+
+        # arguments
+        kwargs = dict(
+            e=e0,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=self.freqs,
+            context=context,
+            context_lens=context_lens,
+            block_mask=self.block_mask
+        )
+        # print("kwargs done")
+        def create_custom_forward(module):
+            def custom_forward(*inputs, **kwargs):
+                return module(*inputs, **kwargs)
+            return custom_forward
+
+        cache_update_info = None
+        cache_update_infos = []  # Collect cache update info for all blocks
+        # State-probe tap collection (mirrors _forward_train). Opt-in via
+        # `_state_probe_tap_set`: when the state_probe branch is attached to
+        # the model, we snapshot intermediate activations at the probe layers
+        # so the wrapper can route them to `StateProbeModule.forward`. The
+        # taps carry autograd history, so backprop from probe loss flows
+        # through the full DiT — this is what gives Phase-1 DMD its
+        # state_probe auxiliary loss without an extra training forward.
+        probe_tap_set = getattr(self, '_state_probe_tap_set', None)
+        tapped_infer = [] if probe_tap_set else None
+
+        # --- Determinism-under-checkpoint snapshot factory ---
+        # Capture per-block ``local_end_index`` / ``global_end_index`` scalars
+        # into Python ints closed over by ``custom_forward``. The rolling
+        # pipeline mutates those 0-d tensors between a checkpointed live
+        # forward (``skip_cache_update=True``) and its backward recompute
+        # (via the slot-0 commit forward + ``_trim_committed_kv_cache``).
+        # Python ints are immutable and captured by the closure, so the
+        # attention sees the same values at save and recompute.
+        def create_custom_forward_with_frozen(module, frozen_le, frozen_ge):
+            def custom_forward(*inputs, **kwargs):
+                prev_le = getattr(module.self_attn, "_frozen_local_end_index", None)
+                prev_ge = getattr(module.self_attn, "_frozen_global_end_index", None)
+                module.self_attn._frozen_local_end_index = frozen_le
+                module.self_attn._frozen_global_end_index = frozen_ge
+                try:
+                    return module(*inputs, **kwargs)
+                finally:
+                    module.self_attn._frozen_local_end_index = prev_le
+                    module.self_attn._frozen_global_end_index = prev_ge
+            return custom_forward
+
+        for block_index, block in enumerate(self.blocks):
+            # print(f"block_index: {block_index}")
+            if kv_cache is not None:
+                blk_cache = kv_cache[block_index]
+                frozen_le_i = int(blk_cache["local_end_index"].item())
+                frozen_ge_i = int(blk_cache["global_end_index"].item())
+            else:
+                frozen_le_i = None
+                frozen_ge_i = None
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                kwargs.update(
+                    {
+                        "kv_cache": kv_cache[block_index],
+                        "current_start": current_start,
+                        "cache_start": cache_start
+                    }
+                )
+                # print(f"forward checkpointing")
+                result = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward_with_frozen(block, frozen_le_i, frozen_ge_i),
+                    x, **kwargs,
+                    use_reentrant=False,
+                )
+                # Handle the result
+                if kv_cache is not None and isinstance(result, tuple):
+                    x, block_cache_update_info = result
+                    cache_update_infos.append((block_index, block_cache_update_info))
+                    # Extract base info for subsequent blocks (without concrete cache update details)
+                    cache_update_info = block_cache_update_info[:2]  # (current_end, local_end_index)
+                else:
+                    x = result
+            else:
+                kwargs.update(
+                    {
+                        "kv_cache": kv_cache[block_index],
+                        "crossattn_cache": crossattn_cache[block_index],
+                        "current_start": current_start,
+                        "cache_start": cache_start
+                    }
+                )
+                # print(f"forward no checkpointing")
+                result = block(x, **kwargs)
+                # Handle the result
+                if kv_cache is not None and isinstance(result, tuple):
+                    x, block_cache_update_info = result
+                    cache_update_infos.append((block_index, block_cache_update_info))
+                    # Extract base info for subsequent blocks (without concrete cache update details)
+                    cache_update_info = block_cache_update_info[:2]  # (current_end, local_end_index)
+                else:
+                    x = result
+            if tapped_infer is not None and block_index in probe_tap_set:
+                tapped_infer.append(x)
+        # log_gpu_memory(f"in _forward_inference: {x[0].device}")
+        # After all blocks are processed, apply cache updates in a single pass.
+        # `skip_cache_update` (module-level flag) lets callers run a forward
+        # through the KV-cache path *without* committing the current k/v into
+        # the persistent cache. Used by rolling-staircase training to do a
+        # 4-slot live forward (noisy slots 1-3) without polluting the clean
+        # cache; the pipeline then commits slot 0 with a separate clean-x0,
+        # t=0 forward that runs with this flag OFF.
+        if (
+            kv_cache is not None
+            and cache_update_infos
+            and not bool(getattr(self, "skip_cache_update", False))
+        ):
+            self._apply_cache_updates(kv_cache, cache_update_infos)
+
+        state_hidden = None
+        if a_per_f > 0:
+            frame_seqlen = spatial_seqlen + a_per_f
+            x_framed = x.unflatten(1, (num_frames_local, frame_seqlen))
+            if s_per_f > 0:
+                state_hidden = x_framed[:, :, -s_per_f:].squeeze(2)
+            x = x_framed[:, :, :spatial_seqlen].flatten(1, 2)
+
+        # head (main) + optional alt head sharing backbone features
+        e_head = e.unflatten(dim=0, sizes=t.shape).unsqueeze(2)
+        x_feat = x  # save pre-head features so alt head can read same input
+        x = self.head(x_feat, e_head)
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        out_alt = None
+        if compute_alt_head and self.head_alt is not None:
+            # Detach the alt head's input so its loss only updates
+            # alt-head params, never the backbone — preserves the
+            # existing fake_score training contract.
+            x_alt = self.head_alt(x_feat.detach(), e_head.detach())
+            x_alt = self.unpatchify(x_alt, grid_sizes)
+            out_alt = torch.stack(x_alt)
+        # Return contract:
+        #   - plain tensor when no extras
+        #   - (tensor, state_hidden) when action/state tokens produce hidden
+        #   - (tensor, tapped_infer) when only probe taps were collected
+        #   - (tensor, state_hidden, tapped_infer) when both are present
+        # Alt-head, when present, is APPENDED as the FINAL element of
+        # whatever tuple shape would otherwise be returned. The wrapper
+        # checks `compute_alt_head` to know how to pop it.
+        if state_hidden is not None and tapped_infer is not None:
+            if out_alt is not None:
+                return torch.stack(x), state_hidden, tapped_infer, out_alt
+            return torch.stack(x), state_hidden, tapped_infer
+        if state_hidden is not None:
+            if out_alt is not None:
+                return torch.stack(x), state_hidden, out_alt
+            return torch.stack(x), state_hidden
+        if tapped_infer is not None:
+            if out_alt is not None:
+                return torch.stack(x), tapped_infer, out_alt
+            return torch.stack(x), tapped_infer
+        if out_alt is not None:
+            return torch.stack(x), out_alt
+        return torch.stack(x)
+
+    def _forward_train(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        clean_x=None,
+        aug_t=None,
+        clip_fea=None,
+        y=None,
+        action_tokens=None,
+        action_tokens_clean=None,
+        state_tokens=None,
+        state_tokens_clean=None,
+        compute_alt_head: bool = False,
+    ):
+        r"""
+        Forward pass through the diffusion model.
+
+        Args:
+            x (List[Tensor]):
+                List of input video tensors, each with shape [C_in, F, H, W]
+            t (Tensor):
+                Diffusion timesteps tensor of shape [B]
+            context (List[Tensor]):
+                List of text embeddings each with shape [L, C]
+            seq_len (`int`):
+                Maximum sequence length for positional encoding
+            clip_fea (Tensor, *optional*):
+                CLIP image features for image-to-video mode
+            y (List[Tensor], *optional*):
+                Conditional video inputs for image-to-video mode, same shape as x
+            state_tokens (Tensor, *optional*):
+                Per-frame learned state tokens [B, F, dim] for the noisy half.
+            state_tokens_clean (Tensor, *optional*):
+                Per-frame learned state tokens [B, F, dim] for the clean half.
+
+        Returns:
+            Tensor or (Tensor, Tensor):
+                Denoised video tensors [B, C_out, F, H/8, W/8], and optionally
+                per-frame state hidden states [B, F, dim] when state tokens are used.
+        """
+        if self.model_type == 'i2v':
+            assert clip_fea is not None and y is not None
+        # params
+        device = self.patch_embedding.weight.device
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
+
+        s_per_f = self.state_tokens_per_frame
+        a_per_f = self.action_tokens_per_frame
+
+        # Single source of truth: ``model.tf_rope_offset_frames`` (set
+        # by the trainer — see ``model/dmd_action_forcing.py`` for the
+        # action-forcing scorer setup). Legacy callers (ODE distillation,
+        # eval scripts) only set ``context_shift`` and never touch
+        # ``tf_rope_offset_frames``; for them we fall back to the
+        # historic derivation ``context_shift * num_frame_per_block``
+        # so existing pipelines continue to work unchanged. The
+        # action-forcing trainer sets ``tf_rope_offset_frames``
+        # explicitly to lock in v14's training-time convention; that
+        # explicit value wins (including an explicit ``0``).
+        # ``None`` (the default in ``__init__``) is the "not set"
+        # sentinel and falls through to the derivation. Distinguishing
+        # ``None`` from ``0`` lets future callers explicitly request
+        # zero shift without being silently overridden.
+        if clean_x is not None:
+            explicit = getattr(self, "tf_rope_offset_frames", None)
+            rope_offset = (
+                int(explicit) if explicit is not None
+                else self.context_shift * self.num_frame_per_block
+            )
+        else:
+            rope_offset = 0
+        for block in self.blocks:
+            block.self_attn.tf_rope_offset = rope_offset
+            block.self_attn.action_tokens_per_frame = a_per_f
+
+        # Compute spatial frame_seqlen and effective frame_seqlen (incl. extra tokens)
+        spatial_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
+        frame_seqlen = spatial_seqlen + a_per_f
+
+        # Frame counts for the TF joint sequence. In v14's training
+        # contract clean and noisy halves had the same number of frames
+        # (default 21). The dmd_one_step path drives this asymmetric —
+        # full GT clean window (21 frames) vs a single student chunk
+        # (3 frames) — to give v14 an in-distribution clean context
+        # while scoring only the new student chunk on the noisy side.
+        if clean_x is not None:
+            num_noisy_frames = int(x.shape[2])
+            # ``clean_x`` is a list of [C, F_clean, H, W] tensors at
+            # this point; F_clean lives on dim 1 of each element.
+            num_clean_frames = int(clean_x[0].shape[1])
+            for block in self.blocks:
+                block.self_attn.tf_num_clean_frames = num_clean_frames
+                block.self_attn.tf_num_noisy_frames = num_noisy_frames
+        else:
+            num_clean_frames = 0
+            num_noisy_frames = int(x.shape[2])
+            # Clear any stale TF-frame attributes from a prior TF call
+            # so non-TF forwards on the same module don't pick up the
+            # asymmetric-aware branch in the attention layer.
+            for block in self.blocks:
+                block.self_attn.tf_num_clean_frames = None
+                block.self_attn.tf_num_noisy_frames = None
+
+        # Invalidate a cached TF block_mask when the clean/noisy frame
+        # counts change (e.g. switching between v14's symmetric 21+21
+        # layout and the dmd_one_step asymmetric 21+3 layout). The mask
+        # geometry depends on (num_clean_frames, num_noisy_frames,
+        # frame_seqlen); reusing a stale mask across a dim change would
+        # silently mis-attend. Keyed cache rebuilds only on change, so
+        # steady-state (all-asymmetric or all-symmetric) pays no per-
+        # call rebuild cost.
+        if clean_x is not None:
+            _tf_sig = (int(num_clean_frames), int(num_noisy_frames), int(frame_seqlen))
+            if getattr(self, "_tf_mask_sig", None) != _tf_sig:
+                self.block_mask = None
+                self._tf_mask_sig = _tf_sig
+
+        # Construct blockwise causal attn mask (invalidate if frame_seqlen changed)
+        if self.block_mask is None:
+            if clean_x is not None:
+                if self.independent_first_frame:
+                    raise NotImplementedError()
+                else:
+                    self.block_mask = self._prepare_teacher_forcing_mask(
+                        device, num_frames=num_clean_frames,
+                        frame_seqlen=frame_seqlen,
+                        num_frame_per_block=self.num_frame_per_block,
+                        context_shift=self.context_shift,
+                        causal=bool(getattr(self, "tf_use_causal_mask", True)),
+                        num_noisy_frames=num_noisy_frames,
+                    )
+            else:
+                if self.independent_first_frame:
+                    self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
+                        device, num_frames=x.shape[2],
+                        frame_seqlen=frame_seqlen,
+                        num_frame_per_block=self.num_frame_per_block,
+                        local_attn_size=self.local_attn_size
+                    )
+                else:
+                    self.block_mask = self._prepare_blockwise_causal_attn_mask(
+                        device, num_frames=x.shape[2],
+                        frame_seqlen=frame_seqlen,
+                        num_frame_per_block=self.num_frame_per_block,
+                        local_attn_size=self.local_attn_size
+                    )
+
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        # embeddings
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        x = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
+                      dim=1) for u in x
+        ])
+
+        # Insert extra per-frame tokens (action tokens + state tokens)
+        num_frames_local = grid_sizes[0, 0].item()
+        if a_per_f > 0:
+            x = x[:, :num_frames_local * spatial_seqlen]
+            x = x.unflatten(1, (num_frames_local, spatial_seqlen))
+            extras = []
+            if action_tokens is not None:
+                extras.append(action_tokens.unsqueeze(2).to(dtype=x.dtype, device=x.device))
+            if state_tokens is not None:
+                extras.append(state_tokens.unsqueeze(2).to(dtype=x.dtype, device=x.device))
+            if extras:
+                x = torch.cat([x] + extras, dim=2).flatten(1, 2)
+            else:
+                x = x.flatten(1, 2)
+
+        seq_lens = torch.tensor([x.shape[1]], dtype=torch.long).expand(x.shape[0])
+        assert seq_lens.max() <= seq_len + num_frames_local * a_per_f
+
+        # time embeddings
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        e0 = self.time_projection(e).unflatten(
+            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+
+        # context
+        context_lens = None
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+
+        if clip_fea is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+
+        if clean_x is not None:
+            clean_x = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
+            clean_x = [u.flatten(2).transpose(1, 2) for u in clean_x]
+
+            seq_lens_clean = torch.tensor([u.size(1) for u in clean_x], dtype=torch.long)
+            clean_x = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_lens_clean[0] - u.size(1), u.size(2))], dim=1) for u in clean_x
+            ])
+
+            # Insert clean extra tokens (action + state). Clean half's
+            # F may differ from the noisy half's (``num_frames_local``)
+            # under the asymmetric scoring path — drive the reshape
+            # with the clean half's own frame count.
+            num_clean_frames_local = num_clean_frames
+            if a_per_f > 0:
+                clean_x = clean_x[:, :num_clean_frames_local * spatial_seqlen]
+                clean_x = clean_x.unflatten(1, (num_clean_frames_local, spatial_seqlen))
+                extras_clean = []
+                if action_tokens_clean is not None:
+                    extras_clean.append(action_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device))
+                if state_tokens_clean is not None:
+                    extras_clean.append(state_tokens_clean.unsqueeze(2).to(dtype=clean_x.dtype, device=clean_x.device))
+                if extras_clean:
+                    clean_x = torch.cat([clean_x] + extras_clean, dim=2).flatten(1, 2)
+                else:
+                    clean_x = clean_x.flatten(1, 2)
+
+            x = torch.cat([clean_x, x], dim=1)
+            # seq_lens here is informational for downstream blocks.
+            # The attention layer's TF detection prefers
+            # ``tf_num_clean_frames`` / ``tf_num_noisy_frames`` set
+            # above; for legacy callers (no asymmetric attributes) it
+            # falls back to ``seq_lens[0] * 2`` which assumes symmetric
+            # halves. Set seq_lens to the noisy slab's length so the
+            # symmetric fallback still works when clean == noisy.
+            noisy_total_seqlen = x.shape[1] - clean_x.shape[1]
+            seq_lens = torch.tensor([noisy_total_seqlen], dtype=torch.long).expand(x.shape[0])
+
+            if aug_t is None:
+                aug_t = torch.zeros_like(t)
+            saved_am = getattr(self, '_action_modulation', None)
+            self._action_modulation = getattr(self, '_action_modulation_clean', None)
+            e_clean = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
+            # Reshape with ``aug_t.shape`` (the CLEAN half's per-frame
+            # timestep grid), NOT ``t.shape`` (the noisy half). Under the
+            # asymmetric layout the clean half has 21 frames while the
+            # noisy half has 3, so ``t.shape`` would demand B*3 rows from
+            # a B*21 tensor and crash. In the symmetric path
+            # aug_t.shape == t.shape so this is unchanged.
+            e0_clean = self.time_projection(e_clean).unflatten(
+                1, (6, self.dim)).unflatten(dim=0, sizes=aug_t.shape)
+            self._action_modulation = saved_am
+            e0 = torch.cat([e0_clean, e0], dim=1)
+
+        # arguments
+        kwargs = dict(
+            e=e0,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=self.freqs,
+            context=context,
+            context_lens=context_lens,
+            block_mask=self.block_mask)
+
+        def create_custom_forward(module):
+            def custom_forward(*inputs, **kwargs):
+                return module(*inputs, **kwargs)
+            return custom_forward
+
+        probe_tap_set = getattr(self, '_state_probe_tap_set', None)
+        tapped = [] if probe_tap_set else None
+
+        for i, block in enumerate(self.blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x, **kwargs,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, **kwargs)
+            if tapped is not None and i in probe_tap_set:
+                tapped.append(x)
+
+        if clean_x is not None:
+            # Strip the clean slab, keep only the noisy tail. Use the clean
+            # half's actual token count (``clean_x.shape[1]``) rather than a
+            # 50/50 split: under the asymmetric layout the clean half may have
+            # more frames than the noisy half (e.g. 21 clean + 3 noisy, or a
+            # growing clean context at inference). In the symmetric path
+            # clean_x.shape[1] == x.shape[1] // 2 exactly, so this is identical.
+            x = x[:, clean_x.shape[1]:]
+
+        # Extract state token hidden states before stripping extra tokens
+        state_hidden = None
+        if s_per_f > 0 and a_per_f > 0:
+            x_framed = x.unflatten(1, (num_frames_local, frame_seqlen))
+            state_hidden = x_framed[:, :, -s_per_f:].squeeze(2)  # [B, F, dim]
+
+        # Strip all extra tokens before head/unpatchify
+        if a_per_f > 0:
+            x = x.unflatten(1, (num_frames_local, frame_seqlen))
+            x = x[:, :, :spatial_seqlen].flatten(1, 2)
+
+        # head (main) + optional alt head sharing backbone features
+        e_head = e.unflatten(dim=0, sizes=t.shape).unsqueeze(2)
+        x_feat = x
+        x = self.head(x_feat, e_head)
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        out_alt = None
+        if compute_alt_head and self.head_alt is not None:
+            # Detach the alt head's input so its loss only updates
+            # alt-head params, never the backbone.
+            x_alt = self.head_alt(x_feat.detach(), e_head.detach())
+            x_alt = self.unpatchify(x_alt, grid_sizes)
+            out_alt = torch.stack(x_alt)
+
+        if state_hidden is not None:
+            if out_alt is not None:
+                return torch.stack(x), state_hidden, out_alt
+            return torch.stack(x), state_hidden
+
+        if tapped:
+            if out_alt is not None:
+                return torch.stack(x), tapped, out_alt
+            return torch.stack(x), tapped
+
+        if out_alt is not None:
+            return torch.stack(x), out_alt
+        return torch.stack(x)
+
+    def forward(
+        self,
+        *args,
+        **kwargs
+    ):
+        if kwargs.get('kv_cache', None) is not None:
+            return self._forward_inference(*args, **kwargs)
+        else:
+            return self._forward_train(*args, **kwargs)
+
+    def unpatchify(self, x, grid_sizes):
+        r"""
+        Reconstruct video tensors from patch embeddings.
+
+        Args:
+            x (List[Tensor]):
+                List of patchified features, each with shape [L, C_out * prod(patch_size)]
+            grid_sizes (Tensor):
+                Original spatial-temporal grid dimensions before patching,
+                    shape [B, 3] (3 dimensions correspond to F_patches, H_patches, W_patches)
+
+        Returns:
+            List[Tensor]:
+                Reconstructed video tensors with shape [C_out, F, H / 8, W / 8]
+        """
+
+        c = self.out_dim
+        out = []
+        for u, v in zip(x, grid_sizes.tolist()):
+            u = u[:math.prod(v)].view(*v, *self.patch_size, c)
+            u = torch.einsum('fhwpqrc->cfphqwr', u)
+            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            out.append(u)
+        return out
+
+    def init_weights(self):
+        r"""
+        Initialize model parameters using Xavier initialization.
+        """
+
+        # basic init
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # init embeddings
+        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
+        for m in self.text_embedding.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=.02)
+        for m in self.time_embedding.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=.02)
+
+        # init output layer
+        nn.init.zeros_(self.head.head.weight)

@@ -21,6 +21,12 @@ save an mp4 under .motion_check/ for realized-egomotion checks).
 """
 import os, json
 os.environ.setdefault("WORLD_SIZE", "1"); os.environ.setdefault("RANK", "0"); os.environ.setdefault("LOCAL_RANK", "0")
+# Pilot TRAINING jobs export AF_SNAPSHOT_STEPS/AF_EVAL_STEPS (pinned 14e
+# grid), but this recorder builds from the eval yaml whose random_steps
+# assume the DEFAULT snapshot grid — the leaked env crashes the build
+# ("step value 36 is not one of SNAPSHOT_STEPS"). Serving rungs are pinned
+# separately via FR_RUNGS, so the training grid is irrelevant here: drop it.
+os.environ.pop("AF_SNAPSHOT_STEPS", None); os.environ.pop("AF_EVAL_STEPS", None)
 import torch
 
 ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"

@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"
-RUNS = {"pca8_8node": ("batch size 32", "C1"), "16node": ("batch size 64", "C0"),
+RUNS = {"pca8_8node": ("Default", "C1"), "16node": ("batch size 64", "C0"),
         "pca4": ("pca4", "C3"), "pca2": ("pca2", "C4"),
         "4node": ("batch size 16", "C2"), "noatok": ("no action tokens", "C5"),
         "noadaln": ("no AdaLN", "C6")}
@@ -125,7 +125,7 @@ def main():
     ax.set_xlim(-0.75, lim); ax.set_ylim(-0.75, 0.75)
     ax.xaxis.set_major_locator(plt.MultipleLocator(0.2))
     ax.yaxis.set_major_locator(plt.MultipleLocator(0.2))
-    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    ax.legend(fontsize=14); ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{ARR}/analysis/response_complete.png", dpi=130)
     if tab:
@@ -155,7 +155,7 @@ def main():
     ax.set_xlim(-slim, slim); ax.set_ylim(-slim, slim)
     ax.xaxis.set_major_locator(plt.MultipleLocator(0.2))
     ax.yaxis.set_major_locator(plt.MultipleLocator(0.2))
-    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    ax.legend(fontsize=14); ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{ARR}/analysis/response_complete_steer.png", dpi=130)
     print(f"[resp] saved {ARR}/analysis/response_complete_steer.png")

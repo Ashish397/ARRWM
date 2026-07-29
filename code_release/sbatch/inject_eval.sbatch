@@ -1,0 +1,22 @@
+#!/bin/bash
+#SBATCH --job-name=inject-eval
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=16
+#SBATCH --time=03:00:00
+#SBATCH --output=${AF_ROOT}/logs/%x_%j.out
+#SBATCH --error=${AF_ROOT}/logs/%x_%j.err
+set -e -o pipefail
+cd ${AF_ROOT}
+source ${CONDA_ROOT}/bin/activate; conda activate arrwm
+export HF_HOME=${HF_HOME} PYTHONPATH=${AF_ROOT}:$PYTHONPATH TMPDIR=/tmp
+# IE_CONFIG IE_CKPT IE_PHASE IE_WINDOWS IE_MANIFEST IE_OUT are exported by the launcher (--export=ALL)
+echo "inject: phase=$IE_PHASE config=$IE_CONFIG out=$IE_OUT ckpt=$IE_CKPT"
+srun --ntasks=16 --ntasks-per-node=4 --gpus-per-node=4 bash -c '
+  export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
+  export IE_SHARD=$SLURM_PROCID IE_NSHARDS=16
+  export TORCHINDUCTOR_CACHE_DIR=/tmp/ti_${USER}_${SLURM_PROCID} TRITON_CACHE_DIR=/tmp/tr_${USER}_${SLURM_PROCID}
+  python utils/inject_eval.py > logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_shard${SLURM_PROCID}.log 2>&1
+'
+echo "INJECT-EVAL done $(date)"

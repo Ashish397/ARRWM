@@ -493,6 +493,15 @@ class CausalLoRADiffusionTrainer:
             if self.is_main_process:
                 logging.info("Building action critic and frozen evaluator modules...")
             self._build_action_critic()
+        elif getattr(self.config, "control_test", False):
+            # The frozen VAE/CoTracker teacher read is normally built as a side
+            # effect of _build_action_critic. With the critic disabled (the
+            # nocritic_full ablation) the control test still needs it, otherwise
+            # _control_test_eval silently bails on `self._frozen_vae is None`
+            # and the run logs no controllability eval at all.
+            if self.is_main_process:
+                logging.info("Building frozen evaluator modules (control_test, critic off)...")
+            self._build_frozen_evaluator_modules()
 
         if self.is_main_process:
             logging.info("Building optimizer...")
