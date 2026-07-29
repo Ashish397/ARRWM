@@ -17,7 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"
+ARR = os.environ.get("ARR_ROOT", "/scratch/u6ex/as1748.u6ex/ARRWM")
 RUNS = {"pca8_8node": ("Default", "C1"), "16node": ("batch size 64", "C0"),
         "pca4": ("pca4", "C3"), "pca2": ("pca2", "C4"),
         "4node": ("batch size 16", "C2"), "noatok": ("no action tokens", "C5"),

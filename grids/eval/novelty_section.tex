@@ -1,0 +1,74 @@
+\subsection{Novelty (Generated-Content) Probe}
+\label{app:novelty_probe}
+
+The style, implausibility, and relocation instruments all penalise things the
+model does wrong. None of them catch the opposite failure: a model that
+generates nothing new and simply coasts on the visible scene passes every
+damage check while doing no world-modelling at all. We therefore add a novelty
+probe that asks whether the model introduced genuinely new content, and we use
+it as a diagnostic rather than a scored column, because generating a well-formed
+new object is not itself an error.
+
+The probe is a third binary question put to the same judge (Qwen3-VL-8B) under
+the identical protocol as the style and implausibility probes
+(Section~\ref{app:vlm_quality_probes}): four real REFERENCE frames, sixteen
+GENERATED frames, forced answer prefix, score read as the logit probability of
+\emph{Yes}. The question is:
+
+\begin{quote}
+\small
+\emph{Does any NEW OBJECT appear in the generated frames that was not visible in
+the reference---a vehicle, person, structure or large item that the model
+introduced? Newly revealed parts of the existing scene (from driving) do NOT
+count; only genuinely new objects. Answer Yes or No.}
+\end{quote}
+
+We do not report novelty as a per-model rate, because on its own it does not
+separate good models from bad ones---a high rate can mean useful generation or
+confabulation. Its value is that it distinguishes the two when read against the
+commanded action. A model that has learnt to condition on the action should
+generate new content only when the command reveals unseen scene: almost never
+when driving forward along visible road, and often when turning or reversing
+into geography that was never in view. A model that hallucinates instead
+produces new objects regardless of direction.
+
+Table~\ref{tab:novelty_direction} shows this split. Our model's novelty tracks
+the action: near zero on forward commands, rising to $30$--$50\%$ on lateral and
+backward commands where new scene must genuinely be synthesised. minWM fires at
+$48$--$72\%$ in every direction, including forward, where nothing new should
+appear, and it continues to introduce objects even in rollouts we classify as
+static ($36\%$ novelty when frozen versus $60\%$ when moving). This is the
+signature of confabulation, and it is the evidence that minWM's otherwise clean
+damage scores are bought by inventing content and by not moving, rather than by
+modelling the scene. At the other extreme, \texttt{noadaln} fires at only $4\%$:
+it barely generates anything, consistent with its high static rate and weak
+action response.
+
+\begin{table}[t]
+\centering
+\small
+\caption{
+    Novelty-probe fire rate (\% of active rollouts, $P(\text{yes})>0.5$) by
+    commanded direction, for our full-capacity model against minWM. Our model
+    generates new content only where the action reveals unseen scene; minWM
+    introduces objects in every direction, including forward.
+}
+\label{tab:novelty_direction}
+\begin{tabular}{lcccccccc}
+\toprule
+Model & F & FL & FR & L & R & B & BL & BR \\
+\midrule
+Ours (pca8) & $0$  & $0$  & $13$ & $50$ & $27$ & $33$ & $47$ & $37$ \\
+minWM       & $53$ & $56$ & $64$ & $48$ & $65$ & $59$ & $72$ & $61$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The probe has one measured limitation: it detects objects \emph{inserted} into a
+stable scene, and is largely blind to novelty introduced by wholesale
+relocation. When a model abandons the scene for a different street, the entire
+frame is new content, yet the probe often reads near zero because there is no
+discrete new object against a stable background. Novelty is therefore
+anti-correlated with relocation and must be read jointly with the relocation
+flag, never alone; this is the second reason we keep it as a diagnostic rather
+than a headline column.

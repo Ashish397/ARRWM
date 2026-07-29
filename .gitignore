@@ -115,3 +115,10 @@ grids/eval/*.mp4
 grids/eval/*.png
 grids/eval/*.pth
 grids/eval/*.pt
+grids/eval/out/
+grids/eval/ours_stable_novel_reels/
+grids/eval/reels_pnovel/
+
+# AAAI submission bundle (paper zip + extraction) — large build artifact,
+# kept out of the code repo.
+aaai/
