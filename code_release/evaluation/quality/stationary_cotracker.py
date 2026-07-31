@@ -12,7 +12,9 @@ import os, glob
 import numpy as np, torch, cv2, imageio, pandas as pd
 from scipy.spatial import cKDTree
 
-DIR = "/home/ashish/stationary_evaluation"
+# No-op rollouts for the stationarity evaluation; not distributed with the code.
+DIR = os.environ.get("AF_STATIONARY_DIR",
+                     os.path.expanduser("~/stationary_evaluation"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out", "stationary_cotracker.csv")
 CTX = {"astra": 4, "matrixgame": 1, "minwm": 13, "worldcam": 65, "worldplay": 1, "yume": 1}
