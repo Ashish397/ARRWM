@@ -10,16 +10,14 @@ import imageio, numpy as np, pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Rollout videos are large and are not distributed with the code. Point
-# AF_FLEET_DIR at the directory holding grids_A/ and baselines/; the default
-# keeps the original in-repo layout working.
+# AF_FLEET_DIR at the directory holding grids_A/ and baselines/.
 FLEET_DIR = os.environ.get(
-    "AF_FLEET_DIR",
-    os.path.join(os.path.dirname(os.path.dirname(HERE)), "grids"),
+    "AF_FLEET_DIR", os.path.join(os.path.dirname(os.path.dirname(HERE)), "grids")
 )
 GRID_DIR = os.path.join(FLEET_DIR, "grids_A", "A")
 BASE_DIR = os.path.join(FLEET_DIR, "baselines")
 
-# Scene/model index: the coverage and naming every instrument iterates over.
+# Scene/model index: the coverage every instrument iterates over.
 LABELS_VLM = os.environ.get(
     "AF_FLEET_INDEX", os.path.join(HERE, "results_external_vlm.csv")
 )

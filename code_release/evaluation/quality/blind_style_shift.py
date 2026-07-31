@@ -12,7 +12,7 @@ Writes out/blind_style_shift.csv.
 import os
 import numpy as np, torch, torch.nn.functional as F, pandas as pd
 import blind100_common as bc
-from analysis.testbench_v2.style_shift import VGGStyle, gram_distance, read_frames
+from style_shift import VGGStyle, gram_distance, read_frames
 
 DEV = "cuda"
 HERE = os.path.dirname(os.path.abspath(__file__))

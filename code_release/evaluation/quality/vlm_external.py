@@ -17,11 +17,9 @@ import pandas as pd
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.join(
-    os.environ.get("AF_FLEET_DIR",
-                   os.path.join(os.path.dirname(os.path.dirname(
-                       os.path.dirname(os.path.abspath(__file__)))), "grids")),
-    "baselines")
+BASE_DIR = os.path.join(os.environ.get("AF_FLEET_DIR", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "grids")), "baselines")
 MODELS = ["astra", "matrixgame", "minwm", "worldcam", "worldplay", "yume"]
 OURS = ["pca8", "pca4", "pca2", "16node", "4node", "noatok", "noadaln"]
 OUT = os.path.join(HERE, "results_external_vlm.csv")

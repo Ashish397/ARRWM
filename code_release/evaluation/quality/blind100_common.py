@@ -7,8 +7,7 @@ mapped to model/scene/direction in blind100_labels_and_scores.csv. Every video i
 import os
 import pandas as pd
 
-# blind100 is the 100-rollout human-labelled validation subset; not distributed
-# with the code. Override the location with AF_BLIND_DIR.
+# blind100 is the human-labelled validation subset; not distributed with the code.
 BLIND_DIR = os.environ.get("AF_BLIND_DIR", os.path.expanduser("~/blind100"))
 PNG_DIR = os.environ.get("AF_BLIND_PNG_DIR", os.path.expanduser("~/blind100_png"))
 LABELS = os.environ.get("AF_BLIND_LABELS",
