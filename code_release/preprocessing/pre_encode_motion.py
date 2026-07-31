@@ -1,25 +1,34 @@
-#################################
-#Imports
-#################################
+"""Track a fixed pixel grid through raw video and store per-chunk displacements.
+
+For each 0.5 s chunk (12 pixel frames / 3 latent frames) CoTracker follows a
+fixed 10x10 grid of query points and the net displacement of each point is
+written to motion.npy as [n_chunks, 100, 3] = (dx, dy, visibility). Those
+displacement fields are the input to the PCA action basis; visibility is stored
+but not used by the encoder.
+
+Paths come from the environment: DATA_ROOT/frodobots_data in,
+DATA_ROOT/frodobots_motion out.
+"""
 
 import os
+import subprocess
+import time
 from pathlib import Path
 
-import time, subprocess, numpy as np
+import numpy as np
 import torch
 
-#################################
-#Set parameters
-#################################
+device = "cuda"
 
-device = 'cuda'
-grid_size = 20
-input_base = Path(os.path.join(os.environ.get("DATA_ROOT", ""), "frodobots_data"))
-output_base = Path(os.path.join(os.environ.get("DATA_ROOT", ""), "frodobots_motion"))
+# 10x10 = the 100 tracked points the action basis is fitted on. Changing this
+# changes the dimensionality of the motion vectors and makes them incompatible
+# with the shipped basis, which expects 200 = 100 points x (dx, dy).
+grid_size = 10
 
-#################################
-#Define Functions
-#################################
+_DATA_ROOT = Path(os.environ.get("DATA_ROOT", "."))
+input_base = _DATA_ROOT / "frodobots_data"
+output_base = _DATA_ROOT / "frodobots_motion"
+
 
 def iter_video_chunks_ffmpeg(
     hls_path,
@@ -206,9 +215,7 @@ def process_video(
         print(f"  Error processing video: {e}")
         return False
 
-#################################
 #Main processing loop
-#################################
 
 output_chunk_size = 12          # frames per output window
 compute_T = 48                  # frames per compute chunk (NO overlap). Must be multiple of 12.
@@ -226,44 +233,44 @@ total_skipped = 0
 for output_rides_dir in sorted(input_base.glob("output_rides_*")):
     if not output_rides_dir.is_dir():
         continue
-
+    
     output_rides_name = output_rides_dir.name
     print(f"\nProcessing {output_rides_name}...")
-
+    
     # Iterate through all ride_x_y folders
     for ride_dir in sorted(output_rides_dir.glob("ride_*")):
         if not ride_dir.is_dir():
             continue
-
+        
         ride_name = ride_dir.name
         recordings_dir = ride_dir / "recordings"
-
+        
         if not recordings_dir.exists():
             print(f"  Skipping {ride_name}: recordings directory not found")
             total_skipped += 1
             continue
-
+        
         # Find video file (try uid_s_1000 first, then uid_s_1001)
         video_path = None
         matches = list(recordings_dir.glob("*uid_s_1000*video*.m3u8"))
         video_path = matches[0] if matches else None
-
+        
         if video_path is None:
             print(f"  Skipping {ride_name}: no video file found")
             total_skipped += 1
             continue
-
+        
         # Create output path: frodobots_motion/output_rides_n/ride_x_y/motion.npy
         output_path = output_base / output_rides_name / ride_name / "motion.npy"
-
+        
         print(f"  Processing {ride_name}...")
         start_time = time.time()
-
+        
         success = process_video(video_path, cotracker, output_path, output_chunk_size, compute_T, grid_size, device)
-
+        
         if success:
             elapsed = time.time() - start_time
-            print(f"    Completed in {elapsed:.2f}s -> {output_path}")
+            print(f"    ✓ Completed in {elapsed:.2f}s -> {output_path}")
             total_processed += 1
         else:
             total_skipped += 1

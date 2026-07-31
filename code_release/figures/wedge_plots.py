@@ -23,8 +23,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from figures.figure_labels import label
-
 ARR = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EF = f"{ARR}/analysis/eval_final"
 OUT = os.environ.get("WG_OUT", f"{EF}/wedges")
@@ -32,15 +30,15 @@ os.makedirs(OUT, exist_ok=True)
 
 ANG = {"F": 90, "FR": 45, "R": 0, "BR": -45, "B": -90, "BL": -135, "L": 180, "FL": 135}
 METRICS = ["recession", "tx", "g0", "g1", "rot", "g2", "g3", "g4", "g5", "g6", "g7"]
-# ours are marked "Ours (...)" here because the rest of the row is external
-ALL_SET = [(k, label(k, ours=True)) for k in
-           ("pca8_8node", "16node", "minwm", "matrixgame", "worldcam",
-            "yume", "worldplay", "astra")]
-# row 1 = encoder family + noatok, row 2 = node family + noadaln;
-# pca8_8node appears in both rows as the shared reference model
-ABL_SET = [(k, label(k)) for k in
-           ("pca8_8node", "pca4", "pca2", "noatok",
-            "16node", "pca8_8node", "4node", "noadaln")]
+ALL_SET = [("pca8_8node", "Ours (Default)"), ("16node", "Ours (batch 64)"),
+           ("minwm", "minWM"), ("matrixgame", "Matrix-Game"), ("worldcam", "WorldCam"),
+           ("yume", "Yume"), ("worldplay", "WorldPlay"), ("astra", "Astra")]
+# (run, display label); row 1 = encoder family + noatok, row 2 = node family
+# + noadaln; pca8_8node appears in both rows as the shared reference model
+ABL_SET = [("pca8_8node", "Default"), ("pca4", "PCA4"), ("pca2", "PCA2"),
+           ("noatok", "No Action Tokens"),
+           ("16node", "batch 64"), ("pca8_8node", "Default"), ("4node", "batch 16"),
+           ("noadaln", "No AdaLN")]
 
 frames = [pd.read_csv(f"{EF}/headtohead_motion.csv")]
 for f in sorted(glob.glob(f"{EF}/headtohead_*.csv")):

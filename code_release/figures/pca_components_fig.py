@@ -3,12 +3,13 @@ quiver fields, one panel per component, labelled with each component's
 explained-variance share (from analysis/pca_evr.npy, measured on 300 rides /
 115k chunks). No suptitle. Writes analysis/pca_components_flowfields.png.
 """
+import os
 import numpy as np, torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-CK = "preprocessing/checkpoints/pca_basis.pt"
+CK = "action_query/checkpoints/ss_vae_8free.pt"
 GX = GY = 10
 
 

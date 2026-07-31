@@ -1,34 +1,32 @@
 """Family-superimposed versions of following_{run}_by_REALdir_strength.png.
 
-Same data and panel layout as figures/following_by_realdir.py (teacher-forced
+Same data and panel layout as utils/following_by_realdir.py (teacher-forced
 control tests over training steps, realized magnitude along the command per
 REAL ride direction), but several models drawn in the SAME figure, one color
 per model: GT branch solid, FLIP branch dashed, gray dotted = commanded target.
 
 Writes analysis/following_FAMILY_{nodes,encoders}_by_REALdir_strength.png.
 """
+import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from figures.following_by_realdir import build, DIRS, DNAME, CHUNK_SEC
-from figures.figure_labels import label as run_label       # `label` is a local below
 
 FAMILIES = {
-    # Each family varies one axis, so the member that is also the default model
-    # carries a parenthetical naming the axis value it sits at.
-    "nodes": [("logs/v14e_4node/control_test", run_label("4node"), "#4393c3"),
-              ("logs/v14e_pca8_raw/control_test", f"{run_label('pca8')} (batch 32)", "#08306b"),
-              ("logs/v14e_16node/control_test", run_label("16node"), "#e08214")],
-    "encoders": [("logs/v14e_pca8_raw/control_test", run_label("pca8"), "#08306b"),
-                 ("logs/v14e_pca4/control_test", run_label("pca4"), "#2ca02c"),
-                 ("logs/v14e_pca2/control_test", run_label("pca2"), "#9467bd")],
-    # injection pathway: Default = AdaLN + tokens, noatok = AdaLN only,
-    # noadaln = tokens only
-    "injection": [("logs/v14e_pca8_raw/control_test", f"{run_label('pca8')} (AdaLN + tokens)", "#08306b"),
-                  ("logs/v14e_noatok/control_test", run_label("noatok"), "#2ca02c"),
-                  ("logs/v14e_noadaln/control_test", run_label("noadaln"), "#b2182b")],
+    "nodes": [("logs/v14e_4node/control_test", "batch size 16", "#4393c3"),
+              ("logs/v14e_pca8_raw/control_test", "batch size 32", "#08306b"),
+              ("logs/v14e_16node/control_test", "batch size 64", "#e08214")],
+    "encoders": [("logs/v14e_pca8_raw/control_test", "pca8", "#08306b"),
+                 ("logs/v14e_pca4/control_test", "pca4", "#2ca02c"),
+                 ("logs/v14e_pca2/control_test", "pca2", "#9467bd")],
+    # injection-pathway ablation: pca8/8node = adaln+tokens (full), noatok =
+    # adaln-only, noadaln = tokens-only
+    "injection": [("logs/v14e_pca8_raw/control_test", "pca8 (batch size 32, adaln+tokens)", "#08306b"),
+                  ("logs/v14e_noatok/control_test", "no action tokens (adaln-only)", "#2ca02c"),
+                  ("logs/v14e_noadaln/control_test", "no AdaLN (tokens-only)", "#b2182b")],
 }
 
 

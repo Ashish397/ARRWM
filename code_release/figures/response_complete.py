@@ -17,12 +17,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from figures.figure_labels import label
-
 ARR = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-RUNS = {k: (label(k), c) for k, c in
-        [("pca8_8node", "C1"), ("16node", "C0"), ("pca4", "C3"), ("pca2", "C4"),
-         ("4node", "C2"), ("noatok", "C5"), ("noadaln", "C6")]}
+RUNS = {"pca8_8node": ("Default", "C1"), "16node": ("batch size 64", "C0"),
+        "pca4": ("pca4", "C3"), "pca2": ("pca2", "C4"),
+        "4node": ("batch size 16", "C2"), "noatok": ("no action tokens", "C5"),
+        "noadaln": ("no AdaLN", "C6")}
 LASTN = 1000
 SETTLE = 2                      # drop first N generated chunks on both halves
 MIN_BIN_N = 12
