@@ -19,6 +19,7 @@ RUNS = [
     ("logs/v14e_pca4/control_test",     "pca4 (top4, batch32)",    "pca4"),
     ("logs/v14e_noatok/control_test",   "no action tokens (adaln-only)", "noatok"),
     ("logs/v14e_noadaln/control_test",  "no AdaLN (tokens-only)", "noadaln"),
+    ("logs/v14e_nocritic/control_test", "no critic guidance",     "nocritic"),
 ]
 DIRS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]
 DNAME = {"F": "Forward", "FR": "Forward-Right", "R": "Right", "BR": "Backward-Right",

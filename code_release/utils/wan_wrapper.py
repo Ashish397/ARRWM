@@ -10,7 +10,7 @@ from torch import nn
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
-from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
+from wan.modules.model import WanModel
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
@@ -23,22 +23,6 @@ _default_wan_model_path = _default_config.get("wan_model_path", os.environ.get("
 if not _default_wan_model_path.endswith("/"):
     _default_wan_model_path = _default_wan_model_path + "/"
 
-class ResidualMLPBlock(nn.Module):
-    """Residual block for classification head with dropout."""
-    def __init__(self, dim: int, dropout: float = 0.0):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.linear = nn.Linear(dim, dim)
-        self.activation = nn.SiLU()
-        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-        x = self.linear(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        return x + residual  # Residual connection
 
 class WanTextEncoder(torch.nn.Module):
     def __init__(
@@ -67,7 +51,7 @@ class WanTextEncoder(torch.nn.Module):
                 weights_only=False,
             )
         )
-        
+
         # Move text encoder to GPU if available
         if torch.cuda.is_available():
             self.text_encoder = self.text_encoder.cuda()
@@ -237,7 +221,6 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         self.post_init()
 
-
     def adjust_seq_len_for_action_tokens(self, num_frames: int = 21, action_per_frame: int = 1):
         """Increase seq_len capacity to accommodate per-frame action tokens."""
         self.seq_len = self._base_seq_len + num_frames * action_per_frame
@@ -264,123 +247,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             pass
         return m
 
-    def enable_alt_head(self) -> None:
-        """Build the alt head on the underlying WAN model.
 
-        After this is called, ``forward(..., compute_alt_head=True)``
-        will compute and return both main and alt head outputs in one
-        backbone forward.
-        """
-        m = self._unwrapped_model()
-        if not hasattr(m, "enable_alt_head"):
-            raise RuntimeError(
-                "enable_alt_head: underlying model does not support "
-                "alt heads. Only WAN-family models can host the v21 "
-                "fake-alt head."
-            )
-        m.enable_alt_head()
-
-    @property
-    def has_alt_head(self) -> bool:
-        return getattr(self._unwrapped_model(), "head_alt", None) is not None
-
-    def adding_cls_branch(
-        self, 
-        atten_dim=1536, 
-        num_class=1, 
-        hidden_dim=3072,
-        num_layers=4,
-        dropout=0.2,
-        gan_blocks_per_token=2,
-    ) -> None:
-        """
-        Add classification branch with deeper layers, dropout, and residual connections.
-        
-        Args:
-            atten_dim: Attention dimension (default 1536)
-            num_class: Number of output classes (default 1 for binary real/fake)
-            hidden_dim: Hidden dimension for intermediate layers (default 3072)
-            num_layers: Number of residual layers in classification head (default 4)
-            dropout: Dropout rate (default 0.2)
-            gan_blocks_per_token: Number of GanAttentionBlocks to stack per register token (default 2).
-                                 Using multiple blocks allows progressive refinement of features
-                                 from each transformer layer, improving feature extraction.
-        """
-        # Multi-scale feature extraction: default to extracting from more layers
-        layer_indices = [7, 13, 21, 29]
-        num_registers = len(layer_indices)
-                
-        # Input dimension: num_registers * atten_dim
-        input_dim = num_registers * atten_dim
-        
-        # Build deeper classification head with residual connections
-        layers = []
-        
-        # Initial projection and normalization
-        layers.append(nn.LayerNorm(input_dim))
-        layers.append(nn.Linear(input_dim, hidden_dim))
-        layers.append(nn.SiLU())
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
-        
-        # Residual blocks
-        for _ in range(num_layers - 1):  # -1 because we have final layer
-            layers.append(ResidualMLPBlock(hidden_dim, dropout=dropout))
-        
-        # Final output layer (no residual connection)
-        layers.append(nn.LayerNorm(hidden_dim))
-        layers.append(nn.Linear(hidden_dim, num_class))
-        
-        self._cls_pred_branch = nn.Sequential(*layers)
-        self._cls_pred_branch.requires_grad_(True)
-        
-        # Register tokens for each layer we extract from
-        self._register_tokens = RegisterTokens(num_registers=num_registers, dim=atten_dim)
-        self._register_tokens.requires_grad_(True)
-
-        # Stack multiple GAN cross-attention blocks per token for richer feature extraction
-        # Structure: ModuleList[ModuleList[GanAttentionBlock]] - one ModuleList per token
-        gan_ca_blocks = []
-        for _ in range(num_registers):
-            token_blocks = []
-            for _ in range(gan_blocks_per_token):
-                block = GanAttentionBlock()
-                token_blocks.append(block)
-            gan_ca_blocks.append(nn.ModuleList(token_blocks))
-        self._gan_ca_blocks = nn.ModuleList(gan_ca_blocks)
-        self._gan_ca_blocks.requires_grad_(True)
         # self.has_cls_branch = True
-
-    def adding_rgs_branch(
-        self,
-        atten_dim: int = 1536,
-        num_class: int = 2,
-        time_embed_dim: int = 0,
-        num_frames: int = 21,
-    ) -> None:
-        # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
-        self._rgs_pred_branch = nn.Sequential(
-            # Input: [B, 384, 21, 60, 104]
-            nn.LayerNorm(atten_dim * 3 + time_embed_dim),
-            nn.Linear(atten_dim * 3 + time_embed_dim, 1536),
-            nn.SiLU(),
-            nn.Linear(1536, num_class * num_frames)
-        )
-        self._rgs_pred_branch.requires_grad_(True)
-        num_registers = 3
-        self._register_tokens_rgs = RegisterTokens(num_registers=num_registers, dim=atten_dim)
-        self._register_tokens_rgs.requires_grad_(True)
-
-        gan_ca_blocks = []
-        for _ in range(num_registers):
-            block = GanAttentionBlock()
-            gan_ca_blocks.append(block)
-        self._gan_ca_blocks_rgs = nn.ModuleList(gan_ca_blocks)
-        self._gan_ca_blocks_rgs.requires_grad_(True)
-        # self.has_rgs_branch = True
-
-        self.num_frames = num_frames
-        self.num_class = num_class
 
     def adding_state_token_branch(
         self,
@@ -474,7 +342,6 @@ class WanDiffusionWrapper(torch.nn.Module):
         pred = noise - x0
         x_t = (1-sigma_t) * x0 + sigma_t * noise
         we have x0 = x_t - sigma_t * pred
-        see derivations https://chatgpt.com/share/67bf8589-3d04-8008-bc6e-4cf1a24e2d0e
         """
         # use higher precision for calculations
         original_dtype = flow_pred.dtype
@@ -519,13 +386,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None,
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
-        classify_mode: Optional[bool] = False,
-        regress_mode: Optional[bool] = False,
-        concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
-        compute_alt_head: bool = False,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
         if getattr(self, "_action_patch_applied", False):
@@ -552,15 +415,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         #     input_timestep = timestep
         input_timestep = timestep
 
-        logits = None
         has_state = getattr(self, "_state_token_init", None) is not None
         has_probe = getattr(self, "_state_probe", None) is not None
         state_hidden = None
         tapped_features = None
-        # Alt-head output (raw, channels-first). Set by the clean_x / else
-        # branches when ``compute_alt_head=True``; remains None otherwise
-        # (kv_cache / classify_mode / regress_mode don't support alt yet).
-        model_alt_raw = None
 
         # Build state tokens once. Cached inference only supports the noisy-side
         # tokens, while teacher-forcing also threads a clean-side copy.
@@ -616,9 +474,6 @@ class WanDiffusionWrapper(torch.nn.Module):
             else:
                 flow_pred = model_out.permute(0, 2, 1, 3, 4)
         elif clean_x is not None:
-            extra_kwargs = {}
-            if compute_alt_head:
-                extra_kwargs["compute_alt_head"] = True
             model_out = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
@@ -627,19 +482,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 aug_t=aug_t,
                 **action_mod_kwargs,
                 **state_kwargs,
-                **extra_kwargs,
             )
-            # When compute_alt_head=True, the model APPENDS the alt
-            # output as the final tuple element. Strip it off before
-            # falling through to the existing state_hidden/tapped
-            # unpack logic (which expects the legacy shapes).
-            model_alt_raw = None
-            if compute_alt_head and isinstance(model_out, tuple):
-                model_alt_raw = model_out[-1]
-                if len(model_out) == 2:
-                    model_out = model_out[0]
-                else:
-                    model_out = model_out[:-1]
             if isinstance(model_out, tuple):
                 flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
                 aux = model_out[1]
@@ -649,53 +492,14 @@ class WanDiffusionWrapper(torch.nn.Module):
                     state_hidden = aux
             else:
                 flow_pred = model_out.permute(0, 2, 1, 3, 4)
-        elif classify_mode:
-            flow_pred, logits = self.model(
-                noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                t=input_timestep, context=prompt_embeds,
-                seq_len=self.seq_len,
-                classify_mode=True,
-                register_tokens=self._register_tokens,
-                cls_pred_branch=self._cls_pred_branch,
-                gan_ca_blocks=self._gan_ca_blocks,
-                concat_time_embeddings=concat_time_embeddings,
-                **action_mod_kwargs,
-            )
-            flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
-        elif regress_mode:
-            flow_pred, logits = self.model(
-                noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                t=input_timestep, context=prompt_embeds,
-                seq_len=self.seq_len,
-                regress_mode=True,
-                register_tokens_rgs=self._register_tokens_rgs,
-                rgs_pred_branch=self._rgs_pred_branch,
-                gan_ca_blocks_rgs=self._gan_ca_blocks_rgs,
-                num_frames_rgs=self.num_frames,
-                num_class_rgs=self.num_class,
-                concat_time_embeddings=concat_time_embeddings,
-                **action_mod_kwargs,
-            )
-            flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
         else:
-            extra_kwargs = {}
-            if compute_alt_head:
-                extra_kwargs["compute_alt_head"] = True
             model_out = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
                 **action_mod_kwargs,
                 **state_kwargs,
-                **extra_kwargs,
             )
-            model_alt_raw = None
-            if compute_alt_head and isinstance(model_out, tuple):
-                model_alt_raw = model_out[-1]
-                if len(model_out) == 2:
-                    model_out = model_out[0]
-                else:
-                    model_out = model_out[:-1]
             if isinstance(model_out, tuple):
                 flow_pred = model_out[0].permute(0, 2, 1, 3, 4)
                 aux = model_out[1]
@@ -711,19 +515,6 @@ class WanDiffusionWrapper(torch.nn.Module):
             xt=noisy_image_or_video.flatten(0, 1),
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
-
-        # Alt head conversion (when present). Mirrors the main head's
-        # flow→x0 conversion exactly so downstream code can treat
-        # ``(flow_alt, pred_x0_alt)`` symmetrically with the main pair.
-        flow_pred_alt = None
-        pred_x0_alt = None
-        if model_alt_raw is not None:
-            flow_pred_alt = model_alt_raw.permute(0, 2, 1, 3, 4)
-            pred_x0_alt = self._convert_flow_pred_to_x0(
-                flow_pred=flow_pred_alt.flatten(0, 1),
-                xt=noisy_image_or_video.flatten(0, 1),
-                timestep=timestep.flatten(0, 1),
-            ).unflatten(0, flow_pred_alt.shape[:2])
 
         # Cross-attention probe readout
         if has_probe and tapped_features is not None:
@@ -759,7 +550,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 probe_module, "num_frame_per_block", 0,
             ) or 0)
             expected_frames = probe_n_chunks * probe_fpb
-            # Dual-view (AOO) teacher path feeds 2x frames (forward+reverse). The
+            # Dual-view rear camera teacher path feeds 2x frames (forward+reverse). The
             # probe runs on the FORWARD half only: StateProbeModule slices the
             # first n_chunks*chunk_tokens tokens and forward frames are first, and
             # frame_seqlen above is computed per-frame, so the reshape stays valid.
@@ -787,7 +578,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 )
                 return flow_pred, pred_x0, state_preds.float(), probe_hidden
 
-        # State-token readout: pool per chunk and map to z2/z7
+        # State-token readout: pool per chunk and map to (PC0, PC1)
         if has_state and state_hidden is not None:
             fpb = self._state_num_frame_per_block
             n_c = self._state_n_chunks
@@ -803,14 +594,6 @@ class WanDiffusionWrapper(torch.nn.Module):
             state_preds = self._state_readout(pooled.to(readout_dtype)).float()
             return flow_pred, pred_x0, state_preds, pooled
 
-        if logits is not None:
-            return flow_pred, pred_x0, logits
-
-        # Alt-head return: when ``compute_alt_head=True`` was passed
-        # and the alt branch fired, return a 4-tuple. Callers know to
-        # unpack ``(flow_pred, pred_x0, flow_pred_alt, pred_x0_alt)``.
-        if pred_x0_alt is not None:
-            return flow_pred, pred_x0, flow_pred_alt, pred_x0_alt
         return flow_pred, pred_x0
 
     def get_scheduler(self) -> SchedulerInterface:

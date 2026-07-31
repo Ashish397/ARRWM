@@ -5,7 +5,7 @@ Streaming-only trainer for the Causal-Forcing Stage 1 pipeline:
   - ZarrRideDataset + LockstepRideBatcher: ride-level streaming windows
   - Per-block independent timestep sampling (BSMNTW-weighted flow loss)
   - Teacher forcing: model sees clean context (clean_x + aug_t)
-  - Action conditioning: tanh-squashed z2/z7 ss_vae latent via adaLN-Zero + tokens
+  - Action conditioning: tanh-squashed top-8 PCA action vector via adaLN-Zero + tokens
   - Learned action critic for action-aware guidance
   - Periodic held-out evaluation with W&B video logging
 """
@@ -18,7 +18,7 @@ import signal
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -27,13 +27,13 @@ import wandb
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler, SequentialSampler
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 from omegaconf import OmegaConf
 import peft
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 
-from utils.zarr_dataset import ZarrRideDataset, build_ride_manifest, _tanh_squash
+from utils.zarr_dataset import ZarrRideDataset, build_ride_manifest
 from utils.dataset import cycle
 from utils.distributed import barrier, launch_distributed_job
 from utils.misc import set_seed
@@ -277,7 +277,7 @@ class CausalLoRADiffusionTrainer:
 
     Trains Stage 1 of the Causal-Forcing pipeline: an AR diffusion model with
     teacher forcing, block-wise causal attention, and action conditioning via
-    the ss_vae z2/z7 motion latent.
+    the top-8 PCA motion action vector.
     """
 
     def __init__(self, config):
@@ -339,16 +339,6 @@ class CausalLoRADiffusionTrainer:
 
         self.streaming_chunk_size = int(getattr(config, "streaming_chunk_size", 21))
 
-        # Study 1 / AOO dual-view: model the rear camera as a simultaneous second
-        # view. forward + reverse latent windows are concatenated on the frame
-        # axis; the reverse view reuses the forward z with z2/z7 sign-flipped, and
-        # the critic/state-probe supervise the FORWARD half only (v1). Off by
-        # default -> byte-identical single-view behaviour.
-        self.dual_view = bool(getattr(config, "dual_view", False))
-        self.reverse_root = getattr(config, "reverse_root", None)
-        if self.dual_view and not self.reverse_root:
-            raise ValueError("dual_view: true requires reverse_root in the config")
-
         set_seed(int(getattr(config, "seed", 0)) + self.global_rank)
 
         if self.is_main_process:
@@ -408,30 +398,26 @@ class CausalLoRADiffusionTrainer:
         # state_head_action_dim_weight). Defaults preserve the original
         # behavior for every existing config (action_critic_dims == [2,7]).
         emph_cfg = getattr(config, "action_critic_emphasis_dims", None)
-        self.action_critic_emphasis_dims = list(emph_cfg) if emph_cfg is not None else [2, 7]
-        # z2/z7 weight in the critic's training MSE (vs 1.0 for the rest).
+        self.action_critic_emphasis_dims = list(emph_cfg) if emph_cfg is not None else [0, 1]
+        # Weight on the two controllable axes (PC0, PC1) in the critic's
+        # training MSE, vs 1.0 for the remaining six.
         self.action_critic_emphasis_weight = float(
             getattr(config, "action_critic_action_dim_weight", 2.0))
-        # Guidance weight applied to the NON-action (6 extra) dims, relative to
-        # 1.0 on z2/z7. 0.5 => the 6 dims get a 2x-smaller guidance term.
+        # Guidance weight applied to the 6 non-controllable dims, relative to
+        # 1.0 on PC0/PC1. 0.5 => those 6 get a 2x-smaller guidance term.
         self.action_critic_extra_dim_weight = float(
             getattr(config, "action_critic_extra_dim_weight", 0.5))
         self.action_critic_z_loss_weight = float(
-            getattr(config, "action_critic_z_loss_weight",
-                    getattr(config, "action_critic_reward_loss_weight", 0.1)))
+            getattr(config, "action_critic_z_loss_weight", 0.1))
         self.generator_action_z_guidance_weight = float(
-            getattr(config, "generator_action_z_guidance_weight",
-                    getattr(config, "generator_action_reward_guidance_weight", 0.0)))
+            getattr(config, "generator_action_z_guidance_weight", 0.0))
         self.z_guidance_warmup_steps = int(
-            getattr(config, "z_guidance_warmup_steps",
-                    getattr(config, "reward_guidance_warmup_steps", 500)))
+            getattr(config, "z_guidance_warmup_steps", 500))
         self.critic_lr = float(getattr(config, "critic_lr", 3e-4))
         self.action_critic = None
         self.critic_optimizer = None
         self._frozen_vae = None
         self._frozen_cotracker = None
-        self._frozen_ss_vae = None
-        self._frozen_ss_vae_scale = 1.0
 
         # State-token action head config
         self.state_head_enabled = bool(getattr(config, "state_head_enabled", False))
@@ -469,7 +455,7 @@ class CausalLoRADiffusionTrainer:
         self.grad_norm_interval = int(getattr(config, "grad_norm_interval", 50))
 
         if getattr(config, "skip_train_dataloader", False):
-            # Eval drivers (utils/inject_eval.py) never touch the training
+            # Eval drivers (evaluation/inject_eval.py) never touch the training
             # data; building it means every WORLD_SIZE=1 shard loads AND
             # re-saves the ~22GB ride manifest on one shared path — the
             # lustre pile-up that hung the sweep jobs. eval_dataset users
@@ -516,7 +502,8 @@ class CausalLoRADiffusionTrainer:
     # ------------------------------------------------------------------
 
     def _build_dataloader(self) -> None:
-        ss_vae_ckpt = getattr(self.config, "ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt")
+        pca_basis_ckpt = getattr(self.config, "pca_basis_checkpoint",
+                                 "preprocessing/checkpoints/pca_basis.pt")
         min_ride_frames = self.streaming_chunk_size + self.context_frames
         max_rides = getattr(self.config, "max_rides", None)
         if max_rides is not None:
@@ -571,7 +558,7 @@ class CausalLoRADiffusionTrainer:
                 logging.info("eval_ride_zarrs override active: %d eval rides (was %d)",
                              len(eval_rides), self.test_num_rides)
 
-        # --- Curated motion-y + backward window pool (v14b) ----------------
+        # --- Curated motion-y + backward window pool ----------------
         # If ``train_window_manifest`` is set, replace train_rides with ONE
         # entry per curated window (forced_offset = window start), so the model
         # is supervised only on the highest-motion windows + the backward
@@ -606,32 +593,10 @@ class CausalLoRADiffusionTrainer:
                 )
             train_rides = _expanded
 
-        # Dual-view (AOO): only rides with BOTH a rear zarr and a wall-clock
-        # alignment map under reverse_root can be trained as dual-view. Most weu
-        # rides have no rear footage (raw gone) — drop them so the batcher never
-        # hits a missing rear/map.
-        if self.dual_view:
-            from pathlib import Path as _P
-            import os as _os
-            def _has_rear(r):
-                ts = _P(r["zarr_path"]).stem
-                return (_os.path.exists(_os.path.join(self.reverse_root, f"{ts}.align.npy"))
-                        and _os.path.isdir(_os.path.join(self.reverse_root, f"{ts}.zarr")))
-            _before = len(train_rides)
-            train_rides = [r for r in train_rides if _has_rear(r)]
-            if not train_rides:
-                raise RuntimeError(
-                    f"dual_view: no train rides have a rear encode + align map under "
-                    f"{self.reverse_root}; run utils/build_rear_alignment.py first."
-                )
-            if self.is_main_process:
-                logging.info("dual_view: %d/%d train rides have rear encode+align map",
-                             len(train_rides), _before)
-
         self.dataset = ZarrRideDataset.from_manifest(
             rides_data=train_rides,
             motion_root=self.config.motion_root,
-            ss_vae_checkpoint=ss_vae_ckpt,
+            pca_basis_checkpoint=pca_basis_ckpt,
         )
         self.train_dataset_size = len(self.dataset)
         if self.is_main_process:
@@ -650,8 +615,8 @@ class CausalLoRADiffusionTrainer:
                 self.eval_dataset = ZarrRideDataset.from_manifest(
                     rides_data=eval_rides,
                     motion_root=self.config.motion_root,
-                    ss_vae_checkpoint=ss_vae_ckpt,
-                    _share_ss_vae=self.dataset,
+                    pca_basis_checkpoint=pca_basis_ckpt,
+                    _share_basis=self.dataset,
                 )
                 self.eval_dataset_size = len(self.eval_dataset)
                 if self.is_main_process:
@@ -709,13 +674,7 @@ class CausalLoRADiffusionTrainer:
         if gradient_checkpointing:
             wrapper.model.enable_gradient_checkpointing()
 
-        # Dual-view (AOO): the noisy sequence carries 2x frames (forward+reverse),
-        # so the DiT forward's seq_len budget (asserted in causal_model.forward)
-        # must be sized for 2x. _base_seq_len is hardcoded for 1x frames.
-        if self.dual_view:
-            wrapper.seq_len = int(wrapper.seq_len) * 2
-            wrapper._base_seq_len = int(wrapper._base_seq_len) * 2
-        eff_train_frames = (2 if self.dual_view else 1) * num_train_frames
+        eff_train_frames = num_train_frames
 
         self.scheduler = wrapper.get_scheduler()
         self.scheduler.set_timesteps(num_inference_steps=num_train_timestep, denoising_strength=1.0)
@@ -887,50 +846,32 @@ class CausalLoRADiffusionTrainer:
         for p in self._frozen_cotracker.parameters():
             p.requires_grad_(False)
 
-        from action_query.ss_vae_model import load_ss_vae
-        ss_vae_ckpt = getattr(self.config, "ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt")
-        ss_vae, scale = load_ss_vae(ss_vae_ckpt, device=str(self.device))
-        ss_vae.eval()
-        ss_vae.requires_grad_(False)
-        self._frozen_ss_vae = ss_vae
-        self._frozen_ss_vae_scale = scale
-
-        # Teacher action encoder: ss_vae (default) or pca_raw (14e: VAE OFF, the
-        # critic teacher target + eval read use raw top-8 PCA of the CoTracker
-        # grid, squashed with pca_raw_scales). Must match the dataset's
-        # conditioning encoder (ARRWM_ACTION_ENCODER=pca_raw).
-        self._teacher_action_encoder = str(getattr(self.config, "teacher_action_encoder", "ss_vae")).lower()
-        if self._teacher_action_encoder == "pca_raw":
-            _ck = torch.load(ss_vae_ckpt, map_location="cpu", weights_only=False)
-            self._pca_mean = torch.tensor(np.asarray(_ck["pca_mean"]), dtype=torch.float32, device=self.device)
-            self._pca_comp_T = torch.tensor(np.asarray(_ck["pca_comp"]).T, dtype=torch.float32, device=self.device)  # [200,16]
-            _scales = getattr(self.config, "pca_raw_scales",
-                              [93.7, 57.7, 22.5, 21.2, 18.1, 14.5, 12.6, 10.8])
-            self._pca_scales = torch.tensor(list(_scales)[:8], dtype=torch.float32, device=self.device)
-            if self.is_main_process:
-                logging.info("Teacher action encoder = pca_raw (VAE off); scales=%s", list(_scales)[:8])
+        # Teacher action encoder: the critic teacher target and the eval read
+        # both use the raw top-8 PCA projection of the CoTracker grid, squashed
+        # with pca_raw_scales -- the same basis the dataset conditions on.
+        _ck = torch.load(pca_basis_ckpt, map_location="cpu", weights_only=False)
+        self._pca_mean = torch.tensor(np.asarray(_ck["pca_mean"]), dtype=torch.float32, device=self.device)
+        self._pca_comp_T = torch.tensor(np.asarray(_ck["pca_comp"]).T, dtype=torch.float32, device=self.device)  # [200,16]
+        _scales = getattr(self.config, "pca_raw_scales",
+                          [93.7, 57.7, 22.5, 21.2, 18.1, 14.5, 12.6, 10.8])
+        self._pca_scales = torch.tensor(list(_scales)[:8], dtype=torch.float32, device=self.device)
 
         if self.is_main_process:
-            logging.info("Frozen evaluator modules ready (VAE, CoTracker, %s)", self._teacher_action_encoder)
+            logging.info("Frozen evaluator modules ready (VAE, CoTracker, PCA basis); "
+                         "scales=%s", list(_scales)[:8])
 
     def _motion_to_action_z(self, est_motion: torch.Tensor) -> torch.Tensor:
         """[raw_n,100,3] CoTracker motion -> [raw_n,8] action z.
 
-        ss_vae: encode the 10x10 dx/dy grid through the frozen VAE.
-        pca_raw (14e): project the flattened (200-D) dx/dy onto the top-8 PCA
-        components and tanh-squash with per-component scales -- identical
-        pipeline to the dataset's conditioning encoder, so teacher target and
-        command live in the same space.
+        Project the flattened (200-D) dx/dy onto the top-8 PCA components and
+        tanh-squash with per-component scales -- the identical pipeline to the
+        dataset's conditioning encoder, so the teacher target and the command
+        live in the same space.
         """
         raw_n = est_motion.shape[0]
-        if getattr(self, "_teacher_action_encoder", "ss_vae") == "pca_raw":
-            flat = est_motion[:, :, :2].reshape(raw_n, 200).float()
-            P = (flat - self._pca_mean) @ self._pca_comp_T            # [raw_n,16]
-            return torch.tanh(P[:, :8] / self._pca_scales)            # top-8, squashed
-        xy = est_motion[:, :, :2].reshape(raw_n, 10, 10, 2)
-        x_in = xy.permute(0, 3, 1, 2).float() / self._frozen_ss_vae_scale
-        mu, _ = self._frozen_ss_vae.encoder(x_in.to(self.device))
-        return _tanh_squash(mu.squeeze(-1).squeeze(-1))
+        flat = est_motion[:, :, :2].reshape(raw_n, 200).float()
+        P = (flat - self._pca_mean) @ self._pca_comp_T            # [raw_n,16]
+        return torch.tanh(P[:, :8] / self._pca_scales)            # top-8, squashed
 
     @torch.no_grad()
     def _compute_action_teacher_targets(
@@ -1637,7 +1578,7 @@ class CausalLoRADiffusionTrainer:
         teacher_z_8d = teacher_z_8d[:, :n_chunks]  # [B, n_chunks, 8]
         # The critic predicts len(action_critic_dims) (= z_out_dim) dims; slice the
         # 8-D teacher to those dims so the critic loss matches. No-op when
-        # action_critic_dims == [0..7] (top-8 / v14d), required for top-4 / top-2.
+        # action_critic_dims == [0..7] (top-8), required for top-4 / top-2.
         teacher_targets = teacher_z_8d[..., self.action_critic_dims]
 
         pred_x0_detached = pred_x0.detach()
@@ -1961,9 +1902,9 @@ class CausalLoRADiffusionTrainer:
         saved_mask = getattr(causal_model, "block_mask", None)
         causal_model.block_mask = None
 
-        # Watchdog: this eval runs on rank 0 ONLY; if its mp4-encode or W&B upload
-        # hangs (it has — job 5290964 deadlocked at the step-50 eval), the other
-        # ranks block forever at the next collective. SIGALRM converts any hang
+        # Watchdog: this eval runs on rank 0 only. If its mp4-encode or W&B upload
+        # hangs, the other ranks block forever at the next collective, so this is
+        # not optional. SIGALRM converts any hang
         # into a TimeoutError that the except-block below catches, so rank 0 always
         # aborts the eval and rejoins the collectives. Main-thread / main-process
         # only (which is exactly where _maybe_eval runs).
@@ -2321,8 +2262,6 @@ class CausalLoRADiffusionTrainer:
             batch_size=micro_batch,
             max_windows_per_ride=max_windows_per_ride,
             context_frames=self.context_frames,
-            dual_view=self.dual_view,
-            reverse_root=self.reverse_root,
         )
 
         total_batch_size = micro_batch * self.gradient_accumulation * self.world_size
@@ -2401,30 +2340,12 @@ class CausalLoRADiffusionTrainer:
                 )
                 prompt_embeds = batcher.load_prompt_embeds_batch(self.device, dtype=self.dtype)
 
-                # Single-view: nf == num_frames. Dual-view (AOO): full_latents and
-                # z carry [forward_window | reverse_window] on the frame axis; slice
-                # each view to (clean context, noisy target) then re-concat so the
-                # model sees [fwd | rev] with nf = 2*num_frames. flow loss covers
-                # BOTH views; critic/state-probe supervise the FORWARD half only
-                # (z_actions_full_raw = forward z) — reverse egomotion teacher
-                # targets are a known-unreliable failure mode.
-                if self.dual_view:
-                    wt = num_frames + cf
-                    nf = 2 * num_frames
-                    f_lat, r_lat = full_latents[:, :wt], full_latents[:, wt:2 * wt]
-                    context_latents = torch.cat([f_lat[:, :num_frames], r_lat[:, :num_frames]], dim=1)
-                    target_latents = torch.cat([f_lat[:, cf:], r_lat[:, cf:]], dim=1)
-                    f_z, r_z = z_actions_full[:, :wt], z_actions_full[:, wt:2 * wt]
-                    z_raw_noisy = torch.cat([f_z[:, cf:], r_z[:, cf:]], dim=1)
-                    z_raw_clean = torch.cat([f_z[:, :num_frames], r_z[:, :num_frames]], dim=1)
-                    z_actions_full_raw = f_z
-                else:
-                    nf = num_frames
-                    context_latents = full_latents[:, :num_frames]
-                    target_latents = full_latents[:, cf:]
-                    z_raw_noisy = z_actions_full[:, cf:]
-                    z_raw_clean = z_actions_full[:, :num_frames]
-                    z_actions_full_raw = z_actions_full
+                nf = num_frames
+                context_latents = full_latents[:, :num_frames]
+                target_latents = full_latents[:, cf:]
+                z_raw_noisy = z_actions_full[:, cf:]
+                z_raw_clean = z_actions_full[:, :num_frames]
+                z_actions_full_raw = z_actions_full
 
                 z_noisy = z_raw_noisy[..., self.action_dims] if self.action_dims is not None else z_raw_noisy
                 z_clean = z_raw_clean[..., self.action_dims] if self.action_dims is not None else z_raw_clean
@@ -2454,7 +2375,7 @@ class CausalLoRADiffusionTrainer:
                 # (window_start + cf + k); window_start from the batcher's get_window_bounds.
                 glitch_mask = None
                 _gp = int(getattr(self.config, "glitch_mask_period", 0))
-                if _gp > 0 and not self.dual_view:
+                if _gp > 0:
                     _starts = torch.tensor([b[0] for b in batcher.get_window_bounds()],
                                            device=self.device, dtype=torch.long)        # [bsz]
                     _k = torch.arange(num_frames, device=self.device, dtype=torch.long)
@@ -2486,12 +2407,9 @@ class CausalLoRADiffusionTrainer:
 
                     teacher_z_8d = None
                     if self.action_critic_enabled and self.action_critic is not None:
-                        # Forward-only critic (v1): supervise the forward half of
-                        # pred_x0 / timesteps; z_actions_full_raw is already the
-                        # forward-view z (reverse egomotion teacher is unreliable).
                         target_action_z = z_actions_full_raw[:, cf:][..., self.action_critic_dims]
-                        pred_x0_sup = pred_x0[:, :num_frames] if self.dual_view else pred_x0
-                        ts_sup = timesteps[:, :num_frames] if self.dual_view else timesteps
+                        pred_x0_sup = pred_x0
+                        ts_sup = timesteps
                         gen_loss, critic_logs, teacher_z_8d = self._compute_action_critic_losses(
                             pred_x0_sup, target_action_z, ts_sup, step,
                         )

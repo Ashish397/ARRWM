@@ -775,6 +775,16 @@ class ODEChainPipeline(ChainPipeline):
         #                         denoise step.
         # ------------------------------------------------------------------
         generated: List[torch.Tensor] = []
+        # ODE_STAT_LOCK=1: serve-time inversion of the measured per-chunk
+        # affine variance contraction (s_c = s_GT * k^(c+1), k~0.917 for
+        # the 4-rung ladder; see flow_viz/STAT_FORENSICS_REPORT.txt).
+        # Reference = the REAL seed context's per-channel mean/std; each
+        # committed chunk is re-pinned to it BEFORE emission + cache
+        # refresh, so the contraction cannot compound through self-context.
+        _sl_ref = None
+        if os.environ.get("ODE_STAT_LOCK"):
+            _r = initial_latents_dev.to(torch.float32)
+            _sl_ref = (_r.mean(dim=(0, 1, 3, 4)), _r.std(dim=(0, 1, 3, 4)))
         _fr_steps: list = []                       # ARRWM flow-viz hook records
 
         # FIFO state used only by cache_refresh="full_fifo". Entries are
@@ -913,6 +923,44 @@ class ODEChainPipeline(ChainPipeline):
                         _fr_steps.append((step_idx, d_idx, -next_t,
                                           x.detach().float().to(torch.float16).cpu().numpy()))
             assert pred_x0 is not None
+
+            _sl_mode = os.environ.get("ODE_STAT_LOCK")
+            if _sl_mode == "hyb" and _sl_ref is not None:
+                # Hybrid: hard-pin per-channel STD to the seed anchor
+                # (contrast is where the contraction is visible and is
+                # near-stationary in GT) but leave channel MEANS free with
+                # only the inverse-gain correction (egomotion partly lives
+                # in mean shifts; anchoring them halves realized motion).
+                _kmu = min(1.0 / float(os.environ.get("ODE_SL_KMU", "0.894")), 1.2)
+                _p = pred_x0.to(torch.float32)
+                _mu = _p.mean(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1)
+                _sd = _p.std(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1)
+                pred_x0 = (
+                    _mu * _kmu + (_p - _mu) / (_sd + 1e-6)
+                    * _sl_ref[1].view(1, 1, -1, 1, 1)
+                ).to(pred_x0.dtype)
+            elif _sl_mode == "inv":
+                # Inverse-gain mode: cancel the MEASURED per-chunk affine
+                # contraction (std x k_sd, mean x k_mu toward zero) without
+                # anchoring content to any fixed reference — hard-pinning to
+                # the seed stats was shown to also cancel legitimate scene
+                # evolution (halved realized motion). Gains are measured per
+                # checkpoint (arm-D: k_sd 0.9565, k_mu 0.894) and clamped.
+                _ksd = min(1.0 / float(os.environ.get("ODE_SL_KSTD", "0.9565")), 1.1)
+                _kmu = min(1.0 / float(os.environ.get("ODE_SL_KMU", "0.894")), 1.2)
+                _p = pred_x0.to(torch.float32)
+                _mu = _p.mean(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1)
+                pred_x0 = (_mu * _kmu + (_p - _mu) * _ksd).to(pred_x0.dtype)
+            elif _sl_ref is not None:
+                # Hard-pin mode: per-channel affine re-pin to seed stats.
+                _p = pred_x0.to(torch.float32)
+                _mu = _p.mean(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1)
+                _sd = _p.std(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1)
+                pred_x0 = (
+                    (_p - _mu) / (_sd + 1e-6)
+                    * _sl_ref[1].view(1, 1, -1, 1, 1)
+                    + _sl_ref[0].view(1, 1, -1, 1, 1)
+                ).to(pred_x0.dtype)
 
             generated.append(pred_x0.detach().to(torch.float32))
 

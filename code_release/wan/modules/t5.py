@@ -475,11 +475,17 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
     ):
+        # Upstream defaulted this to ``torch.cuda.current_device()``, which is
+        # evaluated when the class body runs -- i.e. at import time -- and
+        # raises on a CPU-only machine. Resolving it here leaves the effective
+        # default on a GPU host unchanged.
+        if device is None:
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
         self.text_len = text_len
         self.dtype = dtype
         self.device = device

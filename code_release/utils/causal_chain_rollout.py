@@ -32,7 +32,7 @@ def stream_causal_chain(
         prompt_embeds: [1, L, D] text embeds (already on device, dtype).
         seed_lat: [1, nfb, C, H, W] clean seed chunk (real context).
         z_actions: [1, TOT_F, A] per-frame action command (A = raw_action_dim,
-            e.g. 2 for [z2,z7]); TOT_F must be >= nfb + gen_chunks*nfb. The first
+            e.g. 2 for [PC0, PC1]); TOT_F must be >= nfb + gen_chunks*nfb. The first
             nfb frames condition the seed; flip only the frames AFTER nfb to keep
             the starting state identical across GT/flipped runs.
 

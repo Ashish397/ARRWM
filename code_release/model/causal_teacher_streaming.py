@@ -9,7 +9,7 @@ batch members begin at different temporal positions in their rides.
 """
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -26,14 +26,6 @@ class _RideSlot:
     window_idx: int = 0
     start_offset: int = 0
     loaded: bool = False
-    # Dual-view (Study 1 / AOO): absolute forward index of the aligned-span
-    # start (window bases are offset by this), absolute aligned-span end, the
-    # forward->rear wall-clock alignment map, and the rear zarr path. Defaults
-    # keep single-view behaviour unchanged (base_offset 0, no rear).
-    base_offset: int = 0
-    align_end: int = 0
-    align_map: object = None
-    reverse_zarr_path: str = ""
 
 
 class LockstepRideBatcher:
@@ -70,8 +62,6 @@ class LockstepRideBatcher:
         max_windows_per_ride: Optional[int] = None,
         context_frames: int = 3,
         max_start_offset: int = 40,
-        dual_view: bool = False,
-        reverse_root: Optional[str] = None,
     ):
         assert window_size % num_frame_per_block == 0
         self.window_size = window_size
@@ -80,15 +70,6 @@ class LockstepRideBatcher:
         self.max_windows_per_ride = max_windows_per_ride
         self.context_frames = context_frames
         self.max_start_offset = max_start_offset
-        # Study 1 / AOO: when True, each window also loads the wall-clock-aligned
-        # rear view and concatenates it on the frame axis (forward frames then
-        # reverse frames). The batcher owns the rear loading: per ride it reads
-        # <reverse_root>/<ride_ts>.align.npy (built by utils/build_rear_alignment),
-        # constrains windows to the aligned span, and gathers rear latents.
-        self.dual_view = dual_view
-        self.reverse_root = reverse_root
-        if dual_view and not reverse_root:
-            raise ValueError("dual_view requires reverse_root")
 
         self._slots: List[_RideSlot] = [_RideSlot() for _ in range(batch_size)]
 
@@ -113,7 +94,7 @@ class LockstepRideBatcher:
         """
         n_lat = int(rd["n_latent_frames"])
         forced = int(rd.get("forced_offset", -1))
-        if (not self.dual_view) and forced >= 0 and forced + self.window_size + self.context_frames <= n_lat:
+        if forced >= 0 and forced + self.window_size + self.context_frames <= n_lat:
             # Single curated window at the forced (block-aligned) start.
             self._slots[idx] = _RideSlot(
                 zarr_path=rd["zarr_path"],
@@ -125,21 +106,7 @@ class LockstepRideBatcher:
                 loaded=True,
             )
             return
-        # Dual-view: load the wall-clock alignment map for this ride and constrain
-        # windows to the contiguous aligned span [align_start, align_end) (clamped
-        # to the motion-capped n_lat). Window bases are offset by base_offset
-        # (= align_start). Single-view: base_offset 0, eff_end = n_lat -> identical
-        # to the original logic.
-        base, eff_end, align_map, rev_path = 0, n_lat, None, ""
-        if self.dual_view:
-            from utils.zarr_dataset import ZarrRideDataset
-            from pathlib import Path as _Path
-            ride_ts = _Path(rd["zarr_path"]).stem
-            align_map = ZarrRideDataset.load_alignment_map(self.reverse_root, ride_ts)
-            a, b = ZarrRideDataset.aligned_span(align_map)
-            base, eff_end = a, min(b, n_lat)
-            rev_path = str(_Path(self.reverse_root) / f"{ride_ts}.zarr")
-        usable_len = max(0, eff_end - base)
+        usable_len = n_lat
         offset = self._random_start_offset()
         usable = usable_len - offset - self.context_frames
         if usable < self.window_size:
@@ -156,10 +123,6 @@ class LockstepRideBatcher:
             window_idx=0,
             start_offset=offset,
             loaded=True,
-            base_offset=base,
-            align_end=eff_end,
-            align_map=align_map,
-            reverse_zarr_path=rev_path,
         )
 
     # ------------------------------------------------------------------
@@ -240,7 +203,7 @@ class LockstepRideBatcher:
         """
         bounds = []
         for s in self._slots:
-            start = s.base_offset + s.start_offset + s.window_idx * self.window_size
+            start = s.start_offset + s.window_idx * self.window_size
             end = start + self.window_size + self.context_frames
             bounds.append((start, end))
         return bounds
@@ -275,14 +238,6 @@ class LockstepRideBatcher:
             chunk = ZarrRideDataset.load_latent_chunk(
                 slot.zarr_path, start, end,
             )
-            if self.dual_view:
-                # Gather the wall-clock-aligned rear latents for THIS window and
-                # concat on the frame axis -> [forward_frames, reverse_frames].
-                rear_idx = slot.align_map[start:end]
-                rear = ZarrRideDataset.load_reverse_latent_chunk(
-                    slot.reverse_zarr_path, rear_idx,
-                )
-                chunk = torch.cat([chunk, rear], dim=0)
             chunks.append(chunk)
         return torch.stack(chunks).to(device=device, dtype=dtype)
 
@@ -309,12 +264,6 @@ class LockstepRideBatcher:
         actions = []
         for slot, (start, end) in zip(self._slots, bounds):
             z = encode_fn(slot.zarr_path, slot.n_latent_frames, start, end)
-            if self.dual_view:
-                # Reverse view reuses the SAME forward z with z2/z7 sign-flipped
-                # (not re-extracted), concatenated on the frame axis to match the
-                # [forward_frames, reverse_frames] latent order.
-                from utils.zarr_dataset import flip_reverse_z
-                z = torch.cat([z, flip_reverse_z(z)], dim=0)
             actions.append(z)
         return torch.stack(actions).to(device=device, dtype=dtype)
 

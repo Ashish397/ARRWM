@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 from typing import List, Optional
 import torch
-import os
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
+from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from utils.debug_option import DEBUG
 import torch.distributed as dist
 

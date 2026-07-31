@@ -17,6 +17,6 @@ srun --ntasks=16 --ntasks-per-node=4 --gpus-per-node=4 bash -c '
   export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
   export IE_SHARD=$SLURM_PROCID IE_NSHARDS=16
   export TORCHINDUCTOR_CACHE_DIR=/tmp/ti_${USER}_${SLURM_PROCID} TRITON_CACHE_DIR=/tmp/tr_${USER}_${SLURM_PROCID}
-  python utils/inject_eval.py > logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_shard${SLURM_PROCID}.log 2>&1
+  python evaluation/inject_eval.py > logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_shard${SLURM_PROCID}.log 2>&1
 '
 echo "INJECT-EVAL done $(date)"

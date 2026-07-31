@@ -2,10 +2,10 @@
 
 Chunkwise 3D-convolutional critic that consumes 3-frame latent cubes
 from ``pred_x0``, plus the per-chunk diffusion timestep and commanded
-action, and predicts the full 8-D ss_vae latent z per chunk.
+action, and predicts the full 8-D PCA action vector z per chunk.
 
 The critic is trained to approximate the teacher z:
-  pred_x0 -> noise(t=25) -> VAE decode -> CoTracker -> ss_vae -> z (8D)
+  pred_x0 -> noise(t=25) -> VAE decode -> CoTracker -> PCA -> z (8D)
 
 Generator guidance is provided by backpropagating through the frozen
 critic to minimise weighted MSE between predicted z and target z.
@@ -105,8 +105,8 @@ class ActionCritic(nn.Module):
 
     Args:
         latent_channels: Number of latent channels (default 16).
-        action_dim: Dimension of commanded action input (default 2 for z2/z7).
-        z_out_dim: Dimension of output z prediction (default 8 for full ss_vae latent).
+        action_dim: Dimension of commanded action input (default 2 = PC0 throttle, PC1 steer).
+        z_out_dim: Dimension of output z prediction (default 8 = top-8 PCA components).
         base_channels: Channel width of first conv stage (default 64).
         num_res_blocks: Number of residual blocks in the trunk (default 3).
         chunk_frames: Frames per chunk (default 3, matching num_frame_per_block).

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the final action-injection (A) or static-render (B) eval for all 6 models.
+# Launch the final action-injection (A) or static-render (B) eval for all 7 runs.
 # Usage: bash sbatch/launch_inject.sh A     (or B)
 set -e
 cd ${AF_ROOT}
@@ -18,6 +18,7 @@ declare -A MAP=(
   [16node]="causal_lora_diffusion_teacher_v14e_16node.yaml:v14e_16node"
   [4node]="causal_lora_diffusion_teacher_v14e_4node.yaml:v14e_4node"
   [noatok]="causal_lora_diffusion_teacher_v14e_noatok.yaml:v14e_noatok"
+  [noadaln]="causal_lora_diffusion_teacher_v14e_noadaln.yaml:v14e_noadaln"
 )
 for run in "${!MAP[@]}"; do
   cfg="configs/${MAP[$run]%%:*}"; dir="logs/${MAP[$run]##*:}"

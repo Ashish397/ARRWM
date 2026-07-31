@@ -6,7 +6,12 @@ import torch
 
 
 cpu = torch.device('cpu')
-gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
+# Fall back to CPU when no GPU is visible. Upstream calls current_device()
+# unconditionally, which raises at import time on a CPU-only machine and makes
+# every module that imports this one un-importable. On a GPU host this resolves
+# to cuda:0 exactly as before.
+gpu = (torch.device(f'cuda:{torch.cuda.current_device()}')
+       if torch.cuda.is_available() else cpu)
 gpu_complete_modules = []
 
 

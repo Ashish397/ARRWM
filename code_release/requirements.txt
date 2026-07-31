@@ -1,40 +1,49 @@
-opencv-python>=4.9.0.80
+# Derived from the imports this release actually uses. Install PyTorch first,
+# matched to your CUDA version (see pytorch.org); the pin below is the build the
+# reported runs used.
+
+# --- core: training, inference, data ---
+torch==2.10.0
+torchvision
+numpy
+einops
+omegaconf
+zarr
+numcodecs
 diffusers==0.31.0
 transformers>=4.49.0
 tokenizers>=0.20.3
-accelerate>=1.1.1
-tqdm
-datasets
-imageio
-easydict
-ftfy
-dashscope
-imageio-ffmpeg
-# numpy==1.24.4
-wandb
-omegaconf
-einops
-av==13.1.0
-opencv-python
-git+https://github.com/openai/CLIP.git
-open_clip_torch
-starlette
-pycocotools
-lmdb
-matplotlib
-sentencepiece
-pydantic==2.10.6
-scikit-image
-huggingface_hub[cli]
-dominate
-nvidia-pyindex
-nvidia-tensorrt
-pycuda
-onnx
-onnxruntime
-onnxscript
-onnxconverter_common
-flask
-flask-socketio
-torchao
 peft
+wandb
+
+# --- video / image IO ---
+opencv-python>=4.9.0.80
+av==13.1.0
+imageio
+imageio-ffmpeg
+pillow
+
+# --- Wan T5 text encoder tokenisation ---
+ftfy
+regex
+sentencepiece
+
+# --- analysis and figures ---
+pandas
+scipy
+matplotlib
+tqdm
+
+# --- reference-free evaluation metrics ---
+pyiqa                 # MUSIQ / NIQE image-quality scores
+open_clip_torch       # CLIP embeddings for the style-shift axes
+ruptures              # change-point detection on the style timeline
+ultralytics           # object detection for the scene-content features
+datasets              # HuggingFace loader used by the caption pipeline
+
+# --- optional ---
+# flash-attn is imported behind a try/except in wan/modules/attention.py. The
+# causal model used by every released config runs on PyTorch's flex_attention
+# and never calls into it, so it is not required to reproduce the results. Only
+# the bidirectional WanModel path (is_causal=False, unused here) asserts it.
+# flash-attn

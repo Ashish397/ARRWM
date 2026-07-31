@@ -1,12 +1,10 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from einops import repeat
 
 from .attention import flash_attention
 
@@ -195,33 +193,6 @@ class WanT2VCrossAttention(WanSelfAttention):
         return x
 
 
-class WanGanCrossAttention(WanSelfAttention):
-
-    def forward(self, x, context, crossattn_cache=None):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
-            crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
-        """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
-        qq = self.norm_q(self.q(context)).view(b, 1, -1, d)
-
-        kk = self.norm_k(self.k(x)).view(b, -1, n, d)
-        vv = self.v(x).view(b, -1, n, d)
-
-        # compute attention
-        x = flash_attention(qq, kk, vv)
-
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
-
-
 class WanI2VCrossAttention(WanSelfAttention):
 
     def __init__(self,
@@ -359,88 +330,6 @@ class WanAttentionBlock(nn.Module):
         return x
 
 
-class GanAttentionBlock(nn.Module):
-
-    def __init__(self,
-                 dim=1536,
-                 ffn_dim=8192,
-                 num_heads=12,
-                 window_size=(-1, -1),
-                 qk_norm=True,
-                 cross_attn_norm=True,
-                 eps=1e-6):
-        super().__init__()
-        self.dim = dim
-        self.ffn_dim = ffn_dim
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.qk_norm = qk_norm
-        self.cross_attn_norm = cross_attn_norm
-        self.eps = eps
-
-        # layers
-        # self.norm1 = WanLayerNorm(dim, eps)
-        # self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
-        #   eps)
-        self.norm3 = WanLayerNorm(
-            dim, eps,
-            elementwise_affine=True) if cross_attn_norm else nn.Identity()
-
-        self.norm2 = WanLayerNorm(dim, eps)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
-            nn.Linear(ffn_dim, dim))
-
-        self.cross_attn = WanGanCrossAttention(dim, num_heads,
-                                               (-1, -1),
-                                               qk_norm,
-                                               eps)
-
-        # modulation
-        # self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-
-    def forward(
-        self,
-        x,
-        context,
-        # seq_lens,
-        # grid_sizes,
-        # freqs,
-        # context,
-        # context_lens,
-    ):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, 6, C]
-            seq_lens(Tensor): Shape [B], length of each sequence in batch
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-        """
-        # assert e.dtype == torch.float32
-        # with amp.autocast(dtype=torch.float32):
-        # e = (self.modulation + e).chunk(6, dim=1)
-        # assert e[0].dtype == torch.float32
-
-        # # self-attention
-        # y = self.self_attn(
-        #     self.norm1(x) * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-        #     freqs)
-        # # with amp.autocast(dtype=torch.float32):
-        # x = x + y * e[2]
-
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context):
-            token = context + self.cross_attn(self.norm3(x), context)
-            y = self.ffn(self.norm2(token)) + token  # * (1 + e[4]) + e[3])
-            # with amp.autocast(dtype=torch.float32):
-            # x = x + y * e[5]
-            return y
-
-        x = cross_attn_ffn(x, context)
-        return x
-
-
 class Head(nn.Module):
 
     def __init__(self, dim, out_dim, patch_size, eps=1e-6):
@@ -484,19 +373,6 @@ class MLPProj(torch.nn.Module):
     def forward(self, image_embeds):
         clip_extra_context_tokens = self.proj(image_embeds)
         return clip_extra_context_tokens
-
-
-class RegisterTokens(nn.Module):
-    def __init__(self, num_registers: int, dim: int):
-        super().__init__()
-        self.register_tokens = nn.Parameter(torch.randn(num_registers, dim) * 0.02)
-        self.rms_norm = WanRMSNorm(dim, eps=1e-6)
-
-    def forward(self):
-        return self.rms_norm(self.register_tokens)
-
-    def reset_parameters(self):
-        nn.init.normal_(self.register_tokens, std=0.02)
 
 
 class WanModel(ModelMixin, ConfigMixin):
@@ -606,16 +482,6 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
-        # Optional alt head — same architecture as ``self.head`` (a tiny
-        # ~135K-param projection from backbone features to flow-space
-        # output) but learns a different target. Built lazily via
-        # ``enable_alt_head()``. In v21, fake_score's alt head is trained
-        # to predict the EMA-real teacher's x0 estimate (instead of the
-        # student's x0 the main head predicts); at inference time, its
-        # output is the "causal AR GT" estimate used by the aux teacher
-        # pass. Input is detached during forward so its loss never
-        # propagates into the backbone.
-        self.head_alt: Optional[Head] = None
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
@@ -647,24 +513,6 @@ class WanModel(ModelMixin, ConfigMixin):
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
 
-    def enable_alt_head(self) -> None:
-        """Build the alt head (warm-init from main head's weights).
-
-        Idempotent. Should be called AFTER the main head's weights are
-        loaded from a pretrained checkpoint so the alt head starts from
-        the same parameter values, then diverges via its own training.
-        """
-        if self.head_alt is not None:
-            return
-        # Match the main head's class (Head). The args mirror the
-        # __init__ above.
-        # NB: out_dim was multiplied into Head() at construction time
-        # via ``math.prod(patch_size) * out_dim`` already; pass the
-        # raw out_dim per the constructor signature.
-        self.head_alt = Head(self.dim, self.out_dim, self.patch_size, self.eps)
-        sample_param = next(self.head.parameters())
-        self.head_alt.to(device=sample_param.device, dtype=sample_param.dtype)
-        self.head_alt.load_state_dict(self.head.state_dict())
 
     def forward(
         self,
@@ -679,20 +527,8 @@ class WanModel(ModelMixin, ConfigMixin):
         t,
         context,
         seq_len,
-        classify_mode=False,
-        regress_mode=False,
-        concat_time_embeddings=False,
-        register_tokens=None,
-        cls_pred_branch=None,
-        gan_ca_blocks=None,
-        register_tokens_rgs=None,
-        rgs_pred_branch=None,
-        gan_ca_blocks_rgs=None,
-        num_frames_rgs=None,
-        num_class_rgs=None,
         clip_fea=None,
         y=None,
-        compute_alt_head: bool = False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -771,30 +607,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 return module(*inputs, **kwargs)
             return custom_forward
 
-        # TODO: Tune the number of blocks for feature extraction
-        final_x = None
-        if classify_mode:
-            assert register_tokens is not None
-            assert gan_ca_blocks is not None
-            assert cls_pred_branch is not None
-
-            final_x = []
-            registers = repeat(register_tokens(), "n d -> b n d", b=x.shape[0])
-            # x = torch.cat([registers, x], dim=1)
-
-        final_x_rgs = None
-        if regress_mode:
-            assert register_tokens_rgs is not None
-            assert gan_ca_blocks_rgs is not None
-            assert rgs_pred_branch is not None
-
-            final_x_rgs = []
-            registers_rgs = repeat(register_tokens_rgs(), "n d -> b n d", b=x.shape[0])
-            # x = torch.cat([registers_rgs, x], dim=1)
-
-        gan_idx = 0
-        gan_idx_rgs = 0
-        for ii, block in enumerate(self.blocks):
+        for block in self.blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
@@ -804,69 +617,9 @@ class WanModel(ModelMixin, ConfigMixin):
             else:
                 x = block(x, **kwargs)
 
-            if classify_mode and ii in [7, 13, 21, 29]:
-                gan_token = registers[:, gan_idx: gan_idx + 1]
-                # Apply multiple GanAttentionBlocks sequentially for progressive feature refinement
-                token_features = gan_token
-                for block in gan_ca_blocks[gan_idx]:
-                    token_features = block(x, token_features)
-                final_x.append(token_features)
-                gan_idx += 1
-
-            if regress_mode and ii in [7, 13, 21, 29]:
-                gan_token_rgs = registers_rgs[:, gan_idx_rgs: gan_idx_rgs + 1]
-                # Apply multiple GanAttentionBlocks sequentially for progressive feature refinement
-                token_features_rgs = gan_token_rgs
-                for block in gan_ca_blocks_rgs[gan_idx_rgs]:
-                    token_features_rgs = block(x, token_features_rgs)
-                final_x_rgs.append(token_features_rgs)
-                gan_idx_rgs += 1
-
-        if classify_mode:
-            final_x = torch.cat(final_x, dim=1)
-            if concat_time_embeddings:
-                final_x = cls_pred_branch(torch.cat([final_x, 10 * e[:, None, :]], dim=1).view(final_x.shape[0], -1))
-            else:
-                final_x = cls_pred_branch(final_x.view(final_x.shape[0], -1))
-
-        if regress_mode:
-            final_x_rgs = torch.cat(final_x_rgs, dim=1)
-            if concat_time_embeddings:
-                final_x_rgs = rgs_pred_branch(torch.cat([final_x_rgs, 10 * e[:, None, :]], dim=1).view(final_x_rgs.shape[0], -1))
-            else:
-                final_x_rgs = rgs_pred_branch(final_x_rgs.view(final_x_rgs.shape[0], -1))
-
-            # Reshape from [B, 4, 21] to [B, 21, 4]
-            # Hard-coded: 42 = 21 frames * 2 actions
-            batch_size = final_x_rgs.shape[0]
-            final_x_rgs = final_x_rgs.view(batch_size, num_frames_rgs, num_class_rgs)
-
-        # head (main) + optional alt head sharing backbone features
-        x_feat = x
-        x = self.head(x_feat, e)
+        x = self.head(x, e)
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
-        out_alt = None
-        if compute_alt_head and self.head_alt is not None:
-            # Detach the alt head's input so its loss only updates
-            # alt-head params, never the backbone — preserves
-            # fake_score's existing training contract.
-            x_alt = self.head_alt(x_feat.detach(), e.detach())
-            x_alt = self.unpatchify(x_alt, grid_sizes)
-            out_alt = torch.stack(x_alt)
-
-        if classify_mode:
-            if out_alt is not None:
-                return torch.stack(x), final_x, out_alt
-            return torch.stack(x), final_x
-
-        if regress_mode:
-            if out_alt is not None:
-                return torch.stack(x), final_x_rgs, out_alt
-            return torch.stack(x), final_x_rgs
-
-        if out_alt is not None:
-            return torch.stack(x), out_alt
         return torch.stack(x)
 
     def unpatchify(self, x, grid_sizes, c=None):

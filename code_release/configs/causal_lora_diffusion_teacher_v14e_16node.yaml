@@ -64,7 +64,7 @@ encoded_root: ${oc.env:DATA_ROOT}/frodobots_encoded_weunz
 train_window_manifest: paper_assets/v14d_train_windows.json
 caption_root: ${oc.env:DATA_ROOT}/frodobots_captions/train
 motion_root: ${oc.env:DATA_ROOT}/frodobots_motion
-ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
+pca_basis_checkpoint: preprocessing/checkpoints/pca_basis.pt
 
 # Action conditioning  (UNCHANGED from v14 — full injection: both channels)
 model_variant: action-injection

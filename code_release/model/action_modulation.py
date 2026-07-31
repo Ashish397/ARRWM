@@ -18,11 +18,11 @@ import torch.nn as nn
 class ActionModulationProjection(nn.Module):
     """
     Projects action features to adaLN modulation parameters.
-    
+
     Similar to time_projection in Wan model, but specifically for action conditioning.
     Outputs 6 modulation parameters per frame: (shift, scale, gate) × 2 (for self-attn and ffn)
     """
-    
+
     def __init__(
         self,
         action_dim: int,
@@ -45,7 +45,7 @@ class ActionModulationProjection(nn.Module):
             zero_init: if True, initialize output layer to zero (adaLN-Zero)
         """
         super().__init__()
-        
+
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
@@ -70,7 +70,7 @@ class ActionModulationProjection(nn.Module):
             in_dim = fourier_dim + (action_dim if self.include_raw_actions else 0)
         else:
             in_dim = action_dim
-        
+
         # Shallow, sign-symmetric-ish MLP with activation + LayerNorm
         self.action_embedding = nn.Sequential(
             nn.Linear(in_dim, mlp_dim),
@@ -82,13 +82,13 @@ class ActionModulationProjection(nn.Module):
 
         # Projection to modulation parameters (6 params per frame -> dim)
         self.action_projection = nn.Linear(mlp_dim, hidden_dim * 6)
-        
+
         # Initialize with zeros for adaLN-Zero
         if zero_init:
             # "Near-zero" init so gradients flow through the whole branch immediately
             nn.init.normal_(self.action_projection.weight, mean=0.0, std=self.zero_init_std)
             nn.init.zeros_(self.action_projection.bias)
-    
+
     def _get_activation(self, activation_str: str):
         """Get the appropriate activation class based on string."""
         activation_str = activation_str.lower()
@@ -100,15 +100,15 @@ class ActionModulationProjection(nn.Module):
             return nn.Tanh
         else:
             raise ValueError(f"Unknown activation function: {activation_str}. Must be one of 'leakyrelu', 'silu', or 'tanh'")
-    
+
     def forward(self, action_features: torch.Tensor, num_frames: int | None = None) -> torch.Tensor:
         """
         Generate modulation parameters from action features.
-        
+
         Args:
             action_features: [batch_size, action_dim] or [batch_size, num_frames, action_dim]
             num_frames: number of frames (if action_features is 2D)
-            
+
         Returns:
             modulation_params: [batch_size, num_frames, 6, hidden_dim]
         """
@@ -128,7 +128,7 @@ class ActionModulationProjection(nn.Module):
                 x = torch.cat([x, ff], dim=-1)                     # [B,F,A+2AK]
             else:
                 x = ff                                             # [B,F,2AK]
-        
+
         # Flatten for processing
         action_flat = x.flatten(0, 1)  # [B*F, in_dim]
         ref_weight = next(self.action_embedding.parameters(), None)
@@ -143,7 +143,7 @@ class ActionModulationProjection(nn.Module):
         modulation = self.action_projection(action_emb)  # [B*F, hidden_dim * 6]
         # Reshape to [B, F, 6, hidden_dim]
         modulation = modulation.view(batch_size, num_frames, 6, self.hidden_dim)
-        
+
         scale = modulation.new_tensor([
             self.shift_scale, self.shift_scale, self.gate_scale,
             self.shift_scale, self.shift_scale, self.gate_scale

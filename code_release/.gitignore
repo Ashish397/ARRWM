@@ -7,3 +7,14 @@ logs/
 wandb/
 *.mp4
 *.zarr/
+
+# Required artifacts, not build output. These negations guard against a
+# broader rule (e.g. "checkpoints/" or "analysis/") inherited from a parent
+# repository or a global gitignore silently dropping them.
+!preprocessing/checkpoints/
+!preprocessing/checkpoints/pca_basis.pt
+!analysis/
+!analysis/testbench_v2/labels/
+!analysis/testbench_v2/labels/*.csv
+!paper_assets/
+!paper_assets/*.json

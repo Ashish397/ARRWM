@@ -88,7 +88,6 @@ class SchedulerInterface(ABC):
         noise = (xt-sqrt(alpha_t)*x0) / sqrt(beta_t)
         given v, x_t, we have
         x0 = sqrt(alpha_t) * x_t - sqrt(beta_t) * v
-        see derivations https://chatgpt.com/share/679fb6c8-3a30-8008-9b0e-d1ae892dac56
         """
         # use higher precision for calculations
         original_dtype = velocity.dtype

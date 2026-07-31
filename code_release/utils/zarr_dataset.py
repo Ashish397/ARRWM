@@ -1,13 +1,19 @@
-"""ZarrSequentialDataset: sequential video latent dataset from frodobots zarr files.
+"""ZarrRideDataset: ride-level video latent dataset from frodobots zarr files.
 
 Each zarr encodes a single ride with latents (T, 16, 60, 104), timestamps, and attrs
 containing ride_dir_2k, action_start_sec, fps, etc.
 
-Motion is loaded from motion.npy, aligned with the 0.8s delay, encoded through the
-ss_vae to 8D latents, tanh-squashed per dimension, then subsampled to latent frame rate.
+Motion is loaded from motion.npy, aligned with the 0.8s delay, encoded to an 8D
+action vector per chunk, then subsampled to latent frame rate.
 
-The dataset builds a flat list of (zarr_path, window_start) tuples ordered sequentially
-within each ride, so DistributedSampler(shuffle=False) naturally iterates rides in order.
+Motion is encoded by projecting the flattened 200-D CoTracker dx/dy field onto
+the frozen PCA basis and keeping the top 8 components, then tanh-squashing each
+with its own scale. The trainer's critic target and the eval read use the same
+basis, so command and teacher target live in one space.
+
+The dataset yields one sample per ride rather than per window, returning full-ride
+z_actions so the streaming trainer can slice arbitrary chunks itself. Latents load
+lazily and motion is encoded on first access, so construction only validates metadata.
 """
 
 import json
@@ -22,7 +28,6 @@ import torch
 import zarr as zarr_lib
 from torch.utils.data import Dataset
 
-from action_query.ss_vae_model import load_ss_vae
 
 # ---------------------------------------------------------------------------
 # Hardcoded constants (matching test_zarr_chunks.py)
@@ -80,75 +85,17 @@ _LATENT_HEAD_DROP = 0
 # See utils/test_zarr_chunks.py:117 for v14's matching convention.
 _ACTION_CAUSAL_LAG_SEC = 0.8
 
-# ss_vae encoding batch size.
-_ENCODE_BATCH = 128
-
 # Per-dimension tanh squash scales: tanh(z / scale) -> asymptotic ±1.
-# z2 = turn/sides (raw range ≈ ±25), z7 = fwd/back (raw range ≈ ±10).
+# PC1 = turn/sides (raw range ~ +-25), PC0 = fwd/back (raw range ~ +-10).
 _ZACTION_SCALES = torch.full((8,), 25.0, dtype=torch.float32)
 _ZACTION_SCALES[2] = 25.0
 _ZACTION_SCALES[7] = 10.0
 
 
-def _format_gib(num_bytes: int) -> str:
-    return f"{num_bytes / (1024 ** 3):.2f} GiB"
-
-
-def _read_proc_status_memory() -> Tuple[Optional[int], Optional[int]]:
-    """Return current RSS and high-water mark from /proc/self/status in bytes."""
-    try:
-        with open("/proc/self/status", "r", encoding="utf-8") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return None, None
-
-    vmrss_bytes: Optional[int] = None
-    vmhwm_bytes: Optional[int] = None
-
-    for line in lines:
-        if line.startswith("VmRSS:"):
-            parts = line.split()
-            if len(parts) >= 2:
-                vmrss_bytes = int(parts[1]) * 1024
-        elif line.startswith("VmHWM:"):
-            parts = line.split()
-            if len(parts) >= 2:
-                vmhwm_bytes = int(parts[1]) * 1024
-
-    return vmrss_bytes, vmhwm_bytes
-
-
-def _build_memory_log_message() -> str:
-    parts = []
-
-    rss_bytes, hwm_bytes = _read_proc_status_memory()
-    if rss_bytes is not None:
-        parts.append(f"RSS={_format_gib(rss_bytes)}")
-    if hwm_bytes is not None:
-        parts.append(f"PeakRSS={_format_gib(hwm_bytes)}")
-
-    if torch.cuda.is_available():
-        try:
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            used_bytes = total_bytes - free_bytes
-            parts.append(
-                "GPU="
-                f"{_format_gib(used_bytes)} used / "
-                f"{_format_gib(free_bytes)} free / "
-                f"{_format_gib(total_bytes)} total"
-            )
-        except Exception:
-            pass
-
-    if not parts:
-        return "memory stats unavailable"
-    return ", ".join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Motion helpers (ported from utils/test_zarr_chunks.py)
 # ---------------------------------------------------------------------------
+
 
 def _resolve_motion_path(attrs: dict, motion_root: Path) -> Path:
     ride_dir_2k = attrs.get("ride_dir_2k", "")
@@ -256,54 +203,12 @@ def _load_aligned_motion_for_zarr(
     return motion[chunk_indices].astype(np.float32)
 
 
-def _encode_motion_ss_vae(
-    motion_per_frame: np.ndarray,
-    model,
-    scale: float,
-    device: str,
-    batch_size: int = _ENCODE_BATCH,
-) -> np.ndarray:
-    """Encode motion (n, 100, 3) to latent mu (n, latent_ch) via ss_vae encoder.
-
-    Ported from test_zarr_chunks.py lines 180-197.
-    dx/dy are used; visibility is ignored.
-    """
-    n = motion_per_frame.shape[0]
-    # Reshape (n, 100, 3) -> (n, 10, 10, 2) taking only dx, dy
-    xy = motion_per_frame[:, :, :2].reshape(n, 10, 10, 2)
-    x = torch.from_numpy(xy).permute(0, 3, 1, 2).float() / scale  # (n, 2, 10, 10)
-
-    zs = []
-    model.eval()
-    with torch.no_grad():
-        for s in range(0, n, batch_size):
-            mu, _ = model.encoder(x[s: s + batch_size].to(device))
-            zs.append(mu.squeeze(-1).squeeze(-1).cpu().numpy())  # (B, latent_ch)
-    return np.concatenate(zs, axis=0)  # (n, latent_ch)
-
-
-# --- PCA action-vector encoder (drop-in alternative to the SS-VAE) ----------
-# The SS-VAE's z2/z7 are each ~0.99 a SINGLE PCA component (z2<-PC1, z7<-PC0);
-# the VAE was literally PCA-regularised. These affine maps put the PCA coords
-# back into the VAE's z-space so the SAME tanh scales (25/10) apply and a
-# VAE-trained model sees a near-identical conditioning signal (squashed-action
-# MAE ~1.5-2%). Constants fit on 80k real motion windows.
+# --- PCA action-vector encoder --------------------------------------------
+# The action vector is the top-8 projection of the 200-D CoTracker dx/dy field
+# onto the frozen PCA basis. PC0 is throttle (forward/back) and PC1 is steer
+# (turn); the model is conditioned on those two.
 _PCA_SLOT_COMP = {2: 1, 7: 0}                                  # action slot -> PCA component
 _PCA_SLOT_AFFINE = {2: (0.34343, 0.3876), 7: (0.19748, 0.5047)}  # z_slot = a*PC + b
-
-
-def _encode_motion_pca(motion_per_frame, pca_mean, pca_comp, latent_ch):
-    """Encode motion (n,100,3) -> (n, latent_ch) via PCA + affine into VAE z-space.
-    Drop-in for _encode_motion_ss_vae: only the action slots (2,7) are populated;
-    the model selects action_dims=[2,7] downstream. dx/dy used; visibility ignored."""
-    n = motion_per_frame.shape[0]
-    flat = motion_per_frame[:, :, :2].reshape(n, 200).astype(np.float64)
-    P = (flat - pca_mean) @ pca_comp.T                         # (n, n_pca)
-    out = np.zeros((n, latent_ch), dtype=np.float32)
-    for slot, comp in _PCA_SLOT_COMP.items():
-        a, b = _PCA_SLOT_AFFINE[slot]
-        out[:, slot] = (a * P[:, comp] + b).astype(np.float32)
-    return out
 
 
 # Raw-PCA (14e): NO affine, NO slot-remap. Dim i = PCA component i (pca_0=throttle,
@@ -321,15 +226,10 @@ def _encode_motion_pca_raw(motion_per_frame, pca_mean, pca_comp, n_out=8):
     return P[:, :n_out].astype(np.float32)
 
 
-def _tanh_squash(z_raw: torch.Tensor) -> torch.Tensor:
-    """Apply per-dimension tanh squash.  Output is in (-1, 1)."""
-    scales = _ZACTION_SCALES.to(z_raw.device)
-    return torch.tanh(z_raw / scales)
-
-
 # ---------------------------------------------------------------------------
 # Caption helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_encoded_caption(caption_root: Path, rel_ride_path: Path) -> Optional[Path]:
     """Find the *_encoded.json caption file for a ride.
@@ -506,7 +406,7 @@ class ZarrRideDataset(Dataset):
     full-ride z_actions so the trainer can slice arbitrary chunks during
     the streaming loop.  Latents are loaded lazily via ``load_latent_chunk``.
 
-    Motion encoding through the ss_vae is deferred until a ride is first
+    Motion encoding is deferred until a ride is first
     accessed (``__getitem__``), so dataset construction only validates
     metadata and is fast regardless of how many rides exist.
 
@@ -519,10 +419,9 @@ class ZarrRideDataset(Dataset):
         encoded_root: str,
         caption_root: str,
         motion_root: str,
-        ss_vae_checkpoint: str,
+        pca_basis_checkpoint: str,
         min_ride_frames: int = 21,
         device: str = "cpu",
-        ss_vae_device: Optional[str] = None,
         start_zarr_index: int = 0,
         max_rides: Optional[int] = None,
         sort_by_length: Optional[str] = None,
@@ -541,24 +440,10 @@ class ZarrRideDataset(Dataset):
         # validated on load — mismatches force a re-scan.
         self.cache_path = cache_path
 
-        ss_dev = ss_vae_device or device
-        logging.info("Loading ss_vae from %s on %s", ss_vae_checkpoint, ss_dev)
-        ss_vae_model, ss_scale = load_ss_vae(ss_vae_checkpoint, ss_dev)
-        self._ss_vae = ss_vae_model
-        self._ss_scale = float(ss_scale)
-        self._ss_dev = ss_dev
-
-        # Action-vector encoder: "ss_vae" (default; PCA-regularised VAE) or "pca"
-        # (pure-PCA drop-in, affine-mapped into VAE z-space). PCA basis lives in
-        # the ss_vae checkpoint, so both modes load the same file.
-        self._action_encoder = os.environ.get("ARRWM_ACTION_ENCODER", "ss_vae").lower()
-        _ss_ck = torch.load(ss_vae_checkpoint, map_location="cpu", weights_only=False)
-        self._pca_mean = np.asarray(_ss_ck["pca_mean"], dtype=np.float64)
-        self._pca_comp = np.asarray(_ss_ck["pca_comp"], dtype=np.float64)
-        self._latent_ch = int(_ss_ck["hparams"]["LATENT_CH"])
-        if getattr(self, "_action_encoder", "ss_vae") == "pca":
-            logging.info("ACTION ENCODER = PCA drop-in (slots %s <- PCA comps %s, affine->VAE z-space)",
-                         list(_PCA_SLOT_COMP), [_PCA_SLOT_COMP[s] for s in _PCA_SLOT_COMP])
+        _ck = torch.load(pca_basis_checkpoint, map_location="cpu", weights_only=False)
+        self._pca_mean = np.asarray(_ck["pca_mean"], dtype=np.float64)
+        self._pca_comp = np.asarray(_ck["pca_comp"], dtype=np.float64)
+        self._latent_ch = int(_ck["latent_ch"])
 
         self._rides: List[Tuple[Path, torch.Tensor, dict, int]] = []
         self._attrs_by_path: dict = {}
@@ -569,15 +454,14 @@ class ZarrRideDataset(Dataset):
         cls,
         rides_data: List[dict],
         motion_root: str,
-        ss_vae_checkpoint: str,
+        pca_basis_checkpoint: str,
         device: str = "cpu",
-        ss_vae_device: Optional[str] = None,
-        _share_ss_vae: Optional["ZarrRideDataset"] = None,
+        _share_basis: Optional["ZarrRideDataset"] = None,
     ) -> "ZarrRideDataset":
         """Construct from a pre-built manifest (no zarr scan needed).
 
-        Pass ``_share_ss_vae`` to reuse another dataset's ss_vae model
-        instead of loading a second copy.
+        Pass ``_share_basis`` to reuse another dataset's already-loaded PCA
+        basis instead of reading the checkpoint a second time.
         """
         obj = object.__new__(cls)
         obj.motion_root = Path(motion_root)
@@ -587,33 +471,15 @@ class ZarrRideDataset(Dataset):
         obj.start_zarr_index = 0
         obj.max_rides = None
 
-        if _share_ss_vae is not None:
-            obj._ss_vae = _share_ss_vae._ss_vae
-            obj._ss_scale = _share_ss_vae._ss_scale
-            obj._ss_dev = _share_ss_vae._ss_dev
+        if _share_basis is not None:
+            obj._pca_mean = _share_basis._pca_mean
+            obj._pca_comp = _share_basis._pca_comp
+            obj._latent_ch = _share_basis._latent_ch
         else:
-            ss_dev = ss_vae_device or device
-            logging.info("Loading ss_vae from %s on %s", ss_vae_checkpoint, ss_dev)
-            ss_vae_model, ss_scale = load_ss_vae(ss_vae_checkpoint, ss_dev)
-            obj._ss_vae = ss_vae_model
-            obj._ss_scale = float(ss_scale)
-            obj._ss_dev = ss_dev
-
-        # Action-vector encoder (see __init__): "ss_vae" default or "pca" drop-in.
-        # from_manifest bypasses __init__, so set it here too.
-        obj._action_encoder = os.environ.get("ARRWM_ACTION_ENCODER", "ss_vae").lower()
-        if _share_ss_vae is not None and hasattr(_share_ss_vae, "_pca_mean"):
-            obj._pca_mean = _share_ss_vae._pca_mean
-            obj._pca_comp = _share_ss_vae._pca_comp
-            obj._latent_ch = _share_ss_vae._latent_ch
-        else:
-            _ss_ck = torch.load(ss_vae_checkpoint, map_location="cpu", weights_only=False)
-            obj._pca_mean = np.asarray(_ss_ck["pca_mean"], dtype=np.float64)
-            obj._pca_comp = np.asarray(_ss_ck["pca_comp"], dtype=np.float64)
-            obj._latent_ch = int(_ss_ck["hparams"]["LATENT_CH"])
-        if obj._action_encoder == "pca":
-            logging.info("ACTION ENCODER = PCA drop-in (from_manifest): slots %s <- PCA %s",
-                         list(_PCA_SLOT_COMP), [_PCA_SLOT_COMP[s] for s in _PCA_SLOT_COMP])
+            _ck = torch.load(pca_basis_checkpoint, map_location="cpu", weights_only=False)
+            obj._pca_mean = np.asarray(_ck["pca_mean"], dtype=np.float64)
+            obj._pca_comp = np.asarray(_ck["pca_comp"], dtype=np.float64)
+            obj._latent_ch = int(_ck["latent_ch"])
 
         obj._rides = []
         obj._attrs_by_path = {}
@@ -681,47 +547,6 @@ class ZarrRideDataset(Dataset):
                     "[ZarrRideDataset] cache load failed (%s); rescanning.", exc,
                 )
 
-        # Smoke-test affordance: skip the per-zarr scan and load a pre-built manifest.
-        _manifest_pickle = os.environ.get("ARRWM_MANIFEST_PICKLE")
-        if _manifest_pickle:
-            try:
-                _cached = torch.load(_manifest_pickle, map_location="cpu", weights_only=False)
-                # Mirror the version guard ``build_ride_manifest`` does
-                # for ``cache_path`` — pre-v3 pickles have uncapped
-                # ``n_latent_frames`` and would crash inside
-                # ``encode_z_actions_window`` on first call. Reject
-                # silently and fall through to a fresh scan.
-                _cached_version = (
-                    _cached.get("version") if isinstance(_cached, dict) else None
-                )
-                if _cached_version != _MANIFEST_VERSION:
-                    logging.warning(
-                        "[ZarrRideDataset] ARRWM_MANIFEST_PICKLE=%s has "
-                        "version=%s but current=%d — ignoring cache, "
-                        "rebuilding from scratch.",
-                        _manifest_pickle, _cached_version, _MANIFEST_VERSION,
-                    )
-                    _cached = None
-                _rides = (
-                    _cached.get("rides")
-                    if isinstance(_cached, dict) else None
-                )
-                if _rides:
-                    if self.max_rides is not None:
-                        _rides = _rides[: int(self.max_rides)]
-                    for r in _rides:
-                        zp = Path(r["zarr_path"])
-                        self._rides.append((zp, r["prompt_embeds"], r["attrs"], int(r["n_latent_frames"])))
-                        self._attrs_by_path[str(zp)] = r["attrs"]
-                    logging.info(
-                        "[ZarrRideDataset] ARRWM_MANIFEST_PICKLE=%s -> loaded %d rides (no scan)",
-                        _manifest_pickle, len(self._rides),
-                    )
-                    if self.sort_by_length in ("asc", "desc"):
-                        self._rides.sort(key=lambda r: r[3], reverse=(self.sort_by_length == "desc"))
-                    return
-            except Exception as exc:
-                logging.warning("[ZarrRideDataset] manifest pickle load failed (%s); falling back to scan", exc)
         zarr_paths = sorted(self.encoded_root.glob("*.zarr"))
         if zarr_paths and self.start_zarr_index:
             start = self.start_zarr_index % len(zarr_paths)
@@ -841,11 +666,11 @@ class ZarrRideDataset(Dataset):
         v14-aligned (chunk-grain): each ``_LATENTS_PER_MOTION_CHUNK`` (= 3)
         consecutive dataset latents are encoded from the SAME motion entry,
         so the returned z stream is constant within each chunk. We
-        encode at chunk-grain (one ss_vae forward per unique chunk in
+        encode at chunk-grain (one projection per unique chunk in
         the window, NOT per latent), then ``np.repeat`` to per-latent
         for the trainer's per-frame action stream contract. The output
         values are identical to the per-latent path; only the
-        encoding cost is reduced (3x fewer ss_vae forwards).
+        encoding cost is reduced (3x fewer projections).
 
         ``n_latent_frames`` is the EFFECTIVE post-head-drop, motion-capped
         ride length (= ``meta["n_latent_frames"]`` from the manifest);
@@ -866,7 +691,7 @@ class ZarrRideDataset(Dataset):
         )
         t_loaded = time.perf_counter()
 
-        # Encode at chunk-grain to avoid 3x redundant ss_vae forwards.
+        # Encode at chunk-grain to avoid 3x redundant projections.
         # Window touches chunks [chunk_lo, chunk_hi) — one motion row
         # per chunk; the per-latent stream then repeats each chunk's z
         # ``_LATENTS_PER_MOTION_CHUNK`` times.
@@ -877,19 +702,9 @@ class ZarrRideDataset(Dataset):
             : _LATENTS_PER_MOTION_CHUNK
         ]  # one motion entry per chunk in [chunk_lo, chunk_hi)
 
-        _enc = getattr(self, "_action_encoder", "ss_vae")
-        if _enc == "pca":
-            z_chunks = _encode_motion_pca(
-                chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
-            )  # [n_chunks_window, latent_ch] (affine into VAE z-space)
-        elif _enc == "pca_raw":
-            z_chunks = _encode_motion_pca_raw(
-                chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
-            )  # [n_chunks_window, latent_ch] RAW top-N PCA (pre-squash)
-        else:
-            z_chunks = _encode_motion_ss_vae(
-                chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
-            )  # [n_chunks_window, 8]
+        z_chunks = _encode_motion_pca_raw(
+            chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
+        )  # [n_chunks_window, latent_ch] RAW top-N PCA (pre-squash)
         t_encoded = time.perf_counter()
 
         # Per-latent broadcast of chunk-grain z, then slice to the
@@ -901,15 +716,12 @@ class ZarrRideDataset(Dataset):
         z_window = z_per_latent_full[rel_start:rel_end]
 
         z_tensor = torch.from_numpy(z_window)
-        if getattr(self, "_action_encoder", "ss_vae") == "pca_raw":
-            scales = torch.from_numpy(_PCA_RAW_SCALES[:z_tensor.shape[-1]]).to(z_tensor.dtype)
-            z_squashed = torch.tanh(z_tensor / scales)             # per-component squash
-        else:
-            z_squashed = _tanh_squash(z_tensor)
+        scales = torch.from_numpy(_PCA_RAW_SCALES[:z_tensor.shape[-1]]).to(z_tensor.dtype)
+        z_squashed = torch.tanh(z_tensor / scales)             # per-component squash
 
         logging.info(
             "  z_actions [%d:%d]: encode %d chunks (%d latents) | "
-            "motion_load=%.3fs  ss_vae=%.3fs  total=%.3fs",
+            "motion_load=%.3fs  encode=%.3fs  total=%.3fs",
             latent_start, latent_end, chunk_hi - chunk_lo,
             latent_end - latent_start,
             t_loaded - t0, t_encoded - t_loaded, time.perf_counter() - t0,
@@ -970,307 +782,3 @@ class ZarrRideDataset(Dataset):
         g = zarr_lib.open_group(zarr_path, mode="r")
         lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
         return torch.from_numpy(lat_np.astype(np.float32))
-
-    # ------------------------------------------------------------------
-    # Dual-view (Study 1 / AOO): rear camera as a simultaneous second view
-    # ------------------------------------------------------------------
-    @staticmethod
-    def load_reverse_latent_chunk(
-        reverse_zarr_path: str,
-        rear_indices: "np.ndarray",
-    ) -> torch.Tensor:
-        """Gather rear latents at WALL-CLOCK-aligned rear indices.
-
-        ``rear_indices`` is one rear dataset-latent index per forward latent in
-        the window (from ``<ride>.align.npy``, see utils/build_rear_alignment.py).
-        We fail LOUD on any -1 (unaligned) entry — callers must constrain windows
-        to the aligned span so this never fires; a silent clamp would misalign
-        the two views. One contiguous read [min..max] then index in numpy
-        (rear indices are monotonic with possible VFR repeats).
-        """
-        assert _LATENT_HEAD_DROP == 0, (
-            "dual-view rear gather assumes _LATENT_HEAD_DROP==0 (current default); "
-            "update gather offsets if it changes."
-        )
-        idx = np.asarray(rear_indices).astype(np.int64)
-        if (idx < 0).any():
-            raise ValueError(
-                "reverse gather hit unaligned (-1) frames; window not constrained "
-                "to the aligned span."
-            )
-        g = zarr_lib.open_group(reverse_zarr_path, mode="r")
-        n_rear = int(g["latents"].shape[0])
-        idx = np.clip(idx, 0, n_rear - 1)
-        rmin, rmax = int(idx.min()), int(idx.max())
-        block = g["latents"][rmin : rmax + 1]
-        out = block[idx - rmin]
-        return torch.from_numpy(out.astype(np.float32))
-
-    @staticmethod
-    def load_alignment_map(reverse_root: str, ride_ts: str) -> "np.ndarray":
-        """Load ``<reverse_root>/<ride_ts>.align.npy`` (int32, len = T_forward)."""
-        return np.load(str(Path(reverse_root) / f"{ride_ts}.align.npy"))
-
-    @staticmethod
-    def aligned_span(amap: "np.ndarray") -> Tuple[int, int]:
-        """Largest contiguous run of aligned (>=0) forward latents -> (start, end).
-
-        The map is built from monotonic wall-clock so the aligned region is a
-        single contiguous interval flanked by -1; we still scan for the longest
-        run to be robust. Returns (0, 0) if nothing is aligned.
-        """
-        valid = np.asarray(amap) >= 0
-        best_s = best_e = 0
-        s = None
-        for i, v in enumerate(valid):
-            if v and s is None:
-                s = i
-            elif not v and s is not None:
-                if i - s > best_e - best_s:
-                    best_s, best_e = s, i
-                s = None
-        if s is not None and len(valid) - s > best_e - best_s:
-            best_s, best_e = s, len(valid)
-        return best_s, best_e
-
-
-def flip_reverse_z(z: torch.Tensor, dims: Tuple[int, ...] = (2, 7)) -> torch.Tensor:
-    """Sign-flip the egomotion dims for the rear/reverse view.
-
-    The rear camera under forward translation sees the world recede (z7 throttle
-    flips) and yaw pans oppositely (z2 steering flips). The reverse view reuses
-    the forward z with these dims negated (NOT a re-extraction). Operates on the
-    raw 8-D ss_vae z BEFORE any action_dims slicing, so it's correct regardless
-    of action_dims ordering. Returns a new tensor; input is not mutated.
-    """
-    z = z.clone()
-    for d in dims:
-        z[..., d] = -z[..., d]
-    return z
-
-
-class ZarrSequentialDataset(Dataset):
-    """Sequential video latent dataset backed by frodobots zarr files.
-
-    Each item is a sliding window of `window_size` consecutive latent frames
-    from a single ride, returned in ride order.
-
-    Args:
-        encoded_root: directory containing `*.zarr` ride files.
-        caption_root: directory tree with `*_encoded.json` caption files.
-        motion_root: directory tree with `motion.npy` motion files.
-        ss_vae_checkpoint: path to the ss_vae_8free.pt checkpoint.
-        window_size: number of latent frames per sample (default 21).
-        window_stride: step between successive windows within a ride (default 1).
-        device: device for ss_vae inference (default "cuda" if available).
-        ss_vae_device: override device specifically for ss_vae encoding at init.
-    """
-
-    def __init__(
-        self,
-        encoded_root: str,
-        caption_root: str,
-        motion_root: str,
-        ss_vae_checkpoint: str,
-        window_size: int = 21,
-        window_stride: int = 1,
-        device: str = "cpu",
-        ss_vae_device: Optional[str] = None,
-        log_every_n_validated: Optional[int] = None,
-        start_zarr_index: int = 0,
-        max_samples: Optional[int] = None,
-        context_frames: int = 3,
-    ):
-        self.encoded_root = Path(encoded_root)
-        self.caption_root = Path(caption_root)
-        self.motion_root = Path(motion_root)
-        self.window_size = window_size
-        self.window_stride = window_stride
-        self.context_frames = context_frames
-        self.log_every_n_validated = log_every_n_validated
-        self.start_zarr_index = start_zarr_index
-        self.max_samples = max_samples
-
-        ss_dev = ss_vae_device or device
-        logging.info("Loading ss_vae from %s on %s", ss_vae_checkpoint, ss_dev)
-        ss_vae_model, ss_scale = load_ss_vae(ss_vae_checkpoint, ss_dev)
-        self._ss_vae = ss_vae_model
-        self._ss_scale = float(ss_scale)
-        self._ss_dev = ss_dev
-
-        # Action-vector encoder: "ss_vae" (default) or "pca" drop-in. See the
-        # other constructor for the rationale; PCA basis is in the ss_vae ckpt.
-        self._action_encoder = os.environ.get("ARRWM_ACTION_ENCODER", "ss_vae").lower()
-        _ss_ck = torch.load(ss_vae_checkpoint, map_location="cpu", weights_only=False)
-        self._pca_mean = np.asarray(_ss_ck["pca_mean"], dtype=np.float64)
-        self._pca_comp = np.asarray(_ss_ck["pca_comp"], dtype=np.float64)
-        self._latent_ch = int(_ss_ck["hparams"]["LATENT_CH"])
-        if getattr(self, "_action_encoder", "ss_vae") == "pca":
-            logging.info("ACTION ENCODER = PCA drop-in (slots %s <- PCA comps %s, affine->VAE z-space)",
-                         list(_PCA_SLOT_COMP), [_PCA_SLOT_COMP[s] for s in _PCA_SLOT_COMP])
-
-        # Build index: list of (zarr_path, prompt_embeds_tensor, z_actions_tensor, window_start)
-        self._samples: List[Tuple[Path, torch.Tensor, torch.Tensor, int]] = []
-        self._build_index()
-
-    # ------------------------------------------------------------------
-    # Indexing
-    # ------------------------------------------------------------------
-
-    def _build_index(self) -> None:
-        zarr_paths = sorted(self.encoded_root.glob("*.zarr"))
-        if zarr_paths and self.start_zarr_index:
-            start = self.start_zarr_index % len(zarr_paths)
-            zarr_paths = zarr_paths[start:] + zarr_paths[:start]
-        logging.info("Scanning %d zarr files in %s", len(zarr_paths), self.encoded_root)
-
-        skipped = 0
-        total_windows = 0
-        validated = 0
-
-        for zpath in zarr_paths:
-            try:
-                prompt_embeds, z_actions_latent, n_latent_frames = self._process_zarr(zpath)
-            except Exception as exc:
-                logging.warning("Skipping %s: %s", zpath.name, exc)
-                skipped += 1
-                continue
-
-            # Slide window over latent frames (account for context prepended to each window)
-            max_start = n_latent_frames - (self.window_size + self.context_frames)
-            if max_start < 0:
-                skipped += 1
-                continue
-
-            windows = list(range(0, max_start + 1, self.window_stride))
-            if self.max_samples is not None:
-                remaining = self.max_samples - len(self._samples)
-                if remaining <= 0:
-                    logging.info(
-                        "Reached requested sample cap (%d); stopping index build early.",
-                        self.max_samples,
-                    )
-                    return
-                windows = windows[:remaining]
-
-            for start in windows:
-                self._samples.append((zpath, prompt_embeds, z_actions_latent, start))
-
-            total_windows += len(windows)
-            validated += 1
-
-            if self.log_every_n_validated and validated % self.log_every_n_validated == 0:
-                logging.info(
-                    "Validated %d rides so far (%d skipped, %d windows) | %s",
-                    validated,
-                    skipped,
-                    total_windows,
-                    _build_memory_log_message(),
-                )
-
-            if self.max_samples is not None and len(self._samples) >= self.max_samples:
-                logging.info(
-                    "Reached requested sample cap (%d); stopping index build early.",
-                    self.max_samples,
-                )
-                return
-
-        logging.info(
-            "ZarrSequentialDataset: %d windows from %d rides (%d skipped)",
-            total_windows,
-            len(zarr_paths) - skipped,
-            skipped,
-        )
-        if not self._samples:
-            raise RuntimeError(
-                "No valid samples found. Check encoded_root, caption_root, motion_root."
-            )
-
-    def _process_zarr(
-        self, zpath: Path
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Load and preprocess a single zarr ride.
-
-        Returns:
-            prompt_embeds: (seq_len, dim) float32
-            z_actions_latent: (n_latent_frames, 8) float32, tanh-squashed
-            n_latent_frames: number of latent frames in this ride
-        """
-        g = zarr_lib.open_group(str(zpath), mode="r")
-        attrs = dict(g.attrs)
-        lat_ds = g["latents"]
-        zarr_n_latents = int(lat_ds.shape[0])  # raw (T, 16, 60, 104)
-
-        # Derive relative ride path for caption/motion lookup
-        ride_dir_2k = attrs.get("ride_dir_2k", "")
-        if not ride_dir_2k:
-            raise RuntimeError("ride_dir_2k missing from zarr attrs")
-        rel = _extract_ride_rel(ride_dir_2k)
-
-        # Caption
-        caption_file = _find_encoded_caption(self.caption_root, rel)
-        if caption_file is None:
-            raise FileNotFoundError(f"No encoded caption for {rel}")
-        prompt_embeds = _load_prompt_embeds(caption_file)
-
-        # v14-aligned dataset latent count: drop the head latent + cap
-        # at min(zarr - 1, _motion_capped_latents). The motion cap
-        # accounts for the per-ride (action_start_sec - 0.8) chunk
-        # offset between motion.npy and the encoded latents.
-        n_after_head_drop = max(0, zarr_n_latents - _LATENT_HEAD_DROP)
-        motion_capped = _motion_capped_latents(attrs, self.motion_root)
-        n_latent_frames = min(n_after_head_drop, motion_capped)
-
-        # Per-latent motion view (chunk-grain values, repeated within
-        # each chunk). Encode at chunk-grain to avoid 3x redundant
-        # ss_vae forwards, then repeat back to per-latent.
-        motion_per_latent = _load_aligned_motion_for_zarr(
-            attrs, n_latent_frames, self.motion_root,
-        )
-        chunk_motion = motion_per_latent[::_LATENTS_PER_MOTION_CHUNK]
-        if getattr(self, "_action_encoder", "ss_vae") == "pca":
-            z_chunks = _encode_motion_pca(
-                chunk_motion, self._pca_mean, self._pca_comp, self._latent_ch,
-            )  # (n_chunks, latent_ch)
-        else:
-            z_chunks = _encode_motion_ss_vae(
-                chunk_motion, self._ss_vae, self._ss_scale, self._ss_dev,
-            )  # (n_chunks, 8)
-        z_per_latent = np.repeat(
-            z_chunks, _LATENTS_PER_MOTION_CHUNK, axis=0,
-        )[:n_latent_frames]
-
-        z_tensor = torch.from_numpy(z_per_latent)
-        z_squashed = _tanh_squash(z_tensor)
-
-        return prompt_embeds, z_squashed, n_latent_frames
-
-    # ------------------------------------------------------------------
-    # Dataset interface
-    # ------------------------------------------------------------------
-
-    def __len__(self) -> int:
-        return len(self._samples)
-
-    def __getitem__(self, idx: int) -> dict:
-        zpath, prompt_embeds, z_actions_latent, start = self._samples[idx]
-
-        end = start + self.window_size + self.context_frames
-
-        # Load latents lazily from zarr (window + leading context).
-        # ``z_actions_latent`` and ``self._samples``'s ``start`` are
-        # POST-head-drop dataset latents; shift the zarr read by
-        # ``_LATENT_HEAD_DROP`` so frame i of the returned tensor
-        # corresponds to the same time position as ``z_actions_latent[i]``
-        # (= chunk i // 3's z, mapped to the post-drop video segment).
-        g = zarr_lib.open_group(str(zpath), mode="r")
-        lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
-        latents = torch.from_numpy(lat_np.astype(np.float32))
-
-        z_window = z_actions_latent[start:end]  # (window_size+context_frames, 8)
-
-        return {
-            "real_latents": latents,          # (window_size+context_frames, 16, 60, 104)
-            "prompt_embeds": prompt_embeds,   # (seq_len, dim)
-            "z_actions": z_window,            # (window_size+context_frames, 8)
-        }

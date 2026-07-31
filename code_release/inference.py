@@ -5,7 +5,6 @@ import torch
 import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from torchvision import transforms
 from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
@@ -18,7 +17,7 @@ from pipeline import (
 from utils.dataset import TextDataset
 from utils.misc import set_seed
 
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -196,13 +195,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
 
     print("sampled_noise.device", sampled_noise.device)
-    # print("initial_latent.device", initial_latent.device)
     print("prompts", prompts)
     # Generate 81 frames
-    # print('sampled_noise.shape', sampled_noise.shape, 'prompts', prompts)
-    # print('pipeline.generator', pipeline.generator)
-    # print('pipeline.text_encoder', pipeline.text_encoder)
-    # print('pipeline.vae', pipeline.vae)
 
     video, latents = pipeline.inference(
         noise=sampled_noise,
@@ -235,7 +229,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             model_type = "ema"
         else:
             model_type = "regular"
-            
+
         for seed_idx in range(config.num_samples):
             # All processes save their videos
             if config.save_with_index:

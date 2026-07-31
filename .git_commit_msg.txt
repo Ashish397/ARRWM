@@ -1,0 +1,26 @@
+Add supplementary code release, no-op eval suite, and figure updates
+
+code_release/: self-contained supplementary bundle (import-closure verified,
+paths parameterised via AF_ROOT/DATA_ROOT/WAN_MODELS/HF_HOME, credentials and
+identifying paths scrubbed). Includes training core, data-prep, eval rollout
+generation, figure scripts, reference-free quality suite, and the frozen PCA
+action basis. Dead DMD/self-forcing tier removed (~6.3k LOC).
+
+Evaluation:
+- stationary/no-op suite: reference-based FVD + paired PSNR/SSIM/LPIPS binned
+  by reference dynamics, motion_ratio liveliness, RAFT ego/residual split
+- reference-free quality suite additions (testbench_v2) + blind adjudication
+  packet with human labels
+- nocritic ablation configs and launchers; frozen evaluator now built when the
+  critic is disabled so control_test still reports controllability
+- IE_NULL_Z for the null command (default "0,0" keeps prior runs identical)
+
+Figures: relabel pca8 -> Default, larger legends, select-direction and
+stationary wedge variants regenerated.
+
+Docs/tooling: CLEANUP_PLAN.md (release cleanup assessment), tools/ baseline
+harness pinning deterministic outputs so cleanup can be verified as a no-op.
+
+Removes the superseded AAAI-2026 template (replaced by AuthorKit27_extracted).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
