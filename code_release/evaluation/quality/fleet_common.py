@@ -8,9 +8,19 @@ import os
 import imageio, numpy as np, pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GRID_DIR = os.path.join(os.path.dirname(HERE), "grids_A", "A")   # grids/grids_A/A
-BASE_DIR = os.path.join(os.path.dirname(HERE), "baselines")      # grids/baselines
-LABELS_VLM = os.path.join(HERE, "results_external_vlm.csv")
+
+# Rollout videos are large and are not distributed with the code. Point
+# AF_FLEET_DIR at the directory holding grids_A/ and baselines/.
+FLEET_DIR = os.environ.get(
+    "AF_FLEET_DIR", os.path.join(os.path.dirname(os.path.dirname(HERE)), "grids")
+)
+GRID_DIR = os.path.join(FLEET_DIR, "grids_A", "A")
+BASE_DIR = os.path.join(FLEET_DIR, "baselines")
+
+# Scene/model index: the coverage every instrument iterates over.
+LABELS_VLM = os.environ.get(
+    "AF_FLEET_INDEX", os.path.join(HERE, "results_external_vlm.csv")
+)
 
 # tile origin (x,y) in the grid for each ours variant (from GRID LAYOUT / fleet_pixscan)
 POS = {"pca8": (0, 0), "pca4": (832, 0), "pca2": (1664, 0), "16node": (2496, 0),

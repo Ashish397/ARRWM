@@ -1,7 +1,7 @@
-import os
 """VLM discriminator for external models vs our good variants (pca8/16node).
 
 Per video: REFERENCE = first real second (6 labeled frames), GENERATED = 16 frames
+import os
 from the remainder (sampled by wall-clock time, native fps). Three yes/no logit
 probes targeting the failure modes seen in the external fleet:
   p_style   style departs from reference (game-like/painted/cartoon counts; lighting doesn't)
@@ -17,8 +17,9 @@ import pandas as pd
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.environ.get("FLEET_BASE",
-                          os.path.join(os.environ.get("AF_ROOT", "."), "grids", "baselines"))
+BASE_DIR = os.path.join(os.environ.get("AF_FLEET_DIR", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "grids")), "baselines")
 MODELS = ["astra", "matrixgame", "minwm", "worldcam", "worldplay", "yume"]
 OURS = ["pca8", "pca4", "pca2", "16node", "4node", "noatok", "noadaln"]
 OUT = os.path.join(HERE, "results_external_vlm.csv")
