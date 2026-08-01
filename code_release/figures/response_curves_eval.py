@@ -19,7 +19,9 @@ import matplotlib.pyplot as plt
 from figures.figure_labels import label
 
 ARR = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EF = f"{ARR}/analysis/eval_final"
+# The head-to-head motion tables ship with the release. AF_EVAL_DIR overrides,
+# for regenerating figures from a fresh evaluation run instead of the reference.
+EF = os.environ.get("AF_EVAL_DIR", f"{ARR}/evaluation/quality/reference")
 OUT = os.environ.get("RC_OUT", f"{ARR}/analysis")
 M = 0.5; Dv = round(M / np.sqrt(2), 4)
 CMD = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),

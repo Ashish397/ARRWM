@@ -57,28 +57,38 @@ a reviewer running the released code gets the paper's figures.
 
 ---
 
-## One question on the no-critic table — two of your artefacts disagree
+## The no-critic table: 27.2% is wrong — please realign until it matches the paper
 
-Not a correction, and I am not claiming to have evaluated anything. Two files
-you shipped give different values for the same quantity, and only you can say
-which is right.
+This one is settled, not a question. **The paper is correct and the 27.2% is
+wrong.** Default's high-frequency degradation figure is **6%**.
 
 `high-frequency degradation | no-critic 16.3% | Default 27.2%`
 
-Your `tests/test_paper_tables.py:233` pins Default's published HF figure at
-`"pca8": 6`, and reading `reference/fleet_hf.csv` over the active population
-with your own `B > 150` rule gives 5.9%. The table says 27.2%. Every other cell
+Your own `tests/test_paper_tables.py:233` pins it at `"pca8": 6`, and reading
+`reference/fleet_hf.csv` over the active population with your own `B > 150` rule
+gives 5.9%. So the table contradicts a test in the same commit. Every other cell
 in the Default column agrees with the published values (geometry 16.8 vs 17,
 relocation 10.9 vs 11, style 2.5 vs 3, conjuration 1.2 vs 1, legitimacy 73,
-active 239), which is what makes this one stand out rather than look like a
-different population convention.
+active 239), which is what makes this one an outlier rather than a different
+population convention consistently applied.
 
-It matters because of which way it points. At 27.2% the axis reads as a
-no-critic win; at 6% it reads as the one axis where removing the critic makes
-generation measurably **worse** (16.3% against 6%). That is the difference
-between "wins or ties four of five quality axes" and a more interesting claim —
-that the critic buys control at some cost in high-frequency detail. If 27.2% is
-right and I have the population convention wrong, say so and I will drop it.
+**Please rerun and realign until every cell reproduces the paper**, and treat
+the paper as the reference throughout rather than reconciling toward whatever a
+fresh scan produces. Where a recomputation disagrees with a published number,
+the recomputation is what needs explaining.
+
+The consequence is directional, which is why it cannot be left: at 27.2% the
+axis reads as a no-critic win. At 6% it is the one axis where removing the
+critic makes generation measurably **worse** (16.3% against 6%). So the honest
+version of the result is not "wins or ties four of five quality axes" — it is
+that the critic buys control at some cost in high-frequency detail, which is a
+more interesting claim and a defensible one.
+
+Worth a check on how it arose: the same pipeline that produced this cell
+produced the rest of the column correctly, so it is likely a single wrong
+population or a stale input on one axis rather than a systematic problem. If
+`fleet_hf` was scanned over a set that includes near-static rollouts, or over a
+different generation of the videos, that would produce exactly this.
 
 ## A robustness check on the same data, for whatever it is worth to you
 
@@ -107,10 +117,10 @@ significant. So it is a genuine effect rather than survivorship — your reading
 holds up under the harshest version of the test I could construct. Relocation
 stops being significant once the populations are matched, so "identical to
 Default" is stronger than the data supports; "indistinguishable on the scenes
-where both move" is weaker and safer. HF comes out significantly worse, which is
-why the 27.2% question above is worth settling.
+where both move" is weaker and safer. HF comes out significantly worse here too,
+independently of the 27.2% error above — two routes to the same conclusion.
 
-If it survives your check, the clean statement is: removing the critic severs
+The clean statement is: removing the critic severs
 command from output (77.3% control failure, 64% near-static) while leaving
 *geometric* fidelity intact or better, at some cost in high-frequency detail.
 Sharper than any baseline as a demonstration of the paper's argument, and it

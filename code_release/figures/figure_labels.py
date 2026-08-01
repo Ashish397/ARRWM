@@ -48,7 +48,10 @@ BASELINES = {
 STYLES = {
     # response_curves_eval.py: lowercase throughout, "ours X" without brackets.
     "curves": {
-        "pca8": "ours Default", "16node": "ours batch size 64",
+        # every alias of the default run, since this script keys on pca8_8node
+        "pca8": "ours Default", "pca8_8node": "ours Default",
+        "8node8pca": "ours Default", "8node": "ours Default",
+        "16node": "ours batch size 64",
         "minwm": "minwm", "matrixgame": "matrixgame", "worldcam": "worldcam",
         "yume": "yume", "worldplay": "worldplay", "astra": "astra",
     },
