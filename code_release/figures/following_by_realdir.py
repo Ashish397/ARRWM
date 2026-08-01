@@ -1,27 +1,23 @@
 """Flip-following by REAL ride direction, per v14e run. Produces TWO views:
 
   A) DIRECTION-ONLY (the original, cleaner view): cosine agreement between the
-     commanded action [cz2,cz7] and the teacher-read [tz2,tz7], per real
+     commanded action and the teacher-read action, per real
      direction, GT solid / FLIP dashed. -> following_{run}_by_REALdir.png
   B) DIRECTION+STRENGTH: realized magnitude along the command (c.t/|c|, sign-
      preserved) with the commanded magnitude as the gain=1 target line. Weak-but-
      correct now scores low. -> following_{run}_by_REALdir_strength.png
 """
-import os
 import glob, json
 import numpy as np, pandas as pd
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
-RUNS = [
-    ("logs/v14e_16node/control_test",   "batch size 64 (top8)",  "16node"),
-    ("logs/v14e_pca8_raw/control_test", "batch size 32 (top8)",   "8node8pca"),
-    ("logs/v14e_4node/control_test",    "batch size 16 (top8)",   "4node"),
-    ("logs/v14e_pca2/control_test",     "pca2 (top2, batch32)",    "pca2"),
-    ("logs/v14e_pca4/control_test",     "pca4 (top4, batch32)",    "pca4"),
-    ("logs/v14e_noatok/control_test",   "no action tokens (adaln-only)", "noatok"),
-    ("logs/v14e_noadaln/control_test",  "no AdaLN (tokens-only)", "noadaln"),
-    ("logs/v14e_nocritic/control_test", "no critic guidance",     "nocritic"),
-]
+from figures.figure_labels import label
+
+RUNS = [(f"logs/v14e_{d}/control_test", label(k), k) for d, k in [
+    ("16node", "16node"), ("pca8_raw", "8node8pca"), ("4node", "4node"),
+    ("pca2", "pca2"), ("pca4", "pca4"), ("noatok", "noatok"),
+    ("noadaln", "noadaln"), ("nocritic", "nocritic"),
+]]
 DIRS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]
 DNAME = {"F": "Forward", "FR": "Forward-Right", "R": "Right", "BR": "Backward-Right",
          "B": "Backward", "BL": "Backward-Left", "L": "Left", "FL": "Forward-Left"}

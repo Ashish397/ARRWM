@@ -1,5 +1,11 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+"""Inference entry point: generate videos from prompts with a trained checkpoint.
+
+Builds the causal pipeline, encodes the prompts, rolls the model out
+autoregressively and writes mp4s.
+"""
+
 import argparse
 import torch
 import os

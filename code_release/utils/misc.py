@@ -1,3 +1,5 @@
+"""Small shared helpers (seeding, reproducibility)."""
+
 import numpy as np
 import random
 import torch

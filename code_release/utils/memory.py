@@ -2,6 +2,8 @@
 # Apache-2.0 License
 # By lllyasviel
 
+"""GPU memory helpers: dynamic module swapping and offload between CPU and GPU."""
+
 import torch
 
 

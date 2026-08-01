@@ -16,6 +16,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from figures.figure_labels import label
+
 ARR = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EF = f"{ARR}/analysis/eval_final"
 OUT = os.environ.get("RC_OUT", f"{ARR}/analysis")
@@ -27,7 +29,6 @@ CMD = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),
 ORDER = ["pca8_8node", "16node",
          "minwm", "matrixgame", "worldcam", "yume", "worldplay", "astra"]
 OURS = {"pca8_8node", "16node"}
-LABEL = {"pca8_8node": "ours Default", "16node": "ours batch size 64"}
 STYLE = {  # ours = blues/solid lines, external = warm markers
     "pca8_8node": ("#08306b", "-", 2.6), "16node": ("#2166ac", "-", 2.6),
     "minwm": ("#7f7f7f", "o", 1.8), "matrixgame": ("#b2182b", "s", 1.8),
@@ -55,10 +56,10 @@ for fname, ccol, gcol in [("response_curves_eval_throttle.png", "c0", "g0"),
         col, style, lw = STYLE[m]
         if m in OURS:   # continuous action space: a real dose axis -> line
             ax.plot(g.index, g["mean"], color=col, ls=style, lw=lw,
-                    marker="o", ms=4, label=LABEL.get(m, m))
+                    marker="o", ms=4, label=label(m, ours=True))
         else:           # fixed-strength interface: distinct markers, thin line
             ax.plot(g.index, g["mean"], color=col, ls="-", lw=1.4,
-                    marker=style, ms=7, alpha=0.9, label=LABEL.get(m, m))
+                    marker=style, ms=7, alpha=0.9, label=label(m, ours=True))
         ax.fill_between(g.index, g["mean"] - g["sem"], g["mean"] + g["sem"],
                         color=col, alpha=0.3, lw=0)
     ax.set_xlabel("commanded value"); ax.set_ylabel("teacher-read response (CoTracker→PCA)")

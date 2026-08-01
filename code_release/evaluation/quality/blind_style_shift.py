@@ -10,7 +10,7 @@ Higher = more style drift. Uses each model's context length so short-context ext
 Writes out/blind_style_shift.csv.
 """
 import os
-import numpy as np, torch, torch.nn.functional as F, pandas as pd
+import torch, torch.nn.functional as F, pandas as pd
 import blind100_common as bc
 from analysis.testbench_v2.style_shift import VGGStyle, gram_distance, read_frames
 

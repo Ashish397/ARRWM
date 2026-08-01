@@ -21,6 +21,7 @@ NAMES = {
     "4node": "batch 16",
     "noatok": "No Action Tokens",
     "noadaln": "No AdaLN",
+    "nocritic": "No Critic",
 }
 
 # External baselines, for the figures that place us alongside them.

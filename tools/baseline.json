@@ -107,7 +107,21 @@
    "SchedulerInterface.convert_velocity_to_x0": "(self, velocity: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor",
    "SchedulerInterface.convert_x0_to_noise": "(self, x0: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor"
   },
-  "utils.wan_wrapper": "skipped:AssertionError",
+  "utils.wan_wrapper": {
+   "WanDiffusionWrapper": "(model_name='Wan2.1-T2V-1.3B', timestep_shift=8.0, is_causal=False, local_attn_size=-1, sink_size=0)",
+   "WanDiffusionWrapper.adding_state_probe_branch": "(self, n_chunks: int = 7, z_out_dim: int = 2, dim: int = 2048, probe_dim: int = 256, num_heads: int = 8, n_taps: int = 6, num_frame_per_block: int = 3) -> None",
+   "WanDiffusionWrapper.adding_state_token_branch": "(self, n_chunks: int = 7, z_out_dim: int = 2, dim: int = 2048, num_frame_per_block: int = 3) -> None",
+   "WanDiffusionWrapper.adjust_seq_len_for_action_tokens": "(self, num_frames: int = 21, action_per_frame: int = 1)",
+   "WanDiffusionWrapper.enable_gradient_checkpointing": "(self) -> None",
+   "WanDiffusionWrapper.forward": "(self, noisy_image_or_video: torch.Tensor, conditional_dict: dict, timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None, crossattn_cache: Optional[List[dict]] = None, current_start: Optional[int] = None, clean_x: Optional[torch.Tensor] = None, aug_t: Optional[torch.Tensor] = None, cache_start: Optional[int] = None) -> torch.Tensor",
+   "WanDiffusionWrapper.get_scheduler": "(self) -> utils.scheduler.SchedulerInterface",
+   "WanDiffusionWrapper.post_init": "(self)",
+   "WanTextEncoder": "(model_name: Optional[str] = None, *, model_root: Union[str, pathlib.Path, NoneType] = None) -> None",
+   "WanTextEncoder.forward": "(self, text_prompts: List[str]) -> dict",
+   "WanVAEWrapper": "(model_name: Optional[str] = None, *, model_root: Union[str, pathlib.Path, NoneType] = None)",
+   "WanVAEWrapper.decode_to_pixel": "(self, latent: torch.Tensor, use_cache: bool = False, seed_first: bool = False) -> torch.Tensor",
+   "WanVAEWrapper.encode_to_latent": "(self, pixel: torch.Tensor) -> torch.Tensor"
+  },
   "utils.zarr_dataset": {
    "ZarrRideDataset": "(encoded_root: str, caption_root: str, motion_root: str, pca_basis_checkpoint: str, min_ride_frames: int = 21, device: str = 'cpu', start_zarr_index: int = 0, max_rides: Optional[int] = None, sort_by_length: Optional[str] = None, cache_path: Optional[str] = None)",
    "ZarrRideDataset.encode_z_actions_window": "(self, zarr_path: str, n_latent_frames: int, latent_start: int, latent_end: int) -> torch.Tensor",

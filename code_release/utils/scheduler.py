@@ -1,3 +1,5 @@
+"""Flow-matching scheduler: timestep schedule, add_noise, x0/flow conversions."""
+
 from abc import abstractmethod, ABC
 import torch
 

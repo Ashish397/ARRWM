@@ -18,7 +18,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-device = "cuda"
+# Resolve at import so the module can be inspected on a CPU-only machine;
+# CoTracker itself still needs a GPU for any real run.
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 10x10 = the 100 tracked points the action basis is fitted on. Changing this
 # changes the dimensionality of the motion vectors and makes them incompatible
@@ -215,68 +217,72 @@ def process_video(
         print(f"  Error processing video: {e}")
         return False
 
-#Main processing loop
+def main():
 
-output_chunk_size = 12          # frames per output window
-compute_T = 48                  # frames per compute chunk (NO overlap). Must be multiple of 12.
-assert compute_T % output_chunk_size == 0
+    output_chunk_size = 12          # frames per output window
+    compute_T = 48                  # frames per compute chunk (NO overlap). Must be multiple of 12.
+    assert compute_T % output_chunk_size == 0
 
-# Load model once
-print("Loading CoTracker model...")
-cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device).eval()
-print("Model loaded.")
+    # Load model once
+    print("Loading CoTracker model...")
+    cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device).eval()
+    print("Model loaded.")
 
-# Iterate through all output_rides_n folders
-total_processed = 0
-total_skipped = 0
+    # Iterate through all output_rides_n folders
+    total_processed = 0
+    total_skipped = 0
 
-for output_rides_dir in sorted(input_base.glob("output_rides_*")):
-    if not output_rides_dir.is_dir():
-        continue
-    
-    output_rides_name = output_rides_dir.name
-    print(f"\nProcessing {output_rides_name}...")
-    
-    # Iterate through all ride_x_y folders
-    for ride_dir in sorted(output_rides_dir.glob("ride_*")):
-        if not ride_dir.is_dir():
+    for output_rides_dir in sorted(input_base.glob("output_rides_*")):
+        if not output_rides_dir.is_dir():
             continue
-        
-        ride_name = ride_dir.name
-        recordings_dir = ride_dir / "recordings"
-        
-        if not recordings_dir.exists():
-            print(f"  Skipping {ride_name}: recordings directory not found")
-            total_skipped += 1
-            continue
-        
-        # Find video file (try uid_s_1000 first, then uid_s_1001)
-        video_path = None
-        matches = list(recordings_dir.glob("*uid_s_1000*video*.m3u8"))
-        video_path = matches[0] if matches else None
-        
-        if video_path is None:
-            print(f"  Skipping {ride_name}: no video file found")
-            total_skipped += 1
-            continue
-        
-        # Create output path: frodobots_motion/output_rides_n/ride_x_y/motion.npy
-        output_path = output_base / output_rides_name / ride_name / "motion.npy"
-        
-        print(f"  Processing {ride_name}...")
-        start_time = time.time()
-        
-        success = process_video(video_path, cotracker, output_path, output_chunk_size, compute_T, grid_size, device)
-        
-        if success:
-            elapsed = time.time() - start_time
-            print(f"    ✓ Completed in {elapsed:.2f}s -> {output_path}")
-            total_processed += 1
-        else:
-            total_skipped += 1
 
-print(f"\n{'='*60}")
-print(f"Processing complete!")
-print(f"  Processed: {total_processed}")
-print(f"  Skipped: {total_skipped}")
-print(f"{'='*60}")
+        output_rides_name = output_rides_dir.name
+        print(f"\nProcessing {output_rides_name}...")
+
+        # Iterate through all ride_x_y folders
+        for ride_dir in sorted(output_rides_dir.glob("ride_*")):
+            if not ride_dir.is_dir():
+                continue
+
+            ride_name = ride_dir.name
+            recordings_dir = ride_dir / "recordings"
+
+            if not recordings_dir.exists():
+                print(f"  Skipping {ride_name}: recordings directory not found")
+                total_skipped += 1
+                continue
+
+            # Find video file (try uid_s_1000 first, then uid_s_1001)
+            video_path = None
+            matches = list(recordings_dir.glob("*uid_s_1000*video*.m3u8"))
+            video_path = matches[0] if matches else None
+
+            if video_path is None:
+                print(f"  Skipping {ride_name}: no video file found")
+                total_skipped += 1
+                continue
+
+            # Create output path: frodobots_motion/output_rides_n/ride_x_y/motion.npy
+            output_path = output_base / output_rides_name / ride_name / "motion.npy"
+
+            print(f"  Processing {ride_name}...")
+            start_time = time.time()
+
+            success = process_video(video_path, cotracker, output_path, output_chunk_size, compute_T, grid_size, device)
+
+            if success:
+                elapsed = time.time() - start_time
+                print(f"    ✓ Completed in {elapsed:.2f}s -> {output_path}")
+                total_processed += 1
+            else:
+                total_skipped += 1
+
+    print(f"\n{'='*60}")
+    print(f"Processing complete!")
+    print(f"  Processed: {total_processed}")
+    print(f"  Skipped: {total_skipped}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

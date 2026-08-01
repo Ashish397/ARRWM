@@ -2,7 +2,6 @@
 Forward, Right, Forward-Right, Backward, in a single row. Reuses build() and
 the paper styling from following_by_realdir.
 """
-import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

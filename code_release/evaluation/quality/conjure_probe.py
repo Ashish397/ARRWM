@@ -7,7 +7,7 @@ coordinate is in the CENTRAL band and it did not touch a left/right edge (i.e. i
 from the side) - the object materialised in the middle of the scene. Objects present in the real
 context (born at frame 0) and objects that enter from a side edge never count. Warps are ignored
 (not detected as objects). Rollout score = number of central-birth events (>=1 => FLAG)."""
-import os, sys
+import os
 import numpy as np, torch, cv2
 import fleet_common as fc
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights

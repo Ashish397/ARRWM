@@ -4,7 +4,7 @@ Loads every available out/blind_*.csv, and for each axis with blind100 ground tr
 prints a competitor table (AUC vs the relevant human tag), ranked. Metrics not yet
 computed are skipped. Geometry components are also validated against the reference CSV.
 """
-import os, re
+import os
 import numpy as np, pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))

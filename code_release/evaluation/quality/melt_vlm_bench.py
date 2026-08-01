@@ -26,7 +26,7 @@ Env:
   MELT_OUT     output csv (default out/melt_vlm_<model>.csv)
 Writes per-video p_yes: columns scene,model,tier,note,p_yes.
 """
-import os, sys, gc
+import os, gc
 import numpy as np, pandas as pd, imageio, torch
 from PIL import Image
 

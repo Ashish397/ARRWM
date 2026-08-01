@@ -1,3 +1,5 @@
+"""Distributed helpers: process-group setup, barriers, FSDP wrapping."""
+
 from datetime import timedelta
 from functools import partial
 import os

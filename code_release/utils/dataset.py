@@ -1,5 +1,11 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+"""Prompt datasets for inference, plus the infinite `cycle` iterator.
+
+STYLE_SUFFIX is appended to every caption so generation matches the dash-camera
+look of the training corpus.
+"""
+
 from torch.utils.data import Dataset
 try:
     import datasets

@@ -1,5 +1,12 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+"""Training entry point.
+
+Loads a config, merges CLI overrides, and hands off to the causal LoRA teacher
+trainer. Launch under torchrun; see sbatch/train_v14e*.sbatch for the recipes
+that produced the released runs.
+"""
+
 import argparse
 from omegaconf import OmegaConf
 import wandb

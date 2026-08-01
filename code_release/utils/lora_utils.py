@@ -7,6 +7,8 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+"""Attach, gather and load LoRA adapters on the Wan backbone."""
+
 import torch
 import peft
 from peft import get_peft_model_state_dict

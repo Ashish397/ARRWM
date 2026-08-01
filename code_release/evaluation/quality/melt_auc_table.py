@@ -10,7 +10,7 @@ Honest framing (per reviewer): every number here is a DEVELOPMENT-set result on 
 same 84 labelled videos -- the labels were used both to observe each model's AUC and
 (elsewhere) the 0.89 ensemble, so it is not a nested held-out estimate.
 """
-import os, re, sys
+import os, re
 import numpy as np, pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))

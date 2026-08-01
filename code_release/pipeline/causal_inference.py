@@ -1,5 +1,11 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+"""Causal inference pipeline: block-causal KV-cache rollout for generation.
+
+Generates a video chunk by chunk, committing each denoised block to the cache
+before the next one starts, so context grows without recomputing it.
+"""
+
 from typing import List, Optional
 import torch
 

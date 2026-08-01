@@ -8,6 +8,12 @@ the model as throttle and steer.
 
 Run once to fit and save the basis; training loads the saved checkpoint and
 never refits it.
+
+The released basis in ``checkpoints/pca_basis.pt`` is the artifact of record --
+use it as-is. This script is provided for provenance. Re-fitting reproduces the
+component directions closely (|cos| >= 0.998 on the top 8), but the mean depends
+on the motion distribution of the sample, so a different draw shifts the origin
+of the throttle axis.
 """
 
 from __future__ import annotations

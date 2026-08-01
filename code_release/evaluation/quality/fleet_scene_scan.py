@@ -1,10 +1,11 @@
 """Fleet-wide scene-relocation scan: RANSAC-inlier place identity, CPU-only.
 inliers between real ref frame (ours frame 8) and each model's 6s-horizon end frame.
 Writes fleet_scene_reloc.csv incrementally with resume."""
-import os, sys, glob
+import os, glob
 import cv2, numpy as np, pandas as pd
 HERE=os.path.dirname(os.path.abspath(__file__))
-BASE="/home/ashish/ARRWM/grids/baselines"
+BASE = os.environ.get("FLEET_BASE",
+                      os.path.join(os.environ.get("AF_ROOT", "."), "grids", "baselines"))
 MODELS={"astra":4,"matrixgame":1,"minwm":13,"worldcam":65,"worldplay":1,"yume":1}
 OURS={"pca8":9,"16node":9}
 THR=int(open(os.path.join(HERE,"scene_reloc_threshold.txt")).read())

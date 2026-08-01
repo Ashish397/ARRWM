@@ -41,7 +41,7 @@ import time
 import pytz
 from datetime import datetime, timezone
 from geopy.distance import geodesic
-from PIL import Image, ImageOps
+from PIL import Image
 
 # Set up logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -52,7 +52,7 @@ def _set_hf_cache_from_config():
     """Load config and set HF cache directory before any HuggingFace imports."""
     script_dir = Path(__file__).parent
     config_path = script_dir / 'config_paths.yaml'
-    
+
     if config_path.exists():
         try:
             with open(config_path, 'r') as f:
@@ -85,10 +85,10 @@ DEFAULT_MAX_FRAMES = 32  # Maximum number of frame timestamps to sample from chu
 def load_config_paths(config_file: str = 'config_paths.yaml') -> Dict[str, str]:
     """
     Load path configurations from YAML file.
-    
+
     Args:
         config_file: Path to the YAML config file (default: 'config_paths.yaml' in script directory)
-    
+
     Returns:
         Dictionary with path configurations
     """
@@ -100,27 +100,27 @@ def load_config_paths(config_file: str = 'config_paths.yaml') -> Dict[str, str]:
         'analysis_dir': './analysis',
         'hf_cache': None,  # No default, use HuggingFace's default if not specified
     }
-    
+
     # Try to find config file in script directory
     script_dir = Path(__file__).parent
     config_path = script_dir / config_file
-    
+
     if not config_path.exists():
         logger.warning(f"Config file not found at {config_path}, using default paths")
         return default_config
-    
+
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
         logger.info(f"Loaded configuration from {config_path}")
-        
+
         # Ensure required keys exist, use defaults if missing
         for key in default_config:
             if key not in config:
                 config[key] = default_config[key]
                 if key != 'hf_cache':  # Don't warn about missing hf_cache
                     logger.warning(f"Missing '{key}' in config, using default: {default_config[key]}")
-        
+
         return config
     except Exception as e:
         logger.error(f"Error loading config file {config_path}: {e}")
@@ -454,7 +454,7 @@ def load_frame_chunks(chunks_path: Path) -> Optional[List[Tuple[List[np.ndarray]
     """Load precomputed frame chunks from disk"""
     if not chunks_path.exists():
         return None
-        
+
     with open(chunks_path, 'rb') as f:
         chunks = pickle.load(f)
     logger.info(f"Loaded {len(chunks)} frame chunks from {chunks_path}")
@@ -519,7 +519,7 @@ class VideoCaptionerTestbench:
         else:
             # Evenly distribute samples across the chunk
             frame_indices = [int(i * (len(frames) - 1) / (num_samples - 1)) for i in range(num_samples)]
-        
+
         selected_frame_dicts = [frames[i] for i in frame_indices]
 
         # Build interleaved front+rear frames (front frame 1, rear frame 1, front frame 2, rear frame 2, ...)
@@ -832,16 +832,16 @@ def process_ride_with_frames(ride_dir: Path, captioner: VideoCaptionerTestbench,
 def main():
     # Load config paths
     config = load_config_paths()
-    
+
     parser = argparse.ArgumentParser(description='Ride-level captioning with video captioning models (two-phase processing)')
-    parser.add_argument('--data_root', default=config.get('data_dir', './FrodoBots-2K/data'), 
+    parser.add_argument('--data_root', default=config.get('data_dir', './FrodoBots-2K/data'),
                         help='Dataset root containing output_rides_* (default from config_paths.yaml)')
     parser.add_argument('--captions_dir', default=config.get('captions_dir', './captions'),
                         help='Directory to save caption outputs (default from config_paths.yaml)')
     parser.add_argument('--output_rides_dir', default=None, help='Specific output_rides_* directory to process')
     parser.add_argument('--ride_dir', default=None, help='Single specific ride directory to process')
     parser.add_argument('--rides_folder_dir', default=None, help='Directory containing multiple ride_* folders to process')
-    parser.add_argument('--phase', choices=['precompute', 'caption', 'both'], default='both', 
+    parser.add_argument('--phase', choices=['precompute', 'caption', 'both'], default='both',
                         help='Processing phase: precompute frame chunks, caption from chunks, or both')
     parser.add_argument('--model_name', default='OpenGVLab/InternVL3-8B',
                         help='Video captioning model name from HuggingFace (InternVL3 models only)')
@@ -852,7 +852,7 @@ def main():
     parser.add_argument('--full_video', action='store_true', help='Process all video chunks (default: only first chunk)')
 
     args = parser.parse_args()
-    
+
     # Log the paths being used
     logger.info(f"Using data_root: {args.data_root}")
     logger.info(f"Using captions_dir: {args.captions_dir}")
@@ -880,14 +880,14 @@ def main():
         if not rides_folder.exists():
             logger.error(f"Rides folder directory does not exist: {rides_folder}")
             return
-        
+
         # Find all ride_* subdirectories
         potential_rides = [d for d in rides_folder.iterdir() if d.is_dir() and d.name.startswith('ride_')]
-        
+
         if not potential_rides:
             logger.error(f"No ride_* directories found in {rides_folder}")
             return
-        
+
         rides = sorted(potential_rides)
         logger.info(f"Found {len(rides)} ride directories in {rides_folder}")
     elif args.output_rides_dir:
@@ -913,20 +913,20 @@ def main():
     # Process each ride sequentially: save frames → generate captions → move to next
     if args.phase in ['precompute', 'caption', 'both']:
         logger.info(f"Processing {len(rides)} rides sequentially (save frames → caption → next)")
-        
+
         for idx, ride_dir in enumerate(rides, 1):
             logger.info(f"\n=== Processing ride {idx}/{len(rides)}: {ride_dir.name} ===")
-            
+
             # Check if caption output already exists
             ride_id = ride_dir.name.replace('ride_', '')
             model_suffix = args.model_name.replace('/', '_').replace('-', '_') if args.phase in ['caption', 'both'] else ''
             out_dir = ensure_output_dir(base_caption_dir, ride_dir)
             out_path = out_dir / f"ride_{ride_id}_video_captions_{model_suffix}.json" if model_suffix else None
-            
+
             if args.phase in ['caption', 'both'] and out_path and out_path.exists():
                 logger.info(f"Skipping {ride_dir.name}; output already exists at {out_path}")
                 continue
-            
+
             # Step 1: Precompute frame chunks for this ride
             if args.phase in ['precompute', 'both']:
                 logger.info(f"Step 1/2: Precomputing frame chunks for {ride_dir.name}")
@@ -938,7 +938,7 @@ def main():
                 except Exception as e:
                     logger.error(f"Error precomputing frame chunks for {ride_dir}: {e}")
                     continue
-            
+
             # Step 2: Generate captions for this ride
             if args.phase in ['caption', 'both']:
                 logger.info(f"Step 2/2: Generating captions for {ride_dir.name}")
@@ -947,15 +947,15 @@ def main():
                     if not result:
                         logger.warning(f"No result for {ride_dir}")
                         continue
-                    
+
                     with open(out_path, 'w') as f:
                         json.dump(result, f, indent=2)
                     logger.info(f"Saved video captions: {out_path}")
-                    
+
                 except Exception as e:
                     logger.error(f"Failed generating captions for {ride_dir}: {e}")
                     continue
-            
+
             logger.info(f"=== Completed {ride_dir.name} ({idx}/{len(rides)}) ===")
 
 

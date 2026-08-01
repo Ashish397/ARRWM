@@ -7,7 +7,7 @@ externals are handled. Env MELT_MODEL (qwen25vl7b|cosmos_reason1_7b).
 Writes out/blind_melt_<model>.csv.
 """
 import os
-import numpy as np, imageio, torch, pandas as pd
+import numpy as np, imageio, pandas as pd
 import blind100_common as bc
 from melt_vlm_bench import load_judge, MELT_MODEL
 

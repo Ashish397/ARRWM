@@ -28,7 +28,7 @@ if str(ROOT) not in sys.path:
 from utils.wan_wrapper import WanTextEncoder
 
 CONFIG_DIR = ROOT / "configs"
-DEFAULT_NEGATIVE_ROOT = Path("/projects/u5as/frodobots_captions/negative")
+DEFAULT_NEGATIVE_ROOT = Path(os.environ.get("DATA_ROOT", "data")) / "frodobots_captions" / "negative"
 
 
 STYLE_SENTENCE = (
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-dir",
         type=Path,
-        default=Path("/projects/u5as/frodobots_captions"),
+        default=Path(os.environ.get("DATA_ROOT", "data")) / "frodobots_captions",
         help="Root directory to scan for caption JSON files.",
     )
     parser.add_argument(

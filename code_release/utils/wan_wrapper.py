@@ -1,5 +1,11 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+"""Wrappers around Wan's text encoder, VAE and DiT.
+
+WanDiffusionWrapper owns the action-conditioning entry points (the state-token
+and state-probe branches) and converts between flow and x0 parameterisations.
+"""
+
 import os
 import types
 from pathlib import Path

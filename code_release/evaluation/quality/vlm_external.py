@@ -1,3 +1,4 @@
+import os
 """VLM discriminator for external models vs our good variants (pca8/16node).
 
 Per video: REFERENCE = first real second (6 labeled frames), GENERATED = 16 frames
@@ -16,7 +17,8 @@ import pandas as pd
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = "/home/ashish/ARRWM/grids/baselines"
+BASE_DIR = os.environ.get("FLEET_BASE",
+                          os.path.join(os.environ.get("AF_ROOT", "."), "grids", "baselines"))
 MODELS = ["astra", "matrixgame", "minwm", "worldcam", "worldplay", "yume"]
 OURS = ["pca8", "pca4", "pca2", "16node", "4node", "noatok", "noadaln"]
 OUT = os.path.join(HERE, "results_external_vlm.csv")
