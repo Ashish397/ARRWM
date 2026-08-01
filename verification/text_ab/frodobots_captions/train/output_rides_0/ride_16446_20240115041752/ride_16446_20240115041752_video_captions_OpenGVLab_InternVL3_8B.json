@@ -1,0 +1,32 @@
+{
+  "ride_id": "16446_20240115041752",
+  "analysis_type": "ride_level_video_captioner_testbench",
+  "metadata": {
+    "location": "Tokyo",
+    "local_date": "2024-01-15",
+    "local_day": "Monday",
+    "local_time": "13:17",
+    "local_datetime_readable": "Monday, January 15, 2024",
+    "gps": {
+      "latitude": 35.716705,
+      "longitude": 139.854324
+    },
+    "total_chunks": 1,
+    "processing_method": "chunk_video_captioning",
+    "chunk_duration_seconds": 32.0,
+    "sampling_fps": 1.0,
+    "model_name": "OpenGVLab/InternVL3-8B"
+  },
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "timestamp_range": "[0-32]",
+      "start_seconds": 0.0,
+      "end_seconds": 32.0,
+      "chunk_caption": "The scene unfolds in a spacious, open plaza bathed in bright sunlight, casting sharp shadows from the leafless trees scattered across the area. The ground is paved with large, textured stone tiles, creating a uniform surface. The plaza is largely empty, with no visible people or moving objects, suggesting a quiet, serene atmosphere. \n\nIn the background, several traditional-style pavilions with dark roofs are visible, adding a cultural element to the setting. These structures are surrounded by a mix of bare deciduous trees and evergreens, indicating a winter or early spring season. The sky is clear and blue, with the sun positioned high, creating a lens flare effect in the upper part of the frame.\n\nTo the left, a tall, modern building rises, contrasting with the traditional pavilions. Street lamps are sporadically placed throughout the plaza, standing tall and unlit. On the right, a low stone wall encloses a small, circular area, possibly a garden or seating space. \n\nThe overall layout suggests a public park or historical site, designed for leisure and reflection. The absence of people and the stillness of the environment evoke a sense of calm and tranquility. The scene is well-lit, with the sun's glare and shadows providing a dynamic interplay of light and dark across the plaza.",
+      "frames_processed": 33,
+      "chunk_type": "scene_description"
+    }
+  ],
+  "combined_analysis": "The scene unfolds in a spacious, open plaza bathed in bright sunlight, casting sharp shadows from the leafless trees scattered across the area. The ground is paved with large, textured stone tiles, creating a uniform surface. The plaza is largely empty, with no visible people or moving objects, suggesting a quiet, serene atmosphere. \n\nIn the background, several traditional-style pavilions with dark roofs are visible, adding a cultural element to the setting. These structures are surrounded by a mix of bare deciduous trees and evergreens, indicating a winter or early spring season. The sky is clear and blue, with the sun positioned high, creating a lens flare effect in the upper part of the frame.\n\nTo the left, a tall, modern building rises, contrasting with the traditional pavilions. Street lamps are sporadically placed throughout the plaza, standing tall and unlit. On the right, a low stone wall encloses a small, circular area, possibly a garden or seating space. \n\nThe overall layout suggests a public park or historical site, designed for leisure and reflection. The absence of people and the stillness of the environment evoke a sense of calm and tranquility. The scene is well-lit, with the sun's glare and shadows providing a dynamic interplay of light and dark across the plaza."
+}
