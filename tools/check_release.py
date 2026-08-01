@@ -23,7 +23,8 @@ REL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 # Anything here in a shipped file de-anonymises an anonymous submission.
 LEAK = re.compile(r"ashish|as1748|u5as|u6ex|/home/|/scratch/|/projects/|/lus/",
                   re.I)
-SKIP_DIRS = ("/wan/", "/__pycache__/")
+# tests/ legitimately contains these strings as needles in its own leak test.
+SKIP_DIRS = ("/wan/", "/__pycache__/", "/tests/")
 
 # Paper figure -> the local-agent script that generates it (D43).
 FIGURE_GENERATORS = {

@@ -33,7 +33,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dumps_glob", required=True)
     ap.add_argument("--orig_pool", required=True)
-    ap.add_argument("--ride_attrs", default="paper_assets/v14d_ride_attrs.json")
+    ap.add_argument("--ride_attrs", default="assets/ride_attrs.json")
     ap.add_argument("--out", default=None)
     ap.add_argument("--target_per_class", type=int, default=600)
     ap.add_argument("--report_only", action="store_true")

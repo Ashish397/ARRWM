@@ -37,7 +37,7 @@ EGO_HARD = 0.12         # absolute ego ceiling for non-moving (squashed z units)
 
 
 def main():
-    tw = json.load(open("paper_assets/v14d_train_windows.json"))
+    tw = json.load(open("assets/train_windows.json"))
     train = set(os.path.basename(x["zarr_path"]) for x in tw["windows"])
     evalr = set(cfg.get("eval_ride_zarrs", []) or [])
 

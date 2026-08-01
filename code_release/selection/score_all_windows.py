@@ -29,7 +29,7 @@ ap.add_argument("--window", type=int, default=24)   # context(3)+chunk(21)
 ap.add_argument("--cf", type=int, default=3)
 ap.add_argument("--stride", type=int, default=3)    # block-aligned dense candidates
 ap.add_argument("--bwd_thr", type=float, default=-0.15)
-ap.add_argument("--outdir", default="paper_assets/window_scores")
+ap.add_argument("--outdir", default="assets/window_scores")
 args = ap.parse_args()
 
 rank = int(os.environ.get("SLURM_PROCID", "0"))

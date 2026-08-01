@@ -61,7 +61,7 @@ eval_ride_zarrs:
 # as v14c (60k fwd + 632 bwd x6 = 63792); ONLY change vs v14c = swap the
 # high-motion-curated forward pool for the natural one (= v14's threshold).
 encoded_root: ${oc.env:DATA_ROOT}/frodobots_encoded_weunz
-train_window_manifest: paper_assets/v14d_train_windows.json
+train_window_manifest: assets/train_windows.json
 caption_root: ${oc.env:DATA_ROOT}/frodobots_captions/train
 motion_root: ${oc.env:DATA_ROOT}/frodobots_motion
 pca_basis_checkpoint: preprocessing/checkpoints/pca_basis.pt

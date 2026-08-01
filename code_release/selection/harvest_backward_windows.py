@@ -7,7 +7,7 @@ A "backward window" = a 24-latent training window (3 context + 21) whose FUTURE
 (the 21 generated latents) has mean z7 below --thr.
 
 Writes:
-  paper_assets/backward_windows.json  -- list of {zarr_path, start, n_latent_frames, mean_z7_future}
+  assets/backward_windows.json  -- list of {zarr_path, start, n_latent_frames, mean_z7_future}
   prints the global z7 distribution + per-threshold backward fractions.
 """
 import os
@@ -26,7 +26,7 @@ ap.add_argument("--window", type=int, default=24)   # context(3)+chunk(21)
 ap.add_argument("--cf", type=int, default=3)
 ap.add_argument("--stride", type=int, default=3)
 ap.add_argument("--thr", type=float, default=-0.15)  # mean future z7 below this = backward window
-ap.add_argument("--out", default="paper_assets/backward_windows.json")
+ap.add_argument("--out", default="assets/backward_windows.json")
 args = ap.parse_args()
 
 man = torch.load(args.manifest, map_location='cpu', weights_only=False)
@@ -102,7 +102,7 @@ print(f"\nwrote {args.out}  ({len(back_windows)} backward windows)")
 # Interesting (high turning/motion) windows, best-per-ride, sorted by score —
 # for diverse, non-boring AR-rollout demo videos.
 interesting = sorted(interesting_by_ride.values(), key=lambda w: -w["score"])
-iout = "paper_assets/interesting_windows.json"
+iout = "assets/interesting_windows.json"
 with open(iout, "w") as f:
     json.dump({"n_rides": len(interesting), "windows": interesting}, f, indent=1)
 print(f"wrote {iout}  ({len(interesting)} ride-diverse candidates; top score {interesting[0]['score'] if interesting else 'NA'})")
