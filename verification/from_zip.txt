@@ -1,0 +1,24 @@
+=== extracting to a clean directory ===
+extracted 185 files to /scratch/u6ex/as1748.u6ex/_zipcheck/code_release
+AF_ROOT=/scratch/u6ex/as1748.u6ex/_zipcheck/code_release
+
+=== 1. the tree is self-contained ===
+pytest (the shipped suite)                     PASS
+fresh-clone gate                               FAIL (rc=1)
+        [import] selection.score_all_windows
+              FileNotFoundError: [Errno 2] No such file or directory: 'logs/v14_balanced_weunz/.ride_manifest.pt'
+        [paths] README.md
+              names rides.csv, which does not exist
+        [paths] evaluation/quality/README.md
+              names fleet_scene_reloc.csv, which does not exist
+
+=== 2. figures regenerate from shipped data ===
+figures/wedge_plots.py                         PASS
+figures/response_curves_eval.py                PASS
+
+=== 3. preprocessing, from raw video ===
+preprocessing/build_rides_csv.py               PASS
+preprocessing/pre_encode_direct.py             PASS
+
+=== 4. training starts from the extracted tree ===
+(reusing a prebuilt ride manifest; a cold run rescans for ~30 min)

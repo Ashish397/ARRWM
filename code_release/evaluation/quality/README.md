@@ -77,7 +77,8 @@ present in their output. That is a real hazard: if a rollout is re-rendered afte
 its row was written, the row is **skipped rather than recomputed**, and the file
 silently ends up holding numbers from two different generations of the videos.
 
-This has happened. In the reference `fleet_scene_reloc.csv`, all 256 yume
+This has happened. In an earlier relocation file, `fleet_scene_reloc.csv`
+(superseded by `fleet_scene_consensus.csv` and no longer shipped), all 256 yume
 rollouts and matrixgame's BL/BR rollouts were re-rendered after their rows were
 written, so those rows describe videos that no longer exist. Recomputed from
 scratch, yume's relocation rate moves substantially.

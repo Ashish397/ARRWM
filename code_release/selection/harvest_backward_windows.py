@@ -31,6 +31,12 @@ ap.add_argument("--thr", type=float, default=-0.15)  # mean future z7 below this
 ap.add_argument("--out", default="assets/backward_windows.json")
 args = ap.parse_args()
 
+if not os.path.exists(args.manifest):
+    raise SystemExit(
+        f"ride manifest not found: {args.manifest}\n"
+        "It is written as <logdir>/.ride_manifest.pt the first time training runs "
+        "(the dataset scans every zarr under encoded_root). Point --manifest at an "
+        "existing one, or run training once to build it.")
 man = torch.load(args.manifest, map_location='cpu', weights_only=False)
 rides = man['rides'] if isinstance(man, dict) and 'rides' in man else man
 print(f"manifest rides: {len(rides)}")

@@ -40,6 +40,12 @@ local = int(os.environ.get("SLURM_LOCALID", "0"))
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[rank {rank}/{world}] local_gpu={local} dev={dev} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}", flush=True)
 
+if not os.path.exists(args.manifest):
+    raise SystemExit(
+        f"ride manifest not found: {args.manifest}\n"
+        "It is written as <logdir>/.ride_manifest.pt the first time training runs "
+        "(the dataset scans every zarr under encoded_root). Point --manifest at an "
+        "existing one, or run training once to build it.")
 man = torch.load(args.manifest, map_location='cpu', weights_only=False)
 rides = man['rides'] if isinstance(man, dict) and 'rides' in man else man
 print(f"[rank {rank}] manifest rides: {len(rides)}", flush=True)
