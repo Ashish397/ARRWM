@@ -17,6 +17,9 @@ import pandas as pd
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Stationary mode: score the no-op set, a flat directory of <model>_<scene>.mp4.
+STATIONARY_DIR = os.environ.get("AF_STATIONARY_DIR", "")
+STATIONARY = bool(STATIONARY_DIR) and os.path.isdir(STATIONARY_DIR)
 BASE_DIR = os.path.join(os.environ.get("AF_FLEET_DIR", os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "grids")), "baselines")
@@ -104,10 +107,16 @@ def main():
     for scene in scenes:
         vids = {}
         for m in MODELS:
-            fp = os.path.join(BASE_DIR, f"A_{m}", f"{m}_{scene}.mp4")
+            fp = (os.path.join(STATIONARY_DIR, f"{m}_{scene}.mp4") if STATIONARY
+                  else os.path.join(BASE_DIR, f"A_{m}", f"{m}_{scene}.mp4"))
             if os.path.exists(fp):
                 vids[m] = fp
         for v in OURS:
+            if STATIONARY:
+                fp = os.path.join(STATIONARY_DIR, f"{v}_{scene}.mp4")
+                if os.path.exists(fp):
+                    vids[f"ours_{v}"] = fp
+                continue
             for tdir in TILE_DIRS:
                 fp = os.path.join(HERE, tdir, f"{scene}__{v}.mp4")
                 if os.path.exists(fp):
@@ -115,8 +124,12 @@ def main():
                     break
         # shared REFERENCE: 4 real frames spanning the 0.75s context (frames 2,5,8,11 of our tile)
         ref_imgs = None
-        for tdir in TILE_DIRS:
-            fp0 = os.path.join(HERE, tdir, f"{scene}__pca8.mp4")
+        # The stationary set ships the real rollout itself, so the reference
+        # frames come from that rather than from our tile's context span.
+        ref_candidates = ([os.path.join(STATIONARY_DIR, f"real_{scene}.mp4"),
+                           os.path.join(STATIONARY_DIR, f"pca8_{scene}.mp4")] if STATIONARY
+                          else [os.path.join(HERE, td, f"{scene}__pca8.mp4") for td in TILE_DIRS])
+        for fp0 in ref_candidates:
             if os.path.exists(fp0):
                 fr0, _ = read_video(fp0)
                 ref_imgs = [label_img(fr0[i], "REFERENCE") for i in (2, 5, 8, 11)]

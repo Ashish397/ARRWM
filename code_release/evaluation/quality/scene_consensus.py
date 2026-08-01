@@ -6,6 +6,8 @@ import os, sys
 import cv2, numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 HERE=os.path.dirname(os.path.abspath(__file__))
+STATIONARY_DIR = os.environ.get("AF_STATIONARY_DIR", "")
+STATIONARY = bool(STATIONARY_DIR) and os.path.isdir(STATIONARY_DIR)
 BASE = os.path.join(os.environ.get("AF_FLEET_DIR", os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "grids")), "baselines")
@@ -38,6 +40,9 @@ TILE_DIRS=[d for d in os.environ.get("AF_TILES_DIR",
     ).split(os.pathsep) if d]
 
 def tile(s,v="pca8"):
+    if STATIONARY:
+        p=os.path.join(STATIONARY_DIR,f"{v}_{s}.mp4")
+        return p if os.path.exists(p) else None
     for td in TILE_DIRS:
         p=os.path.join(td,f"{s}__{v}.mp4")
         if os.path.exists(p): return p
@@ -52,7 +57,10 @@ def run(scenes, out):
         for _ri in (2,5,8):
             _rf=frame_at(rp,_ri)
             if _rf is not None: members[f"__ref{_ri}__"]=desc(_rf)
-        jobs={m:(os.path.join(BASE,f"A_{m}",f"{m}_{sc}.mp4"),c) for m,c in MODELS.items()}
+        if STATIONARY:
+            jobs={m:(os.path.join(STATIONARY_DIR,f"{m}_{sc}.mp4"),c) for m,c in MODELS.items()}
+        else:
+            jobs={m:(os.path.join(BASE,f"A_{m}",f"{m}_{sc}.mp4"),c) for m,c in MODELS.items()}
         jobs.update({f"ours_{v}":(tile(sc,v),c) for v,c in OURS.items()})
         for name,(fp,ctx) in jobs.items():
             if not fp or not os.path.exists(fp): continue
@@ -76,7 +84,11 @@ def run(scenes, out):
 if __name__=="__main__":
     import glob
     if len(sys.argv)>1 and sys.argv[1]=="fleet":
-        scenes=sorted(set(os.path.basename(p).split("_",1)[1][:-4] for p in glob.glob(f"{BASE}/A_astra/*.mp4")))
+        if STATIONARY:
+            scenes=sorted({os.path.basename(p)[:-4].rsplit("_r",1)[1] for p in glob.glob(f"{STATIONARY_DIR}/real_r*.mp4")})
+            scenes=[f"r{x}" for x in scenes]
+        else:
+            scenes=sorted(set(os.path.basename(p).split("_",1)[1][:-4] for p in glob.glob(f"{BASE}/A_astra/*.mp4")))
         run(scenes, os.environ.get("AF_CONSENSUS_OUT", "fleet_scene_consensus.csv"))
     else:
         run(["r00_B","r00_BL","r00_BR","r00_F","r00_FL","r00_FR","r00_L","r00_R","r01_B","r01_BL"],

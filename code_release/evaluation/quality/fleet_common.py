@@ -28,6 +28,28 @@ LABELS_VLM = os.environ.get(
 # resolve exactly like the grid-sourced variants.
 EXTRA_TILE_DIRS = [d for d in os.environ.get("AF_EXTRA_TILES", "").split(os.pathsep) if d]
 
+# Stationary mode. The no-op evaluation scores the same models with the same
+# instruments, but over a flat directory of <model>_<scene>.mp4 rather than the
+# grid, and it has no notion of a commanded direction. Set AF_STATIONARY_DIR to
+# score that set instead of the directional fleet; every resolver below switches.
+STATIONARY_DIR = os.environ.get("AF_STATIONARY_DIR", "")
+STATIONARY = bool(STATIONARY_DIR) and os.path.isdir(STATIONARY_DIR)
+
+
+def _stationary_index():
+    """[(scene, model)] for the no-op set, e.g. ("r00", "ours_pca8")."""
+    import glob
+    rows = []
+    for path in sorted(glob.glob(os.path.join(STATIONARY_DIR, "*.mp4"))):
+        stem = os.path.basename(path)[:-4]
+        if "_r" not in stem:
+            continue
+        model, scene = stem.rsplit("_r", 1)
+        if model == "real":                      # the real-video reference, not a model
+            continue
+        rows.append((f"r{scene}", model if model in EXT_CTX else f"ours_{model}"))
+    return sorted(rows)
+
 
 def _extra_path(scene, variant):
     for d in EXTRA_TILE_DIRS:
@@ -54,6 +76,8 @@ EXT_CTX = {"astra": 4, "matrixgame": 1, "minwm": 13, "worldcam": 65, "worldplay"
 
 
 def fleet_index(include_extra=True):
+    if STATIONARY:
+        return _stationary_index()
     """List of (scene, model). Base coverage comes from the VLM label file so it
     matches the reported fleet exactly; standalone ablations are appended."""
     d = pd.read_csv(LABELS_VLM)
@@ -70,6 +94,9 @@ def ctx_of(model):
 
 
 def _path(scene, model):
+    if STATIONARY:
+        name = model[len("ours_"):] if model.startswith("ours_") else model
+        return os.path.join(STATIONARY_DIR, f"{name}_{scene}.mp4")
     if model.startswith("ours_"):
         variant = model[len("ours_"):]
         if variant not in POS:
@@ -93,7 +120,8 @@ def frames_at(scene, model, idxs):
         return None
     r = imageio.get_reader(p)
     out = []
-    if model.startswith("ours_") and model[len("ours_"):] in POS:
+    # Stationary rollouts are stored per model at native size; nothing to de-tile.
+    if (not STATIONARY) and model.startswith("ours_") and model[len("ours_"):] in POS:
         x, y = POS[model[len("ours_"):]]
         for i in idxs:
             f = np.asarray(r.get_data(int(i)))
