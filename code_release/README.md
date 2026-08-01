@@ -1,7 +1,17 @@
-# Action-conditioned causal driving world model
+# Action Forcing
 
-Supplementary code for the submission: training, preprocessing, the evaluation
-instruments, and the scripts that regenerate the paper's figures.
+Code for *Action Forcing: Training World Models on Unsupervised Video by
+Recovering Underlying Egomotion Bases*.
+
+The method turns unlabelled driving video into action-supervised training data.
+Pixel displacements are tracked on a fixed grid, principal components of those
+displacements over a large corpus recover a signed, scalable, composable
+egomotion basis, and a video DiT is adapted to that basis by an online latent
+critic that distils a frozen decoder-tracker-PCA teacher without
+backpropagating through the decoder or the tracker.
+
+This release holds training, preprocessing, the evaluation instruments, and the
+scripts that regenerate the paper's figures.
 
 `validation/` holds the evidence that this release reproduces the reported
 numbers, including what was checked by running it and what was not.

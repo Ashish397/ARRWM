@@ -18,7 +18,8 @@ def lap_var(rgb):
 def main():
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     rows = []
-    for k, (scene, model) in enumerate(fc.fleet_index()):
+    index = fc.fleet_index()
+    for k, (scene, model) in enumerate(index):
         try:
             n, fps = fc.meta(scene, model); ctx = fc.ctx_of(model)
             b0 = ctx + int(round(fps))
@@ -35,7 +36,7 @@ def main():
         except Exception as e:
             print(f"[fhf] {scene} {model} FAIL {str(e)[:60]}", flush=True); continue
         if (k + 1) % 200 == 0:
-            print(f"[fhf] {k+1}/3328", flush=True)
+            print(f"[fhf] {k+1}/{len(index)}", flush=True)
     df = pd.DataFrame(rows)
     df["x_blur"] = df.groupby("scene").d_blur.transform(lambda s: s - s.median())
     df["B"] = -df["x_blur"]

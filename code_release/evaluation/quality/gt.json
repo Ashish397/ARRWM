@@ -1,0 +1,533 @@
+{
+ "_comment": "Ground truth derived from GRID LAYOUT.txt (human eye eval, no references). quality: 0-10 visual quality/artifact score. style_shift: 1 if the video's style at the end departs from the start (hazy/black/desaturated drift). action_follow: 0 if variant ignores the commanded action. Notes are near-verbatim from the txt.",
+ "grids": {
+  "r01_BR": {
+   "pca8": {
+    "quality": 6.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "looks good but weird melting lines"
+   },
+   "pca4": {
+    "quality": 4.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "stronger melt"
+   },
+   "pca2": {
+    "quality": 3.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "jumbled, shapes warped in little circles, no melt"
+   },
+   "16node": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "4node": {
+    "quality": 6.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "haze but not bad"
+   },
+   "noatok": {
+    "quality": 4.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "a lot more black, shapes correct, left a lot as black, uncanny"
+   },
+   "noadaln": {
+    "quality": 6.5,
+    "style_shift": 1,
+    "action_follow": 0,
+    "note": "some style shift, a bit worse, but no warp since it only moves forward"
+   }
+  },
+  "r02_BR": {
+   "pca8": {
+    "quality": 7.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good, builds building, slightly blurry details"
+   },
+   "pca4": {
+    "quality": 6.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "building but more blurry"
+   },
+   "pca2": {
+    "quality": 3.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "buildings but mashier, mangled, melted"
+   },
+   "16node": {
+    "quality": 6.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "hallucinates blue tarp, building strange/uncanny but good-ish"
+   },
+   "4node": {
+    "quality": 6.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "makes nothing; landscape looks good and low error"
+   },
+   "noatok": {
+    "quality": 2.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "mangled black weird and wrong"
+   },
+   "noadaln": {
+    "quality": 5.0,
+    "style_shift": 1,
+    "action_follow": 0,
+    "note": "moves forward, gets blurry and a bit hazy"
+   }
+  },
+  "r04_BR": {
+   "pca8": {
+    "quality": 6.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "ok, tree has curved space warping artefact"
+   },
+   "pca4": {
+    "quality": 7.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good, smaller tree, some curved warping, best here"
+   },
+   "pca2": {
+    "quality": 3.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "hazy blurry mashy, visible artefacts"
+   },
+   "16node": {
+    "quality": 6.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "weird wrong tree, otherwise good"
+   },
+   "4node": {
+    "quality": 4.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "hazy and missing large parts (tree trunks)"
+   },
+   "noatok": {
+    "quality": 5.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "black but style/warping fine; generated building strange, uncanny"
+   },
+   "noadaln": {
+    "quality": 7.0,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "looks good but does not follow the action"
+   }
+  },
+  "r05_BR": {
+   "pca8": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "looks good"
+   },
+   "pca4": {
+    "quality": 5.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "bit blurry and hazy, scooter shapes warped"
+   },
+   "pca2": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "16node": {
+    "quality": 9.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "excellent"
+   },
+   "4node": {
+    "quality": 5.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "warped (building right)"
+   },
+   "noatok": {
+    "quality": 5.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "warped building with missing sides"
+   },
+   "noadaln": {
+    "quality": 3.0,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "does not follow directions, warping really bad"
+   }
+  },
+  "r06_BR": {
+   "pca8": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "pca4": {
+    "quality": 4.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "significant temporal shimmer and blurring artefacts"
+   },
+   "pca2": {
+    "quality": 4.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "significant temporal shimmer and blurring artefacts"
+   },
+   "16node": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "4node": {
+    "quality": 7.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "noatok": {
+    "quality": 7.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "noadaln": {
+    "quality": 7.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   }
+  },
+  "r10_BR": {
+   "pca8": {
+    "quality": 7.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good, little bit of artefacts"
+   },
+   "pca4": {
+    "quality": 3.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "very blurry on new generation, bad"
+   },
+   "pca2": {
+    "quality": 3.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "blurry too, also bad"
+   },
+   "16node": {
+    "quality": 6.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "some blurring artefacts, makes building, 8node better"
+   },
+   "4node": {
+    "quality": 5.0,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "hazy, building with holes, bit uncanny"
+   },
+   "noatok": {
+    "quality": 9.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "excellent here"
+   },
+   "noadaln": {
+    "quality": 9.0,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "best here but does not move back or right"
+   }
+  },
+  "r15_R": {
+   "pca8": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "really good"
+   },
+   "16node": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "really good"
+   },
+   "4node": {
+    "quality": 6.5,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "good but hazy"
+   },
+   "noadaln": {
+    "quality": 5.5,
+    "style_shift": 1,
+    "action_follow": 0,
+    "note": "hazy"
+   },
+   "pca2": {
+    "quality": 4.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "kind of bad, mangles on the right side"
+   },
+   "pca4": {
+    "quality": 4.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "kind of bad, mangles on the right side"
+   },
+   "noatok": {
+    "quality": 2.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "mangled and horrid"
+   }
+  },
+  "r17_BL": {
+   "16node": {
+    "quality": 8.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "best, nothing bad on it"
+   },
+   "noatok": {
+    "quality": 7.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "good"
+   },
+   "noadaln": {
+    "quality": 7.0,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "good"
+   },
+   "4node": {
+    "quality": 6.5,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "good but hazy"
+   },
+   "pca8": {
+    "quality": 5.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "kind of weak, right building hazy"
+   },
+   "pca2": {
+    "quality": 4.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "big messy structure on the right, not right"
+   },
+   "pca4": {
+    "quality": 4.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "messy structure on the right"
+   }
+  },
+  "r18_BR": {
+   "noadaln": {
+    "quality": 7.0,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "generates nothing new or cool but good"
+   },
+   "4node": {
+    "quality": 6.5,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "good but hazy"
+   },
+   "pca8": {
+    "quality": 4.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "right building is a load of shite, looks so bad"
+   },
+   "pca4": {
+    "quality": 3.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "even worse than pca8"
+   },
+   "16node": {
+    "quality": 3.5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "sucks, black mass on the right"
+   },
+   "noatok": {
+    "quality": 3.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "quite bad, big black mess"
+   },
+   "pca2": {
+    "quality": 3.0,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "somehow even worse"
+   }
+  },
+  "r22_BL": {
+   "noatok": {
+    "quality": 8,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "top tier"
+   },
+   "noadaln": {
+    "quality": 8,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "top tier"
+   },
+   "16node": {
+    "quality": 6,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "next tier; shadows better than pca8"
+   },
+   "pca8": {
+    "quality": 6,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "next tier; wall much better than 16node"
+   },
+   "pca2": {
+    "quality": 4,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "a bit mangled/mashed but crisp, plausible even if different"
+   },
+   "4node": {
+    "quality": 2,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "bad, implausible content generated (washed out)"
+   },
+   "pca4": {
+    "quality": 2,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "bad, implausible content generated"
+   }
+  },
+  "r04_BL": {
+   "16node": {
+    "quality": 9,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "best"
+   },
+   "noatok": {
+    "quality": 9,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "very good"
+   },
+   "noadaln": {
+    "quality": 9,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "very good"
+   },
+   "pca8": {
+    "quality": 7,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "blobs (trees)"
+   },
+   "pca4": {
+    "quality": 7,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "blobs"
+   },
+   "pca2": {
+    "quality": 7,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "blobs"
+   },
+   "4node": {
+    "quality": 5,
+    "style_shift": 1,
+    "action_follow": 1,
+    "note": "a bit hazy and washed out"
+   }
+  },
+  "r14_B": {
+   "noadaln": {
+    "quality": 7,
+    "style_shift": 0,
+    "action_follow": 0,
+    "note": "mangles its wires but the van is ok"
+   },
+   "pca8": {
+    "quality": 7,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "acceptable"
+   },
+   "16node": {
+    "quality": 7,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "acceptable"
+   },
+   "noatok": {
+    "quality": 5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "changes van front into a box, not right"
+   },
+   "4node": {
+    "quality": 5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "same van-front box issue"
+   },
+   "pca4": {
+    "quality": 5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "same"
+   },
+   "pca2": {
+    "quality": 5,
+    "style_shift": 0,
+    "action_follow": 1,
+    "note": "backpacker addition not bad but its low render quality is; van front box"
+   }
+  }
+ }
+}

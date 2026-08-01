@@ -17,12 +17,27 @@ import pandas as pd
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Stationary mode: score the no-op set, a flat directory of <model>_<scene>.mp4.
+STATIONARY_DIR = os.environ.get("AF_STATIONARY_DIR", "")
+STATIONARY = bool(STATIONARY_DIR) and os.path.isdir(STATIONARY_DIR)
 BASE_DIR = os.path.join(os.environ.get("AF_FLEET_DIR", os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "grids")), "baselines")
 MODELS = ["astra", "matrixgame", "minwm", "worldcam", "worldplay", "yume"]
+# AF_VLM_MODELS restricts the run, so a new ablation can be scored without
+# putting the whole fleet through the VLM again.
+if os.environ.get("AF_VLM_MODELS"):
+    _want = {m.strip() for m in os.environ["AF_VLM_MODELS"].split(",") if m.strip()}
+    MODELS = [m for m in MODELS if m in _want]
 OURS = ["pca8", "pca4", "pca2", "16node", "4node", "noatok", "noadaln"]
-OUT = os.path.join(HERE, "results_external_vlm.csv")
+# Ablations rendered after the grid was built, supplied as standalone tiles.
+OURS += [v.strip() for v in os.environ.get("AF_EXTRA_VARIANTS", "").split(",") if v.strip()]
+if os.environ.get("AF_VLM_MODELS"):
+    _w = {m.strip() for m in os.environ["AF_VLM_MODELS"].split(",") if m.strip()}
+    OURS = [v for v in OURS if v in _w or f"ours_{v}" in _w]
+# AF_VLM_OUT keeps a new ablation out of the shipped reference artefact, which
+# the paper's geometry column is computed from.
+OUT = os.environ.get("AF_VLM_OUT", os.path.join(HERE, "results_external_vlm.csv"))
 
 INTRO = """The first four images labelled REFERENCE are real frames of a driving video, in temporal order - the true scene and style. The remaining images labelled GENERATED are an AI world model's continuation of that exact scene, in temporal order. The model was supposed to continue the SAME scene in the SAME visual style with plausible content."""
 
@@ -30,6 +45,10 @@ INTRO = """The first four images labelled REFERENCE are real frames of a driving
 CTX_FRAMES = {"astra": 4, "matrixgame": 1, "minwm": 13, "worldcam": 65,
               "worldplay": 1, "yume": 1}
 OURS_CTX = 12
+
+# Directories holding <scene>__<variant>.mp4; AF_TILES_DIR may add more.
+TILE_DIRS = [os.path.join(HERE, "tiles"), os.path.join(HERE, "tiles_new")]
+TILE_DIRS += [d for d in os.environ.get("AF_TILES_DIR", "").split(os.pathsep) if d]
 
 PROBES = [
     ("style", """Does the visual STYLE of the generated frames depart from the reference - e.g. becoming painted, game-like, cartoonish, watercolour, oversaturated, or otherwise a different rendering style? Ordinary lighting or exposure changes do NOT count. Answer Yes or No."""),
@@ -88,19 +107,29 @@ def main():
     for scene in scenes:
         vids = {}
         for m in MODELS:
-            fp = os.path.join(BASE_DIR, f"A_{m}", f"{m}_{scene}.mp4")
+            fp = (os.path.join(STATIONARY_DIR, f"{m}_{scene}.mp4") if STATIONARY
+                  else os.path.join(BASE_DIR, f"A_{m}", f"{m}_{scene}.mp4"))
             if os.path.exists(fp):
                 vids[m] = fp
         for v in OURS:
-            for tdir in ("tiles", "tiles_new"):
+            if STATIONARY:
+                fp = os.path.join(STATIONARY_DIR, f"{v}_{scene}.mp4")
+                if os.path.exists(fp):
+                    vids[f"ours_{v}"] = fp
+                continue
+            for tdir in TILE_DIRS:
                 fp = os.path.join(HERE, tdir, f"{scene}__{v}.mp4")
                 if os.path.exists(fp):
                     vids[f"ours_{v}"] = fp
                     break
         # shared REFERENCE: 4 real frames spanning the 0.75s context (frames 2,5,8,11 of our tile)
         ref_imgs = None
-        for tdir in ("tiles", "tiles_new"):
-            fp0 = os.path.join(HERE, tdir, f"{scene}__pca8.mp4")
+        # The stationary set ships the real rollout itself, so the reference
+        # frames come from that rather than from our tile's context span.
+        ref_candidates = ([os.path.join(STATIONARY_DIR, f"real_{scene}.mp4"),
+                           os.path.join(STATIONARY_DIR, f"pca8_{scene}.mp4")] if STATIONARY
+                          else [os.path.join(HERE, td, f"{scene}__pca8.mp4") for td in TILE_DIRS])
+        for fp0 in ref_candidates:
             if os.path.exists(fp0):
                 fr0, _ = read_video(fp0)
                 ref_imgs = [label_img(fr0[i], "REFERENCE") for i in (2, 5, 8, 11)]

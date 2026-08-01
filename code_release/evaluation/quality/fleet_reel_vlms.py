@@ -11,7 +11,7 @@ from blind_plausibility import ref_indices
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_ID = {"internvl3_8b": "OpenGVLab/InternVL3-8B-HF", "cosmos_reason1_7b": "nvidia/Cosmos-Reason1-7B"}
-VLM = os.environ["PLAUS_MODEL"]
+VLM = os.environ.get("PLAUS_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 OUT = os.path.join(HERE, "out", f"reel_uncanny_{VLM}.csv")
 UNC_Q = dict(PROBES)["uncanny"]
 DEV = "cuda"

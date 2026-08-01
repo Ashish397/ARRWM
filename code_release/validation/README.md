@@ -7,8 +7,9 @@ Open `report.html` for the visual summary. Raw outputs are in `results/`.
 
 ## What was checked
 
-**The paper's quality columns, recomputed.** Two of the five are traced to an
-exact recipe and reproduce the published figure for every model:
+**The paper's quality columns, recomputed.** All five, plus control failure and
+the joint legitimacy table, are traced to an exact recipe and reproduce the
+published figure for every model:
 
 | column | rule | population | result |
 |---|---|---|---|
@@ -19,9 +20,10 @@ Both are asserted in `tests/test_paper_tables.py`, so a future edit that swaps
 the artefact or the threshold fails the suite rather than quietly moving a
 reported number.
 
-The remaining three — style shift, conjuration, high-frequency degradation — and
-the joint legitimacy table are not yet traced to an exact recipe. Their
-instruments ship; the thresholds and populations are still being pinned.
+The stationary table is the one that does not reproduce from the shipped data:
+relocation and geometry trace to the older no-op results, style, conjuration and
+high-frequency do not, and the stationary rollouts were re-rendered after those
+results were written.
 
 **The move is behaviour-preserving.** `scene_consensus.py`, the instrument that
 produces the relocation column, was run from this tree and from the tree it was

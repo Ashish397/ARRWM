@@ -16,17 +16,17 @@ from figures.figure_labels import label as run_label   # `label` is a local belo
 from figures.following_by_realdir import build, DIRS, DNAME, CHUNK_SEC
 
 FAMILIES = {
-    "nodes": [("logs/v14e_4node/control_test", run_label("4node"), "#4393c3"),
-              ("logs/v14e_pca8_raw/control_test", f"{run_label('pca8')} (batch 32)", "#08306b"),
-              ("logs/v14e_16node/control_test", run_label("16node"), "#e08214")],
-    "encoders": [("logs/v14e_pca8_raw/control_test", run_label("pca8"), "#08306b"),
-                 ("logs/v14e_pca4/control_test", run_label("pca4"), "#2ca02c"),
-                 ("logs/v14e_pca2/control_test", run_label("pca2"), "#9467bd")],
+    "nodes": [("logs/v14e_4node/control_test", run_label("4node", style="following_nodes"), "#4393c3"),
+              ("logs/v14e_pca8_raw/control_test", run_label("pca8", style="following_nodes"), "#08306b"),
+              ("logs/v14e_16node/control_test", run_label("16node", style="following_nodes"), "#e08214")],
+    "encoders": [("logs/v14e_pca8_raw/control_test", run_label("pca8", style="following_encoders"), "#08306b"),
+                 ("logs/v14e_pca4/control_test", run_label("pca4", style="following_encoders"), "#2ca02c"),
+                 ("logs/v14e_pca2/control_test", run_label("pca2", style="following_encoders"), "#9467bd")],
     # injection-pathway ablation: pca8/8node = adaln+tokens (full), noatok =
     # adaln-only, noadaln = tokens-only
-    "injection": [("logs/v14e_pca8_raw/control_test", f"{run_label('pca8')} (AdaLN + tokens)", "#08306b"),
-                  ("logs/v14e_noatok/control_test", run_label("noatok"), "#2ca02c"),
-                  ("logs/v14e_noadaln/control_test", run_label("noadaln"), "#b2182b")],
+    "injection": [("logs/v14e_pca8_raw/control_test", run_label("pca8", style="following_injection"), "#08306b"),
+                  ("logs/v14e_noatok/control_test", run_label("noatok", style="following_injection"), "#2ca02c"),
+                  ("logs/v14e_noadaln/control_test", run_label("noadaln", style="following_injection"), "#b2182b")],
 }
 
 

@@ -79,12 +79,29 @@ def test_relocation_threshold_is_pinned():
     assert int(path.read_text()) == 26
 
 
-def test_quality_scripts_have_no_author_paths():
-    """No absolute author or cluster paths may remain in the shipped instruments."""
+def test_no_author_paths_anywhere_in_the_release():
+    """No author or cluster path may appear anywhere in the shipped tree.
+
+    This deliberately walks the whole release, not just the instruments. An
+    earlier version globbed one directory, and a home path survived in a
+    committed validation log — in an anonymous submission, which is the case
+    that matters most.
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    pattern = re.compile(r"/home/[A-Za-z0-9_.-]+|/scratch/u6e[a-z]|/projects/u6ex")
     offenders = []
-    for f in sorted(QUALITY.glob("*.py")):
-        text = f.read_text()
-        for needle in ("/home/ashish", "/scratch/u6ex", "/projects/u6ex"):
-            if needle in text:
-                offenders.append(f"{f.name}: {needle}")
-    assert not offenders, "hardcoded paths:\n  " + "\n  ".join(offenders)
+    for f in sorted(root.rglob("*")):
+        if not f.is_file() or ".git" in f.parts or f.name == Path(__file__).name:
+            continue
+        if f.suffix.lower() in {".mp4", ".png", ".npy", ".npz", ".pt", ".pth", ".pyc"}:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        hit = pattern.search(text)
+        if hit:
+            offenders.append(f"{f.relative_to(root)}: {hit.group(0)}")
+    assert not offenders, "author paths in the release:\n  " + "\n  ".join(offenders)

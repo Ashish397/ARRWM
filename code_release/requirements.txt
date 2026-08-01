@@ -25,6 +25,7 @@ pillow
 
 # --- Wan T5 text encoder tokenisation ---
 ftfy
+geopy                # ride_level_caption geocoding
 regex
 sentencepiece
 

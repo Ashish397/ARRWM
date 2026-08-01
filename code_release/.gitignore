@@ -15,3 +15,7 @@ wandb/
 !preprocessing/checkpoints/pca_basis.pt
 !assets/
 !assets/*.json
+!analysis/
+evaluation/quality/out/
+.pytest_cache/
+logs/

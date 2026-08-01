@@ -56,10 +56,10 @@ for fname, ccol, gcol in [("response_curves_eval_throttle.png", "c0", "g0"),
         col, style, lw = STYLE[m]
         if m in OURS:   # continuous action space: a real dose axis -> line
             ax.plot(g.index, g["mean"], color=col, ls=style, lw=lw,
-                    marker="o", ms=4, label=label(m, ours=True))
+                    marker="o", ms=4, label=label(m, style="curves"))
         else:           # fixed-strength interface: distinct markers, thin line
             ax.plot(g.index, g["mean"], color=col, ls="-", lw=1.4,
-                    marker=style, ms=7, alpha=0.9, label=label(m, ours=True))
+                    marker=style, ms=7, alpha=0.9, label=label(m, style="curves"))
         ax.fill_between(g.index, g["mean"] - g["sem"], g["mean"] + g["sem"],
                         color=col, alpha=0.3, lw=0)
     ax.set_xlabel("commanded value"); ax.set_ylabel("teacher-read response (CoTracker→PCA)")
