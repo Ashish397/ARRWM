@@ -27,7 +27,7 @@ AF_ROOT=$PWD/.. PYTHONPATH=. WG_OUT=../verification/figures python figures/wedge
 AF_ROOT=$PWD/.. PYTHONPATH=. RC_OUT=../verification/figures python figures/response_curves_eval.py
 ```
 
-## `pca/` — the PCA basis ⚠️ PASS WITH A FINDING
+## `pca/` — the PCA basis ✅ PASS (finding resolved)
 
 `pca_basis_shipped_vs_refit.png`. Refit the frozen action basis from scratch on
 the real motion corpus (7,590 `motion.npy` files, 400k frames sampled across
@@ -42,10 +42,22 @@ PC1 (steer) = 0.99999, worst of the top-8 = 0.9985. The fitter is correct.
 channel by **MAE 0.260** in squashed action units, against a dataset whose
 maximum forward command is +0.5. Steer is unaffected (0.016).
 
-This does not invalidate the trained models — training used the shipped basis
-consistently for both conditioning and the critic target. It means a third party
-regenerating the basis gets a measurably different throttle channel. Open
-question: see D41 in `DECISIONS.md`.
+**Resolved.** Sweeping the mean over motion-filtered subsets reproduces the
+shipped value where you would expect: all frames 35.35, slowest 90% 26.47,
+slowest 70% 14.72, slowest 50% 5.19, **shipped 2.20**, slowest 30% 0.29. The
+shipped basis was fitted on a stationary-weighted sample, not a size-weighted
+draw of the whole corpus. Nothing is corrupt.
+
+It does not affect any result. `pca_mean` sets only the *origin* of the action
+space, and training used the shipped basis for the conditioning signal, the
+critic teacher target and the eval read-back alike — so it is one consistent
+frame, and every commanded-vs-realized relationship the paper reports measures
+both sides through it. The components, which define what "throttle" and "steer"
+mean, reproduce to |cos| >= 0.9985.
+
+The one consequence: re-fitting instead of using the shipped file shifts the
+throttle origin. `pca_basis.pt` ships and is the artifact of record, so that
+path is avoidable; the fitter's docstring now says so. See D41.
 
 ```bash
 python tools/pca_verify_plot.py \
