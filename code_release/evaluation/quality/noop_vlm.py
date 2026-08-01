@@ -43,11 +43,20 @@ refs={}
 for sc in range(32):
     p=paths("pca8",sc)
     if p: fr,_=readv(p[0]); refs[sc]=lab(fr[8],"REFERENCE")
-out=open("noop_vlm_results.csv","a")
-if os.path.getsize("noop_vlm_results.csv") if os.path.exists("noop_vlm_results.csv") else 0==0: out.write("model,scene,p_style,p_imp\n")
+OUT = os.environ.get("AF_NOOP_VLM_OUT",
+                     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "noop_vlm_results.csv"))
+# The header goes in only when the file is new or empty. The guard used to read
+# `getsize(...) if exists(...) else 0==0`, where `0==0` binds tighter than the
+# conditional, so an existing non-empty file returned its size — truthy — and the
+# header was appended again on every resume.
+_needs_header = not os.path.exists(OUT) or os.path.getsize(OUT) == 0
+out = open(OUT, "a")
+if _needs_header:
+    out.write("model,scene,p_style,p_imp\n")
 done=set()
-if os.path.exists("noop_vlm_results.csv"):
-    for l in open("noop_vlm_results.csv"):
+if os.path.exists(OUT):
+    for l in open(OUT):
         if l.startswith("model"): continue
         c=l.split(","); done.add((c[0],int(c[1])))
 for m in MODELS:

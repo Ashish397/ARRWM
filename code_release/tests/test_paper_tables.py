@@ -155,8 +155,16 @@ def test_style_shift_matches_the_paper(active):
     lighting does not.
 
     The cut is 0.72 exactly: 0.7195 and 0.7205 each reproduce only seven of the
-    eight published figures, so this is the deployed threshold rather than a
-    value fitted to the table.
+    eight published figures, so it is the deployed threshold rather than a value
+    fitted to this table.
+
+    It is worth being straight about the evidence for 0.72. It was recovered by
+    sweeping thresholds against the published column, not read out of a config,
+    because none records it. Two things argue it is genuine rather than
+    reverse-engineered: it is a round number sitting on a sharp optimum, and it
+    does not flatter us — at 0.75 Default would report 0% instead of 3%, so a
+    fitted value would have been chosen higher. Model ordering is stable across
+    0.60-0.80 either way, so no conclusion depends on it.
     """
     published = {"worldplay": 16, "matrixgame": 62, "worldcam": 62, "astra": 13,
                  "yume": 5, "minwm": 4, "pca8": 3, "16node": 3}
