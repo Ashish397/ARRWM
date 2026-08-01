@@ -75,3 +75,64 @@ the output file before rescanning whenever an input video has changed.
 
 Skipped tests need the rollout videos, which are too large to distribute. Set
 `AF_FLEET_DIR` to enable them.
+
+---
+
+# Cluster-side validation
+
+The section above was produced on the machine the evaluation was developed on.
+This section is the complementary half: the training and preprocessing path,
+exercised on the HPC cluster against the real corpus. Charts in `charts/`, raw
+logs in `results/`.
+
+## Preprocessing reproduces the shipped data
+
+`charts/motion_ab.png`. Two rides were re-extracted from their raw `.ts`
+recordings with the released `preprocessing/pre_encode_motion.py` and compared
+against the `motion.npy` the original pipeline produced for the same rides.
+
+| ride | shape | max abs diff | min per-chunk cosine |
+|---|---|---|---|
+| ride_22757 | 499x100x3, matches | 0.0024 | 0.99956 |
+| ride_22763 | 9x100x3, matches | 0.0040 | 0.99939 |
+
+508 chunks compared, mean cosine 0.999846. Not bit-identical, and should not be:
+CoTracker's reductions are non-deterministic across GPUs. The agreement is at
+the level that difference explains.
+
+## The action basis reproduces
+
+`charts/pca_basis_shipped_vs_refit.png`. Refitting the frozen PCA basis from
+scratch on the real motion corpus reproduces every component direction to
+|cos| >= 0.9985 (PC0 throttle and PC1 steer to 0.99999). The mean differs
+because the shipped basis was fitted on a stationary-weighted sample; since it
+sets only the origin of the action space, and conditioning, critic target and
+eval read-back all share the shipped file, it cancels in every
+commanded-vs-realized relationship the paper reports. Use the shipped
+`pca_basis.pt`; the fitter is included for provenance.
+
+## Self-checks, run here
+
+| file | result |
+|---|---|
+| `results/pytest_cluster.txt` | the suite above, re-run on the cluster: 37 passed, 4 skipped (the 4 need the rollout grids, which live on the other machine) |
+| `results/imports_and_configs.txt` | 21/21 modules import on a CPU-only node; all 8 configs resolve under the documented env contract |
+| `results/release_gate.txt` | no de-anonymisation leaks, shared figure label map intact, no figure script left without its upstream producer |
+
+## What running it actually caught
+
+Three defects survived every static check -- compilation, imports, AST-identity
+proofs, 37 passing tests and the numeric baseline probes -- and were found only
+by executing the pipeline:
+
+- `NameError: pca_basis_ckpt` in `_build_frozen_evaluator_modules`. Removing the
+  ss_vae left one use of a variable whose definition went with it. **The release
+  could not train at all.** No test reaches that function.
+- `assets/train_windows.json` shipped machine-independent `${DATA_ROOT}/...`
+  paths, which JSON does not expand, so the trainer matched none of its 63,792
+  windows.
+- `wan_model_path` read `DATA_ROOT` while the release documents `WAN_MODELS`
+  for checkpoints.
+
+All three are fixed. They are recorded here because they are the argument for
+running a release rather than inspecting it.

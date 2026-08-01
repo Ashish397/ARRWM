@@ -65,7 +65,17 @@ python tools/pca_verify_plot.py \
   --refit <your-refit>.pt --out verification/pca/pca_basis_shipped_vs_refit.png
 ```
 
-## `ab/` — training A/B ⏳ PENDING
+## `checks/` — reproducible self-checks, run here ✅ PASS
+
+Text logs, not prose claims. Regenerate each with the command in its header.
+
+| file | result |
+|---|---|
+| `pytest_cluster.txt` | the local agent's suite run **on this cluster**: 37 passed, 4 skipped (their own run was 35/6; the 4 skips need the rollout `grids/`, which live on their machine) |
+| `imports_and_configs.txt` | all 21 modules import on a CPU-only node; all 8 configs resolve under the documented env contract, `nocritic` showing `critic_guidance=0.0` |
+| `release_gate.txt` | `tools/check_release.py`: no de-anonymisation leaks, label map intact, no orphaned figure inputs, everything parses |
+
+## `ab/` — training A/B ⏳ IN PROGRESS
 
 `ab_compare.png` once jobs 5855705 (`ab_main`) and 5855706 (`ab_release`)
 finish. Both run the **same** recipe, seed and node count — one under the

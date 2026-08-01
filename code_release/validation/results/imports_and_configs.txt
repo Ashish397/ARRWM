@@ -1,0 +1,41 @@
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/miniforge3/envs/arrwm/lib/python3.10/site-packages/torch/cuda/__init__.py:1007: UserWarning: Can't initialize NVML
+  raw_cnt = _raw_device_count_nvml()
+/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/miniforge3/envs/arrwm/lib/python3.10/site-packages/torch/cuda/__init__.py:1007: UserWarning: Can't initialize NVML
+  raw_cnt = _raw_device_count_nvml()
+# Release self-check on the HPC cluster, CPU-only node
+# 2026-08-01T05:36:10.134563Z
+
+## Every module imports without a GPU
+  OK    utils.zarr_dataset
+  OK    utils.wan_wrapper
+  OK    utils.scheduler
+  OK    utils.causal_chain_rollout
+  OK    utils.memory
+  OK    utils.distributed
+  OK    utils.lora_utils
+  OK    utils.dataset
+  OK    utils.misc
+  OK    trainer.causal_diffusion_teacher_train
+  OK    pipeline.causal_inference
+  OK    model.causal_teacher_streaming
+  OK    model.action_critic
+  OK    model.action_modulation
+  OK    figures.figure_labels
+  OK    evaluation.chunk_metrics
+  OK    evaluation.ndof_following
+  OK    preprocessing.fit_pca_basis
+  OK    preprocessing.pre_encode_motion
+  OK    preprocessing.pre_encode_local
+  OK    preprocessing.pre_encode_text
+  -> 21 ok, 0 failed
+
+## Every config resolves under the documented env contract
+  OK  causal_lora_diffusion_teacher_v14e.yaml                critic_guidance=0.3
+  OK  causal_lora_diffusion_teacher_v14e_16node.yaml         critic_guidance=0.3
+  OK  causal_lora_diffusion_teacher_v14e_4node.yaml          critic_guidance=0.3
+  OK  causal_lora_diffusion_teacher_v14e_noadaln.yaml        critic_guidance=0.3
+  OK  causal_lora_diffusion_teacher_v14e_noatok.yaml         critic_guidance=0.3
+  OK  causal_lora_diffusion_teacher_v14e_nocritic.yaml       critic_guidance=0.0
+  OK  causal_lora_diffusion_teacher_v14e_pca2.yaml           critic_guidance=0.3
+  OK  causal_lora_diffusion_teacher_v14e_pca4.yaml           critic_guidance=0.3
+  OK  default_config.yaml                                    critic_guidance=-

@@ -856,6 +856,10 @@ class CausalLoRADiffusionTrainer:
         # Teacher action encoder: the critic teacher target and the eval read
         # both use the raw top-8 PCA projection of the CoTracker grid, squashed
         # with pca_raw_scales -- the same basis the dataset conditions on.
+        # Resolved locally: _build_dataloader has its own copy, and this method
+        # is reachable without it, so the name must not be borrowed from there.
+        pca_basis_ckpt = getattr(self.config, "pca_basis_checkpoint",
+                                 "preprocessing/checkpoints/pca_basis.pt")
         _ck = torch.load(pca_basis_ckpt, map_location="cpu", weights_only=False)
         self._pca_mean = torch.tensor(np.asarray(_ck["pca_mean"]), dtype=torch.float32, device=self.device)
         self._pca_comp_T = torch.tensor(np.asarray(_ck["pca_comp"]).T, dtype=torch.float32, device=self.device)  # [200,16]
