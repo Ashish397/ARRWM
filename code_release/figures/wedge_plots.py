@@ -26,7 +26,12 @@ import matplotlib.pyplot as plt
 from figures.figure_labels import label
 
 ARR = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EF = f"{ARR}/analysis/eval_final"
+# The motion readouts ship with the release under evaluation/quality/reference/;
+# analysis/eval_final/ is the development-tree location and wins when present.
+EF = os.environ.get("AF_EVAL_DIR", "")
+if not EF:
+    _dev = f"{ARR}/analysis/eval_final"
+    EF = _dev if os.path.exists(f"{_dev}/headtohead_motion.csv") else f"{ARR}/evaluation/quality/reference"
 OUT = os.environ.get("WG_OUT", f"{EF}/wedges")
 os.makedirs(OUT, exist_ok=True)
 
