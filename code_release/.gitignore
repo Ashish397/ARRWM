@@ -18,3 +18,4 @@ wandb/
 !analysis/testbench_v2/labels/*.csv
 !paper_assets/
 !paper_assets/*.json
+evaluation/quality/out/

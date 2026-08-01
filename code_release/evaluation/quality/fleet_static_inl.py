@@ -22,21 +22,29 @@ def inl(a,b):
     src=np.float32([k0[m.queryIdx].pt for m in ms]); dst=np.float32([k1[m.trainIdx].pt for m in ms])
     H,mask=cv2.findHomography(src,dst,cv2.RANSAC,5.0)
     return int(mask.sum()) if mask is not None else 0
-OUT=os.path.join(HERE,"fleet_static_inl.csv")
+# AF_STATIC_OUT keeps a new ablation out of the shipped reference artefact.
+OUT=os.environ.get("AF_STATIC_OUT", os.path.join(HERE,"fleet_static_inl.csv"))
 done=set()
 if os.path.exists(OUT) and os.path.getsize(OUT)>0:
     done=set(zip(*pd.read_csv(OUT)[["scene","model"]].values.T.tolist()))
 f=open(OUT,"a")
 if not done: f.write("scene,model,static_inl,static\n")
+TILE_DIRS=[os.path.join(HERE,"tiles"),os.path.join(HERE,"tiles_new")]
+TILE_DIRS+=[d for d in os.environ.get("AF_TILES_DIR","").split(os.pathsep) if d]
+OURS_VARIANTS=("pca8","pca4","pca2","16node","4node","noatok","noadaln")
+OURS_VARIANTS+=tuple(v.strip() for v in os.environ.get("AF_EXTRA_VARIANTS","").split(",") if v.strip())
+
 def tile(s,v):
-    for td in ("tiles","tiles_new"):
-        p=os.path.join(HERE,td,f"{s}__{v}.mp4")
+    for td in TILE_DIRS:
+        p=os.path.join(td,f"{s}__{v}.mp4")
         if os.path.exists(p): return p
 scenes=sorted(set(os.path.basename(p).split("_",1)[1][:-4] for p in glob.glob(f"{BASE}/A_astra/*.mp4")))
 for sc in scenes:
     jobs={m:(os.path.join(BASE,f"A_{m}",f"{m}_{sc}.mp4"),c) for m,c in CTX.items()}
-    jobs.update({f"ours_{v}":(tile(sc,v),12) for v in ("pca8","pca4","pca2","16node","4node","noatok","noadaln")})
+    jobs.update({f"ours_{v}":(tile(sc,v),12) for v in OURS_VARIANTS})
+    _only={m.strip() for m in os.environ.get("AF_STATIC_MODELS","").split(",") if m.strip()}
     for name,(fp,ctx) in jobs.items():
+        if _only and name not in _only and name.replace("ours_","") not in _only: continue
         if (sc,name) in done or not fp or not os.path.exists(fp): continue
         fps,n=meta(fp)
         f0=frame_at(fp,ctx); f1=frame_at(fp,min(n-2,ctx+int(round(6.0*fps))))

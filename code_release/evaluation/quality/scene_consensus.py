@@ -77,6 +77,7 @@ if __name__=="__main__":
     import glob
     if len(sys.argv)>1 and sys.argv[1]=="fleet":
         scenes=sorted(set(os.path.basename(p).split("_",1)[1][:-4] for p in glob.glob(f"{BASE}/A_astra/*.mp4")))
-        run(scenes, "fleet_scene_consensus.csv")
+        run(scenes, os.environ.get("AF_CONSENSUS_OUT", "fleet_scene_consensus.csv"))
     else:
-        run(["r00_B","r00_BL","r00_BR","r00_F","r00_FL","r00_FR","r00_L","r00_R","r01_B","r01_BL"], "results_scene_consensus_val.csv")
+        run(["r00_B","r00_BL","r00_BR","r00_F","r00_FL","r00_FR","r00_L","r00_R","r01_B","r01_BL"],
+            os.environ.get("AF_CONSENSUS_OUT", "results_scene_consensus_val.csv"))

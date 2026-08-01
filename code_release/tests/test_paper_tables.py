@@ -91,3 +91,56 @@ def test_the_shipped_artefacts_are_one_generation():
 def test_active_population_is_smaller_than_the_fleet(active):
     """Near-static and wet-lens rollouts are excluded, so active < 3328."""
     assert 2500 < len(active) < 3328
+
+
+def test_control_failure_matches_the_paper(active):
+    """Control fail % = near-static OR realised motion >90 deg from the command.
+
+    Commands are unit-norm 0.5 in (throttle, yaw); a rollout fails when the dot
+    product of commanded and realised motion is non-positive, or when the static
+    mask marks it near-static. Reported over the feature-valid population.
+
+    Freezing and steering the wrong way are both control failures, which is why
+    minWM scores 22% despite following directions well when it moves at all.
+    """
+    import glob
+    import numpy as np
+
+    published = {"worldplay": 1, "matrixgame": 0, "worldcam": 13, "astra": 19,
+                 "yume": 5, "minwm": 22, "pca8_8node": 0, "16node": 1}
+    s = 0.5
+    r = s / np.sqrt(2)
+    commands = {"F": (s, 0), "B": (-s, 0), "R": (0, s), "L": (0, -s),
+                "FR": (r, r), "FL": (r, -r), "BR": (-r, r), "BL": (-r, -r)}
+
+    import os
+    hh = os.environ.get("AF_HEADTOHEAD_DIR",
+                        str(QUALITY.parent.parent.parent / "grids" / "eval" / "headtohead"))
+    motion_files = sorted(glob.glob(os.path.join(hh, "headtohead_*.csv")))
+    if not motion_files:
+        pytest.skip("head-to-head motion readouts not present")
+    motion = pd.concat([pd.read_csv(f) for f in motion_files], ignore_index=True)
+
+    mask = _csv("canonical_static_mask.csv")
+    key = lambda m, sc: (m.replace("ours_", ""), sc)  # noqa: E731
+    static = {key(m, sc): bool(v) for m, sc, v in
+              zip(mask.model, mask.scene, mask.static)}
+    valid = {key(m, sc): bool(v) for m, sc, v in
+             zip(mask.model, mask.scene, mask.feature_valid)}
+
+    for model, want in published.items():
+        rows = motion[motion.model == model]
+        if not len(rows):
+            continue
+        name = "pca8" if model == "pca8_8node" else model
+        failed = total = 0
+        for t in rows.itertuples():
+            scene = f"r{int(t.window):02d}_{t.dir}"
+            if not valid.get(key(name, scene), True):
+                continue
+            total += 1
+            cx, cy = commands[t.dir]
+            if static.get(key(name, scene), False) or cx * t.g0 + cy * t.g1 <= 0:
+                failed += 1
+        got = round(100 * failed / max(total, 1))
+        assert got == want, f"control fail {model}: recomputed {got}%, paper says {want}%"
