@@ -34,6 +34,14 @@ MASTER_PORT=$((29500 + SLURM_JOB_ID % 16000))
 export NCCL_CROSS_NIC=1 NCCL_SOCKET_IFNAME=hsn NCCL_DEBUG=WARN NCCL_IB_TIMEOUT=50
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The configs resolve ${oc.env:DATA_ROOT} etc., so these must be exported.
+# torchelastic writes its rendezvous state under TMPDIR; the node-local
+# default is not provisioned everywhere, so pin it somewhere that always is.
+export TMPDIR=/tmp
+export TORCHELASTIC_ERROR_FILE=/tmp/torchelastic_err_${SLURM_JOB_ID}.json
+export DATA_ROOT=/projects/u6ex/fbots
+export WAN_MODELS=/scratch/u6ex/as1748.u6ex/frodobots
+export AF_ROOT=/scratch/u6ex/as1748.u6ex/ARRWM
 export ARRWM_ACTION_ENCODER=pca_raw
 export WANDB_MODE=offline          # keep the comparison free of network effects
 

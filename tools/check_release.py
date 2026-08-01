@@ -77,7 +77,31 @@ def main():
         warnings.append(f"{len(missing)}/{len(FIGURE_GENERATORS)} paper figures "
                         f"have no generator in the release")
 
-    # 4. integrity
+    # 4. every figure's upstream producer must still ship. The local-agent
+    #    merge once deleted the action-injection chain while leaving the figure
+    #    scripts that consume it, which breaks 10 paper figures silently.
+    PRODUCERS = {
+        "metrics_r*.jsonl": "evaluation/inject_eval.py",
+        "chunk_metrics.csv": "evaluation/chunk_metrics.py",
+        "ndof_following.csv": "evaluation/ndof_following.py",
+        "headtohead_motion.csv": "evaluation/headtohead_extract.py",
+        "pca_evr.npy": "analysis/pca_evr.npy",
+    }
+    figs = os.path.join(REL, "figures")
+    orphaned = []
+    if os.path.isdir(figs):
+        for f in sorted(os.listdir(figs)):
+            if not f.endswith(".py"):
+                continue
+            body = open(os.path.join(figs, f), encoding="utf-8").read()
+            for token, producer in PRODUCERS.items():
+                needle = token.replace("*", "")
+                if needle in body and not os.path.exists(os.path.join(REL, producer)):
+                    orphaned.append(f"figures/{f} needs {token} but {producer} is missing")
+    if orphaned:
+        blockers.append(f"{len(orphaned)} figure scripts have no upstream producer")
+
+    # 5. integrity
     bad_syntax, n = [], 0
     mods = set()
     for p in py_files():
@@ -104,6 +128,11 @@ def main():
             print("   ", l)
         if len(leaks) > 12:
             print(f"    ... and {len(leaks) - 12} more")
+        print()
+    if orphaned:
+        print("BLOCKER - orphaned figure inputs:")
+        for o in orphaned:
+            print("   ", o)
         print()
     if missing:
         print("MISSING paper-figure generators (see D43):")
