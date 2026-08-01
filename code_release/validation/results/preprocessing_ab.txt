@@ -47,3 +47,26 @@ NOT confirmed:
                                     VLM sampling in any case, so an exact A/B
                                     against the shipped captions would not be
                                     meaningful -- only a well-formedness check.
+
+# --- Later additions -------------------------------------------------------
+
+pre_encode.py             REMOVED. Superseded by pre_encode_direct now that the
+                          pipeline is zarr-based; nothing imported it.
+
+inject_eval.py            CONFIRMED. Ran phase A from the released tree against
+                          the step-5000 checkpoint: 256/256 generations, 70 mp4
+                          and a metrics jsonl with the expected schema
+                          (tz2/tz7/cz2/cz7/corr_z2/corr_z7, 8 chunks per record).
+                          This is the head of the action-injection chain that
+                          feeds the following_* and response_* figures.
+
+figures/                  ALL NINE scripts execute against real data:
+                          wedge_plots, response_curves_eval, response_complete,
+                          following_by_realdir (incl. the nocritic ablation,
+                          34,056 rows), following_family_realdir,
+                          following_select, pca_components_fig, figure_labels.
+
+chunk_metrics.py          PARTIAL. Executes end-to-end and loads its MUSIQ and
+                          LPIPS models, but its input glob matched nothing at
+                          the default location here, so it wrote a header-only
+                          CSV. Runs; not output-compared.
