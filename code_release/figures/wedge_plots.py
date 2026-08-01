@@ -14,7 +14,7 @@ tx_pct):
                        (pca8_8node, pca4, pca2, 16node, 4node, noatok, noadaln)
 
 Reads headtohead_motion.csv + headtohead_*.csv + ty_motion.csv.
-Env: WG_OUT (default analysis/eval_final/wedges).
+Env: WG_OUT (default analysis/wedges), AF_EVAL_DIR for the input tables.
 """
 import os, glob
 import numpy as np
@@ -26,13 +26,10 @@ import matplotlib.pyplot as plt
 from figures.figure_labels import label
 
 ARR = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# The motion readouts ship with the release under evaluation/quality/reference/;
-# analysis/eval_final/ is the development-tree location and wins when present.
-EF = os.environ.get("AF_EVAL_DIR", "")
-if not EF:
-    _dev = f"{ARR}/analysis/eval_final"
-    EF = _dev if os.path.exists(f"{_dev}/headtohead_motion.csv") else f"{ARR}/evaluation/quality/reference"
-OUT = os.environ.get("WG_OUT", f"{EF}/wedges")
+# The head-to-head motion tables ship with the release. AF_EVAL_DIR overrides,
+# for regenerating figures from a fresh evaluation run instead of the reference.
+EF = os.environ.get("AF_EVAL_DIR", f"{ARR}/evaluation/quality/reference")
+OUT = os.environ.get("WG_OUT", f"{ARR}/analysis/wedges")
 os.makedirs(OUT, exist_ok=True)
 
 ANG = {"F": 90, "FR": 45, "R": 0, "BR": -45, "B": -90, "BL": -135, "L": 180, "FL": 135}

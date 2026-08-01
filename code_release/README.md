@@ -51,10 +51,37 @@ scripts take their own optional overrides — `AF_FLEET_DIR`, `AF_BLIND_DIR`,
 ## Data
 
 The corpus is [FrodoBots-2K](https://huggingface.co/datasets/frodobots/FrodoBots-2K),
-public and not redistributed here. Under `DATA_ROOT` the pipeline expects:
+public and not redistributed here. It is a gated dataset: accept the terms on
+the dataset page while logged in, then authenticate before downloading.
+
+```bash
+pip install "huggingface_hub[cli]"
+hf auth login                                   # or: export HF_TOKEN=hf_...
+
+hf download frodobots/FrodoBots-2K --repo-type dataset \
+    --local-dir $DATA_ROOT/frodobots_data
+```
+
+It is roughly 2 TB in total. To develop against a slice, restrict the download
+to a few ride groups — each `output_rides_N` is a few dozen rides, and the
+pipeline is happy with any subset:
+
+```bash
+hf download frodobots/FrodoBots-2K --repo-type dataset \
+    --include "output_rides_0/*" --local-dir $DATA_ROOT/frodobots_data
+```
+
+Extract any archives in place, so that rides sit at
+`frodobots_data/output_rides_*/ride_<id>_<timestamp>/`. Each ride holds
+`recordings/` plus the control, GPS and IMU logs. **`recordings/` contains three
+streams**: the front camera (`uid_s_1000`), the rear camera and the audio (both
+`uid_s_1001`). Only the front camera is used; every script selects it by name,
+so do not flatten or rename the recordings directory.
+
+Under `DATA_ROOT` the pipeline expects:
 
 ```
-frodobots_data/output_rides_*/ride_*/recordings/*.m3u8   raw video
+frodobots_data/output_rides_*/ride_*/recordings/*.m3u8   raw video (downloaded)
 frodobots_encoded_*/<ride_ts>.zarr                       Wan-VAE latents
 frodobots_motion/output_rides_*/ride_*/motion.npy        CoTracker displacements
 frodobots_captions/train/output_rides_*/ride_*/*.json    captions + T5 embeddings
@@ -62,17 +89,48 @@ frodobots_captions/train/output_rides_*/ride_*/*.json    captions + T5 embedding
 
 The first is the input; the other three are produced by `preprocessing/`.
 
+You also need the Wan2.1 backbone, which is ungated:
+
+```bash
+hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir $WAN_MODELS/Wan2.1-T2V-1.3B
+```
+
 ## Reproducing
 
 ### 1. Preprocess
 
+Four stages, in this order. Each is independent per ride and safe to shard
+across nodes; each skips rides whose output already exists, so an interrupted
+run can simply be restarted.
+
 ```bash
-python preprocessing/pre_encode_direct.py --rides_csv <rides>.csv \
-    --output_root $DATA_ROOT/frodobots_encoded     # video -> Wan VAE latents
-python preprocessing/pre_encode_motion.py          # CoTracker 10x10 grid -> motion.npy
-python preprocessing/ride_level_caption.py --ride_dir <ride> --phase caption
-python preprocessing/pre_encode_text.py            # captions -> Wan T5 embeddings
+# 0. index the rides (front-camera stream only) -> rides.csv
+python preprocessing/build_rides_csv.py \
+    --data_root $DATA_ROOT/frodobots_data --out rides.csv
+
+# 1. video -> Wan VAE latents, one zarr per ride            [GPU, the slow one]
+python preprocessing/pre_encode_direct.py --rides_csv rides.csv \
+    --output_root $DATA_ROOT/frodobots_encoded \
+    --vae_path $WAN_MODELS/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+
+# 2. video -> CoTracker 10x10 grid displacements, motion.npy          [GPU]
+#    reads DATA_ROOT/frodobots_data, writes DATA_ROOT/frodobots_motion
+python preprocessing/pre_encode_motion.py
+
+# 3. video -> ride captions (InternVL3-8B, downloaded on first use)   [GPU]
+python preprocessing/ride_level_caption.py \
+    --output_rides_dir $DATA_ROOT/frodobots_data/output_rides_0 --phase both
+
+# 4. captions -> Wan T5 embeddings, written beside each caption JSON  [GPU]
+python preprocessing/pre_encode_text.py --workers-per-device 2
 ```
+
+Stage 1 dominates: it decodes and VAE-encodes every frame. Stages 1 and 2 both
+read the raw video and are the two you would shard first. Stage 3 is the only
+one that needs network access, to fetch the captioning model.
+
+To check a single ride before committing to the corpus, point stage 3 at one
+ride with `--ride_dir <ride>` and pass a one-row `rides.csv` to stage 1.
 
 The frozen PCA action basis ships as `preprocessing/checkpoints/pca_basis.pt`
 and **is the artifact of record — use it as-is.** `preprocessing/fit_pca_basis.py`
@@ -124,6 +182,7 @@ wan/                      vendored Wan2.1 backbone (DiT, VAE, T5)
 preprocessing/            raw video -> latents, motion, captions, PCA basis
 selection/                window scoring and train/eval pool selection
 evaluation/               action-injection eval; quality/ = the paper's instruments
+baselines/                control interfaces for the external models
 figures/                  regenerates the paper's figures
 configs/  sbatch/         one config and one launcher per reported run
 assets/                   training-window manifest, ride attributes
