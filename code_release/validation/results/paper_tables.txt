@@ -1,0 +1,21 @@
+GEOMETRIC CORRUPTION  = p_uncanny > 0.5, all 256 directional rollouts
+  model         paper  recomputed    
+  worldplay        80          80   MATCH
+  matrixgame       71          71   MATCH
+  worldcam         68          68   MATCH
+  astra            52          52   MATCH
+  yume              9           9   MATCH
+  minwm             1           1   MATCH
+  pca8             17          17   MATCH
+  16node           26          26   MATCH
+
+SCENE RELOCATION      = consensus_inl < 50, active population
+  model         paper  recomputed    
+  worldplay        77          77   MATCH
+  matrixgame       95          95   MATCH
+  worldcam         88          88   MATCH
+  astra            67          67   MATCH
+  yume             58          58   MATCH
+  minwm             4           4   MATCH
+  pca8             11          11   MATCH
+  16node            9           9   MATCH

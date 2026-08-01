@@ -1,0 +1,50 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.19, pytest-9.0.0, pluggy-1.6.0 -- /home/ashish/miniconda3/envs/flash/bin/python
+cachedir: .pytest_cache
+rootdir: /home/ashish/ARRWM/code_release
+plugins: anyio-4.11.0
+collecting ... collected 41 items
+
+tests/test_action_space.py::test_explained_variance_matches_paper PASSED [  2%]
+tests/test_action_space.py::test_null_action_reproduces_paper_constant PASSED [  4%]
+tests/test_action_space.py::test_null_action_is_inside_training_support PASSED [  7%]
+tests/test_action_space.py::test_encode_is_signed_and_odd_about_the_mean PASSED [  9%]
+tests/test_action_space.py::test_encode_is_linear_in_displacement PASSED [ 12%]
+tests/test_action_space.py::test_encode_is_additive_across_axes PASSED   [ 14%]
+tests/test_action_space.py::test_squash_is_bounded_and_monotone PASSED   [ 17%]
+tests/test_action_space.py::test_squash_scales_are_two_point_five_sigma PASSED [ 19%]
+tests/test_action_space.py::test_encode_golden_values PASSED             [ 21%]
+tests/test_data_split.py::test_split_composition_matches_paper SKIPPED   [ 24%]
+tests/test_data_split.py::test_backward_oversampling_is_consistent SKIPPED [ 26%]
+tests/test_data_split.py::test_window_count_and_ride_count SKIPPED (...) [ 29%]
+tests/test_data_split.py::test_reverse_motion_matches_the_reported_duration SKIPPED [ 31%]
+tests/test_data_split.py::test_every_window_has_the_required_fields SKIPPED [ 34%]
+tests/test_eval_pipeline.py::test_fleet_index_is_the_full_grid PASSED    [ 36%]
+tests/test_eval_pipeline.py::test_index_covers_ours_and_every_baseline PASSED [ 39%]
+tests/test_eval_pipeline.py::test_frame_extraction_is_repeatable PASSED  [ 41%]
+tests/test_eval_pipeline.py::test_relocation_threshold_is_pinned SKIPPED [ 43%]
+tests/test_eval_pipeline.py::test_quality_scripts_have_no_author_paths PASSED [ 46%]
+tests/test_modules.py::test_critic_output_shape_is_one_code_per_chunk PASSED [ 48%]
+tests/test_modules.py::test_critic_rejects_frames_not_divisible_by_chunk PASSED [ 51%]
+tests/test_modules.py::test_critic_chunks_are_independent PASSED         [ 53%]
+tests/test_modules.py::test_critic_forward_golden PASSED                 [ 56%]
+tests/test_modules.py::test_critic_head_starts_near_zero PASSED          [ 58%]
+tests/test_modules.py::test_adaln_zero_init_starts_as_identity PASSED    [ 60%]
+tests/test_modules.py::test_adaln_responds_to_action_after_perturbation PASSED [ 63%]
+tests/test_modules.py::test_adaln_shape_is_six_params_per_frame PASSED   [ 65%]
+tests/test_modules.py::test_action_token_shape_is_one_token_per_frame PASSED [ 68%]
+tests/test_modules.py::test_action_projection_is_finite_at_zero_action[adaln] PASSED [ 70%]
+tests/test_modules.py::test_action_projection_is_finite_at_zero_action[tokens] PASSED [ 73%]
+tests/test_modules.py::test_action_projection_golden PASSED              [ 75%]
+tests/test_modules.py::test_flow_match_scheduler_timesteps_are_monotone PASSED [ 78%]
+tests/test_modules.py::test_flow_match_scheduler_shift_golden PASSED     [ 80%]
+tests/test_paper_tables.py::test_geometric_corruption_matches_the_paper PASSED [ 82%]
+tests/test_paper_tables.py::test_scene_relocation_matches_the_paper PASSED [ 85%]
+tests/test_paper_tables.py::test_the_shipped_artefacts_are_one_generation PASSED [ 87%]
+tests/test_paper_tables.py::test_active_population_is_smaller_than_the_fleet PASSED [ 90%]
+tests/test_preprocess_contract.py::test_tracker_grid_matches_the_basis PASSED [ 92%]
+tests/test_preprocess_contract.py::test_basis_dimensionality_matches_the_grid PASSED [ 95%]
+tests/test_preprocess_contract.py::test_encoder_consumes_the_documented_motion_shape PASSED [ 97%]
+tests/test_preprocess_contract.py::test_encoder_rejects_a_different_grid PASSED [100%]
+
+======================== 35 passed, 6 skipped in 1.73s =========================

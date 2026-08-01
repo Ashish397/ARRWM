@@ -1,0 +1,192 @@
+<title>Action Forcing — release validation</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-0:#f2f3f2; --surface-1:#fcfcfb; --surface-2:#eaebe9; --rule:#d9dbd7;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#7d7c76;
+    --series-1:#2a78d6; --series-2:#eb6834;
+    --ok:#006644; --ok-tint:#e2efe9; --warn-tint:#fbeade;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-0:#131312; --surface-1:#1a1a19; --surface-2:#232322; --rule:#34342f;
+      --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8e8d84;
+      --series-1:#3987e5; --series-2:#d95926;
+      --ok:#35b183; --ok-tint:#16281f; --warn-tint:#2b1a10;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-0:#131312; --surface-1:#1a1a19; --surface-2:#232322; --rule:#34342f;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8e8d84;
+    --series-1:#3987e5; --series-2:#d95926;
+    --ok:#35b183; --ok-tint:#16281f; --warn-tint:#2b1a10;
+  }
+  .viz-root {
+    --mono: ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+    background:var(--surface-0); color:var(--text-primary); font-family:var(--sans);
+    line-height:1.55; padding:clamp(20px,4vw,44px); min-height:100vh;
+  }
+  .wrap{max-width:940px;margin:0 auto;display:flex;flex-direction:column;gap:34px}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;
+    color:var(--text-muted);margin:0 0 10px}
+  h1{font-family:var(--mono);font-size:clamp(21px,3.2vw,29px);font-weight:600;letter-spacing:-.01em;
+    margin:0 0 10px;text-wrap:balance}
+  h2{font-family:var(--mono);font-size:14px;font-weight:600;letter-spacing:.04em;margin:0 0 4px;
+    text-transform:uppercase}
+  p{margin:0;color:var(--text-secondary);max-width:68ch}
+  .lede{font-size:16px}
+  .verdict{background:var(--ok-tint);border:1px solid var(--rule);border-left:3px solid var(--ok);
+    padding:16px 18px;border-radius:3px;display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
+  .verdict .mark{font-family:var(--mono);font-size:20px;color:var(--ok);font-weight:700}
+  .verdict p{color:var(--text-primary)}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+  .tile{background:var(--surface-1);border:1px solid var(--rule);border-radius:3px;padding:15px 16px;
+    display:flex;flex-direction:column;gap:3px}
+  .tile .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--text-muted)}
+  .tile .v{font-family:var(--mono);font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;
+    letter-spacing:-.02em}
+  .tile .n{font-size:12.5px;color:var(--text-secondary)}
+  .tile.good .v{color:var(--ok)}
+  section{display:flex;flex-direction:column;gap:14px}
+  .panel{background:var(--surface-1);border:1px solid var(--rule);border-radius:3px;padding:18px}
+  table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:12.5px}
+  th,td{padding:7px 12px;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+  th{background:var(--surface-2);color:var(--text-secondary);font-weight:600;font-size:10.5px;
+    letter-spacing:.07em;text-transform:uppercase}
+  td:first-child,th:first-child{text-align:left}
+  tbody tr{border-top:1px solid var(--rule)}
+  .tablewrap{overflow-x:auto;border:1px solid var(--rule);border-radius:3px;background:var(--surface-1)}
+  .ok{color:var(--ok);font-weight:700}
+  .chart{display:flex;flex-direction:column;gap:9px}
+  .row{display:grid;grid-template-columns:112px 1fr 74px;gap:11px;align-items:center}
+  .row .lab{font-family:var(--mono);font-size:12px;color:var(--text-secondary);text-align:right}
+  .track{background:var(--surface-2);border-radius:2px;height:15px}
+  .bar{height:100%;border-radius:0 3px 3px 0;background:var(--series-1)}
+  .row .val{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;
+    color:var(--text-secondary)}
+  ul{margin:0;padding-left:19px;color:var(--text-secondary);display:flex;flex-direction:column;gap:7px}
+  .note{font-size:13px;color:var(--text-secondary)}
+  .note strong{color:var(--text-primary);font-weight:600}
+  code{font-family:var(--mono);font-size:.92em;background:var(--surface-2);padding:1px 5px;border-radius:2px}
+  .flag{background:var(--warn-tint);border:1px solid var(--rule);border-left:3px solid var(--series-2);
+    padding:14px 16px;border-radius:3px}
+  .flag p{color:var(--text-primary)}
+</style>
+
+<div class="viz-root"><div class="wrap">
+
+  <header>
+    <p class="eyebrow">Action Forcing · code appendix</p>
+    <h1>Release validation</h1>
+    <p class="lede">Evidence that the code in this folder reproduces the paper's reported
+    numbers, and that moving it here did not change what it computes.</p>
+  </header>
+
+  <div class="verdict">
+    <span class="mark">✓</span>
+    <p><strong>Validated.</strong> Both quality columns traced so far reproduce the published
+    figures exactly, for every model. The evaluation computes bit-identically from this tree
+    and from the tree it was developed in. 35 tests pass.</p>
+  </div>
+
+  <div class="tiles">
+    <div class="tile good"><span class="k">Geometry column</span><span class="v">8 / 8</span>
+      <span class="n">models reproduce the paper exactly</span></div>
+    <div class="tile good"><span class="k">Relocation column</span><span class="v">8 / 8</span>
+      <span class="n">models reproduce the paper exactly</span></div>
+    <div class="tile good"><span class="k">Port equivalence</span><span class="v">130 / 130</span>
+      <span class="n">scene_consensus, release vs original</span></div>
+    <div class="tile good"><span class="k">Test suite</span><span class="v">35</span>
+      <span class="n">passed · 6 skipped (need rollout videos)</span></div>
+  </div>
+
+  <section>
+    <div><h2>Paper tables, recomputed</h2>
+      <p class="note">Each column recomputed from the shipped result files using the stated
+      rule, then compared against the published table.</p></div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Model</th>
+          <th>Geometry paper</th><th>Geometry here</th>
+          <th>Relocation paper</th><th>Relocation here</th><th></th></tr></thead>
+        <tbody id="tables"></tbody>
+      </table>
+    </div>
+    <p class="note"><strong>Geometry</strong> = fraction with <code>p_uncanny &gt; 0.5</code>
+    over all 256 directional rollouts. <strong>Relocation</strong> = fraction with
+    <code>consensus_inl &lt; 50</code> over the active population (feature-valid and
+    non-static). Both pinned by <code>tests/test_paper_tables.py</code>.</p>
+  </section>
+
+  <section>
+    <div><h2>The move did not change the computation</h2>
+      <p class="note"><code>scene_consensus.py</code> — the instrument that produces the
+      relocation column — run from this tree and from the tree it was developed in, over the
+      same validation scenes. Agreement on consensus inlier counts, per model.</p></div>
+    <div class="panel"><div class="chart" id="port"></div></div>
+    <p class="note">Against the shipped fleet CSV, 124 of these 130 rows are identical and six
+    differ by 1–7 inliers. All six sit at counts of 12–22, far below the threshold of 50, so
+    <strong>no relocation flag and no reported percentage changes</strong>. That is the
+    instrument's own RANSAC jitter at marginal match counts, and both trees show it equally.</p>
+  </section>
+
+  <section>
+    <div><h2>What the validation turned up</h2></div>
+    <ul>
+      <li><strong>The paper's tables are correct.</strong> Both columns traced so far reproduce
+      to the digit, from result files dated 2026-08-01 — the current generation.</li>
+      <li><strong>A superseded artefact was nearly shipped.</strong> An older relocation file
+      held rows computed against rollouts that had since been re-rendered, because the scan
+      resumes by skipping pairs already present. It does not feed any reported number, and it
+      and its producer are no longer in the release.</li>
+      <li><strong>The instruments now shipped are the ones the paper used</strong> —
+      <code>scene_consensus.py</code> for relocation, not the single-reference scan that wrote
+      the stale file. The first version of this validation tested the scan that was
+      subsequently removed; it has been redone against what actually ships.</li>
+    </ul>
+  </section>
+
+  <div class="flag">
+    <p><strong>Standing hazard.</strong> Several scans append and skip any
+    <code>(scene, model)</code> already in their output. If a rollout is re-rendered after its
+    row was written, the row is never recomputed and the file silently mixes generations.
+    Delete the output before rescanning whenever an input video has changed.</p>
+  </div>
+
+  <section>
+    <div><h2>Reproducing this</h2></div>
+    <p class="note">
+      <code>AF_FLEET_DIR=&lt;grids&gt; pytest tests/</code> — the whole suite. Tests needing
+      rollout videos skip cleanly without them. Raw outputs behind this page are in
+      <code>validation/results/</code>: the pytest log, the two A/B runs, the full
+      2,048-row relocation recomputation, and the recomputed paper tables.
+    </p>
+  </section>
+
+</div></div>
+
+<script>
+const TABLES = [
+  ["worldplay",80,80,77,77],["matrixgame",71,71,95,95],["worldcam",68,68,88,88],
+  ["astra",52,52,67,67],["yume",9,9,58,58],["minwm",1,1,4,4],
+  ["pca8 (Default)",17,17,11,11],["16node (Batch64)",26,26,9,9]
+];
+document.getElementById('tables').innerHTML = TABLES.map(([m,gp,gh,rp,rh]) => {
+  const ok = gp===gh && rp===rh;
+  return `<tr><td>${m}</td><td>${gp}%</td><td>${gh}%</td><td>${rp}%</td><td>${rh}%</td>
+    <td class="${ok?'ok':''}">${ok?'match':'differs'}</td></tr>`;
+}).join('');
+
+const PORT = [["yume",10],["matrixgame",10],["worldcam",10],["astra",10],["worldplay",10],
+              ["minwm",10],["ours_pca8",10],["ours_pca4",10],["ours_pca2",10],
+              ["ours_16node",10],["ours_4node",10],["ours_noatok",10],["ours_noadaln",10]];
+document.getElementById('port').innerHTML = PORT.map(([m,n]) =>
+  `<div class="row"><span class="lab">${m}</span>
+     <span class="track"><span class="bar" style="width:100%"
+       title="${m}: ${n}/${n} identical"></span></span>
+     <span class="val">${n}/${n}</span></div>`).join('');
+</script>
