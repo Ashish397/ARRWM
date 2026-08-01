@@ -39,7 +39,10 @@ def load(scene, model, span):
     need = ctx + int(round(span * fps))
     # Variants rendered after the grid was built ship as standalone tiles and
     # are already cropped, so they need no de-tiling window.
-    variant = model[len("ours_"):] if model.startswith("ours_") else None
+    # The stationary set ships each rollout as its own clip, already at tile
+    # size, so the grid window must not be applied there — it would index past
+    # the frame and yield an empty crop.
+    variant = model[len("ours_"):] if model.startswith("ours_") and not fc.STATIONARY else None
     tile = fc.POS.get(variant) if variant else None
     frames = []
     for i, f in enumerate(rd.iter_data()):
