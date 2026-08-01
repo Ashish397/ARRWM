@@ -76,6 +76,11 @@ for model in MODELS:
         lap_loss = float(np.mean(laps_base)-np.mean(laps_end)) if laps_base else np.nan
         rows.append({"model":model,"scene":sc,"stillness":round(still,1),
                      "lap_loss":round(lap_loss,1)})
+if not rows:
+    raise SystemExit(
+        f"no no-op rollouts found under {NOOP}. Set AF_FLEET_DIR, or "
+        "AF_STATIONARY_DIR for the stationary set, to the directory holding them."
+    )
 df=pd.DataFrame(rows)
 
 # pass 2: drift = consensus of end frame vs ref + all sibling ends per scene
