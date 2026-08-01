@@ -11,6 +11,9 @@ BASE = os.path.join(os.environ.get("AF_FLEET_DIR", os.path.join(
     "grids")), "baselines")
 MODELS={"astra":4,"matrixgame":1,"minwm":13,"worldcam":65,"worldplay":1,"yume":1}
 OURS={"pca8":12,"pca4":12,"pca2":12,"16node":12,"4node":12,"noatok":12,"noadaln":12}
+# Ablations rendered after the grid was built, supplied as standalone tiles.
+for _v in os.environ.get("AF_EXTRA_VARIANTS","").split(","):
+    if _v.strip(): OURS[_v.strip()]=12
 orb=cv2.ORB_create(3000); bf=cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True)
 def frame_at(path,i):
     c=cv2.VideoCapture(path); c.set(cv2.CAP_PROP_POS_FRAMES,i); ok,f=c.read(); c.release()
