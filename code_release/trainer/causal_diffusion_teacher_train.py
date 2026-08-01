@@ -1358,7 +1358,7 @@ class CausalLoRADiffusionTrainer:
                 ]:
                     if key in checkpoint:
                         obj = getattr(base, attr_name)
-                        if isinstance(obj, nn.Parameter):
+                        if isinstance(obj, torch.nn.Parameter):
                             saved = checkpoint[key]
                             if isinstance(saved, dict) and "weight" in saved:
                                 saved = saved["weight"]

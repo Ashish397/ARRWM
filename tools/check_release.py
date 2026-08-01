@@ -26,7 +26,8 @@ LEAK = re.compile(r"ashish|as1748|u5as|u6ex|/home/|/scratch/|/projects/|/lus/",
 # tests/ legitimately contains these strings as needles in its own leak test.
 SKIP_DIRS = ("/wan/", "/__pycache__/", "/tests/")
 
-# Paper figure -> the local-agent script that generates it (D43).
+# Paper figure -> the script that generates it. Absent ones are reported so the
+# release never silently claims a figure is reproducible when it is not.
 FIGURE_GENERATORS = {
     "hf_distribution.png": "hf_distribution.py",
     "hf_fleet_distribution.png": "hf_fleet_distribution.py",
@@ -135,7 +136,7 @@ def main():
             print("   ", o)
         print()
     if missing:
-        print("MISSING paper-figure generators (see D43):")
+        print("MISSING paper-figure generators:")
         for fig, g in sorted(missing.items()):
             print(f"    {fig:38} <- {g}")
         print()

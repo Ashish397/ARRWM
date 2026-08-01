@@ -1,6 +1,6 @@
-/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/miniforge3/envs/arrwm/lib/python3.10/site-packages/torch/cuda/__init__.py:1007: UserWarning: Can't initialize NVML
+<REPO>/miniforge3/envs/arrwm/lib/python3.10/site-packages/torch/cuda/__init__.py:1007: UserWarning: Can't initialize NVML
   raw_cnt = _raw_device_count_nvml()
-/lus/lfs1aip2/scratch/u6ex/as1748.u6ex/miniforge3/envs/arrwm/lib/python3.10/site-packages/torch/cuda/__init__.py:1007: UserWarning: Can't initialize NVML
+<REPO>/miniforge3/envs/arrwm/lib/python3.10/site-packages/torch/cuda/__init__.py:1007: UserWarning: Can't initialize NVML
   raw_cnt = _raw_device_count_nvml()
 # Release self-check on the HPC cluster, CPU-only node
 # 2026-08-01T05:36:10.134563Z

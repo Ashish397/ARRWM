@@ -65,7 +65,6 @@ else:
 
 print(f'Free VRAM {get_cuda_free_memory_gb(device)} GB')
 low_memory = get_cuda_free_memory_gb(device) < 40
-low_memory = True
 
 torch.set_grad_enabled(False)
 

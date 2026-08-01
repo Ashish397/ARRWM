@@ -1,7 +1,7 @@
 ============================= test session starts ==============================
-platform linux -- Python 3.10.19, pytest-9.0.0, pluggy-1.6.0 -- /home/ashish/miniconda3/envs/flash/bin/python
+platform linux -- Python 3.10.19, pytest-9.0.0, pluggy-1.6.0 -- <HOME>/miniconda3/envs/flash/bin/python
 cachedir: .pytest_cache
-rootdir: /home/ashish/ARRWM/code_release
+rootdir: <HOME>/ARRWM/code_release
 plugins: anyio-4.11.0
 collecting ... collected 41 items
 

@@ -7,19 +7,17 @@ This codebase is a derivative work. The lineage, in order:
 | Repository scaffolding, training loop shape, config family | **LongLive** — NVlabs, [arXiv:2509.22622](https://arxiv.org/abs/2509.22622), <https://github.com/NVlabs/LongLive> | Files carrying the `# Adopted from` header descend from here. |
 | Causal/self-forcing training formulation, `train.py`, `utils/wan_wrapper.py`, `utils/dataset.py`, `wan/modules/causal_model.py` | **Self-Forcing** — <https://github.com/guandeh17/Self-Forcing> | Source of the `CC-BY-NC-SA-4.0` licence and the `SPDX-License-Identifier` headers retained in those files. |
 | Base video diffusion model, all of `wan/` | **Wan2.1** — Alibaba Wan Team, <https://github.com/Wan-Video/Wan2.1> | Near-verbatim; `Copyright 2024-2025 The Alibaba Wan Team Authors` headers retained. Model: `Wan2.1-T2V-1.3B`. |
-| Flow-matching solvers (`wan/utils/fm_solvers*.py`) | HuggingFace **diffusers** v0.31.0 | Marked `Copied from` in-file. |
 | GPU memory helpers (`utils/memory.py`) | **FramePack** — <https://github.com/lllyasviel/FramePack> | |
 | Distribution-matching distillation lineage | **CausVid** | Cited, not vendored. |
 | Frozen point tracker (motion teacher) | **CoTracker3** — <https://github.com/facebookresearch/co-tracker> | Fetched at runtime via `torch.hub`; not vendored. |
 | Generative-artifact segmenter (one quality instrument) | **PAL4VST** | Not vendored; clone upstream. |
-| Pairwise 3-D reconstruction (evaluated, **rejected** as a metric) | **DUSt3R** | Retained in `analysis/testbench_v2/dust3r_metrics.py` for completeness. |
 | Dataset | **FrodoBots-2K** | Public; cited in the paper. Not redistributed. |
 
 ## What is new in this work
 
 - The data-derived action space: grid point-tracking → 200-D per-chunk
-  displacement → PCA egomotion basis (`action_query/pca_motion.py`), with the
-  frozen basis in `action_query/checkpoints/ss_vae_8free.pt`.
+  displacement → PCA egomotion basis (`preprocessing/fit_pca_basis.py`), with the
+  frozen basis in `preprocessing/checkpoints/pca_basis.pt`.
 - Action conditioning of the causal backbone via AdaLN-zero and action tokens
   (`model/action_modulation.py`, `model/action_model_patch.py`).
 - The latent egomotion critic and its generator guidance
@@ -28,13 +26,14 @@ This codebase is a derivative work. The lineage, in order:
 - Teacher-forced multi-chunk decomposition and the chunk-at-a-time
   autoregressive rollout (`utils/causal_chain_rollout.py`,
   `model/causal_teacher_streaming.py`).
-- The cross-model evaluation protocol and its metrics (`utils/inject_eval.py`,
-  `utils/ndof_following.py`, `utils/headtohead_extract.py`,
-  `analysis/testbench_v2/`).
+- The cross-model evaluation protocol and its metrics
+  (`evaluation/inject_eval.py`, `evaluation/ndof_following.py`,
+  `evaluation/headtohead_extract.py`, and the instruments in
+  `evaluation/quality/`).
 
 ## Licence
 
-`LICENSE.md` — Creative Commons **Attribution-NonCommercial-ShareAlike 4.0
+`LICENSE` — Creative Commons **Attribution-NonCommercial-ShareAlike 4.0
 International**, inherited from Self-Forcing/LongLive. Share-alike applies:
 derivative works must carry the same licence and attribution. Wan2.1 and the
 other upstream components remain under their own licences.

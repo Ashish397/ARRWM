@@ -1,3 +1,4 @@
+import os
 """Paper figure: top-8 PCA components of the 10x10 CoTracker flow grid as
 quiver fields, one panel per component, labelled with each component's
 explained-variance share (from analysis/pca_evr.npy, measured on 300 rides /
@@ -8,7 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-CK = "action_query/checkpoints/ss_vae_8free.pt"
+CK = os.environ.get("PCA_BASIS", "preprocessing/checkpoints/pca_basis.pt")
 GX = GY = 10
 
 

@@ -44,7 +44,8 @@ for sc in range(32):
     p=paths("pca8",sc)
     if p: fr,_=readv(p[0]); refs[sc]=lab(fr[8],"REFERENCE")
 out=open("noop_vlm_results.csv","a")
-if os.path.getsize("noop_vlm_results.csv") if os.path.exists("noop_vlm_results.csv") else 0==0: out.write("model,scene,p_style,p_imp\n")
+if out.tell() == 0:
+    out.write("model,scene,p_style,p_imp\n")
 done=set()
 if os.path.exists("noop_vlm_results.csv"):
     for l in open("noop_vlm_results.csv"):

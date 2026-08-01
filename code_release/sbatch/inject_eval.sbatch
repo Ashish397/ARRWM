@@ -5,8 +5,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --time=03:00:00
-#SBATCH --output=${AF_ROOT}/logs/%x_%j.out
-#SBATCH --error=${AF_ROOT}/logs/%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 set -e -o pipefail
 cd ${AF_ROOT}
 source ${CONDA_ROOT}/bin/activate; conda activate arrwm

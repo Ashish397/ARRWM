@@ -7,8 +7,8 @@
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
 #SBATCH --requeue
-#SBATCH --output=${AF_ROOT}/logs/%x_%j.out
-#SBATCH --error=${AF_ROOT}/logs/%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 # =====================================================================
 # v14e: VAE OFF -> RAW top-8 PCA actions (pca_0=throttle, pca_1=steer).
@@ -27,7 +27,7 @@ WANDB_SAVE_DIR=wandb
 source ${CONDA_ROOT}/bin/activate
 conda activate arrwm
 
-CACHE_DIR='${HF_HOME}'
+CACHE_DIR="${HF_HOME:?set HF_HOME to a writable HuggingFace cache}"
 export HF_HOME=$CACHE_DIR
 export HF_HUB_CACHE=$CACHE_DIR
 export HUGGINGFACE_HUB_CACHE=$CACHE_DIR

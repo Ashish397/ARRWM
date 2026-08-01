@@ -13,8 +13,5 @@ wandb/
 # repository or a global gitignore silently dropping them.
 !preprocessing/checkpoints/
 !preprocessing/checkpoints/pca_basis.pt
-!analysis/
-!analysis/testbench_v2/labels/
-!analysis/testbench_v2/labels/*.csv
-!paper_assets/
-!paper_assets/*.json
+!assets/
+!assets/*.json

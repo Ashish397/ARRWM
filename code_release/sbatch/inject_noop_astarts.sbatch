@@ -5,8 +5,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --time=03:00:00
-#SBATCH --output=${AF_ROOT}/logs/%x_%j.out
-#SBATCH --error=${AF_ROOT}/logs/%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 # No-op (static command) rollouts from the 32 PHASE-A starts. Same
 # inject_eval machinery as phase B, but IE_WINDOWS=phaseA_windows.json;
 # 1 node / 4 shards (only 32 gens per run).

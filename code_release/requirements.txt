@@ -28,6 +28,11 @@ ftfy
 regex
 sentencepiece
 
+# --- captioning + ride metadata (preprocessing/ride_level_caption.py) ---
+geopy                 # reverse-geocodes ride GPS into the caption
+pytz                  # ride-local timestamps
+PyYAML                # caption prompt/config files
+
 # --- analysis and figures ---
 pandas
 scipy
@@ -35,10 +40,11 @@ matplotlib
 tqdm
 
 # --- reference-free evaluation metrics ---
+lpips                 # perceptual distance, stationary reference metrics
+scikit-image          # SSIM, stationary reference metrics
+timm                  # DINO backbones for the drift instruments
 pyiqa                 # MUSIQ / NIQE image-quality scores
 open_clip_torch       # CLIP embeddings for the style-shift axes
-ruptures              # change-point detection on the style timeline
-ultralytics           # object detection for the scene-content features
 datasets              # HuggingFace loader used by the caption pipeline
 
 # --- optional ---

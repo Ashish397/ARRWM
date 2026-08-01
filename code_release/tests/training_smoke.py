@@ -5,8 +5,13 @@ The unit tests pin components; this pins the whole pipeline — data loading,
 action encoding, the LoRA-adapted DiT, the critic, and the optimiser step —
 against recorded per-step losses. Run it before a batch of edits and after.
 
-    python tests/training_smoke.py --save     # record the reference
-    python tests/training_smoke.py --check    # assert nothing moved
+    python tests/training_smoke.py --config configs/<cfg>.yaml \
+        --logdir logs/smoke --save     # record the reference
+    python tests/training_smoke.py --config configs/<cfg>.yaml \
+        --logdir logs/smoke --check    # assert nothing moved
+
+The reference is machine-specific: it records real losses, so a golden
+recorded on other hardware will not match. Record it where you check it.
 
 The config is deliberately reduced (9 frames, LoRA rank 32, small critic) so it
 fits one 32 GB card; the paper's own config needs 4x GH200 and OOMs here. That

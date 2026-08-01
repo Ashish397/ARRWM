@@ -17,7 +17,7 @@ the separate no-op evaluation.
 
 | instrument | what it scores |
 |---|---|
-| `fleet_scene_scan`, `blind_scene_reloc`, `blind_scene_features` | scene relocation: ORB + RANSAC place identity |
+| `scene_consensus`, `blind_scene_reloc`, `blind_scene_features` | scene relocation: ORB + RANSAC place identity |
 | `blind_style_shift`, `style_shift` | style shift: VGG Gram + CLIP against a real reference |
 | `fleet_hf` | high-frequency degradation: Laplacian sharpness loss |
 | `conjure_*`, `fleet_novelty`, `blind_temporal_novelty` | conjuration — objects appearing from nothing. Called "novelty" in the earlier naming; same axis. |
@@ -37,7 +37,7 @@ environment:
 export AF_FLEET_DIR=/path/to/grids          # holds grids_A/ and baselines/
 export AF_TILES_DIR=/path/to/tiles          # de-tiled ours-variant rollouts
 export AF_BLIND_DIR=/path/to/blind100       # human-labelled subset
-python fleet_scene_scan.py                  # AF_SCENES=r00_B,r00_F limits the run
+python scene_consensus.py                   # AF_SCENES=r00_B,r00_F limits the run
 ```
 
 `pytest tests/test_eval_pipeline.py` checks the resolvers find their data and
