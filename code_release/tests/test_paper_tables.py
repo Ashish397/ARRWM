@@ -144,3 +144,37 @@ def test_control_failure_matches_the_paper(active):
                 failed += 1
         got = round(100 * failed / max(total, 1))
         assert got == want, f"control fail {model}: recomputed {got}%, paper says {want}%"
+
+
+def test_style_shift_matches_the_paper(active):
+    """Style shift % = fraction with dino_drift > 0.72, over the active population.
+
+    DINOv2 embedding drift between the real conditioning frames and the last
+    generated frames up to the six-second horizon, so a rollout that drifts into
+    a different visual register scores high while one that merely changes
+    lighting does not.
+
+    The cut is 0.72 exactly: 0.7195 and 0.7205 each reproduce only seven of the
+    eight published figures, so this is the deployed threshold rather than a
+    value fitted to the table.
+    """
+    published = {"worldplay": 16, "matrixgame": 62, "worldcam": 62, "astra": 13,
+                 "yume": 5, "minwm": 4, "pca8": 3, "16node": 3}
+    joined = _csv("fleet_style_6s.csv").merge(active, on=["m", "scene"])
+    for model, want in published.items():
+        rows = joined[joined.m == model]
+        assert len(rows), f"{model}: no rows in the active population"
+        got = round(100 * (rows.dino_drift > 0.72).mean())
+        assert got == want, f"style {model}: recomputed {got}%, paper says {want}%"
+
+
+def test_active_population_matches_the_published_denominators():
+    """The per-model active counts are themselves a reported table."""
+    published = {"worldplay": 238, "matrixgame": 240, "worldcam": 216, "astra": 215,
+                 "yume": 237, "minwm": 187, "pca8": 239, "pca4": 237, "pca2": 232,
+                 "16node": 237, "4node": 236, "noatok": 229, "noadaln": 200}
+    mask = _csv("canonical_static_mask.csv")
+    counts = mask[(mask.feature_valid == True) & (mask.active == 1)].groupby("m").size()  # noqa: E712
+    for model, want in published.items():
+        assert counts.get(model) == want, (
+            f"active population {model}: {counts.get(model)}, paper says {want}")
