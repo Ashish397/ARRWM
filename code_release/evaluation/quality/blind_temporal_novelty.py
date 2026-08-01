@@ -1,6 +1,7 @@
 """Multi-VLM validation of the NEW frame-to-frame confabulation probe on blind100.
 
-Same temporal metric as fleet_novelty (does a new object POP into frame B vs A), run
+Same temporal metric as the deployed pop-in detector (does a new object POP into
+frame B vs A), run
 across Qwen3-VL-8B / Cosmos-Reason1-7B / InternVL3-8B so the Qwen3-VL choice for the
 confab axis is justified (the earlier 3-VLM bakeoff validated the OLD cumulative p_novel,
 not this one). Per rollout: novel_sudden = max frame-to-frame spike.

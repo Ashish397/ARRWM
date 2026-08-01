@@ -21,7 +21,8 @@ import popin_backends as B
 import fleet_common as fc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUTD = os.path.join(HERE, "out", "popin_fleet_all")
+# AF_POPIN_OUT keeps a new ablation out of the shipped reference artefact.
+OUTD = os.environ.get("AF_POPIN_OUT", os.path.join(HERE, "out", "popin_fleet_all"))
 
 
 def arg(name, default):
@@ -36,7 +37,10 @@ def load(scene, model, span):
     fps = float(rd.get_meta_data().get("fps", 16) or 16)
     ctx = fc.ctx_of(model)
     need = ctx + int(round(span * fps))
-    tile = fc.POS[model[len("ours_"):]] if model.startswith("ours_") else None
+    # Variants rendered after the grid was built ship as standalone tiles and
+    # are already cropped, so they need no de-tiling window.
+    variant = model[len("ours_"):] if model.startswith("ours_") else None
+    tile = fc.POS.get(variant) if variant else None
     frames = []
     for i, f in enumerate(rd.iter_data()):
         if i > need:
@@ -81,6 +85,11 @@ def main():
     P.set_detector(crop)
 
     idx = fc.fleet_index()
+    # AF_POPIN_MODELS scores a subset, so a new ablation does not put the whole
+    # fleet back through the detector.
+    _only = {m.strip() for m in os.environ.get("AF_POPIN_MODELS", "").split(",") if m.strip()}
+    if _only:
+        idx = [(s, m) for s, m in idx if m in _only or m.replace("ours_", "") in _only]
     if limit:
         idx = idx[:limit]
     csv_path = os.path.join(OUTD, "popin_fleet_all.csv")

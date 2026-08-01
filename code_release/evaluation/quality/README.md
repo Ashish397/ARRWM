@@ -17,16 +17,43 @@ the separate no-op evaluation.
 
 | instrument | what it scores |
 |---|---|
-| `fleet_scene_scan`, `blind_scene_reloc`, `blind_scene_features` | scene relocation: ORB + RANSAC place identity |
-| `blind_style_shift`, `style_shift` | style shift: VGG Gram + CLIP against a real reference |
-| `fleet_hf` | high-frequency degradation: Laplacian sharpness loss |
-| `conjure_*`, `fleet_novelty`, `blind_temporal_novelty` | conjuration — objects appearing from nothing. Called "novelty" in the earlier naming; same axis. |
-| `blind_vlm_probes`, `vlm_external`, `blind_plausibility` | geometric corruption, the deployed Qwen3-VL probe |
+| `vlm_external` | geometric corruption, the deployed Qwen3-VL probe: `p_uncanny > 0.5` |
+| `scene_consensus` | scene relocation: sibling-consensus ORB/RANSAC place identity, `consensus_inl < 50` |
+| `fleet_style_6s` | style shift: DINOv2 drift to the six-second horizon, `dino_drift > 0.72` |
+| `fleet_hf` | high-frequency degradation: sibling-relative sharpness loss, `B > 150` |
+| `popin_fleet_all` (+ `popin_detect`, `popin_backends`) | conjuration: objects with no history that persist to the end |
+| `fleet_static_inl` | the near-static mask defining the active population |
+| `fleet_common` | fleet resolver shared by all of the above |
+
+Validation, against the 100-rollout human-labelled subset. These produce the
+appendix AUC table and the `*_validation_*` figures, not the main columns:
+
+| instrument | what it validates |
+|---|---|
+| `blind_vlm_probes`, `blind_plausibility`, `fleet_reel_vlms` | the geometry probe across Qwen3-VL, InternVL3 and Cosmos |
+| `blind_style_shift`, `style_shift` | style shift |
+| `blind_scene_reloc`, `blind_scene_features` | relocation, and the ORB / SIFT / AKAZE choice |
+| `blind_dino_drift` | DINOv2 drift as a relocation competitor |
 | `blind_melt`, `melt_vlm_bench`, `melt_auc_table` | the melt probe: evaluated, reported, not deployed |
 | `fleet_pal`, `pal_local` | PAL4VST artifact fraction: evaluated, reported, not deployed |
-| `fleet_dino`, `blind_dino_drift` | DINOv2 cosine drift, a relocation competitor |
-| `blind_adjudicate`, `blind_cpu_metrics` | the instrument bake-off behind the validation appendix |
-| `stationary_*`, `noop_*` | the no-op evaluation and its camera-drift wedges |
+| `blind_temporal_novelty` | the conjuration probe across three VLMs |
+| `blind_adjudicate`, `blind_cpu_metrics` | the competitor panels behind instrument selection |
+| `hf_distribution`, `hf_fleet_distribution` | the HF ridgeline figures |
+| `blind100_common` | shared loader for the blind set |
+
+The no-op evaluation:
+
+| instrument | what it scores |
+|---|---|
+| `noop_cpu`, `noop_vlm` | the stationary quality axes |
+| `stationary_cotracker`, `stationary_signs`, `stationary_freeze` | camera drift and residual scene animation under a no-op |
+| `stationary_wedges` | the no-op camera-drift wedge figure |
+
+Superseded instruments have been removed rather than kept alongside: the earlier
+conjuration probe and its detector bake-off (replaced by pop-in with RT-DETR),
+`fleet_dino` (replaced by `fleet_style_6s`, whose window is capped to the
+six-second horizon) and `fleet_novelty` (replaced by pop-in). Keeping two
+generations of the same axis is how the wrong one gets used.
 
 ## Running
 

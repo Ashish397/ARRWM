@@ -23,13 +23,11 @@ SCRIPTS = sorted(p for p in QUALITY.glob("*.py") if p.name != "__init__.py")
 
 # Import pulls a detector or VLM onto the GPU in these; skip unless asked.
 NEEDS_GPU = {"popin_detect.py", "popin_backends.py", "popin_fleet_all.py",
-             "conjure_probe.py", "conjure_detectors.py", "conjure_contact.py",
-             "fleet_pal.py", "pal_local.py", "fleet_dino.py", "melt_vlm_bench.py",
+             "fleet_pal.py", "pal_local.py", "melt_vlm_bench.py",
              "blind_melt.py", "blind_vlm_probes.py", "blind_plausibility.py",
              "blind_temporal_novelty.py", "blind_dino_drift.py", "vlm_external.py",
              "fleet_reel_vlms.py", "style_shift.py", "blind_style_shift.py",
-             "fleet_novelty.py", "noop_vlm.py", "stationary_cotracker.py",
-             "fleet_cotracker.py"}
+             "noop_vlm.py", "stationary_cotracker.py"}
 
 
 @pytest.mark.parametrize("path", SCRIPTS, ids=[p.name for p in SCRIPTS])
