@@ -64,7 +64,7 @@ environment:
 export AF_FLEET_DIR=/path/to/grids          # holds grids_A/ and baselines/
 export AF_TILES_DIR=/path/to/tiles          # de-tiled ours-variant rollouts
 export AF_BLIND_DIR=/path/to/blind100       # human-labelled subset
-python fleet_scene_scan.py                  # AF_SCENES=r00_B,r00_F limits the run
+python scene_consensus.py fleet             # relocation over the full fleet
 ```
 
 `pytest tests/test_eval_pipeline.py` checks the resolvers find their data and

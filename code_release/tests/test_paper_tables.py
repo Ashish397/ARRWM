@@ -24,9 +24,13 @@ ALIAS = {"ours_pca8": "pca8", "ours_16node": "16node", "ours_4node": "4node",
 
 
 def _csv(name):
+    """Load a shipped artefact. Absence is a failure, not a skip: these files are
+    part of the release, so a missing one means the release is broken rather than
+    the environment being incomplete."""
     path = QUALITY / name
     if not path.exists():
-        pytest.skip(f"{name} not shipped")
+        path = QUALITY / "reference" / name
+    assert path.exists(), f"{name} missing from the release"
     df = pd.read_csv(path)
     if "model" in df:
         df["m"] = df.model.replace(ALIAS)
@@ -113,12 +117,10 @@ def test_control_failure_matches_the_paper(active):
     commands = {"F": (s, 0), "B": (-s, 0), "R": (0, s), "L": (0, -s),
                 "FR": (r, r), "FL": (r, -r), "BR": (-r, r), "BL": (-r, -r)}
 
-    import os
-    hh = os.environ.get("AF_HEADTOHEAD_DIR",
-                        str(QUALITY.parent.parent.parent / "grids" / "eval" / "headtohead"))
-    motion_files = sorted(glob.glob(os.path.join(hh, "headtohead_*.csv")))
-    if not motion_files:
-        pytest.skip("head-to-head motion readouts not present")
+    # The readouts ship with the release; reading them from anywhere else would
+    # pin this column against a file no reviewer receives.
+    motion_files = sorted(glob.glob(str(QUALITY / "reference" / "headtohead_*.csv")))
+    assert motion_files, "head-to-head readouts missing from evaluation/quality/reference/"
     motion = pd.concat([pd.read_csv(f) for f in motion_files], ignore_index=True)
 
     mask = _csv("canonical_static_mask.csv")
@@ -190,8 +192,7 @@ def test_active_population_matches_the_published_denominators():
 
 def _reference(name):
     path = QUALITY / "reference" / name
-    if not path.exists():
-        pytest.skip(f"{name} not shipped")
+    assert path.exists(), f"reference/{name} missing from the release"
     df = pd.read_csv(path)
     df["m"] = df.model.replace(ALIAS)
     return df
@@ -258,8 +259,7 @@ def test_overall_legitimacy_matches_the_paper():
     published = {"worldplay": 7, "matrixgame": 3, "worldcam": 4, "astra": 21,
                  "yume": 36, "minwm": 59, "pca8": 73, "16node": 64}
     ref = QUALITY / "reference"
-    if not (ref / "popin_fleet_all.csv").exists():
-        pytest.skip("reference artefacts not shipped")
+    assert (ref / "popin_fleet_all.csv").exists(), "reference artefacts missing"
 
     mask = _reference("canonical_static_mask.csv")
     feature_valid = {(m, s) for m, s, v in zip(mask.m, mask.scene, mask.feature_valid) if v}

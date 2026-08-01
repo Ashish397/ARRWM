@@ -19,3 +19,5 @@ wandb/
 !paper_assets/
 !paper_assets/*.json
 evaluation/quality/out/
+.pytest_cache/
+logs/

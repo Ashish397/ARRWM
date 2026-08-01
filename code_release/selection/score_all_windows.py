@@ -15,8 +15,9 @@ Sharding: ride i handled by rank (i % WORLD). GPU = SLURM_LOCALID.
 """
 import os
 import sys, os, json, argparse
-sys.path.insert(0, '${AF_ROOT}')
-os.chdir('${AF_ROOT}')
+_ROOT = os.environ.get("AF_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _ROOT)
+os.chdir(_ROOT)
 import numpy as np
 import torch
 from utils.zarr_dataset import ZarrRideDataset

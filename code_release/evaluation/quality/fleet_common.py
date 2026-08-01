@@ -18,8 +18,10 @@ GRID_DIR = os.path.join(FLEET_DIR, "grids_A", "A")
 BASE_DIR = os.path.join(FLEET_DIR, "baselines")
 
 # Scene/model index: the coverage every instrument iterates over.
+# The artefacts of record live in reference/; that is the single copy, so the
+# index and the tests cannot drift apart.
 LABELS_VLM = os.environ.get(
-    "AF_FLEET_INDEX", os.path.join(HERE, "results_external_vlm.csv")
+    "AF_FLEET_INDEX", os.path.join(HERE, "reference", "results_external_vlm.csv")
 )
 
 # Ablations rendered after the grid was built live as standalone per-scene files
