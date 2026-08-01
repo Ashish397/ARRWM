@@ -12,8 +12,10 @@ Writes:
 """
 import os
 import sys, os, json, argparse
-sys.path.insert(0, '${AF_ROOT}')
-os.chdir('${AF_ROOT}')
+# Run from the release root so the relative asset paths below resolve.
+_ROOT = os.environ.get("AF_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+os.chdir(_ROOT)
 import numpy as np
 import torch; torch.set_num_threads(4)
 from utils.zarr_dataset import ZarrRideDataset
