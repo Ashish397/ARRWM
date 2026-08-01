@@ -1,0 +1,25 @@
+Running the shipped zip from a clean directory
+==============================================
+Extracted code_release.zip to /scratch/.../_zipcheck and ran everything from
+THERE, not from the repo, so a file the zip omits is genuinely absent and a path
+that resolved by accident no longer does. One GH200, env per the README.
+
+  pytest tests                        PASS   63 passed, 25 skipped
+  figures/wedge_plots.py              PASS   all wedge PNGs regenerated
+  figures/response_curves_eval.py     PASS   both response curves regenerated
+  preprocessing/build_rides_csv.py    PASS   1272 rides indexed from raw video
+  preprocessing/pre_encode_direct.py  PASS   ride -> 90 latents (9,16,60,104) fp16
+  train.py                            RUNS   reached step 90, loss 0.086 / flow 0.065,
+                                             wrote causal_lora_step0000001.pt and ran
+                                             control_test. Cut off by the harness's own
+                                             25-minute timeout, not by any fault.
+
+Found and fixed by this run: both selection/ scripts torch.load a ride manifest
+whose default path was one this project happened to use, so running either
+without --manifest gave a bare FileNotFoundError naming a meaningless directory.
+They now explain what the file is and how to obtain one.
+
+Known and accepted, re-confirmed here:
+  - inference.py does not run from any shipped config (README, Known limitations)
+  - evaluation/quality/* need rollout videos, which are too large to ship
+    (evaluation/quality/README.md documents AF_FLEET_DIR)

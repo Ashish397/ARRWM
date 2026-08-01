@@ -22,3 +22,17 @@ preprocessing/pre_encode_direct.py             PASS
 
 === 4. training starts from the extracted tree ===
 (reusing a prebuilt ride manifest; a cold run rescans for ~30 min)
+train.py, a few steps                          FAIL (rc=124)
+      2026-08-01 11:41:06,887 | INFO |   z_actions [567:591]: encode 8 chunks (24 latents) | motion_load=0.003s  encode=0.000s  total=0.004s
+      2026-08-01 11:41:17,330 | INFO | step 90 | loss 0.086434 | flow 0.065317
+      2026-08-01 11:41:17,332 | INFO | Refilled 1 slot(s): slots=[20240430114001.zarr[w=0/1,off=1197]]
+      2026-08-01 11:41:17,357 | INFO |   z_actions [1197:1221]: encode 8 chunks (24 latents) | motion_load=0.003s  encode=0.000s  total=0.003s
+      2026-08-01 11:41:27,963 | INFO | Refilled 1 slot(s): slots=[20240313081146.zarr[w=0/1,off=1428]]
+      2026-08-01 11:41:28,083 | INFO |   z_actions [1428:1452]: encode 8 chunks (24 latents) | motion_load=0.003s  encode=0.000s  total=0.003s
+
+======================================================
+  5 passed, 2 failed
+  see failures above
+======================================================
+srun: error: nid010599: task 0: Exited with exit code 2
+srun: Terminating StepId=5859780.0
