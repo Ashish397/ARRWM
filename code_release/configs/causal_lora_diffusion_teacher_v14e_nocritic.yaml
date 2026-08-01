@@ -1,5 +1,5 @@
-config_name: v14e-pca8-raw
-load_checkpoint_config_name: v14e-pca8-raw
+config_name: v14e-nocritic
+load_checkpoint_config_name: v14e-nocritic
 
 trainer: causal_lora_diffusion
 
@@ -8,13 +8,13 @@ mixed_precision: true
 autocast_dtype: bf16
 max_iters: 30000          # MATCH v14 so the cosine LR schedule is identical (near-flat through the useful region); stop early at the visual sweet spot via the step-50 ckpts
 log_interval: 10
-ckpt_interval: 100        # save every 100 steps
+ckpt_interval: 500        # save every 500 steps
 max_grad_norm: 1.0
 auto_resume: true
 allow_checkpoint_config_mismatch: true
 wandb_entity: YOUR_WANDB_ENTITY
 wandb_project: frodobots_wm
-wandb_run_name: v14e-pca8-raw
+wandb_run_name: v14e-nocritic
 wandb_group: causal-lora-teacher
 wandb_tags:
   - causal
@@ -122,7 +122,14 @@ action_critic_enabled: true
 action_critic_dims: [0, 1, 2, 3, 4, 5, 6, 7]   # <-- critic uses all 8 dims
 action_critic_z_out_dim: 8
 action_critic_z_loss_weight: 0.5
-generator_action_z_guidance_weight: 0.3    # z2/z7 guidance (critic8 was 0.25)
+generator_action_z_guidance_weight: 0.0    # ABLATION: critic guidance OFF.
+                                           # The critic still trains, so its
+                                           # read-back stays available as a
+                                           # diagnostic; only its gradient
+                                           # contribution to the generator is
+                                           # removed. Isolates how much of the
+                                           # action grounding comes from
+                                           # guidance rather than conditioning.
 action_critic_extra_dim_weight: 0.3333     # scene-dim ratio (critic8 default 0.5); scene dims = 0.3 x 0.3333 = 0.1 absolute (3:1)
 z_guidance_warmup_steps: 50    # guidance RAMP length
 critic_lr: 2.12e-04
@@ -146,7 +153,7 @@ state_guidance_warmup_steps: 200
 state_guidance_action_scale: 1.0
 
 # Logging
-
+logdir: ${oc.env:AF_ROOT}/logs/v14e_nocritic
 
 # =========================================================================
 # v14e = v14d recipe, but VAE OFF -> raw top-8 PCA actions (pca_0=throttle,
@@ -176,4 +183,4 @@ eval_interval: 25
 # Encoder-glitch loss mask + deterministic data order; 5000 optimiser steps.
 glitch_mask_period: 151
 fixed_shuffle: true
-stop_at_step: 120
+stop_at_step: 5000

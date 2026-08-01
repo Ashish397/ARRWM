@@ -1,0 +1,7 @@
+..............ssss.......................                                [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_eval_pipeline.py:42: rollout videos not present (set AF_FLEET_DIR); looked in /lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/code_release/grids
+SKIPPED [1] tests/test_eval_pipeline.py:50: rollout videos not present (set AF_FLEET_DIR); looked in /lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/code_release/grids
+SKIPPED [1] tests/test_eval_pipeline.py:56: rollout videos not present (set AF_FLEET_DIR); looked in /lus/lfs1aip2/scratch/u6ex/as1748.u6ex/ARRWM/code_release/grids
+SKIPPED [1] tests/test_eval_pipeline.py:78: threshold file not present
+37 passed, 4 skipped in 12.15s

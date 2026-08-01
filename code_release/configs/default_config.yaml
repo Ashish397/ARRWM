@@ -15,7 +15,7 @@ causal: true
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
 prompt_path: prompts/MovieGenVideoBench.txt
-wan_model_path: ${oc.env:DATA_ROOT}
+wan_model_path: ${oc.env:WAN_MODELS}   # pretrained Wan checkpoints (not the dataset)
 eval_first_n: 64
 num_samples: 1
 height: 480

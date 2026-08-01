@@ -571,11 +571,18 @@ class CausalLoRADiffusionTrainer:
             with open(win_manifest) as _f:
                 _wm = _json.load(_f)
             _windows = _wm["windows"] if isinstance(_wm, dict) else _wm
+            # The shipped manifest stores machine-independent paths of the form
+            # "${DATA_ROOT}/frodobots_encoded_.../<ride>.zarr". JSON does not
+            # expand those, so do it here; already-absolute paths pass through
+            # unchanged. Match on basename as a fallback so a manifest written
+            # against a different root still resolves.
             _by_path = {r["zarr_path"]: r for r in train_rides}
+            _by_name = {_P(r["zarr_path"]).name: r for r in train_rides}
             _expanded = []
             _skipped = 0
             for _w in _windows:
-                _base = _by_path.get(_w["zarr_path"])
+                _zp = os.path.expandvars(_w["zarr_path"])
+                _base = _by_path.get(_zp) or _by_name.get(_P(_zp).name)
                 if _base is None:
                     _skipped += 1
                     continue

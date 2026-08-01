@@ -1,0 +1,17 @@
+# Release gate: leaks, label-map regression, orphaned figure inputs, integrity
+# 2026-08-01T05:32:48Z
+
+code_release: 87 .py files, 87 modules
+
+MISSING paper-figure generators (see D43):
+    conjuring_validation.png               <- conjuration_fleet_reels.py
+    geometry_validation_fleet_*.png        <- geom_fleet_reels.py
+    hf_validation_internal.png             <- hf_ablation_reels.py
+    scene_validation_fleet_*.png           <- scene_fleet_reels.py
+    stationary numbers                     <- stationary_refmetrics.py
+    style_validation_fleet_*.png           <- style_fleet_reels.py
+
+WARN     6/9 paper figures have no generator in the release
+WARN     7 __pycache__ dirs present
+
+exit=0
