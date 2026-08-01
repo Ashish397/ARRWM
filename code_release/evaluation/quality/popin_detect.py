@@ -8,6 +8,7 @@ those detections into tracks and interrogates each track. The core problem is th
 object appeared" is not the same as "an object popped into existence": in driving footage new
 objects appear constantly and legitimately. They drive in from the side of the frame, they
 approach from the distance until they cross the detector's resolution limit, and they emerge
+import os
 from behind occluders. All three are ruled out explicitly.
 
 CANDIDATE GATES (cheap, from the tracks alone)
@@ -407,7 +408,8 @@ def arg(name, default):
 
 def main():
     tag = arg("--tag", "minwm")
-    vdir = arg("--dir", "/home/ashish/stationary_evaluation")
+    vdir = arg("--dir", os.environ.get("AF_STATIONARY_DIR",
+                                       os.path.expanduser("~/stationary_evaluation")))
     ctx = int(arg("--ctx", CTX))
     cache = json.load(open(os.path.join(OUTD, f"popin_dets_{tag}.json")))
     rows, flagged, panels = {}, set(), []
