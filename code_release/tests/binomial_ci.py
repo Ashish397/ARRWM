@@ -11,7 +11,10 @@ Q = Path(__file__).resolve().parents[1] / "evaluation" / "quality"
 ALIAS = {"ours_pca8":"pca8","ours_16node":"16node","ours_4node":"4node","ours_pca4":"pca4",
          "ours_pca2":"pca2","ours_noadaln":"noadaln","ours_noatok":"noatok"}
 def csv(n):
-    d = pd.read_csv(Q/n)
+    p = Q/n
+    if not p.exists():
+        p = Q/"reference"/n   # reference artefacts were moved into their own dir
+    d = pd.read_csv(p)
     if "model" in d: d["m"] = d.model.replace(ALIAS)
     return d
 def wilson(k,n,z=1.96):
