@@ -54,12 +54,12 @@ eval_ride_zarrs:
   - 20240319133048.zarr  # Stockholm, 1752 latents
   - 20240314090046.zarr  # Rome,   3895 latents
 
-# Data -- v14d FIX: NATURAL motion distribution (uniform tiling start%21==0, NO
-# motion floor) on weunz + the SAME backward oversampler. 60k forward windows,
-# motion median 0.486, ~38% STATIONARY/slow windows (vs v14c's 0% — that 0% is
-# why v14c/v14b always rolled forward on a stop command). Same scale/structure
-# as v14c (60k fwd + 632 bwd x6 = 63792); ONLY change vs v14c = swap the
-# high-motion-curated forward pool for the natural one (= v14's threshold).
+# Data. The training pool uses the NATURAL motion distribution: uniform window
+# tiling with no motion floor, so ~38% of windows are stationary or slow
+# (median motion 0.486). This matters -- a pool with no stationary windows
+# produces a model that rolls forward on a stop command, because it never saw
+# a stationary segment. 60k forward windows plus 632 distinct backward windows
+# oversampled 6x = 63,792 total.
 encoded_root: ${oc.env:DATA_ROOT}/frodobots_encoded_weunz
 train_window_manifest: assets/train_windows.json
 caption_root: ${oc.env:DATA_ROOT}/frodobots_captions/train
@@ -104,13 +104,8 @@ model_kwargs:
   sink_size: 0
 
 # =========================================================================
-# v14d = v14c VERBATIM except the training-data motion distribution. v14c trained
-# on high-motion-curated windows (motion_min 0.3 => 0% stationary), which is why
-# it (and v14b) always rolled forward / railed throttle on a stop command — the
-# model never saw a stationary segment. v14d swaps in the NATURAL distribution
-# (uniform tiling, no motion floor, ~38% stationary) + the same backward
-# oversampler. Everything else is identical to v14c: critic8 mechanism (probe
-# OFF, 8-dim critic, guidance 0.30/3:1), weunz, lr 7e-5, max_iters 30000.
+# The action critic supervises all 8 PCA dimensions with the state probe off;
+# guidance weight 0.30 on the two controllable axes against 1.0 elsewhere.
 # In-training eval is re-enabled (watchdog-guarded) — no separate eval scripts.
 # NOTE: the logged train/critic_z2_mse,z7_mse use action_critic_dims[0],[1]
 # (= dims 0,1 here, mislabeled) — the comparison uses the external swap/quality
@@ -122,8 +117,10 @@ action_critic_enabled: true
 action_critic_dims: [0, 1, 2, 3]
 action_critic_z_out_dim: 4
 action_critic_z_loss_weight: 0.5
-generator_action_z_guidance_weight: 0.3    # z2/z7 guidance (critic8 was 0.25)
-action_critic_extra_dim_weight: 0.3333     # scene-dim ratio (critic8 default 0.5); scene dims = 0.3 x 0.3333 = 0.1 absolute (3:1)
+generator_action_z_guidance_weight: 0.3    # guidance on PC0/PC1 (throttle, steer)
+action_critic_extra_dim_weight: 0.3333     # the 6 non-controllable dims get
+                                           # 0.3 x 0.3333 = 0.1 absolute, a 3:1
+                                           # ratio against PC0/PC1
 z_guidance_warmup_steps: 50    # guidance RAMP length
 critic_lr: 2.12e-04
 critic_updates_per_step: 2
@@ -149,7 +146,7 @@ state_guidance_action_scale: 1.0
 logdir: ${oc.env:AF_ROOT}/logs/v14e_pca4
 
 # =========================================================================
-# v14e = v14d recipe, but VAE OFF -> raw top-8 PCA actions (pca_0=throttle,
+# VAE off: the action vector is the raw top-8 PCA projection (pca_0=throttle,
 # pca_1=steer). Critic supervises top-8 PCA (test run; 2/4 are config-only later).
 # Guidance start DECOUPLED from LR warmup: LR warmup stays 200, guidance starts
 # at 50 and ramps over 50. Eval = GT-vs-flip fast causal chain. Checkpoints at

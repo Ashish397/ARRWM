@@ -14,7 +14,7 @@
 # v14e: VAE OFF -> RAW top-8 PCA actions (pca_0=throttle, pca_1=steer).
 # Critic supervises top-8 PCA. Guidance decoupled from LR warmup (LR warmup
 # 200; guidance start 50, ramp 50). Eval = GT-vs-flip fast causal chain.
-# 8 nodes = global batch 32. 4h via --time; ckpt at step 1 + every 100.
+# 16 nodes = global batch 64. 4h via --time; ckpt at step 1 + every 100.
 # =====================================================================
 
 set -e -o pipefail
