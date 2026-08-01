@@ -19,3 +19,7 @@ wandb/
 evaluation/quality/out/
 .pytest_cache/
 logs/
+
+# Figure scripts write here by default; regenerated output is not release content.
+analysis/wedges/
+analysis/*.png
