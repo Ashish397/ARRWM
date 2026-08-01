@@ -1,0 +1,36 @@
+
+GEOMETRIC CORRUPTION
+  minwm          1.2%  95% CI [  0.4,   3.4]   k=3/256
+  yume           8.6%  95% CI [  5.7,  12.7]   k=22/256
+  pca8          16.8%  95% CI [ 12.7,  21.9]   k=43/256
+  16node        25.8%  95% CI [ 20.8,  31.5]   k=66/256
+  astra         52.0%  95% CI [ 45.8,  58.0]   k=133/256
+  worldcam      68.0%  95% CI [ 62.0,  73.4]   k=174/256
+  matrixgame    70.7%  95% CI [ 64.9,  75.9]   k=181/256
+  worldplay     80.1%  95% CI [ 74.8,  84.5]   k=205/256
+  ours (pca8) vs each, two-proportion z:
+    vs minwm        p = 6.33e-10   significant
+    vs yume         p = 0.00531    significant
+    vs 16node       p = 0.013      significant
+    vs astra        p = 0          significant
+    vs worldcam     p = 0          significant
+    vs matrixgame   p = 0          significant
+    vs worldplay    p = 0          significant
+
+SCENE RELOCATION
+  minwm          3.7%  95% CI [  1.8,   7.5]   k=7/187
+  16node         8.9%  95% CI [  5.9,  13.2]   k=21/237
+  pca8          10.9%  95% CI [  7.5,  15.5]   k=26/239
+  yume          57.8%  95% CI [ 51.4,  63.9]   k=137/237
+  astra         66.5%  95% CI [ 60.0,  72.5]   k=143/215
+  worldplay     77.3%  95% CI [ 71.6,  82.2]   k=184/238
+  worldcam      87.5%  95% CI [ 82.4,  91.3]   k=189/216
+  matrixgame    95.4%  95% CI [ 92.0,  97.4]   k=229/240
+  ours (pca8) vs each, two-proportion z:
+    vs minwm        p = 0.00626    significant
+    vs 16node       p = 0.461      NOT significant
+    vs yume         p = 0          significant
+    vs astra        p = 0          significant
+    vs worldplay    p = 0          significant
+    vs worldcam     p = 0          significant
+    vs matrixgame   p = 0          significant
