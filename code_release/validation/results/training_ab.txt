@@ -1,0 +1,23 @@
+# Training A/B: pre-cleanup repo vs code_release
+# same seed, same node, same shared ride manifest -> identical data order
+# 2026-08-01T06:32:54Z
+
+  step  pre-cleanup repo    code_release        diff
+    10        0.260804        0.260955   -0.000151
+    20        0.159984        0.159513   +0.000471
+    30        0.112131        0.111096   +0.001035
+    40        0.144120        0.143192   +0.000928
+    50        0.051017        0.050990   +0.000027
+    60        0.135208        0.135033   +0.000175
+    70        0.165564        0.164811   +0.000753
+    80        0.071521        0.071361   +0.000160
+    90        0.101548        0.106875   -0.005327
+   100        0.140266        0.142895   -0.002629
+   110        0.095449        0.095693   -0.000244
+   120        0.150057        0.148912   +0.001145
+
+steps compared      : 12
+max |difference|    : 0.005327
+mean |difference|   : 0.001087
+identical (exact)   : False
+max relative diff   : 4.984%

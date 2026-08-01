@@ -111,6 +111,24 @@ eval read-back all share the shipped file, it cancels in every
 commanded-vs-realized relationship the paper reports. Use the shipped
 `pca_basis.pt`; the fitter is included for provenance.
 
+## Training is behaviour-preserving
+
+`charts/ab_compare.png`, raw numbers in `results/training_ab.txt`. The same
+recipe was trained from step 0 under the pre-cleanup repo and under this
+release: same seed, same node, same GPUs, and the same shared ride manifest so
+both iterate rides in identical order. Configs differ only in the deliberate key
+rename (`ss_vae_checkpoint` -> `pca_basis_checkpoint`).
+
+Over 12 logged steps: **max absolute difference 0.0053, mean 0.0011**, against
+losses spanning 0.05-0.26.
+
+The number that matters is not the magnitude but the sign. The per-step
+difference oscillates around zero -- +0.0010, -0.0053, +0.0011 -- with no drift
+in either direction. A behavioural change shows up as a consistent sign or a
+widening gap; run-to-run non-determinism looks exactly like this. For scale, the
+loss moves by more than 0.09 between adjacent steps, so the residual is well
+inside the step-to-step variation of a single run.
+
 ## Self-checks, run here
 
 | file | result |
