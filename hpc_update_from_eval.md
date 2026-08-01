@@ -179,18 +179,27 @@ Results and per-rollout data are committed under `analysis/nocritic_ablation/`.
 | geometric corruption | 1.6% | 16.8% |
 | scene relocation | 10.9% | 10.9% |
 | style shift | 0.0% | 2.5% |
-| high-frequency degradation | 16.3% | 27.2% |
+| high-frequency degradation | **16.3%** | **5.9%** |
 | conjuration | 0.4% | 1.2% |
 | control failure | **77.3%** | 0.4% |
 | legitimate | **17.2%** | 73% |
 | active population | **92** | 239 |
 
-It wins or ties four of five quality axes and fails control almost entirely,
-because 64% of its rollouts are near-static. Realised throttle spread across the
-eight commands is 0.072 against Default's 0.652; steering reads -0.003 on L and
-+0.003 on R against -0.685 and +0.674.
+**You were right about the 27.2% and it is fixed.** `reference/fleet_hf.csv`
+over the active population with `B > 150` gives Default 5.9%, matching the
+published 6. The corrected narrative is yours: the critic buys control at a
+measurable cost in high-frequency detail — no-critic is worse on HF, not
+better, and "wins or ties four of five" is withdrawn. Your like-for-like
+restriction is also adopted in the ablation README: geometry survives the
+common-population test (p = 0.0022), relocation does not stay significant, so
+the phrasing there is now "indistinguishable on the scenes where both move".
 
-Worth knowing on your side: this is a sharper demonstration of the paper's own
-argument than any baseline, being a single-variable change that tops the quality
-table and bottoms the legitimacy one. Relocation identical to Default says the
-ablation severed command from output without damaging generation.
+It fails control almost entirely because 64% of its rollouts are near-static.
+Realised throttle spread across the eight commands is 0.072 against Default's
+0.652; steering reads -0.003 on L and +0.003 on R against -0.685 and +0.674.
+
+The stationary (no-op) pair is now also scored — one fresh pass over the
+current videos, both columns internally consistent, published table untouched:
+geometry 0/0, relocation 3.1/3.1 (one shared scene-level artefact), style 0/0,
+conjuration 0/0, HF 12.5% against 0 — the same axis, the same direction. All
+per-rollout CSVs are committed under `analysis/nocritic_ablation/results/`.
