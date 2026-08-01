@@ -56,17 +56,6 @@ def _is_distributed() -> bool:
 # Eval / overlay helpers (factored from testing/test_actual_trainer.py)
 # ======================================================================
 
-def _temporal_pool(per_frame: torch.Tensor, n_seg: int) -> torch.Tensor:
-    """Average-pool ``[B, F, D]`` into ``[B, n_seg, D]``."""
-    B, F_len, D = per_frame.shape
-    seg_size = max(1, F_len // n_seg)
-    segs = []
-    for i in range(n_seg):
-        s = i * seg_size
-        e = min(s + seg_size, F_len)
-        segs.append(per_frame[:, s:e].mean(dim=1))
-    return torch.stack(segs, dim=1)
-
 
 def _chunk_actions(per_frame: torch.Tensor, chunk_frames: int) -> torch.Tensor:
     """Mean-pool ``[B, F, D]`` into ``[B, n_chunks, D]`` with exact chunk size."""
@@ -88,31 +77,6 @@ def _safe_corr(a: torch.Tensor, b: torch.Tensor) -> float:
     if denom < 1e-8:
         return 0.0
     return (a_c @ b_c / denom).item()
-
-
-def _asymmetric_action_diff(
-    gen: torch.Tensor,
-    target: torch.Tensor,
-    over_weight: float = 0.5,
-    under_weight: float = 1.0,
-) -> torch.Tensor:
-    """Compute asymmetric action error that penalises undershoot more than overshoot.
-
-    Overshoot = same direction as target but greater magnitude (e.g. gen=-5
-    for target=-4).  Undershoot = less magnitude or wrong direction.
-
-    Near-zero targets (``|target| < 1e-3``) fall back to symmetric absolute error.
-    """
-    raw_err = gen - target
-    dir_sign = torch.sign(target)
-    signed_err = raw_err * dir_sign
-
-    over_err = torch.relu(signed_err)
-    under_err = torch.relu(-signed_err)
-    asym = over_weight * over_err + under_weight * under_err
-
-    sym = raw_err.abs()
-    return torch.where(target.abs() > 1e-3, asym, sym)
 
 
 def _draw_z_action_overlay(
@@ -271,6 +235,7 @@ def _frames_to_mp4_bytes(frames: np.ndarray, fps: float = 5.0) -> Optional[bytes
 # ======================================================================
 # Trainer
 # ======================================================================
+
 
 class CausalLoRADiffusionTrainer:
     """LoRA finetuning for the causal (autoregressive) Wan diffusion model.

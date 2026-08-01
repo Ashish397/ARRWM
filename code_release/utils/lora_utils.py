@@ -11,11 +11,6 @@
 
 import torch
 import peft
-from peft import get_peft_model_state_dict
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import (
-    StateDictType, FullStateDictConfig
-)
 
 
 def configure_lora_for_model(transformer, model_name, lora_config, is_main_process=True):
@@ -75,31 +70,3 @@ def configure_lora_for_model(transformer, model_name, lora_config, is_main_proce
         lora_model.print_trainable_parameters()
 
     return lora_model
-
-
-def gather_lora_state_dict(lora_model):
-    with FSDP.state_dict_type(
-        lora_model,
-        StateDictType.FULL_STATE_DICT,
-        FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-    ):
-        full = lora_model.state_dict()
-    return get_peft_model_state_dict(lora_model, state_dict=full)
-
-
-def load_lora_checkpoint(lora_model, lora_state_dict, model_name, is_main_process=True):
-    """Load LoRA weights from state dict
-
-    Args:
-        lora_model: The LoRA-wrapped model
-        lora_state_dict: LoRA state dict to load
-        model_name: 'generator' or 'critic'
-        is_main_process: Whether this is the main process (for logging)
-    """
-    if is_main_process:
-        print(f"Loading LoRA {model_name} weights: {len(lora_state_dict)} keys in checkpoint")
-
-    peft.set_peft_model_state_dict(lora_model, lora_state_dict)
-
-    if is_main_process:
-        print(f"LoRA {model_name} weights loaded successfully")
