@@ -1,6 +1,6 @@
 Running the shipped zip from a clean directory
 ==============================================
-Extracted code_release.zip to /scratch/.../_zipcheck and ran everything from
+Extracted code_release.zip to a scratch directory outside the repo and ran from
 THERE, not from the repo, so a file the zip omits is genuinely absent and a path
 that resolved by accident no longer does. One GH200, env per the README.
 
