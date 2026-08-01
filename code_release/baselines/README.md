@@ -21,10 +21,18 @@ checkout. Only the interface layer is ours and only that is included.
 
 `shims/` holds compatibility patches, not method code. Astra and Yume were
 released against older library versions and do not import under the versions
-this project uses; each `sitecustomize.py` is auto-imported by Python at
-interpreter start and restores the removed APIs. Copy the relevant one onto
-`PYTHONPATH` when running that baseline. They are included because a reviewer
-reproducing a baseline number will hit the same import failures we did.
+this project uses; the shims restore the removed APIs. They are prefixed here
+to keep them distinct, but Python only auto-imports a file literally named
+`sitecustomize.py`, so copy the one you need onto `PYTHONPATH` under that name:
+
+```bash
+mkdir -p /tmp/astra_shims && cp shims/astra_sitecustomize.py /tmp/astra_shims/sitecustomize.py
+cp shims/astra_modelscope.py /tmp/astra_shims/modelscope.py
+PYTHONPATH=/tmp/astra_shims:$PYTHONPATH python <astra entry point>
+```
+
+They are included because a reviewer reproducing a baseline number will hit the
+same import failures we did.
 
 ## Paths
 
