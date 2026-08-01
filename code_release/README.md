@@ -182,6 +182,7 @@ wan/                      vendored Wan2.1 backbone (DiT, VAE, T5)
 preprocessing/            raw video -> latents, motion, captions, PCA basis
 selection/                window scoring and train/eval pool selection
 evaluation/               action-injection eval; quality/ = the paper's instruments
+baselines/                control interfaces for the external models
 figures/                  regenerates the paper's figures
 configs/  sbatch/         one config and one launcher per reported run
 assets/                   training-window manifest, ride attributes
