@@ -122,3 +122,4 @@ grids/eval/reels_pnovel/
 # AAAI submission bundle (paper zip + extraction) — large build artifact,
 # kept out of the code repo.
 aaai/
+ARRWM_supplementary_code.zip
