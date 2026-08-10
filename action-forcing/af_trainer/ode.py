@@ -296,17 +296,266 @@ class Trainer:
             if self.is_distributed else None
         )
         self.sampler = sampler
-        self.loader = DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            shuffle=(sampler is None),
-            sampler=sampler,
-            num_workers=int(getattr(config, "num_workers", 2)),
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=int(getattr(config, "num_workers", 2)) > 0,
-        )
+        if bool(getattr(config, "alldir_batches", False)):
+            # All-directions batches: dataset emitted each (context, chunk)'s
+            # cf-variants consecutively; batch = one whole group, so every
+            # optimizer step sees ALL directions of one context (packed
+            # forward handles B_pair = group size natively).
+            import random as _rnd
+            _rank = dist.get_rank() if self.is_distributed else 0
+            _world = dist.get_world_size() if self.is_distributed else 1
+
+            class _GroupedBatches:
+                # Same seeded group order on every rank; each rank takes its
+                # contiguous slice of the group -> the GLOBAL batch is one
+                # whole group (e.g. 8 directions over 4 ranks x 2).
+                def __init__(self, sizes, rank, world):
+                    self.rank, self.world = rank, world
+                    self.groups = []
+                    i = 0
+                    for g in sizes:
+                        self.groups.append(list(range(i, i + g)))
+                        i += g
+                    self.epoch = 0
+                def _k(self):
+                    # world > group size: concatenate K whole groups per
+                    # global batch (32 ranks / groups of 8 -> 4 contexts x
+                    # 8 dirs per optimizer step). K=1 == old behavior.
+                    g = len(self.groups[0]) if self.groups else 1
+                    return max(1, self.world // max(g, 1))
+                def __iter__(self):
+                    order = list(self.groups)
+                    _rnd.Random(1234 + self.epoch).shuffle(order)
+                    self.epoch += 1
+                    k = self._k()
+                    for i in range(0, len(order) - k + 1, k):
+                        grp = [j for g in order[i:i + k] for j in g]
+                        per = max(len(grp) // self.world, 1)
+                        lo = self.rank * per
+                        yield grp[lo:lo + per] if lo < len(grp) else grp[:per]
+                def __len__(self):
+                    return max(len(self.groups) // self._k(), 1)
+
+            class _CurriculumBatches(_GroupedBatches):
+                """Hard-direction curriculum (user design, 2026-08-09).
+
+                Epoch 0 trains ALL directions of every (context, chunk)
+                group. From epoch 1 on, each group contributes only 2-4
+                directions: the WORST ones by recorded per-sample error
+                ("bad"), plus an equal number of well-learned ones for
+                anti-forgetting, chosen as the OPPOSITE compass direction
+                where possible (maximum contrast inside the fan batch,
+                which is what makes the global-batch mechanism work) and
+                at random otherwise.
+                    2 bad -> 4 total | 1 bad -> 2 total | 0 bad -> 2 random
+                Selected groups are packed so every global batch holds
+                exactly `world` samples of WHOLE groups, preserving the
+                fan-contrast structure within an optimizer step.
+                """
+                OPP = {"cF": "cB", "cB": "cF", "cL": "cR", "cR": "cL",
+                       "cFR": "cBL", "cBL": "cFR", "cFL": "cBR",
+                       "cBR": "cFL"}
+                # MEASURED 2026-08-10: pre-curriculum alldir8n HAD a reverse
+                # response (BR -0.44, BL -0.54 fwd); after ~1 epoch of
+                # curriculum it was GONE (BR +0.25, B +0.26 — forward motion
+                # for a reverse command) while forward was untouched
+                # (F +0.767 -> +0.765). Reverse is the rarest, hardest mode,
+                # so a mean-seeking loss drags it toward the data's dominant
+                # forward motion. Reserve a slot so a BACKWARD direction is
+                # always in the selected set (user-directed).
+                BACK = ("cB", "cBR", "cBL")
+
+                def __init__(self, sizes, rank, world, dirs, groups_of,
+                             n_bad_max=2, seed=1234):
+                    super().__init__(sizes, rank, world)
+                    self.dirs = dirs
+                    self.n_bad_max = int(n_bad_max)
+                    self.seed = seed
+                    self.err = None            # [N] mean per-sample error
+                    self.epoch_i = 0
+
+                def set_errors(self, err):
+                    self.err = err
+
+                def _force_back(self, grp, picks):
+                    """Guarantee a backward direction in the selection."""
+                    if any(self.dirs[i] in self.BACK for i in picks):
+                        return picks
+                    cand = [i for i in grp if self.dirs[i] in self.BACK
+                            and i not in picks]
+                    if not cand:
+                        return picks
+                    worst = max(cand, key=lambda i: (float(self.err[i])
+                                                     if self.err[i] >= 0 else 1e9))
+                    if len(picks) >= 4:        # swap out the easiest pick
+                        drop = min(picks, key=lambda i: (float(self.err[i])
+                                                         if self.err[i] >= 0 else -1.0))
+                        picks = [p for p in picks if p != drop]
+                    return picks + [worst]
+
+                def _select(self, grp, rng):
+                    if self.err is None:       # epoch 0: everything
+                        return list(grp)
+                    scored = sorted(grp, key=lambda i: -float(self.err[i]))
+                    seen = [i for i in grp if self.err[i] >= 0]
+                    if not seen:
+                        return self._force_back(
+                            grp, list(rng.sample(grp, min(2, len(grp)))))
+                    # ABSOLUTE threshold, not the group median. The median
+                    # always marks half the group "bad" by construction, so
+                    # every group selected exactly 4 and the 1-bad/0-bad
+                    # cases never fired. The error is rung-normalised with
+                    # global mean 1.0, so "worse than the dataset average"
+                    # is a meaningful absolute bar and the count can vary.
+                    med = float(getattr(self, "bad_thresh", 1.0))
+                    bad = [i for i in scored if float(self.err[i]) > med][:self.n_bad_max]
+                    if not bad:
+                        return self._force_back(
+                            grp, list(rng.sample(grp, min(2, len(grp)))))
+                    # Anti-forgetting partners must be directions we have
+                    # actually OBSERVED to be well-learned; an unseen
+                    # sample (err == -1) is unknown, not good.
+                    good_pool = [i for i in grp
+                                 if i not in bad and self.err[i] >= 0]
+                    if not good_pool:
+                        good_pool = [i for i in grp if i not in bad]
+                    picks = list(bad)
+                    for b in bad:
+                        want = self.OPP.get(self.dirs[b])
+                        opp = [i for i in good_pool
+                               if self.dirs[i] == want and i not in picks]
+                        if opp:
+                            picks.append(opp[0])
+                        else:
+                            rem = [i for i in good_pool if i not in picks]
+                            if rem:
+                                picks.append(rng.choice(rem))
+                    return self._force_back(grp, picks)
+
+                def _batches(self):
+                    rng = _rnd.Random(self.seed + self.epoch_i)
+                    order = list(self.groups)
+                    rng.shuffle(order)
+                    sel = [self._select(g, rng) for g in order]
+                    sel = [s for s in sel if s]
+                    # BIN-PACK to exactly `world`. A naive "reset cur on
+                    # overflow" loop DISCARDS the partial bin: harmless
+                    # when every group is the same size, but the selection
+                    # rules emit a MIX of 2s and 4s, and mixing knocks the
+                    # accumulator off alignment so it overflows constantly
+                    # (simulated: 5% size-2 groups -> ~25% of samples
+                    # silently dropped). Bucket by size and always take a
+                    # group that FITS, so only one final partial bin is
+                    # ever left over.
+                    from collections import defaultdict as _dd
+                    buckets = _dd(list)
+                    for s in sel:
+                        buckets[len(s)].append(s)
+                    sizes_desc = sorted(buckets, reverse=True)
+                    out, cur = [], []
+                    while True:
+                        room = self.world - len(cur)
+                        pick = next((z for z in sizes_desc
+                                     if z <= room and buckets[z]), None)
+                        if pick is None:
+                            break
+                        cur.extend(buckets[pick].pop())
+                        if len(cur) == self.world:
+                            out.append(cur); cur = []
+                    left = len(cur) + sum(len(g) for z in buckets
+                                          for g in buckets[z])
+                    if left and self.rank == 0:
+                        log.info("[curriculum] epoch %d: %d batches, %d "
+                                 "samples left over (not a full batch)",
+                                 self.epoch_i, len(out), left)
+                    return out
+
+                def __iter__(self):
+                    bs = self._batches()
+                    self.epoch_i += 1
+                    self._last_len = len(bs)
+                    for gb in bs:
+                        per = max(len(gb) // self.world, 1)
+                        lo = self.rank * per
+                        yield gb[lo:lo + per]
+
+                def __len__(self):
+                    # NOTE: _batches() must not be called here after the
+                    # first epoch — epoch_i has already advanced, so it
+                    # would report the NEXT epoch's length. Cache instead,
+                    # and never let a legitimate 0 fall through to the
+                    # recompute (an empty loader makes the epoch boundary
+                    # fire every step and cycle() spin forever).
+                    n = getattr(self, "_last_len", None)
+                    if n is None:
+                        n = len(self._batches())
+                        self._last_len = n
+                    return n
+
+            _curric = bool(getattr(config, "ode_curriculum", False))
+            _sampler_obj = (
+                _CurriculumBatches(
+                    self.dataset.group_sizes, _rank, _world,
+                    self.dataset.sample_dir, self.dataset.sample_group,
+                    n_bad_max=int(getattr(config, "ode_curriculum_bad_max", 2)))
+                if _curric else
+                _GroupedBatches(self.dataset.group_sizes, _rank, _world))
+            self.curriculum = _sampler_obj if _curric else None
+            self.loader = DataLoader(
+                self.dataset,
+                batch_sampler=_sampler_obj,
+                num_workers=int(getattr(config, "num_workers", 2)),
+                pin_memory=True,
+                persistent_workers=int(getattr(config, "num_workers", 2)) > 0,
+            )
+        else:
+            self.loader = DataLoader(
+                self.dataset,
+                batch_size=self.batch_size,
+                shuffle=(sampler is None),
+                sampler=sampler,
+                num_workers=int(getattr(config, "num_workers", 2)),
+                pin_memory=True,
+                drop_last=True,
+                persistent_workers=int(getattr(config, "num_workers", 2)) > 0,
+            )
         self.data_iter = cycle(self.loader)
+        # ---- Hard-direction curriculum state -----------------------------
+        # err_sum/err_cnt are indexed by DATASET sample id and are summed
+        # across ranks at each epoch boundary, so every rank selects the
+        # same directions for the next epoch (the sampler must stay
+        # identical on all ranks or the global batch desyncs).
+        self._curric_epochs_done = 0
+        self._curric_steps_in_epoch = 0
+        if bool(getattr(config, "ode_curriculum", False)) and \
+                getattr(self, "curriculum", None) is None:
+            raise RuntimeError(
+                "ode_curriculum=true requires alldir_batches=true — the "
+                "curriculum selects DIRECTIONS within a (context, chunk) "
+                "group, which only exists in the grouped sampler. Refusing "
+                "to run with the curriculum silently disabled.")
+        if getattr(self, "curriculum", None) is not None:
+            n = len(self.dataset)
+            # Per-EPOCH accumulators (reset every boundary) + a persistent
+            # EMA. The accumulators must never be all_reduced in place:
+            # doing so leaves the global sum in each rank's local tensor,
+            # so the next epoch re-reduces its own history and the mean
+            # freezes at the epoch-0 value forever.
+            self._err_ep_sum = torch.zeros(n, device=self.device)
+            self._err_ep_cnt = torch.zeros(n, device=self.device)
+            self._err_ep_rung = torch.full((n,), -1.0, device=self.device)
+            self._err_ema = torch.full((n,), -1.0, device=self.device)
+            self._rung_vals = [float(v) for v in
+                               self.model.denoising_step_list.tolist()]
+            _nr = len(self._rung_vals)
+            self._rung_sum = torch.zeros(_nr, device=self.device)
+            self._rung_cnt = torch.zeros(_nr, device=self.device)
+            self.max_epochs = int(getattr(config, "ode_curriculum_epochs", 10))
+            self._log(f"Curriculum ON: {n} samples, epoch 0 = all directions, "
+                      f"then 2-4 per group; rung-normalised error; "
+                      f"stopping after {self.max_epochs} epochs")
+        else:
+            self.max_epochs = 0
 
         # ------------------------------------------------------------------
         # Resume
@@ -385,9 +634,42 @@ class Trainer:
             gen_params.extend(p for p in self.model.action_projection.parameters() if p.requires_grad)
         if self.model.action_token_projection is not None:
             gen_params.extend(p for p in self.model.action_token_projection.parameters() if p.requires_grad)
+        for _hn in ("emd_head_scale", "emd_head_shift"):
+            _hp = getattr(self.model, _hn, None)
+            if _hp is not None and _hp.requires_grad:
+                # The wrapper module is never .to(device)'d wholesale —
+                # move the head params to the compute device BEFORE the
+                # optimizer captures them, else their grads live on CPU
+                # and the NCCL all-reduce crashes (job 5934528).
+                _hp.data = _hp.data.to(self.device)
+                gen_params.append(_hp)
         if not gen_params:
             raise RuntimeError("No trainable generator-group parameters.")
 
+        # The EMD transport head is a 16-dim ZERO-INIT gate, not a DiT
+        # weight: the fine-tuning lr (2e-6) caps its total movement at
+        # ~1e-3 over a short run and weight decay actively pulls it back
+        # to its zero init. Measured on jobs 5941221/5946996: after 500
+        # steps |scale| <= 6e-4, i.e. the head never left zero and both
+        # head arms were effectively no-ops. Give it its own group:
+        # much larger lr, NO weight decay.
+        head_params = [p for p in (
+            getattr(self.model, "emd_head_scale", None),
+            getattr(self.model, "emd_head_shift", None)) if p is not None]
+        if head_params:
+            hp_ids = {id(p) for p in head_params}
+            gen_params = [p for p in gen_params if id(p) not in hp_ids]
+            head_lr = float(getattr(cfg, "ode_emdhead_lr", 1e-2))
+            optimizer = torch.optim.AdamW(
+                [{"params": gen_params, "lr": lr, "weight_decay": weight_decay},
+                 {"params": head_params, "lr": head_lr, "weight_decay": 0.0}],
+                betas=(beta1, beta2),
+            )
+            self._log(f"Generator optimiser: AdamW lr={lr:.2e} "
+                      f"params={len(gen_params)} + EMD-head group "
+                      f"lr={head_lr:.2e} wd=0 params={len(head_params)}")
+            return optimizer, self._build_critic_optimizer(critic_lr, beta1,
+                                                           beta2, weight_decay)
         optimizer = torch.optim.AdamW(
             gen_params, lr=lr, betas=(beta1, beta2), weight_decay=weight_decay,
         )
@@ -403,6 +685,19 @@ class Trainer:
             self._log(f"Critic optimiser: AdamW lr={critic_lr:.2e} params={len(critic_params)}")
 
         return optimizer, critic_optimizer
+
+    def _build_critic_optimizer(self, critic_lr, beta1, beta2, weight_decay):
+        cm = self._critic_base()
+        if cm is None:
+            return None
+        critic_params = [p for p in cm.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(
+            critic_params, lr=critic_lr, betas=(beta1, beta2),
+            weight_decay=weight_decay,
+        )
+        self._log(f"Critic optimiser: AdamW lr={critic_lr:.2e} "
+                  f"params={len(critic_params)}")
+        return opt
 
     # ------------------------------------------------------------------
     # W&B
@@ -566,6 +861,17 @@ class Trainer:
                     f"unexpected[:5]={list(unexpected)[:5]}. The probe "
                     "architecture changed relative to the checkpoint."
                 )
+        _cs = ck.get("curriculum")
+        if _cs is not None and getattr(self, "curriculum", None) is not None:
+            self._err_ema = _cs["err_ema"].to(self.device)
+            self._curric_epochs_done = int(_cs["epochs_done"])
+            self._curric_steps_in_epoch = int(_cs.get("steps_in_epoch", 0))
+            self.curriculum.epoch_i = int(_cs.get("sampler_epoch", 0))
+            self._rung_sum = _cs["rung_sum"].to(self.device)
+            self._rung_cnt = _cs["rung_cnt"].to(self.device)
+            if self._curric_epochs_done > 0:
+                self.curriculum.set_errors(self._err_ema.cpu().tolist())
+            self._log(f"Curriculum resumed at epoch {self._curric_epochs_done}")
         cm = self._critic_base()
         if cm is not None:
             if "action_critic" not in ck:
@@ -643,6 +949,22 @@ class Trainer:
             state["action_token_projection"] = self.model.action_token_projection.state_dict()
         if hasattr(base, "_state_probe") and base._state_probe is not None:
             state["state_probe"] = base._state_probe.state_dict()
+        if getattr(self, "curriculum", None) is not None:
+            # Without this a requeue restarts the curriculum at epoch 0
+            # with no error history while global_step carries on, so
+            # "10 epochs" would not be resume-stable.
+            state["curriculum"] = {
+                "err_ema": self._err_ema.detach().cpu(),
+                "epochs_done": self._curric_epochs_done,
+                "steps_in_epoch": self._curric_steps_in_epoch,
+                "sampler_epoch": getattr(self.curriculum, "epoch_i", 0),
+                "rung_sum": self._rung_sum.detach().cpu(),
+                "rung_cnt": self._rung_cnt.detach().cpu(),
+            }
+        if getattr(self.model, "emd_head_scale", None) is not None:
+            state["emd_head"] = {
+                "scale": self.model.emd_head_scale.detach().cpu(),
+                "shift": self.model.emd_head_shift.detach().cpu()}
         return state
 
     def _save_checkpoint(self, step: int) -> None:
@@ -663,7 +985,11 @@ class Trainer:
             # stream the finished file out.
             import shutil
             local_dir = os.environ.get("TMPDIR", "/tmp")
-            local_tmp = os.path.join(local_dir, path.name + ".tmp")
+            # Unique per process: co-scheduled jobs on one node staged
+            # to the SAME /tmp filename and one unlink raced another's
+            # copy (job 5915952). Suffix with job id + pid.
+            _uid = f"{os.environ.get('SLURM_JOB_ID', 'x')}.{os.getpid()}"
+            local_tmp = os.path.join(local_dir, f"{path.name}.{_uid}.tmp")
             torch.save(state, local_tmp)
             try:
                 shutil.copyfile(local_tmp, str(tmp))
@@ -728,6 +1054,13 @@ class Trainer:
             for p in mod.parameters():
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+        # EMD transport head: the 0.0*touch in the loss guarantees these
+        # grads exist on every rank whenever the head is enabled, so the
+        # collective can never desync across ranks.
+        for _hn in ("emd_head_scale", "emd_head_shift"):
+            _hp = getattr(self.model, _hn, None)
+            if _hp is not None and _hp.grad is not None:
+                dist.all_reduce(_hp.grad, op=dist.ReduceOp.AVG)
 
     def _generator_optim_step(self) -> float:
         self._sync_projection_grads()
@@ -738,9 +1071,22 @@ class Trainer:
             all_gen_params.extend(self.model.action_projection.parameters())
         if self.model.action_token_projection is not None:
             all_gen_params.extend(self.model.action_token_projection.parameters())
+        # The EMD transport head is clipped SEPARATELY: its objective can
+        # spike (measured on job 5941221: head grad-norm 13-29 vs flow
+        # ~0.2), and a joint clip_grad_norm_ would scale the flow map's
+        # own gradients down by up to 3x on those steps — coupling the
+        # two through the clipper and defeating the stop-gradient that
+        # is supposed to keep the flow map untouched.
+        head_params: list = []
+        for _hn in ("emd_head_scale", "emd_head_shift"):
+            _hp = getattr(self.model, _hn, None)
+            if _hp is not None:
+                head_params.append(_hp)
         grad_norm = 0.0
         if self.grad_clip and self.grad_clip > 0:
             grad_norm = float(torch.nn.utils.clip_grad_norm_(all_gen_params, self.grad_clip))
+            if head_params:
+                torch.nn.utils.clip_grad_norm_(head_params, self.grad_clip)
 
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
@@ -878,6 +1224,31 @@ class Trainer:
                 step=self.global_step,
             )
         loss.backward()
+
+        # ---- Curriculum: attribute this step's error to its samples ----
+        if getattr(self, "curriculum", None) is not None:
+            _e = logs.get("per_sample_err_cf")
+            _si = batch.get("sample_idx")
+            _rg = logs.get("per_sample_rung_cf")
+            if _e is not None and _si is not None:
+                dev = self._err_ep_sum.device
+                _si = _si.to(dev).view(-1)
+                _e = _e.detach().float().view(-1).to(dev)
+                assert _si.numel() == _e.numel(), (
+                    f"curriculum: {_si.numel()} sample ids vs {_e.numel()} "
+                    "errors — silent truncation would mis-attribute errors")
+                self._err_ep_sum.index_add_(0, _si, _e)
+                self._err_ep_cnt.index_add_(0, _si,
+                                            torch.ones_like(_e))
+                if _rg is not None:
+                    _rg = _rg.detach().float().view(-1).to(dev)
+                    # remember the rung each sample was scored at, and
+                    # build the per-rung reference used to normalise it
+                    self._err_ep_rung.index_copy_(0, _si, _rg)
+                    rv = torch.tensor(self._rung_vals, device=dev)
+                    ridx = (_rg.view(-1, 1) - rv.view(1, -1)).abs().argmin(dim=1)
+                    self._rung_sum.index_add_(0, ridx, _e)
+                    self._rung_cnt.index_add_(0, ridx, torch.ones_like(_e))
 
         # ---- Generator optimiser step ----
         grad_norm = self._generator_optim_step()
@@ -1623,6 +1994,70 @@ class Trainer:
 
             metrics = self._train_step()
             self.global_step += 1
+
+            # ---- Curriculum epoch boundary --------------------------------
+            if getattr(self, "curriculum", None) is not None:
+                self._curric_steps_in_epoch += 1
+                if self._curric_steps_in_epoch >= len(self.loader):
+                    # Reduce COPIES: an in-place all_reduce would leave the
+                    # global sum in every rank's accumulator and the next
+                    # epoch would re-reduce its own history (weights *=
+                    # world_size each epoch), freezing the mean at epoch 0.
+                    s = self._err_ep_sum.clone()
+                    c = self._err_ep_cnt.clone()
+                    rg = self._err_ep_rung.clone()
+                    rs = self._rung_sum.clone()
+                    rc = self._rung_cnt.clone()
+                    if self.is_distributed:
+                        dist.all_reduce(s, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(c, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(rg, op=dist.ReduceOp.MAX)
+                        dist.all_reduce(rs, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(rc, op=dist.ReduceOp.SUM)
+                    obs = c > 0
+                    raw = s / c.clamp(min=1)
+                    # RUNG NORMALISATION: divide by the mean error at the
+                    # rung the sample was scored at, so "hard direction"
+                    # means hard relative to its own noise level rather
+                    # than "drew the noisiest timestep".
+                    rung_mean = (rs / rc.clamp(min=1)).clamp(min=1e-8)
+                    rv = torch.tensor(self._rung_vals, device=raw.device)
+                    ridx = (rg.view(-1, 1) - rv.view(1, -1)).abs().argmin(dim=1)
+                    norm = raw / rung_mean[ridx]
+                    epoch_err = torch.where(obs, norm,
+                                            torch.full_like(norm, -1.0))
+                    # EMA so a single unlucky draw cannot condemn a
+                    # direction for the whole run; unobserved keep history.
+                    prev = self._err_ema
+                    self._err_ema = torch.where(
+                        obs, torch.where(prev < 0, epoch_err,
+                                         0.5 * prev + 0.5 * epoch_err), prev)
+                    self.curriculum.set_errors(
+                        self._err_ema.detach().cpu().tolist())
+                    self._curric_epochs_done += 1
+                    seen = int(obs.sum().item())
+                    if self.is_main:
+                        _m = epoch_err[obs]
+                        log.info(
+                            "[curriculum] epoch %d done at step %d | seen "
+                            "%d/%d | rung-norm err mean %.4f min %.4f max "
+                            "%.4f | rung means %s",
+                            self._curric_epochs_done, self.global_step, seen,
+                            epoch_err.numel(),
+                            float(_m.mean()) if _m.numel() else -1,
+                            float(_m.min()) if _m.numel() else -1,
+                            float(_m.max()) if _m.numel() else -1,
+                            [round(float(x), 5) for x in rung_mean.tolist()])
+                    # reset per-epoch accumulators (EMA carries history)
+                    self._err_ep_sum.zero_(); self._err_ep_cnt.zero_()
+                    self._err_ep_rung.fill_(-1.0)
+                    self._curric_steps_in_epoch = 0
+                    if self._curric_epochs_done >= self.max_epochs:
+                        if self.is_main:
+                            log.info("[curriculum] reached %d epochs — stopping",
+                                     self.max_epochs)
+                        self._save_checkpoint(self.global_step)
+                        break
 
             if self.is_main and (self.global_step % self.log_interval == 0 or self.global_step == 1):
                 now = time.time()

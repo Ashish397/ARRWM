@@ -485,6 +485,138 @@ class ODERegression(nn.Module):
         # _nextrung_targets). Default OFF -> byte-identical.
         self.ode_nextrung_targets = bool(
             getattr(config, "ode_nextrung_targets", False))
+        # Moment-preservation loss (root fix for few-step moment
+        # contraction, 2026-08-03 ledger): pointwise MSE is minimised by
+        # the conditional mean — correct per-channel mean, strictly
+        # UNDER-DISPERSED per-channel std (measured: committed std -40%
+        # over 6 chunks at 4 rungs vs -4% dense, same weights). This term
+        # matches the prediction's per-channel (mu, sigma) on the target
+        # block to the TARGET state's own moments, making the learned
+        # jump map moment-preserving. Default 0 -> byte-identical.
+        self.ode_moment_loss_weight = float(
+            getattr(config, "ode_moment_loss_weight", 0.0))
+        # Action-plane separation loss (user prescription 2026-08-05):
+        # match the DISTANCE between the clean/cf branch predictions to
+        # the distance between their committed teacher samples — fights
+        # the collapse of action branches toward the no-op/conditional
+        # mean without unbounded repulsion. Default 0 -> byte-identical.
+        self.ode_sep_loss_weight = float(
+            getattr(config, "ode_sep_loss_weight", 0.0))
+        # Action-effect vector matching (user-directed 2026-08-05): the
+        # clean/cf pair shares context AND noise seed, differing only in
+        # action — match the student's action-induced displacement VECTOR
+        # (p_c - p_cf) to the teacher's (t_c - t_cf), relative to its
+        # norm. Trains the action-effect map itself (direction+magnitude
+        # of divergence at fixed noise). Default 0 -> byte-identical.
+        self.ode_actdelta_loss_weight = float(
+            getattr(config, "ode_actdelta_loss_weight", 0.0))
+        # Gaussian-signature repulsor (user-directed 2026-08-05): the
+        # noise/attractor signature in latent moment space is (mu=0,
+        # sigma=1) per channel. One-sided hinge: penalize predictions
+        # whose signature distance D = ||mu||^2 + ||sigma-1||^2 falls
+        # BELOW their own target's (i.e., closer to the gaussian than
+        # the data is); being farther is free. Default 0 -> identical.
+        self.ode_noiserep_loss_weight = float(
+            getattr(config, "ode_noiserep_loss_weight", 0.0))
+        # EMD repulsor family (user-directed 2026-08-06): d = per-channel
+        # 1-D earth-mover (W2) distance between the predicted block's
+        # empirical value distribution and N(0,1), exact via sorted-value
+        # vs gaussian-quantile matching (captures full-shape deviation,
+        # not just the first two moments). v1: + w / d^2 (always-on
+        # inverse-square, same law as ode_noiserep). v2: + w / (d_cur -
+        # d_prevchunk) — penalizes chunk-over-chunk CONTRACTION toward
+        # the gaussian; delta clamped at ode_emdrep_delta_eps (1/x is
+        # singular at 0 and REWARDS contraction when negative — clamp
+        # makes contraction pay the max penalty instead). Default 0 ->
+        # byte-identical.
+        self.ode_emdrep_loss_weight = float(
+            getattr(config, "ode_emdrep_loss_weight", 0.0))
+        self.ode_emdrep_delta_weight = float(
+            getattr(config, "ode_emdrep_delta_weight", 0.0))
+        self.ode_emdrep_delta_eps = float(
+            getattr(config, "ode_emdrep_delta_eps", 0.05))
+        # Commit-clock restriction (user-directed 2026-08-07): d is a
+        # property of the COMMITTED chunk — it only exists at the last
+        # rung. With commit_only=true the EMD terms are applied ONLY on
+        # samples drawn at the final rung (t=208.33, whose pred_x0 IS the
+        # chunk the 4-rung sampler commits), so the high-rung flow map
+        # (conditional-mean regime) is never fought by a chunk-clock
+        # statistical constraint.
+        self.ode_emdrep_commit_only = bool(
+            getattr(config, "ode_emdrep_commit_only", False))
+        # Zero-init learned transport head (AdaLN-zero analog, user-
+        # directed 2026-08-07): per-channel affine correction
+        # y = x*(1+s)+b with s,b initialized to EXACT ZERO — at step 0
+        # nothing is perturbed. Trained ONLY by the commit-clock EMD
+        # objectives on the DETACHED committed prediction (the flow map
+        # never receives repulsor gradient); the correction grows from
+        # zero as the EMD gradient teaches it. At serve the head is
+        # applied to each committed chunk (ODE_EMDHEAD=1) — a LEARNED
+        # serve-time EMD transport.
+        self.ode_emdhead_weight = float(
+            getattr(config, "ode_emdhead_weight", 0.0))
+        self.ode_emdhead_delta_weight = float(
+            getattr(config, "ode_emdhead_delta_weight", 0.0))
+        # Head objective (lit-review 2026-08-07): "invd" = original
+        # 1/d^2 + 1/dd EMD pressures; "deadband" = VICReg-style
+        # satisfiable constraint — per-channel log-ratio of the corrected
+        # chunk's std vs the PREVIOUS committed chunk, squared hinge below
+        # 0 (contraction) and above +band_hi (runaway), ZERO gradient
+        # inside; mean tracked the same way; + identity-minimality term
+        # so the correction is minimum-necessary. Target = zero per-chunk
+        # decay (beats the teacher's k~0.986, per user requirement).
+        self.ode_emdhead_objective = str(
+            getattr(config, "ode_emdhead_objective", "invd"))
+        self.ode_emdhead_band_hi = float(
+            getattr(config, "ode_emdhead_band_hi", 0.05))
+        self.ode_emdhead_mu_band = float(
+            getattr(config, "ode_emdhead_mu_band", 0.03))
+        self.ode_emdhead_id_weight = float(
+            getattr(config, "ode_emdhead_id_weight", 0.1))
+        # AXIS 2 (lit-review 2026-08-08): BOUNDED gaussian exclusion zone,
+        # replacing the divergent 1/d^2 repulsor. R = softplus((r0-d)/tau):
+        # a real force while the committed chunk is nearer the gaussian
+        # signature than r0, and ~0 beyond it, so there is no incentive
+        # for unbounded expansion (the emd1/emd2/emdc failure).
+        # MEASURED 2026-08-09 on real dir8n committed chunks: their
+        # per-channel sigma is ~0.5, so they sit at distance ~2.2 from the
+        # N(0,1) signature, and COLLAPSE MOVES THEM FURTHER AWAY (k=1.0 ->
+        # d 2.30, k=0.0 -> d 4.00). A "repel from the gaussian" term is
+        # therefore both inert here (0.2% of max force at r0=1.0) and
+        # WRONGLY SIGNED — it rewards contraction. The collapse mode is not
+        # near N(0,1) at all. So the barrier is referenced to the TEACHER's
+        # own committed sigma instead: a satisfiable deadband that fires
+        # only when the student contracts below the teacher (or runs away
+        # above it), which is the failure actually being fought.
+        self.ode_gexcl_weight = float(getattr(config, "ode_gexcl_weight", 0.0))
+        self.ode_gexcl_band = float(getattr(config, "ode_gexcl_band", 0.05))
+        self.ode_gexcl_r0 = float(getattr(config, "ode_gexcl_r0", 1.0))
+        self.ode_gexcl_tau = float(getattr(config, "ode_gexcl_tau", 0.25))
+        # AXIS 3: distribution matching instead of pure mean matching.
+        # ENERGY DISTANCE between the student's and teacher's committed
+        # chunks in a feature space phi(z) (moments + quantiles + temporal
+        # deltas -- NOT channel-Gaussian moments alone, which is what made
+        # the KL arms action-blind):
+        #     D_E = 2 E||X-Y|| - E||X-X'|| - E||Y-Y'||
+        # The -E||Y-Y'|| term is a BOUNDED anti-collapse repulsion whose
+        # optimum is the teacher distribution rather than infinite
+        # separation. Samples come from the 8-action fan batch, gathered
+        # across ranks (features are tiny), so the set spans the whole fan
+        # and producing one answer for every action is directly penalized.
+        self.ode_edist_weight = float(getattr(config, "ode_edist_weight", 0.0))
+        self.ode_edist_commit_only = bool(
+            getattr(config, "ode_edist_commit_only", True))
+        if self.ode_emdhead_weight > 0.0 or self.ode_emdhead_delta_weight > 0.0:
+            self.emd_head_scale = nn.Parameter(torch.zeros(16))
+            self.emd_head_shift = nn.Parameter(torch.zeros(16))
+        self._emd_quantiles = None
+        # Action-CFG training (user-directed 2026-08-05): with prob p per
+        # sample, replace the noisy-branch action stream with the NULL
+        # action (zeros) so the model learns an unconditional-action
+        # branch -> enables classifier-free guidance on actions at serve
+        # (ODE_ACTION_CFG). Default 0 -> byte-identical.
+        self.ode_action_cfg_dropout = float(
+            getattr(config, "ode_action_cfg_dropout", 0.0))
         # Off-registry placeholders (object.__setattr__ keeps them out of
         # ._modules so .parameters()/.state_dict()/DDP never see them).
         object.__setattr__(self, "_cd_teacher", None)
@@ -922,7 +1054,104 @@ class ODERegression(nn.Module):
             index=tgt_snap.reshape(B, 1, F_, 1, 1, 1).expand(-1, -1, -1, C, H, W),
         ).squeeze(1)
 
-    @torch.no_grad()
+    @staticmethod
+    def _dist_features(x: torch.Tensor) -> torch.Tensor:
+        """phi(z) for distribution matching: per-channel moments, quantiles
+        and TEMPORAL deltas. The temporal/quantile parts are what a
+        channel-Gaussian KL throws away — the omission that let the KL
+        arms satisfy the loss while discarding the action fan.
+        """
+        xf = x.to(torch.float32)                       # [B, F, C, H, W]
+        B, F_, C_, H_, W_ = xf.shape
+        v = xf.permute(0, 2, 1, 3, 4).reshape(B, C_, -1)
+        mu = v.mean(dim=-1)
+        sd = v.std(dim=-1).clamp(min=1e-6).log()
+        q = torch.quantile(
+            v, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=v.device),
+            dim=-1)                                    # [5, B, C]
+        q = q.permute(1, 0, 2).reshape(B, -1)
+        if F_ > 1:                                     # temporal structure
+            d = (xf[:, 1:] - xf[:, :-1]).abs().mean(dim=(1, 3, 4))
+        else:
+            d = torch.zeros_like(mu)
+        # SPATIALLY-SENSITIVE terms. Everything above is a per-channel
+        # value histogram and is therefore INVARIANT to permuting voxels
+        # — exactly the blindness that made ode_loss_type=kl action-blind
+        # (verified: scrambling a prediction leaves that loss bit-identical
+        # while MSE rises 66x). Without these a distribution loss can be
+        # satisfied by a scrambled image, so add a coarse spatial grid of
+        # (a) content and (b) SIGNED frame-to-frame motion — the latter is
+        # where a left turn differs from a right turn.
+        gh, gw = 3, 4
+        pool = torch.nn.functional.adaptive_avg_pool2d
+        grid = pool(xf.mean(dim=1), (gh, gw)).reshape(B, -1)
+        if F_ > 1:
+            dmap = (xf[:, 1:] - xf[:, :-1]).mean(dim=1)   # signed motion
+            dgrid = pool(dmap, (gh, gw)).reshape(B, -1)
+        else:
+            dgrid = torch.zeros_like(grid)
+        return torch.cat([mu, sd, q, d, grid, dgrid], dim=1)
+
+    def _energy_distance_loss(self, p_c, t_c, p_f, t_f, tt_c, tt_f):
+        """D_E(student, teacher) over the fan batch, gathered across ranks.
+
+        Only commit-rung samples participate (the statistic is a property
+        of the committed chunk). Returns None when the global sample count
+        is too small for the U-statistic to mean anything.
+        """
+        import torch.distributed as dist
+        sel_c = (tt_c < 250.0) if self.ode_edist_commit_only else torch.ones_like(tt_c, dtype=torch.bool)
+        sel_f = (tt_f < 250.0) if self.ode_edist_commit_only else torch.ones_like(tt_f, dtype=torch.bool)
+        xs, ys = [], []
+        for _p, _t, _s in ((p_c, t_c, sel_c), (p_f, t_f, sel_f)):
+            if int(_s.sum()) == 0:
+                continue
+            xs.append(self._dist_features(_p[_s]))
+            ys.append(self._dist_features(_t[_s].float()).detach())
+        # Every rank must reach the collectives below, so build (possibly
+        # empty) local tensors and let the gather decide if there is data.
+        dev = p_c.device
+        # phi width: C*(1 mu + 1 sd + 5 quantiles + 1 temporal-mag)
+        #          + C*gh*gw content grid + C*gh*gw signed-motion grid
+        D = p_c.shape[2] * (8 + 2 * 3 * 4)
+        X = torch.cat(xs, 0) if xs else torch.zeros(0, D, device=dev)
+        Y = torch.cat(ys, 0) if ys else torch.zeros(0, D, device=dev)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            world = dist.get_world_size()
+            n_loc = torch.tensor([X.shape[0]], device=dev)
+            counts = [torch.zeros_like(n_loc) for _ in range(world)]
+            dist.all_gather(counts, n_loc)
+            n_max = int(max(int(c.item()) for c in counts))
+            if n_max == 0:
+                return None
+            def _gather(T):
+                pad = torch.zeros(n_max, D, device=dev, dtype=T.dtype)
+                if T.shape[0]:
+                    pad[:T.shape[0]] = T
+                buf = [torch.zeros_like(pad) for _ in range(world)]
+                dist.all_gather(buf, pad)
+                buf[dist.get_rank()] = pad              # keep LOCAL grad path
+                return torch.cat([b[:int(counts[i].item())]
+                                  for i, b in enumerate(buf)], 0)
+            X, Y = _gather(X), _gather(Y)
+        if X.shape[0] < 2 or Y.shape[0] < 2:
+            return None
+        # Scale each feature by the teacher's spread so no single family
+        # (e.g. the 80 quantile dims) dominates the distance.
+        _sd = Y.std(dim=0, keepdim=True).detach()
+        s = _sd.clamp(min=1e-2 * _sd.median().clamp(min=1e-6))
+        Xn, Yn = X / s, Y / s
+        cross = torch.cdist(Xn, Yn).mean()
+        xx = torch.cdist(Xn, Xn)
+        n = Xn.shape[0]
+        xx = xx.sum() / max(n * (n - 1), 1)             # exclude diagonal
+        # DDP AVERAGES rank gradients, but each rank contributes only
+        # its own 1/W rows of X, so the effective weight would be 1/W
+        # (1/32 here). Scale back so the flag means what it says.
+        _w = float(dist.get_world_size()) if (
+            dist.is_available() and dist.is_initialized()) else 1.0
+        return _w * (2.0 * cross - xx)   # -E||Y-Y'|| is constant
+
     def _nextrung_targets(
         self,
         trajectory: torch.Tensor,     # [B, T_snap, F, C, H, W]
@@ -963,9 +1192,40 @@ class ODERegression(nn.Module):
         sig_pad = torch.cat([sig, torch.zeros(1, device=pool.device)])
         sig_k = sig_pad[pool]
         sig_n = sig_pad[(pool + 1).clamp(max=K)]
-        w = (sig_k / (sig_k - sig_n).clamp(min=1e-6)).reshape(B, F_, 1, 1, 1)
         x_k = noisy_input.float()
-        x0_hat = x_k - w * (x_k - x_next)
+        _solver = str(getattr(self.config, "ode_nextrung_solver", "euler")).lower()
+        if _solver in ("midpoint", "heun"):
+            # Higher-order tangent from the teacher's stored path. The
+            # Euler form uses the single secant over [k, k+1]; these use a
+            # second stored segment [k+1, k+2] so the x0 extrapolation
+            # follows the CURVATURE of the teacher's trajectory instead of
+            # its local chord (the chord systematically under-shoots on a
+            # curved path, which is one source of the mean-like target).
+            #   midpoint: central secant over [k, k+2]  (slope at k+1)
+            #   heun    : mean of secant[k,k+1] and secant[k+1,k+2]
+            nxt2 = (pool + 2).clamp(max=T_snap - 1)
+            x_next2 = torch.gather(
+                trajectory, dim=1,
+                index=nxt2.reshape(B, 1, F_, 1, 1, 1).expand(-1, -1, -1, C, H, W),
+            ).squeeze(1).float()
+            sig_n2 = sig_pad[(pool + 2).clamp(max=K)]
+            d1 = (sig_k - sig_n).clamp(min=1e-6).reshape(B, F_, 1, 1, 1)
+            d2 = (sig_n - sig_n2).clamp(min=1e-6).reshape(B, F_, 1, 1, 1)
+            v1 = (x_k - x_next) / d1
+            v2 = (x_next - x_next2) / d2
+            # Where the second segment does not exist (last rung: k+1 is
+            # already the committed slot) fall back to the Euler secant,
+            # preserving the exact v1 continuity property.
+            has2 = ((pool + 2) <= K).reshape(B, F_, 1, 1, 1)
+            if _solver == "heun":
+                v = torch.where(has2, 0.5 * (v1 + v2), v1)
+            else:
+                dtot = (sig_k - sig_n2).clamp(min=1e-6).reshape(B, F_, 1, 1, 1)
+                v = torch.where(has2, (x_k - x_next2) / dtot, v1)
+            x0_hat = x_k - sig_k.reshape(B, F_, 1, 1, 1) * v
+        else:
+            w = (sig_k / (sig_k - sig_n).clamp(min=1e-6)).reshape(B, F_, 1, 1, 1)
+            x0_hat = x_k - w * (x_k - x_next)
         mask = (pool_idx >= 0).reshape(B, F_, 1, 1, 1)
         return torch.where(
             mask, x0_hat, base_target.float()).to(base_target.dtype)
@@ -990,6 +1250,25 @@ class ODERegression(nn.Module):
         avoid an empty ``reduction="mean"`` division.
         """
         mask = timestep != 0
+        if getattr(self.config, "ode_loss_type", "mse") == "kl":
+            # Per-channel Gaussian KL(pred || target) over the masked
+            # frames: log(st/sp) + (sp^2 + (mp-mt)^2) / (2 st^2) - 1/2.
+            # log(st/sp) -> +inf as sp -> 0: under-dispersion is punished
+            # asymmetrically, the anti-collapse property MSE lacks.
+            m = mask if mask.any() else torch.ones_like(mask)
+            p = pred_x0.float() * m[..., None, None, None]
+            t = target.float() * m[..., None, None, None]
+            nfrm = m.sum(dim=1).clamp(min=1)
+            dims = (1, 3, 4)
+            scale = (pred_x0.shape[1] / nfrm).view(-1, 1)
+            mp = p.mean(dim=dims) * scale
+            mt = t.mean(dim=dims) * scale
+            # centred second moments over masked region only
+            vp = (p - (mp / scale).view(p.shape[0], 1, -1, 1, 1) * m[..., None, None, None]).pow(2).mean(dim=dims) * scale
+            vt = (t - (mt / scale).view(t.shape[0], 1, -1, 1, 1) * m[..., None, None, None]).pow(2).mean(dim=dims) * scale
+            sp2 = vp.clamp(min=1e-6); st2 = vt.clamp(min=1e-6)
+            kl = 0.5 * torch.log(st2 / sp2) + (sp2 + (mp - mt).pow(2)) / (2.0 * st2) - 0.5
+            return kl.mean().to(pred_x0.dtype)
         if not mask.any():
             return F.mse_loss(pred_x0.float(), target.float())
         # mask is [B, F]; broadcast to the full [B, F, C, H, W] shape.
@@ -1491,6 +1770,14 @@ class ODERegression(nn.Module):
 
         target_clean = self._resolve_target(trajectory_clean)
         target_cf    = self._resolve_target(trajectory_cf)
+        # Committed-sample copies kept for the moment loss: nr tangent
+        # targets at high rungs are extrapolations whose OWN std is
+        # mean-like (~0.63 vs sample 0.88) — matching moments to them
+        # reproduces the collapse (measured: nrmom rung-0 std 0.714 =
+        # nr's 0.719). ode_moment_ref=committed matches moments to the
+        # SAMPLE-level committed block instead.
+        target_clean_committed = target_clean
+        target_cf_committed    = target_cf
         if getattr(self, "ode_nextrung_targets", False):
             target_clean = self._nextrung_targets(
                 trajectory_clean, target_clean, noisy_clean, pool_idx_clean)
@@ -1519,6 +1806,15 @@ class ODERegression(nn.Module):
         clean_x_cf_in = (clean_x_gt_cf.to(dtype)
                          if clean_x_gt_cf is not None else clean_x_in)
         clean_x_pack = torch.cat([clean_x_in,   clean_x_cf_in], dim=0)
+        if self.ode_action_cfg_dropout > 0.0:
+            _keep = (torch.rand(z_noisy_c.shape[0], 1, 1,
+                                device=z_noisy_c.device)
+                     >= self.ode_action_cfg_dropout).to(z_noisy_c.dtype)
+            z_noisy_c = z_noisy_c * _keep
+            _keep_cf = (torch.rand(z_noisy_cfc.shape[0], 1, 1,
+                                   device=z_noisy_cfc.device)
+                        >= self.ode_action_cfg_dropout).to(z_noisy_cfc.dtype)
+            z_noisy_cfc = z_noisy_cfc * _keep_cf
         z_noisy_pack = torch.cat([z_noisy_c,    z_noisy_cfc],  dim=0)
         z_clean_pack = torch.cat([z_clean_c,    z_clean_c],    dim=0)
         noisy_pack   = torch.cat([noisy_clean,  noisy_cf],     dim=0)
@@ -1572,6 +1868,217 @@ class ODERegression(nn.Module):
                 pred_cf[:, -_nfb:],    target_cf[:, -_nfb:].to(dtype),
                 t_cf[:, -_nfb:],
             )
+            if self.ode_moment_loss_weight > 0.0:
+                # Per-channel moments over (frames, H, W) of the target
+                # block; grad flows through pred only.
+                def _mml(p, tgt):
+                    pf = p.to(torch.float32)
+                    tf = tgt.to(torch.float32)
+                    dims = (1, 3, 4)
+                    dmu = pf.mean(dim=dims) - tf.mean(dim=dims)
+                    dsd = pf.std(dim=dims) - tf.std(dim=dims)
+                    return (dmu.pow(2).mean() + dsd.pow(2).mean()).to(dtype)
+                if getattr(self.config, "ode_moment_ref", "target") == "committed":
+                    _mm_c = _mml(pred_clean[:, -_nfb:], target_clean_committed[:, -_nfb:])
+                    _mm_f = _mml(pred_cf[:, -_nfb:],    target_cf_committed[:, -_nfb:])
+                else:
+                    _mm_c = _mml(pred_clean[:, -_nfb:], target_clean[:, -_nfb:])
+                    _mm_f = _mml(pred_cf[:, -_nfb:],    target_cf[:, -_nfb:])
+                ode_loss_clean = ode_loss_clean + self.ode_moment_loss_weight * _mm_c
+                ode_loss_cf    = ode_loss_cf    + self.ode_moment_loss_weight * _mm_f
+            if self.ode_noiserep_loss_weight > 0.0:
+                # ALWAYS-ON inverse-square repulsor from the gaussian
+                # signature (mu=0, sigma=1): L = w / D with D = the
+                # SQUARED signature distance, so the repulsion grows as
+                # 1/d^2 the closer the prediction sits to the noise
+                # point and never switches off (user-specified form).
+                def _sigdist2(x):
+                    xf = x.to(torch.float32)
+                    mu = xf.mean(dim=(1, 3, 4))
+                    sd = xf.std(dim=(1, 3, 4))
+                    return (mu.pow(2).sum(dim=1)
+                            + (sd - 1.0).pow(2).sum(dim=1)).clamp(min=1e-4)
+                _rep = ((1.0 / _sigdist2(pred_clean[:, -_nfb:])).mean()
+                        + (1.0 / _sigdist2(pred_cf[:, -_nfb:])).mean())
+                ode_loss_clean = ode_loss_clean + self.ode_noiserep_loss_weight * (_rep / 2.0).to(dtype)
+            if (self.ode_emdrep_loss_weight > 0.0
+                    or self.ode_emdrep_delta_weight > 0.0
+                    or self.ode_emdhead_weight > 0.0
+                    or self.ode_emdhead_delta_weight > 0.0):
+                def _emd2(x):
+                    # Squared per-channel 1-D W2 to N(0,1), summed over
+                    # channels: sort values over (frames, H, W), match
+                    # against standard-normal quantiles. Exact 1-D OT;
+                    # differentiable through the sort.
+                    xf = x.to(torch.float32)
+                    b, f, c, h, w = xf.shape
+                    v = xf.permute(0, 2, 1, 3, 4).reshape(b, c, -1)
+                    v, _ = v.sort(dim=-1)
+                    n = v.shape[-1]
+                    if (self._emd_quantiles is None
+                            or self._emd_quantiles.shape[0] != n
+                            or self._emd_quantiles.device != v.device):
+                        p = (torch.arange(n, device=v.device,
+                                          dtype=torch.float32) + 0.5) / n
+                        self._emd_quantiles = (
+                            torch.erfinv(2.0 * p - 1.0) * (2.0 ** 0.5))
+                    q = self._emd_quantiles
+                    return (v - q).pow(2).mean(dim=-1).sum(dim=1) \
+                        .clamp(min=1e-4)
+                # Commit-rung masks: True where the sample's rung is the
+                # final one (t=208.33), i.e. where pred_x0 IS the chunk
+                # the 4-rung sampler would commit.
+                _cm_c = t_clean[:, -1] < 250.0
+                _cm_f = t_cf[:, -1] < 250.0
+                def _msel(x, m):
+                    return x[m] if self.ode_emdrep_commit_only else x
+                if self.ode_emdrep_loss_weight > 0.0:
+                    # v1: inverse-square EMD repulsor (commit-only when
+                    # ode_emdrep_commit_only; else every rung).
+                    _terms = []
+                    for _pp, _mm in ((pred_clean[:, -_nfb:], _cm_c),
+                                     (pred_cf[:, -_nfb:], _cm_f)):
+                        _ps = _msel(_pp, _mm)
+                        if _ps.shape[0] > 0:
+                            _terms.append((1.0 / _emd2(_ps)).mean())
+                    if _terms:
+                        _er = sum(_terms) / len(_terms)
+                        ode_loss_clean = ode_loss_clean \
+                            + self.ode_emdrep_loss_weight * _er.to(dtype)
+                if self.ode_emdrep_delta_weight > 0.0:
+                    # v2: penalize contraction of d across chunks. d_prev
+                    # from the COMMITTED context chunk directly preceding
+                    # the target block (constant — grad flows only
+                    # through the current chunk's d).
+                    _eps = self.ode_emdrep_delta_eps
+                    _terms = []
+                    for _pp, _tc, _mm in (
+                            (pred_clean[:, -_nfb:],
+                             target_clean_committed[:, -2 * _nfb:-_nfb], _cm_c),
+                            (pred_cf[:, -_nfb:],
+                             target_cf_committed[:, -2 * _nfb:-_nfb], _cm_f)):
+                        _ps = _msel(_pp, _mm)
+                        if _ps.shape[0] == 0:
+                            continue
+                        with torch.no_grad():
+                            _dp = _emd2(_msel(_tc, _mm)).sqrt()
+                        _dd = (_emd2(_ps).sqrt() - _dp).clamp(min=_eps)
+                        _terms.append((1.0 / _dd).mean())
+                    if _terms:
+                        _ed = sum(_terms) / len(_terms)
+                        ode_loss_clean = ode_loss_clean \
+                            + self.ode_emdrep_delta_weight * _ed.to(dtype)
+            if self.ode_gexcl_weight > 0.0:
+                # Bounded gaussian exclusion zone on the COMMITTED chunk
+                # (commit clock: applied where the statistic exists).
+                _cmg_c = t_clean[:, -1] < 250.0
+                _cmg_f = t_cf[:, -1] < 250.0
+                _band = self.ode_gexcl_band
+                _gt = []
+                for _pp, _tt, _mm in (
+                        (pred_clean[:, -_nfb:],
+                         target_clean_committed[:, -_nfb:], _cmg_c),
+                        (pred_cf[:, -_nfb:],
+                         target_cf_committed[:, -_nfb:], _cmg_f)):
+                    if int(_mm.sum()) == 0:
+                        continue
+                    _p = _pp[_mm].to(torch.float32)
+                    with torch.no_grad():
+                        _sd_t = _tt[_mm].to(torch.float32).std(
+                            dim=(1, 3, 4)).clamp(min=1e-6)
+                    _lr = (_p.std(dim=(1, 3, 4)).clamp(min=1e-6) / _sd_t).log()
+                    # squared hinge OUTSIDE [-band, +band]; exactly zero
+                    # loss and zero gradient inside -> satisfiable.
+                    _gt.append((((-_band) - _lr).clamp(min=0).pow(2)
+                                + (_lr - _band).clamp(min=0).pow(2)
+                                ).sum(dim=1).mean())
+                if _gt:
+                    ode_loss_clean = ode_loss_clean + self.ode_gexcl_weight \
+                        * (sum(_gt) / len(_gt)).to(dtype)
+            if self.ode_edist_weight > 0.0:
+                _ed_loss = self._energy_distance_loss(
+                    pred_clean[:, -_nfb:], target_clean_committed[:, -_nfb:],
+                    pred_cf[:, -_nfb:], target_cf_committed[:, -_nfb:],
+                    t_clean[:, -1], t_cf[:, -1])
+                if _ed_loss is not None:
+                    ode_loss_clean = ode_loss_clean \
+                        + self.ode_edist_weight * _ed_loss.to(dtype)
+            if (self.ode_emdhead_weight > 0.0
+                    or self.ode_emdhead_delta_weight > 0.0):
+                # Zero-init transport head: EMD objectives on the head-
+                # corrected DETACHED commit-rung prediction. Flow map is
+                # untouched; only s,b learn. The 0.0* touch guarantees
+                # head grads exist on EVERY rank each step (manual DDP
+                # all-reduce would desync otherwise).
+                _cm_c = t_clean[:, -1] < 250.0
+                _cm_f = t_cf[:, -1] < 250.0
+                _hs = self.emd_head_scale.to(torch.float32)
+                _hb = self.emd_head_shift.to(torch.float32)
+                def _hcorr(x):
+                    return (x.to(torch.float32)
+                            * (1.0 + _hs.view(1, 1, -1, 1, 1))
+                            + _hb.view(1, 1, -1, 1, 1))
+                _hterms = []
+                for _pp, _tc, _mm in (
+                        (pred_clean[:, -_nfb:],
+                         target_clean_committed[:, -2 * _nfb:-_nfb], _cm_c),
+                        (pred_cf[:, -_nfb:],
+                         target_cf_committed[:, -2 * _nfb:-_nfb], _cm_f)):
+                    if int(_mm.sum()) == 0:
+                        continue
+                    _base = _pp[_mm].detach()
+                    _ch = _hcorr(_base)
+                    if self.ode_emdhead_objective == "deadband":
+                        _dims = (1, 3, 4)
+                        with torch.no_grad():
+                            _prev = _tc[_mm].to(torch.float32)
+                            _sd_r = _prev.std(dim=_dims).clamp(min=1e-6)
+                            _mu_r = _prev.mean(dim=_dims)
+                        _lr = (_ch.std(dim=_dims).clamp(min=1e-6)
+                               / _sd_r).log()
+                        _lsd = ((-_lr).clamp(min=0).pow(2)
+                                + (_lr - self.ode_emdhead_band_hi)
+                                .clamp(min=0).pow(2)).sum(dim=1).mean()
+                        _lmu = ((_ch.mean(dim=_dims) - _mu_r).abs()
+                                - self.ode_emdhead_mu_band) \
+                            .clamp(min=0).pow(2).sum(dim=1).mean()
+                        _lid = (_ch - _base.to(torch.float32)).pow(2).mean()
+                        _hterms.append(
+                            self.ode_emdhead_weight * (_lsd + _lmu)
+                            + self.ode_emdhead_id_weight * _lid)
+                        continue
+                    _d2 = _emd2(_ch)
+                    if self.ode_emdhead_weight > 0.0:
+                        _hterms.append(
+                            self.ode_emdhead_weight * (1.0 / _d2).mean())
+                    if self.ode_emdhead_delta_weight > 0.0:
+                        with torch.no_grad():
+                            _dp = _emd2(_tc[_mm]).sqrt()
+                        _dd = (_d2.sqrt() - _dp).clamp(
+                            min=self.ode_emdrep_delta_eps)
+                        _hterms.append(
+                            self.ode_emdhead_delta_weight * (1.0 / _dd).mean())
+                _htouch = 0.0 * (_hs.sum() + _hb.sum())
+                ode_loss_clean = ode_loss_clean \
+                    + (_htouch + (sum(_hterms) if _hterms else 0.0)).to(dtype)
+            if self.ode_actdelta_loss_weight > 0.0:
+                _dp = (pred_clean[:, -_nfb:].to(torch.float32)
+                       - pred_cf[:, -_nfb:].to(torch.float32))
+                _dt = (target_clean_committed[:, -_nfb:].to(torch.float32)
+                       - target_cf_committed[:, -_nfb:].to(torch.float32))
+                _num = (_dp - _dt).flatten(1).norm(dim=1)
+                _den = _dt.flatten(1).norm(dim=1) + 1e-6
+                _ad = (_num / _den).pow(2).mean().to(dtype)
+                ode_loss_clean = ode_loss_clean + self.ode_actdelta_loss_weight * _ad
+            if self.ode_sep_loss_weight > 0.0:
+                _pc = pred_clean[:, -_nfb:].to(torch.float32)
+                _pf = pred_cf[:, -_nfb:].to(torch.float32)
+                _tc = target_clean_committed[:, -_nfb:].to(torch.float32)
+                _tf_ = target_cf_committed[:, -_nfb:].to(torch.float32)
+                _dp = (_pc - _pf).flatten(1).norm(dim=1)
+                _dt = (_tc - _tf_).flatten(1).norm(dim=1)
+                _sep = ((_dp - _dt) / (_dt + 1e-6)).pow(2).mean().to(dtype)
+                ode_loss_clean = ode_loss_clean + self.ode_sep_loss_weight * _sep
         else:
             ode_loss_clean = self._compute_ode_loss(
                 pred_clean, target_clean.to(dtype), t_clean,
@@ -1767,10 +2274,32 @@ class ODERegression(nn.Module):
         else:
             flow_norm = 0.0
 
+        # PER-SAMPLE cf error for the hard-direction curriculum: the same
+        # masked-frame squared error the ODE loss averages, but kept
+        # per batch element so the trainer can attribute difficulty to
+        # this (context, target-chunk, DIRECTION) triple. Always emitted
+        # (cheap); the trainer ignores it unless the curriculum is on.
+        with torch.no_grad():
+            if getattr(self, "ode_chunked_supervision", False):
+                _nfb_e = self.num_frame_per_block
+                _pe = pred_cf[:, -_nfb_e:].float()
+                _te = target_cf[:, -_nfb_e:].float().to(_pe.device)
+                _per_sample_err = (_pe - _te).pow(2).mean(dim=(1, 2, 3, 4))
+            else:
+                _per_sample_err = (pred_cf.float() - target_cf.float()
+                                   ).pow(2).flatten(1).mean(dim=1)
+
         log_dict: Dict[str, Any] = {
             # ODE losses
             "ode_loss_clean": ode_loss_clean.detach(),
             "ode_loss_cf":    ode_loss_cf.detach(),
+            "per_sample_err_cf": _per_sample_err.detach(),
+            # The rung this sample was drawn at. The raw error is dominated
+            # by WHICH RUNG was sampled (t=1000 errors dwarf t=208 ones),
+            # not by which direction is hard, so the curriculum MUST divide
+            # by a per-rung reference before ranking directions — otherwise
+            # "hardest direction" just means "unluckiest timestep draw".
+            "per_sample_rung_cf": t_cf[:, -1].detach(),
             # On-policy teacher supervision (zeros when disabled)
             "ode_teachersup_clean": ts_sup_clean.detach(),
             "ode_teachersup_cf":    ts_sup_cf.detach(),

@@ -72,10 +72,12 @@ NFB = 3
 # constant (throttle, steer) on generated frames, |z| = 0.5 like flow_record.
 _M = 0.5; _D = _M / (2 ** 0.5)
 COMPASS = {"cF": (_M, 0.0), "cFR": (_D, _D), "cR": (0.0, _M), "cBR": (-_D, _D),
-           "cB": (-_M, 0.0), "cBL": (-_D, -_D), "cL": (0.0, -_M), "cFL": (_D, -_D)}
+           "cB": (-_M, 0.0), "cBL": (-_D, -_D), "cL": (0.0, -_M), "cFL": (_D, -_D),
+           "cN": (0.0, 0.0)}
 _VSETS = {"gt": ["gt"], "flip2": ["gt", "flip"],
           "dir4": ["gt", "flip", "cL", "cR"],
-          "dir8": ["c" + d for d in ("F", "FR", "R", "BR", "B", "BL", "L", "FL")]}
+          "dir8": ["c" + d for d in ("F", "FR", "R", "BR", "B", "BL", "L", "FL")],
+          "dir8n": ["c" + d for d in ("F", "FR", "R", "BR", "B", "BL", "L", "FL", "N")]}
 VARIANTS = _VSETS[os.environ.get("GL_VARIANT", "flip2")]
 
 
@@ -83,7 +85,15 @@ def main():
     from trainer.causal_diffusion_teacher_train import CausalLoRADiffusionTrainer
     from utils.causal_chain_rollout import stream_causal_chain
     from utils.zarr_dataset import ZarrRideDataset
-    from gen_lmdb import apply_counterfactual, window_noise_seed
+    from gen_lmdb import apply_counterfactual, window_noise_seed as _wns
+    # GL_NOISE_VARIANT=k (k>=1): generate an ADDITIONAL noise realization of
+    # every chain — same context, same actions, different seed — stored under
+    # a suffixed ride id ({ts}ns{k}) so the chunked dataset ingests it as an
+    # independent chain. Multi-noise supervision makes noise->future routing
+    # learnable (single-noise data makes mean-prediction optimal).
+    _NV = int(os.environ.get("GL_NOISE_VARIANT", "0"))
+    def window_noise_seed(ts_id, off):
+        return _wns(ts_id, off) + 90001 * _NV
 
     os.makedirs(OUT, exist_ok=True)
     cfg = OmegaConf.merge(OmegaConf.load(f"{ARR}/configs/default_config.yaml"),
@@ -153,6 +163,8 @@ def main():
     for w in windows:
         zp, off = w["zarr_path"], int(w.get("offset", w.get("start")))
         ts_id = os.path.basename(zp).replace(".zarr", "")
+        if int(os.environ.get("GL_NOISE_VARIANT", "0")):
+            ts_id = f"{ts_id}ns{os.environ['GL_NOISE_VARIANT']}"
         cap = min(n_lat_by_zarr.get(zp, 0), int(w.get("n_latent_frames", 1 << 30)))
         if zp not in pe_by_zarr or off + tot_f > cap:
             n_skipped += 1

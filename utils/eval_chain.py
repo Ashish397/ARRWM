@@ -474,6 +474,14 @@ class ChainPipeline:
         """Load v12 critic weights once per process (CPU cache), build module on this GPU."""
         global _SHARED_V12_ACTION_CRITIC_SD
         if _SHARED_V12_ACTION_CRITIC_SD is None:
+            if not os.path.exists(EVAL_ACTION_CRITIC_CKPT):
+                # z_critic_v12 was removed in the 2026-08-02 checkpoint
+                # decimation; the shared critic readout is optional
+                # (flow probes never consume it) — disable gracefully.
+                log.warning("[%s] Shared eval critic ckpt missing (%s); "
+                            "critic bars disabled.", self.device,
+                            EVAL_ACTION_CRITIC_CKPT)
+                return
             log.info("[%s] Loading shared eval critic from %s", self.device, EVAL_ACTION_CRITIC_CKPT)
             blob = torch.load(
                 EVAL_ACTION_CRITIC_CKPT, map_location="cpu", weights_only=False,

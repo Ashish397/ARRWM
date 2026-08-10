@@ -894,10 +894,72 @@ class ODEChainPipeline(ChainPipeline):
                         current_start=current_start_frame * frame_seq_length,
                     )
                 pred_x0 = out[1]
+                _acfg = float(os.environ.get("ODE_ACTION_CFG", "0") or 0)
+                if _acfg and _acfg != 1.0:
+                    # Action classifier-free guidance: second forward with
+                    # the NULL (no-op, z=0) action, extrapolate the action
+                    # effect: pred = pred_null + s * (pred_act - pred_null).
+                    # Meaningful when trained with action-cfg dropout.
+                    if "_cfg_null_cond" not in locals() or _cfg_null_cond_frame != cur_frame_lo:
+                        _null_fa = torch.zeros_like(block_fa)
+                        _cfg_null_cond = self._build_action_cond_chunk(
+                            prompt_embeds_dev, _null_fa,
+                            num_frames=num_frame_per_block)
+                        _cfg_null_cond_frame = cur_frame_lo
+                    with torch.amp.autocast("cuda", dtype=self.dtype):
+                        out_n = self.wrapper(
+                            noisy_image_or_video=x,
+                            conditional_dict=_cfg_null_cond,
+                            timestep=tt,
+                            kv_cache=kv_cache,
+                            crossattn_cache=crossattn_cache,
+                            current_start=current_start_frame * frame_seq_length,
+                        )
+                    pred_x0 = out_n[1] + _acfg * (pred_x0 - out_n[1])
                 if _fr_dir:                        # x0 prediction at this rung
                     _fr_steps.append((step_idx, d_idx, t_val,
                                       pred_x0.detach().float().to(torch.float16).cpu().numpy()))
-                if d_idx < int(ts.shape[0]) - 1:
+                _samp = os.environ.get("ODE_SAMPLER", "euler").lower()
+                if _samp in ("midpoint", "heun") and d_idx < int(ts.shape[0]) - 1:
+                    # Higher-order DETERMINISTIC flow step between rungs
+                    # instead of the x0-restart re-noise. Velocity is
+                    # derived from the model's own x0 prediction,
+                    #     x_s = (1-s) x0 + s eps  =>  v = dx/ds = (x-x0)/s,
+                    # so this is independent of the wrapper's flow-pred
+                    # sign convention. Costs one extra forward per rung.
+                    next_t = float(ts[d_idx + 1].item())
+                    s_a, s_b = t_val / 1000.0, next_t / 1000.0
+                    _xa = x.float()
+                    _va = (_xa - pred_x0.float()) / max(s_a, 1e-6)
+
+                    def _pred_at(_xin, _tv):
+                        _tt = torch.full([B, num_frame_per_block], _tv,
+                                         device=self.device, dtype=torch.float32)
+                        with torch.amp.autocast("cuda", dtype=self.dtype):
+                            _o = self.wrapper(
+                                noisy_image_or_video=_xin.to(self.dtype),
+                                conditional_dict=cond,
+                                timestep=_tt,
+                                kv_cache=kv_cache,
+                                crossattn_cache=crossattn_cache,
+                                current_start=current_start_frame * frame_seq_length,
+                            )
+                        return _o[1].float()
+
+                    if _samp == "midpoint":
+                        s_m = 0.5 * (s_a + s_b)
+                        _xm = _xa + (s_m - s_a) * _va
+                        _vm = (_xm - _pred_at(_xm, s_m * 1000.0)) / max(s_m, 1e-6)
+                        _xb = _xa + (s_b - s_a) * _vm
+                    else:                                  # heun (trapezoid)
+                        _xe = _xa + (s_b - s_a) * _va
+                        _ve = (_xe - _pred_at(_xe, next_t)) / max(s_b, 1e-6)
+                        _xb = _xa + (s_b - s_a) * 0.5 * (_va + _ve)
+                    x = _xb.to(self.dtype)
+                    if _fr_dir:
+                        _fr_steps.append((step_idx, d_idx, -next_t,
+                                          x.detach().float().to(torch.float16).cpu().numpy()))
+                elif d_idx < int(ts.shape[0]) - 1:
                     next_t = float(ts[d_idx + 1].item())
                     flat = pred_x0.flatten(0, 1).float()
                     if _fr_dir and os.environ.get("ODE_FLOW_DET"):
@@ -925,7 +987,54 @@ class ODEChainPipeline(ChainPipeline):
             assert pred_x0 is not None
 
             _sl_mode = os.environ.get("ODE_STAT_LOCK")
-            if _sl_mode == "hyb" and _sl_ref is not None:
+            if _sl_mode == "repnudge":
+                # Closed-form gaussian-signature repulsor at serve: one
+                # gradient step of the inverse-square potential in moment
+                # coordinates. D = ||mu||^2 + ||sigma-1||^2; update
+                # mu *= 1 + 2*eta/D^2, sigma += 2*eta*(sigma-1)/D^2 —
+                # strength grows as the state nears the noise signature.
+                _eta = float(os.environ.get("ODE_REPNUDGE_ETA", "0.5"))
+                _p = pred_x0.to(torch.float32)
+                _mu = _p.mean(dim=(0, 1, 3, 4))
+                _sd = _p.std(dim=(0, 1, 3, 4))
+                _D = (_mu.pow(2).sum() + (_sd - 1.0).pow(2).sum()).clamp(min=1e-3)
+                _g = 2.0 * _eta / _D.pow(2)
+                _mu2 = _mu * (1.0 + _g)
+                _sd2 = (_sd + _g * (_sd - 1.0)).clamp(min=1e-4)
+                _muv = _mu.view(1, 1, -1, 1, 1)
+                pred_x0 = (
+                    (_p - _muv) / (_sd.view(1, 1, -1, 1, 1) + 1e-6)
+                    * _sd2.view(1, 1, -1, 1, 1) + _mu2.view(1, 1, -1, 1, 1)
+                ).to(pred_x0.dtype)
+            elif _sl_mode == "chroma" and _sl_ref is not None:
+                # Chroma-subspace lock (lit-review-guided): correct latent
+                # channel MEANS only along the fitted decoder-visible
+                # chroma directions (Cb/Cr; R^2 ~0.96), leaving the ~14
+                # motion/luminance-carrying mean directions untouched.
+                # Per-channel std pinned to seed (proven motion-safe).
+                if not hasattr(self, "_chroma_map"):
+                    import numpy as _np
+                    _cz = _np.load(os.environ.get(
+                        "ODE_SL_CHROMA",
+                        "/scratch/u6ex/as1748.u6ex/ARRWM/analysis/"
+                        "eval_final/flow_viz/chroma_subspace.npz"))
+                    _Mc = torch.from_numpy(_cz["Mc"]).float()      # [2,16]
+                    self._chroma_map = (
+                        _Mc.to(self.device),
+                        torch.linalg.pinv(_Mc).to(self.device))    # [16,2]
+                _Mc, _Mp = self._chroma_map
+                _p = pred_x0.to(torch.float32)
+                _mu = _p.mean(dim=(0, 1, 3, 4))                    # [16]
+                _sd = _p.std(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1)
+                _mu_ref = _sl_ref[0]
+                # move means only along chroma pseudo-inverse directions
+                _dmu = (_Mp @ (_Mc @ (_mu_ref - _mu))).view(1, 1, -1, 1, 1)
+                pred_x0 = (
+                    (_p - _p.mean(dim=(0, 1, 3, 4)).view(1, 1, -1, 1, 1))
+                    / (_sd + 1e-6) * _sl_ref[1].view(1, 1, -1, 1, 1)
+                    + _mu.view(1, 1, -1, 1, 1) + _dmu
+                ).to(pred_x0.dtype)
+            elif _sl_mode == "hyb" and _sl_ref is not None:
                 # Hybrid: hard-pin per-channel STD to the seed anchor
                 # (contrast is where the contraction is visible and is
                 # near-stationary in GT) but leave channel MEANS free with
@@ -961,6 +1070,106 @@ class ODEChainPipeline(ChainPipeline):
                     * _sl_ref[1].view(1, 1, -1, 1, 1)
                     + _sl_ref[0].view(1, 1, -1, 1, 1)
                 ).to(pred_x0.dtype)
+
+            if os.environ.get("ODE_GEXCL"):
+                # AXIS 2 at serve: BOUNDED gaussian exclusion on the
+                # committed chunk. Push the moment vector radially away
+                # from the gaussian signature only while it is inside r0,
+                # and never past r0 — so unlike the inverse-square
+                # repnudge there is no unbounded expansion.
+                _eta = float(os.environ["ODE_GEXCL"])
+                _r0 = float(os.environ.get("ODE_GEXCL_R0", "1.0"))
+                _p = pred_x0.to(torch.float32)
+                _mu = _p.mean(dim=(0, 1, 3, 4))
+                _sd = _p.std(dim=(0, 1, 3, 4))
+                _dev = torch.cat([_mu, _sd - 1.0])
+                _d = _dev.norm().clamp(min=1e-6)
+                if float(_d) < _r0:
+                    _dt = min(_r0, float(_d) * (1.0 + _eta))
+                    _k = _dt / float(_d)
+                    _mu2 = _mu * _k
+                    _sd2 = (1.0 + (_sd - 1.0) * _k).clamp(min=1e-4)
+                    pred_x0 = (
+                        (_p - _mu.view(1, 1, -1, 1, 1))
+                        / (_sd.view(1, 1, -1, 1, 1) + 1e-6)
+                        * _sd2.view(1, 1, -1, 1, 1)
+                        + _mu2.view(1, 1, -1, 1, 1)
+                    ).to(pred_x0.dtype)
+
+            if os.environ.get("ODE_EMDHEAD"):
+                # Zero-init LEARNED transport head (AdaLN-zero analog):
+                # per-channel affine y = x*(1+s)+b trained at commit-rung
+                # by the EMD objectives (ode_emdhead_* arms); applied to
+                # every committed chunk before emission + cache refresh.
+                if not hasattr(self, "_emdhead_sb"):
+                    _hck = torch.load(os.environ["ODE_EMDHEAD_CKPT"],
+                                      map_location="cpu")
+                    _eh = _hck.get("emd_head")
+                    if _eh is None:
+                        raise RuntimeError(
+                            "ODE_EMDHEAD set but checkpoint has no emd_head")
+                    self._emdhead_sb = (
+                        _eh["scale"].float().to(self.device),
+                        _eh["shift"].float().to(self.device))
+                    log.info("[AR] EMD head loaded: scale %s shift %s",
+                             self._emdhead_sb[0].tolist(),
+                             self._emdhead_sb[1].tolist())
+                _es, _eb = self._emdhead_sb
+                _p = pred_x0.to(torch.float32)
+                pred_x0 = (_p * (1.0 + _es.view(1, 1, -1, 1, 1))
+                           + _eb.view(1, 1, -1, 1, 1)).to(pred_x0.dtype)
+
+            if os.environ.get("ODE_EMDREMAP"):
+                # Closed-form serve-time EMD transport: per-channel
+                # monotone quantile remap of the committed chunk toward
+                # the REAL seed context's quantile profile (exact 1-D OT
+                # map, blend lambda in [0,1]). Chunk-clock by
+                # construction — applied where d exists, flow map never
+                # touched.
+                _lamenv = os.environ["ODE_EMDREMAP"]
+                _p = pred_x0.to(torch.float32)
+                _B, _F, _C, _H, _W = _p.shape
+                _v = _p.permute(2, 0, 1, 3, 4).reshape(_C, -1)
+                if (not hasattr(self, "_emdremap_ref")
+                        or self._emdremap_ref.shape[1] != _v.shape[1]):
+                    _r = initial_latents_dev.to(torch.float32)
+                    _rv = _r.permute(2, 0, 1, 3, 4).reshape(_C, -1)
+                    _n = _v.shape[1]
+                    _pq = (torch.arange(_n, device=_v.device,
+                                        dtype=torch.float32) + 0.5) / _n
+                    self._emdremap_ref = torch.quantile(
+                        _rv, _pq, dim=1).T.contiguous()
+                    self._emdremap_refsd = _rv.std(dim=1)
+                # Optional per-channel action-sensitivity protection
+                # (lit-review 2026-08-07): scale correction inversely
+                # with each channel's measured same-context action-fan
+                # variance so action-carrying channels are remapped less.
+                if (os.environ.get("ODE_EMDREMAP_ASENS")
+                        and not hasattr(self, "_emdremap_asens")):
+                    import numpy as _np
+                    self._emdremap_asens = torch.from_numpy(
+                        _np.load(os.environ["ODE_EMDREMAP_ASENS"])["w"]
+                    ).float().to(_v.device).view(_C, 1)
+                if _lamenv.startswith("auto"):
+                    # Adaptive per-channel blend: strength proportional to
+                    # the channel's measured contraction deficit vs the
+                    # seed reference — healthy channels untouched, fully
+                    # collapsed channels fully remapped. auto[:eta]
+                    # scales the response (default 1).
+                    _eta = float(_lamenv.split(":")[1]) \
+                        if ":" in _lamenv else 1.0
+                    _sd_c = _v.std(dim=1).clamp(min=1e-6)
+                    _lam = ((self._emdremap_refsd / _sd_c - 1.0) * _eta) \
+                        .clamp(0.0, 1.0).view(_C, 1)
+                else:
+                    _lam = float(_lamenv)
+                if hasattr(self, "_emdremap_asens"):
+                    _lam = _lam * self._emdremap_asens
+                _srt, _idx = _v.sort(dim=1)
+                _blend = (1.0 - _lam) * _srt + _lam * self._emdremap_ref
+                _out = torch.empty_like(_v).scatter_(1, _idx, _blend)
+                pred_x0 = (_out.view(_C, _B, _F, _H, _W)
+                           .permute(1, 2, 0, 3, 4).to(pred_x0.dtype))
 
             generated.append(pred_x0.detach().to(torch.float32))
 

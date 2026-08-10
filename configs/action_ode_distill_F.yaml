@@ -56,7 +56,10 @@ ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
 # this stage — ``load_teacher_checkpoint`` raises loudly if this path is
 # invalid or missing the 'lora' key.
 # ODE-F: distill the FIXED v14d teacher (stationary + backward work), not v14.
-generator_ckpt: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14d_critic8_natural/causal_lora_step0002150.pt
+# v14d_critic8_natural@2150 was removed in the 2026-08-02 checkpoint
+# decimation. All 14e pilot drivers override generator_ckpt on the CLI;
+# this default now points at the surviving 14e teacher.
+generator_ckpt: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14e_pca8_raw/causal_lora_step0005000.pt
 
 # ---- Data ----
 # ODE-F: regenerated from the v14d teacher on the NATURAL-motion + backward pool

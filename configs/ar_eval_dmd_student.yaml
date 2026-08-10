@@ -55,7 +55,10 @@ ss_vae_checkpoint: action_query/checkpoints/ss_vae_8free.pt
 # checkpoint. Re-initialising from a fresh Wan2.1 base is never desired at
 # this stage — ``load_teacher_checkpoint`` raises loudly if this path is
 # invalid or missing the 'lora' key.
-generator_ckpt: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14_balanced_weunz/causal_lora_step0006600.pt
+# v14_balanced_weunz@6600 was removed in the 2026-08-02 checkpoint
+# decimation; this init is structural only (FR_CKPT overwrites all
+# weights), so the surviving 14e teacher is a drop-in.
+generator_ckpt: /scratch/u6ex/as1748.u6ex/ARRWM/logs/v14e_pca8_raw/causal_lora_step0005000.pt
 
 # ---- Data ----
 clean_root:   /projects/u6ex/fbots/frodobots_lmdb/v14

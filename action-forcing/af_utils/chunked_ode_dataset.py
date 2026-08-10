@@ -53,14 +53,53 @@ class ChunkedODEDataset(Dataset):
             m = re.match(r"(.+_o\d{5})_([a-zA-Z0-9]+)\.pt$", os.path.basename(f))
             if m:
                 groups.setdefault(m.group(1), []).append(f)
-        self.samples = []                  # (clean_file, cf_file, target_chunk)
+        # ODE_RANDOM_CF=1: sample the counterfactual branch uniformly at
+        # random per __getitem__ instead of a fixed round-robin pairing.
+        # With a multi-action LMDB (e.g. dir4) this matches ALL pairwise
+        # action distances of the fan in expectation over steps — the
+        # action-distribution form of the separation loss.
+        self.random_cf = bool(os.environ.get("ODE_RANDOM_CF"))
+        # ODE_ALLDIR=1: emit ONE sample PER cf-variant, consecutively, and
+        # record group boundaries — with the trainer's grouped batch
+        # sampler every optimizer step then contains ALL directions of one
+        # (context, target-chunk) simultaneously.
+        self.alldir = bool(os.environ.get("ODE_ALLDIR"))
+        self.samples = []                  # (clean_file, cf_file, chunk, [pool])
+        self.group_sizes = []
+        # Curriculum bookkeeping: which DIRECTION each sample trains and
+        # which group (context, target-chunk) it belongs to. Used by the
+        # hard-direction sampler to re-select per group after epoch 1.
+        self.sample_dir = []               # e.g. "cF" / "cBL" / "gt"
+        self.sample_group = []             # group index
         for key, files in sorted(groups.items()):
             gt = [f for f in files if f.endswith("_gt.pt")]
-            clean = gt[0] if gt else files[0]
+            # No GT chain (pure-compass sets): prefer the NO-OP chain as the
+            # clean side so every pair is (no-op, action) and the full 8-dir
+            # fan stays trained (dir8n); else fall back to the first file.
+            noop = [f for f in files if f.endswith("_cN.pt")]
+            clean = gt[0] if gt else (noop[0] if noop else files[0])
             others = [f for f in files if f != clean]
             for i, c in enumerate(TARGETS):
-                cf = others[i % len(others)] if others else clean
-                self.samples.append((clean, cf, c))
+                if self.alldir and others:
+                    grp = list(others)
+                    if os.environ.get("ODE_ALLDIR_PAD8") and len(grp) == 7:
+                        grp = grp + [clean]     # pad to 8 with the clean pair
+                    gidx = len(self.group_sizes)
+                    for cf in grp:
+                        self.samples.append((clean, cf, c, others))
+                        self.sample_dir.append(
+                            re.sub(r".*_([a-zA-Z0-9]+)\.pt$", r"\1",
+                                   os.path.basename(cf)))
+                        self.sample_group.append(gidx)
+                    self.group_sizes.append(len(grp))
+                else:
+                    cf = others[i % len(others)] if others else clean
+                    self.samples.append((clean, cf, c, others if others else [clean]))
+                    self.sample_dir.append(
+                        re.sub(r".*_([a-zA-Z0-9]+)\.pt$", r"\1",
+                               os.path.basename(cf)))
+                    self.sample_group.append(len(self.group_sizes))
+                    self.group_sizes.append(1)
 
     def __len__(self):
         return len(self.samples)
@@ -93,7 +132,10 @@ class ChunkedODEDataset(Dataset):
         return traj_win, clean_x, frame_lo
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        clean_f, cf_f, c = self.samples[idx]
+        clean_f, cf_f, c, cf_pool = self.samples[idx]
+        if self.random_cf and len(cf_pool) > 1:
+            import random as _rnd
+            cf_f = _rnd.choice(cf_pool)
         cpt = torch.load(clean_f, map_location="cpu", weights_only=False)
         fpt = cpt if (cf_f == clean_f) else \
             torch.load(cf_f, map_location="cpu", weights_only=False)
@@ -117,6 +159,7 @@ class ChunkedODEDataset(Dataset):
             "clean_x_gt": clean_x,
             "clean_x_gt_cf": clean_x_cf,
             "prompt_embeds": self.prompt_loader(ride_ts),
+            "sample_idx": torch.tensor(int(idx), dtype=torch.long),
             "meta": {"filename": os.path.basename(clean_f), "ride_ts": ride_ts,
                      "window_offset": off, "target_chunk": c,
                      "noise_seed": int(cpt["noise_seed"]), "zarr_path": zp,

@@ -32,7 +32,10 @@ OUT = os.environ.get("FR_OUT", f"{ARR}/analysis/eval_final/flow_viz")
 
 M = 0.5; Dv = M / (2 ** 0.5)
 DIRS = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),
-        "B": (-M, 0.0), "BL": (-Dv, -Dv), "L": (0.0, -M), "FL": (Dv, -Dv)}   # (throttle, steer)
+        "B": (-M, 0.0), "BL": (-Dv, -Dv), "L": (0.0, -M), "FL": (Dv, -Dv)}
+if os.environ.get("FR_NOOP"):          # stationary/no-op branch
+    DIRS = {"N": (0.0, 0.0)}
+   # (throttle, steer)
 
 
 def main():

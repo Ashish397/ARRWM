@@ -43,9 +43,19 @@ if os.environ.get("FR_DET"):
 
 M = 0.5; Dv = M / (2 ** 0.5)
 DIRS = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),
-        "B": (-M, 0.0), "BL": (-Dv, -Dv), "L": (0.0, -M), "FL": (Dv, -Dv)}   # (throttle, steer)
+        "B": (-M, 0.0), "BL": (-Dv, -Dv), "L": (0.0, -M), "FL": (Dv, -Dv)}
+if os.environ.get("FR_NOOP"):          # stationary/no-op branch
+    DIRS = {"N": (0.0, 0.0)}
+   # (throttle, steer)
 NFB = 3
 GEN_CHUNKS = int(os.environ.get("FR_CHUNKS", "2"))
+# EXPOSURE-BIAS TEST (audit finding A1): training ALWAYS supplies a
+# 21-frame / 7-chunk clean context, but serving starts from ONE real
+# chunk, so chunk k runs at context depth 3(k+1) = 3..18 and never
+# reaches the trained 21 -- and all but the first chunk is the
+# student's OWN output. FR_SEED_CHUNKS>1 seeds with more REAL context
+# to separate "context too shallow" from "context is self-generated".
+SEED_CHUNKS = int(os.environ.get("FR_SEED_CHUNKS", "1"))
 
 
 def main():
@@ -55,7 +65,10 @@ def main():
     device = "cuda"
     pipe = ODEChainPipeline(device)
     pipe.build(config_path=CONFIG)
-    step = pipe.load_checkpoint(CKPT)
+    if CKPT.lower() == "none":
+        step = "init"        # teacher-init: eval yaml's generator_ckpt only
+    else:
+        step = pipe.load_checkpoint(CKPT)
     if os.environ.get("FR_RUNGS"):                # pinned-grid override (14e pilots)
         _rungs = torch.tensor(
             [float(x) for x in os.environ["FR_RUNGS"].split(",")],
@@ -68,11 +81,12 @@ def main():
     windows = json.load(open(f"{ARR}/analysis/eval_final/phaseA_windows.json"))
     w = windows[WINDOW]
     zp, off = w["zarr_path"], int(w["offset"])
-    seed = ZarrRideDataset.load_latent_chunk(zp, off, off + NFB).unsqueeze(0).to(device, torch.float32)
+    seed = ZarrRideDataset.load_latent_chunk(
+        zp, off, off + NFB * SEED_CHUNKS).unsqueeze(0).to(device, torch.float32)
     manifest = torch.load(f"{ARR}/analysis/eval_final/manifest_unseen.pt", map_location="cpu")
     pe = {r["zarr_path"]: r["prompt_embeds"] for r in manifest}[zp].unsqueeze(0)
 
-    tot_f = NFB * (1 + GEN_CHUNKS)
+    tot_f = NFB * (SEED_CHUNKS + GEN_CHUNKS)
     for dname, (thr, ste) in DIRS.items():
         for sd in range(NSEEDS):
             dst = f"{OUT}/flow_{RUN}{TAG}/r{WINDOW:02d}_{dname}_s{sd}"
@@ -81,7 +95,8 @@ def main():
                 print(f"[rec-ode] {dst} exists, skipping", flush=True)
                 continue
             z = torch.zeros(1, tot_f, 2, device=device, dtype=torch.float32)
-            z[:, NFB:, 0] = thr; z[:, NFB:, 1] = ste
+            z[:, NFB * SEED_CHUNKS:, 0] = thr
+            z[:, NFB * SEED_CHUNKS:, 1] = ste
             os.environ["ODE_FLOW_REC"] = dst
             os.environ["ODE_FLOW_SEED"] = str(1234 + sd * 7919)
             # CRITICAL: production AR evals wrap generate_ar in the
