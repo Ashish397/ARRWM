@@ -594,8 +594,17 @@ class ODEChainPipeline(ChainPipeline):
         base_dit.block_mask = None
         action_tokens_per_frame = int(getattr(base_dit, "action_tokens_per_frame", 1))
         frame_seq_length = FRAME_SPATIAL_TOKENS + action_tokens_per_frame
-        local_attn_size_frames = (cache_chunks + chunks_per_step) * BASE_CHUNK_FRAMES
-        kv_cache_tokens = local_attn_size_frames * frame_seq_length
+        # TEACHER PARITY (utils/causal_chain_rollout.py: local_attn_chunks=7,
+        # LOCAL_ATTN_F=21, target_max=21*FRAME_SEQ). The cache may be deeper than
+        # the attention span -- the teacher allocates 27 frames but HARD-CAPS
+        # attention at 21 -- but the span itself must not exceed what the student
+        # was trained at (21-frame clean window), or late chunks attend across
+        # query-key distances never seen in training and degrade per chunk.
+        TEACHER_ATTN_FRAMES = 21
+        _cache_frames = (cache_chunks + chunks_per_step) * BASE_CHUNK_FRAMES
+        local_attn_size_frames = int(os.environ.get(
+            "ODE_ATTN_FRAMES", TEACHER_ATTN_FRAMES))
+        kv_cache_tokens = max(_cache_frames, local_attn_size_frames) * frame_seq_length
         required_chunk_tokens = num_frame_per_block * frame_seq_length
         self.wrapper.seq_len = max(int(self.wrapper.seq_len), required_chunk_tokens)
         _set_attention_window(
@@ -603,6 +612,18 @@ class ODEChainPipeline(ChainPipeline):
             local_attn_size_frames=local_attn_size_frames,
             max_tokens=kv_cache_tokens,
         )
+        # TEACHER PARITY, and it MUST precede the cache prefill below:
+        # the seed/clean-fill forwards write K/V into the cache, so if the
+        # flag is set after them the seed context is cached with the
+        # sheared rotation. causal_chain_rollout.py sets this before any
+        # forward and RESTORES it in a finally; do both.
+        _apf = int(getattr(base_dit, "action_tokens_per_frame", 0) or 0)
+        _cra_prev = []
+        if _apf > 0:
+            for _m in base_dit.modules():
+                if hasattr(_m, "local_attn_size"):
+                    _cra_prev.append((_m, getattr(_m, "cached_rope_action_aware", None)))
+                    _m.cached_rope_action_aware = True
 
         num_transformer_blocks = len(base_dit.blocks)
         total_frames = initial_frames + num_gen_chunks * BASE_CHUNK_FRAMES
@@ -1543,7 +1564,13 @@ def main():
     ss_vae_ckpt = args.ss_vae_checkpoint or str(
         _cfg.get("ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt")
     )
-    action_dims = list(_cfg.get("action_dims", [2, 7]))
+    # TEACHER PARITY: the ODE LMDB was built with pca_raw + dims [0,1]
+    # (gen_lmdb_14e.py sets ARRWM_ACTION_ENCODER from the teacher config).
+    # zarr_dataset defaults to ss_vae, so without this the eval encodes a
+    # DIFFERENT physical action than the model was trained on.
+    os.environ.setdefault("ARRWM_ACTION_ENCODER",
+                          str(_cfg.get("teacher_action_encoder", "pca_raw")))
+    action_dims = list(_cfg.get("action_dims", [0, 1]))
     # Default ``infinity_rope`` to the config value (if any) — falls back
     # to True so the rerope fix is on for fresh runs without an explicit
     # CLI flag. ``--no-infinity_rope`` overrides the config to False.

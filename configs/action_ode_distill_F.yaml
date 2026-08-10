@@ -213,7 +213,7 @@ model_kwargs:
 # Action conditioning
 model_variant: action-injection
 raw_action_dim: 2
-action_dims: [2, 7]
+action_dims: [0, 1]        # pca_raw dims (matches the ODE LMDB); was [2,7] = retired z2/z7
 action_activation: silu
 enable_adaln_zero: true
 action_conditioning_mode: both

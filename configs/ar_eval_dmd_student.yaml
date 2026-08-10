@@ -36,7 +36,7 @@ trainer: ode
 #                      final-polish regime it will hit at eval time.)
 # ``-1`` / teacher_x0 is intentionally still omitted (timestep 0 is a
 # zero-loss identity).
-random_steps: [0, 36, 40, 44, 46]
+random_steps: [0, 15, 18, 19]        # 20-step shift-5 grid (14e student); was the 48-step grid
 
 # CF branch weight in the packed dual-forward loss.
 lambda_cf: 1.0
@@ -181,7 +181,7 @@ infinity_rope: true
 # Model / scheduler
 model_name: Wan2.1-T2V-1.3B
 num_train_timestep: 1000
-eval_inference_steps: 48
+eval_inference_steps: 20             # 14e student trained at 20 steps; was 48
 gradient_checkpointing: true
 
 model_kwargs:
@@ -192,7 +192,7 @@ model_kwargs:
 # Action conditioning
 model_variant: action-injection
 raw_action_dim: 2
-action_dims: [2, 7]
+action_dims: [0, 1]        # pca_0=throttle, pca_1=steer (matches the ODE LMDB; was [2,7] = retired z2/z7)
 action_activation: silu
 enable_adaln_zero: true
 action_conditioning_mode: both
@@ -254,4 +254,5 @@ beta2: 0.999
 weight_decay: 0.01
 
 # AR-chain eval of stat_wave DMD students: pin the student trained 4-step schedule
-denoising_step_list: [1000, 625, 312.5, 178.6]
+denoising_step_list: [1000, 625, 357.142857, 208.333333]   # = idx [0,15,18,19] of the 20-step grid
+teacher_action_encoder: pca_raw   # must match ARRWM_ACTION_ENCODER used to build the LMDB

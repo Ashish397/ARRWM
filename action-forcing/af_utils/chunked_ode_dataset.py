@@ -79,7 +79,11 @@ class ChunkedODEDataset(Dataset):
             noop = [f for f in files if f.endswith("_cN.pt")]
             clean = gt[0] if gt else (noop[0] if noop else files[0])
             others = [f for f in files if f != clean]
-            for i, c in enumerate(TARGETS):
+            # ROLLOUT: a sample is a whole CHAIN, not a (chunk, variant)
+            # pair -- _rollout_item ignores c, so emitting both TARGETS
+            # would duplicate every chain byte-for-byte.
+            _targets = (TARGETS[0],) if os.environ.get("ODE_ROLLOUT") else TARGETS
+            for i, c in enumerate(_targets):
                 if self.alldir and others:
                     grp = list(others)
                     if os.environ.get("ODE_ALLDIR_PAD8") and len(grp) == 7:
@@ -131,8 +135,44 @@ class ChunkedODEDataset(Dataset):
         frame_lo = NFB * (c - 3)                           # global frame of noisy window start
         return traj_win, clean_x, frame_lo
 
+    def _rollout_item(self, clean_f, cf_f, c, idx):
+        """Items for the KV-cache ROLLOUT stage (af_model/ode_rollout.py).
+
+        The teacher generated each chain as: SEED_CHUNKS real chunks written
+        into the cache, then gen_chunks chunks produced autoregressively. To
+        train the student the same way we need exactly that: the REAL seed, the
+        full per-frame action stream over seed+generated, and every committed
+        chunk as the target. No 21-frame window, no clean_x, no single target
+        chunk -- those belong to the teacher-forced stage this replaces.
+        """
+        cpt = torch.load(clean_f, map_location="cpu", weights_only=False)
+        fpt = cpt if (cf_f == clean_f) else \
+            torch.load(cf_f, map_location="cpu", weights_only=False)
+        zp, off = str(cpt["zarr_path"]), int(cpt["window_offset"])
+        seed_chunks = int(cpt.get("seed_chunks", 3))
+        seed_f = NFB * seed_chunks
+        seed_lat = self.zarr_loader(zp, off, off + seed_f).to(torch.float32)
+        ride_ts = os.path.basename(zp).replace(".zarr", "")
+        out = {"seed_lat": seed_lat,
+               "prompt_embeds": self.prompt_loader(ride_ts),
+               "sample_idx": torch.tensor(int(idx), dtype=torch.long),
+               "meta": {"filename": os.path.basename(clean_f),
+                        "ride_ts": ride_ts, "window_offset": off,
+                        "target_chunk": int(c), "zarr_path": zp,
+                        "seed_chunks": seed_chunks,
+                        "noise_seed": int(cpt["noise_seed"]), "city": ""}}
+        for tag, pt in (("clean", cpt), ("cf", fpt)):
+            traj = pt["trajectory"].to(torch.float32)      # [n_chunks,5,3,C,H,W]
+            out[f"committed_{tag}"] = traj[:, -1]          # [n_chunks,3,C,H,W]
+            out[f"z_{tag}"] = pt["z"].to(torch.float32)    # [seed_f+gen_f, 2]
+            out[f"noise_seed_{tag}"] = torch.tensor(
+                int(pt["noise_seed"]), dtype=torch.long)
+        return out
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         clean_f, cf_f, c, cf_pool = self.samples[idx]
+        if os.environ.get("ODE_ROLLOUT"):
+            return self._rollout_item(clean_f, cf_f, c, idx)
         if self.random_cf and len(cf_pool) > 1:
             import random as _rnd
             cf_f = _rnd.choice(cf_pool)

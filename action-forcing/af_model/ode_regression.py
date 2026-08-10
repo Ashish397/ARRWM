@@ -54,6 +54,7 @@ B=1 is the only shape it tolerates safely. See
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -606,6 +607,22 @@ class ODERegression(nn.Module):
         self.ode_edist_weight = float(getattr(config, "ode_edist_weight", 0.0))
         self.ode_edist_commit_only = bool(
             getattr(config, "ode_edist_commit_only", True))
+        # KV-CACHE ROLLOUT STAGE (af_model/ode_rollout.py). The teacher made
+        # every target with a cache-driven AR rollout and NO clean_x; the
+        # teacher-forced window path above trains a mechanism the teacher never
+        # used and the student never serves. With ode_rollout=true the student
+        # is rolled out through the teacher's own cache path at its 4 rungs and
+        # EVERY generated frame is supervised.
+        self.ode_rollout = bool(getattr(config, "ode_rollout", False))
+        if self.ode_rollout != bool(os.environ.get("ODE_ROLLOUT")):
+            raise RuntimeError(
+                "ode_rollout and the ODE_ROLLOUT env var must agree: the\n"
+                "MODEL switches on the config key but the DATASET switches\n"
+                "on the env var. Mismatch gives a bare KeyError "
+                "('seed_lat' or 'trajectory_clean'). "
+                f"config={self.ode_rollout} env={bool(os.environ.get('ODE_ROLLOUT'))}")
+        self.ode_rollout_commit = str(getattr(config, "ode_rollout_commit", "teacher"))
+        self.ode_rollout_commit_p = float(getattr(config, "ode_rollout_commit_p", 0.0))
         if self.ode_emdhead_weight > 0.0 or self.ode_emdhead_delta_weight > 0.0:
             self.emd_head_scale = nn.Parameter(torch.zeros(16))
             self.emd_head_shift = nn.Parameter(torch.zeros(16))
@@ -1715,6 +1732,79 @@ class ODERegression(nn.Module):
             logs["cd_student_loss_raw"] = float(cd_student.detach().item())
 
         return cd_teacher, cd_student, logs
+
+    def rollout_loss(self, batch, step: int = 0):
+        """KV-cache AR rollout stage — see af_model/ode_rollout.py.
+
+        Runs the clean (no-op) and cf (action) chains through the SAME cache
+        path the teacher used to generate their targets, at the student's 4
+        rungs, supervising every generated frame of every chunk.
+        """
+        from af_model.ode_rollout import rollout_ode_loss
+        wrapper = self.generator
+        dev, dt = self.device, self.dtype
+        pe = batch["prompt_embeds"].to(dev, dt)
+        seed = batch["seed_lat"].to(dev)
+        # Assert rather than slice: [:1] would silently discard 50-75% of a
+        # batch whenever the 8-direction group does not split 1-per-rank.
+        _B = int(seed.shape[0])
+        if _B != 1:
+            raise RuntimeError(
+                f"ode_rollout supports a per-rank batch of 1; got {_B}. The "
+                "grouped sampler yields max(len(group)//world,1), so this "
+                "means world_size < group size (need >= 8 ranks for dir8n).")
+        logs, total, n = {}, None, 0
+        per_chunk_all = []
+        for tag in ("clean", "cf"):
+            z = batch[f"z_{tag}"].to(dev, dt)
+            tgt = batch[f"committed_{tag}"].to(dev)
+            sb = int(batch[f"noise_seed_{tag}"].reshape(-1)[0].item())
+            out = rollout_ode_loss(
+                wrapper, self.action_projection, self.action_token_projection,
+                wrapper_call=self.generator,
+                prompt_embeds=pe[:1], seed_lat=seed[:1], z_actions=z[:1],
+                committed=tgt[:1],
+                denoising_step_list=self.denoising_step_list,
+                scheduler=self.scheduler, dtype=dt, device=dev,
+                nfb=self.num_frame_per_block,
+                seed_base=sb,
+                commit_mode=self.ode_rollout_commit,
+                commit_p=self.ode_rollout_commit_p,
+                # Keep the target in fp32: t.to(p.dtype) would round the
+                # teacher's committed latents to bf16 under autocast before the
+                # loss casts both back to float.
+                loss_fn=(lambda p, t: self._compute_ode_loss(
+                    p.float(), t.float(),
+                    torch.full(p.shape[:2], 1.0, device=p.device))),
+            )
+            total = out["loss"] if total is None else total + out["loss"]
+            n += 1
+            per_chunk_all.append(out["per_chunk"])
+            logs[f"ode_loss_{tag}"] = out["loss"].detach()
+        loss = total          # SUM (matches loss_clean + lambda_cf*loss_cf), not a mean
+        # DDP find_unused_parameters=False: every parameter in the wrapped
+        # module must receive a gradient. The state probe only fires at 21/42
+        # frames, and this path forwards 3 at a time, so touch its params with a
+        # zero-weighted term (same trick the packed path uses) or DDP aborts
+        # with "Expected to have finished reduction in the prior iteration".
+        _touch = None
+        _base_mod = self._gen_base_module()
+        _probe = getattr(_base_mod, "_state_probe", None)
+        if _probe is not None:
+            for _pp in _probe.parameters():
+                _t = 0.0 * _pp.sum()
+                _touch = _t if _touch is None else _touch + _t
+        if _touch is not None:
+            loss = loss + _touch.to(loss.dtype)
+        logs["rollout_per_chunk_clean"] = per_chunk_all[0]
+        logs["rollout_per_chunk_cf"] = per_chunk_all[-1]
+        # curriculum hook: difficulty of THIS (context, direction) = mean error
+        # of the cf chain's chunks
+        logs["per_sample_err_cf"] = torch.tensor(
+            [sum(per_chunk_all[-1]) / max(len(per_chunk_all[-1]), 1)], device=dev)
+        logs["per_sample_rung_cf"] = torch.tensor(
+            [float(self.denoising_step_list[-1])], device=dev)
+        return loss, logs
 
     def generator_loss(
         self,

@@ -54,7 +54,10 @@ def main():
     tot_f = NFB * (1 + NCH)
     z_full = z_ds.encode_z_actions_window(
         zp, int(row["n_latent_frames"]), off, off + tot_f)      # [21, zdim]
-    dims = list(cfg.get("action_dims", [2, 7]))
+    # TEACHER PARITY (see gen_lmdb_14e.py): pca_raw + dims [0,1].
+    os.environ.setdefault("ARRWM_ACTION_ENCODER",
+                          str(cfg.get("teacher_action_encoder", "pca_raw")))
+    dims = list(cfg.get("action_dims", [0, 1]))
     z_act = z_full[:, dims].to(torch.float32)                    # [21, 2]
     gt = ZarrRideDataset.load_latent_chunk(zp, off, off + tot_f).unsqueeze(0).to(device, torch.float32)
 

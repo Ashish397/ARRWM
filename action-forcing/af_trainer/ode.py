@@ -1208,6 +1208,54 @@ class Trainer:
         batch = _to_device(batch, self.device)
         self.optimizer.zero_grad(set_to_none=True)
 
+        # ---- KV-cache AR ROLLOUT stage (teacher-aligned) ----
+        # The rollout takes different batch keys (real seed + full action
+        # stream + all committed chunks) and drives the cache path itself,
+        # so it bypasses the packed teacher-forced forward entirely.
+        if getattr(self.model, "ode_rollout", False):
+            with torch.amp.autocast(
+                "cuda", dtype=self.dtype, enabled=self.mixed_precision,
+            ):
+                loss, logs = self.model.rollout_loss(batch, step=self.global_step)
+            loss.backward()
+            if getattr(self, "curriculum", None) is not None:
+                _e = logs.get("per_sample_err_cf")
+                _si = batch.get("sample_idx")
+                _rg = logs.get("per_sample_rung_cf")
+                if _e is not None and _si is not None:
+                    dev = self._err_ep_sum.device
+                    _si = _si.to(dev).view(-1)
+                    _e = _e.detach().float().view(-1).to(dev)
+                    assert _si.numel() == _e.numel(), (
+                        f"rollout curriculum: {_si.numel()} ids vs "
+                        f"{_e.numel()} errors")
+                    self._err_ep_sum.index_add_(0, _si, _e)
+                    self._err_ep_cnt.index_add_(0, _si, torch.ones_like(_e))
+                    # MUST also fill the rung stats: the boundary divides by
+                    # rung_mean, which clamps to 1e-8 when they are all zero and
+                    # inflates the curriculum EMA by 1e8.
+                    if _rg is not None:
+                        _rg = _rg.detach().float().view(-1).to(dev)
+                        if _rg.numel() == 1 and _e.numel() > 1:
+                            _rg = _rg.expand_as(_e)
+                        self._err_ep_rung.index_copy_(0, _si, _rg)
+                        rv = torch.tensor(self._rung_vals, device=dev)
+                        ridx = (_rg.view(-1, 1) - rv.view(1, -1)).abs().argmin(dim=1)
+                        self._rung_sum.index_add_(0, ridx, _e)
+                        self._rung_cnt.index_add_(0, ridx, torch.ones_like(_e))
+            grad_norm = self._generator_optim_step()
+            return {
+                "loss/total": float(loss.detach().item()),
+                "loss/clean": float(logs.get("ode_loss_clean", loss).detach().item()),
+                "loss/cf": float(logs.get("ode_loss_cf", loss).detach().item()),
+                "loss/ode_clean": float(logs.get("ode_loss_clean", loss).detach().item()),
+                "loss/ode_cf": float(logs.get("ode_loss_cf", loss).detach().item()),
+                "train/state_z_loss_clean": 0.0,
+                "train/gen_action_loss_clean": 0.0,
+                "train/z_guidance_scale": 0.0,
+                "train/grad_norm": grad_norm,
+            }
+
         # ---- Packed B=2 forward ----
         with torch.amp.autocast(
             "cuda", dtype=self.dtype, enabled=self.mixed_precision,
@@ -1768,6 +1816,15 @@ class Trainer:
         ranks' training RNG state. Without this guard each eval would
         leave rank-0's RNG advanced relative to the rest of the world.
         """
+        if getattr(self.model, "ode_rollout", False):
+            # The rollout dataset item has no z_clean/z_noisy/clean_x_gt, so the
+            # teacher-forced eval below cannot run on it. Skipping is REQUIRED:
+            # two consecutive eval failures raise, and _maybe_eval runs before
+            # the save_interval block, so the run would die without ever writing
+            # the final checkpoint.
+            log.info("[eval] skipped: ode_rollout batches are not "
+                     "teacher-forced pairs (no z_clean/clean_x_gt)")
+            return
         idx = (self.global_step // max(self.eval_interval, 1)) % max(self.eval_num_samples, 1)
         pair = self.dataset[int(idx) % len(self.dataset)]
 

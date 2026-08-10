@@ -55,7 +55,7 @@ GEN_CHUNKS = int(os.environ.get("FR_CHUNKS", "2"))
 # reaches the trained 21 -- and all but the first chunk is the
 # student's OWN output. FR_SEED_CHUNKS>1 seeds with more REAL context
 # to separate "context too shallow" from "context is self-generated".
-SEED_CHUNKS = int(os.environ.get("FR_SEED_CHUNKS", "1"))
+SEED_CHUNKS = int(os.environ.get("FR_SEED_CHUNKS", "3"))  # = teacher GL_SEED_CHUNKS
 
 
 def main():
@@ -109,6 +109,11 @@ def main():
                 _base = _base.get_base_model()
             try:
                 with infinity_rope_active(True, _base):
+                    from utils.infinity_rope import is_active as _ira
+                    assert _ira(), (
+                        'Infinity-RoPE did NOT install: the bare cached-RoPE path \n'
+                        'ropes interleaved action tokens as spatial ones, giving a \n'
+                        'per-chunk column shear. Refusing to record a shear artifact.')
                     # cache_chunks=6 pins the attention span to the trained
                     # 21-frame window (= teacher local_attn_chunks=7)
                     full = pipe.generate_ar(prompt_embeds=pe, noisy_fa_full=z,

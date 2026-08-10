@@ -33,6 +33,8 @@ case "$ARM" in
   alldir8kl) EXTRA="alldir_batches=true ode_loss_type=kl"; export ODE_ALLDIR=1 ODE_ALLDIR_PAD8=1; DATAV=dir8;;
   alldir8n)   EXTRA="alldir_batches=true"; export ODE_ALLDIR=1; DATAV=dir8n;;                    # big dir8+noop LMDB; cN = clean side, groups of 8
   alldir8nkl) EXTRA="alldir_batches=true ode_loss_type=kl"; export ODE_ALLDIR=1; DATAV=dir8n;;
+  roll)     EXTRA="ode_rollout=true ode_rollout_commit=teacher"; export ODE_ROLLOUT=1;;                 # KV-cache AR rollout: student trained the way 14e is INFERENCED
+  rollsf)   EXTRA="ode_rollout=true ode_rollout_commit=schedule ode_rollout_commit_p=0.5"; export ODE_ROLLOUT=1;;  # + scheduled self-forcing (student commits its own chunk 50% of the time)
   c10mse)    EXTRA="alldir_batches=true ode_curriculum=true ode_curriculum_epochs=10"; export ODE_ALLDIR=1; DATAV=dir8n;;
   c10kl)     EXTRA="alldir_batches=true ode_curriculum=true ode_curriculum_epochs=10 ode_loss_type=kl"; export ODE_ALLDIR=1; DATAV=dir8n;;
   c10mserep) EXTRA="alldir_batches=true ode_curriculum=true ode_curriculum_epochs=10 ode_gexcl_weight=0.5 ode_gexcl_band=0.05"; export ODE_ALLDIR=1; DATAV=dir8n;;
@@ -57,6 +59,17 @@ case "$ARM" in
   *) echo "bad ARM=$ARM"; exit 1;;
 esac
 
+# DEFAULTS (user directive): 8 directions + no-op data, intelligent
+# (hard-direction) sampling. Flip/counterfactual style is retired.
+: "${DATAV:=dir8n}"
+case "$EXTRA" in
+  *alldir_batches*) : ;;                       # arm set it explicitly
+  *) EXTRA="alldir_batches=true $EXTRA"; export ODE_ALLDIR=1 ;;
+esac
+case "$EXTRA" in
+  *ode_curriculum*) : ;;
+  *) EXTRA="ode_curriculum=true ode_curriculum_epochs=${CURRIC_EPOCHS:-10} $EXTRA" ;;
+esac
 TS=${TOTAL_STEPS:-250}
 CKPT_NAME=action_ode_step$(printf %07d $TS).pt
 LOGDIR=logs/ode14e_pilot/run3_flip2_${ARM}
