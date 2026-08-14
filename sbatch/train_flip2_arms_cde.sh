@@ -33,6 +33,44 @@ case "$ARM" in
   alldir8kl) EXTRA="alldir_batches=true ode_loss_type=kl"; export ODE_ALLDIR=1 ODE_ALLDIR_PAD8=1; DATAV=dir8;;
   alldir8n)   EXTRA="alldir_batches=true"; export ODE_ALLDIR=1; DATAV=dir8n;;                    # big dir8+noop LMDB; cN = clean side, groups of 8
   alldir8nkl) EXTRA="alldir_batches=true ode_loss_type=kl"; export ODE_ALLDIR=1; DATAV=dir8n;;
+  rollaw)     EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_actw_enabled=true ode_actw_alpha=1.0"; export ODE_ROLLOUT=1;;             # rollout + MSE, loss upweighted by CoTracker-measured ACTION ERROR
+  rollklaw)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_actw_alpha=1.0"; export ODE_ROLLOUT=1;;  # same, kl_local base
+  rollawsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_actw_enabled=true ode_actw_alpha=1.0"; export ODE_ROLLOUT=1;;            # SMOKE for the action-weight mechanic
+  rollaws)    EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_actw_enabled=true ode_curriculum_mode=actsplit"; export ODE_ROLLOUT=1;;    # MSE + action weight + 3-bottom/2-top sampling
+  rollall9)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_actw_enabled=true ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;        # ALTERNATIVE: train on all 9 directions
+  rollklawv)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_varw_enabled=true ode_curriculum_mode=actsplit"; export ODE_ROLLOUT=1;;  # KL variant: ACTION + VARIANCE weighted
+  rollklawv9) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_varw_enabled=true ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;      # KL variant, all 9
+  rollklawvr)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_varw_enabled=true ode_gexcl_weight=0.5 ode_gexcl_band=0.05 ode_curriculum_mode=actsplit"; export ODE_ROLLOUT=1;;  # KL + action + variance + CONTRACTION BARRIER, 3-bottom/2-top
+  rollklawvr9) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_varw_enabled=true ode_gexcl_weight=0.5 ode_gexcl_band=0.05 ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;      # same, all 9 directions
+  # --- smoke twins (same recipe, own LOGDIR) -------------------------------
+  rollklsmoke)    EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local"; export ODE_ROLLOUT=1;;
+  rollawssmoke)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_actw_enabled=true ode_curriculum_mode=actsplit"; export ODE_ROLLOUT=1;;
+  rollall9smoke)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_actw_enabled=true ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;
+  rollklawvsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_varw_enabled=true ode_curriculum_mode=actsplit"; export ODE_ROLLOUT=1;;
+  rollklawvrsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_actw_enabled=true ode_varw_enabled=true ode_gexcl_weight=0.5 ode_gexcl_band=0.05 ode_curriculum_mode=actsplit"; export ODE_ROLLOUT=1;;
+  # --- VARIATIONAL RECTIFIED FLOW MATCHING (arXiv:2502.09616, adapted) ------
+  # v(x_t,t) -> v(x_t,t,z); p(z|x0,xt,t,a) conditional prior, q(z|x0,x1,xt,t,a)
+  # posterior, loss = base + beta*KL(q||p). Two variants: MSE base and KL base.
+  rollvz)    EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_vrfm=true ode_vrfm_beta=1e-3"; export ODE_ROLLOUT=1 ODE_VRFM=1;;                        # VRFM on MSE
+  rollklvz)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_vrfm=true ode_vrfm_beta=1e-3"; export ODE_ROLLOUT=1 ODE_VRFM=1;; # VRFM on KL
+  rollvzsmoke)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_vrfm=true ode_vrfm_beta=1e-3"; export ODE_ROLLOUT=1 ODE_VRFM=1;;
+  rollklvzsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_vrfm=true ode_vrfm_beta=1e-3"; export ODE_ROLLOUT=1 ODE_VRFM=1;;
+  # ---- BASE VALIDATION: rollout + plain MSE, nothing else. Two variants
+  # differing ONLY in direction scheduling, so the curriculum is the single
+  # isolated factor. Both keep the 10-epoch stop so the budgets match.
+  #   mse9 : every direction every epoch (8 compass as cf + no-op as the clean
+  #          branch = all 9 trained on every sample)
+  #   msec : the hard-direction ODE curriculum (prunes to 2-4 dirs after ep 0)
+  rollmse9)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;
+  rollmsec)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=hard"; export ODE_ROLLOUT=1;;
+  # Gaussian repulsor on the MSE rollout base (N(0,1), inverse-square, no
+  # deadband). Queued only after the base is validated.
+  rollmse9g) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 ode_grep_weight=0.5"; export ODE_ROLLOUT=1;;
+  rollsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher"; export ODE_ROLLOUT=1;;   # smoke of the rollout stage
+  rolledsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_edist_weight=0.005"; export ODE_ROLLOUT=1;;  # edist SMOKE
+  rolled)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_edist_weight=0.005"; export ODE_ROLLOUT=1;;                   # rollout + MSE + within-context energy distance (0.005: at 0.5 it dominated the base 116-683x)
+  rollkled) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_edist_weight=0.005"; export ODE_ROLLOUT=1;; # rollout + KL + within-context energy distance
+  rollkl)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local"; export ODE_ROLLOUT=1;;  # rollout + KL: per-channel Gaussian KL on every committed chunk
   roll)     EXTRA="ode_rollout=true ode_rollout_commit=teacher"; export ODE_ROLLOUT=1;;                 # KV-cache AR rollout: student trained the way 14e is INFERENCED
   rollsf)   EXTRA="ode_rollout=true ode_rollout_commit=schedule ode_rollout_commit_p=0.5"; export ODE_ROLLOUT=1;;  # + scheduled self-forcing (student commits its own chunk 50% of the time)
   c10mse)    EXTRA="alldir_batches=true ode_curriculum=true ode_curriculum_epochs=10"; export ODE_ALLDIR=1; DATAV=dir8n;;
@@ -67,7 +105,10 @@ case "$EXTRA" in
   *) EXTRA="alldir_batches=true $EXTRA"; export ODE_ALLDIR=1 ;;
 esac
 case "$EXTRA" in
-  *ode_curriculum*) : ;;
+  # NOT *ode_curriculum* -- that glob also matches `ode_curriculum_mode=`, so
+  # the actsplit/all9 arms silently ran with the curriculum (and its 10-epoch
+  # stop) DISABLED, differing from the controls on two axes at once.
+  *ode_curriculum=*) : ;;
   *) EXTRA="ode_curriculum=true ode_curriculum_epochs=${CURRIC_EPOCHS:-10} $EXTRA" ;;
 esac
 TS=${TOTAL_STEPS:-250}
@@ -85,8 +126,14 @@ if [ ! -f "$LOGDIR/.train_done" ]; then
     random_steps="[0,15,18,19]" eval_inference_steps=20 \
     generator_ckpt=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v14e_pca8_raw/causal_lora_step0005000.pt \
     total_steps=$TS save_interval=${SAVE_EVERY:-$TS} eval_interval=$TS ckpt_skip_optimizer=true ckpt_local_stage=true \
-    logdir=$LOGDIR config_name=pilot_flip2_${ARM} > logs/ode14e_pilot_flip2_${ARM}.log 2>&1 \
+    logdir=$LOGDIR config_name=pilot_flip2_${ARM} \
+    wandb_name=pilot_flip2_${ARM} > logs/ode14e_pilot_flip2_${ARM}.log 2>&1 \
     && touch "$LOGDIR/.train_done"
+  if [ ! -f "$LOGDIR/.train_done" ]; then
+    echo "TRAIN-FAIL $ARM — training did not complete; last 40 lines:"
+    tail -40 logs/ode14e_pilot_flip2_${ARM}.log
+    exit 1        # so smokes can gate the full runs via --dependency=afterok
+  fi
 fi
 
 CKPT=$LOGDIR/$CKPT_NAME
@@ -101,8 +148,13 @@ if [ -f "$CKPT" ]; then
     python utils/flow_record_ode_student.py || echo "PROBE-FAIL $ARM"
   FDD_NSEEDS=2 FDD_PAIRS="pilot3_flip2${ARM}=14e8" FDD_FIGNAME=flow_pilot3_flip2${ARM}_scorecard \
     python utils/flow_diverge_dmd3.py || echo "SCORE-FAIL $ARM"
-  MC_RUNS=pilot3_flip2${ARM} python utils/motion_check.py || true
-  SD_RUNS=pilot2_flip2:pilot3_flip2${ARM} python utils/stat_drift.py || true
+  # Per-ARM output paths: both tools wrote FIXED filenames, so with 12 arms
+  # finishing independently the last one to run silently overwrote the rest.
+  FV_OUT=analysis/eval_final/flow_viz
+  mkdir -p "$FV_OUT/mc_${ARM}"
+  MC_OUT=$FV_OUT/mc_${ARM} MC_RUNS=pilot3_flip2${ARM} python utils/motion_check.py || true
+  SD_OUT=$FV_OUT/stat_drift_${ARM}.csv SD_RUNS=pilot2_flip2:pilot3_flip2${ARM} \
+    python utils/stat_drift.py || true
   # TARGET METRIC: match vs the SEED-MATCHED dense teacher (>= 0.95 goal).
   # Falls back to the differently-seeded teacher videos (ceiling ~0.85)
   # if the matched reference has not been recorded yet.

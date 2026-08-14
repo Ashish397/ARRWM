@@ -33,6 +33,15 @@ RUNS = [r for r in os.environ.get("TM_RUNS", "").split(":") if r]
 REF_RUN = os.environ.get("TM_REF_RUN", "")
 DIRS = os.environ.get("TM_DIRS", "F,FR,R,BR,B,BL,L,FL").split(",")
 SKIP = int(os.environ.get("TM_SKIP", "14"))
+# Horizon cap (frames scored AFTER skip). The window is otherwise
+# min(len(student), len(teacher)), i.e. set by whichever recording is
+# shorter -- so two runs recorded at different chunk counts are scored over
+# DIFFERENT rollout horizons and their `match` values are not comparable
+# (measured: c10mserep2 94f vs alldir8n2 70f). Match falls with horizon
+# because AR contraction accumulates, so the longer-recorded run is
+# penalised for being recorded longer. Set TM_MAXF to the shortest run in
+# the comparison to score like-for-like. 0 = unlimited (previous behaviour).
+MAXF = int(os.environ.get("TM_MAXF", "0"))
 OUT = os.environ.get("TM_OUT", f"{FV}/teacher_match.csv")
 FFMPEG = dict(input_params=["-threads", "1"], output_params=["-threads", "1"])
 
@@ -63,6 +72,8 @@ def score(student_path, teacher_path):
     n = min(len(s), len(t))
     if n <= SKIP + 1:
         return None
+    if MAXF > 0:
+        n = min(n, SKIP + MAXF)
     s, t = s[SKIP:n], t[SKIP:n]
     mse = float(np.mean((s - t) ** 2))
     var = float(np.var(t))

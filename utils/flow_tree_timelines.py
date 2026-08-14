@@ -239,6 +239,7 @@ def main():
                                ("c10kl", "pilot7_c10kl_s0002800", None),
                                ("c10mserep", "pilot7_c10mserep_s0002800", None),
                                ("c10klrep", "pilot7_c10klrep_s0002800", None),
+                               ("c10mserep2", "pilot7_c10mserep2_s0002092", None),
                                ("alldir8", "pilot4_alldir82", None),
                                ("alldir8kl", "pilot4_alldir8kl2", None),
                                # grid-parity set (2026-08-08): every method
@@ -293,6 +294,7 @@ def main():
                            "c10kl": "C10KL (curriculum, KL)",
                            "c10mserep": "C10MSEREP (MSE + repulsor)",
                            "c10klrep": "C10KLREP (KL + repulsor)",
+                           "c10mserep2": "C10MSEREP2 (v2: backward slot)",
                            "alldir8": "ALLDIR8 (8-dir global batch, MSE)",
                            "alldir8kl": "ALLDIR8-KL (8-dir global batch, KL)",
                            "nr": "NR (next-rung targets)",

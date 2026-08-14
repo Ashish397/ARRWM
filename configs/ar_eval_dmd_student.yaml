@@ -36,7 +36,10 @@ trainer: ode
 #                      final-polish regime it will hit at eval time.)
 # ``-1`` / teacher_x0 is intentionally still omitted (timestep 0 is a
 # zero-loss identity).
-random_steps: [0, 15, 18, 19]        # 20-step shift-5 grid (14e student); was the 48-step grid
+random_steps: [0, 36, 40, 44, 46]    # MUST be a subset of schedule.SNAPSHOT_STEPS
+                                     # ([0,18,36,40,44,46,-1]); the probe pops
+                                     # AF_SNAPSHOT_STEPS and pins the real serve
+                                     # rungs via FR_RUNGS=1000,625,357.14,208.33
 
 # CF branch weight in the packed dual-forward loss.
 lambda_cf: 1.0

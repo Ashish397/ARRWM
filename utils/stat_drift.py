@@ -114,11 +114,12 @@ def main():
                     max(np.mean([v[1] for v in lat[cs[0]]]), 1e-9))
             print(f"{run:14s}  -> latent std last/first ratio {d_sd:.3f}")
     import csv
-    with open(f"{FV}/stat_drift.csv", "w", newline="") as f:
+    _out = os.environ.get("SD_OUT", f"{FV}/stat_drift.csv")
+    with open(_out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["run", "chunk", "lat_mean", "lat_std", "R", "G", "B", "luma_std"])
         w.writerows(rows)
-    print(f"[sd] saved {FV}/stat_drift.csv")
+    print(f"[sd] saved {_out}")
 
 
 if __name__ == "__main__":

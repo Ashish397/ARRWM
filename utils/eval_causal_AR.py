@@ -231,6 +231,14 @@ class ODEChainPipeline(ChainPipeline):
 
         log.info("[%s] Loading config %s", self.device, config_path)
         cfg = OmegaConf.load(config_path)
+        # VRFM: the eval config has no ode_vrfm key, so without this the probe
+        # would build vrfm=None and serve a VRFM-trained student with the
+        # z-AdaLN contribution identically ZERO -- reading exactly like "the
+        # method did nothing" instead of erroring. Same env-var handshake the
+        # rollout stage uses for ODE_ROLLOUT.
+        if os.environ.get("ODE_VRFM"):
+            cfg.ode_vrfm = True
+            cfg.ode_vrfm_zdim = int(os.environ.get("ODE_VRFM_ZDIM", 128))
         OmegaConf.set_struct(cfg, False)
 
         # ODERegression constructs: wrapper (WanDiffusionWrapper), action
@@ -303,6 +311,21 @@ class ODEChainPipeline(ChainPipeline):
             and "action_token_projection" in raw
         ):
             self.ode_model.action_token_projection.load_state_dict(raw["action_token_projection"])
+        # VRFM: the CONDITIONAL PRIOR p(z|x0,xt,t,a) is what inference samples
+        # from, so it must come out of the checkpoint. Without it the student
+        # would be evaluated with z=0 -- i.e. with the very conditioning it was
+        # trained to use switched off, which silently looks like "VRFM did
+        # nothing" rather than an error.
+        for _vn in ("vrfm", "z_modulation"):
+            _vm = getattr(self.ode_model, _vn, None)
+            if _vm is not None:
+                if _vn not in raw:
+                    raise RuntimeError(
+                        f"checkpoint has no '{_vn}' but the eval model was "
+                        f"built with ode_vrfm=true; refusing to evaluate a "
+                        f"VRFM student with an untrained prior.")
+                _vm.load_state_dict(raw[_vn])
+                _vm.eval()
 
         self.ode_model.to(self.device).eval()
 
@@ -428,6 +451,7 @@ class ODEChainPipeline(ChainPipeline):
         prompt_embeds: torch.Tensor,
         noisy_fa_chunk: torch.Tensor,
         num_frames: int,
+        z_lat: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Conditional dict for a single streaming block (KV-cache path).
 
@@ -446,6 +470,10 @@ class ODEChainPipeline(ChainPipeline):
             )
         if self.action_token_projection is not None:
             cond["_action_tokens"] = self.action_token_projection(noisy_fa_chunk)
+        if z_lat is not None:
+            _zm = self.ode_model.z_modulation(z_lat, num_frames=num_frames)
+            cond["_action_modulation"] = (
+                cond["_action_modulation"] + _zm if "_action_modulation" in cond else _zm)
         return cond
 
     # ---- AR streaming generation -------------------------------------
@@ -899,16 +927,32 @@ class ODEChainPipeline(ChainPipeline):
                                   x.detach().float().to(torch.float16).cpu().numpy()))
 
             pred_x0: Optional[torch.Tensor] = None
+            # VRFM: x_0 is this chunk's INITIAL noise, the same quantity the
+            # encoders saw at training time.
+            _x0_lat = x
             for d_idx in range(int(ts.shape[0])):
                 t_val = float(ts[d_idx].item())
                 tt = torch.full(
                     [B, num_frame_per_block], t_val,
                     device=self.device, dtype=torch.float32,
                 )
+                _cond = cond
+                _vrfm = getattr(self.ode_model, "vrfm", None)
+                if _vrfm is not None:
+                    # z ~ p(.|x0, xt, t, a): the PRIOR only. x1 (the clean
+                    # target) does not exist here, which is exactly why the
+                    # prior was made conditional on everything else.
+                    _z, _, _ = _vrfm(
+                        x0=_x0_lat.float(), xt=x.float(),
+                        t=tt.reshape(-1)[:1],
+                        action=block_fa.reshape(1, -1)[:, :_vrfm.action_dim], x1=None)
+                    _cond = self._build_action_cond_chunk(
+                        prompt_embeds_dev, block_fa,
+                        num_frames=num_frame_per_block, z_lat=_z)
                 with torch.amp.autocast("cuda", dtype=self.dtype):
                     out = self.wrapper(
                         noisy_image_or_video=x,
-                        conditional_dict=cond,
+                        conditional_dict=_cond,
                         timestep=tt,
                         kv_cache=kv_cache,
                         crossattn_cache=crossattn_cache,

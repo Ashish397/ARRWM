@@ -26,6 +26,7 @@ os.environ.setdefault("WORLD_SIZE", "1"); os.environ.setdefault("RANK", "0"); os
 # assume the DEFAULT snapshot grid — the leaked env crashes the build
 # ("step value 36 is not one of SNAPSHOT_STEPS"). Serving rungs are pinned
 # separately via FR_RUNGS, so the training grid is irrelevant here: drop it.
+os.environ["ODE_EVAL_BUILD"] = "1"   # probe: eval config has no ode_rollout key
 os.environ.pop("AF_SNAPSHOT_STEPS", None); os.environ.pop("AF_EVAL_STEPS", None)
 import torch
 

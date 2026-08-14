@@ -394,8 +394,27 @@ class Trainer:
                     return picks + [worst]
 
                 def _select(self, grp, rng):
+                    mode = getattr(self, "sel_mode", "hard")
+                    if mode == "all9":
+                        return list(grp)       # alternative arm: every direction
                     if self.err is None:       # epoch 0: everything
                         return list(grp)
+                    if mode == "actsplit":
+                        # Rank by the per-direction ROLLING-MEAN action residual
+                        # (the reference), worst first. 3 random from the bottom
+                        # half + 2 random from the top half.
+                        ref = getattr(self, "act_ref", None)
+                        def _score(i):
+                            d = self.dirs[i]
+                            if ref is not None and d in ref and ref[d] >= 0:
+                                return float(ref[d])
+                            return float(self.err[i]) if self.err[i] >= 0 else 1e9
+                        ordered = sorted(grp, key=_score, reverse=True)  # worst first
+                        h = max(1, len(ordered) // 2)
+                        bottom, top = ordered[:h], ordered[h:]
+                        picks = list(rng.sample(bottom, min(3, len(bottom))))
+                        picks += list(rng.sample(top, min(2, len(top))))
+                        return self._force_back(grp, picks) if picks else list(grp)
                     scored = sorted(grp, key=lambda i: -float(self.err[i]))
                     seen = [i for i in grp if self.err[i] >= 0]
                     if not seen:
@@ -458,7 +477,28 @@ class Trainer:
                         pick = next((z for z in sizes_desc
                                      if z <= room and buckets[z]), None)
                         if pick is None:
-                            break
+                            # No WHOLE group fits the remaining room. Breaking
+                            # here discards everything -- and when every group
+                            # is the same size that does not divide `world`
+                            # (actsplit emits exactly 5; world=32) it discards
+                            # ALL of them, returning ZERO batches. `cycle()`
+                            # then spins forever on an empty loader: no error,
+                            # no NCCL timeout, all ranks silently wedged.
+                            # Fill the bin with a PARTIAL group instead. Only
+                            # `edist` cares about whole fans, and it masks by
+                            # group_id, so a split group is still correct.
+                            src = next((z for z in sizes_desc if buckets[z]), None)
+                            if src is None:
+                                break                  # genuinely exhausted
+                            g = buckets[src].pop()
+                            cur.extend(g[:room])
+                            rest = g[room:]
+                            if rest:
+                                buckets[len(rest)].append(rest)
+                                sizes_desc = sorted(buckets, reverse=True)
+                            if len(cur) == self.world:
+                                out.append(cur); cur = []
+                            continue
                         cur.extend(buckets[pick].pop())
                         if len(cur) == self.world:
                             out.append(cur); cur = []
@@ -501,6 +541,9 @@ class Trainer:
                 if _curric else
                 _GroupedBatches(self.dataset.group_sizes, _rank, _world))
             self.curriculum = _sampler_obj if _curric else None
+            if self.curriculum is not None:
+                self.curriculum.sel_mode = str(
+                    getattr(config, "ode_curriculum_mode", "hard"))
             self.loader = DataLoader(
                 self.dataset,
                 batch_sampler=_sampler_obj,
@@ -550,6 +593,12 @@ class Trainer:
             _nr = len(self._rung_vals)
             self._rung_sum = torch.zeros(_nr, device=self.device)
             self._rung_cnt = torch.zeros(_nr, device=self.device)
+            # Per-DIRECTION rolling mean of the action residual (the reference
+            # the weighting is relative to). Index order follows _ACT_DIRS.
+            self._ACT_DIRS = ["cF", "cFR", "cR", "cBR", "cB", "cBL", "cL", "cFL", "cN"]
+            self._act_res_ema = torch.full((len(self._ACT_DIRS),), -1.0,
+                                           device=self.device)
+            self._act_res_beta = float(getattr(config, "ode_act_res_beta", 0.9))
             self.max_epochs = int(getattr(config, "ode_curriculum_epochs", 10))
             self._log(f"Curriculum ON: {n} samples, epoch 0 = all directions, "
                       f"then 2-4 per group; rung-normalised error; "
@@ -634,6 +683,13 @@ class Trainer:
             gen_params.extend(p for p in self.model.action_projection.parameters() if p.requires_grad)
         if self.model.action_token_projection is not None:
             gen_params.extend(p for p in self.model.action_token_projection.parameters() if p.requires_grad)
+        # VRFM prior/posterior/z-projection live OUTSIDE DDP, like the action
+        # projections: they must be in the optimizer, manually all_reduced in
+        # _sync_projection_grads, and clipped with the rest.
+        for _vm in (getattr(self.model, "vrfm", None),
+                    getattr(self.model, "z_modulation", None)):
+            if _vm is not None:
+                gen_params.extend(p for p in _vm.parameters() if p.requires_grad)
         for _hn in ("emd_head_scale", "emd_head_shift"):
             _hp = getattr(self.model, _hn, None)
             if _hp is not None and _hp.requires_grad:
@@ -833,6 +889,17 @@ class Trainer:
                     "modulation weights."
                 )
             self.model.action_projection.load_state_dict(ck["action_projection"])
+        if "act_res_ema" in ck and hasattr(self, "_act_res_ema"):
+            self._act_res_ema = ck["act_res_ema"].clone()
+        for _vn in ("vrfm", "z_modulation"):
+            _vm = getattr(self.model, _vn, None)
+            if _vm is not None:
+                if _vn not in ck:
+                    raise RuntimeError(
+                        f"Resume checkpoint {target} has no '{_vn}' but "
+                        f"ode_vrfm is on -- resuming would silently reset the "
+                        f"prior/posterior and invalidate the run.")
+                _vm.load_state_dict(ck[_vn])
         if self.model.action_token_projection is not None:
             if "action_token_projection" not in ck:
                 raise RuntimeError(
@@ -945,8 +1012,19 @@ class Trainer:
             state["critic_optimizer"] = self.critic_optimizer.state_dict()
         if self.model.action_projection is not None:
             state["action_projection"] = self.model.action_projection.state_dict()
+        if hasattr(self, "_act_res_ema"):
+            # Not saving this made every requeue restart actsplit at the -1
+            # sentinel, i.e. plain error ranking for a whole epoch.
+            state["act_res_ema"] = self._act_res_ema.detach().cpu()
         if self.model.action_token_projection is not None:
             state["action_token_projection"] = self.model.action_token_projection.state_dict()
+        for _vn in ("vrfm", "z_modulation"):
+            _vm = getattr(self.model, _vn, None)
+            if _vm is not None:
+                # The conditional PRIOR is needed at inference (the probe draws
+                # z ~ p(.|x0,xt,t,a)); without it in the checkpoint a VRFM run
+                # could not be sampled at all.
+                state[_vn] = _vm.state_dict()
         if hasattr(base, "_state_probe") and base._state_probe is not None:
             state["state_probe"] = base._state_probe.state_dict()
         if getattr(self, "curriculum", None) is not None:
@@ -1048,7 +1126,9 @@ class Trainer:
         """All-reduce grads on projections not wrapped in DDP."""
         if not self.is_distributed:
             return
-        for mod in (self.model.action_projection, self.model.action_token_projection):
+        for mod in (self.model.action_projection, self.model.action_token_projection,
+                    getattr(self.model, "vrfm", None),
+                    getattr(self.model, "z_modulation", None)):
             if mod is None:
                 continue
             for p in mod.parameters():
@@ -1071,6 +1151,10 @@ class Trainer:
             all_gen_params.extend(self.model.action_projection.parameters())
         if self.model.action_token_projection is not None:
             all_gen_params.extend(self.model.action_token_projection.parameters())
+        for _vm in (getattr(self.model, "vrfm", None),
+                    getattr(self.model, "z_modulation", None)):
+            if _vm is not None:
+                all_gen_params.extend(_vm.parameters())
         # The EMD transport head is clipped SEPARATELY: its objective can
         # spike (measured on job 5941221: head grad-norm 13-29 vs flow
         # ~0.2), and a joint clip_grad_norm_ would scale the flow map's
@@ -1087,6 +1171,21 @@ class Trainer:
             grad_norm = float(torch.nn.utils.clip_grad_norm_(all_gen_params, self.grad_clip))
             if head_params:
                 torch.nn.utils.clip_grad_norm_(head_params, self.grad_clip)
+
+        # Non-finite guard (pre-launch review): clip_grad_norm_ SCALES by the
+        # total norm, so a single NaN/inf gradient anywhere poisons every
+        # parameter on this step and nothing downstream detects it — on a 24h
+        # unattended run that destroys all subsequent training. Skip the step
+        # (grads are still zeroed) and log; byte-identical when healthy.
+        # clip_grad_norm_ is deterministic given the grads, and the grads are
+        # identical on all ranks after the DDP reduction + manual projection
+        # sync above, so this branch is rank-uniform — no divergence risk.
+        import math as _math
+        if self.grad_clip and self.grad_clip > 0 and not _math.isfinite(grad_norm):
+            log.warning(f"[optim] non-finite grad_norm={grad_norm}; SKIPPING "
+                        f"optimizer step at global_step={self.global_step}")
+            self.optimizer.zero_grad(set_to_none=True)
+            return grad_norm
 
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
@@ -1213,11 +1312,27 @@ class Trainer:
         # stream + all committed chunks) and drives the cache path itself,
         # so it bypasses the packed teacher-forced forward entirely.
         if getattr(self.model, "ode_rollout", False):
+            # cache_enabled=False: this OUTER autocast region spans the
+            # rollout's no-grad seed/commit forwards, its grad forwards AND
+            # its per-rung backwards. With the cast cache on, the no-grad
+            # forwards populate the cache and the grad forwards reuse those
+            # casts (no grad_fn -> weight gradients silently severed; and the
+            # checkpoint recompute diverges -> the CheckpointError that killed
+            # jobs 5989253/5998622/6004035). The DiT forward itself autocasts
+            # in ode_rollout.fwd (also cache_enabled=False); this region only
+            # needs to cover the projection/cond math, where caching buys
+            # nothing measurable.
             with torch.amp.autocast(
                 "cuda", dtype=self.dtype, enabled=self.mixed_precision,
+                cache_enabled=False,
             ):
                 loss, logs = self.model.rollout_loss(batch, step=self.global_step)
-            loss.backward()
+            # The rollout backwards each rung DURING the rollout (gradient
+            # checkpointing recomputes against the LIVE kv_cache, so a deferred
+            # backward recomputes against the wrong cache state). The returned
+            # scalar is detached and for logging only.
+            if not bool(logs.get("backwarded", False)):
+                loss.backward()
             if getattr(self, "curriculum", None) is not None:
                 _e = logs.get("per_sample_err_cf")
                 _si = batch.get("sample_idx")
@@ -1234,6 +1349,17 @@ class Trainer:
                     # MUST also fill the rung stats: the boundary divides by
                     # rung_mean, which clamps to 1e-8 when they are all zero and
                     # inflates the curriculum EMA by 1e8.
+                    # rolling mean of the per-DIRECTION action residual
+                    _ar = logs.get("act_residual")
+                    _ad = batch.get("meta", {}).get("dir_idx")
+                    if _ar is not None and _ad is not None:
+                        _i = int(torch.as_tensor(_ad).reshape(-1)[0].item())
+                        if 0 <= _i < self._act_res_ema.numel():
+                            _v = float(_ar)
+                            _b = self._act_res_beta
+                            _prev = float(self._act_res_ema[_i])
+                            self._act_res_ema[_i] = (
+                                _v if _prev < 0 else _b * _prev + (1 - _b) * _v)
                     if _rg is not None:
                         _rg = _rg.detach().float().view(-1).to(dev)
                         if _rg.numel() == 1 and _e.numel() > 1:
@@ -1244,16 +1370,37 @@ class Trainer:
                         self._rung_sum.index_add_(0, ridx, _e)
                         self._rung_cnt.index_add_(0, ridx, torch.ones_like(_e))
             grad_norm = self._generator_optim_step()
+            _lt = float(loss.detach().item())
+            _lc = float(logs.get("ode_loss_clean", loss).detach().item())
+            _lf = float(logs.get("ode_loss_cf", loss).detach().item())
+            if self.is_distributed:
+                # Match the packed path: log WORLD means, or roll arms are not
+                # comparable with every other arm.
+                _t = torch.tensor([_lt, _lc, _lf], device=self.device)
+                dist.all_reduce(_t, op=dist.ReduceOp.AVG)
+                _lt, _lc, _lf = (float(x) for x in _t.tolist())
             return {
-                "loss/total": float(loss.detach().item()),
-                "loss/clean": float(logs.get("ode_loss_clean", loss).detach().item()),
-                "loss/cf": float(logs.get("ode_loss_cf", loss).detach().item()),
-                "loss/ode_clean": float(logs.get("ode_loss_clean", loss).detach().item()),
-                "loss/ode_cf": float(logs.get("ode_loss_cf", loss).detach().item()),
+                "loss/total": _lt,
+                "loss/clean": _lc,
+                "loss/cf": _lf,
+                "loss/ode_clean": _lc,
+                "loss/ode_cf": _lf,
+                "train/lr": self.optimizer.param_groups[0]["lr"],
                 "train/state_z_loss_clean": 0.0,
                 "train/gen_action_loss_clean": 0.0,
                 "train/z_guidance_scale": 0.0,
                 "train/grad_norm": grad_norm,
+                # VRFM diagnostics. Without these the run is undiagnosable:
+                # nothing distinguishes "z is informative" from "z collapsed"
+                # from "q is leaking the target". Watch sigma_q -- pinned at
+                # 1.0 while z_absmean grows means z is noise, not information.
+                **{f"vrfm/{_k}": float(_v) for _k, _v in logs.items()
+                   if _k.startswith("vrfm_")},
+                # Ratio of the KL term to the base loss: the single number that
+                # says whether beta is doing anything at all (see H1).
+                **({"vrfm/kl_over_base": float(logs.get("vrfm_kl_cf", 0.0))
+                    * float(getattr(self.model, "ode_vrfm_beta", 0.0))
+                    / max(abs(_lf), 1e-9)} if logs.get("vrfm_kl_cf") else {}),
             }
 
         # ---- Packed B=2 forward ----
@@ -2091,6 +2238,28 @@ class Trainer:
                                          0.5 * prev + 0.5 * epoch_err), prev)
                     self.curriculum.set_errors(
                         self._err_ema.detach().cpu().tolist())
+                    if hasattr(self, "_act_res_ema"):
+                        # _act_res_ema is updated only from the direction THIS
+                        # rank happened to draw, so it differs per rank. The
+                        # batch sampler must be identical on every rank -- an
+                        # actsplit ranked on divergent references makes ranks
+                        # select different groups, desyncing the global batch
+                        # and eventually hanging in NCCL when their epoch
+                        # boundaries land on different steps. Average across
+                        # ranks over the entries that were actually observed
+                        # (-1 is the never-seen sentinel).
+                        _e = self._act_res_ema.detach().clone().to(self.device)
+                        _m = (_e >= 0).float()
+                        _v = torch.where(_m > 0, _e, torch.zeros_like(_e))
+                        if self.is_distributed:
+                            dist.all_reduce(_v, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(_m, op=dist.ReduceOp.SUM)
+                        _e = torch.where(_m > 0, _v / _m.clamp(min=1.0),
+                                         torch.full_like(_v, -1.0))
+                        self._act_res_ema = _e.cpu()
+                        self.curriculum.act_ref = {
+                            d: float(v) for d, v in
+                            zip(self._ACT_DIRS, _e.tolist())}
                     self._curric_epochs_done += 1
                     seen = int(obs.sum().item())
                     if self.is_main:
@@ -2108,6 +2277,20 @@ class Trainer:
                     # reset per-epoch accumulators (EMA carries history)
                     self._err_ep_sum.zero_(); self._err_ep_cnt.zero_()
                     self._err_ep_rung.fill_(-1.0)
+                    # Reset the rung reference too: as a LIFETIME mean it makes
+                    # the normalised error drift monotonically downward, `bad`
+                    # empties against the absolute threshold, and the curriculum
+                    # silently becomes random sampling.
+                    self._rung_sum.zero_(); self._rung_cnt.zero_()
+                    if self.is_main and hasattr(self, "_act_res_ema"):
+                        _seen = self._act_res_ema >= 0
+                        if bool(_seen.any()):
+                            _m = float(self._act_res_ema[_seen].mean())
+                            log.info("[actres] rolling mean per direction "
+                                     "(avg %.4f): %s", _m,
+                                     {d: round(float(v), 4) for d, v in
+                                      zip(self._ACT_DIRS,
+                                          self._act_res_ema.tolist()) if v >= 0})
                     self._curric_steps_in_epoch = 0
                     if self._curric_epochs_done >= self.max_epochs:
                         if self.is_main:

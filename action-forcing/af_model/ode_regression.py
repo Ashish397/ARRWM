@@ -285,6 +285,44 @@ class ODERegression(nn.Module):
                 )
 
         # ------------------------------------------------------------------
+        # VARIATIONAL RECTIFIED FLOW MATCHING (arXiv:2502.09616), adapted.
+        # The GT velocity field is multi-modal: many (x0, x1) pairs cross the
+        # same (x_t, t), so plain MSE regresses their MEAN and the motion comes
+        # out direction-averaged. A per-sample latent z says WHICH mode this
+        # sample takes, making v = v(x_t, t, z) so no averaging is needed.
+        # Our prior is CONDITIONAL on (x0, x_t, t, a) -- everything inference
+        # has -- while only the posterior additionally sees x1 (the teacher's
+        # clean chunk). See af_model/vrfm.py.
+        # ------------------------------------------------------------------
+        self.ode_vrfm = bool(getattr(config, "ode_vrfm", False))
+        self.ode_vrfm_beta = float(getattr(config, "ode_vrfm_beta", 1e-3))
+        self.vrfm = None
+        self.z_modulation = None
+        if self.ode_vrfm:
+            from af_model.vrfm import VRFMLatent, ZModulation
+            if not self.use_adaln:
+                raise RuntimeError(
+                    "ode_vrfm injects z through the AdaLN modulation stream "
+                    "(the same tensor _action_modulation feeds), so it needs "
+                    "enable_adaln_zero/use_adaln. Got use_adaln=False.")
+            _zdim = int(getattr(config, "ode_vrfm_zdim", 128))
+            _lc = int(getattr(wrapper.model, "in_dim", 16))
+            _md = int(getattr(wrapper.model, "dim", 1536))
+            self.vrfm = VRFMLatent(
+                latent_channels=_lc, z_dim=_zdim,
+                hidden=int(getattr(config, "ode_vrfm_hidden", 128)),
+                action_dim=self.raw_action_dim).to(device)
+            self.z_modulation = ZModulation(
+                z_dim=_zdim, hidden_dim=_md).to(device)
+            self.vrfm.train()
+            self.z_modulation.train()
+            logger.info(
+                "VRFM enabled: z_dim=%d beta=%.2e latent_ch=%d model_dim=%d "
+                "(%.2fM params)", _zdim, self.ode_vrfm_beta, _lc, _md,
+                (sum(p.numel() for p in self.vrfm.parameters())
+                 + sum(p.numel() for p in self.z_modulation.parameters())) / 1e6)
+
+        # ------------------------------------------------------------------
         # 3) Apply a *transient* LoRA wrapper (post action patches, pre
         #    state probe) so we can load the teacher's rank-256 adapter
         #    state in ``load_teacher_checkpoint``. The adapter is folded
@@ -591,6 +629,11 @@ class ODERegression(nn.Module):
         # above it), which is the failure actually being fought.
         self.ode_gexcl_weight = float(getattr(config, "ode_gexcl_weight", 0.0))
         self.ode_gexcl_band = float(getattr(config, "ode_gexcl_band", 0.05))
+        # Gaussian repulsor (N(0,1) reference, inverse-square, no deadband).
+        # Separate from ode_gexcl_*, which is the teacher-referenced barrier.
+        self.ode_grep_weight = float(getattr(config, "ode_grep_weight", 0.0))
+        self.ode_grep_components = str(
+            getattr(config, "ode_grep_components", "both"))
         self.ode_gexcl_r0 = float(getattr(config, "ode_gexcl_r0", 1.0))
         self.ode_gexcl_tau = float(getattr(config, "ode_gexcl_tau", 0.25))
         # AXIS 3: distribution matching instead of pure mean matching.
@@ -614,7 +657,11 @@ class ODERegression(nn.Module):
         # is rolled out through the teacher's own cache path at its 4 rungs and
         # EVERY generated frame is supervised.
         self.ode_rollout = bool(getattr(config, "ode_rollout", False))
-        if self.ode_rollout != bool(os.environ.get("ODE_ROLLOUT")):
+        # The PROBE builds this class from the EVAL config, which has no
+        # ode_rollout key, while ODE_ROLLOUT is still exported by the arm.
+        # Only enforce the guard for the TRAINING model.
+        if (not os.environ.get("ODE_EVAL_BUILD")
+                and self.ode_rollout != bool(os.environ.get("ODE_ROLLOUT"))):
             raise RuntimeError(
                 "ode_rollout and the ODE_ROLLOUT env var must agree: the\n"
                 "MODEL switches on the config key but the DATASET switches\n"
@@ -623,6 +670,28 @@ class ODERegression(nn.Module):
                 f"config={self.ode_rollout} env={bool(os.environ.get('ODE_ROLLOUT'))}")
         self.ode_rollout_commit = str(getattr(config, "ode_rollout_commit", "teacher"))
         self.ode_rollout_commit_p = float(getattr(config, "ode_rollout_commit_p", 0.0))
+        # ACTION-ERROR LOSS WEIGHTING (user-directed): measure the REALISED
+        # action of the rolled-out chain with the teacher's own CoTracker->PCA
+        # pipeline and upweight the chain's loss in proportion to how far it is
+        # from the COMMANDED action. Applies to whichever pointwise base is in
+        # use (mse / kl_local) because it scales the accumulated total.
+        # Chain-level, not per-chunk: CoTracker needs >=12 frames and a chunk is 3.
+        self.ode_actw_enabled = bool(getattr(config, "ode_actw_enabled", False))
+        self.ode_actw_alpha = float(getattr(config, "ode_actw_alpha", 1.0))
+        # 0.25 was a GUESS made before calibration. utils/calibrate_actw.py
+        # then measured 360 TEACHER chains -- i.e. the achievable floor --
+        # and found median err 0.914 (analysis/eval_final/flow_viz/
+        # actw_calibration.json). With err_ref=0.25 the ratio pinned at
+        # max_ratio for ~19% of chains and averaged 4.2x, making the
+        # "weight" a flat LR multiplier carrying no per-chain signal --
+        # the exact failure the weighting was meant to avoid.
+        self.ode_actw_ref = float(getattr(config, "ode_actw_ref", 0.914))
+        self.ode_actw_max = float(getattr(config, "ode_actw_max", 4.0))
+        self._actw_cotracker = None
+        # KL variant: weight by DISPERSION error as well as action error.
+        self.ode_varw_enabled = bool(getattr(config, "ode_varw_enabled", False))
+        self.ode_varw_alpha = float(getattr(config, "ode_varw_alpha", 1.0))
+        self.ode_varw_ref = float(getattr(config, "ode_varw_ref", 0.10))
         if self.ode_emdhead_weight > 0.0 or self.ode_emdhead_delta_weight > 0.0:
             self.emd_head_scale = nn.Parameter(torch.zeros(16))
             self.emd_head_shift = nn.Parameter(torch.zeros(16))
@@ -1151,23 +1220,87 @@ class ODERegression(nn.Module):
                 return torch.cat([b[:int(counts[i].item())]
                                   for i, b in enumerate(buf)], 0)
             X, Y = _gather(X), _gather(Y)
+        return self._edist_core(X, Y)
+
+    def _edist_core(self, X, Y, gid=None):
+        """Energy distance between two GATHERED feature sets.
+
+        D_E = 2E||X-Y|| - E||X-X'|| - E||Y-Y'||; the last term is constant
+        (Y is detached) so it is dropped. The -E||X-X'|| term is a BOUNDED
+        anti-collapse repulsion whose optimum is the teacher distribution
+        rather than infinite separation.
+        """
+        import torch.distributed as dist
         if X.shape[0] < 2 or Y.shape[0] < 2:
             return None
         # Scale each feature by the teacher's spread so no single family
         # (e.g. the 80 quantile dims) dominates the distance.
         _sd = Y.std(dim=0, keepdim=True).detach()
+        # A degenerate set (all rows identical -> median spread 0) would floor
+        # the scale at 1e-8 and amplify features by 1e8. Y is identical on every
+        # rank here, so returning None is collective-safe.
+        if float(_sd.median()) <= 1e-8:
+            return None
         s = _sd.clamp(min=1e-2 * _sd.median().clamp(min=1e-6))
         Xn, Yn = X / s, Y / s
-        cross = torch.cdist(Xn, Yn).mean()
-        xx = torch.cdist(Xn, Xn)
+        _cx = torch.cdist(Xn, Yn)
+        _xx = torch.cdist(Xn, Xn)
         n = Xn.shape[0]
-        xx = xx.sum() / max(n * (n - 1), 1)             # exclude diagonal
+        if gid is not None:
+            # WITHIN-GROUP pairs only = the action fan of one context.
+            same = (gid.view(-1, 1) == gid.view(1, -1)).float()
+            eye = torch.eye(n, device=X.device)
+            n_cross = same.sum().clamp(min=1.0)
+            n_self = (same - same * eye).sum().clamp(min=1.0)
+            cross = (_cx * same).sum() / n_cross
+            xx = (_xx * (same - same * eye)).sum() / n_self
+        else:
+            cross = _cx.mean()
+            xx = _xx.sum() / max(n * (n - 1), 1)        # exclude diagonal
         # DDP AVERAGES rank gradients, but each rank contributes only
         # its own 1/W rows of X, so the effective weight would be 1/W
         # (1/32 here). Scale back so the flag means what it says.
+        # Each rank contributes only its own 1/W rows of X, so the effective
+        # gradient weight after DDP's AVG would be 1/W; scale back so the flag
+        # means what it says. This holds with grouping too: a rank's row takes
+        # part in G of the W*G same-group pairs, i.e. 1/W of `cross` either
+        # way, so the rescale is world-size-INVARIANT as written.
         _w = float(dist.get_world_size()) if (
             dist.is_available() and dist.is_initialized()) else 1.0
         return _w * (2.0 * cross - xx)   # -E||Y-Y'|| is constant
+
+    def edist_chunk(self, pred, target, group_id=None):
+        """Set-level energy distance for ONE committed chunk, across ranks.
+
+        This is the loss the user's distribution-matching theory actually
+        calls for: each rank holds a DIFFERENT commanded direction of the
+        same context (see alldir_batches / _CurriculumBatches), so gathering
+        the committed chunks across ranks gives the OUTPUT DISTRIBUTION
+        induced by the ACTION DISTRIBUTION, and D_E compares it to the
+        teacher's. Contrast with the per-sample KL, which matches one
+        prediction to one target via per-channel moments only.
+
+        Collective-safe: every rank calls the same gathers unconditionally.
+        """
+        import torch.distributed as dist
+        X = self._dist_features(pred)
+        Y = self._dist_features(target.float()).detach()
+        gid = None
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            world, rank = dist.get_world_size(), dist.get_rank()
+            def _g(T):
+                buf = [torch.zeros_like(T) for _ in range(world)]
+                dist.all_gather(buf, T.contiguous())
+                buf[rank] = T                     # keep the LOCAL grad path
+                return torch.cat(buf, 0)
+            X, Y = _g(X), _g(Y)
+            # Group id per row, so D_E is computed WITHIN a context (the action
+            # fan) instead of across the 4-8 contexts a global batch spans.
+            # Without this 90-97% of the pairs compare different contexts and
+            # the term measures mixture spread, not the conditional fan.
+            if group_id is not None:
+                gid = _g(torch.full((1,), float(group_id), device=X.device))
+        return self._edist_core(X, Y, gid)
 
     def _nextrung_targets(
         self,
@@ -1267,7 +1400,42 @@ class ODERegression(nn.Module):
         avoid an empty ``reduction="mean"`` division.
         """
         mask = timestep != 0
-        if getattr(self.config, "ode_loss_type", "mse") == "kl":
+        _lt = getattr(self.config, "ode_loss_type", "mse")
+        if _lt == "kl_local":
+            # LOCALISED Gaussian KL. The global variant reduces over
+            # dims=(1,3,4), i.e. one mean+var per CHANNEL over the whole
+            # 18,720-voxel chunk. Measured consequences of that reduction:
+            #   * gradient rank 2 per channel -> 32 constrained scalars out of
+            #     299,520 (0.011%); it can shift and rescale the existing
+            #     pattern but never change WHICH pixels move;
+            #   * bit-exact invariance to spatially scrambling the prediction;
+            #   * a "moment cheat" -- take the OPPOSITE direction's chunk and
+            #     affine-rescale it to the target's channel moments -- scores
+            #     MACHINE ZERO while its MSE is 91% of a fully wrong answer.
+            # Reducing per (channel x frame x spatial cell) on a gh x gw grid
+            # keeps the log(st/sp) anti-collapse term (which genuinely resists
+            # blur: KL prefers a crisp wrong answer where MSE prefers the blur
+            # by 2.5x) while taking the constrained count to 2*C*F*gh*gw and
+            # destroying the global permutation invariance.
+            gh = int(getattr(self.config, "ode_kl_grid_h", 3))
+            gw = int(getattr(self.config, "ode_kl_grid_w", 4))
+            m = mask if mask.any() else torch.ones_like(mask)
+            _m = m[..., None, None, None]
+            p_ = (pred_x0.float() * _m)
+            t_ = (target.float() * _m)
+            B, F_, C_, H_, W_ = p_.shape
+            pool = torch.nn.functional.adaptive_avg_pool2d
+            def _cells(x):
+                y = x.reshape(B * F_, C_, H_, W_)
+                mu = pool(y, (gh, gw))
+                var = (pool(y * y, (gh, gw)) - mu * mu).clamp(min=1e-6)
+                return mu.reshape(B, F_, C_, gh, gw), var.reshape(B, F_, C_, gh, gw)
+            mp, sp2 = _cells(p_)
+            mt, st2 = _cells(t_)
+            kl = (0.5 * torch.log(st2 / sp2)
+                  + (sp2 + (mp - mt).pow(2)) / (2.0 * st2) - 0.5)
+            return kl.mean().to(pred_x0.dtype)
+        if _lt == "kl":
             # Per-channel Gaussian KL(pred || target) over the masked
             # frames: log(st/sp) + (sp^2 + (mp-mt)^2) / (2 st^2) - 1/2.
             # log(st/sp) -> +inf as sp -> 0: under-dispersion is punished
@@ -1733,6 +1901,137 @@ class ODERegression(nn.Module):
 
         return cd_teacher, cd_student, logs
 
+    def _grep_chunk(self, pred, target=None):
+        """GAUSSIAN REPULSOR for one committed chunk. Reference is N(0,1).
+
+        Purpose is EXPOSURE BIAS, not dispersion matching: over an AR rollout
+        the student's committed chunks drift toward the noise point, and the
+        drift COMPOUNDS chunk over chunk. A standing repulsion from N(0,1)
+        makes each step drift less, so the compounding is damped.
+
+        Deliberately NOT the teacher-referenced deadband: the student has to be
+        free to be better than the teacher, so the reference is the noise point
+        itself, and there is no satisfied region -- the term is always on.
+
+        Inverse-square in the signature distance (same law as the original
+        `ode_noiserep`), so the force is strong close to the noise point and
+        falls away as the prediction gets clear of it:
+
+            d2 = sum_c mu_c^2 + sum_c (sigma_c - 1)^2      (per channel)
+            L  = w / d2
+
+        Minimising L maximises d2, i.e. repels. `target` is accepted and
+        ignored so this can be dropped into the same call site as the barrier.
+        """
+        p_ = pred.float()
+        mu = p_.mean(dim=(1, 3, 4))
+        sd = p_.std(dim=(1, 3, 4))
+        comp = getattr(self, "ode_grep_components", "both")
+        d2 = torch.zeros(p_.shape[0], device=p_.device, dtype=torch.float32)
+        if comp in ("both", "mu"):
+            d2 = d2 + mu.pow(2).sum(dim=1)
+        if comp in ("both", "sigma"):
+            d2 = d2 + (sd - 1.0).pow(2).sum(dim=1)
+        # Floor keeps the gradient finite if a chunk lands exactly on N(0,1).
+        return (1.0 / d2.clamp(min=1e-4)).mean()
+
+    def _gexcl_chunk(self, pred, target):
+        """Teacher-referenced contraction barrier for one committed chunk.
+
+        Per-channel log(sigma_pred / sigma_teacher) with a SQUARED HINGE
+        outside [-band, +band]: exactly zero loss and zero gradient while the
+        student's dispersion sits inside the teacher's band, real force once it
+        contracts below it (and once it runs away above it). Satisfiable by
+        construction -- unlike the 1/d^2 repulsors earlier in this campaign,
+        which had no satisfied region and diverged, and unlike the N(0,1)
+        reference, which we measured to be inert AND wrongly signed on this data
+        (committed chunks sit at sigma~0.5, so contraction moves them AWAY from
+        the gaussian and the old term rewarded it).
+        """
+        band = self.ode_gexcl_band
+        p = pred.float()
+        with torch.no_grad():
+            sd_t = target.float().std(dim=(1, 3, 4)).clamp(min=1e-6)
+        lr = (p.std(dim=(1, 3, 4)).clamp(min=1e-6) / sd_t).log()
+        return (((-band) - lr).clamp(min=0).pow(2)
+                + (lr - band).clamp(min=0).pow(2)).sum(dim=1).mean()
+
+    def _action_error_weight(self, chain, z_actions):
+        """Detached weight >= 1 from the CoTracker->PCA realised action.
+
+        Built lazily so a run that never enables it pays nothing, and it fails
+        SOFT: any problem (no CoTracker, chain too short, missing PCA table)
+        returns None and the loss is left unweighted rather than crashing a
+        multi-hour job.
+        """
+        from af_model.action_weight import realised_action_z, action_error_weight
+        try:
+            if self._actw_cotracker is None:
+                import torch.hub
+                self._actw_cotracker = torch.hub.load(
+                    "facebookresearch/co-tracker", "cotracker3_offline"
+                ).to(chain.device).eval()
+                for _p in self._actw_cotracker.parameters():
+                    _p.requires_grad_(False)
+            if getattr(self, "_actw_pca", None) is None:
+                import numpy as _np
+                _ck = torch.load(str(self.config.ss_vae_checkpoint),
+                                 map_location="cpu", weights_only=False)
+                # The checkpoint has NO "pca_scales" key (it holds a single
+                # scalar "scale"), so the old [1.0]*8 fallback ALWAYS fired:
+                # tanh(P/1.0) with |P|~37 saturates to +-1 for every window,
+                # so the error pinned at max_ratio and the "action weight"
+                # was a constant 5.0 -- an LR change, not a weight. Use the
+                # teacher's own per-component scales (2.5*std), the same
+                # numbers 14e trains with (pca_raw_scales in its config).
+                _sc = list(getattr(self.config, "pca_raw_scales",
+                                   [93.7, 57.7, 22.5, 21.2, 18.1, 14.5, 12.6, 10.8]))[:8]
+                self._actw_pca = (
+                    torch.tensor(_np.asarray(_ck["pca_mean"]), dtype=torch.float32,
+                                 device=chain.device),
+                    torch.tensor(_np.asarray(_ck["pca_comp"]).T, dtype=torch.float32,
+                                 device=chain.device),
+                    torch.tensor(_sc, dtype=torch.float32, device=chain.device))
+            pm, pc, ps = self._actw_pca
+            rz = realised_action_z(
+                chain_latents=chain, frozen_vae=self._frozen_vae,
+                cotracker=self._actw_cotracker,
+                pca_mean=pm, pca_comp_T=pc, pca_scales=ps)
+            # commanded action over the GENERATED frames only
+            cmd = z_actions[0, -chain.shape[1]:]
+            return action_error_weight(
+                realised_z=rz, commanded_z=cmd,
+                # self.action_dims does not exist on this class -- reading it
+                # raised AttributeError, which the broad except below caught,
+                # so EVERY actw arm silently ran unweighted. Read the config.
+                action_dims=tuple(
+                    (getattr(self.config, 'action_dims', None) or (0, 1))[:2]),
+                alpha=self.ode_actw_alpha, err_ref=self.ode_actw_ref,
+                max_ratio=self.ode_actw_max)
+        except Exception as e:                       # fail SOFT, never kill a run
+            if not getattr(self, "_actw_warned", False):
+                logging.warning("action-error weighting disabled (%s: %s)",
+                                type(e).__name__, e)
+                self._actw_warned = True
+            return None
+
+    def _probe_touch(self):
+        """Zero-weighted touch of the state-probe params.
+
+        DDP runs with find_unused_parameters=False, so every parameter in the
+        wrapped module must receive a gradient. The state probe only fires at
+        21/42 frames and this path forwards 3 at a time, so without this the
+        run aborts with "Expected to have finished reduction in the prior
+        iteration". Folded into the rollout's LAST backward.
+        """
+        _touch = None
+        _probe = getattr(self._gen_base_module(), "_state_probe", None)
+        if _probe is not None:
+            for _pp in _probe.parameters():
+                _t = 0.0 * _pp.sum()
+                _touch = _t if _touch is None else _touch + _t
+        return _touch
+
     def rollout_loss(self, batch, step: int = 0):
         """KV-cache AR rollout stage — see af_model/ode_rollout.py.
 
@@ -1741,6 +2040,16 @@ class ODERegression(nn.Module):
         rungs, supervising every generated frame of every chunk.
         """
         from af_model.ode_rollout import rollout_ode_loss
+        # The rollout path SUMS the branch losses; lambda_cf is not wired in
+        # (each branch backwards internally, so a late multiply would be a
+        # silent no-op). Fail fast rather than silently ignore a non-default
+        # value (review M1).
+        _lam = float(getattr(self.config, "lambda_cf", 1.0))
+        if _lam != 1.0:
+            raise RuntimeError(
+                f"ode_rollout ignores lambda_cf (got {_lam}); it must be 1.0. "
+                "To weight the cf branch, scale it inside rollout_ode_loss "
+                "via loss_scale instead.")
         wrapper = self.generator
         dev, dt = self.device, self.dtype
         pe = batch["prompt_embeds"].to(dev, dt)
@@ -1755,10 +2064,15 @@ class ODERegression(nn.Module):
                 "means world_size < group size (need >= 8 ranks for dir8n).")
         logs, total, n = {}, None, 0
         per_chunk_all = []
+        _scale_next = 1.0
         for tag in ("clean", "cf"):
             z = batch[f"z_{tag}"].to(dev, dt)
             tgt = batch[f"committed_{tag}"].to(dev)
             sb = int(batch[f"noise_seed_{tag}"].reshape(-1)[0].item())
+            # edist ONLY on the cf branch: every rank of a group shares the
+            # SAME clean file, so the clean branch's gathered set is identical
+            # across ranks -> zero spread -> 1e8 feature amplification.
+            _use_ed = (tag == "cf") and self.ode_edist_weight > 0.0
             out = rollout_ode_loss(
                 wrapper, self.action_projection, self.action_token_projection,
                 wrapper_call=self.generator,
@@ -1770,32 +2084,83 @@ class ODERegression(nn.Module):
                 seed_base=sb,
                 commit_mode=self.ode_rollout_commit,
                 commit_p=self.ode_rollout_commit_p,
+                # group_id is REQUIRED, no sample_idx fallback (review M4):
+                # unique-per-sample ids degenerate the within-group mask to
+                # the identity and the repulsion term silently vanishes.
+                edist_fn=((lambda p_, t_: self.edist_chunk(
+                    p_, t_, group_id=int(
+                        batch['group_id'].reshape(-1)[0].item())))
+                    if _use_ed else None),
+                edist_weight=(self.ode_edist_weight if _use_ed else 0.0),
+                gexcl_fn=(self._grep_chunk if self.ode_grep_weight > 0.0
+                          else (self._gexcl_chunk if self.ode_gexcl_weight > 0.0
+                                else None)),
+                gexcl_weight=(self.ode_grep_weight if self.ode_grep_weight > 0.0
+                              else self.ode_gexcl_weight),
                 # Keep the target in fp32: t.to(p.dtype) would round the
                 # teacher's committed latents to bf16 under autocast before the
                 # loss casts both back to float.
                 loss_fn=(lambda p, t: self._compute_ode_loss(
                     p.float(), t.float(),
                     torch.full(p.shape[:2], 1.0, device=p.device))),
+                ddp_module=(self.generator if hasattr(self.generator, "no_sync")
+                            else None),
+                vrfm=self.vrfm, z_modulation=self.z_modulation,
+                vrfm_beta=(self.ode_vrfm_beta if self.ode_vrfm else 0.0),
+                # Only the LAST backward of the LAST branch may all-reduce.
+                sync_last=(tag == "cf"),
+                # The action/variance weights need the FULL chain, which does
+                # not exist until the rollout has finished -- but the per-rung
+                # backwards happen DURING it. Apply the previous step's weight
+                # instead: it is a slowly-varying scalar with a rolling-mean
+                # reference, so a one-step lag is immaterial. Multiplying the
+                # returned scalar (as before) would now be a silent no-op,
+                # because the gradients are already applied.
+                loss_scale=float(getattr(self, "_rollout_scale_prev", 1.0)),
+                tail_loss_fn=self._probe_touch,   # every armed backward must mark all params ready
             )
+            _w_act = None
+            if self.ode_actw_enabled and tag == "cf" and out.get("chain") is not None:
+                _w_act = self._action_error_weight(out["chain"], z[:1])
+                if _w_act is not None:
+                    _scale_next = _scale_next * float(_w_act)
+                    logs["actw"] = float(_w_act)
+                    logs["act_residual"] = float(_w_act) - 1.0
+            if (self.ode_varw_enabled and out.get("chain") is not None
+                    and tag == "cf"):
+                from af_model.action_weight import variance_error_weight
+                _tc = tgt[:1].reshape(1, -1, *tgt.shape[-3:])
+                _n = min(out["chain"].shape[1], _tc.shape[1])
+                _w_var = variance_error_weight(
+                    pred_chain=out["chain"][:, :_n], teacher_chain=_tc[:, :_n],
+                    alpha=self.ode_varw_alpha, ref=self.ode_varw_ref)
+                _scale_next = _scale_next * float(_w_var)
+                logs["varw"] = float(_w_var)
             total = out["loss"] if total is None else total + out["loss"]
             n += 1
             per_chunk_all.append(out["per_chunk"])
             logs[f"ode_loss_{tag}"] = out["loss"].detach()
+            if out.get("kl_z"):
+                logs[f"vrfm_kl_{tag}"] = float(out["kl_z"])
+            for _k, _v in (out.get("vrfm_stats") or {}).items():
+                logs[f"vrfm_{_k}_{tag}"] = float(_v)
         loss = total          # SUM (matches loss_clean + lambda_cf*loss_cf), not a mean
         # DDP find_unused_parameters=False: every parameter in the wrapped
         # module must receive a gradient. The state probe only fires at 21/42
         # frames, and this path forwards 3 at a time, so touch its params with a
         # zero-weighted term (same trick the packed path uses) or DDP aborts
         # with "Expected to have finished reduction in the prior iteration".
-        _touch = None
-        _base_mod = self._gen_base_module()
-        _probe = getattr(_base_mod, "_state_probe", None)
-        if _probe is not None:
-            for _pp in _probe.parameters():
-                _t = 0.0 * _pp.sum()
-                _touch = _t if _touch is None else _touch + _t
-        if _touch is not None:
-            loss = loss + _touch.to(loss.dtype)
+        # NOTE: under the rollout the probe touch is handed to the rollout as
+        # `tail_loss_fn` and folded into the LAST backward (see below) -- adding
+        # it here would be a no-op, since `loss` is already detached, and DDP
+        # would abort on the untouched probe params.
+        # Carry the action/variance weight to the NEXT step (see loss_scale).
+        logs["backwarded"] = True
+        # Log the scale that was ACTUALLY applied to this step's gradients
+        # (the previous step's weight), BEFORE overwriting it for the next.
+        logs["rollout_scale_applied"] = float(
+            getattr(self, "_rollout_scale_prev", 1.0))
+        self._rollout_scale_prev = float(_scale_next)
         logs["rollout_per_chunk_clean"] = per_chunk_all[0]
         logs["rollout_per_chunk_cf"] = per_chunk_all[-1]
         # curriculum hook: difficulty of THIS (context, direction) = mean error

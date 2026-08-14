@@ -39,6 +39,10 @@ NUM_FRAMES = 21
 TARGETS = (4, 5)
 
 
+# Must match Trainer._ACT_DIRS exactly.
+_ROLL_DIRS = ["cF", "cFR", "cR", "cBR", "cB", "cBL", "cL", "cFL", "cN"]
+
+
 class ChunkedODEDataset(Dataset):
     def __init__(self, root: str, zarr_loader, prompt_loader,
                  clean_only: bool = False):
@@ -153,14 +157,28 @@ class ChunkedODEDataset(Dataset):
         seed_f = NFB * seed_chunks
         seed_lat = self.zarr_loader(zp, off, off + seed_f).to(torch.float32)
         ride_ts = os.path.basename(zp).replace(".zarr", "")
+        # Direction tag from the CF filename suffix, e.g. "..._cBL.pt" -> "cBL".
+        _m = re.search(r"_(c[A-Z]+)\.pt$", os.path.basename(cf_f))
+        _dtag = _m.group(1) if _m else ""
         out = {"seed_lat": seed_lat,
                "prompt_embeds": self.prompt_loader(ride_ts),
                "sample_idx": torch.tensor(int(idx), dtype=torch.long),
+               # CONTEXT id shared by all 8 directions of one fan. edist needs
+               # this, not sample_idx, or its within-group mask degenerates to
+               # the identity and the repulsion term vanishes.
+               "group_id": torch.tensor(int(self.sample_group[idx]),
+                                        dtype=torch.long),
                "meta": {"filename": os.path.basename(clean_f),
                         "ride_ts": ride_ts, "window_offset": off,
                         "target_chunk": int(c), "zarr_path": zp,
                         "seed_chunks": seed_chunks,
-                        "noise_seed": int(cpt["noise_seed"]), "city": ""}}
+                        "noise_seed": int(cpt["noise_seed"]), "city": "",
+                        # The actsplit curriculum keys its per-direction
+                        # rolling mean off dir_idx. It was never emitted here,
+                        # so _act_res_ema stayed at its -1 sentinel forever and
+                        # actsplit silently degraded to plain error ranking.
+                        # Order must match Trainer._ACT_DIRS.
+                        "dir_idx": _ROLL_DIRS.index(_dtag) if _dtag in _ROLL_DIRS else -1}}
         for tag, pt in (("clean", cpt), ("cf", fpt)):
             traj = pt["trajectory"].to(torch.float32)      # [n_chunks,5,3,C,H,W]
             out[f"committed_{tag}"] = traj[:, -1]          # [n_chunks,3,C,H,W]
