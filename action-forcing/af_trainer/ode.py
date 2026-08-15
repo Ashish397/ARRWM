@@ -1396,6 +1396,11 @@ class Trainer:
                 # 1.0 while z_absmean grows means z is noise, not information.
                 **{f"vrfm/{_k}": float(_v) for _k, _v in logs.items()
                    if _k.startswith("vrfm_")},
+                # Attractor-tracker diagnostics (review H2): without these the
+                # rollar smoke cannot demonstrate whether the gates opened and
+                # the actuation path ran at all.
+                **{f"attr/{_k}": float(_v) for _k, _v in logs.items()
+                   if _k.startswith("attr_")},
                 # Ratio of the KL term to the base loss: the single number that
                 # says whether beta is doing anything at all (see H1).
                 **({"vrfm/kl_over_base": float(logs.get("vrfm_kl_cf", 0.0))

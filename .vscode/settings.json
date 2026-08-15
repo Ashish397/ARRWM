@@ -3,6 +3,9 @@
     "**/logs/**": true,
     "**/wandb/**": true,
     "**/analysis/**": true,
+    "**/third_party/**": true,
+    "**/eval/**": true,
+    "**/.lmdb14e_smoke/**": true,
     "**/paper_assets/**": true,
     "**/*.mp4": true,
     "**/*.pt": true,
@@ -12,6 +15,9 @@
     "**/logs/**": true,
     "**/wandb/**": true,
     "**/analysis/**": true,
+    "**/third_party/**": true,
+    "**/eval/**": true,
+    "**/.lmdb14e_smoke/**": true,
     "**/*.mp4": true,
     "**/*.pt": true
   },
@@ -22,5 +28,11 @@
   "git.autorefresh": false,
   "git.autofetch": false,
   "git.enabled": false,
-  "python.analysis.exclude": ["**/logs/**", "**/wandb/**", "**/*.mp4", "**/*.pt"]
+  "python.analysis.exclude": [
+    "**/logs/**",
+    "**/wandb/**",
+    "**/third_party/**",
+    "**/*.mp4",
+    "**/*.pt"
+  ]
 }

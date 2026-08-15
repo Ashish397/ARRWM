@@ -316,7 +316,7 @@ class ODERegression(nn.Module):
                 z_dim=_zdim, hidden_dim=_md).to(device)
             self.vrfm.train()
             self.z_modulation.train()
-            logger.info(
+            log.info(
                 "VRFM enabled: z_dim=%d beta=%.2e latent_ch=%d model_dim=%d "
                 "(%.2fM params)", _zdim, self.ode_vrfm_beta, _lc, _md,
                 (sum(p.numel() for p in self.vrfm.parameters())
@@ -634,6 +634,30 @@ class ODERegression(nn.Module):
         self.ode_grep_weight = float(getattr(config, "ode_grep_weight", 0.0))
         self.ode_grep_components = str(
             getattr(config, "ode_grep_components", "both"))
+        # ONLINE ATTRACTOR TRACKING + REPULSION (af_model/attractor_tracker.py):
+        # estimate the per-direction collapse attractor in stat space from the
+        # training rollouts, repel from a target-network-frozen copy, gated to
+        # auto-shutoff when the attractor merges with the data manifold.
+        self.ode_attractor_enabled = bool(
+            getattr(config, "ode_attractor_enabled", False))
+        if self.ode_attractor_enabled:
+            if self.ode_grep_weight > 0.0 or self.ode_gexcl_weight > 0.0:
+                raise RuntimeError(
+                    "ode_attractor_enabled shares the per-chunk slot with "
+                    "ode_grep/ode_gexcl; enable exactly one of the three.")
+            from af_model.attractor_tracker import AttractorTracker
+            # .to(device): ODERegression never moves itself wholesale (each
+            # submodule is moved individually), so without this the tracker's
+            # buffers stay on CPU -> device-mismatch crash at the first
+            # observe(), and sync() would hand NCCL a CPU tensor (review C1).
+            self.attractor = AttractorTracker(
+                weight=float(getattr(config, "ode_attractor_weight", 0.1)),
+                freeze_k=int(getattr(config, "ode_attractor_freeze_k", 200)),
+                warmup=int(getattr(config, "ode_attractor_warmup", 300)),
+                use_sigma=bool(getattr(config, "ode_attractor_sigma", False)),
+            ).to(self.device)
+        else:
+            self.attractor = None
         self.ode_gexcl_r0 = float(getattr(config, "ode_gexcl_r0", 1.0))
         self.ode_gexcl_tau = float(getattr(config, "ode_gexcl_tau", 0.25))
         # AXIS 3: distribution matching instead of pure mean matching.
@@ -888,22 +912,39 @@ class ODERegression(nn.Module):
 
         import torch.distributed as dist  # noqa: F401 (optional import guard)
 
+        def _load_cotracker():
+            """torch.hub.load with a pinned ref + retries.
+
+            Without an explicit ref, torch.hub queries the GitHub API for the
+            default branch EVEN WHEN the local cache is warm — a transient
+            network drop on any single rank then kills the whole 32-rank job
+            at init (job 6015319: rank 7 RemoteDisconnected -> SIGTERM x31).
+            Pinning ':main' + skip_validation makes the warm-cache path fully
+            offline; the retry covers the cold-cache case on flaky links.
+            """
+            last = None
+            for attempt in range(3):
+                try:
+                    return torch.hub.load(
+                        "facebookresearch/co-tracker:main", "cotracker3_offline",
+                        skip_validation=True,
+                    ).to(self.device)
+                except Exception as e:              # noqa: BLE001
+                    last = e
+                    import time as _t
+                    _t.sleep(20 * (attempt + 1))
+            raise last
+
         if distributed and hasattr(torch.distributed, "is_initialized") and torch.distributed.is_initialized():
             is_main = (torch.distributed.get_rank() == 0)
             if is_main:
-                self._frozen_cotracker = torch.hub.load(
-                    "facebookresearch/co-tracker", "cotracker3_offline",
-                ).to(self.device)
+                self._frozen_cotracker = _load_cotracker()
             torch.distributed.barrier()
             if not is_main:
-                self._frozen_cotracker = torch.hub.load(
-                    "facebookresearch/co-tracker", "cotracker3_offline",
-                ).to(self.device)
+                self._frozen_cotracker = _load_cotracker()
             torch.distributed.barrier()
         else:
-            self._frozen_cotracker = torch.hub.load(
-                "facebookresearch/co-tracker", "cotracker3_offline",
-            ).to(self.device)
+            self._frozen_cotracker = _load_cotracker()
 
         self._frozen_cotracker.eval()
         for p in self._frozen_cotracker.parameters():
@@ -1932,8 +1973,20 @@ class ODERegression(nn.Module):
             d2 = d2 + mu.pow(2).sum(dim=1)
         if comp in ("both", "sigma"):
             d2 = d2 + (sd - 1.0).pow(2).sum(dim=1)
-        # Floor keeps the gradient finite if a chunk lands exactly on N(0,1).
-        return (1.0 / d2.clamp(min=1e-4)).mean()
+        # ADDITIVE softening, not a clamp (2026-08-14, noise-point campaign):
+        # clamp(min) makes the loss FLAT inside the floor — zero gradient
+        # exactly at the attractor, where a collapsed chunk needs the rescue
+        # force most (defect caught by the tracker unit tests). The additive
+        # form keeps the same bound (max L = 1/0.25 = 4 at d=0, so max dose
+        # w*4 = 0.4) but stays smooth with nonzero gradient off-centre.
+        # Healthy chunks (Sum mu^2 ~ 1.5-3.2 measured) pay ~w*0.03-0.06 —
+        # regulariser scale — with force growing as the chunk nears mu=0.
+        # RUNG GATING (user directive): the slot fires at EVERY rung EXCEPT
+        # the first (see ode_rollout.py, `if i >= 1` on the gexcl fold) —
+        # final-rung-only was "too little too late". Rung 0 stays excluded:
+        # its pred_x0 comes from near-pure noise, closest to mu=0, where the
+        # inverse-square force would be outsized.
+        return (1.0 / (d2 + 0.25)).mean()
 
     def _gexcl_chunk(self, pred, target):
         """Teacher-referenced contraction barrier for one committed chunk.
@@ -2065,6 +2118,12 @@ class ODERegression(nn.Module):
         logs, total, n = {}, None, 0
         per_chunk_all = []
         _scale_next = 1.0
+        # Direction bin for the attractor tracker: clean branch is always the
+        # no-op chain (bin 8 = cN, chunked_ode_dataset._ROLL_DIRS); cf uses the
+        # dataset's dir_idx (defensive extraction mirrors the trainer's).
+        _ad = batch.get("meta", {}).get("dir_idx", -1)
+        _cf_bin = (int(torch.as_tensor(_ad).reshape(-1)[0].item())
+                   if _ad is not None else -1)
         for tag in ("clean", "cf"):
             z = batch[f"z_{tag}"].to(dev, dt)
             tgt = batch[f"committed_{tag}"].to(dev)
@@ -2073,6 +2132,20 @@ class ODERegression(nn.Module):
             # SAME clean file, so the clean branch's gathered set is identical
             # across ranks -> zero spread -> 1e8 feature amplification.
             _use_ed = (tag == "cf") and self.ode_edist_weight > 0.0
+            _bin = 8 if tag == "clean" else _cf_bin
+            # Per-chunk slot precedence: attractor repulsor > grep > gexcl
+            # (mutual exclusion enforced at init). The lambda binds THIS
+            # branch's direction bin; target arg accepted and ignored to match
+            # the slot signature.
+            if self.attractor is not None:
+                _gfn = (lambda p_, t_, _b=_bin: self.attractor.repulsor(p_, _b))
+                _gw = self.attractor.weight
+            elif self.ode_grep_weight > 0.0:
+                _gfn, _gw = self._grep_chunk, self.ode_grep_weight
+            elif self.ode_gexcl_weight > 0.0:
+                _gfn, _gw = self._gexcl_chunk, self.ode_gexcl_weight
+            else:
+                _gfn, _gw = None, 0.0
             out = rollout_ode_loss(
                 wrapper, self.action_projection, self.action_token_projection,
                 wrapper_call=self.generator,
@@ -2092,11 +2165,8 @@ class ODERegression(nn.Module):
                         batch['group_id'].reshape(-1)[0].item())))
                     if _use_ed else None),
                 edist_weight=(self.ode_edist_weight if _use_ed else 0.0),
-                gexcl_fn=(self._grep_chunk if self.ode_grep_weight > 0.0
-                          else (self._gexcl_chunk if self.ode_gexcl_weight > 0.0
-                                else None)),
-                gexcl_weight=(self.ode_grep_weight if self.ode_grep_weight > 0.0
-                              else self.ode_gexcl_weight),
+                gexcl_fn=_gfn,
+                gexcl_weight=_gw,
                 # Keep the target in fp32: t.to(p.dtype) would round the
                 # teacher's committed latents to bf16 under autocast before the
                 # loss casts both back to float.
@@ -2119,6 +2189,14 @@ class ODERegression(nn.Module):
                 loss_scale=float(getattr(self, "_rollout_scale_prev", 1.0)),
                 tail_loss_fn=self._probe_touch,   # every armed backward must mark all params ready
             )
+            # Attractor estimator feed: the committed chain (detached) plus the
+            # teacher targets, binned by this branch's direction. The clean
+            # branch is the SAME no-op chain on all ranks of a curriculum
+            # group (max group size 8), so it is down-weighted to avoid the
+            # SUM all-reduce counting the identical observation 8x (review M4).
+            if self.attractor is not None and out.get("chain") is not None:
+                self.attractor.observe(out["chain"], tgt[:1], _bin,
+                                       weight=(0.125 if tag == "clean" else 1.0))
             _w_act = None
             if self.ode_actw_enabled and tag == "cf" and out.get("chain") is not None:
                 _w_act = self._action_error_weight(out["chain"], z[:1])
@@ -2144,6 +2222,11 @@ class ODERegression(nn.Module):
                 logs[f"vrfm_kl_{tag}"] = float(out["kl_z"])
             for _k, _v in (out.get("vrfm_stats") or {}).items():
                 logs[f"vrfm_{_k}_{tag}"] = float(_v)
+        # Fold this step's attractor observations + (periodically) re-freeze
+        # the actuation reference. Runs on EVERY rank every step (collective).
+        if self.attractor is not None:
+            self.attractor.sync(step)
+            logs.update(self.attractor.log_summary())
         loss = total          # SUM (matches loss_clean + lambda_cf*loss_cf), not a mean
         # DDP find_unused_parameters=False: every parameter in the wrapped
         # module must receive a gradient. The state probe only fires at 21/42

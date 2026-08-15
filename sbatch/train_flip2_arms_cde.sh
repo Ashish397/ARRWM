@@ -67,6 +67,32 @@ case "$ARM" in
   # deadband). Queued only after the base is validated.
   rollmse9g) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 ode_grep_weight=0.5"; export ODE_ROLLOUT=1;;
   rollsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher"; export ODE_ROLLOUT=1;;   # smoke of the rollout stage
+  # Gaussian repulsor on the rollout MSE base (roll + 1/d^2 from N(0,1),
+  # _grep_chunk). MU-ONLY at w=0.1 (user sign-off 2026-08-14 after the d2
+  # measurement): every sigma_c sits BELOW 1 on this data, so the sigma half
+  # of d2 grows as the rollout contracts (5.52 -> 7.47 over chunks 0-5) and
+  # 1/d2 would REWARD contraction; the mu half is right-signed (mean collapse
+  # shrinks Sum mu_c^2 3.25 -> 1.56, toward the gaussian mean, and the term
+  # resists it). w=0.1 puts the dose at regulariser scale (~0.04 vs base
+  # ~0.03), not the 2-3.5x dominance w=0.5 would give. Same hard curriculum
+  # as roll so the repulsor is the single variable vs the roll arm.
+  rollrep)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_grep_weight=0.1 ode_grep_components=mu"; export ODE_ROLLOUT=1;;
+  rollrepsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_grep_weight=0.1 ode_grep_components=mu"; export ODE_ROLLOUT=1;;
+  # STAGED, NOT YET SUBMITTED (user 2026-08-14: wait for rollkl + rollrep
+  # results first). kl_local base + mu-repulsor: kl_local's per-cell KL pulls
+  # dispersion up toward the teacher (variance channel) while the mu-only
+  # 1/d^2 term fights the gaussian-residue mean drift (exposure-bias channel).
+  rollklrep)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grep_weight=0.1 ode_grep_components=mu"; export ODE_ROLLOUT=1;;
+  rollklrepsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grep_weight=0.1 ode_grep_components=mu"; export ODE_ROLLOUT=1;;
+  # STAGED, NOT SUBMITTED — ONLINE ATTRACTOR TRACKER (af_model/
+  # attractor_tracker.py): per-direction AR(1) attractor estimation in stat
+  # space from the training rollouts + inverse-square repulsion from a
+  # target-network-frozen copy; pointness/distinctness/consistency gates give
+  # auto-shutoff when no point attractor is findable (manifold hypothesis:
+  # degenerate solutions are point collapses, the true solution is a
+  # manifold, so gate-dark = free convergence).
+  rollar)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_attractor_enabled=true ode_attractor_weight=0.1"; export ODE_ROLLOUT=1;;
+  rollarsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_attractor_enabled=true ode_attractor_weight=0.1 ode_attractor_warmup=5 ode_attractor_freeze_k=5"; export ODE_ROLLOUT=1;;  # smoke: tiny warmup/freeze so the smoke actually exercises the actuation path
   rolledsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_edist_weight=0.005"; export ODE_ROLLOUT=1;;  # edist SMOKE
   rolled)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_edist_weight=0.005"; export ODE_ROLLOUT=1;;                   # rollout + MSE + within-context energy distance (0.005: at 0.5 it dominated the base 116-683x)
   rollkled) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_edist_weight=0.005"; export ODE_ROLLOUT=1;; # rollout + KL + within-context energy distance

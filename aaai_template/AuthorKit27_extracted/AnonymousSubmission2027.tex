@@ -818,6 +818,7 @@ Batch64       & 0 & 0  & 3  & 0  & 0  \\
 Batch16       & 0 & 0  & 3  & 0  & 12 \\
 No Act. Tok.  & 0 & 0  & 3  & 0  & 0  \\
 No AdaLN      & 0 & 3  & 9  & 0  & 66 \\
+No Critic     & 0 & 0  & 3  & 0  & 13 \\
 \midrule
 minWM         & 0 & 0  & 6  & 31 & 9  \\
 Matrix-Game   & 0 & 94 & 9  & 0  & 0  \\
@@ -1775,6 +1776,7 @@ Ours (Batch 64)        & 240 & 237 \\
 Ours (Batch 16)        & 240 & 236 \\
 Ours (No Action Tokens)& 240 & 229 \\
 Ours (No AdaLN)        & 240 & 200 \\
+Ours (No Critic)       & 240 & 92  \\
 \bottomrule
 \end{tabular}
 }
@@ -2484,6 +2486,7 @@ pca2             & $3$ & $40$ & $15$ & $0$   & $22$ \\
 Batch16          & $5$ & $32$ & $26$ & $1$ & $43$ \\
 No Action Tokens & $3$ & $29$ & $14$ & $1$   & $20$ \\
 No AdaLN         & $4$ & $11$ & $28$ & $2$ & $48$ \\
+No Critic        & $0$ & $2$  & $11$ & $0$ & $16$ \\
 \bottomrule
 \end{tabular}
 }
@@ -2729,6 +2732,269 @@ matches its behaviour elsewhere: with the AdaLN action pathway removed it
 produces weak, drifting continuations even when the command asks for none. The
 smaller \texttt{Batch16} and lower-dimension \texttt{pca2} variants show mild
 high-frequency degradation ($12\%$ and $9\%$) but otherwise remain stable.
+
+\subsection{Critic Ablation}
+\label{app:no_critic_ablation}
+
+The online critic is introduced because the flow-matching objective alone does
+not require a generated continuation to realise the supplied action. To test
+whether the critic is in fact necessary, we train a No Critic variant
+in which the generator is optimized using only $\mathcal{L}_{\mathrm{flow}}$,
+while keeping the same action-conditioning pathway and overall training setup.
+
+Figure~\ref{fig:no_critic_gt_flip} shows that evaluation against the recorded
+training command (GT) is misleading in this setting. GT cosine agreement can
+become moderately positive for several source-motion groups, which might
+suggest successful control if considered in isolation. However, when the same
+contexts are evaluated under the sign-reversed counterfactual command (FLIP),
+agreement remains predominantly negative or unstable. This indicates that the
+model is primarily continuing motion inherited from the context, rather than
+redirecting that continuation in response to the supplied command.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.95\textwidth]{Figures/following_nocritic_by_REALdir.png}
+    \caption{
+        Training-time cosine agreement for the \texttt{No Critic} variant.
+        Blue denotes agreement with the recorded command (GT), while red
+        denotes agreement with the sign-reversed counterfactual command
+        (FLIP). High GT agreement together with negative or unstable FLIP
+        agreement indicates continuation of source motion rather than genuine
+        command following. Panel titles denote the source-direction group and
+        its duration in the training subset.
+    }
+    \label{fig:no_critic_gt_flip}
+\end{figure*}
+
+To make this failure visible at rollout level, Fig.~\ref{fig:no_critic_wedges}
+reproduces the action-forcing wedge comparison and includes the
+\texttt{No Critic} model alongside the other ablations. The \texttt{No Critic}
+panel shows that the realised responses collapse substantially relative to the
+default model, especially for backward and compositional commands. In other
+words, the model may still produce plausible-looking video, but it no longer
+maps commanded egomotion to realised egomotion reliably.
+
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}[t]{0.49\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{Figures/wedge_throttle_ablation.png}
+        \caption{Realised throttle response.}
+        \label{fig:no_critic_wedge_throttle}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.49\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{Figures/wedge_yaw_ablation.png}
+        \caption{Realised steering/yaw response.}
+        \label{fig:no_critic_wedge_yaw}
+    \end{subfigure}
+    \caption{
+        Wedge plots for the ablation suite, reproduced here to make the
+        \texttt{No Critic} comparison explicit in the appendix. The
+        \texttt{No Critic} model exhibits markedly weaker and less coherent
+        realised responses than the default model, despite appearing less
+        obviously degraded under some quality-only metrics.
+    }
+    \label{fig:no_critic_wedges}
+\end{figure*}
+
+Table~\ref{tab:no_critic_directional} confirms that this is a control failure
+rather than an obvious visual-quality failure. On the directional benchmark,
+the \texttt{No Critic} model achieves superficially favourable values on some
+quality axes, but its active population falls from $239$ to $92$ rollouts and
+$77.3\%$ of rollouts fail control, compared with $0.4\%$ for the default
+model. Consequently, the legitimate rollout rate drops from $73.0\%$ to
+$17.2\%$. Thus, flow loss and GT-only tracking can substantially overestimate
+controllability: the model learns to continue motion plausibly, but not to
+follow the requested action.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcc}
+\toprule
+Axis / metric & \texttt{No Critic} & Default \\
+\midrule
+Geometric corruption $\downarrow$ & 1.6\%  & 16.8\% \\
+Scene relocation $\downarrow$     & 10.9\% & 10.9\% \\
+Style shift $\downarrow$          & 0.0\%  & 2.5\%  \\
+HF degradation $\downarrow$       & 16.3\% & 27.2\% \\
+Conjuration $\downarrow$          & 0.4\%  & 1.2\%  \\
+\midrule
+Control fail $\downarrow$         & 77.3\% & 0.4\%  \\
+Legitimate $\uparrow$             & 17.2\% & 73.0\% \\
+Active population                 & 92 / 256 & 239 / 256 \\
+\bottomrule
+\end{tabular}
+\caption{
+    Directional-rollout critic ablation results. Geometry and conjuration are
+    evaluated over all 256 rollouts; relocation, style shift, and
+    high-frequency (HF) degradation are evaluated on the model-specific active
+    population. Although some quality-only scores appear favourable for
+    \texttt{No Critic}, the control-failure rate reveals that the model rarely
+    follows the supplied action correctly.
+}
+\label{tab:no_critic_directional}
+\end{table}
+
+The stationary no-op results in Table~\ref{tab:no_critic_stationary} further
+support this interpretation. Under a no-op command, the \texttt{No Critic}
+model is not catastrophically worse than the default model on most failure
+axes, although it shows increased high-frequency degradation. This makes the directional-collapse result more
+informative: the critic is not merely improving appearance, but is specifically
+needed to bind the commanded control signal to realised motion.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcc}
+\toprule
+Axis / metric & \texttt{No Critic} & Default (pca8) \\
+\midrule
+Geometric corruption $\downarrow$ & 0.0\% & 0.0\% \\
+Scene relocation $\downarrow$     & 3.1\% & 3.1\% \\
+Style shift $\downarrow$          & 0.0\% & 0.0\% \\
+HF degradation $\downarrow$       & 12.5\% & 0.0\% \\
+Conjuration $\downarrow$          & 0.0\% & 0.0\% \\
+\bottomrule
+\end{tabular}
+\caption{
+    Stationary (no-op) critic ablation results over 32 rollouts per model. The no-critic variant remains superficially reasonable
+    under no-op evaluation, but this does not translate into directional
+    controllability.
+}
+\label{tab:no_critic_stationary}
+\end{table}
+
+Overall, the critic ablation shows that the online critic is necessary not
+simply for improving video quality, but for making the action-conditioning
+meaningful. Without it, the model can achieve acceptable flow loss and appear
+to respond under GT evaluation, while in reality it is mostly preserving or
+continuing motion already implied by the conditioning context. The FLIP test
+and the wedge plots make this failure explicit.
+
+\section{Training Infrastructure and Statistical Protocol}
+\label{app:compute}
+
+\subsection{Hardware and software}
+
+All models were trained on an HPE Cray EX system with NVIDIA GH200
+Grace--Hopper nodes: four GPUs per node, 95\,GiB of usable HBM per GPU, compute
+capability 9.0, 128 CPU cores per task, and a Slingshot-11 interconnect
+(NCCL over the \texttt{hsn} interfaces). Training used PyTorch 2.10.0 with CUDA
+12.8, distributed data-parallel across nodes, and LoRA adapters over a frozen
+Wan2.1-T2V-1.3B backbone.
+
+The Default model and every conditioning ablation (PCA-2, PCA-4, No-Act-Tokens,
+No-AdaLN, No-Critic) were trained on 8 nodes = 32 GPUs at global batch 32 and
+learning rate $4.95\times10^{-5}$. The batch-size ablations used 4 nodes = 16
+GPUs (global batch 16, lr $3.5\times10^{-5}$) and 16 nodes = 64 GPUs (global
+batch 64, lr $7.0\times10^{-5}$). Every variant trains from step 0 to step 5000.
+The scheduler enforces a four-hour limit per job, so each run proceeds as a
+short sequence of checkpoint-resumed segments; Table~\ref{tab:compute} reports
+the total.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Variant & Nodes & GPUs & Wall-clock & GPU-h \\
+\midrule
+Default (PCA-8)   & 8  & 32 & 26.9\,h & 862 \\
+Batch64           & 16 & 64 & 28.4\,h & 1819 \\
+Batch16           & 4  & 16 & 27.4\,h & 439 \\
+PCA-4             & 8  & 32 & 27.5\,h & 879 \\
+PCA-2             & 8  & 32 & 26.9\,h & 860 \\
+No-Act-Tokens     & 8  & 32 & 21.0\,h & 671 \\
+No-AdaLN          & 8  & 32 & 26.7\,h & 854 \\
+No-Critic         & 8  & 32 & 26.8\,h & 857 \\
+\midrule
+\multicolumn{4}{l}{Total} & $\approx$7{,}250 \\
+\bottomrule
+\end{tabular}
+\caption{Measured training cost per reported model.}
+\label{tab:compute}
+\end{table}
+
+\subsection{One run per variant, many rollouts per run}
+
+Each reported model is a \textbf{single training run} at \texttt{seed:\ 0},
+offset per rank so that data order and initialisation are deterministic. We
+report no seed replicates. At roughly 850 GPU-hours per variant, a three-seed
+replication of the eight-model table would cost on the order of 22{,}000
+GPU-hours, which was not available to us; we therefore spent the budget on
+breadth of evaluation instead of depth of replication.
+
+We evaluate each trained model over \textbf{256 directional
+rollouts} spanning the action grid and scene pool, and every quality column in
+the paper is a statistic over that population rather than a single measurement.
+The uncertainty we can quantify is therefore evaluation-sample uncertainty --
+how much a reported percentage would move if we drew a different set of
+rollouts from the same trained model -- and it is quantified exactly, from
+hundreds of independent inferences per cell. What we cannot quantify from these
+data is training-seed uncertainty, and we do not claim to.
+
+Training is not bit-reproducible past the first step, because the backward pass
+uses non-deterministic kernels. Measured run-to-run loss agreement is
+$\sim$$10^{-3}$, against a loss that moves by $\sim$0.09 between adjacent steps
+of a single run, so the residual is well inside one run's own variation.
+
+\subsection{Significance}
+
+The quality columns are proportions over known denominators --- 256 directional
+rollouts for geometric corruption, and an explicitly defined feature-valid,
+non-static active population for scene relocation. Proportions over known
+denominators admit exact binomial inference directly from the published counts,
+with no additional training runs. We report Wilson 95\% intervals per cell and
+two-sided two-proportion $z$-tests between our model and each other model
+(Table~\ref{tab:signif}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Model & Geometric corruption & Scene relocation \\
+      & \% [95\% CI]         & \% [95\% CI] \\
+\midrule
+MinWM      & \phantom{0}1.2 [0.4, 3.4]    & \phantom{0}3.7 [1.8, 7.5] \\
+Yume       & \phantom{0}8.6 [5.7, 12.7]   & 57.8 [51.4, 63.9] \\
+\textbf{Ours} & \textbf{16.8} [12.7, 21.9] & \textbf{10.9} [7.5, 15.5] \\
+Batch64    & 25.8 [20.8, 31.5]            & \phantom{0}8.9 [5.9, 13.2] \\
+Astra      & 52.0 [45.8, 58.0]            & 66.5 [60.0, 72.5] \\
+WorldCam   & 68.0 [62.0, 73.4]            & 87.5 [82.4, 91.3] \\
+MatrixGame & 70.7 [64.9, 75.9]            & 95.4 [92.0, 97.4] \\
+WorldPlay  & 80.1 [74.8, 84.5]            & 77.3 [71.6, 82.2] \\
+\bottomrule
+\end{tabular}
+\caption{Wilson 95\% confidence intervals on the two quality columns. Lower is
+better in both.}
+\label{tab:signif}
+\end{table}
+
+Our model's advantage over every external baseline is significant on both
+columns ($p < 10^{-9}$ against Astra, WorldCam, MatrixGame and WorldPlay on
+both; $p = 5.3\times10^{-3}$ against Yume on geometric corruption, $p < 10^{-9}$
+on relocation). Two results run the other way and we state them plainly. MinWM
+is significantly \emph{better} than our model on both columns
+($p = 6.3\times10^{-10}$ geometry, $p = 6.3\times10^{-3}$ relocation), which is
+the near-static failure mode discussed in the main text: a model that barely
+moves has little opportunity to corrupt geometry or leave the scene. The
+comparison against the Batch64 ablation splits by column: Default is
+significantly better on geometric corruption (16.8\% vs.\ 25.8\%,
+$p = 1.3\times10^{-2}$), but the relocation gap (10.9\% vs.\ 8.9\%) is
+\textbf{not} significant ($p = 0.46$) and we do not claim a difference there.
+
+These intervals characterise the rollout population for a fixed trained model.
+They should not be read as intervals over training seeds, and the per-rollout
+dispersion drawn in the response curves (SEM bands) and wedge plots
+(interquartile arcs) likewise describes variation across rollouts within a
+single run, not across runs.
+
 
 
 \end{document}

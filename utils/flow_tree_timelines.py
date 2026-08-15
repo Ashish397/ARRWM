@@ -266,7 +266,13 @@ def main():
                                ("nr_chroma", "pilot4_nr_chroma", None),
                                ("nr_hyb", "pilot4_nr_hyb", None),
                                ("nrcg_chroma", "pilot4_nrcg_chroma", None),
-                               ("nrcg_hyb", "pilot4_nrcg_hyb", None)]:
+                               ("nrcg_hyb", "pilot4_nrcg_hyb", None)] + [
+                               # TL_CUSTOM="label=flow_run_name,..." appends
+                               # arbitrary recordings (e.g. the per-checkpoint
+                               # v100_* probes) without touching this table.
+                               (kv.split("=", 1)[0], kv.split("=", 1)[1], None)
+                               for kv in os.environ.get("TL_CUSTOM", "").split(",")
+                               if "=" in kv]:
             if label not in which:
                 continue
             traj = load_run(run, m0, pcs, 2, lx)
@@ -316,7 +322,8 @@ def main():
                            "nr_chroma": "NR + CHROMA-lock",
                            "nr_hyb": "NR + hybrid",
                            "nrcg_chroma": "NR+CRITIC + chroma",
-                           "nrcg_hyb": "NR+CRITIC + hybrid"}[label]
+                           "nrcg_hyb": "NR+CRITIC + hybrid"}.get(
+                               label, label.upper())
                     stages.append((f"{hdr} AR TIMELINE | committed: {b_cur} | "
                                    f"chunk {b_cur}: {LBL[si]}", per, noise))
                 stages.extend([stages[-1]] * 4)

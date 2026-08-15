@@ -24,12 +24,12 @@ from PIL import Image, ImageDraw
 ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"
 OUT = os.environ.get("AR_OUT", f"{ARR}/analysis/reels_appendix")
 N_SET = int(os.environ.get("AR_N", "20"))
-OURS = ["16node", "pca8_8node", "4node", "pca4", "pca2", "noatok", "noadaln"]
+OURS = ["16node", "pca8_8node", "4node", "pca4", "pca2", "noatok", "noadaln", "nocritic"]
 BEST = ["16node", "pca8_8node"]
 DIRS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]
 NICE = {"16node": "batch 64", "pca8_8node": "batch 32", "4node": "batch 16",
         "pca4": "PCA4", "pca2": "PCA2", "noatok": "no action tokens",
-        "noadaln": "no AdaLN"}
+        "noadaln": "no AdaLN", "nocritic": "no critic"}
 DNAME = {"F": "Forward", "FR": "Forward-Right", "R": "Right", "BR": "Back-Right",
          "B": "Backward", "BL": "Back-Left", "L": "Left", "FL": "Forward-Left"}
 PICKS = [6, 24, 45, 66, 87, 107]          # seed + 5 across the generated span
@@ -279,9 +279,14 @@ def pick_failure(df):
     """Four cheaply-detectable failure modes. Geometric mangle is deliberately
     NOT mined here: whole-frame sharpness/IQA features score at chance on it,
     so it cannot be selected automatically."""
+    # NB: every slice must be SORTED before head(), otherwise rows are taken in
+    # dataframe order and models late in OURS (e.g. nocritic) never enter the
+    # candidate pool at all.
+    near_zero = df.loc[df.follow.abs().sort_values().index]
+    near_zero = near_zero[near_zero.follow.abs() < 0.08]
     cand = pd.concat([
         df[df.follow < -0.10].sort_values("follow").head(70),
-        df[df.follow.abs() < 0.08].head(70),
+        near_zero.head(90),
         df.sort_values("follow").head(40),
         df[df.model.isin(BEST)].sort_values("follow").head(30),
     ]).drop_duplicates(subset=["model", "wi", "dir"])

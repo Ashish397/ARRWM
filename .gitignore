@@ -11,6 +11,14 @@ prompts
 checkpoints/
 logs/
 wandb/
+# Root-level symlinks to bulk data moved out to ../ARRWM_data (the
+# trailing-slash patterns above match directories only, not symlinks).
+/logs
+/wandb
+/eval
+/third_party
+/analysis
+/$WANDB_SAVE_DIR
 # Literal "$LOGDIR" directory: created when the env var is unexpanded
 # (the smoke launcher passes ``log_dir=$LOGDIR`` as a literal string).
 $LOGDIR/

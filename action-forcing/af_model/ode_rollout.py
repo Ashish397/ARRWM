@@ -471,15 +471,25 @@ def rollout_ode_loss(
                     # through the graph a second time" -- and would place a
                     # backward AFTER the DDP-syncing one, breaking DDP's
                     # one-reduction-per-iteration contract.
+                    # REPULSOR RUNG GATING (user directive 2026-08-14): fire at
+                    # EVERY rung EXCEPT the first — final-rung-only is "too
+                    # little too late"; rung 0 is excluded because its pred_x0
+                    # comes from near-pure noise and sits closest to the mu=0
+                    # attractor, where the 1/d^2 force would be outsized.
+                    # Dose: each firing is divided by n_chunks*(n_rungs-1) so
+                    # the per-step total stays `gexcl_weight` once (the same
+                    # calibrated dose the final-rung-only version applied),
+                    # spread across the ladder where it can still steer the
+                    # trajectory.
+                    if i >= 1 and gexcl_fn is not None and gexcl_weight > 0.0:
+                        _gx = gexcl_fn(pred_x0, tgt)
+                        if _gx is not None:
+                            n_gx += 1
+                            bwd_loss = bwd_loss + loss_scale * gexcl_weight * (
+                                _gx / max(n_chunks * max(len(rungs) - 1, 1), 1))
+                            gx_total = (_gx.detach() if gx_total is None
+                                        else gx_total + _gx.detach())
                     if i == len(rungs) - 1:
-                        if gexcl_fn is not None and gexcl_weight > 0.0:
-                            _gx = gexcl_fn(pred_x0, tgt)
-                            if _gx is not None:
-                                n_gx += 1
-                                bwd_loss = bwd_loss + loss_scale * gexcl_weight * (
-                                    _gx / max(n_chunks, 1))
-                                gx_total = (_gx.detach() if gx_total is None
-                                            else gx_total + _gx.detach())
                         if edist_fn is not None and edist_weight > 0.0:
                             # Divided by n_chunks so the per-step dose is
                             # `edist_weight` once, not once per chunk. NOT added to
