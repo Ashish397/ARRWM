@@ -634,6 +634,17 @@ class ODERegression(nn.Module):
         self.ode_grep_weight = float(getattr(config, "ode_grep_weight", 0.0))
         self.ode_grep_components = str(
             getattr(config, "ode_grep_components", "both"))
+        # DIRECTIONAL repulsor (v2 of the mu-repulsor, 2026-08-15): distance
+        # measured as the PROJECTION onto the teacher's per-chunk mean
+        # direction, not the isotropic distance from mu=0. The isotropic form
+        # was measured gaming itself: it held Sum mu^2 up (4.2->5.2) while
+        # pushing means in wrong-sign directions (error 1.68 vs roll's 1.09,
+        # the purple tinge) because ANY escape from the origin satisfied it.
+        # Orthogonal/wrong-sign offsets buy ZERO relief from the projection.
+        self.ode_grepdir_weight = float(
+            getattr(config, "ode_grepdir_weight", 0.0))
+        self.ode_grepdir_eps = float(
+            getattr(config, "ode_grepdir_eps", 0.5))
         # ONLINE ATTRACTOR TRACKING + REPULSION (af_model/attractor_tracker.py):
         # estimate the per-direction collapse attractor in stat space from the
         # training rollouts, repel from a target-network-frozen copy, gated to
@@ -1988,6 +1999,30 @@ class ODERegression(nn.Module):
         # inverse-square force would be outsized.
         return (1.0 / (d2 + 0.25)).mean()
 
+    def _grepdir_chunk(self, pred, target):
+        """DIRECTIONAL mean repulsor: barrier on the projection of the chunk's
+        per-channel means onto the TEACHER's mean direction.
+
+            p = <mu_student, mu_teacher/||mu_teacher||>
+            L = 1 / (max(p, 0)^2 + eps)
+
+        Semantics: the collapse mode drains mean energy along the teacher's
+        direction (measured: Sum mu^2 3.3->1.0 over the rollout); L blows up
+        as that projection approaches zero -- the barrier kl_local's quadratic
+        tracking lacks -- and is INDIFFERENT to components orthogonal to the
+        teacher direction, so the isotropic form's color-offset cheat earns
+        nothing. Wrong-sign (anti-aligned) projections clamp to 0 = maximum
+        force. eps bounds the worst case (max L = 1/eps; early rungs sit
+        closest to collapse and ran ~3x hot under the isotropic form).
+        `target` is the teacher's committed chunk from the batch: a per-chunk
+        MOVING reference with zero estimation machinery.
+        """
+        mu_s = pred.float().mean(dim=(1, 3, 4))            # [B, C]
+        mu_t = target.float().mean(dim=(1, 3, 4))          # [B, C]
+        that = mu_t / mu_t.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        p = (mu_s * that).sum(dim=1).clamp(min=0.0)        # [B]
+        return (1.0 / (p.pow(2) + self.ode_grepdir_eps)).mean()
+
     def _gexcl_chunk(self, pred, target):
         """Teacher-referenced contraction barrier for one committed chunk.
 
@@ -2140,6 +2175,8 @@ class ODERegression(nn.Module):
             if self.attractor is not None:
                 _gfn = (lambda p_, t_, _b=_bin: self.attractor.repulsor(p_, _b))
                 _gw = self.attractor.weight
+            elif self.ode_grepdir_weight > 0.0:
+                _gfn, _gw = self._grepdir_chunk, self.ode_grepdir_weight
             elif self.ode_grep_weight > 0.0:
                 _gfn, _gw = self._grep_chunk, self.ode_grep_weight
             elif self.ode_gexcl_weight > 0.0:

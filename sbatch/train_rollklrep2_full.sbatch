@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rollmsec-full
+#SBATCH --job-name=rollklrep2-full
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
@@ -24,4 +24,4 @@ export SAVE_EVERY=200
 export CURRIC_EPOCHS=10
 DRIVER_COPY=$SLURM_SUBMIT_DIR/logs/.driver_${SLURM_JOB_ID}.sh
 cp /scratch/u6ex/as1748.u6ex/ARRWM/sbatch/train_flip2_arms_cde.sh "$DRIVER_COPY"
-ARM=rollmsec bash "$DRIVER_COPY"
+ARM=rollklrep2 bash "$DRIVER_COPY"

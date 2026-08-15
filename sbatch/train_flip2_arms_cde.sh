@@ -63,6 +63,8 @@ case "$ARM" in
   #   msec : the hard-direction ODE curriculum (prunes to 2-4 dirs after ep 0)
   rollmse9)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;
   rollmsec)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=hard"; export ODE_ROLLOUT=1;;
+  rollklc)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=hard"; export ODE_ROLLOUT=1;;   # SAMPLED (hard-curriculum) kl_local — canonical name; recipe == rollkl default
+  rollkl9)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9"; export ODE_ROLLOUT=1;;   # all-9 kl_local control (STAGED, not submitted)
   # Gaussian repulsor on the MSE rollout base (N(0,1), inverse-square, no
   # deadband). Queued only after the base is validated.
   rollmse9g) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 ode_grep_weight=0.5"; export ODE_ROLLOUT=1;;
@@ -84,6 +86,11 @@ case "$ARM" in
   # 1/d^2 term fights the gaussian-residue mean drift (exposure-bias channel).
   rollklrep)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grep_weight=0.1 ode_grep_components=mu"; export ODE_ROLLOUT=1;;
   rollklrepsmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grep_weight=0.1 ode_grep_components=mu"; export ODE_ROLLOUT=1;;
+  # v2 DIRECTIONAL repulsor on the kl_local base (2026-08-15): projection onto
+  # the teacher chunk-mean direction — purple-cheat immune (CPU-verified:
+  # orthogonal offset relief == 0, descent cos 1.0 with teacher means).
+  rollklrep2)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grepdir_weight=0.1"; export ODE_ROLLOUT=1;;
+  rollklrep2smoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grepdir_weight=0.1"; export ODE_ROLLOUT=1;;
   # STAGED, NOT SUBMITTED — ONLINE ATTRACTOR TRACKER (af_model/
   # attractor_tracker.py): per-direction AR(1) attractor estimation in stat
   # space from the training rollouts + inverse-square repulsion from a
