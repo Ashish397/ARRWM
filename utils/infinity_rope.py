@@ -20,13 +20,22 @@ The `LongLive
 <https://github.com/NVlabs/LongLive>`_ ``causal_model_infinity.py``
 fixes this with a few changes that this module ports onto our model:
 
-* **Window-relative indexing**, bounded once the cache fills:
-  cache K is rotated at ``[0 .. num_cache_frames-1]``, Q is rotated at
-  ``[local_attn_size - num_new_frames, local_attn_size]`` once the cache
-  is full (so Q-rotation magnitude is bounded — the *infinity* property
-  for arbitrarily long rollouts), and at
-  ``[local_start_index/frame_seqlen, ...]`` before the cache fills
-  (matches the original direct-insert semantics).
+* **Buffer-relative indexing**, bounded because the buffer is:
+  cache K is rotated at ``[0 .. num_cache_frames-1]`` and Q at
+  ``[num_cache_frames - num_new_frames, num_cache_frames)``. Both Q and
+  K are therefore anchored to the SAME origin (the live buffer), in both
+  the pre-fill and the post-roll regime, so query-key offsets are
+  continuous across the first roll and at every buffer size. Q-rotation
+  magnitude is bounded by ``kv_cache_size / frame_seqlen`` — the
+  *infinity* property for arbitrarily long rollouts. Before the cache
+  fills this is identical to ``local_start_index / frame_seqlen``, i.e.
+  the original direct-insert semantics are preserved exactly.
+
+  (Upstream LongLive anchors the post-roll Q at ``local_attn_size -
+  num_new_frames`` instead. That is only equivalent when the buffer is
+  sized equal to the attention window; when the buffer is deeper — which
+  every one of our seed-headroom configs does — it shears every offset
+  by ``local_attn_size - num_cache_frames`` from the first roll onward.)
 * **Un-roped K stored in the cache**, with RoPE applied at attention
   time. This makes every denoise pass / cache lookup re-rotate K at
   fresh window-relative indices.
@@ -306,26 +315,45 @@ def patched_forward(
         }
 
     # ---- Block-Relativistic RoPE ----
-    if rolled:
-        # Cache is full; Q anchored at the end of the local_attn_size
-        # window. ``self.local_attn_size`` is in *frames* here (frames
-        # of the live region, including sink + window) — that is the
-        # contract enforced by ``utils.eval_causal_AR._set_attention_window``.
-        q_start_idx = self.local_attn_size - num_new_frames
-        query_rel_indices = torch.arange(
-            q_start_idx,
-            q_start_idx + num_new_frames,
-            device=q.device,
-        )
-    else:
-        current_frame_in_window = local_start_index // frame_seqlen
-        query_rel_indices = torch.arange(
-            current_frame_in_window,
-            current_frame_in_window + num_new_frames,
-            device=q.device,
-        )
-
     num_cache_frames = local_end_index // frame_seqlen
+
+    # Q is anchored to the *buffer* frame count, exactly like K.
+    #
+    # K is ALWAYS indexed off the buffer: the prefix is rotated at
+    # ``[0 .. local_start_index/frame_seqlen)`` and the live region at
+    # ``[num_cache_frames - live_frames .. num_cache_frames)`` (see
+    # below), i.e. ``k_rel[i] = i`` for ``i in [0, num_cache_frames)``.
+    # Q must therefore be indexed off the same origin or every
+    # query-key offset is uniformly sheared.
+    #
+    # The previous code anchored the post-roll query at
+    # ``self.local_attn_size - num_new_frames`` (a WINDOW-relative
+    # anchor) while keeping the pre-roll query at
+    # ``local_start_index // frame_seqlen`` (a BUFFER-relative anchor).
+    # Because ``local_attn_size`` (the attention *window*, frames) and
+    # ``num_cache_frames`` (the *buffer* occupancy, frames) need not be
+    # equal, every offset jumped by ``local_attn_size - num_cache_frames``
+    # at the very first roll and stayed sheared forever after. Measured:
+    # buffer 33 / window 21 -> a -12 jump; buffer 39 / window 21 -> -18;
+    # buffer 27 / window 21 -> -6 (and offsets even went POSITIVE, i.e.
+    # the model was told past keys lay in its future). Only buffer ==
+    # window gave a jump of 0.
+    #
+    # ``num_cache_frames - num_new_frames`` is algebraically IDENTICAL to
+    # the old pre-roll expression (``local_start_index = local_end_index
+    # - num_new_tokens``, so ``local_start_index // frame_seqlen ==
+    # num_cache_frames - num_new_frames``), so the not-yet-rolled regime
+    # — including any config whose buffer is >= its sequence and
+    # therefore never rolls at all — is bit-for-bit unchanged. It is
+    # also still BOUNDED (``num_cache_frames <= kv_cache_size /
+    # frame_seqlen``), preserving the "infinity" property for
+    # arbitrarily long rollouts.
+    q_start_idx = num_cache_frames - num_new_frames
+    query_rel_indices = torch.arange(
+        q_start_idx,
+        q_start_idx + num_new_frames,
+        device=q.device,
+    )
 
     import os as _os
     if _os.environ.get("ARRWM_ROPE_DEBUG") and torch.is_grad_enabled():

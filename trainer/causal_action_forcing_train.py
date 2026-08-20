@@ -825,6 +825,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             False,
                         )
                     ),
+                    wavelet_hf_drop_hh=bool(
+                        getattr(
+                            self.config,
+                            "ladd_wavelet_hf_drop_hh",
+                            False,
+                        )
+                    ),
                     wavelet_hf_adapter_init_gain=float(
                         getattr(
                             self.config,
@@ -1200,6 +1207,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             rollout_frames=rollout_frames,
             context_noise=context_noise,
             exit_flag_weights=exit_flag_weights,
+            # 14e alignment: the DMD streaming path prefills
+            # ``dmd_context_clean_frames`` of context into the KV cache
+            # BEFORE the first generated chunk. The pipeline needs that
+            # count to size the buffer so the cache never evicts, and
+            # ``seed_prefill_mode`` selects what gets written there.
+            # Both default to the legacy behaviour (0 frames declared,
+            # "estimate" prefill) so every other config is unchanged.
+            seed_prefill_frames=int(
+                getattr(cfg, "dmd_context_clean_frames", 0) or 0),
+            seed_prefill_mode=str(
+                getattr(cfg, "seed_prefill_mode", "estimate")),
+            kv_cache_seed_headroom=bool(
+                getattr(cfg, "kv_cache_seed_headroom", False)),
         )
         # The ActionForcingDMD model needs the pipeline reference for backward
         # simulation inside generator_loss / critic_loss.
@@ -1243,13 +1263,60 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "parity with utils/eval_causal_AR.py defaults)."
                 )
         else:
+            # PREREQUISITE for the original (absolute ``causal_rope_apply``)
+            # cached path when per-frame action tokens are live.
+            # ``causal_model.py:306-326`` ropes the cached branch as a
+            # contiguous (f, h, w) grid UNLESS ``cached_rope_action_aware``
+            # is set on the attention module; with
+            # ``action_tokens_per_frame=1`` the interleaved action token
+            # shifts every frame's spatial grid by one token — a per-frame
+            # column shear, i.e. a WORSE defect than the RoPE convention
+            # mismatch we are removing. Every other cache-driven consumer
+            # of these weights sets it (``utils/eval_causal_AR.py:648-654``,
+            # ``utils/causal_chain_rollout.py:76-82``,
+            # ``action-forcing/af_model/ode_rollout.py:228-229``); the DMD
+            # trainer never did, because the infinity-RoPE patch (default
+            # ON) bypasses that code entirely.
+            #
+            # Scope: the flag is read ONLY inside the ``kv_cache is not
+            # None`` branch, so it is inert on the teacher-forced scorer
+            # forwards (which pass no kv_cache). Setting it on the scorers
+            # too therefore changes nothing for the TF heads and fixes the
+            # optional AR head (``dmd_ar_head_weight``), which drives the
+            # same weights through a real KV cache.
+            #
+            # Predicate is ``hasattr`` (as in ode_rollout.py:228 /
+            # causal_chain_rollout.py:76), NOT ``value > 0``: the DiT only
+            # PROPAGATES its ``action_tokens_per_frame`` down to
+            # ``block.self_attn`` inside ``_forward_inference`` /
+            # ``_forward_train`` (causal_model.py:1276-1278, 1579), so at
+            # construction time every attention module still reads 0.
+            # Setting the flag where apf is genuinely 0 is a no-op — the
+            # consuming branch is ``_apf > 0 and cached_rope_action_aware``.
+            _rope_targets = [self._inner_dit_for_rope()]
+            for _name in ("real_score", "fake_score"):
+                _sm = getattr(self.model, _name, None)
+                if _sm is not None:
+                    _rope_targets.append(_sm)
+            _cra_set = 0
+            for _root in _rope_targets:
+                if _root is None:
+                    continue
+                for _m in _root.modules():
+                    if hasattr(_m, "action_tokens_per_frame"):
+                        _m.cached_rope_action_aware = True
+                        _cra_set += 1
             if self.is_main_process:
                 logging.info(
                     "[ActionForcing] Infinity-RoPE patch DISABLED "
                     "(infinity_rope=false). Training will run the "
-                    "original RoPE path; AR-eval defaults to "
+                    "original absolute-RoPE cached path; "
+                    "cached_rope_action_aware=True set on %d module(s) so "
+                    "the interleaved per-frame action tokens are not roped "
+                    "as spatial ones. AR-eval defaults to "
                     "infinity_rope=true so a train/inference mismatch "
-                    "is expected on long-horizon rollouts."
+                    "is expected on long-horizon rollouts.",
+                    _cra_set,
                 )
 
         # ------------------------------------------------------------------
@@ -5191,9 +5258,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # disc's view — counters the transition GAN's progressive
         # brightening. Differentiable, so on the grad-on fake side it also
         # zeroes the gen-side gradient pushing the inter-member magnitude.
+        # cpp==2: the transition flag (unchanged). cpp==1 (gt_vs_fake): its
+        # OWN flag, default "" = off = byte-identical. The m1/m1m2 branch of
+        # _mean_equalize_pair reduces over [F,H,W] keeping C, so it
+        # generalises to a single chunk cleanly -- unlike mean_equalize, whose
+        # former/latter split is NaN at cpp==1. Applied to the disc input AND
+        # (via _mean_eq) to cand_disc, so match queries and candidates are
+        # normalised identically -- which is the point: it removes the raw
+        # brightness cue a grey student otherwise uses to retrieve an equally
+        # grey GT chunk and escape being penalised.
         _mag_mode = (
             str(getattr(self.model, "ladd_gt_transition_mag_norm", "")).lower()
-            if chunks_per_pair == 2 else ""
+            if chunks_per_pair == 2
+            else str(getattr(self.model, "ladd_gt_vs_fake_mag_norm", "")).lower()
         )
         _mean_eq = (_mag_mode in ("m1", "m1m2")) or (
             chunks_per_pair == 2
@@ -5584,10 +5661,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # noise + diff-aug-clone work when matching is active. ``_match`` is
         # defined further below and bound to this (``_match = _match_active``)
         # so the two cannot diverge.
+        # ``ladd_gt_vs_fake_match`` (default False) enables the SAME
+        # nearest-match real retrieval for the SINGLE-CHUNK gt_vs_fake mode:
+        # each fake chunk is scored against its K nearest-by-L1 GT CHUNKS
+        # drawn from the ride pool, instead of the positional GT chunk that
+        # produced the dead disc (d_real ~= d_fake, d_loss == log2). The
+        # TRANSITION structure stays exclusive to gt_transition: gt_vs_fake
+        # keeps ``chunks_per_pair == 1`` here and in every candidate slice
+        # below (the matched path is parameterised by ``chunks_per_pair``,
+        # never by the mode name). Read from the model with a config
+        # fallback (same pattern as the other late-added LADD knobs).
         _match_active = (
-            pair_mode == "gt_transition"
-            and chunks_per_pair == 2
-            and bool(getattr(self.model, "ladd_gt_transition_match", False))
+            (
+                pair_mode == "gt_transition"
+                and chunks_per_pair == 2
+                and bool(getattr(self.model, "ladd_gt_transition_match", False))
+            )
+            or (
+                pair_mode == "gt_vs_fake"
+                and chunks_per_pair == 1
+                and bool(
+                    getattr(self.model, "ladd_gt_vs_fake_match", None)
+                    or getattr(self.config, "ladd_gt_vs_fake_match", False)
+                )
+            )
         )
         # DiffAugment — same per-sample randomness on real and fake.
         # Different seeds per mode so the augmentations decorrelate.
@@ -5812,10 +5909,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # n_real sampler — the match branch is physically first and returns,
         # so a co-set config would SILENTLY ignore those. Fail loud instead.
         if _match and (_all_pairs_mode or _mismatched):
+            _mflag = ("ladd_gt_vs_fake_match" if pair_mode == "gt_vs_fake"
+                      else "ladd_gt_transition_match")
+            _pfx = ("ladd_gt_vs_fake" if pair_mode == "gt_vs_fake"
+                    else "ladd_gt_transition")
             raise RuntimeError(
-                "ladd_gt_transition_match is mutually exclusive with "
-                "ladd_gt_transition_all_pairs / ladd_gt_transition_n_real>0; "
-                "set all_pairs=false and n_real=0 for the matched mode."
+                f"{_mflag} is mutually exclusive with "
+                f"{_pfx}_all_pairs / {_pfx}_n_real>0; "
+                "set all_pairs=false and n_real=0 for the matched mode. "
+                "(The matched branch returns before the all-pairs / "
+                "mismatched code, so a co-set config would SILENTLY ignore "
+                "them.)"
             )
         _match_lat = None
         if _match:
@@ -5824,7 +5928,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _ss_m.get("gt_match_latents")
                 if isinstance(_ss_m, dict) else None
             )
-        if _match and _match_lat is not None and int(_match_lat.shape[1]) >= 2 * npb:
+        # Minimum usable pool = ONE candidate = ``chunks_per_pair``
+        # consecutive chunks: 2*npb frames for a gt_transition pair, npb
+        # frames for a gt_vs_fake single chunk. (Was hard-coded 2*npb.)
+        _match_min_frames = chunks_per_pair * npb
+        if (
+            _match
+            and _match_lat is not None
+            and int(_match_lat.shape[1]) >= _match_min_frames
+        ):
             K = max(1, int(getattr(self.model, "ladd_gt_transition_match_k", 3)))
             _need_pp = pooled_prompt is not None
             _r1_gamma = float(getattr(self.model, "ladd_r1_gamma", 1.0))
@@ -5836,8 +5948,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _K_stat = int(getattr(self.r3gan_disc, "stat_logit_count", 0))
             _W_stat = float(getattr(
                 self.model, "ladd_stat_head_loss_weight", 1.0))
-            _action_blind = bool(getattr(
-                self.model, "ladd_gt_transition_action_blind", False))
+            # ``ladd_gt_transition_action_blind`` zeroes the conditioning.
+            # The FAKE-side zeroing above is gated on
+            # ``pair_mode == "gt_transition"``, so gating the matched REAL
+            # side the same way keeps the two sides symmetric — otherwise a
+            # gt_vs_fake matched run with that (transition-only) flag set
+            # would feed action-BLIND reals against action-FUL fakes, i.e.
+            # hand the disc a free giveaway feature. No-op with the flag off
+            # (default), and unchanged for gt_transition.
+            _action_blind = (
+                pair_mode == "gt_transition"
+                and bool(getattr(
+                    self.model, "ladd_gt_transition_action_blind", False))
+            )
             B = int(prompt_embeds.shape[0])
             pool_lat = _match_lat.detach()                       # [B, RL, C,H,W]
             pool_act_full = (
@@ -5845,7 +5968,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 if isinstance(_ss_m, dict) else None
             )
             pool_chunks = int(pool_lat.shape[1] // npb)
-            n_cand = max(1, pool_chunks - 1)                     # (u, u+1)
+            # A candidate starts at chunk ``u`` and spans chunks
+            # [u, u + chunks_per_pair), so the last legal start is
+            # ``pool_chunks - chunks_per_pair`` and the count is
+            # ``pool_chunks - chunks_per_pair + 1``:
+            #   chunks_per_pair == 2 (gt_transition): pool_chunks - 1  (u, u+1)
+            #   chunks_per_pair == 1 (gt_vs_fake):    pool_chunks      (u)
+            # The guard above proves pool_chunks >= chunks_per_pair, so the
+            # max(1, ...) clamp never actually fires (kept as belt-and-braces
+            # — it must NEVER manufacture an out-of-range u).
+            n_cand = max(1, pool_chunks - chunks_per_pair + 1)
             Kk = min(K, n_cand)
             # Hard cap on distinct reals forwarded per D-update (memory): the
             # combined disc forward is 2*n_uniq + n_fake rows, so this bounds
@@ -5855,6 +5987,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _fdt = fake_chunks_det.dtype
 
             def _pool_pair_lat(b, u):
+                if chunks_per_pair == 1:
+                    # gt_vs_fake: a candidate is ONE chunk -> [1, npb, ...].
+                    # u in [0, pool_chunks) => the slice end (u+1)*npb is
+                    # <= pool_chunks*npb <= pool_lat.shape[1].
+                    return pool_lat[b:b + 1, u * npb:(u + 1) * npb]
                 return torch.cat([
                     pool_lat[b:b + 1, u * npb:(u + 1) * npb],
                     pool_lat[b:b + 1, (u + 1) * npb:(u + 2) * npb],
@@ -6008,16 +6145,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 acts_list = []
                 if a_per_f > 0 and pool_act_full is not None and atp is not None:
                     for (b, u) in rows_bu:
-                        acts_list.append(torch.cat([
-                            pool_act_full[b:b + 1, u * npb:(u + 1) * npb],
-                            pool_act_full[b:b + 1, (u + 1) * npb:(u + 2) * npb],
-                        ], dim=1))
+                        if chunks_per_pair == 1:
+                            # gt_vs_fake: ONE chunk's co-located actions, so
+                            # the per-frame action modulation has exactly npb
+                            # rows == the disc input's F dim (t_frames).
+                            acts_list.append(
+                                pool_act_full[b:b + 1, u * npb:(u + 1) * npb])
+                        else:
+                            acts_list.append(torch.cat([
+                                pool_act_full[b:b + 1, u * npb:(u + 1) * npb],
+                                pool_act_full[
+                                    b:b + 1, (u + 1) * npb:(u + 2) * npb],
+                            ], dim=1))
                 ru = torch.stack(real_rows, dim=0).to(
                     device=device, dtype=_fdt)                   # [n_uniq, ...]
                 # e11: CARN the matched real FORMERS (Req 1 + Req 2). Only on
                 # the D-update side (carn=True); the gen-side keeps clean
                 # formers (Req 2), so the student is pulled toward clean GT.
-                if carn and bool(getattr(
+                # FORMER/LATTER semantics (ru[:, :npb] vs ru[:, npb:]) only
+                # exist for a 2-chunk transition. Under chunks_per_pair == 1
+                # ``ru[:, npb:]`` is EMPTY, so this whole block is skipped
+                # (gt_vs_fake has no former to degrade).
+                if carn and chunks_per_pair == 2 and bool(getattr(
                         self.model, "ladd_gt_transition_carn_match_pool", False)):
                     n_uniq = ru.shape[0]
                     # Per-row cap = (min served-fake drift) - 1. A row's
@@ -6114,6 +6263,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _gt_former = bool(getattr(
                     self.model, "forward_noiser_apply_gt_former", False))
                 if ((_gt_both or _gt_former)
+                        and chunks_per_pair == 2
                         and getattr(self.model, "forward_noiser", None)
                         is not None):
                   # chain_levels drives the FORMER-only forward scheme; any
@@ -6506,11 +6656,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         # of a fire-step (heavy). ladd_r1_once_per_step (default
                         # off) restricts it to the FIRST update only (1-of-N) so
                         # the per-fire-step R1 dose is cut ~n_disc_updates-fold.
-                        _do_r1 = (current_step % _r1_every_n == 0) and (
+                        # DEBT-BASED cadence (2026-08-19). The old
+                        # ``current_step % _r1_every_n == 0`` required EXACT
+                        # alignment, but the GAN only runs on generator iters
+                        # (step % dfake_gen_update_ratio == 0), so whenever
+                        # _r1_every_n and the gen ratio are not commensurate
+                        # the modulo can be missed forever. Fire instead when
+                        # at least _r1_every_n steps have elapsed since the
+                        # last ACTUAL firing -- slightly delayed at times, but
+                        # it can never be skipped indefinitely.
+                        _last_r1_at = int(getattr(self, "_ladd_last_r1_step", -10**9))
+                        _do_r1 = (current_step - _last_r1_at >= _r1_every_n) and (
                             _it == 0 or not bool(getattr(
                                 self.config, "ladd_r1_once_per_step",
                                 getattr(self.model, "ladd_r1_once_per_step",
                                         False))))
+                        if _do_r1:
+                            self._ladd_last_r1_step = int(current_step)
                         _do_r2 = self._ladd_r2_fires(
                             _r2_gamma, _r2_every_n, _r2_offset, current_step)
                         if _micro_groups > 1:
@@ -6532,11 +6694,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             last_d_loss = _log["d_loss"]
                             last_d_real = _log["d_real"]
                             last_d_fake = _log["d_fake"]
-                            last_r1 = _log["r1"]
-                            last_r2 = _log["r2"]
-                            last_r1_grad_sq = _log["r1_grad_sq"]
-                            last_r1_fired = _log["r1_fired"]
-                            last_r2_grad_sq = _log["r2_grad_sq"]
+                            last_r1 = max(last_r1, _log["r1"])
+                            last_r2 = max(last_r2, _log["r2"])
+                            last_r1_grad_sq = max(last_r1_grad_sq, _log["r1_grad_sq"])
+                            last_r1_fired = max(last_r1_fired, _log["r1_fired"])
+                            last_r2_grad_sq = max(last_r2_grad_sq, _log["r2_grad_sq"])
                             last_r2_fired = _log["r2_fired"]
                             last_d_loss_stat = _log["d_loss_stat"]
                             continue
@@ -6697,9 +6859,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/r3gan_g_weight": float(gen_gan_weight),
                 "train/critic_warmup_done": 1.0 if critic_warmup_done else 0.0,
                 "train/ladd_n_pairs": float(n_pairs),
+                # PROOF-OF-MATCHING telemetry. These keys exist ONLY on the
+                # matched branch, and _compute_ladd_losses suffixes every
+                # per-mode key ("_gt" for gt_vs_fake, "_gtxn" for
+                # gt_transition), so seeing ``train/ladd_match_k_gt`` in a
+                # run is proof the single-chunk retrieval path executed.
                 "train/ladd_match_k": float(Kk),
                 "train/ladd_match_pool_m": float(_M),
                 "train/ladd_match_n_real": last_n_real,
+                "train/ladd_match_active": 1.0,
+                "train/ladd_match_n_cand": float(n_cand),
+                "train/ladd_match_chunks_per_pair": float(chunks_per_pair),
                 "train/r3gan_d_loss_stat": last_d_loss_stat,
                 "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
                 "train/r3gan_stat_loss_weight": float(
@@ -6714,6 +6884,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # pre-guard graceful fallback (only hit on an empty-match ride; the
         # normal matched path returns above and never reaches here).
         if _match_active and real_chunks_det_noisy is None:
+            # LOUD (rate-limited) warning: matching was REQUESTED but the
+            # pool was absent or shorter than one candidate, so this step
+            # silently used positional pairing instead. Worth shouting
+            # about: it changes what the disc learns AND (with
+            # ladd_disc_micro_batch_groups > 1) it changes this rank's
+            # backward COUNT vs a rank that matched, which is a DDP hang
+            # risk. Behaviour is unchanged (still the graceful fallback);
+            # only the visibility is new.
+            _mf_n = getattr(self, "_ladd_match_fallback_n", 0) + 1
+            self._ladd_match_fallback_n = _mf_n
+            if _mf_n <= 5 or _mf_n % 100 == 0:
+                import sys as _sys
+                _pl_f = (0 if _match_lat is None
+                         else int(_match_lat.shape[1]))
+                print(
+                    f"[LADD-MATCH-FALLBACK] mode={pair_mode} step="
+                    f"{int(current_step)} n={_mf_n}: match requested but "
+                    f"pool frames={_pl_f} < required "
+                    f"{chunks_per_pair * npb} (chunks_per_pair="
+                    f"{chunks_per_pair}, npb={npb}) -> POSITIONAL pairing "
+                    "this step. Check that setup_sequence published "
+                    "streaming_state['gt_match_latents'].",
+                    file=_sys.stderr, flush=True,
+                )
             real_chunks_det_noisy = _add_disc_noise(real_chunks_det)
             fake_chunks_det_noisy = _add_disc_noise(fake_chunks_det)
             if diff_aug_policy:
@@ -8152,6 +8346,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if self.pipeline is not None:
             self.pipeline.rollout_frames = max(
                 int(self.pipeline.num_max_frames), int(target)
+            )
+            # max_attention_size was NOT schedule-aware (2026-08-17): it is
+            # set once at construction from model_kwargs.local_attn_size and
+            # never revisited, so a GROWING schedule (phase-1 default
+            # [[0,21],[250,30],[500,42],...]) raised local_attn_size and the
+            # roll trigger while the attention slice
+            # (`local_end - max_attention_size`) still truncated to the OLD
+            # frame count -> more memory, no extra context, silently. It only
+            # went unnoticed here because this recipe pins a FLAT [[0,21]]
+            # AND model_kwargs.local_attn_size=21, so the two agreed by
+            # construction. Propagate it with the schedule so correctness no
+            # longer depends on that duplicate pin being left alone.
+            _fsl = int(self.pipeline.frame_seq_length)
+            _tgt_tok = 32760 if int(target) == -1 else int(target) * _fsl
+            _n_set = 0
+            for _m in self.model.generator.modules():
+                if hasattr(_m, "max_attention_size"):
+                    _m.max_attention_size = _tgt_tok
+                    _n_set += 1
+            logging.info(
+                "[ActionForcing] max_attention_size -> %d tokens (%s frames) "
+                "on %d module(s) [schedule-propagated]",
+                _tgt_tok, target, _n_set,
             )
 
         # Force the NEXT _fwdbwd_streaming_step to open a new sequence
@@ -10063,7 +10280,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # wider than ride_latents_window so the per-fake MAE matcher has a
         # rich candidate set. Moved to the rollout device once per ride
         # (~tens of MB; ride is small). Only when matching is enabled.
-        if bool(getattr(self.model, "ladd_gt_transition_match", False)):
+        # Published for EITHER matched mode: gt_transition (2-chunk
+        # transition candidates) or gt_vs_fake (single-chunk candidates).
+        # Without this the gt_vs_fake matcher would find no pool and
+        # silently fall back to positional pairing.
+        if (
+            bool(getattr(self.model, "ladd_gt_transition_match", False))
+            or bool(
+                getattr(self.model, "ladd_gt_vs_fake_match", None)
+                or getattr(self.config, "ladd_gt_vs_fake_match", False)
+            )
+        ):
             _ss = self.model.streaming_state
             _dev = _ss["ride_latents_window"].device
             _gm_lat = ride["latents"]

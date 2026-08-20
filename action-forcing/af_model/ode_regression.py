@@ -645,6 +645,22 @@ class ODERegression(nn.Module):
             getattr(config, "ode_grepdir_weight", 0.0))
         self.ode_grepdir_eps = float(
             getattr(config, "ode_grepdir_eps", 0.5))
+        # KLTS — KL Temperature Scaling (user design 2026-08-15): a learned
+        # per-(AR-chunk, rung) temperature on the denoising CHORD,
+        #   pred_x0' = x_t + tau[c, i] * (pred_x0 - x_t),  tau = 1 + theta.
+        # The step direction is the model's OWN prediction for this content —
+        # no external reference to game (the repulsor's purple failure is
+        # impossible by construction). Zero-init theta => tau=1 => byte-
+        # identical model at step 0 (AdaLN-zero philosophy, emd-head
+        # precedent). 8 chunk rows x 4 rungs; measured contraction law
+        # (k~0.917/chunk) predicts learned tau ~1.05-1.15 late — a
+        # falsifiable mechanism check. Trains in the emd-head optimizer
+        # group (high lr, no decay: base 2e-6 would freeze 32 scalars at
+        # init — measured on jobs 5941221/5946996).
+        self.ode_klts = bool(getattr(config, "ode_klts", False))
+        if self.ode_klts:
+            self.klts_theta = nn.Parameter(
+                torch.zeros(8, 4, device=self.device))
         # ONLINE ATTRACTOR TRACKING + REPULSION (af_model/attractor_tracker.py):
         # estimate the per-direction collapse attractor in stat space from the
         # training rollouts, repel from a target-network-frozen copy, gated to
@@ -683,6 +699,17 @@ class ODERegression(nn.Module):
         # across ranks (features are tiny), so the set spans the whole fan
         # and producing one answer for every action is directly penalized.
         self.ode_edist_weight = float(getattr(config, "ode_edist_weight", 0.0))
+        # PROPER energy score (2026-08-16): two noise branches per chunk,
+        # strictly proper scoring rule vs the single teacher realization.
+        # Exclusive with the other slot losses (enforced in rollout_ode_loss).
+        self.ode_es = bool(getattr(config, "ode_es", False))
+        # 1.0 = stop-grad doubling: matches the symmetric m=2 energy score's
+        # expected repulsion gradient (review 2026-08-16; 0.5 is improper).
+        self.ode_es_repw = float(getattr(config, "ode_es_repw", 1.0))
+        if self.ode_es and str(getattr(config, "ode_loss_type", "mse")) != "mse":
+            # The es ladder replaces the pointwise loss entirely; a configured
+            # kl_local would be silently ignored — fail fast instead.
+            raise RuntimeError("ode_es replaces the rung loss; set ode_loss_type=mse")
         self.ode_edist_commit_only = bool(
             getattr(config, "ode_edist_commit_only", True))
         # KV-CACHE ROLLOUT STAGE (af_model/ode_rollout.py). The teacher made
@@ -2204,6 +2231,7 @@ class ODERegression(nn.Module):
                 edist_weight=(self.ode_edist_weight if _use_ed else 0.0),
                 gexcl_fn=_gfn,
                 gexcl_weight=_gw,
+                klts_theta=getattr(self, "klts_theta", None),
                 # Keep the target in fp32: t.to(p.dtype) would round the
                 # teacher's committed latents to bf16 under autocast before the
                 # loss casts both back to float.
@@ -2225,6 +2253,7 @@ class ODERegression(nn.Module):
                 # because the gradients are already applied.
                 loss_scale=float(getattr(self, "_rollout_scale_prev", 1.0)),
                 tail_loss_fn=self._probe_touch,   # every armed backward must mark all params ready
+                es=self.ode_es, es_repw=self.ode_es_repw,
             )
             # Attractor estimator feed: the committed chain (detached) plus the
             # teacher targets, binned by this branch's direction. The clean
@@ -2234,6 +2263,11 @@ class ODERegression(nn.Module):
             if self.attractor is not None and out.get("chain") is not None:
                 self.attractor.observe(out["chain"], tgt[:1], _bin,
                                        weight=(0.125 if tag == "clean" else 1.0))
+            if self.ode_es:
+                # mean rms pair-distance between the two noise branches — the
+                # spread the score is defending; watch it against the teacher's
+                # own draw-to-draw spread rather than letting it run dark.
+                logs[f"es_rep_{tag}"] = float(out.get("es_rep", 0.0))
             _w_act = None
             if self.ode_actw_enabled and tag == "cf" and out.get("chain") is not None:
                 _w_act = self._action_error_weight(out["chain"], z[:1])

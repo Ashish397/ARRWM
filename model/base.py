@@ -186,9 +186,24 @@ class BaseModel(nn.Module):
                 f"(foreign-teacher path removed); got "
                 f"real={self.real_model_name!r} fake={self.fake_model_name!r}."
             )
+        # SCHEDULER SHIFT ALIGNMENT (2026-08-17). Both scorers used to be
+        # built WITHOUT timestep_shift, defaulting to the wrapper's
+        # shift=8.0, while the generator, the ODE student and the v14e
+        # teacher were all trained on the shift=5.0 grid. Since
+        # ``timesteps == sigmas*1000``, sigma(t) ~= t/1000 either way, so the
+        # NOISING agrees -- but each scorer's ``_convert_flow_pred_to_x0``
+        # reads its OWN sigma table, applying a shift-8 gain to an x_t built
+        # on shift-5. <0.1% over most of the sampled range, but ~11% at t=50
+        # and ~19% at t=20, and it does NOT cancel through the DMD
+        # normalisation denominator nor the critic's x0->flow conversion.
+        # Pre-existing (predates the 14e reconnection) but a genuine
+        # cross-stage misalignment, so the scorers now inherit the same
+        # shift as everything else.
+        _sched_shift = float(model_kwargs.get("timestep_shift", 5.0))
         self.real_score = WanDiffusionWrapper(
             model_name=self.real_model_name,
             is_causal=False,
+            timestep_shift=_sched_shift,
         )
         # Override the wrapper's spatial-only ``_base_seq_len`` (default
         # 32760 = 21 * 1560) to match the scorer's actual DMD input
@@ -214,6 +229,7 @@ class BaseModel(nn.Module):
         self.fake_score = WanDiffusionWrapper(
             model_name=self.fake_model_name,
             is_causal=False,
+            timestep_shift=_sched_shift,   # see the shift note on real_score
         )
         # See the matching comment on ``real_score`` above — size the
         # fake-score wrapper's seq_len to the DMD batched window.

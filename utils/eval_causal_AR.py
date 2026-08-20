@@ -959,6 +959,36 @@ class ODEChainPipeline(ChainPipeline):
                         current_start=current_start_frame * frame_seq_length,
                     )
                 pred_x0 = out[1]
+                # KLTS serve parity: apply the LEARNED temperature on the same
+                # chord the training applied it to — pred' = x + tau*(pred - x)
+                # — or the probe would measure a different sampler than was
+                # trained (the mismatch this campaign exists to kill). Table
+                # loaded lazily once from ODE_KLTS_CKPT. Chunk index is
+                # clamped into the 8-row table; serve counts bootstrap blocks
+                # that training's chunk index does not — a <=2-row shift on a
+                # slowly-varying table, accepted for v1.
+                _ktf = float(os.environ.get("ODE_KLTS_FIXED", "0") or 0)
+                if _ktf and _ktf != 1.0:
+                    # serve-time fixed-temperature override (tau sweep): no
+                    # table, no ckpt — one scalar on the same chord.
+                    _xf = x.float()
+                    pred_x0 = (_xf + _ktf * (pred_x0.float() - _xf)
+                               ).to(pred_x0.dtype)
+                if os.environ.get("ODE_KLTS_CKPT"):
+                    if not hasattr(self, "_klts_theta"):
+                        _sd = torch.load(os.environ["ODE_KLTS_CKPT"],
+                                         map_location="cpu", weights_only=False)
+                        _t = _sd.get("klts_theta")
+                        self._klts_theta = (None if _t is None
+                                            else _t.to(self.device).float())
+                        del _sd
+                    if self._klts_theta is not None:
+                        _th = self._klts_theta[
+                            min(step_idx, self._klts_theta.shape[0] - 1),
+                            min(d_idx, self._klts_theta.shape[1] - 1)]
+                        _xf = x.float()
+                        pred_x0 = (_xf + (1.0 + _th) * (pred_x0.float() - _xf)
+                                   ).to(pred_x0.dtype)
                 _acfg = float(os.environ.get("ODE_ACTION_CFG", "0") or 0)
                 if _acfg and _acfg != 1.0:
                     # Action classifier-free guidance: second forward with

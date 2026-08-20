@@ -759,6 +759,370 @@ def _bidir_forward_with_action_tokens(
     return torch.stack(x)
 
 
+# =====================================================================
+# CAUSAL "TWIN" FOR THE BIDIRECTIONAL SCORERS (kv_cache serving)
+# =====================================================================
+# WHY THIS EXISTS (bug fix 2026-08-17).
+# ``model/base.py`` builds real_score / fake_score as
+# ``WanDiffusionWrapper(is_causal=False)``, i.e. a plain bidirectional
+# ``WanModel``. That class has NO ``kv_cache`` parameter anywhere in its
+# forward chain. ``utils/wan_wrapper.py``'s kv_cache branch nevertheless
+# forwards ``kv_cache`` / ``crossattn_cache`` / ``current_start`` down
+# into ``_forward_with_action``, where they landed in ``**kwargs`` and
+# were DROPPED on the floor before ``_bidir_forward_with_action_tokens``.
+# Every "AR-served" forward in ``ActionForcingDMD._ar_score_band`` was
+# therefore an isolated, context-free BIDIRECTIONAL denoise of a single
+# npb-frame chunk: the past-only conditional the AR DMD head exists to
+# build was EMPTY, and the dmd_ar_head / dmd_ar_critic signal vacuous.
+#
+# THE FIX. Give the bidirectional model a CAUSAL VIEW of its OWN weights
+# and dispatch to it whenever ``kv_cache is not None``. The view is a
+# real ``CausalWanModel`` whose parameter-bearing submodules are the
+# SAME PYTHON OBJECTS as the bidirectional model's, so:
+#
+#   * MEMORY: zero extra parameter bytes. ``build_causal_twin`` builds
+#     the skeleton on the ``meta`` device (no storage allocated at all)
+#     and then rebinds every leaf module / Parameter to the
+#     bidirectional model's. The only real cost is ~30 empty
+#     ``CausalWanAttentionBlock`` python objects plus a shared reference
+#     to ``freqs``.
+#   * OPTIMIZER / DDP: no new parameters exist, so no optimizer change,
+#     and ``DistributedDataParallel`` still sees exactly one copy of
+#     each weight. The dispatch happens INSIDE the DDP-wrapped module's
+#     own forward, so the reducer is armed exactly as before — which is
+#     what keeps the AR critic's ``ddp_sync_last`` contract valid.
+#   * peft / LoRA: because whole ``nn.Linear`` (or ``lora.Linear``)
+#     objects are shared — not raw weight tensors — an online LoRA
+#     adapter on the teacher is honoured by the causal view for free.
+#   * infinity-RoPE: the view's attention modules are genuine
+#     ``CausalWanSelfAttention`` instances, so ``utils/infinity_rope.py``
+#     (which patches that CLASS) actually applies to the AR path. It
+#     never did before — the scorers were ``WanSelfAttention``.
+#
+# The view is NOT registered as a submodule (stored via
+# ``object.__setattr__``) so it stays out of ``state_dict()`` /
+# ``parameters()`` / ``_apply``. The shared Parameters are mutated in
+# place by ``.to()`` / ``.half()`` on the real owner, so the view
+# follows automatically.
+
+_CAUSAL_TWIN_ATTR = "_ar_causal_twin"
+
+# Every parameter-bearing attribute of ``CausalWanModel``. Verified
+# against ``WanModel``: both expose 825 parameters with identical names
+# and identical shapes, and zero buffers on either side.
+_TWIN_TOP_SHARED = (
+    "patch_embedding", "text_embedding", "time_embedding", "time_projection",
+)
+_TWIN_BLOCK_SHARED = ("norm1", "norm2", "norm3", "ffn", "cross_attn", "modulation")
+_TWIN_ATTN_SHARED = ("q", "k", "v", "o", "norm_q", "norm_k")
+_TWIN_HEAD_SHARED = ("norm", "head", "modulation")
+
+
+def _twin_is_shared_with(twin, bidir_model) -> bool:
+    """Cheap identity spot-check that ``twin`` still aliases ``bidir_model``.
+
+    Re-run on every use so a re-wrap of the owner (a peft adapter applied
+    after the view was built, an EMA / dual-teacher rebind, a
+    ``deepcopy`` that duplicated the view) is detected and the view
+    rebuilt rather than silently serving stale weights. Pure ``is``
+    comparisons — no tensor op, no allocation, no RNG.
+    """
+    try:
+        if twin.patch_embedding is not bidir_model.patch_embedding:
+            return False
+        if twin.head.head is not bidir_model.head.head:
+            return False
+        if len(twin.blocks) != len(bidir_model.blocks):
+            return False
+        for tb, bb in zip(twin.blocks, bidir_model.blocks):
+            if tb.self_attn.q is not bb.self_attn.q:
+                return False
+            if tb.ffn is not bb.ffn:
+                return False
+    except AttributeError:
+        return False
+    return True
+
+
+def build_causal_twin(
+    bidir_model,
+    *,
+    local_attn_size: int = -1,
+    sink_size: int = 0,
+    max_attention_size=None,
+):
+    """Build a ``CausalWanModel`` that SHARES every weight with
+    ``bidir_model`` (a bidirectional ``WanModel``).
+
+    Raises if anything is left unshared or still on the ``meta`` device,
+    so a future divergence between the two class definitions surfaces as
+    a loud failure rather than a silently-random second model.
+    """
+    if isinstance(bidir_model, CausalWanModel):
+        return bidir_model
+    for _attr in ("blocks", "head", "patch_embedding", "dim", "num_layers"):
+        if not hasattr(bidir_model, _attr):
+            raise TypeError(
+                "build_causal_twin expected a bidirectional WanModel, got "
+                f"{type(bidir_model).__name__} (missing {_attr!r})."
+            )
+    cfg = dict(
+        model_type=str(getattr(bidir_model, "model_type", "t2v")),
+        patch_size=tuple(bidir_model.patch_size),
+        text_len=int(bidir_model.text_len),
+        in_dim=int(bidir_model.in_dim),
+        dim=int(bidir_model.dim),
+        ffn_dim=int(bidir_model.ffn_dim),
+        freq_dim=int(bidir_model.freq_dim),
+        text_dim=int(bidir_model.text_dim),
+        out_dim=int(bidir_model.out_dim),
+        num_heads=int(bidir_model.num_heads),
+        num_layers=int(bidir_model.num_layers),
+        qk_norm=bool(bidir_model.qk_norm),
+        cross_attn_norm=bool(bidir_model.cross_attn_norm),
+        eps=float(bidir_model.eps),
+    )
+    # ``meta`` construction: shapes only. No storage is allocated and
+    # ``init_weights`` consumes no RNG on meta tensors, so building the
+    # view cannot perturb any arm's random stream.
+    with torch.device("meta"):
+        twin = CausalWanModel(
+            local_attn_size=int(local_attn_size),
+            sink_size=int(sink_size),
+            **cfg,
+        )
+    if len(twin.blocks) != len(bidir_model.blocks):
+        raise RuntimeError(
+            "build_causal_twin: block count mismatch "
+            f"({len(twin.blocks)} vs {len(bidir_model.blocks)})."
+        )
+
+    for _name in _TWIN_TOP_SHARED:
+        setattr(twin, _name, getattr(bidir_model, _name))
+    if cfg["model_type"] == "i2v":
+        twin.img_emb = bidir_model.img_emb
+    for _name in _TWIN_HEAD_SHARED:
+        setattr(twin.head, _name, getattr(bidir_model.head, _name))
+    for _tb, _bb in zip(twin.blocks, bidir_model.blocks):
+        for _name in _TWIN_BLOCK_SHARED:
+            setattr(_tb, _name, getattr(_bb, _name))
+        for _name in _TWIN_ATTN_SHARED:
+            setattr(_tb.self_attn, _name, getattr(_bb.self_attn, _name))
+    # ``freqs`` is a plain attribute (deliberately NOT a buffer upstream
+    # so ``.to()`` cannot change its dtype). Both classes build it with
+    # the identical ``rope_params`` call; share the owner's so the view
+    # never needs its own device migration.
+    twin.freqs = bidir_model.freqs
+    twin.rope_max_seq_len = getattr(
+        bidir_model, "rope_max_seq_len", twin.rope_max_seq_len,
+    )
+
+    # ---- completeness proof -----------------------------------------
+    _owner_ids = {id(p) for p in bidir_model.parameters()}
+    _bad = []
+    for _n, _p in twin.named_parameters():
+        if _p.is_meta:
+            _bad.append(f"{_n}[meta]")
+        elif id(_p) not in _owner_ids:
+            _bad.append(f"{_n}[unshared]")
+    for _n, _b in twin.named_buffers():
+        if _b.is_meta:
+            _bad.append(f"{_n}[meta-buffer]")
+    if _bad:
+        raise RuntimeError(
+            "build_causal_twin: the causal view is not fully aliased to "
+            "the bidirectional model — CausalWanModel and WanModel have "
+            "drifted apart. Offending entries (first 12): "
+            f"{_bad[:12]} (total {len(_bad)}). Extend _TWIN_*_SHARED."
+        )
+
+    # ---- serving configuration --------------------------------------
+    twin.local_attn_size = int(local_attn_size)
+    for _blk in twin.blocks:
+        _blk.local_attn_size = int(local_attn_size)
+        _blk.self_attn.local_attn_size = int(local_attn_size)
+        _blk.self_attn.sink_size = int(sink_size)
+        if max_attention_size is not None:
+            # Action-token-aware span (frames * frame_seq_length, where
+            # frame_seq_length is 1561, not 1560).
+            # ``CausalWanSelfAttention.__init__`` hardcodes 1560/frame,
+            # which would silently clip the window by one frame's worth
+            # of tokens once the cache is deep enough for it to matter.
+            # Mirrors the propagation
+            # ``trainer/causal_action_forcing_train.py::
+            # _apply_attn_size_if_changed`` performs on the generator.
+            _blk.self_attn.max_attention_size = int(max_attention_size)
+    twin.block_mask = None
+    # Alt head: ``_forward_inference`` would need a ``CausalHead``-shaped
+    # alt head to serve ``compute_alt_head``; the cached path never asks
+    # for one (``utils/wan_wrapper.py``'s kv_cache branch does not pass
+    # it), so leave it unset and let the dispatch below reject the kwarg.
+    twin.head_alt = None
+    return twin
+
+
+def attach_causal_twin(
+    bidir_model,
+    *,
+    local_attn_size: int = -1,
+    sink_size: int = 0,
+    max_attention_size=None,
+):
+    """Idempotently attach (and return) ``bidir_model``'s causal view.
+
+    Rebuilds when the cached view no longer aliases its owner or when the
+    serving geometry changed. Stored OUTSIDE the ``nn.Module`` registries
+    (``object.__setattr__``) so ``state_dict`` / ``parameters`` / DDP /
+    checkpointing are untouched.
+    """
+    if isinstance(bidir_model, CausalWanModel):
+        return bidir_model
+    _key = (
+        int(local_attn_size),
+        int(sink_size),
+        None if max_attention_size is None else int(max_attention_size),
+    )
+    twin = bidir_model.__dict__.get(_CAUSAL_TWIN_ATTR)
+    if (
+        twin is not None
+        and getattr(twin, "_ar_twin_key", None) == _key
+        and _twin_is_shared_with(twin, bidir_model)
+    ):
+        return twin
+    twin = build_causal_twin(
+        bidir_model,
+        local_attn_size=local_attn_size,
+        sink_size=sink_size,
+        max_attention_size=max_attention_size,
+    )
+    object.__setattr__(twin, "_ar_twin_key", _key)
+    object.__setattr__(bidir_model, _CAUSAL_TWIN_ATTR, twin)
+    return twin
+
+
+def get_causal_twin(bidir_model):
+    """Return the attached causal view, or None if there is none."""
+    if isinstance(bidir_model, CausalWanModel):
+        return bidir_model
+    return bidir_model.__dict__.get(_CAUSAL_TWIN_ATTR)
+
+
+def is_cache_capable(module) -> bool:
+    """True iff ``module`` can actually honour a ``kv_cache`` forward.
+
+    The ONLY correct test. Duck-typing on ``local_attn_size`` does not
+    work: ``wan/modules/model.py`` hardcodes ``self.local_attn_size = 21``
+    on the plain bidirectional ``WanModel``, which is precisely why the
+    AR head's guard sat there dead while every cached forward silently
+    ran context-free.
+    """
+    return isinstance(module, CausalWanModel) or isinstance(
+        get_causal_twin(module), CausalWanModel,
+    )
+
+
+# Flags that live on the bidirectional owner but are READ by the causal
+# forward. Mirrored onto the view immediately before every cached
+# forward so there is exactly one source of truth (the owner) and no way
+# for the two to drift.
+_TWIN_MIRRORED_FLAGS = (
+    ("action_tokens_per_frame", 0),
+    ("state_tokens_per_frame", 0),
+    ("gradient_checkpointing", False),
+    ("skip_cache_update", False),
+    ("num_frame_per_block", 1),
+    ("_state_probe_tap_set", None),
+    ("_action_modulation", None),
+)
+
+
+def _bidir_cached_forward_via_causal_twin(
+    model,
+    x,
+    t,
+    context,
+    seq_len,
+    *,
+    action_tokens,
+    state_tokens,
+    kv_cache,
+    crossattn_cache,
+    current_start,
+    cache_start,
+    clip_fea,
+    y,
+):
+    """Serve a ``kv_cache`` forward of a bidirectional scorer through its
+    causal view. See the block comment above ``build_causal_twin``."""
+    twin = get_causal_twin(model)
+    if twin is None:
+        raise RuntimeError(
+            "A kv_cache forward reached a bidirectional WanModel but no "
+            "causal view is attached, so the cache could not be honoured. "
+            "Call ``model.action_model_patch.attach_causal_twin(dit, ...)`` "
+            "before serving this module with a KV cache (the AR DMD head "
+            "does this in ``ActionForcingDMD._ar_ensure_causal_twin``). "
+            "WanModel has no cache-aware attention at all, so silently "
+            "continuing would score every chunk with ZERO context."
+        )
+    if not _twin_is_shared_with(twin, model):
+        raise RuntimeError(
+            "The attached causal view no longer aliases its owner's "
+            "weights (the module was re-wrapped after the view was "
+            "built). Re-attach it via attach_causal_twin()."
+        )
+    for _name, _default in _TWIN_MIRRORED_FLAGS:
+        setattr(twin, _name, getattr(model, _name, _default))
+    # CROSS-ATTENTION CACHE IS NO_GRAD-ONLY (DDP safety).
+    # ``WanT2VCrossAttention`` reuses cached k/v once ``is_init`` is set,
+    # and in the AR schedule that cache is populated by the no_grad
+    # prefill. A grad-enabled forward that then HITS the cache never
+    # touches ``text_embedding`` or any ``cross_attn.{k,v,norm_k}`` — 14
+    # parameters on a 2-block toy, ~150 on the real 30-block DiT — so
+    # with ``find_unused_parameters=False`` (how the trainer wraps
+    # fake_score) DDP would wait forever for buckets that never become
+    # ready. That is a HANG, not a crash.
+    # Today the AR critic happens to dodge it because
+    # ``_forward_inference``'s gradient-checkpointing branch omits
+    # ``crossattn_cache`` entirely and every queued arm sets
+    # ``fake_score_gradient_checkpointing=true`` — i.e. correctness rests
+    # on an unrelated flag. Pin it instead: under grad, always recompute.
+    # Numerically free — cross-attn k/v are a pure function of
+    # ``context``, which is constant across the whole AR pass, so the
+    # recomputed values are the cached ones.
+    # A per-block list of ``None`` (not a bare ``None``):
+    # ``_forward_inference``'s non-checkpointing branch indexes
+    # ``crossattn_cache[block_index]`` unconditionally, while the block
+    # itself treats a ``None`` entry as "recompute".
+    if torch.is_grad_enabled():
+        crossattn_cache = [None] * len(twin.blocks)
+    return twin._forward_inference(
+        x,
+        t,
+        context,
+        seq_len,
+        clip_fea=clip_fea,
+        y=y,
+        kv_cache=kv_cache,
+        crossattn_cache=crossattn_cache,
+        current_start=0 if current_start is None else current_start,
+        cache_start=cache_start,
+        action_tokens=action_tokens,
+        state_tokens=state_tokens,
+    )
+
+
+# Kwargs the Stream-B branch of ``_forward_with_action`` genuinely
+# consumes. Anything else arriving with a non-inert value is a silent
+# drop and now raises — that swallow is exactly what hid the missing KV
+# cache through the whole AR-head bring-up.
+_STREAM_B_CONSUMED_KWARGS = frozenset(
+    {"clip_fea", "y", "classify_mode", "regress_mode"}
+)
+# Cache kwargs are consumed by the causal-view dispatch instead.
+_CACHE_KWARGS = ("kv_cache", "crossattn_cache", "current_start", "cache_start")
+
+
 def patch_bidirectional_wan_model_for_action(model):
     """Patch Wan's bidirectional model to support external action modulation
     (Stream A, AdaLN) and per-frame action tokens (Stream B)."""
@@ -817,7 +1181,75 @@ def patch_bidirectional_wan_model_for_action(model):
                 "Stream A only is out-of-distribution."
             )
 
+        # ---- CACHED (AR / causal) SERVING --------------------------------
+        # ``utils/wan_wrapper.py`` routes here with ``kv_cache`` set
+        # whenever a caller serves this module autoregressively. The
+        # bidirectional WanModel cannot honour a cache; dispatch to the
+        # weight-sharing causal view instead. Popping the cache kwargs
+        # here also keeps them out of the unrecognised-kwarg check and
+        # out of ``orig_fwd`` (which would TypeError on them).
+        _cache_kwargs = {
+            _k: kwargs.pop(_k) for _k in _CACHE_KWARGS if _k in kwargs
+        }
+        _kv_cache = _cache_kwargs.get("kv_cache")
+
         try:
+            if _kv_cache is not None:
+                # The cached path is a pure past-only conditional: there
+                # is no clean counterpart half and no second action /
+                # state stream to interleave. Silently ignoring them (as
+                # the pre-fix code did with the cache itself) would score
+                # a different conditional than the caller asked for.
+                _tf_only = {
+                    "clean_x": clean_x,
+                    "aug_t": aug_t,
+                    "action_tokens_clean": action_tokens_clean,
+                    "action_modulation_clean": action_modulation_clean,
+                    "state_tokens_clean": state_tokens_clean,
+                }
+                _bad_tf = sorted(k for k, v in _tf_only.items() if v is not None)
+                if _bad_tf:
+                    raise RuntimeError(
+                        "kv_cache (autoregressive) serving was requested "
+                        f"together with teacher-forcing kwarg(s) {_bad_tf}. "
+                        "Those are TF-only; the cached path has no clean "
+                        "counterpart half. Pass one serving mode or the "
+                        "other."
+                    )
+                # ``clip_fea`` / ``y`` ARE forwarded to the causal view
+                # (i2v); everything else — classify_mode, regress_mode,
+                # compute_alt_head, … — is unsupported on the cached
+                # path and must not be silently ignored.
+                _bad_kw = sorted(
+                    k for k, v in kwargs.items()
+                    if k not in ("clip_fea", "y")
+                    and v is not None and v is not False
+                )
+                if _bad_kw:
+                    raise RuntimeError(
+                        "kv_cache (autoregressive) serving does not support "
+                        f"kwarg(s) {_bad_kw}."
+                    )
+                if a_per_f > 0 and action_tokens is None:
+                    raise RuntimeError(
+                        "kv_cache serving with action_tokens_per_frame="
+                        f"{a_per_f} but no action_tokens."
+                    )
+                return _bidir_cached_forward_via_causal_twin(
+                    self,
+                    x,
+                    t,
+                    context,
+                    seq_len,
+                    action_tokens=action_tokens,
+                    state_tokens=state_tokens,
+                    kv_cache=_kv_cache,
+                    crossattn_cache=_cache_kwargs.get("crossattn_cache"),
+                    current_start=_cache_kwargs.get("current_start"),
+                    cache_start=_cache_kwargs.get("cache_start"),
+                    clip_fea=kwargs.get("clip_fea"),
+                    y=kwargs.get("y"),
+                )
             if a_per_f > 0 and action_tokens is not None:
                 # classify_mode / regress_mode don't support Stream B yet.
                 if kwargs.get("classify_mode", False) or kwargs.get(
@@ -827,6 +1259,28 @@ def patch_bidirectional_wan_model_for_action(model):
                         "classify_mode / regress_mode are not supported "
                         "alongside Stream B. Disable GAN or drop Stream B "
                         "for the critic head forward."
+                    )
+                # NO SILENT SWALLOW. Historically every unrecognised
+                # kwarg fell into ``**kwargs`` here and was dropped
+                # without a word — which is how ``kv_cache`` /
+                # ``crossattn_cache`` / ``current_start`` went missing on
+                # every AR-head forward for the whole bring-up. Only
+                # INERT values (None / False) are tolerated, so a caller
+                # that defaults a kwarg it does not use stays byte-
+                # identical while a caller that actually asks for
+                # something unsupported gets told.
+                _dropped = sorted(
+                    k for k, v in kwargs.items()
+                    if k not in _STREAM_B_CONSUMED_KWARGS
+                    and v is not None and v is not False
+                )
+                if _dropped:
+                    raise RuntimeError(
+                        "Bidirectional Stream-B forward received kwarg(s) "
+                        f"{_dropped} that it does not consume; they would "
+                        "be silently dropped. Handle them in "
+                        "_bidir_forward_with_action_tokens or stop passing "
+                        "them."
                     )
                 # Route the small subset of relevant kwargs through.
                 return _bidir_forward_with_action_tokens(

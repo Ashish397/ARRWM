@@ -209,13 +209,14 @@ def main():
             committed = traj[:, -1]
             stats = {"mean": [float(committed[c].float().mean()) for c in range(GEN_CHUNKS)],
                      "std": [float(committed[c].float().std()) for c in range(GEN_CHUNKS)]}
+            _tmp = f"{dst}.tmp{os.getpid()}"   # pid suffix: concurrent jobs never share a tmp
             torch.save({"trajectory": traj, "z": z[0].cpu(),
                         "zarr_path": zp, "window_offset": off, "variant": variant,
                         "noise_seed": window_noise_seed(ts_id, off),
                         "snap_rec": SNAP_REC, "gen_chunks": GEN_CHUNKS,
                         "seed_chunks": SEED_CHUNKS,
-                        "committed_stats": stats}, dst + ".tmp")
-            os.rename(dst + ".tmp", dst)      # atomic: no truncated files on kill
+                        "committed_stats": stats}, _tmp)
+            os.rename(_tmp, dst)      # atomic: no truncated files on kill
             qa.write(json.dumps({"w": f"{ts_id}_o{off}", "v": variant, **stats}) + "\n")
             qa.flush()
             print(f"[gen14e] {ts_id}_o{off:05d}_{variant} "

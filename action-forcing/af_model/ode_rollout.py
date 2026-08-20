@@ -136,6 +136,7 @@ def rollout_ode_loss(
     edist_weight: float = 0.0,
     gexcl_fn=None,                    # (pred, target) -> scalar, contraction barrier
     gexcl_weight: float = 0.0,
+    klts_theta=None,                  # [8,4] nn.Parameter: tau=1+theta chord scaling (KLTS)
     ddp_module=None,                  # DDP wrapper: no_sync on all but the last backward
     tail_loss_fn=None,                # () -> scalar|None, folded into the LAST backward
     vrfm=None,                        # VRFMLatent: conditional prior + posterior
@@ -143,6 +144,14 @@ def rollout_ode_loss(
     vrfm_beta: float = 0.0,           # KL(q||p) weight
     sync_last: bool = True,           # False for every call but the step's LAST
     loss_scale: float = 1.0,          # action/variance weight (one step lagged)
+    es: bool = False,                 # ENERGY SCORE: 2 noise branches/chunk, proper scoring rule
+    es_repw: float = 1.0,             # one-sided repulsion weight. 1.0 = the standard stop-grad
+                                      # DOUBLING: the symmetric m=2 score's repulsion gradient flows
+                                      # through BOTH branches; the one-sided estimator fires once per
+                                      # chunk, so matching its expectation needs 2 x 0.5 (review
+                                      # 2026-08-16: at 0.5 the trained score is improper and keeps
+                                      # half the contraction pressure). Far-field force alternates
+                                      # sign with the chunk-parity swap -> zero-mean, no runaway.
 ) -> Dict[str, Any]:
     """Roll the student through the teacher's cache path; supervise every chunk.
 
@@ -152,6 +161,17 @@ def rollout_ode_loss(
     if loss_fn is None:
         def loss_fn(p, t):
             return torch.nn.functional.mse_loss(p.float(), t.float())
+    if es and (vrfm is not None or klts_theta is not None
+               or gexcl_fn is not None or edist_fn is not None):
+        # The ES ladder runs every rung twice; the add-on slots were calibrated
+        # for one pass and would double-dose (and the sg-partner bookkeeping
+        # only tracks the base prediction). Fail fast rather than mis-train.
+        raise RuntimeError("ode_es is exclusive: disable vrfm/klts/gexcl/edist")
+
+    def _rms(x):
+        # RMS distance: a metric norm (not squared), required for the energy
+        # score to be a strictly proper scoring rule; eps guards grad at 0.
+        return torch.sqrt(x.pow(2).mean() + 1e-12)
 
     # `wrapper` may be a DDP wrapper: nn.Module.__getattr__ does not proxy
     # arbitrary names, so wrapper.model / .seq_len / .adjust_seq_len_* would
@@ -311,6 +331,7 @@ def rollout_ode_loss(
         total = None
         n_terms = 0
         ed_total = None
+        es_rep_total = None    # detached mean pair-distance, es monitoring only
         n_ed = 0
         gx_total = None
         n_gx = 0
@@ -326,7 +347,12 @@ def rollout_ode_loss(
         kl_z_total = None
         n_kl_z = 0
         vrfm_stats = {}
-        n_bwd_total = int(n_chunks) * int(len(rungs))
+        # ES doubles the ladder (2 branches x rungs); the DDP backward plan
+        # must count every backward. The DOSE divisor stays chunks*rungs: the
+        # es attraction terms carry weight 1/2 each, so the summed attraction
+        # dose matches the single-branch arms exactly.
+        n_bwd_total = int(n_chunks) * int(len(rungs)) * (2 if es else 1)
+        bwd_div = int(n_chunks) * int(len(rungs))
         bwd_done = [0]
 
         @contextlib.contextmanager
@@ -354,20 +380,38 @@ def rollout_ode_loss(
             # Per-chunk LOCAL generator seeded exactly as the teacher did
             # (causal_chain_rollout.py:147) so chunk c starts from the SAME
             # noise the teacher used, without perturbing the training RNG.
-            g = torch.Generator(device=device).manual_seed(seed_base + c)
+            # ES: a SECOND independent noise stream (+31337) makes the pair a
+            # 2-sample draw from the student's conditional; chunk-parity swap
+            # alternates which stream carries the one-sided repulsion so both
+            # streams are shaped over training (expected gradient == the
+            # symmetric m=2 energy score's).
+            _seeds = [seed_base + c, seed_base + c + 31337]
+            if es and (c % 2 == 1):
+                _seeds = [_seeds[1], _seeds[0]]
             # Separate stream for z: drawing it from `g` would advance the same
             # generator that produces the restart noise and the commit coin, so
             # a VRFM run would no longer share initial noise with the teacher
             # or with the non-VRFM arms it is being compared against.
             gz = torch.Generator(device=device).manual_seed(seed_base + c + 977)
-            lat = torch.randn([1, BLOCK_F, C, H, W], dtype=torch.float32,
-                              device=device, generator=g)
-            # x_0 for the VRFM encoders: the chunk's INITIAL pure noise,
-            # available identically at training and inference.
-            x0_lat = lat
+            g = None
+            lat = None
+            x0_lat = None
+            _partner = {}         # ES: rung i -> branch-0 pred_x0 (detached)
+            chunk_pred = None     # branch-0 final-rung pred (chain/commit/stats)
 
             pred_x0 = None
-            for i, t in enumerate(rungs):
+            _ladder = [(br, i, t) for br in range(2 if es else 1)
+                       for i, t in enumerate(rungs)]
+            for br, i, t in _ladder:
+                if i == 0:
+                    # branch (re)start: fresh initial noise from this branch's
+                    # stream; the ladder below then re-noises per rung from `g`.
+                    g = torch.Generator(device=device).manual_seed(_seeds[br])
+                    lat = torch.randn([1, BLOCK_F, C, H, W], dtype=torch.float32,
+                                      device=device, generator=g)
+                    # x_0 for the VRFM encoders: the chunk's INITIAL pure
+                    # noise, available identically at training and inference.
+                    x0_lat = lat
                 # DDP's no_sync() must span the FORWARD as well as the
                 # backward: the reducer is armed inside DDP.forward, so
                 # wrapping only the backward leaves EVERY rung all-reducing
@@ -440,13 +484,46 @@ def rollout_ode_loss(
                             f"{type(out).__name__} len="
                             f"{len(out) if isinstance(out, tuple) else 'N/A'}")
                     pred_x0 = out[1]
+                    # KLTS: temperature on the denoising chord. Applied HERE so
+                    # every downstream consumer — the loss, the re-noise to the
+                    # next rung, the commit, the per-chunk stats — sees the
+                    # scaled prediction: the sampler trains exactly as it will
+                    # serve. Grad reaches theta through every rung's loss term.
+                    if klts_theta is not None:
+                        _th = klts_theta[min(c, klts_theta.shape[0] - 1),
+                                         min(i, klts_theta.shape[1] - 1)]
+                        pred_x0 = lat + (1.0 + _th) * (pred_x0.float() - lat)
                     # Explicitly OUTSIDE autocast: guarantees the difference, the
                     # square and the reduction are all fp32 regardless of the
                     # surrounding autocast region. NOTE: pred_x0 itself comes out of
                     # the forward in bf16 -- recovering that would mean running the
                     # DiT in fp32, which is a different (much costlier) decision.
                     with torch.amp.autocast("cuda", enabled=False):
-                        term = loss_fn(pred_x0.float(), tgt.float())
+                        if es:
+                            # ENERGY SCORE (strictly proper, m=2, one-sided):
+                            # branch 0 backwards 1/2*rms(x_a - y) and banks
+                            # sg(x_a) per rung; branch 1 backwards
+                            # 1/2*rms(x_b - y) - repw*rms(x_b - sg(x_a)).
+                            # With the chunk-parity seed swap the branches are
+                            # exchangeable, and at repw=1.0 (sg doubling) the
+                            # EXPECTED gradient equals the symmetric score
+                            # 1/2(d_a+d_b) - 1/2*d_ab. The spread term REWARDS
+                            # branch separation with the proper-score weight:
+                            # distributional, sign-safe, no gaussian reference.
+                            _d = _rms(pred_x0.float() - tgt.float())
+                            term = 0.5 * _d
+                            if br == 0:
+                                _partner[i] = pred_x0.detach().float()
+                                term_bwd = term
+                            else:
+                                _dab = _rms(pred_x0.float() - _partner[i])
+                                term_bwd = term - es_repw * _dab
+                                es_rep_total = (
+                                    _dab.detach() if es_rep_total is None
+                                    else es_rep_total + _dab.detach())
+                        else:
+                            term = loss_fn(pred_x0.float(), tgt.float())
+                            term_bwd = term
                     n_terms += 1
                     # ---- PER-RUNG BACKWARD (the CheckpointError fix) ----------
                     # Gradient checkpointing re-runs each block at BACKWARD time,
@@ -459,7 +536,7 @@ def rollout_ode_loss(
                     # [4683,1536] mismatch) and, when shapes happen to agree, on
                     # the wrong VALUES -- silent and worse. Backward each rung
                     # NOW, while the cache still holds what this forward wrote.
-                    bwd_loss = loss_scale * (term / max(n_bwd_total, 1))
+                    bwd_loss = loss_scale * (term_bwd / max(bwd_div, 1))
                     if _kl_z is not None and vrfm_beta > 0.0:
                         bwd_loss = bwd_loss + vrfm_beta * (_kl_z / max(n_bwd_total, 1))
                         kl_z_total = (_kl_z.detach() if kl_z_total is None
@@ -522,6 +599,15 @@ def rollout_ode_loss(
                 bwd_done[0] += 1
                 total = (term.detach() if total is None
                          else total + term.detach())
+                if br == 0 and i == len(rungs) - 1:
+                    # Branch 0 is the canonical chunk prediction: chain stats,
+                    # curriculum error and any student commit read IT. NOTE
+                    # (review): under es the parity swap means branch 0 holds
+                    # the teacher-matched seed only on EVEN chunks; on odd
+                    # chunks it is the +31337 stream. Fine for commit=teacher
+                    # arms (stats alternate streams); revisit before combining
+                    # es with student/schedule commits or actw/varw/attractor.
+                    chunk_pred = pred_x0
                 if i < len(rungs) - 1:
                     # STUDENT sampler (matches eval_causal_AR): predict x0, then
                     # re-noise to the next rung with FRESH noise. Detached so the
@@ -544,16 +630,16 @@ def rollout_ode_loss(
             # is the output distribution induced by the action distribution.
             # Called once per chunk on EVERY rank -> collective-safe.
             with torch.no_grad():
-                chain.append(pred_x0.detach().float())
+                chain.append(chunk_pred.detach().float())
                 per_chunk.append(float(
-                    (pred_x0.detach().float() - tgt.float()).pow(2).mean()))
+                    (chunk_pred.detach().float() - tgt.float()).pow(2).mean()))
 
             # --- commit into the cache at t=0, SAME current_start, then advance
             if commit_mode == "student":
-                commit_lat = pred_x0.detach()
+                commit_lat = chunk_pred.detach()
             elif commit_mode == "schedule":
                 use_student = torch.rand((), device=device, generator=g).item() < commit_p
-                commit_lat = pred_x0.detach() if use_student else tgt
+                commit_lat = chunk_pred.detach() if use_student else tgt
             else:                                   # "teacher"
                 commit_lat = tgt
             with torch.no_grad():
@@ -589,6 +675,9 @@ def rollout_ode_loss(
                 "kl_z": (float(kl_z_total / max(n_kl_z, 1))
                          if kl_z_total is not None else 0.0),
                 "n_terms": n_terms, "n_ed": n_ed,
+                "es_rep": (float(es_rep_total /
+                                 max(int(n_chunks) * int(len(rungs)), 1))
+                           if es_rep_total is not None else 0.0),
                 "per_chunk": per_chunk, "n_gx": n_gx,
                 "chain": torch.cat(chain, dim=1) if chain else None}
     finally:

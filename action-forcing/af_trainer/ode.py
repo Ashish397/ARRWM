@@ -690,7 +690,7 @@ class Trainer:
                     getattr(self.model, "z_modulation", None)):
             if _vm is not None:
                 gen_params.extend(p for p in _vm.parameters() if p.requires_grad)
-        for _hn in ("emd_head_scale", "emd_head_shift"):
+        for _hn in ("emd_head_scale", "emd_head_shift", "klts_theta"):
             _hp = getattr(self.model, _hn, None)
             if _hp is not None and _hp.requires_grad:
                 # The wrapper module is never .to(device)'d wholesale —
@@ -711,7 +711,10 @@ class Trainer:
         # much larger lr, NO weight decay.
         head_params = [p for p in (
             getattr(self.model, "emd_head_scale", None),
-            getattr(self.model, "emd_head_shift", None)) if p is not None]
+            getattr(self.model, "emd_head_shift", None),
+            # KLTS theta shares the zero-init-gate group: 32 scalars at the
+            # base 2e-6 lr would never leave tau=1 (measured emd-head lesson).
+            getattr(self.model, "klts_theta", None)) if p is not None]
         if head_params:
             hp_ids = {id(p) for p in head_params}
             gen_params = [p for p in gen_params if id(p) not in hp_ids]
@@ -1039,6 +1042,10 @@ class Trainer:
                 "rung_sum": self._rung_sum.detach().cpu(),
                 "rung_cnt": self._rung_cnt.detach().cpu(),
             }
+        if getattr(self.model, "klts_theta", None) is not None:
+            # Needed at SERVE: the probe applies the learned temperature on
+            # the same chord (utils/eval_causal_AR.py, ODE_KLTS_CKPT).
+            state["klts_theta"] = self.model.klts_theta.detach().cpu()
         if getattr(self.model, "emd_head_scale", None) is not None:
             state["emd_head"] = {
                 "scale": self.model.emd_head_scale.detach().cpu(),
@@ -1137,7 +1144,7 @@ class Trainer:
         # EMD transport head: the 0.0*touch in the loss guarantees these
         # grads exist on every rank whenever the head is enabled, so the
         # collective can never desync across ranks.
-        for _hn in ("emd_head_scale", "emd_head_shift"):
+        for _hn in ("emd_head_scale", "emd_head_shift", "klts_theta"):
             _hp = getattr(self.model, _hn, None)
             if _hp is not None and _hp.grad is not None:
                 dist.all_reduce(_hp.grad, op=dist.ReduceOp.AVG)
@@ -1162,7 +1169,7 @@ class Trainer:
         # two through the clipper and defeating the stop-gradient that
         # is supposed to keep the flow map untouched.
         head_params: list = []
-        for _hn in ("emd_head_scale", "emd_head_shift"):
+        for _hn in ("emd_head_scale", "emd_head_shift", "klts_theta"):
             _hp = getattr(self.model, _hn, None)
             if _hp is not None:
                 head_params.append(_hp)

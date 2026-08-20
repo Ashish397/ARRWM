@@ -107,6 +107,17 @@ ladd_pairs_per_step: 0               # 0 = all pairs; >0 = random subset
 ladd_gt_vs_fake_enabled: false
 ladd_adjacent_chunks_enabled: true
 ladd_gt_vs_fake_weight: 1.0          # extra G-side multiplier (gt_vs_fake)
+# Nearest-match REAL RETRIEVAL for gt_vs_fake (default off = positional
+# pairing, i.e. GT chunk i vs student chunk i). When true, each student
+# chunk is scored against its K nearest-by-mean-L1 GT CHUNKS drawn from the
+# ride match pool (streaming_state['gt_match_latents']) instead of its
+# positional GT — the same machinery gt_transition uses, but on SINGLE
+# chunks (chunks_per_pair stays 1; the concatenated adjacent-chunk pair
+# remains gt_transition's distinguishing feature). Reuses the
+# ladd_gt_transition_match_{k,pool,max_real} knobs so the two modes stay
+# comparable. Mutually exclusive with ladd_gt_vs_fake_all_pairs /
+# ladd_gt_vs_fake_n_real (raises).
+ladd_gt_vs_fake_match: false
 ladd_adjacent_chunks_weight: 1.0     # extra G-side multiplier (adjacent)
 
 # Wavelet-HF disc input (v28B, WGSR-style frequency-band restriction).

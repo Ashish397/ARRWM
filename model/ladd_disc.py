@@ -631,6 +631,8 @@ class LADDDiscriminator(nn.Module):
             (WGSR-style frequency-band conditioning). Default False.
         wavelet_hf_in_channels: input latent channel count for the
             wavelet stage (16 for Wan VAE).
+        wavelet_hf_drop_hh: drop the DIAGONAL HF band (HH) -- with
+            drop_ll too, the disc sees only LH/HL (directional HF).
         wavelet_hf_drop_ll: drop the LL band in the wavelet stage.
             Default False — LL carries low-frequency content the disc
             should see, downweighted via ``wavelet_hf_ll_weight``.
@@ -673,6 +675,7 @@ class LADDDiscriminator(nn.Module):
         wavelet_hf_enabled: bool = False,
         wavelet_hf_in_channels: int = 16,
         wavelet_hf_drop_ll: bool = False,
+        wavelet_hf_drop_hh: bool = False,
         wavelet_hf_adapter_init_gain: float = 0.1,
         wavelet_hf_ll_weight: float = 0.15,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
@@ -703,6 +706,7 @@ class LADDDiscriminator(nn.Module):
                 drop_ll=bool(wavelet_hf_drop_ll),
                 adapter_init_gain=float(wavelet_hf_adapter_init_gain),
                 ll_weight=float(wavelet_hf_ll_weight),
+                drop_hh=bool(wavelet_hf_drop_hh),
             )
         else:
             self.wavelet_hf = None
@@ -1102,6 +1106,7 @@ def build_ladd_disc(
     wavelet_hf_enabled: bool = False,
     wavelet_hf_in_channels: int = 16,
     wavelet_hf_drop_ll: bool = False,
+    wavelet_hf_drop_hh: bool = False,
     wavelet_hf_adapter_init_gain: float = 0.1,
     wavelet_hf_ll_weight: float = 0.15,
     patch_size: Tuple[int, int, int] = (1, 2, 2),
@@ -1138,6 +1143,7 @@ def build_ladd_disc(
         wavelet_hf_enabled=wavelet_hf_enabled,
         wavelet_hf_in_channels=wavelet_hf_in_channels,
         wavelet_hf_drop_ll=wavelet_hf_drop_ll,
+        wavelet_hf_drop_hh=wavelet_hf_drop_hh,
         wavelet_hf_adapter_init_gain=wavelet_hf_adapter_init_gain,
         wavelet_hf_ll_weight=wavelet_hf_ll_weight,
         patch_size=patch_size,

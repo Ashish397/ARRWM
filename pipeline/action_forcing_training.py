@@ -159,6 +159,9 @@ class ActionForcingTrainingPipeline:
         rollout_frames: Optional[int] = None,
         context_noise: int = 0,
         exit_flag_weights: Optional[List[float]] = None,
+        seed_prefill_frames: int = 0,
+        seed_prefill_mode: str = "estimate",
+        kv_cache_seed_headroom: bool = False,
         **kwargs,
     ):
         self.scheduler = scheduler
@@ -244,8 +247,63 @@ class ActionForcingTrainingPipeline:
         # gt_latents was None, or extension was disabled).
         self._last_extension_metrics: dict = {}
 
+        # -------------------------------------------------------------
+        # Seed-prefill contract (14e alignment, 2026-08-17).
+        #
+        # ``seed_prefill_frames``: how many CONTEXT frames the caller
+        # writes into the KV cache before any generated chunk (=
+        # ``dmd_context_clean_frames`` on the DMD path). Purely
+        # informational for ``kv_cache_size`` — the prefill itself is
+        # driven by the caller. 0 (default) = the pipeline knows of no
+        # prefill and every size/occupancy computation below collapses
+        # to the pre-existing behaviour.
+        #
+        # ``seed_prefill_mode``: what ``_seed_prefill_chunk`` writes.
+        #   * "estimate" (default, legacy): noise the seed to the last
+        #     rung, run the generator, commit the model's OWN x0
+        #     ESTIMATE at ``context_noise``.
+        #   * "real": write the REAL seed latents at t=0, one forward
+        #     per chunk — the contract the 14e ODE student was trained
+        #     under (``action-forcing/af_model/ode_rollout.py:315-325``).
+        #
+        # ``kv_cache_seed_headroom``: size the cache for seed + rollout
+        # (+ one block) instead of the rollout alone. Implied by
+        # ``seed_prefill_mode="real"`` — a real-seed prefill is
+        # pointless if the buffer then evicts it mid-rollout.
+        # -------------------------------------------------------------
+        self.seed_prefill_frames = int(seed_prefill_frames)
+        mode = str(seed_prefill_mode).strip().lower()
+        if mode not in ("estimate", "real"):
+            raise ValueError(
+                f"seed_prefill_mode must be 'estimate' or 'real'; got "
+                f"{seed_prefill_mode!r}."
+            )
+        self.seed_prefill_mode = mode
+        self.kv_cache_seed_headroom = bool(kv_cache_seed_headroom) or (
+            self.seed_prefill_mode == "real"
+        )
+        # One-shot dedupe for the cache-contract / eviction notices.
+        self._cache_occupancy_warned: set = set()
+        self._cache_contract_logged: set = set()
+
         self.kv_cache1: Optional[list] = None
         self.crossattn_cache: Optional[list] = None
+
+        # max_attention_size propagation (2026-08-16): every sibling pipeline
+        # (self_forcing_training.py:564, rolling_staircase_training.py:570,
+        # ode_rollout.py:204) aligns the attention window to WHOLE frames:
+        # local_attn_size * frame_seq_length (action-token AWARE). This
+        # pipeline was the only one relying on causal_model.py's own default
+        # local_attn_size * 1560 (token-UNAWARE), which starts the window 21
+        # tokens INSIDE the oldest live frame — permanently non-frame-aligned.
+        _gen_mod = getattr(generator, "model", generator)
+        _las = getattr(_gen_mod, "local_attn_size", -1)
+        if _las is not None and not isinstance(_las, (list, tuple)) \
+                and int(_las) != -1:
+            _target = int(_las) * int(self.frame_seq_length)
+            for _m in generator.modules():
+                if hasattr(_m, "max_attention_size"):
+                    _m.max_attention_size = _target
 
     # -----------------------------------------------------------------
     # Token-shape helpers (KV cache + current_start computation must
@@ -407,16 +465,251 @@ class ActionForcingTrainingPipeline:
         return self._spatial_frame_seq_length + extra
 
     @property
+    def attn_window_frames(self) -> int:
+        """The attention window in FRAMES (``local_attn_size``).
+
+        ``-1`` means "no local attention" (attend the whole cache), and
+        is also what we return when the attribute is a list/schedule or
+        otherwise unreadable — i.e. "unknown, do not enforce". Read from
+        the live model, so a ``local_attn_size_schedule`` transition
+        (``trainer/causal_action_forcing_train.py::
+        _apply_attn_size_if_changed``) is picked up on the next read.
+        Step-derived, therefore identical on every rank.
+        """
+        las = getattr(self._inner_model(), "local_attn_size", -1)
+        if las is None or isinstance(las, (list, tuple)):
+            return -1
+        try:
+            return int(las)
+        except (TypeError, ValueError):
+            return -1
+
+    @property
+    def kv_cache_frames(self) -> int:
+        """Cache size in FRAMES.
+
+        Legacy (``kv_cache_seed_headroom=False``): the BASELINE rollout
+        window with no headroom. LongLive's streaming pipeline sizes its
+        cache as ``(local_attn + slice_last) * frame_seq_length`` to give
+        the rolling cache headroom for seed + in-flight rollout
+        simultaneously, but that doubles per-layer memory which OOMs on a
+        32GB 5090.
+
+        ``kv_cache_seed_headroom=True`` (14e alignment): the seed prefill
+        is counted. The legacy formula ignored it entirely, so on the
+        streaming DMD path the buffer held ``max(num_max, rollout)``
+        frames while the sequence actually wrote
+        ``seed + anchor_block + rollout`` — the cache silently ROLLED
+        partway through the very first rollout, evicting the clean GT
+        context the student was conditioned on. Size:
+
+            seed_prefill_frames + max(num_max_frames, rollout_frames)
+                                + num_frame_per_block
+
+        The ``+ npb`` block is the same one-block headroom
+        ``ode_rollout.py:236-237`` allocates; on the DMD streaming path
+        it is exactly consumed by the leading anchor chunk that
+        ``setup_sequence`` rolls between the seed and the first
+        supervised chunk (``dmd_42f_gt_anchor``), so the final cache
+        pointer lands on the last slot rather than past it.
+
+        SIZING INVARIANT (2026-08-17), enforced on the seed-headroom
+        path: ``kv_cache_frames >= local_attn_size + num_frame_per_block``
+        — the buffer must always hold the whole attention window plus
+        one block of headroom, so the model can actually attend the
+        window it is configured for. The floor is applied ONLY when
+        ``kv_cache_seed_headroom`` is on. On the legacy path the buffer
+        is deliberately left equal to the window
+        (``max(num_max_frames, rollout_frames)``, which the schedule
+        keeps in lockstep with ``local_attn_size``) purely to avoid
+        changing every legacy config's memory footprint.
+
+        CORRECTION (2026-08-17): this note used to claim buffer == window
+        is "the one sizing at which the block-relative rotation indices
+        are CONTINUOUS across the cache-fill boundary". That was true of
+        the OLD window-relative query anchor; ``utils/infinity_rope.py``
+        now anchors the query buffer-relative
+        (``num_cache_frames - num_new_frames``), so the offsets are
+        continuous at ANY buffer depth and a deeper buffer introduces no
+        jump. See ``_check_cache_contract``.
+        """
+        rollout = max(self.num_max_frames, self.rollout_frames)
+        if not self.kv_cache_seed_headroom:
+            return rollout
+        frames = self.seed_prefill_frames + rollout + self.num_frame_per_block
+        win = self.attn_window_frames
+        if win > 0:
+            frames = max(frames, win + self.num_frame_per_block)
+        return frames
+
+    @property
     def kv_cache_size(self) -> int:
-        # Per-iter pipeline: cache sized to the BASELINE rollout
-        # window (no headroom). LongLive's streaming pipeline sizes
-        # its cache as ``(local_attn + slice_last) * frame_seq_length``
-        # to give the rolling cache headroom for seed + in-flight
-        # rollout simultaneously, but that doubles per-layer memory
-        # which OOMs on a 32GB 5090. Defer the bigger cache to
-        # Phase B (persistent streaming state), where it can be gated
-        # on a streaming-mode flag.
-        return max(self.num_max_frames, self.rollout_frames) * self.frame_seq_length
+        return self.kv_cache_frames * self.frame_seq_length
+
+    def _check_cache_contract(self) -> None:
+        """One-shot startup line describing the KV-cache steady state,
+        plus one sizing sanity warning.
+
+        Contract (block-relative / infinity RoPE, the single convention
+        for both stationary and rolling generation): the attention
+        window and its rotation slots stay fixed while data flows
+        through them; the newest chunk takes the newest slot, older
+        chunks shift back, and whatever falls out of the window is
+        evicted. Eviction beyond the window is EXPECTED and legitimate —
+        RoPE attention only sees the relative offset (i-j) and the
+        student's attention was already capped at ``local_attn_size``
+        frames, so an evicted frame is one it could not have attended to
+        anyway.
+
+        ROTATION CONTINUITY (corrected 2026-08-17). The earlier text here
+        (and in the log line, and in the ``window > buffer`` raise below)
+        asserted that offsets are continuous across the cache-fill
+        boundary ONLY when ``kv_cache_frames == local_attn_size``, on the
+        grounds that the query anchors at ``local_attn_size -
+        num_new_frames``. That WAS true, and it is what motivated the
+        raise — but ``utils/infinity_rope.py`` has since been fixed: the
+        query anchor is now BUFFER-relative,
+
+            q_start_idx = num_cache_frames - num_new_frames
+
+        (``utils/infinity_rope.py``, "Q is anchored to the *buffer* frame
+        count, exactly like K"), which is the same origin K is rotated
+        against. Offsets are therefore continuous at ANY buffer depth,
+        rolling or not, and a buffer deeper than the window is simply
+        deeper — no shear, no jump. The `local_attn_size == buffer`
+        coincidence is no longer load-bearing.
+
+        WHY ``window > buffer`` IS NOW ONLY A WARNING. With a
+        buffer-relative anchor, ``num_cache_frames`` is bounded by the
+        buffer, so an over-large window cannot shift any RoPE offset; the
+        attention slice ``temp_k[local_end - max_attention_size :
+        local_end]`` just saturates at the whole buffer. The real
+        consequence is a CAPABILITY shortfall, not corruption: the model
+        is told it may attend ``local_attn_size`` frames while the buffer
+        can only ever hold ``kv_cache_frames`` of them, so the effective
+        context is silently capped at the buffer. That is worth saying
+        out loud but it is not worth hard-failing a config that is
+        otherwise correct — and the old raise would kill exactly such a
+        config on a premise that no longer holds. Downgraded to a
+        warning; the sizing facts are printed either way.
+        """
+        win = self.attn_window_frames
+        cap = self.kv_cache_frames
+        npb = self.num_frame_per_block
+        if win > 0 and win > cap:
+            import logging as _logging
+            _logging.warning(
+                "[ActionForcing][KV-CACHE] attention window "
+                "local_attn_size=%d frames exceeds the KV buffer (%d "
+                "frames; seed_prefill_frames=%d, num_max_frames=%d, "
+                "rollout_frames=%d, npb=%d, seed_headroom=%s). Under the "
+                "buffer-relative RoPE anchor this does NOT shift any "
+                "query/key offset, but the effective context is silently "
+                "capped at the buffer: the extra %d frame(s) of window "
+                "can never be stored, so the model attends less history "
+                "than the config advertises. Enlarge the cache "
+                "(kv_cache_seed_headroom / rollout_frames) or shrink "
+                "local_attn_size to make the two agree.",
+                win, cap, self.seed_prefill_frames, self.num_max_frames,
+                self.rollout_frames, npb, self.kv_cache_seed_headroom,
+                win - cap,
+            )
+        key = (win, cap, npb, self.seed_prefill_frames)
+        if key in self._cache_contract_logged:
+            return
+        self._cache_contract_logged.add(key)
+        import logging as _logging
+        if win > 0:
+            when = (
+                f"rolling begins once the sequence passes frame {cap} "
+                f"(evicting {npb} frames per chunk); frames older than the "
+                f"{win}-frame window are never attended to, so eviction "
+                "beyond the window is expected and safe"
+            )
+            if cap == win:
+                cont = "buffer == window"
+            elif cap > win:
+                cont = (
+                    f"buffer > window by {cap - win} frame(s) of slack "
+                    "(deliberate headroom)"
+                )
+            else:
+                cont = (
+                    f"buffer < window by {win - cap} frame(s): effective "
+                    "context is capped at the buffer"
+                )
+            cont += (
+                " | rotation offsets are continuous at any buffer depth "
+                "(query anchored buffer-relative at num_cache_frames - "
+                "num_new_frames)"
+            )
+        else:
+            when = "local attention disabled (local_attn_size=-1); no rolling"
+            cont = "n/a"
+        _logging.info(
+            "[ActionForcing][KV-CACHE] window=%s frames  buffer=%s frames  "
+            "npb=%d  seed_prefill=%d (%s)  seed_headroom=%s | %s | %s",
+            win, cap, npb, self.seed_prefill_frames, self.seed_prefill_mode,
+            self.kv_cache_seed_headroom, when, cont,
+        )
+
+    def _check_cache_occupancy(self, end_frame: int, where: str) -> None:
+        """Informational note the first time a call site's sequence runs
+        past the end of the buffer.
+
+        Downgraded from a warning (2026-08-17): under the block-relative
+        RoPE contract eviction is the DESIGNED steady state, not a
+        defect, so a per-call-site warning here was pure noise. The
+        expected steady state is printed once by
+        ``_check_cache_contract`` at cache-allocation time; this adds one
+        INFO line naming the first call site that actually reaches the
+        rolling regime.
+
+        The window/buffer sizing mismatch is reported by
+        ``_check_cache_contract``. It is re-checked here because
+        ``local_attn_size`` can be mutated AFTER the buffers were
+        allocated (``_apply_attn_size_if_changed``), and a warning cannot
+        deadlock DDP even if some ranks' geometry differs.
+
+        Never raises: ``end_frame`` is derived from per-rank ride
+        geometry (``roll_cap`` depends on each rank's own ride length),
+        so a raise here could fire on some ranks and not others.
+        """
+        cap = self.kv_cache_frames
+        win = self.attn_window_frames
+        if int(end_frame) <= cap:
+            return
+        import logging as _logging
+        if win > 0 and win > cap and "undersized_buffer" not in self._cache_occupancy_warned:
+            self._cache_occupancy_warned.add("undersized_buffer")
+            import sys as _sys
+            # Corrected 2026-08-17: this used to claim "queries anchor
+            # past the last stored rotation slot, shifting every RoPE
+            # offset". That premise died with the buffer-relative anchor
+            # fix in ``utils/infinity_rope.py`` (q_start_idx =
+            # num_cache_frames - num_new_frames, bounded by the buffer).
+            # The real symptom is a truncated context, not a sheared one.
+            msg = (
+                f"[ActionForcing][KV-CACHE] {where}: attention window "
+                f"({win} frames) is LARGER than the KV buffer ({cap} "
+                f"frames), so the last {win - cap} frame(s) of window can "
+                "never be stored and the effective context is capped at "
+                "the buffer. RoPE offsets are NOT affected (the query "
+                "anchor is buffer-relative), but the model attends less "
+                "history than the config advertises — fix the sizing."
+            )
+            _logging.warning(msg)
+            print(msg, file=_sys.stderr, flush=True)
+        if "evict" in self._cache_occupancy_warned:
+            return
+        self._cache_occupancy_warned.add("evict")
+        _logging.info(
+            "[ActionForcing][KV-CACHE] %s: sequence reaches frame %d > "
+            "buffer %d frames -> the cache rolls from here on (expected: "
+            "only frames older than the %s-frame attention window are "
+            "dropped).",
+            where, int(end_frame), cap, win,
+        )
 
     # -----------------------------------------------------------------
     # Lockstep exit-flag selection (rank 0 rolls, broadcast to all)
@@ -580,6 +873,17 @@ class ActionForcingTrainingPipeline:
         All forwards run under ``no_grad``. The seed chunk itself
         (raw GT) remains written to the OUTPUT buffer at the seed
         positions by the caller — only the KV cache content changes.
+
+        ``seed_prefill_mode="real"`` replaces the two forwards above
+        with ONE forward of the REAL seed latents at ``t=0``. That is
+        the contract the 14e ODE student was trained under
+        (``action-forcing/af_model/ode_rollout.py:315-325``: "write the
+        REAL seed into the cache, one chunk at a time, in order, at
+        t=0"), and it is also what the teacher used to produce every
+        LMDB target. The "estimate" rationale above was measured against
+        the 14d student, which was teacher-forced with NO cache at all
+        — for 14e the model-style-trace argument is inverted: its cache
+        traces for CONTEXT frames are real-latent traces.
         """
         batch_size, npb = seed_chunk.shape[:2]
         device = seed_chunk.device
@@ -593,6 +897,30 @@ class ActionForcingTrainingPipeline:
         # grad-on rollout's first dispatch starts from a known state.
         num_rungs = len(self.denoising_step_list)
         prefill_step_idx = max(0, num_rungs - 1)
+        self._check_cache_occupancy(
+            current_start_frame + npb, "seed_prefill")
+
+        if self.seed_prefill_mode == "real":
+            # ODE parity: ONE forward, real latents, t=0, at the same
+            # ``current_start`` the caller advances by ``npb``. No
+            # noising, no estimate, no context_noise commit — the
+            # student's trained contract has none of them for context
+            # frames.
+            with torch.no_grad():
+                zero_t = torch.zeros(
+                    [batch_size, npb], device=device, dtype=torch.int64,
+                )
+                self._maybe_set_phase_lora_for_step(
+                    prefill_step_idx, num_rungs, re_arm=False)
+                self.generator(
+                    noisy_image_or_video=seed_chunk.detach(),
+                    conditional_dict=seed_block_cond,
+                    timestep=zero_t,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+            return
 
         with torch.no_grad():
             seed_t_int = int(round(float(self.denoising_step_list[-1])))
@@ -621,11 +949,19 @@ class ActionForcingTrainingPipeline:
             del cache_pred
             ctx_t = torch.full_like(seed_t, self.context_noise)
             commit_input_flat = commit_input_clean.flatten(0, 1)
-            cache_commit_input = self.scheduler.add_noise(
-                commit_input_flat,
-                torch.randn_like(commit_input_flat),
-                ctx_t.flatten(0, 1),
-            ).unflatten(0, commit_input_clean.shape[:2])
+            if int(self.context_noise) == 0:
+                # Third of three commit sites (see generate_chunk_with_cache
+                # and inference_with_trajectory): add_noise at t=0 resolves to
+                # the grid's min sigma 0.00498, not zero, so it noises clean
+                # context. Dormant under seed_prefill_mode="real" (which
+                # returns before this branch) but live for "estimate".
+                cache_commit_input = commit_input_clean
+            else:
+                cache_commit_input = self.scheduler.add_noise(
+                    commit_input_flat,
+                    torch.randn_like(commit_input_flat),
+                    ctx_t.flatten(0, 1),
+                ).unflatten(0, commit_input_clean.shape[:2])
             del commit_input_clean, commit_input_flat
             self._maybe_set_phase_lora_for_step(prefill_step_idx, num_rungs, re_arm=False)
             self.generator(
@@ -756,6 +1092,8 @@ class ActionForcingTrainingPipeline:
         # the KV-cache positions. The seed slice is sliced off before
         # return so the caller's scoring window is unchanged.
         num_output_frames = num_frames + num_input_frames + num_seed_frames
+        self._check_cache_occupancy(
+            num_output_frames, "inference_with_trajectory")
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
             device=noise.device,
@@ -1298,11 +1636,19 @@ class ActionForcingTrainingPipeline:
             # any autograd nodes early — memory hygiene).
             commit_input_clean = cache_pred.detach()
             context_timestep = torch.full_like(timestep, self.context_noise)
-            cache_commit_input = self.scheduler.add_noise(
-                commit_input_clean.flatten(0, 1),
-                torch.randn_like(commit_input_clean.flatten(0, 1)),
-                context_timestep.flatten(0, 1),
-            ).unflatten(0, commit_input_clean.shape[:2])
+            if int(self.context_noise) == 0:
+                # See the matching note in generate_chunk_with_cache: the
+                # FlowMatchScheduler grid has NO t=0 entry (min sigma
+                # 0.00498), so add_noise at t=0 silently writes
+                # 0.995*pred + 0.005*eps into what is supposed to be clean
+                # context. Pass it through verbatim, as ode_rollout.py does.
+                cache_commit_input = commit_input_clean
+            else:
+                cache_commit_input = self.scheduler.add_noise(
+                    commit_input_clean.flatten(0, 1),
+                    torch.randn_like(commit_input_clean.flatten(0, 1)),
+                    context_timestep.flatten(0, 1),
+                ).unflatten(0, commit_input_clean.shape[:2])
             # Phase-LoRA dispatch for the context_noise commit forward.
             # This forward writes the KV cache at t=context_noise (~0)
             # — same logical position as _seed_prefill_chunk's commit
@@ -1425,6 +1771,11 @@ class ActionForcingTrainingPipeline:
     def _initialize_kv_cache(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> None:
+        # Config-derived sizing contract: logs the steady state once and
+        # raises on window > buffer. Runs on every (re-)allocation, so a
+        # local_attn_size_schedule transition (which forces a re-alloc)
+        # is re-validated at its new window.
+        self._check_cache_contract()
         kv_cache1: list = []
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
@@ -1571,6 +1922,8 @@ class ActionForcingTrainingPipeline:
                 f"num_frames ({num_frames}) must be divisible by "
                 f"num_frame_per_block ({npb})."
             )
+        self._check_cache_occupancy(
+            current_start_frame + num_frames, "generate_chunk_with_cache")
         num_blocks_total = num_frames // npb
         all_num_frames: List[int] = []
         remaining_blocks = num_blocks_total
@@ -1904,11 +2257,23 @@ class ActionForcingTrainingPipeline:
             # block's Flash-DMD gen forward).
             commit_input_clean = cache_pred.detach()
             context_timestep = torch.full_like(timestep, self.context_noise)
-            cache_commit = self.scheduler.add_noise(
-                commit_input_clean.flatten(0, 1),
-                torch.randn_like(commit_input_clean.flatten(0, 1)),
-                context_timestep.flatten(0, 1),
-            ).unflatten(0, commit_input_clean.shape[:2])
+            if int(self.context_noise) == 0:
+                # context_noise=0 did NOT mean "clean". FlowMatchScheduler's
+                # grid (shift=5, sigma_min=0, extra_one_step) has NO t=0
+                # entry: its smallest sigma is 5*0.001/1.004 = 0.00498, and
+                # add_noise resolves t by argmin|timesteps - t|. So every
+                # commit wrote 0.995*pred + 0.005*eps while telling the DiT
+                # t=0 — i.e. it silently noised the clean context, against
+                # the standing rule, and compounding over 7 commits. The ODE
+                # stage commits verbatim (ode_rollout.py: commit_lat passed
+                # straight through at t=0). Match it.
+                cache_commit = commit_input_clean
+            else:
+                cache_commit = self.scheduler.add_noise(
+                    commit_input_clean.flatten(0, 1),
+                    torch.randn_like(commit_input_clean.flatten(0, 1)),
+                    context_timestep.flatten(0, 1),
+                ).unflatten(0, commit_input_clean.shape[:2])
             # Phase-LoRA dispatch for the context_noise commit forward.
             # See the equivalent block in inference_with_trajectory for
             # rationale: route through the lowest-t ODE rung (= K-1)

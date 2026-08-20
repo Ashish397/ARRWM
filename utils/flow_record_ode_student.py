@@ -47,6 +47,9 @@ DIRS = {"F": (M, 0.0), "FR": (Dv, Dv), "R": (0.0, M), "BR": (-Dv, Dv),
         "B": (-M, 0.0), "BL": (-Dv, -Dv), "L": (0.0, -M), "FL": (Dv, -Dv)}
 if os.environ.get("FR_NOOP"):          # stationary/no-op branch
     DIRS = {"N": (0.0, 0.0)}
+if os.environ.get("FR_DIRS"):          # comma-filter, e.g. FR_DIRS=L or F,L
+    _keep = set(os.environ["FR_DIRS"].split(","))
+    DIRS = {k: v for k, v in DIRS.items() if k in _keep}
    # (throttle, steer)
 NFB = 3
 GEN_CHUNKS = int(os.environ.get("FR_CHUNKS", "2"))
@@ -127,7 +130,7 @@ def main():
                 import imageio
                 os.makedirs(os.path.dirname(vid), exist_ok=True)
                 frames = pipe.decode_latents(full.to(device))
-                imageio.mimsave(vid, frames, fps=5, quality=7)
+                imageio.mimsave(vid, frames, fps=int(os.environ.get("FR_FPS", "5")), quality=7)
                 print(f"[rec-ode] saved {vid} ({frames.shape[0]}f)", flush=True)
             print(f"[rec-ode] {RUN} {dname} seed{sd} done", flush=True)
     print(f"[rec-ode] {RUN} ALL DONE", flush=True)

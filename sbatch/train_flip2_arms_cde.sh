@@ -91,6 +91,11 @@ case "$ARM" in
   # orthogonal offset relief == 0, descent cos 1.0 with teacher means).
   rollklrep2)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grepdir_weight=0.1"; export ODE_ROLLOUT=1;;
   rollklrep2smoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_grepdir_weight=0.1"; export ODE_ROLLOUT=1;;
+  # KLTS (user design 2026-08-15): learned per-(chunk,rung) temperature on the
+  # denoising chord, kl_local base, zero-init (tau=1). Trains in the emd-head
+  # high-lr group; exported in the ckpt and applied at serve (ODE_KLTS_CKPT).
+  rollklts)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_klts=true"; export ODE_ROLLOUT=1;;
+  rollkltssmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_klts=true"; export ODE_ROLLOUT=1;;
   # STAGED, NOT SUBMITTED — ONLINE ATTRACTOR TRACKER (af_model/
   # attractor_tracker.py): per-direction AR(1) attractor estimation in stat
   # space from the training rollouts + inverse-square repulsion from a
@@ -127,6 +132,26 @@ case "$ARM" in
   emdz)   EXTRA="ode_emdhead_weight=0.5 ode_emdhead_delta_weight=0.5"; DATAV=dir8n; EMDZ=1;;     # zero-init learned transport head (AdaLN-zero analog), flow map protected
   emdzdb) EXTRA="ode_emdhead_weight=1.0 ode_emdhead_objective=deadband ode_emdhead_band_hi=0.05 ode_emdhead_id_weight=0.1"; DATAV=dir8n; EMDZ=1;;  # zero-init head, VICReg-style SATISFIABLE deadband (no-decay target, beats teacher) + identity-minimality
   v2)    EXTRA="ode_nextrung_targets=true ode_teachersup_enabled=true ode_teachersup_weight=0.15 ode_teachersup_steps=5 ode_teachersup_rungs=[625.0]";;
+  # ---- 10K-SCENE CAMPAIGN (2026-08-16): 2x2 objective x schedule on the
+  # v14e_pilot_dir8n_10k pool (10,003 windows; backward capped at 1,603 by
+  # class availability). At 10k scenes one epoch is ~2,500 batches, so a
+  # 500-step run never leaves the full-diversity epoch-0 phase — the
+  # sampled-vs-all9 axis here is pure batch composition (grouped fan vs
+  # shuffled), no pruning. Ckpt every 100, rotation OFF (keep 99: the
+  # default keep-3 hard-unlinked the round-2 step-200 peaks).
+  roll10k)      EXTRA="ode_rollout=true ode_rollout_commit=teacher keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
+  rollkl10k)    EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
+  rollmse910k)  EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
+  rollkl910k)   EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_loss_type=kl_local ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
+  roll10ksmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
+  # PROPER ENERGY SCORE arm (user 2026-08-16): m=2 noise branches per chunk,
+  # strictly proper scoring rule (CRPS generalization) vs the single teacher
+  # realization — distributional without a critic; spread term sign-correct
+  # by construction. all9 schedule: never worse than sampled in rounds 1-2
+  # and the single-delta control vs rollmse910k. ~2x step time (double
+  # ladder), hence the longer wall at submit.
+  rolles10k)      EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_es=true ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
+  rolles10ksmoke) EXTRA="ode_rollout=true ode_rollout_commit=teacher ode_es=true ode_curriculum=true ode_curriculum_epochs=10 ode_curriculum_mode=all9 keep_last_ckpts=99"; export ODE_ROLLOUT=1; DATAV=dir8n_10k;;
   *) echo "bad ARM=$ARM"; exit 1;;
 esac
 
@@ -162,6 +187,32 @@ if [ ! -f "$LOGDIR/.train_done" ]; then
     logdir=$LOGDIR config_name=pilot_flip2_${ARM} \
     wandb_name=pilot_flip2_${ARM} > logs/ode14e_pilot_flip2_${ARM}.log 2>&1 \
     && touch "$LOGDIR/.train_done"
+  # LAUNCH-FLAKE RETRY (2026-08-15): three arm launches died on transient
+  # startup networking (cotracker hub RemoteDisconnected 6015319, wandb
+  # sentry 6020346, rendezvous socket timeout 6021280) — all BEFORE the
+  # first training step. Retry once iff the log shows a network signature
+  # and training never actually started ("Trainer ready" absent); a real
+  # code failure repeats identically and still TRAIN-FAILs.
+  if [ ! -f "$LOGDIR/.train_done" ] \
+     && grep -qaE "RendezvousConnectionError|DistNetworkError|RemoteDisconnected|Failed to recv|sentry" "logs/ode14e_pilot_flip2_${ARM}.log" \
+     && ! grep -qa "Trainer ready" "logs/ode14e_pilot_flip2_${ARM}.log"; then
+    echo "LAUNCH-FLAKE $ARM: startup network failure, retrying once in 90s"
+    sleep 90
+    ${LAUNCHER:-python} action-forcing/train.py \
+      --config configs/action_ode_distill_F.yaml \
+      chunked_lmdb=true ode_chunked_supervision=true \
+      cd_teacher_loss_enabled=false cd_student_loss_enabled=false \
+      $EXTRA \
+      clean_root=/projects/u6ex/fbots/frodobots_lmdb/v14e_pilot_${DATAV:-flip2} \
+      cf_root=/projects/u6ex/fbots/frodobots_lmdb/v14e_pilot_${DATAV:-flip2} \
+      clean_only=false require_cf=false lambda_cf=1.0 \
+      random_steps="[0,15,18,19]" eval_inference_steps=20 \
+      generator_ckpt=/scratch/u6ex/as1748.u6ex/ARRWM/logs/v14e_pca8_raw/causal_lora_step0005000.pt \
+      total_steps=$TS save_interval=${SAVE_EVERY:-$TS} eval_interval=$TS ckpt_skip_optimizer=true ckpt_local_stage=true \
+      logdir=$LOGDIR config_name=pilot_flip2_${ARM} \
+      wandb_name=pilot_flip2_${ARM} >> logs/ode14e_pilot_flip2_${ARM}.log 2>&1 \
+      && touch "$LOGDIR/.train_done"
+  fi
   if [ ! -f "$LOGDIR/.train_done" ]; then
     echo "TRAIN-FAIL $ARM — training did not complete; last 40 lines:"
     tail -40 logs/ode14e_pilot_flip2_${ARM}.log
@@ -171,6 +222,10 @@ fi
 
 CKPT=$LOGDIR/$CKPT_NAME
 [ -f "$CKPT" ] || CKPT=$(ls -t $LOGDIR/action_ode_step*.pt 2>/dev/null | head -1)
+if [[ "$EXTRA" == *ode_klts=true* ]]; then
+  # KLTS probes must serve WITH the learned temperature applied.
+  export ODE_KLTS_CKPT=$PWD/$CKPT
+fi
 if [ -n "$EMDZ" ]; then
   # emdz probes must serve WITH the learned transport head applied.
   export ODE_EMDHEAD=1 ODE_EMDHEAD_CKPT=$PWD/$CKPT

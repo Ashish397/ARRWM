@@ -86,9 +86,22 @@ def main():
         cm = cm.base_model.model
     cm.block_mask = None
 
-    windows = json.load(open(WINDOWS))
-    manifest = torch.load(MANIFEST, map_location="cpu")
-    emb_by_path = {r["zarr_path"]: r["prompt_embeds"] for r in manifest}
+    # IE_SEED_BUNDLE: a pre-extracted {seed latents + prompt embeds} pack, so a
+    # run needs neither the 840MB manifest nor the ~20GB of source zarrs (the
+    # driver only ever reads 3 latent frames per window). Unset => original path,
+    # byte-identical.
+    BUNDLE = os.environ.get("IE_SEED_BUNDLE", "").strip()
+    bundle = None
+    if BUNDLE:
+        bundle = torch.load(BUNDLE, map_location="cpu")
+        windows = [{"zarr_path": b["zarr_path"], "offset": b["offset"]} for b in bundle]
+        emb_by_path = {b["zarr_path"]: b["prompt_embeds"] for b in bundle}
+        seed_by_idx = {b["idx"]: b["seed"] for b in bundle}
+        print(f"[inject] seed bundle: {len(bundle)} windows from {BUNDLE}", flush=True)
+    else:
+        windows = json.load(open(WINDOWS))
+        manifest = torch.load(MANIFEST, map_location="cpu")
+        emb_by_path = {r["zarr_path"]: r["prompt_embeds"] for r in manifest}
 
     if PHASE == "A":
         branches = list(DIRS.keys())
@@ -135,7 +148,10 @@ def main():
         if os.path.exists(os.path.join(out_dir, f"step{STEP:05d}_r{wi:02d}_{br}_raw.mp4")):
             continue                     # resume: video (and its jsonl line) already written
         zp, off = w["zarr_path"], int(w["offset"])
-        seed = ZarrRideDataset.load_latent_chunk(zp, off, off + nfb).unsqueeze(0).to(device, torch.float32)
+        if bundle is not None:
+            seed = seed_by_idx[wi].unsqueeze(0).to(device, torch.float32)
+        else:
+            seed = ZarrRideDataset.load_latent_chunk(zp, off, off + nfb).unsqueeze(0).to(device, torch.float32)
         pe = emb_by_path[zp].unsqueeze(0).to(device, dtype)
         z_cond = torch.zeros(1, tot_f, 2, device=device, dtype=dtype)
         if PHASE in ("A", "S", "G"):

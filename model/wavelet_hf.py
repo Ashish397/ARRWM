@@ -68,6 +68,9 @@ class LatentWaveletHF(nn.Module):
             weight init. Small (default 0.1) so the projector sees
             roughly-zero output for the first few steps; the adapter
             learns to amplify informative channels over training.
+        drop_hh: when True, the diagonal HF sub-band (HH) is dropped.
+            Combined with ``drop_ll=True`` the disc sees only the two
+            DIRECTIONAL HF bands (LH, HL). Default False.
         ll_weight: relative weight on the LL band when ``drop_ll=False``.
             Default 0.15 — LL has roughly 4× the magnitude of the HF
             bands on smoothed WAN latents; weighting by 0.15 brings LL
@@ -89,6 +92,7 @@ class LatentWaveletHF(nn.Module):
         drop_ll: bool = False,
         adapter_init_gain: float = 0.1,
         ll_weight: float = 0.15,
+        drop_hh: bool = False,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -100,16 +104,30 @@ class LatentWaveletHF(nn.Module):
         # ll_weight < 1.0 makes LL a softer input to the adapter so the
         # disc weighs HF detail more heavily than luminance content.
         self.ll_weight = float(ll_weight)
-        out_bands = 3 if self.drop_ll else 4
-
-        # Stack sub-band kernels; drop LL if requested.
-        if self.drop_ll:
-            kernels = torch.stack([_HAAR_LH, _HAAR_HL, _HAAR_HH], dim=0)
-        else:
-            kernels = torch.stack(
-                [_HAAR_LL * self.ll_weight, _HAAR_LH, _HAAR_HL, _HAAR_HH],
-                dim=0,
+        # ``drop_hh`` (2026-08-19): also drop the DIAGONAL high-frequency
+        # band. HH is the noisiest, least structured sub-band -- it carries
+        # the checkerboard/diagonal component that has no clean analogue in
+        # smoothed WAN latents. The wavelet-ON discriminator was measured
+        # dead (d_real == d_fake, d_loss = log2, common-mode drift) and HH is
+        # the leading suspect for that common-mode term, so this isolates it
+        # while keeping the directional HF bands (LH = width, HL = height).
+        # Bands are selected here only; everything downstream keys off
+        # ``out_bands``, so no other code path needs to change.
+        self.drop_hh = bool(drop_hh)
+        _bands = []
+        if not self.drop_ll:
+            _bands.append(_HAAR_LL * self.ll_weight)
+        _bands.append(_HAAR_LH)
+        _bands.append(_HAAR_HL)
+        if not self.drop_hh:
+            _bands.append(_HAAR_HH)
+        if not _bands:
+            raise ValueError(
+                "LatentWaveletHF: every sub-band was dropped "
+                f"(drop_ll={self.drop_ll}, drop_hh={self.drop_hh})."
             )
+        out_bands = len(_bands)
+        kernels = torch.stack(_bands, dim=0)
         # kernels: [out_per_group, 2, 2] -> [out_per_group, 1, 2, 2]
         kernels = kernels.unsqueeze(1)
         # Tile per channel via grouped conv: shape

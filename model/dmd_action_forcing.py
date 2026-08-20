@@ -1934,6 +1934,29 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_match_max_real = int(
             getattr(args, "ladd_gt_transition_match_max_real", 12)
         )
+        # Content-MATCHED wide GT for the SINGLE-CHUNK gt_vs_fake mode.
+        # Same retrieval machinery as ``ladd_gt_transition_match`` (top-M
+        # by mean-L1 over the ride pool, per-D-update resample of K from M,
+        # max_real cap, block-diagonal RpGAN) but the candidate is ONE
+        # chunk, not a (u, u+1) transition pair — the transition structure
+        # stays the distinguishing difference between the two modes.
+        # Deliberately reuses the ``ladd_gt_transition_match_{k,pool,
+        # max_real}`` knobs so the two modes stay directly comparable; no
+        # gt_vs_fake-specific duplicates are introduced.
+        # Motivation: positional pairing ([(i, i)] vs raw GT chunk i) gave a
+        # DEAD disc (d_real ~= d_fake, d_loss == log2 = chance) because a
+        # time-drifted / content-diverged student has no business being
+        # compared against its positional GT.
+        self.ladd_gt_vs_fake_match = bool(
+            getattr(args, "ladd_gt_vs_fake_match", False)
+        )
+        # Per-chunk magnitude normalisation for the single-chunk matcher.
+        # "" = off (default, byte-identical); "m1" = per-channel RMS;
+        # "m1m2" = per-channel standardise. Removes the raw brightness
+        # cue that lets a grey student retrieve an equally grey GT.
+        self.ladd_gt_vs_fake_mag_norm = str(
+            getattr(args, "ladd_gt_vs_fake_mag_norm", "")
+        ).lower()
         # Magnitude-equalize the two members (former / latter chunk) of
         # every gt_transition pair — for BOTH real and fake — to their
         # common average MEAN MAGNITUDE (mean of |x|, the brightness/energy
@@ -2266,6 +2289,86 @@ class ActionForcingDMD(SelfForcingModel):
         # ``pred_fake - pred_real`` gradient, so the DMD signal decays
         # naturally as the teacher agrees with the student — preferred
         # in v11+ where we want no power when teacher matches student.
+        # ``dmd_normalization_band_local`` (2026-08-18, per user): reduce the
+        # eq.(8) normalizer over the SUPERVISED BAND only instead of the whole
+        # window. The window-wide mean includes the GT-context frames, where
+        # ``x0 - pred_real`` is ~0 because the teacher reconstructs its own
+        # clean context (measured pixel MAE 3-5 there vs 18-50 on the student
+        # band). That makes the denominator systematically too small and
+        # amplifies the band gradient by a data-dependent 1x..1.75x, and it
+        # silently disagrees with the MAE gate, which IS band-local.
+        # Falls back to the window-wide reduction (byte-identical) whenever no
+        # gradient_mask is supplied or the mask is empty.
+        # ``dmd_42f_clean_self_forward`` (G4, 2026-08-18): HYBRID clean half.
+        # Place the clean half one chunk AHEAD (requires the forward drift, i.e.
+        # dmd_42f_clean_drift_* with frac=1 -> drift_off=+npb) and source it from
+        # the STUDENT's own rolled chunk wherever the student has coverage,
+        # falling back to GT for the frames beyond the student's roll -- the
+        # genuine future it has not generated. So the teacher gets the student's
+        # own trajectory where that exists (no GT counterpart to read = no oracle
+        # leak) and GT only where nothing else is available.
+        # Geometry at the live config (npb=3, N=21, n_ctx=9, chunk=12 frames):
+        #   clean window world [noisy_lo+3, noisy_lo+24)
+        #   student roll      world [noisy_lo+9, noisy_lo+21)
+        #   -> clean idx 0..5   = GT (past)
+        #      clean idx 6..17  = STUDENT
+        #      clean idx 18..20 = GT (future)
+        # Detached throughout (clean half never carries gradient).
+        self.dmd_real_traj_enabled = bool(
+            getattr(args, "dmd_real_traj_enabled", False)
+        )
+        # S7: the refinement integrates the COND-only flow and its final x0
+        # REPLACES the CFG-extrapolated pred_real, so a non-zero guidance scale
+        # would be silently discarded. All our configs pin 0.0; fail loud.
+        if self.dmd_real_traj_enabled and float(
+            getattr(args, "real_guidance_scale", 0.0)
+        ) != 0.0:
+            raise ValueError(
+                "dmd_real_traj_enabled requires real_guidance_scale=0.0 "
+                "(the trajectory integration uses the cond-only flow and its "
+                "endpoint replaces the CFG-extrapolated pred_real)."
+            )
+        self.dmd_real_traj_max_steps = int(
+            getattr(args, "dmd_real_traj_max_steps", 6)
+        )
+        self.dmd_real_score_rungs = int(
+            getattr(args, "dmd_real_score_rungs", 1)
+        )
+        # ``dmd_rung_escalate_*`` (G7, 2026-08-18): PER-RUNG adaptive depth for
+        # pred_real. G6 showed a fixed 2nd rung lowers m_real (0.370->0.298 at
+        # high t) but m_fake follows in LOCKSTEP -- the student LEARNS the
+        # teacher's multi-rung advantage, so the ratio stays flat and the gate
+        # stays shut. The response is not "give up" but "escalate": whenever the
+        # gate is still shut for a rung, that rung gets ONE more denoise step,
+        # permanently, for the rest of training. The teacher keeps moving ahead
+        # of a student that keeps catching up.
+        # DDP: the per-rank gate weight differs by ride, so the escalate
+        # DECISION is all-reduced (MAX) -- if ANY rank sees a shut gate every
+        # rank escalates. Without that the ranks would run different numbers of
+        # real_score forwards and deadlock.
+        self.dmd_rung_escalate_enabled = bool(
+            getattr(args, "dmd_rung_escalate_enabled", False)
+        )
+        self.dmd_rung_escalate_w_threshold = float(
+            getattr(args, "dmd_rung_escalate_w_threshold", 0.5)
+        )
+        self.dmd_rung_escalate_max = int(
+            getattr(args, "dmd_rung_escalate_max", 8)
+        )
+        self._rung_depth: Dict[int, int] = {}
+        self._last_sampled_rung: Optional[int] = None
+        self.dmd_42f_clean_drift_chunks = int(
+            getattr(args, "dmd_42f_clean_drift_chunks", 1)
+        )
+        self.dmd_42f_clean_self_forward = bool(
+            getattr(args, "dmd_42f_clean_self_forward", False)
+        )
+        self.dmd_sample_at_rungs = bool(
+            getattr(args, "dmd_sample_at_rungs", False)
+        )
+        self.dmd_normalization_band_local = bool(
+            getattr(args, "dmd_normalization_band_local", False)
+        )
         self.dmd_normalization_enabled = bool(
             getattr(args, "dmd_normalization_enabled", True)
         )
@@ -2341,6 +2444,285 @@ class ActionForcingDMD(SelfForcingModel):
             )
         # Per-rank EMA state for the gate ratio (None until first update).
         self._dmd_mae_gate_ratio_ema: Optional[float] = None
+        # DUAL-TEACHER MEAN AUX (2026-08-16, arXiv:2602.24289 mapping): a
+        # supervised x0-regression on the SAME masked band toward gt_target —
+        # the mean-seeking teacher term run alongside DMD's mode-seeking
+        # reverse-KL. Deliberately NOT scaled by the MAE gate: when the gate
+        # throttles an unreliable teacher score, the GT anchor should hold,
+        # not follow it down. 0.0 = off (byte-identical).
+        self.dmd_gt_band_reg_weight = float(
+            getattr(args, "dmd_gt_band_reg_weight", 0.0)
+        )
+        # --- AR REAL-SCORE HEAD (dmd_ar_head, 2026-08-16) ---
+        # Second DMD head: the SAME frozen real_score weights served
+        # AUTOREGRESSIVELY (fresh local KV cache, PAST-ONLY context)
+        # over the 42f supervised band, alongside the existing
+        # teacher-forced head. The TF head's clean half exposes the
+        # band's GT future, collapsing the teacher's conditional to
+        # near-zero entropy (effectively MEAN-seeking); the AR head's
+        # past-only conditional keeps true entropy over futures, making
+        # its reverse-KL genuinely MODE-seeking.
+        #   total DMD = TF head + dmd_ar_head_weight * AR head
+        # BOTH scores are AR-served: real_score AND fake_score are run
+        # through the SAME local-cache machinery (same prefill/score/
+        # commit schedule, same timesteps, same ``current_start``), so
+        # ``grad_ar = pred_fake_ar - pred_real_ar`` differences two
+        # predictions of the SAME conditional. (v1 subtracted the
+        # TEACHER-FORCED fake prediction instead; that mixes
+        # conditionals — the fake side had seen the band's GT future
+        # through ``clean_x`` — leaving a future-information term that
+        # does NOT vanish at the optimum, i.e. a biased non-zero fixed
+        # point. Fixed.) 0.0 = OFF (default): the AR code path is
+        # completely unreachable — no cache alloc, no tensor op.
+        self.dmd_ar_head_weight = float(
+            getattr(args, "dmd_ar_head_weight", 0.0)
+        )
+        # Weight on the TEACHER-FORCED (mean-seeking) DMD head. 1.0 =
+        # the historical behaviour. 0.0 turns the 42f TF term OFF so the
+        # AR (mode-seeking) head is the ONLY DMD signal — the "AR-only"
+        # arm. The TF forward still RUNS at weight 0 (its pred_real
+        # feeds the MAE gate and supplies the shared eq.-8 normalizer
+        # the AR head reuses), so this is a loss-weight switch, not a
+        # compute saving.
+        self.dmd_tf_head_weight = float(
+            getattr(args, "dmd_tf_head_weight", 1.0)
+        )
+        if self.dmd_tf_head_weight < 0.0:
+            raise ValueError(
+                "dmd_tf_head_weight must be >= 0; got "
+                f"{self.dmd_tf_head_weight}."
+            )
+        if self.dmd_tf_head_weight == 0.0 and self.dmd_ar_head_weight <= 0.0:
+            raise ValueError(
+                "dmd_tf_head_weight=0 with dmd_ar_head_weight=0 leaves NO "
+                "DMD signal at all (the whole distribution-matching term "
+                "would be identically zero). Enable one of the heads."
+            )
+        # What gets committed into the AR teacher's cache between band
+        # chunks.
+        #
+        #   "student" (DEFAULT, and the only mode that supervises
+        #     anything reachable): the student's OWN rolled chunk,
+        #     detached, re-forwarded at t=0 at the same position. This is
+        #     EXACTLY what the rest of the stage does at inference and in
+        #     training — ``pipeline/action_forcing_training.py`` Step 3.4
+        #     commits ``denoised_pred`` (the student's own x0) into
+        #     ``kv_cache1`` unconditionally, every chunk, from step 0.
+        #     The teacher therefore denoises chunk k+1 from the SAME
+        #     history the student will actually have at chunk k+1, so its
+        #     prediction is a target the student can move toward.
+        #
+        #   "gt" (A/B ONLY — WRONG for supervision): the GT band chunk at
+        #     t=0. Kept selectable because it is the historical default
+        #     and the only way to measure the delta, but it is not a
+        #     usable training signal: a teacher conditioned on GT history
+        #     is denoising from a past the student NEVER HAS. Its
+        #     prediction lives on the GT-history manifold, which is
+        #     off-manifold and unreachable for a student whose own
+        #     history has already drifted; the resulting DMD gradient
+        #     asks the student to be somewhere it cannot get to from
+        #     where it is. It also silently re-injects the band's GT into
+        #     the "past-only" conditional the head exists to keep clean.
+        # DEFAULT FLIPPED TO "gt" (2026-08-17, user decision, on measurement).
+        # The comment block above argued for "student" on reachability
+        # grounds. That argument survives, but the measured facts now
+        # outweigh it and the "student" mode is worse in the way that
+        # matters. Probes on holder 6038535 (utils/.probe_ar_edge2.py,
+        # analysis/ar_review/):
+        #   teacher 20-step AR MAE-to-GT: GT ctx 0.2740 | student ctx 0.3508
+        #     | its OWN rolled ctx 0.3520 | student 4-rung roll 0.3282
+        #   -> the teacher's advantage lives in UNCONTAMINATED HISTORY, not
+        #      in its weights: on its own trajectory it is no better than
+        #      the student.
+        #   over 6 chunks: student 0.226->0.490, teacher-on-student-ctx
+        #     0.253->0.516 (degrades in LOCKSTEP with the student),
+        #     teacher-on-GT-ctx 0.253->0.328 (drift-free).
+        #   EDGE (student/teacher) under commit="gt": 1.066 @k=1, 1.083
+        #     @k=2, up to 1.402 at t=980; under "student" it stays <1.0.
+        # With "student" the supervision target inherits the student's own
+        # degradation, so DMD becomes a positive feedback loop that
+        # reinforces the collapse instead of correcting it. Reachability is
+        # a real cost, but an unreachable-but-correct target beats a
+        # reachable target that moves with the failure.
+        # REVERTED TO "student" (2026-08-18, per user, on outcome evidence).
+        # The probe reasoning above is intact but it measured the TEACHER's
+        # AR accuracy in isolation, not the STUDENT's outcome under training.
+        # Every arm that actually trained with commit="gt" collapsed:
+        #   * msedual (6041844, TF+AR, MSE init) -- matched pair vs mse
+        #     (same seed/rides/timesteps, byte-identical clean_x hashes, only
+        #     dmd_ar_head_weight differs): m_fake +90.4% in the last bin,
+        #     worse on 40/40 of the final 40 logged steps, video at step 791
+        #     collapsed to flat grey-blue noise (unstable by 131, gone by 251).
+        #     Teacher's OWN AR MAE stayed flat (+6.8%) while the student's rose
+        #     +37% -- so the rising dmd_ar_ratio was student degradation, NOT a
+        #     teacher edge. `gen/dmd_ar_commit_is_gt == 1.0` on all 79 steps.
+        #   * kldual (6041845) and klar (6041847, AR-ONLY) stuttered by step 31
+        #     and were visibly bad by 46 -- faster than msedual because klar has
+        #     no TF head to dilute the AR gradient. Cancelled by the user.
+        # The unreachability cost this block dismissed is the dominant term:
+        # committing GT conditions the teacher on a past the student never has,
+        # so the target is off-manifold, AND it leaks the band's GT back into a
+        # conditional that is supposed to be past-only.
+        # NOTE the split that makes this coherent: the AR head's PREFILL still
+        # supplies clean GT context (`ctx[:, s0:s0+npb]` = the 42f gt_ctx), so
+        # "GT context" -- the thing the probes showed helps -- is PRESERVED.
+        # Only the per-chunk commit source changes, to what the student will
+        # actually have at inference.
+        self.dmd_ar_head_commit = str(
+            getattr(args, "dmd_ar_head_commit", "student")
+        ).lower()
+        if (
+            self.dmd_ar_head_weight > 0.0
+            and self.dmd_ar_head_commit not in ("student", "gt")
+        ):
+            raise ValueError(
+                "dmd_ar_head_commit must be 'student' (default; the "
+                "teacher conditions on the student's own rolled chunks, "
+                "matching the pipeline's own commit) or 'gt' (A/B only — "
+                "GT-conditioned targets are off-manifold and unreachable "
+                f"for the student); got {self.dmd_ar_head_commit!r}."
+            )
+        # How many supervised band chunks the AR head rolls the teacher
+        # through in ONE shared-cache pass. 0 (default) = ALL chunks in
+        # the 42f supervised band (band_len // npb — 3 at the queued
+        # 3|3|1 geometry). A positive value CAPS it (the FIRST n chunks
+        # of the band). Step cost is ~n sequential teacher forwards per
+        # pass (each conditions on the previous commit, so they cannot be
+        # batched), x2 because the critic is served the same way; hence
+        # the hard ceiling of 4.
+        self.dmd_ar_head_chunks = int(
+            getattr(args, "dmd_ar_head_chunks", 0)
+        )
+        if self.dmd_ar_head_chunks < 0 or self.dmd_ar_head_chunks > 4:
+            raise ValueError(
+                "dmd_ar_head_chunks must be in [0, 4] (0 = all supervised "
+                "band chunks; >4 is a wall-clock trap — each chunk is "
+                f"2 more SEQUENTIAL scorer forwards). Got "
+                f"{self.dmd_ar_head_chunks}."
+            )
+        if self.dmd_ar_head_weight > 0.0 and self.real_guidance_scale != 0.0:
+            raise ValueError(
+                "dmd_ar_head requires real_guidance_scale == 0.0: the AR "
+                "band forwards are cond-only (CFG is not implemented for "
+                "the AR head, and rg != 0 collapses the DMD student "
+                f"anyway). Got real_guidance_scale="
+                f"{self.real_guidance_scale}."
+            )
+        # ---- CRITIC SERVING-MODE WEIGHTS -------------------------------
+        # The DMD critic (``fake_score``) is a CONDITIONAL model: it is
+        # only a valid ``s_fake`` for the conditional it was TRAINED on.
+        # Until now it was trained ONLY teacher-forced
+        # (``_compute_critic_loss_streaming_gtfix``: one TF forward,
+        # ``clean_x`` supplied, ``kv_cache=None``) while the AR head
+        # QUERIES it AR-served (``_ar_score_band``: local KV cache,
+        # past-only context, no ``clean_x``). The AR head's gradient is
+        # then
+        #     grad_ar = (s_fake^AR - s_real^AR)
+        #             = (student - teacher) + (fake_score serving-mode error)
+        # and the second term does NOT vanish at the optimum. Worse, it
+        # GROWS: ``fake_score`` is mirrored from the generator's
+        # AR-competent ODE init (``_mirror_generator_into_fake_score``)
+        # and then receives ~800 TF-only updates per run, drifting away
+        # from the AR conditional it is queried in. Its TF training
+        # conditional also carries the band's GT in ``clean_x`` — a
+        # crutch that is entirely absent under AR serving.
+        #
+        # These two weights let the critic be trained in the regime(s) it
+        # is actually queried in:
+        #   dmd_tf_critic_weight — the existing teacher-forced term.
+        #   dmd_ar_critic_weight — the new AR-served term (same local KV
+        #     cache machinery as ``_ar_score_band``, same prefill /
+        #     score / commit schedule, same ``current_start``, same band,
+        #     same N; the ONLY difference from the head's usage is that
+        #     ``fake_score`` runs WITH GRAD and the teacher is not
+        #     involved at all).
+        #
+        # DEFAULTS ARE DERIVED FROM WHICH HEADS ARE ACTIVE (deliberate).
+        # A flag that has to be remembered is a flag that will eventually
+        # be forgotten, and a critic trained in the wrong regime is a
+        # silent-wrong-answer failure, not a crash. So unless the config
+        # says otherwise:
+        #     dmd_ar_critic_weight = 1.0 if dmd_ar_head_weight > 0 else 0.0
+        #     dmd_tf_critic_weight = 1.0 if dmd_tf_head_weight > 0 else 0.0
+        # i.e. "train the critic in exactly the regimes it is queried
+        # in", which cannot desync from the head configuration. Arm
+        # families land as:
+        #   mse / kl        (TF head only)  -> tf=1.0 ar=0.0  == TODAY,
+        #                                      byte-identical baseline.
+        #   msedual/kldual  (TF + AR heads) -> tf=1.0 ar=1.0  (both
+        #                                      queries in-distribution).
+        #   msear / klar    (AR head only)  -> tf=0.0 ar=1.0  (no TF
+        #                                      query exists, so the TF
+        #                                      critic forward is skipped
+        #                                      entirely — a compute
+        #                                      saving, not just a zero
+        #                                      weight).
+        # Explicit config values always win over the derived default.
+        _ar_cw = getattr(args, "dmd_ar_critic_weight", None)
+        self.dmd_ar_critic_weight = float(
+            (1.0 if self.dmd_ar_head_weight > 0.0 else 0.0)
+            if _ar_cw is None else _ar_cw
+        )
+        _tf_cw = getattr(args, "dmd_tf_critic_weight", None)
+        self.dmd_tf_critic_weight = float(
+            (1.0 if self.dmd_tf_head_weight > 0.0 else 0.0)
+            if _tf_cw is None else _tf_cw
+        )
+        if self.dmd_ar_critic_weight < 0.0 or self.dmd_tf_critic_weight < 0.0:
+            raise ValueError(
+                "dmd_ar_critic_weight / dmd_tf_critic_weight must be >= 0; "
+                f"got ar={self.dmd_ar_critic_weight} "
+                f"tf={self.dmd_tf_critic_weight}."
+            )
+        # Both critic regimes off while a head is live would leave
+        # ``fake_score`` FROZEN at its mirrored init (only the EMA pull
+        # would move it) while both heads keep differencing against it —
+        # a silently mis-specified DMD. Rank-symmetric (pure config), so
+        # this raises on every rank or on none (no DDP hang).
+        if (
+            self.dmd_ar_critic_weight == 0.0
+            and self.dmd_tf_critic_weight == 0.0
+            and (self.dmd_tf_head_weight > 0.0 or self.dmd_ar_head_weight > 0.0)
+        ):
+            raise ValueError(
+                "dmd_tf_critic_weight=0 AND dmd_ar_critic_weight=0 while a "
+                f"DMD head is active (tf_head={self.dmd_tf_head_weight}, "
+                f"ar_head={self.dmd_ar_head_weight}): the critic would "
+                "never be trained at all, so (fake - real) would be "
+                "differenced against a frozen fake_score. Enable at least "
+                "one critic regime (normally: the same regime(s) the "
+                "active heads query)."
+            )
+        if self.dmd_ar_critic_weight > 0.0 and not self.dmd_42f_enabled:
+            # The AR payload (``ar_head``) is built ONLY by
+            # ``_build_42f_scoring_inputs``; without it the AR critic
+            # term could never fire and would be a silent no-op.
+            # Rank-symmetric config fact.
+            raise ValueError(
+                "dmd_ar_critic_weight="
+                f"{self.dmd_ar_critic_weight} > 0 requires "
+                "dmd_42f_enabled=true (the AR band payload is built only "
+                "on the 42f path)."
+            )
+        if (
+            self.dmd_ar_critic_weight > 0.0
+            and self.dmd_ar_head_commit not in ("student", "gt")
+        ):
+            # The head validates this only when the HEAD is on; the AR
+            # critic uses the same commit schedule, so an AR-critic-only
+            # config must be validated too (an unknown value would
+            # silently fall through to "student").
+            raise ValueError(
+                "dmd_ar_head_commit must be 'student' or 'gt'; got "
+                f"{self.dmd_ar_head_commit!r} (dmd_ar_critic_weight="
+                f"{self.dmd_ar_critic_weight} uses the same commit "
+                "schedule as the AR head)."
+            )
+        # Reusable LOCAL KV / cross-attn caches for the AR head (see
+        # ``_ensure_ar_kv_cache``). ``None`` until the first AR-head
+        # call; never allocated while the head is off.
+        self._ar_kv_cache: Optional[list] = None
+        self._ar_crossattn_cache: Optional[list] = None
         # Anti-collapse variance floor. Penalizes the student's
         # per-frame latent std falling below the GT frame's std
         # (one-sided ReLU gap). Counters the loss-shape pull toward
@@ -3254,6 +3636,65 @@ class ActionForcingDMD(SelfForcingModel):
                     if strict:
                         raise
 
+    @staticmethod
+    def _assert_lora_load_ok(load_result, peft_model, where: str) -> None:
+        """Verify a ``set_peft_model_state_dict`` call actually populated
+        the adapter.
+
+        ``set_peft_model_state_dict`` returns the ``_IncompatibleKeys``
+        of an internal ``load_state_dict(..., strict=False)`` and NEVER
+        raises on key drift. Its return value was previously discarded,
+        so a renamed/re-prefixed checkpoint key would leave every
+        ``lora_A``/``lora_B`` at its init value — and since peft
+        zero-inits ``lora_B``, the adapter's contribution is EXACTLY
+        ZERO. The teacher would then silently be base Wan, the run would
+        look healthy, and nothing would say so.
+
+        Two checks, both on rank-symmetric quantities (the checkpoint and
+        the module structure are identical on every rank), so this
+        raises everywhere or nowhere — no DDP divergence:
+          * no ``unexpected_keys`` (a key in the checkpoint that the
+            model does not have);
+          * no LoRA key among ``missing_keys`` (a LoRA weight the model
+            has that the checkpoint did not supply). ``missing_keys``
+            legitimately lists the whole frozen base, so only the
+            ``lora_``-bearing entries are inspected.
+        """
+        if load_result is None:
+            # Older peft returns None; fall back to a direct check that
+            # at least one lora_B is non-zero (peft zero-inits them, so
+            # an all-zero adapter is exactly the failure mode).
+            try:
+                any_nonzero = any(
+                    bool(p.detach().abs().sum() > 0)
+                    for n, p in peft_model.named_parameters()
+                    if "lora_B" in n
+                )
+            except Exception:
+                return
+            if not any_nonzero:
+                raise RuntimeError(
+                    f"[ActionForcingDMD] {where}: every lora_B weight is "
+                    "still zero after set_peft_model_state_dict — the "
+                    "adapter is a no-op (key drift in the checkpoint?)."
+                )
+            return
+        unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+        missing = [
+            k for k in (getattr(load_result, "missing_keys", []) or [])
+            if "lora_" in k
+        ]
+        if unexpected or missing:
+            raise RuntimeError(
+                f"[ActionForcingDMD] {where}: LoRA state-dict load did not "
+                f"match the model. unexpected_keys={len(unexpected)} "
+                f"{unexpected[:6]}; missing LoRA keys={len(missing)} "
+                f"{missing[:6]}. peft's set_peft_model_state_dict does not "
+                "raise on key drift, and an unloaded adapter is silently "
+                "ZERO (lora_B is zero-init) — i.e. the teacher would "
+                "degrade to base Wan without a single log line."
+            )
+
     def _merge_v14_lora_into_generator(self, args, lora_sd, device) -> None:
         """Fold a v14/14d LoRA state-dict into the student generator's
         base Wan (merge_and_unload), leaving the result TRAINABLE — the
@@ -3289,9 +3730,11 @@ class ActionForcingDMD(SelfForcingModel):
             target_modules=target_modules, bias="none",
         )
         peft_model = peft.get_peft_model(self.generator.model, lora_config)
+        _lr_where = "generator v14-LoRA"
         try:
-            set_peft_model_state_dict(peft_model, lora_sd)
+            _lr = set_peft_model_state_dict(peft_model, lora_sd)
         except Exception:
+            _lr_where = "generator v14-LoRA (cross-load)"
             from peft import get_peft_model_state_dict
             current_sd = get_peft_model_state_dict(peft_model)
             matched = 0
@@ -3302,12 +3745,22 @@ class ActionForcingDMD(SelfForcingModel):
                 ):
                     current_sd[key] = lora_sd[key]
                     matched += 1
-            set_peft_model_state_dict(peft_model, current_sd)
+            if matched == 0:
+                raise RuntimeError(
+                    "[ActionForcingDMD] generator v14-LoRA cross-load "
+                    f"matched 0/{len(current_sd)} keys — the adapter "
+                    "would be identically zero (lora_B is zero-init). "
+                    "Checkpoint key drift?"
+                )
+            _lr = set_peft_model_state_dict(peft_model, current_sd)
             if _is_main():
                 logging.info(
                     "[ActionForcingDMD] generator v14-LoRA cross-load "
                     "matched %d/%d", matched, len(current_sd),
                 )
+        # Outside the try/except on purpose: a key-drift failure must be
+        # LOUD, not silently retried through the fallback.
+        self._assert_lora_load_ok(_lr, peft_model, _lr_where)
         merged = peft_model.merge_and_unload()
         try:
             from peft.tuners.lora import LoraLayer
@@ -3393,9 +3846,11 @@ class ActionForcingDMD(SelfForcingModel):
             )
             peft_model = peft.get_peft_model(wrapper.model, lora_config)
             lora_sd = v14_lora_sd
+            _lr_where = "real_score v14e LoRA"
             try:
-                set_peft_model_state_dict(peft_model, lora_sd)
+                _lr = set_peft_model_state_dict(peft_model, lora_sd)
             except Exception:
+                _lr_where = "real_score v14e LoRA (cross-load)"
                 from peft import get_peft_model_state_dict
                 current_sd = get_peft_model_state_dict(peft_model)
                 matched = 0
@@ -3406,12 +3861,23 @@ class ActionForcingDMD(SelfForcingModel):
                     ):
                         current_sd[key] = lora_sd[key]
                         matched += 1
-                set_peft_model_state_dict(peft_model, current_sd)
+                if matched == 0:
+                    raise RuntimeError(
+                        "[ActionForcingDMD] real_score v14e LoRA cross-load "
+                        f"matched 0/{len(current_sd)} keys — the teacher "
+                        "adapter would be identically zero (lora_B is "
+                        "zero-init), i.e. the 'v14e teacher' would in fact "
+                        "be base Wan. Checkpoint key drift?"
+                    )
+                _lr = set_peft_model_state_dict(peft_model, current_sd)
                 if _is_main():
                     logging.info(
                         "[ActionForcingDMD] real_score LoRA cross-load "
                         "matched %d/%d", matched, len(current_sd),
                     )
+            # Outside the try/except on purpose: a key-drift failure must
+            # be LOUD, not silently retried through the fallback.
+            self._assert_lora_load_ok(_lr, peft_model, _lr_where)
             if merge:
                 merged = peft_model.merge_and_unload()
                 try:
@@ -3553,6 +4019,14 @@ class ActionForcingDMD(SelfForcingModel):
         # forwards through.
         _apply_v14_lora(self.real_score, merge=True)
         self.real_score.model.tf_use_causal_mask = bool(self.real_teacher_causal_mask)
+        # Match the dual-teacher branch above, which does call ``.eval()``
+        # on its frozen merged copy. ``_apply_v14_lora(merge=True)``
+        # returns a module in whatever mode ``merge_and_unload`` left it,
+        # so without this the legacy (single, frozen) teacher could score
+        # in train mode. Inference-mode-only change: the WAN DiT carries
+        # no dropout/batchnorm on this path, so it is a no-op numerically
+        # today — made explicit so it stays a no-op if one is ever added.
+        self.real_score.model.eval()
 
     @staticmethod
     def _collect_target_modules(model) -> list:
@@ -4290,8 +4764,11 @@ class ActionForcingDMD(SelfForcingModel):
         missing-GT step leaves the smoothed ratio untouched rather than
         resetting it.
         """
-        if not self.dmd_mae_gate_enabled:
-            return 1.0
+        # DMD3 (2026-08-18): when the gate is DISABLED we still compute and log
+        # m_real / m_fake / ratio -- they are the primary diagnostic and the
+        # old early-return blinded every ungated run. Only the WEIGHT is
+        # forced to 1.0.
+        _gate_off = not self.dmd_mae_gate_enabled
         if gt_target is None:
             log_dict["dmd_mae_gate_skipped"] = 1.0
             return 1.0
@@ -4342,6 +4819,9 @@ class ActionForcingDMD(SelfForcingModel):
             # student-vs-teacher crossover is finally visible on the
             # SAME (per-chunk, masked) basis.
             log_dict["student_mae_vs_gt"] = float(m_fake.item())
+            if _gate_off:
+                log_dict["dmd_mae_gate_weight"] = 1.0
+                return 1.0
             return float(w)
 
     def _sigma_at_timestep(
@@ -4391,6 +4871,7 @@ class ActionForcingDMD(SelfForcingModel):
         aug_t: Optional[torch.Tensor] = None,
         clean_x_real: Optional[torch.Tensor] = None,
         aug_t_real: Optional[torch.Tensor] = None,
+        gradient_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Eq. (7) of the DMD paper, byte-for-byte CF parity.
 
@@ -4488,7 +4969,7 @@ class ActionForcingDMD(SelfForcingModel):
         # and the saved activation graph is the cheapest single memory
         # win available. CF parity preserved by-value; only the
         # forward count differs.
-        _, pred_real_image_cond = self.real_score(
+        flow_real_cond, pred_real_image_cond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep=timestep,
@@ -4506,6 +4987,111 @@ class ActionForcingDMD(SelfForcingModel):
             ) * self.real_guidance_scale
         else:
             pred_real_image = pred_real_image_cond
+
+        # ``dmd_real_score_rungs`` (G6, 2026-08-18): refine pred_real by
+        # continuing the ODE integration instead of stopping at the single
+        # Euler step. Motivation (measured, analysis/bin_gate_by_t.py): binned
+        # by t, at the low rungs m_real ~= m_fake (ratio 1.004-1.011) once the
+        # clean half moves forward, so the MAE gate throttles DMD to W~0.03
+        # exactly where the 4-rung student forms its image. A one-step x0 is a
+        # crude estimator of E[x0|x_t]; the LMDB generator that produced our
+        # ODE data ran TWENTY rungs. Adding rungs lowers m_real, raises the
+        # ratio and opens the gate -- but only if the teacher genuinely has an
+        # edge, so the gate stays an honest instrument.
+        # UNCONDITIONAL by design: making the depth depend on the gate's own
+        # verdict would be self-referential and would make m_real/ratio
+        # non-comparable across steps.
+        # NOTE this is a SEMANTIC change to DMD: pred_real stops being the
+        # one-step score at t. `dmd_fake_score_rungs` (symmetric control) is
+        # deliberately NOT implemented yet -- refining only the real side means
+        # `pred_fake - pred_real` carries an integration-depth term as well as
+        # the distribution difference. That is the thing G6 is testing.
+        # DMD3 TRAJECTORY DISTILLATION (2026-08-18). The 14e teacher that
+        # produced the LMDB data ran a 20-step deterministic Euler chain
+        # (FlowMatchScheduler shift=5.0, sigma_min=0.0, extra_one_step=True;
+        # utils/causal_chain_rollout.py:135-157, GL_STEPS=20). The 4-rung
+        # student ladder [1000,625,357,208] is a SUBSAMPLE of that grid at
+        # indices [0,15,18,19] (verified). So each student rung is responsible
+        # for ONE SEGMENT of the teacher's trajectory:
+        #     rung 1000 -> integrate idx 0 ->15  (15 teacher steps)
+        #     rung  625 -> integrate idx 15->18  ( 3 teacher steps)
+        #     rung  357 -> integrate idx 18->19  ( 1 teacher step)
+        #     rung  208 -> integrate idx 19->x0  (final step, to_final)
+        # 15+3+1+1 = the full 20-step chain, split across the four rungs. The
+        # student therefore learns, at each rung, to make ONE jump that lands
+        # where the teacher's many small steps land -- distilling the WHOLE
+        # trajectory rather than a single Euler step.
+        # Long segments are SUBSAMPLED to `dmd_real_traj_max_steps` uniformly
+        # (the 15-step segment is the only one that hits the cap).
+        # Deterministic throughout: state carried in `_lat`, no fresh randn.
+        if bool(getattr(self, "dmd_real_traj_enabled", False)):
+            _sched = getattr(self, "_real_refine_sched", None)
+            if _sched is None:
+                from third_party.minWM.Wan21.wan_utils.scheduler import (
+                    FlowMatchScheduler as _FMS,
+                )
+                _sched = _FMS(shift=5.0, sigma_min=0.0, extra_one_step=True)
+                _sched.set_timesteps(num_inference_steps=20,
+                                     denoising_strength=1.0)
+                self._real_refine_sched = _sched
+            with torch.no_grad():
+                _g = _sched.timesteps.to(pred_real_image.device)
+                _sig = _sched.sigmas.to(pred_real_image.device)
+                _t0 = float(timestep.flatten()[0].item())
+                _idx = int(torch.argmin((_g - _t0).abs()).item())
+                _lad = sorted({
+                    int(torch.argmin((_g - float(r)).abs()).item())
+                    for r in self.denoising_step_list
+                })
+                _nxt = [i for i in _lad if i > _idx]
+                _end = _nxt[0] if _nxt else len(_g) - 1
+                # S1 FIX: `FlowMatchScheduler.step()` ALWAYS moves exactly one
+                # grid interval (it argmins the timestep then reads
+                # sigmas[id+1]); it cannot jump. Subsampling a segment and
+                # calling step() therefore under-integrates AND mislabels the
+                # latent -- measured: the top rung travelled 0.1424 sigma of an
+                # intended 0.3533, and fed the final forward a latent at
+                # sigma~0.836 while telling it t=625 (sigma=0.625).
+                # Do the Euler update against EXPLICIT sigmas instead, with the
+                # segment endpoint always included, so we land exactly on
+                # sigma[_end] and every forward's label matches its latent.
+                _cap = max(1, int(getattr(self, "dmd_real_traj_max_steps", 6)))
+                # Batch-heterogeneity guard: _t0 and the relabels below take
+                # sample 0's timestep, but _get_timestep draws INDEPENDENTLY per
+                # batch element. With B>1 the other samples would be integrated
+                # along sample 0's segment and mislabelled. B=1 today; skip
+                # refinement rather than silently corrupt if that changes.
+                if int(timestep.flatten().unique().numel()) > 1:
+                    _nodes = [_idx]
+                else:
+                    _nodes = list(range(_idx, _end + 1))
+                if len(_nodes) - 1 > _cap:
+                    _nodes = [
+                        _nodes[int(round(k * (len(_nodes) - 1) / _cap))]
+                        for k in range(_cap + 1)
+                    ]
+                _lat = noisy_image_or_video.detach()
+                _flow = flow_real_cond.detach()
+                _x0 = pred_real_image.detach()
+                _cur = _idx
+                for _n in _nodes[1:]:
+                    _lat = (
+                        _lat.float() + _flow.float() * (_sig[_n] - _sig[_cur])
+                    ).to(dtype=noisy_image_or_video.dtype)
+                    _cur = _n
+                    _tn = torch.full_like(
+                        timestep, int(round(float(_g[_cur].item()))),
+                    )
+                    _flow, _x0 = self.real_score(
+                        noisy_image_or_video=_lat,
+                        conditional_dict=conditional_dict,
+                        timestep=_tn,
+                        **tf_kwargs_real,
+                    )
+                    _flow = _flow.detach(); _x0 = _x0.detach()
+                if len(_nodes) > 1:
+                    pred_real_image = _x0
+                self._last_traj_steps = max(0, len(_nodes) - 1)
 
         # Unconditionally stash pred_real_image for downstream
         # consumers (alt-head plumbing). The CFG-extrapolated
@@ -4525,9 +5111,23 @@ class ActionForcingDMD(SelfForcingModel):
         grad = pred_fake_image - pred_real_image
         if normalization and self.dmd_normalization_enabled:
             p_real = estimated_clean_image_or_video - pred_real_image
-            normalizer = torch.abs(p_real).mean(
-                dim=[1, 2, 3, 4], keepdim=True,
+            _bl = (
+                self.dmd_normalization_band_local
+                and gradient_mask is not None
+                and gradient_mask.shape == p_real.shape
+                and bool(gradient_mask.any())
             )
+            if _bl:
+                _m = gradient_mask.to(dtype=p_real.dtype)
+                _num = (torch.abs(p_real) * _m).sum(
+                    dim=[1, 2, 3, 4], keepdim=True,
+                )
+                _den = _m.sum(dim=[1, 2, 3, 4], keepdim=True).clamp_min(1.0)
+                normalizer = _num / _den
+            else:
+                normalizer = torch.abs(p_real).mean(
+                    dim=[1, 2, 3, 4], keepdim=True,
+                )
             # clamp_min bounds the cusp amplification when the student
             # converges to the teacher: small p_real => big 1/normalizer
             # => DMD gradient pulled hard toward the teacher's prior
@@ -4676,6 +5276,31 @@ class ActionForcingDMD(SelfForcingModel):
         # DMD scoring where the teacher's x0 is sharp). The same monotone map
         # works in both directions; only shift==1 is a no-op (default), so
         # this stays byte-identical for unshifted configs.
+        # ``dmd_sample_at_rungs`` (2026-08-18): draw t from the student's OWN
+        # rung ladder instead of a shifted continuum. The 4-rung student only
+        # ever occupies denoising_step_list; sampling between rungs asks the
+        # teacher about noise levels the student never visits. Overrides the
+        # shift entirely (the shift is a continuum reshaper and is meaningless
+        # on a discrete support). Default off = byte-identical.
+        if bool(getattr(self, "dmd_sample_at_rungs", False)):
+            _rungs = [
+                int(round(float(_r))) for _r in list(self.denoising_step_list)
+            ]
+            if len(_rungs) > 0:
+                _idx = torch.randint(
+                    0, len(_rungs), (batch_size,), device=timestep.device,
+                )
+                _pick = torch.tensor(
+                    _rungs, device=timestep.device, dtype=timestep.dtype,
+                )[_idx]
+                timestep = _pick.view(batch_size, 1).expand_as(timestep).clone()
+                # NO clamp here: the rung ladder is a discrete, valid support
+                # by construction. Clamping to [min_step,max_step]=[20,980]
+                # turned rung 1000 into 980, so the trajectory segment started
+                # at grid index 2 instead of 0 (13 steps, not 15) and the first
+                # Euler step read sigma at the wrong node.
+                self._last_sampled_rung = int(timestep.flatten()[0].item())
+                return timestep
         _shift = self.timestep_shift if shift is None else float(shift)
         if _shift != 1.0:
             t_norm = timestep.float() / 1000.0
@@ -4685,6 +5310,814 @@ class ActionForcingDMD(SelfForcingModel):
             timestep = (t_shifted * 1000.0).long()
         timestep = timestep.clamp(self.min_step, self.max_step)
         return timestep
+
+    def _ar_unwrap_dit(self, score_module, *, require_cache_capable: bool = True) -> Any:
+        """Unwrap a scorer wrapper down to the bare DiT.
+
+        Same chain as the stamping helper above (see
+        ``model/dmd_action_forcing.py`` ``_stamp_*`` /
+        ``self.real_score.model`` unwrap): DDP -> ``get_base_model()``
+        (peft) -> ``base_model.model`` (peft LoraModel intermediate).
+        A plain ``score_module.model`` + ``get_base_model()`` is NOT
+        enough: with ``real_teacher_train_online=true`` the trainer
+        rebinds ``real_score.model`` to a DDP wrapper
+        (``trainer/causal_action_forcing_train.py``), DDP has no
+        ``get_base_model`` and does not proxy attribute lookups, so
+        any ``getattr(_, "local_attn_size", -1)`` probe silently
+        returns the -1 default and every guard built on it goes DEAD.
+
+        ``require_cache_capable`` (default True) additionally asserts the
+        unwrapped module can genuinely honour a ``kv_cache`` forward —
+        i.e. it IS a ``CausalWanModel`` or carries an attached causal
+        view (``model/action_model_patch.py::attach_causal_twin``).
+
+        WHY THAT MATTERS (the 2026-08-17 bug). This guard used to
+        duck-type on ``hasattr(cur, "local_attn_size")``, and
+        ``wan/modules/model.py:585`` hardcodes ``self.local_attn_size =
+        21`` on the plain BIDIRECTIONAL ``WanModel``. So the check
+        passed on a module with no cache-aware attention anywhere in it,
+        and every AR-head forward silently threw its ``kv_cache`` away
+        and scored a context-free chunk. Attribute presence is not
+        capability; assert the capability.
+        """
+        from model.action_model_patch import is_cache_capable
+
+        try:
+            from torch.nn.parallel import DistributedDataParallel as _DDP
+        except Exception:
+            _DDP = None
+        cur = score_module.model
+        if _DDP is not None and isinstance(cur, _DDP):
+            cur = cur.module
+        if hasattr(cur, "get_base_model"):
+            g = cur.get_base_model()
+            if g is not cur:
+                cur = g
+        if not hasattr(cur, "local_attn_size") and hasattr(cur, "model"):
+            # peft LoraModel intermediate: ``.model`` is the bare DiT.
+            cur = cur.model
+        if not hasattr(cur, "local_attn_size"):
+            raise RuntimeError(
+                "dmd_ar_head: could not unwrap the scorer down to a "
+                f"WAN DiT (got {type(cur).__name__}); the "
+                "non-rolling / RoPE guards below depend on reading "
+                "``local_attn_size`` off the real module, and a silent "
+                "fallback would leave them permanently dead."
+            )
+        if require_cache_capable and not is_cache_capable(cur):
+            raise RuntimeError(
+                "dmd_ar_head: the unwrapped scorer module "
+                f"({type(cur).__name__}) is NOT cache-capable — it is "
+                "neither a CausalWanModel nor a bidirectional WanModel "
+                "with an attached causal view. Serving it with a "
+                "kv_cache would score every chunk with ZERO past "
+                "context (this is the defect the causal view fixes). "
+                "Call ``_ar_ensure_causal_twin`` before scoring. NOTE: "
+                "``hasattr(module, 'local_attn_size')`` is NOT a valid "
+                "capability test — WanModel hardcodes it to 21."
+            )
+        return cur
+
+    def _ar_causal_window_frames(self) -> int:
+        """Attention window (frames) the AR causal view should serve with.
+
+        Read off the STUDENT generator's own DiT, which is the module
+        whose serving regime the AR head is trying to reproduce, and
+        which the trainer keeps in sync with
+        ``local_attn_size_schedule`` (``_apply_attn_size_if_changed``).
+        Pure attribute read on a rank-symmetric quantity (config +
+        schedule), so every rank derives the same number.
+        """
+        gen = getattr(self, "generator", None)
+        if gen is None:
+            raise RuntimeError(
+                "dmd_ar_head: no generator to read local_attn_size from."
+            )
+        base = self._ar_unwrap_dit(gen, require_cache_capable=False)
+        win = int(getattr(base, "local_attn_size", -1))
+        return win
+
+    def _ar_ensure_causal_twin(self, score_module) -> Any:
+        """Return the ``CausalWanModel`` that will actually serve
+        ``score_module``'s cached forwards, attaching it if needed.
+
+        For the phase-3 scorers (``model/base.py`` builds both as
+        ``WanDiffusionWrapper(is_causal=False)``) this attaches a
+        weight-SHARING causal view; see the block comment above
+        ``model/action_model_patch.py::build_causal_twin``. Idempotent,
+        allocates no parameter storage, and is reached ONLY from
+        ``_ar_score_band`` — i.e. only when ``dmd_ar_head_weight > 0``
+        or ``dmd_ar_critic_weight > 0``. Baseline (TF-only) arms never
+        construct it.
+
+        Called from ``_ar_score_band`` rather than at model-build time
+        on purpose: by the time the AR pass runs, every peft wrap /
+        LoRA merge / DDP wrap has already happened, so the view aliases
+        the modules that are actually live (an online teacher LoRA is
+        picked up for free because whole ``lora.Linear`` objects are
+        shared, not raw weight tensors).
+        """
+        from model.action_model_patch import attach_causal_twin
+        from wan.modules.causal_model import CausalWanModel
+
+        base = self._ar_unwrap_dit(score_module, require_cache_capable=False)
+        if isinstance(base, CausalWanModel):
+            return base
+        if self.inference_pipeline is None:
+            raise RuntimeError(
+                "dmd_ar_head: inference_pipeline must be set before the "
+                "AR causal view can be sized."
+            )
+        win = self._ar_causal_window_frames()
+        fsl = int(self.inference_pipeline.frame_seq_length)
+        return attach_causal_twin(
+            base,
+            local_attn_size=win,
+            sink_size=0,
+            max_attention_size=(None if win <= 0 else win * fsl),
+        )
+
+    def _ar_causal_module(self, score_module) -> Any:
+        """The cache-serving ``CausalWanModel`` for ``score_module``
+        (already attached). Raises if it is not."""
+        from model.action_model_patch import get_causal_twin
+
+        base = self._ar_unwrap_dit(score_module)
+        twin = get_causal_twin(base)
+        if twin is None:
+            raise RuntimeError(
+                "dmd_ar_head: no causal view attached to "
+                f"{type(base).__name__}; call _ar_ensure_causal_twin."
+            )
+        return twin
+
+    def _ar_num_chunks(self, band_len: int, npb: int) -> int:
+        """How many supervised band chunks the AR head rolls through.
+
+        ``dmd_ar_head_chunks`` (0 = all) capped by what the band
+        actually holds. Pure config/geometry arithmetic — identical on
+        every rank, so every caller's derived shapes stay rank-symmetric
+        (no DDP divergence). Used by ``_ar_score_band`` for the pass
+        itself and by the loss block for the band slice / mask / logs,
+        so the two can never drift apart.
+        """
+        n_avail = int(band_len) // int(npb)
+        n_req = int(getattr(self, "dmd_ar_head_chunks", 0))
+        if n_req <= 0:
+            return n_avail
+        return max(1, min(n_avail, n_req))
+
+    def _ensure_ar_kv_cache(
+        self,
+        batch_size: int,
+        frames_cap: int,
+        rope_offset_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[list, list]:
+        """Reusable LOCAL KV / cross-attn caches for the AR head.
+
+        Follows the ``_ensure_sc_kv_cache`` precedent: the buffers live
+        on ``self`` and are RESET (not reallocated) between calls. A
+        fresh allocation per DMD step would cost
+        ``frames_cap * frame_seq_length`` tokens of K/V per block.
+        ``frames_cap`` is GEOMETRY-DEPENDENT (``band_start + N*npb`` —
+        derive it from the arm's own b0/npb/N, do not assume the
+        figures below). At the queued 3|3|1 geometry (band_start=9,
+        N=3 -> frames_cap=18 frames x 1561 tokens x 12 heads x 128
+        dims x 2 tensors x 30 blocks in bf16) that is ~5.2 GB x B
+        allocated and freed EVERY step; a full
+        21-frame window would be ~6.0 GB x B. On top of the ~200 MB x B
+        per-block transient from ``causal_model``'s ``temp_k =
+        kv_cache["k"].clone()``. The FT_v3 budget on record is peak
+        59 GB / max-reserved 80 GB, so this is not affordable.
+        Reallocated only when ``(n_blocks, batch, frames_cap, dtype,
+        device)`` changes.
+
+        Reset semantics differ from ``_ensure_sc_kv_cache`` in exactly
+        ONE place: ``global_end_index`` is seeded to
+        ``rope_offset_tokens`` instead of 0. ``causal_model`` derives
+        the LOCAL write index as
+        ``local_end += current_end - global_end``, so seeding the
+        global index to the AR head's RoPE offset keeps local
+        occupancy contiguous from slot 0 while every forward still
+        passes an OFFSET ``current_start``. Without the seed the first
+        ``rope_offset_tokens`` cache slots would stay all-zero AND
+        stay inside the attention window (the window is the contiguous
+        ``temp_k[window_start:local_end_index]``, there is no mask) —
+        i.e. every AR forward would attend ``npb`` frames of zero K/V.
+        See ``_ar_score_band`` for why the offset exists at all.
+        """
+        if self.inference_pipeline is None:
+            raise RuntimeError(
+                "ActionForcingDMD.inference_pipeline must be set before "
+                "the dmd_ar_head scoring pass; the trainer assigns this "
+                "in _build_pipeline."
+            )
+        pipe = self.inference_pipeline
+        fsl = int(pipe.frame_seq_length)
+        n_blocks = int(pipe.num_transformer_blocks)
+        kv_size = int(frames_cap) * fsl
+
+        cache = self._ar_kv_cache
+        cross = self._ar_crossattn_cache
+        need_realloc = (
+            cache is None
+            or cross is None
+            or len(cache) != n_blocks
+            or cache[0]["k"].shape[0] != batch_size
+            or cache[0]["k"].shape[1] != kv_size
+            or cache[0]["k"].dtype != dtype
+            or cache[0]["k"].device != device
+        )
+        if need_realloc:
+            cache = []
+            cross = []
+            for _ in range(n_blocks):
+                cache.append({
+                    "k": torch.zeros(
+                        [batch_size, kv_size, 12, 128],
+                        dtype=dtype, device=device,
+                    ),
+                    "v": torch.zeros(
+                        [batch_size, kv_size, 12, 128],
+                        dtype=dtype, device=device,
+                    ),
+                    "global_end_index": torch.tensor(
+                        [0], dtype=torch.long, device=device,
+                    ),
+                    "local_end_index": torch.tensor(
+                        [0], dtype=torch.long, device=device,
+                    ),
+                })
+                cross.append({
+                    "k": torch.zeros(
+                        [batch_size, 512, 12, 128],
+                        dtype=dtype, device=device,
+                    ),
+                    "v": torch.zeros(
+                        [batch_size, 512, 12, 128],
+                        dtype=dtype, device=device,
+                    ),
+                    "is_init": False,
+                })
+            self._ar_kv_cache = cache
+            self._ar_crossattn_cache = cross
+        # Reset on EVERY call (fresh + reused alike): a stale reuse
+        # would leak the previous pass's / previous step's K/V into
+        # this conditional. The real/fake passes run sequentially and
+        # each resets on entry, so one buffer serves both.
+        for layer in cache:
+            layer["global_end_index"].fill_(int(rope_offset_tokens))
+            layer["local_end_index"].zero_()
+        for layer in cross:
+            layer["is_init"] = False
+        return cache, cross
+
+    def _ar_free_rope_prefix_memo(self, *score_modules) -> None:
+        """Drop the infinity-RoPE rotated-prefix memo on the given scorers.
+
+        ``utils/infinity_rope.py::patched_forward`` memoises the rotated
+        prefix on every self-attn module whenever
+        ``not torch.is_grad_enabled()`` — which is ALWAYS true for the AR
+        path's prefill / commit forwards — and nothing frees it
+        afterwards (``_clear_module_state`` only runs at install/restore,
+        i.e. once at startup). The last prefix of a pass is
+        ``[B, (b0 + bl - npb) * fsl, n_heads, head_dim]``: at the queued
+        3|3|1 geometry ~57 MB x 30 blocks ~ 1.7 GB PER score module,
+        which would otherwise stay resident through the backward peak on
+        top of the persistent AR KV cache.
+
+        Freeing it costs NOTHING in throughput: the memo is keyed on
+        ``local_start_index``, which restarts at 0 on every pass (the AR
+        KV cache is reset per ``_ar_score_band`` call), so a memo can only
+        ever be reused WITHIN a pass, never across steps. The TF path
+        cannot be affected either — it scores with ``kv_cache=None``,
+        which ``patched_forward`` delegates straight to the original
+        forward without touching these attributes.
+
+        Pure Python attribute assignment: no tensor op, no allocation, no
+        RNG.
+
+        Walks the CAUSAL VIEW's blocks (2026-08-17): the memo lives on
+        the ``CausalWanSelfAttention`` instances that ``infinity_rope``
+        patches, which are the view's — not the bidirectional scorer's
+        ``WanSelfAttention`` modules. Walking the latter (as this did
+        before the cache fix) freed nothing at all.
+        """
+        for _m in score_modules:
+            for _b in self._ar_causal_module(_m).blocks:
+                _sa = getattr(_b, "self_attn", None)
+                if _sa is None:
+                    continue
+                if hasattr(_sa, "_rot_prefix_k"):
+                    _sa._rot_prefix_k = None
+                if hasattr(_sa, "_rot_prefix_local_start"):
+                    _sa._rot_prefix_local_start = -1
+
+    def _ar_score_band(
+        self,
+        score_module,
+        noisy_window: torch.Tensor,
+        timestep: torch.Tensor,
+        ar_inputs: Dict[str, Any],
+        *,
+        enable_grad: bool = False,
+        ddp_sync_last: bool = False,
+    ) -> torch.Tensor:
+        """AR-served score over the 42f supervised band (dmd_ar_head).
+
+        ``score_module`` is ``self.real_score`` OR ``self.fake_score``.
+        BOTH DMD scores are served through this one function — same
+        prefill/score/commit schedule, same timesteps, same
+        ``current_start``, same local cache geometry — so that
+        ``grad_ar = pred_fake_ar - pred_real_ar`` differences two
+        predictions of the SAME past-only conditional. (Differencing an
+        AR real score against a TEACHER-FORCED fake score, as v1 did,
+        leaves a future-information term that does not vanish at the
+        optimum: a biased non-zero fixed point.)
+
+        Serves the SAME weights the TF head just scored with —
+        including any dual-teacher rebind or EMA swap, because this
+        method is only called from inside
+        ``compute_distribution_matching_loss`` and the call sites wrap
+        that WHOLE function in the swap (``self.real_score =
+        real_score_frozen`` / ``_real_score_ema_swap``) — but
+        AUTOREGRESSIVELY: a LOCAL KV cache is prefilled with the clean
+        PAST-ONLY context at t=0, chunk by chunk (the serving pattern
+        the teacher itself used to generate the training LMDB; see
+        ``utils/causal_chain_rollout.py`` ``stream_causal_chain`` and
+        ``action-forcing/af_model/ode_rollout.py`` warm-start —
+        replicated locally, action-forcing/ is not on phase-3's
+        PYTHONPATH). Then N supervised band chunks are scored IN ONE
+        PASS through the shared cache: every chunk is noised to the
+        SAME rung (``_sample_dmd_timestep`` uses
+        ``uniform_timestep=True``, so ``timestep`` is one draw
+        broadcast across frames) and scored at ``current_start`` =
+        the chunk's absolute window position; between chunks the
+        conditional is advanced by a t=0 commit at the SAME position,
+        overwriting that slot's noisy scoring trace (the standard
+        denoise->commit same-position cache overwrite the pipeline
+        performs every rung).
+
+        WHAT IS COMMITTED (``dmd_ar_head_commit``, default
+        ``"student"``): the STUDENT's own rolled chunk, detached. This
+        is the whole point of the head — the teacher must denoise chunk
+        k+1 from the history the student will actually have at chunk
+        k+1, exactly as ``pipeline/action_forcing_training.py`` Step 3.4
+        commits the student's ``denoised_pred`` into ``kv_cache1``.
+        ``"gt"`` (A/B only) commits the GT band chunk instead, which
+        conditions the teacher on a past the student never has: the
+        resulting target is off-manifold and unreachable, and it leaks
+        the band's GT back into the "past-only" conditional.
+
+        Because this context contains NO information about the band's
+        future, the teacher's conditional keeps true entropy over
+        futures — the property that makes the AR head's reverse-KL
+        mode-seeking (vs the TF head's future-leaking, near-zero-
+        entropy conditional).
+
+        Cost: per pass = ``band_start/npb`` prefill forwards + ``N``
+        scoring forwards + ``N - 1`` commit forwards, all SEQUENTIAL
+        (each commit feeds the next score), and BOTH passes run every
+        DMD step -> twice that per step. GEOMETRY-DEPENDENT: derive it
+        from the arm's own b0/npb/N before sizing a wall-clock limit.
+        At the queued 3|3|1 geometry (band_start=9, band_len=9, npb=3,
+        N=3) it is 3 + 3 + 2 = 8 forwards per pass -> **16 extra
+        sequential scorer forwards per DMD step**. ``N`` is capped by
+        ``dmd_ar_head_chunks`` (0 = all band chunks, ceiling 4).
+
+        ``clean_x`` is deliberately NEVER passed: it is a TF-only
+        feature (utils/wan_wrapper.py gates alt/TF branches on
+        ``clean_x is not None and kv_cache is None``; the kv_cache
+        branch would silently ignore it).
+
+        All forwards are cond-only (``real_guidance_scale == 0.0``
+        enforced at init) and no_grad; the returned band prediction is
+        detached, same dtype/device as the TF ``pred_real`` (same
+        wrapper). The caches are LOCAL to this head — nothing the TF
+        path reads (``self.streaming_state``, ``pipe.kv_cache1``,
+        ``self._sc_kv_cache``) is touched.
+
+        ``enable_grad`` (default False = the head's inference-time
+        contract, unchanged in every respect) switches ONLY the N band
+        SCORING forwards to grad-enabled and returns the band
+        prediction UNdetached. It exists so the CRITIC can be trained in
+        the very conditional the AR head queries it in
+        (``dmd_ar_critic_weight``); the prefill and the commits stay
+        no_grad because they are conditioning, not prediction — exactly
+        as at serving time, where the cache is a constant the model
+        reads. Three things make the shared machinery safe across the
+        grad / no-grad callers:
+
+        1. GRAD NEVER TOUCHES THE SHARED CACHE BUFFERS. The grad
+           scoring forwards run with ``skip_cache_update=True`` on the
+           bare DiT, so ``_apply_cache_updates`` never writes a
+           grad-carrying ``new_k``/``new_v`` into ``self._ar_kv_cache``.
+           The buffers therefore stay ``requires_grad=False`` for their
+           whole life and the later no_grad commits are plain in-place
+           writes — no CopySlices node, no version-counter tripwire, no
+           need to reallocate or detach the buffer between callers.
+           Without the flag the buffer WOULD join the autograd graph and
+           the next commit's in-place write would either error or
+           silently poison the backward.
+        2. SKIPPING THE UPDATE IS A NO-OP FOR THE CACHE TRAJECTORY. The
+           commit that follows each scored chunk rewrites exactly the
+           slots the scoring forward would have written, at the same
+           position. With the update applied, the commit runs as
+           ``is_recompute=True`` (indices already advanced by the score);
+           with it skipped, the commit runs as ``is_recompute=False`` and
+           advances them itself. Both land on the SAME K/V content and
+           the SAME ``(global_end_index, local_end_index)``, and with
+           ``sink_size=0`` on the same ``write_start_index`` too. The
+           last chunk has no commit and nothing reads the cache after
+           it. So the AR conditional the critic trains on is bit-for-bit
+           the conditional the head serves.
+        3. UNDER ``fake_score_gradient_checkpointing`` the block
+           recompute re-reads ``kv_cache["k"]`` LIVE during backward.
+           That is safe here for a structural reason: chunk k reads the
+           buffer only over ``[0, b0 + k*npb)`` (its own K/V lives in the
+           block-local ``temp_k`` clone, never in the buffer), and every
+           write after chunk k's forward — commits k..N-2 — lands at
+           slots ``>= b0 + k*npb``. The read region is immutable from the
+           moment it is written, so save-time and recompute-time
+           attention see identical K/V.
+
+        ``ddp_sync_last``: DDP calls ``prepare_for_backward`` on EVERY
+        grad-enabled forward, and a second call before the matching
+        backward raises "Expected to have finished reduction in the prior
+        iteration". The N grad scoring forwards therefore run inside
+        ``no_sync()`` and exactly ONE forward in the whole critic step is
+        left to arm the reducer: the trailing TF critic forward when
+        ``dmd_tf_critic_weight > 0``, otherwise (AR-only arms) the LAST
+        AR scoring forward — which is what ``ddp_sync_last=True``
+        selects. Gradients from the ``no_sync`` forwards still accumulate
+        into the same ``param.grad`` and are covered by that single
+        reduction, so this is a one-backward / one-allreduce step either
+        way.
+        """
+        if self.inference_pipeline is None:
+            raise RuntimeError(
+                "ActionForcingDMD.inference_pipeline must be set before "
+                "the dmd_ar_head scoring pass; the trainer assigns this "
+                "in _build_pipeline."
+            )
+        # CACHE-CAPABLE SERVING (2026-08-17). ``model/base.py`` builds
+        # both scorers BIDIRECTIONAL, and a bidirectional ``WanModel``
+        # has no ``kv_cache`` parameter anywhere in its forward chain —
+        # every cache kwarg below used to be swallowed by
+        # ``_forward_with_action``'s ``**kwargs`` and dropped, making
+        # each "AR" forward an isolated context-free denoise. Attach the
+        # weight-sharing causal view (idempotent, zero added parameter
+        # bytes) so the prefill / score / commit schedule below actually
+        # accumulates and reads a past-only conditional. Rank-symmetric
+        # (pure geometry + module structure) -> DDP-safe.
+        _causal = self._ar_ensure_causal_twin(score_module)
+        npb = int(self.num_frame_per_block)
+        b0 = int(ar_inputs["band_start"])
+        bl = int(ar_inputs["band_len"])
+        ctx = ar_inputs["ctx"]
+        gt_band = ar_inputs["gt_band"]
+        stu_band = ar_inputs.get("stu_band")
+        cond = ar_inputs["cond"]
+        if b0 % npb != 0 or bl % npb != 0 or bl <= 0:
+            raise RuntimeError(
+                f"dmd_ar_head: band not chunk-aligned (band_start={b0}, "
+                f"band_len={bl}, npb={npb})."
+            )
+        if int(ctx.shape[1]) != b0 or int(gt_band.shape[1]) != bl:
+            raise RuntimeError(
+                "dmd_ar_head: payload shape mismatch (ctx="
+                f"{int(ctx.shape[1])} frames vs band_start={b0}; gt_band="
+                f"{int(gt_band.shape[1])} frames vs band_len={bl})."
+            )
+        commit_mode = str(self.dmd_ar_head_commit)
+        if commit_mode == "student":
+            # Rank-symmetric: the payload key is a pure code-path fact,
+            # identical on every rank -> raises everywhere or nowhere.
+            if stu_band is None or int(stu_band.shape[1]) != bl:
+                raise RuntimeError(
+                    "dmd_ar_head_commit='student' needs the payload's "
+                    "``stu_band`` (the student's own rolled band chunks, "
+                    "detached, pre-noising) — got "
+                    f"{None if stu_band is None else int(stu_band.shape[1])} "
+                    f"frames vs band_len={bl}. Rebuild the ar_head payload "
+                    "in _build_42f_scoring_inputs."
+                )
+        # N = supervised chunks the teacher is rolled through in this
+        # ONE shared-cache pass (see ``dmd_ar_head_chunks``).
+        n_band_chunks = self._ar_num_chunks(bl, npb)
+        bl_eff = n_band_chunks * npb
+        device = noisy_window.device
+        dtype = noisy_window.dtype
+        batch_size = int(noisy_window.shape[0])
+        pipe = self.inference_pipeline
+        fsl = int(pipe.frame_seq_length)   # ACTION-TOKEN AWARE (1561)
+
+        # RoPE position contract.
+        # INVARIANT: AR and TF heads must evaluate the same absolute
+        # RoPE positions or ``dmd_ar_vs_tf_delta`` conflates serving-
+        # mode with position shift.
+        # The TF head feeds v14's joint layout [clean(F) | noisy(F)]
+        # with ``tf_rope_offset_frames = npb`` (see ``_compute_kl_grad``
+        # docstring), i.e. window frame ``i`` is scored at RoPE
+        # ``i + npb``. The AR head therefore offsets ALL THREE call
+        # sites below (prefill, score, commit) by the same ``npb``:
+        # ``current_start = (frame_index + npb) * fsl``.
+        #
+        # Read this before "simplifying" the offset away, and read it
+        # before over-reading ``dmd_ar_vs_tf_delta``:
+        #   * RoPE is RELATIVE — ``q_i . k_j`` depends only on
+        #     ``i - j`` — so applying the SAME offset to every position
+        #     in the AR sequence is, by construction, attention-neutral.
+        #     It is applied so the two heads agree on the absolute
+        #     frame index they claim to be scoring (and so any future
+        #     absolute-position-dependent code sees the same number),
+        #     not because it changes the AR attention math.
+        #   * Under infinity-RoPE (``utils/infinity_rope.py``, ON by
+        #     default in phase-3 and patched onto the SelfAttention
+        #     CLASS, so the scorers get it too) the kv_cache path
+        #     rotates Q/K at LOCAL cache indices, not at
+        #     ``current_start``, so the offset is inert there as well.
+        #   * The residual TF-vs-AR positional difference is the
+        #     TF clean half sitting ``npb`` frames FURTHER BACK than
+        #     its own content position, i.e. a band-vs-context GAP that
+        #     the causal cache cannot reproduce without attending npb
+        #     frames of zero K/V. So ``dmd_ar_vs_tf_delta`` still
+        #     carries a bounded positional component on top of the
+        #     serving-mode difference; it is a monitoring signal, not a
+        #     clean serving-mode measurement.
+        rope_off_frames = npb
+        rope_offset_tokens = rope_off_frames * fsl
+
+        # Cache sizing (re-derived, do NOT restore the old "+ npb"
+        # spare). ``causal_model`` tracks LOCAL indices as
+        # ``local_end += current_end - global_end``; ``_ensure_ar_kv_
+        # cache`` seeds ``global_end = rope_offset_tokens``, so the
+        # local occupancy is exactly the un-offset frame count:
+        #   prefill writes local [0, b0) frames,
+        #   band chunk k writes local [b0 + k*npb, b0 + (k+1)*npb),
+        #   the commit rewrites the SAME local slots (is_recompute).
+        # Max local end = (b0 + bl_eff) frames — the ``+ npb`` spare the
+        # first version allocated was never reachable. The roll branch
+        # fires only on ``num_new + cached_local > kv_cache_size``,
+        # and the last band chunk hits exactly ``==``, so the cache
+        # still never rolls at this size. Sized on ``bl_eff`` (the N
+        # chunks actually rolled), not the full band.
+        frames_cap = b0 + bl_eff
+        _base = self._ar_unwrap_dit(score_module)
+        # Read the window off the module that ACTUALLY serves the cache
+        # (the causal view), not off the bidirectional owner: WanModel
+        # hardcodes ``local_attn_size = 21`` (wan/modules/model.py:585)
+        # regardless of the configured window, so reading it there made
+        # this guard measure a constant instead of the real geometry.
+        local_attn = int(getattr(_causal, "local_attn_size", -1))
+        if local_attn > 0 and frames_cap > local_attn:
+            raise RuntimeError(
+                f"dmd_ar_head: ctx+band = {frames_cap} frames exceeds "
+                f"local_attn_size={local_attn}; the AR cache would roll "
+                "and infinity-RoPE would diverge from absolute RoPE."
+            )
+        # STATE-TOKEN / RoPE-OFFSET INTERACTION (audit 2026-08-17).
+        # ``utils/wan_wrapper.py``'s kv_cache branch derives the state-
+        # token window from the RoPE position:
+        #   frame_start = current_start // tokens_per_frame
+        # The AR head deliberately offsets ``current_start`` by ``npb``
+        # (see the RoPE contract above), which is attention-neutral —
+        # but it would shift that state-token slice by npb frames, i.e.
+        # feed each chunk the WRONG frames' state tokens. Nothing else
+        # in the AR path reads ``current_start`` positionally. The
+        # scorers carry no state tokens in any AR-head arm
+        # (state_probe_aux_enabled=false), so this is a guard, not a
+        # live fix. Rank-symmetric (config fact) -> DDP-safe.
+        if (
+            rope_off_frames != 0
+            and getattr(score_module, "_state_token_init", None) is not None
+        ):
+            raise RuntimeError(
+                "dmd_ar_head: the scorer carries state tokens AND the AR "
+                f"head applies a {rope_off_frames}-frame RoPE offset. "
+                "utils/wan_wrapper.py slices state tokens at "
+                "current_start // tokens_per_frame, so every AR chunk "
+                "would receive state tokens from the wrong frames. Run "
+                "the AR head with state tokens disabled, or drop the "
+                "offset (it is attention-neutral under infinity-RoPE)."
+            )
+
+        kv_cache, crossattn_cache = self._ensure_ar_kv_cache(
+            batch_size=batch_size,
+            frames_cap=frames_cap,
+            rope_offset_tokens=rope_offset_tokens,
+            dtype=dtype,
+            device=device,
+        )
+
+        t_zero = torch.zeros(
+            [batch_size, npb], dtype=torch.int64, device=device,
+        )
+        # Conditioning alignment: ``cond`` is the 42f builder's own
+        # noisy-side conditional over the SAME 21f window the TF head
+        # scored (window frame i == world frame noisy_lo + match_m +
+        # i), so slicing it at the [ctx | band] window indices keeps
+        # the per-frame action streams aligned with the latents by
+        # construction — same ``_slice_per_frame_streams`` discipline
+        # the pipeline uses for its cache-mode block forwards.
+        with torch.no_grad():
+            # --- prefill: clean past-only context at t=0, chunk by chunk ---
+            for s0 in range(0, b0, npb):
+                c_cond = _slice_per_frame_streams(
+                    cond, frame_start=s0, frame_count=npb,
+                )
+                score_module(
+                    noisy_image_or_video=ctx[:, s0:s0 + npb],
+                    conditional_dict=c_cond,
+                    timestep=t_zero,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=(s0 + rope_off_frames) * fsl,
+                )
+            # --- score N band chunks in ONE pass; advance the shared
+            # conditional with a t=0 commit between them ---
+            # ``commit_src`` is the STUDENT's own rolled band by default
+            # (dmd_ar_head_commit="student"): the teacher is rolled
+            # through the SAME history the student will have at
+            # inference, so every chunk k>0 is scored on a conditional
+            # the student can actually reach. "gt" reproduces the old
+            # (unreachable-target) A/B behaviour.
+            commit_src = gt_band if commit_mode == "gt" else stu_band
+            preds: List[torch.Tensor] = []
+
+            # ONE definition of the scoring call, shared by the no-grad
+            # (head) and grad (critic) paths so the two can never drift
+            # apart in slice, timestep, cache or ``current_start``. Pure
+            # closure — no tensor op, no allocation, no RNG.
+            def _score_chunk(_f0: int, _c_cond):
+                return score_module(
+                    noisy_image_or_video=noisy_window[:, _f0:_f0 + npb],
+                    conditional_dict=_c_cond,
+                    timestep=timestep[:, _f0:_f0 + npb],
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=(_f0 + rope_off_frames) * fsl,
+                )
+
+            def _score_chunk_traj(_f0: int, _c_cond):
+                """AR-head trajectory refinement (DMD3 parity, 2026-08-18).
+
+                The AR head scored each chunk with a SINGLE forward at the
+                sampled t, while the 14e teacher that generated the LMDB data
+                ran a 20-step deterministic Euler chain. That mismatch is why
+                the AR ``pred_real`` looked like mush. This walks the SAME
+                rung-segment path the TF head uses (``dmd_real_traj_*``) using
+                explicit-sigma Euler, then returns the endpoint x0.
+
+                KV-CACHE SAFETY: every refinement forward is a RE-SCORE of the
+                same slot at a lower t. ``skip_cache_update`` is forced ON for
+                them so only the caller's own commit writes K/V -- otherwise
+                each extra forward would overwrite the chunk's cache entry and
+                the next chunk would condition on a partially-denoised trace.
+                """
+                _flow, _x0 = _score_chunk(_f0, _c_cond)
+                self._last_ar_traj_steps = 0
+                if not bool(getattr(self, "dmd_real_traj_enabled", False)):
+                    return _flow, _x0
+                _sched = getattr(self, "_real_refine_sched", None)
+                if _sched is None:
+                    from third_party.minWM.Wan21.wan_utils.scheduler import (
+                        FlowMatchScheduler as _FMS,
+                    )
+                    _sched = _FMS(shift=5.0, sigma_min=0.0,
+                                  extra_one_step=True)
+                    _sched.set_timesteps(num_inference_steps=20,
+                                         denoising_strength=1.0)
+                    self._real_refine_sched = _sched
+                _g = _sched.timesteps.to(_x0.device)
+                _sg = _sched.sigmas.to(_x0.device)
+                _t0 = float(timestep[:, _f0].flatten()[0].item())
+                _i = int(torch.argmin((_g - _t0).abs()).item())
+                _lad = sorted({
+                    int(torch.argmin((_g - float(r)).abs()).item())
+                    for r in self.denoising_step_list
+                })
+                _nx = [i for i in _lad if i > _i]
+                _e = _nx[0] if _nx else len(_g) - 1
+                _cap = max(1, int(getattr(self, "dmd_real_traj_max_steps", 6)))
+                _nd = list(range(_i, _e + 1))
+                if len(_nd) - 1 > _cap:
+                    _nd = [_nd[int(round(k * (len(_nd) - 1) / _cap))]
+                           for k in range(_cap + 1)]
+                # (1) batch-heterogeneity guard: _t0 and the relabels below take
+                # sample 0's timestep, but _get_timestep draws INDEPENDENTLY per
+                # batch element. With B>1 samples 1..B-1 would be integrated
+                # along sample 0's segment and mislabelled -- the same
+                # latent/label mismatch the TF fix removed. B=1 today; bail loud
+                # rather than silently corrupt if that ever changes.
+                if int(timestep[:, _f0].flatten().unique().numel()) > 1:
+                    return _flow, _x0
+                if len(_nd) <= 1:
+                    return _flow, _x0
+                _prev_skip = getattr(_base, "skip_cache_update", False)
+                _base.skip_cache_update = True
+                try:
+                    with torch.no_grad():
+                        _lat = noisy_window[:, _f0:_f0 + npb].detach()
+                        _f = _flow.detach()
+                        _cur = _i
+                        for _n in _nd[1:]:
+                            _lat = (
+                                _lat.float()
+                                + _f.float() * (_sg[_n] - _sg[_cur])
+                            ).to(dtype=noisy_window.dtype)
+                            _cur = _n
+                            _tt = torch.full_like(
+                                timestep[:, _f0:_f0 + npb],
+                                int(round(float(_g[_cur].item()))),
+                            )
+                            _f, _x0r = score_module(
+                                noisy_image_or_video=_lat,
+                                conditional_dict=_c_cond,
+                                timestep=_tt,
+                                kv_cache=kv_cache,
+                                crossattn_cache=crossattn_cache,
+                                current_start=(_f0 + rope_off_frames) * fsl,
+                            )
+                            _f = _f.detach(); _x0r = _x0r.detach()
+                finally:
+                    _base.skip_cache_update = _prev_skip
+                self._last_ar_traj_steps = len(_nd) - 1
+                return _flow, _x0r
+
+            # Grad-path plumbing (see the ``enable_grad`` docstring
+            # section). Resolved ONCE, and only when the grad path is
+            # actually taken.
+            _grad_ddp = None
+            if enable_grad:
+                _inner = getattr(score_module, "model", None)
+                if _inner is not None and hasattr(_inner, "no_sync"):
+                    _grad_ddp = _inner
+
+            for k in range(n_band_chunks):
+                f0 = b0 + k * npb
+                c_cond = _slice_per_frame_streams(
+                    cond, frame_start=f0, frame_count=npb,
+                )
+                if enable_grad:
+                    # ``skip_cache_update`` keeps the grad-carrying k/v
+                    # OUT of the shared cache buffers (invariant 1); the
+                    # commit below rewrites the same slots anyway
+                    # (invariant 2). Restored unconditionally so the
+                    # head's no-grad path can never inherit it.
+                    # Set on the OWNER (``_base``): the causal view
+                    # mirrors the flag from its owner immediately before
+                    # every cached forward (``_TWIN_MIRRORED_FLAGS``), so
+                    # the owner stays the single source of truth.
+                    _prev_skip = getattr(_base, "skip_cache_update", False)
+                    _base.skip_cache_update = True
+                    try:
+                        with torch.enable_grad():
+                            if _grad_ddp is not None and not (
+                                ddp_sync_last and k + 1 == n_band_chunks
+                            ):
+                                with _grad_ddp.no_sync():
+                                    _, x0_chunk = _score_chunk(f0, c_cond)
+                            else:
+                                _, x0_chunk = _score_chunk(f0, c_cond)
+                    finally:
+                        _base.skip_cache_update = _prev_skip
+                else:
+                    # Refine ONLY the real (teacher) head, mirroring the TF
+                    # path where the trajectory endpoint replaces pred_real and
+                    # pred_fake stays a one-step score. The critic's grad path
+                    # above is never refined (the loop is no_grad).
+                    # NOT-fake rather than IS-real: a future dual-teacher path
+                    # passing a local frozen teacher would silently DISABLE
+                    # refinement under an is-real check and look like a
+                    # baseline rerun.
+                    if score_module is not self.fake_score:
+                        _, x0_chunk = _score_chunk_traj(f0, c_cond)
+                    else:
+                        _, x0_chunk = _score_chunk(f0, c_cond)
+                preds.append(x0_chunk)
+                if k + 1 < n_band_chunks:
+                    # Same-position t=0 overwrite (is_recompute in
+                    # ``causal_model``): replaces this slot's noisy
+                    # scoring trace with the committed chunk before the
+                    # next chunk is scored.
+                    score_module(
+                        noisy_image_or_video=commit_src[
+                            :, k * npb:(k + 1) * npb
+                        ],
+                        conditional_dict=c_cond,
+                        timestep=t_zero,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=(f0 + rope_off_frames) * fsl,
+                    )
+        # NOTE: the cat is deliberately OUTSIDE the ``no_grad`` block —
+        # the grad path's chunk predictions keep their graph and must be
+        # concatenated with grad enabled.
+        _band_pred = torch.cat(preds, dim=1)
+        return _band_pred if enable_grad else _band_pred.detach()
 
     def compute_distribution_matching_loss(
         self,
@@ -4699,6 +6132,7 @@ class ActionForcingDMD(SelfForcingModel):
         clean_x_real: Optional[torch.Tensor] = None,
         aug_t_real: Optional[torch.Tensor] = None,
         gt_target: Optional[torch.Tensor] = None,
+        ar_head_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """CF-parity DMD loss (eq. 7).
 
@@ -4724,6 +6158,10 @@ class ActionForcingDMD(SelfForcingModel):
             fake keeps the unnoised self-view. ``None`` in
             ``dmd_context='self'`` mode and on the critic step;
             both scorers then share ``(clean_x, aug_t)``.
+          ar_head_inputs: optional AR real-score head payload built by
+            ``_build_42f_scoring_inputs`` (non-None only when
+            ``dmd_ar_head_weight > 0`` on the 42f path). Consumed by
+            the AR-head block below; see ``_ar_score_band``.
         """
         original_latent = image_or_video
         batch_size, num_frame = image_or_video.shape[:2]
@@ -4751,6 +6189,27 @@ class ActionForcingDMD(SelfForcingModel):
                 aug_t=aug_t,
                 clean_x_real=clean_x_real,
                 aug_t_real=aug_t_real,
+                gradient_mask=gradient_mask,
+            )
+            # Exit-rung provenance (diagnostic, always-on). The streaming
+            # rollout picks a RANDOM exit rung per step
+            # (``generate_and_sync_list``), and with
+            # ``flash_dmd_enabled=false`` the sample video is rendered
+            # from that rung -- so ~1/K of the logged sample clips are
+            # single-step-from-t=1000 renders and look mushy for reasons
+            # unrelated to student quality. Nothing logged the rung, so
+            # the videos were uninterpretable. ``denoised_timestep_from/
+            # to`` are already computed by the pipeline and passed in
+            # here; surfacing them identifies the rung exactly.
+            # Pure float reads of existing ints: no tensor op, no
+            # allocation, no RNG, rank-symmetric -> DDP-safe.
+            dmd_log_dict["exit_rung_t_from"] = (
+                -1.0 if denoised_timestep_from is None
+                else float(denoised_timestep_from)
+            )
+            dmd_log_dict["exit_rung_t_to"] = (
+                -1.0 if denoised_timestep_to is None
+                else float(denoised_timestep_to)
             )
 
         # gradient_mask arrives non-None at this API (every caller
@@ -4777,6 +6236,20 @@ class ActionForcingDMD(SelfForcingModel):
                         .abs().mean().item()
                     )
                     dmd_log_dict["real_score_mae_vs_gt"] = real_mae_vs_gt
+        # S5: surface the trajectory depth so a run can be verified to have
+        # actually refined (the previous `dmd_log_dict_traj` was a dead local
+        # and `_last_traj_steps` was never read anywhere).
+        if bool(getattr(self, "dmd_real_traj_enabled", False)):
+            dmd_log_dict["dmd_traj_steps"] = float(
+                getattr(self, "_last_traj_steps", 0)
+            )
+            # AR head has its OWN refinement counter; without this an AR-only
+            # arm shows dmd_traj_steps populated by the TF forward (which still
+            # runs) and proves nothing about the AR path under test.
+            if float(getattr(self, "dmd_ar_head_weight", 0.0)) > 0.0:
+                dmd_log_dict["dmd_ar_traj_steps"] = float(
+                    getattr(self, "_last_ar_traj_steps", 0)
+                )
 
         # gradient_mask is non-None by the contract enforced at the
         # top of this function. After the freeze AND-merge it can be
@@ -4817,14 +6290,297 @@ class ActionForcingDMD(SelfForcingModel):
             gradient_mask=gradient_mask,
             log_dict=dmd_log_dict,
         )
+        if bool(getattr(self, "dmd_rung_escalate_enabled", False)):
+            _rung = self._last_sampled_rung
+            if _rung is not None:
+                _shut = 1.0 if _gate_w < self.dmd_rung_escalate_w_threshold else 0.0
+                try:
+                    import torch.distributed as _d
+                    if _d.is_available() and _d.is_initialized():
+                        _f = torch.tensor(
+                            [_shut], device=pred_real_image_detached.device,
+                        )
+                        _d.all_reduce(_f, op=_d.ReduceOp.MAX)
+                        _shut = float(_f.item())
+                except Exception:
+                    pass
+                _cur = int(self._rung_depth.get(_rung, self.dmd_real_score_rungs))
+                if _shut > 0.5 and _cur < self.dmd_rung_escalate_max:
+                    self._rung_depth[_rung] = _cur + 1
+                dmd_log_dict["rung_depth"] = float(
+                    self._rung_depth.get(_rung, self.dmd_real_score_rungs)
+                )
         if _gate_w != 1.0:
             dmd_loss = dmd_loss * _gate_w
+        # TF (mean-seeking) head weight. Applied AFTER the MAE gate so the
+        # gate keeps its calibrated meaning on the TF term, and BEFORE the
+        # aux/AR additions so those are unaffected. At 0.0 the TF term
+        # contributes no gradient but stays graph-connected (scaling a live
+        # tensor by a python float keeps the edge), so .backward() is safe
+        # even when the AR head is the only active signal.
+        if self.dmd_tf_head_weight != 1.0:
+            dmd_loss = dmd_loss * self.dmd_tf_head_weight
+            dmd_log_dict["dmd_tf_head_weight"] = self.dmd_tf_head_weight
         # Stash the latest gate weight so the trainer can couple the GAN weight
         # to it (when the gate cuts DMD because the teacher is unreliable, the
         # GAN should follow it down — gently — instead of running free and
         # dragging the student off the teacher manifold). Read via getattr with
         # default 1.0, so this is inert unless the trainer opts in.
         self._last_dmd_mae_gate_weight = float(_gate_w)
+
+        # Dual-teacher mean aux (see __init__ note): plain masked-band MSE to
+        # GT, added AFTER the gate multiply so it is gate-independent.
+        if self.dmd_gt_band_reg_weight > 0.0 and gt_target is not None:
+            _gt_reg = gt_target.to(dtype=original_latent.dtype,
+                                   device=original_latent.device)
+            if _gt_reg.shape == original_latent.shape:
+                _reg = F.mse_loss(
+                    original_latent.double()[gradient_mask],
+                    _gt_reg.double().detach()[gradient_mask],
+                    reduction="mean",
+                )
+                dmd_log_dict["dmd_gt_band_reg"] = float(_reg.detach().item())
+                dmd_loss = dmd_loss + self.dmd_gt_band_reg_weight * _reg
+            else:
+                # A mismatch would silently DROP the term AND its log
+                # key, so an arm configured with
+                # ``dmd_gt_band_reg_weight > 0`` would train without it
+                # and be indistinguishable from the baseline in the
+                # logs. Fail loudly instead. Rank-symmetric: both
+                # shapes are the per-rank batch geometry, identical on
+                # every rank, so this raises everywhere or nowhere (no
+                # DDP hang).
+                raise RuntimeError(
+                    "dmd_gt_band_reg: gt_target shape "
+                    f"{tuple(_gt_reg.shape)} != original_latent shape "
+                    f"{tuple(original_latent.shape)}; the regulariser "
+                    "and its 'dmd_gt_band_reg' log key would be "
+                    "silently dropped."
+                )
+
+        # ---- AR DMD head (dmd_ar_head_weight > 0) --------------------------
+        # Second DMD gradient on the SUPERVISED BAND SLOTS ONLY.
+        # BOTH scores are AR-served: real_score AND fake_score go
+        # through ``_ar_score_band`` with the identical prefill/score/
+        # commit schedule, timesteps and ``current_start`` on past-only
+        # context, so ``grad_ar = pred_fake_ar - pred_real_ar`` is a
+        # (s_fake - s_real) difference of the SAME conditional — a
+        # valid reverse-KL gradient that vanishes at the optimum. (v1
+        # subtracted the TEACHER-FORCED fake prediction, which had seen
+        # the band's GT future via ``clean_x``: mixed conditionals, and
+        # a residual future-information term = biased non-zero fixed
+        # point.) Everything scorer-side is no_grad/detached; the only
+        # graph-on tensor entering the added term is the student band
+        # slice of ``original_latent``. The term joins the EXISTING
+        # dmd_loss before return (single backward, DDP-safe). Runs
+        # INSIDE the caller's real_score swap (dual-teacher rebind /
+        # ``_real_score_ema_swap`` wrap this whole function), so the AR
+        # forwards read the SAME teacher weights the TF head read.
+        # Like ``dmd_gt_band_reg`` above, deliberately added AFTER the
+        # MAE-gate multiply and NOT gate-scaled (the gate measures the
+        # TF teacher's reliability; the AR head is an independent view).
+        # LAYOUT (redesign 2026-08-17): the student's N rolled chunks are
+        # all noised to the SAME rung (``_sample_dmd_timestep`` draws one
+        # t per sample and broadcasts it across frames) and the teacher
+        # is rolled through all N in ONE shared-cache pass, committing
+        # the STUDENT's own chunk between them
+        # (``dmd_ar_head_commit="student"``). ``grad_ar`` is then a
+        # per-chunk difference over all N, averaged by the masked MSE
+        # below. N = ``self._ar_num_chunks(band_len, npb)``.
+        # COST is geometry-dependent: 2 x (b0/npb + 2N - 1) extra
+        # SEQUENTIAL scorer forwards per DMD step. At the queued 3|3|1
+        # geometry (band_start=9, band_len=9, npb=3, N=3) that is
+        # 2 x 8 = 16 (see ``_ar_score_band``); recompute it from the
+        # arm's own b0/npb/N before sizing a wall-clock limit.
+        if float(getattr(self, "dmd_ar_head_weight", 0.0)) > 0.0:
+            # Diagnostic only (audit 2026-08-17): the RESOLVED commit
+            # mode, emitted so a gt-vs-student A/B can be verified from
+            # the run's own metrics instead of inferred from a config
+            # default. 1.0 == "gt" (teacher conditioned on GT band
+            # history), 0.0 == "student" (teacher conditioned on the
+            # student's own rolled band -> drift-coupled target). Pure
+            # config fact, identical on every rank (DDP-safe).
+            dmd_log_dict["dmd_ar_commit_is_gt"] = (
+                1.0 if str(self.dmd_ar_head_commit) == "gt" else 0.0
+            )
+            if ar_head_inputs is not None:
+                _ar_b0 = int(ar_head_inputs["band_start"])
+                # Effective band = the N chunks the AR pass actually
+                # rolls through (``dmd_ar_head_chunks`` cap). Derived
+                # from the SAME helper ``_ar_score_band`` uses, so the
+                # loss slice, the mask and the logged metrics can never
+                # disagree with the pass. Pure config/geometry ->
+                # identical on every rank (DDP-safe).
+                _ar_npb = int(self.num_frame_per_block)
+                _ar_bl = self._ar_num_chunks(
+                    int(ar_head_inputs["band_len"]), _ar_npb,
+                ) * _ar_npb
+                with torch.no_grad():
+                    pred_real_ar = self._ar_score_band(
+                        score_module=self.real_score,
+                        noisy_window=noisy_latent,
+                        timestep=timestep,
+                        ar_inputs=ar_head_inputs,
+                    )
+                    pred_fake_ar = self._ar_score_band(
+                        score_module=self.fake_score,
+                        noisy_window=noisy_latent,
+                        timestep=timestep,
+                        ar_inputs=ar_head_inputs,
+                    )
+                    # BOTH AR passes are done — drop the infinity-RoPE
+                    # rotated-prefix memo they just populated (~1.7 GB
+                    # per score module at the queued geometry, i.e.
+                    # ~3.4 GB/rank held through the backward peak on top
+                    # of the ~4.4 GB persistent AR KV cache). See
+                    # ``_ar_free_rope_prefix_memo`` for why freeing it
+                    # costs nothing in throughput.
+                    self._ar_free_rope_prefix_memo(
+                        self.real_score, self.fake_score,
+                    )
+                    grad_ar = pred_fake_ar - pred_real_ar
+                    if self.dmd_normalization_enabled:
+                        # Eq. (8) normalizer, computed over the SAME
+                        # SUPPORT the TF head uses: the FULL window
+                        # residual ``|x0 - pred_real|.mean(dim=
+                        # [1,2,3,4])``, not the 3-frame band. This is
+                        # byte-for-value the TF head's ``normalizer``
+                        # (same formula, same two tensors —
+                        # ``pred_real_image_detached`` IS the TF
+                        # ``pred_real_image``), recomputed here rather
+                        # than plumbed out of ``_compute_kl_grad`` so
+                        # the default-off path stays untouched.
+                        # ONE normalizer, BOTH heads: a band-only
+                        # normalizer is systematically larger (~18/21
+                        # of the TF window is near-zero-residual GT)
+                        # and its ratio to the TF one DRIFTS as the
+                        # student converges, so ``dmd_ar_head_weight``
+                        # would not be a like-for-like head weight and
+                        # any weight sweep would be measuring the
+                        # drift instead of the head.
+                        _p_real_tf = (
+                            original_latent.detach()
+                            - pred_real_image_detached
+                        )
+                        _normalizer_ar = torch.abs(_p_real_tf).mean(
+                            dim=[1, 2, 3, 4], keepdim=True,
+                        )
+                        grad_ar = grad_ar / _normalizer_ar.clamp_min(
+                            self.dmd_normalization_denom_floor
+                        )
+                    grad_ar = torch.nan_to_num(grad_ar)
+                    dmd_log_dict["dmd_ar_grad_norm"] = torch.mean(
+                        torch.abs(grad_ar)
+                    ).detach()
+                    # Direct measure of how much the two REAL-score
+                    # heads disagree on the band slots (TF vs AR
+                    # serving of the same weights at the same noisy
+                    # input). NOTE: carries a bounded positional
+                    # component too — see the RoPE contract note in
+                    # ``_ar_score_band``.
+                    _pred_real_tf_band = pred_real_image_detached[
+                        :, _ar_b0:_ar_b0 + _ar_bl
+                    ]
+                    dmd_log_dict["dmd_ar_vs_tf_delta"] = float(
+                        (pred_real_ar.float() - _pred_real_tf_band.float())
+                        .abs().mean().item()
+                    )
+                    dmd_log_dict["dmd_ar_head_chunks_used"] = float(
+                        _ar_bl // _ar_npb
+                    )
+                    _ar_gt_band = ar_head_inputs.get("gt_band")
+                    if _ar_gt_band is not None:
+                        _ar_gt_band = _ar_gt_band[:, :_ar_bl]
+                    if (
+                        _ar_gt_band is not None
+                        and _ar_gt_band.shape == pred_real_ar.shape
+                    ):
+                        _ar_gt_f = _ar_gt_band.float()
+                        _m_real_ar = float(
+                            (pred_real_ar.float() - _ar_gt_f)
+                            .abs().mean().item()
+                        )
+                        dmd_log_dict["dmd_ar_mae_vs_gt"] = _m_real_ar
+                        # NOTE (audit 2026-08-17): this is the CRITIC's
+                        # AR x0 prediction, NOT the student's band. Both
+                        # scorers denoise the SAME noisy input from the
+                        # SAME conditional, so at low/mid t they both
+                        # land near the student band and this ratio pins
+                        # to ~1 by construction. It is a scorer-vs-
+                        # scorer disagreement readout, NOT the
+                        # teacher-beats-student measurement — the TF
+                        # head's 1.7-3x comes from
+                        # ``dmd_mae_gate_m_fake``, which is the
+                        # STUDENT's own latent. Use ``dmd_ar_ratio``
+                        # below for the like-for-like AR comparison.
+                        dmd_log_dict["dmd_ar_fake_mae_vs_gt"] = float(
+                            (pred_fake_ar.float() - _ar_gt_f)
+                            .abs().mean().item()
+                        )
+                        # LIKE-FOR-LIKE: the student's OWN band vs the
+                        # same GT frames, i.e. the exact AR analogue of
+                        # the TF gate's ``m_fake`` / ``m_real`` pair.
+                        # ``dmd_ar_ratio`` > 1 == the AR-served teacher
+                        # is the better oracle on the band (the TF head
+                        # sits at 1.7-3x). Always emitted, gate on or
+                        # off.
+                        _m_stu_ar = float(
+                            (
+                                original_latent.detach().float()[
+                                    :, _ar_b0:_ar_b0 + _ar_bl
+                                ] - _ar_gt_f
+                            ).abs().mean().item()
+                        )
+                        dmd_log_dict["dmd_ar_stu_mae_vs_gt"] = _m_stu_ar
+                        dmd_log_dict["dmd_ar_ratio"] = float(
+                            _m_stu_ar / max(_m_real_ar, 1e-8)
+                        )
+                # Same TF gradient_mask, restricted to the band slots
+                # (True exactly there by the 42f builder's layout; the
+                # slice keeps any freeze/AND-merge holes a caller
+                # carved into it).
+                _ar_band_mask = gradient_mask[:, _ar_b0:_ar_b0 + _ar_bl]
+                if _ar_band_mask.any():
+                    _stu_band = original_latent.double()[
+                        :, _ar_b0:_ar_b0 + _ar_bl
+                    ]
+                    ar_loss = 0.5 * F.mse_loss(
+                        _stu_band[_ar_band_mask],
+                        (_stu_band - grad_ar.double()).detach()[
+                            _ar_band_mask
+                        ],
+                        reduction="mean",
+                    )
+                    dmd_log_dict["dmd_ar_loss_raw"] = float(
+                        ar_loss.detach().item()
+                    )
+                    dmd_loss = dmd_loss + self.dmd_ar_head_weight * ar_loss
+            else:
+                # The AR head is enabled but no payload arrived. Three
+                # call paths never build one (non-streaming
+                # generator_loss, the asymmetric branch, and the plain
+                # branch — the payload is 42f-only), so if
+                # ``dmd_42f_enabled`` were flipped off on an AR-only
+                # arm the AR term would just never be added. With
+                # ``dmd_tf_head_weight == 0.0`` the TF term is scaled to
+                # zero too, so dmd_loss would be identically ZERO with
+                # no exception and no log key — a silently dead run.
+                # Rank-symmetric: both conditions are pure config /
+                # call-path facts, identical on every rank, so this
+                # raises everywhere or nowhere (no DDP hang).
+                dmd_log_dict["dmd_ar_payload_missing"] = 1.0
+                if self.dmd_tf_head_weight == 0.0:
+                    raise RuntimeError(
+                        "dmd_ar_head_weight="
+                        f"{float(self.dmd_ar_head_weight)} > 0 but no "
+                        "ar_head_inputs payload was supplied (the "
+                        "payload is built only on the dmd_42f path — "
+                        "check dmd_42f_enabled), AND "
+                        "dmd_tf_head_weight=0.0, so the AR head is the "
+                        "only DMD signal. The DMD loss would be "
+                        "identically zero and train silently on "
+                        "nothing."
+                    )
 
         # Anti-collapse: stashed unscaled on ``self`` so the caller adds
         # it AFTER the dmd_loss_weight multiplication. See helper
@@ -7838,7 +9594,13 @@ class ActionForcingDMD(SelfForcingModel):
                 _frac = 1.0 if _cs >= _df else 0.0
             else:
                 _frac = max(0.0, min(1.0, (_cs - _ds) / float(_df - _ds)))
-            drift_off = int(round((2.0 * _frac - 1.0) * npb))
+            # ``dmd_42f_clean_drift_chunks`` (G2, 2026-08-18): how many CHUNKS
+            # forward the clean half travels at frac=1. Default 1 reproduces the
+            # original +-npb ramp byte-identically. =2 puts the clean half TWO
+            # chunks ahead (drift_off=+2*npb); with couple_rope the teacher's
+            # RoPE follows to -2*npb so content and position stay consistent.
+            _dc = max(1, int(getattr(self, "dmd_42f_clean_drift_chunks", 1)))
+            drift_off = int(round((2.0 * _frac - 1.0) * npb * _dc))
             if getattr(self, "_42f_drift_dbg", 0) < 4 or _cs % 50 == 0:
                 self._42f_drift_dbg = getattr(self, "_42f_drift_dbg", 0) + 1
                 import sys as _sys
@@ -8022,6 +9784,29 @@ class ActionForcingDMD(SelfForcingModel):
         clean_x = ride_lat[:, clean_lo:clean_lo + N].to(
             dtype=chunk.dtype, device=chunk.device,
         ).detach()
+        # G4 hybrid: overwrite the student-covered span of the clean half with
+        # the student's OWN rolled content, leaving GT outside it.
+        if bool(getattr(self, "dmd_42f_clean_self_forward", False)):
+            _stu_lo = chunk_lo                       # world start of the roll
+            _stu_hi = chunk_lo + int(chunk.shape[1])  # world end of the roll
+            _ov_lo = max(clean_lo, _stu_lo)
+            _ov_hi = min(clean_lo + N, _stu_hi)
+            if _ov_hi > _ov_lo:
+                _c0 = _ov_lo - clean_lo              # index into clean_x
+                _s0 = _ov_lo - _stu_lo               # index into chunk
+                _n = _ov_hi - _ov_lo
+                clean_x = clean_x.clone()
+                clean_x[:, _c0:_c0 + _n] = chunk[
+                    :, _s0:_s0 + _n
+                ].detach().to(dtype=clean_x.dtype, device=clean_x.device)
+                if getattr(self, "_g4_dbg", 0) < 3:
+                    self._g4_dbg = getattr(self, "_g4_dbg", 0) + 1
+                    import sys as _sys
+                    print(
+                        f"[42F-G4] clean_lo={clean_lo} N={N} stu=[{_stu_lo},"
+                        f"{_stu_hi}) -> clean[{_c0}:{_c0+_n}] from student, "
+                        f"GT elsewhere", file=_sys.stderr, flush=True,
+                    )
         # Clean-counterpart fix: in v14's joint TF, clean frame at array
         # index (a+npb) is the SAME world frame as noisy frame at index a
         # (clean shifted back npb). Where the noisy half holds a STUDENT
@@ -8184,6 +9969,62 @@ class ActionForcingDMD(SelfForcingModel):
         # teacher reads the clean half as one chunk AHEAD (rope_offset = -npb).
         if _match_forward:
             _rope_offset = int(-drift_off)  # = -npb
+        # ---- AR payload (dmd_ar_head_weight / dmd_ar_critic_weight) -------
+        # Everything ``_ar_score_band`` needs, derived from the
+        # SAME layout arithmetic as the TF window above (n_ctx /
+        # sup_offset / sup_span) so the band indices and the action
+        # alignment can never drift from the TF head's. ``None`` when
+        # both the AR head and the AR critic term are off (default):
+        # zero extra tensor ops. The CRITIC step goes through this same
+        # builder, so the AR critic trains on the identical band /
+        # context / action slices the head is served on.
+        ar_head = None
+        if (
+            float(getattr(self, "dmd_ar_head_weight", 0.0)) > 0.0
+            or float(getattr(self, "dmd_ar_critic_weight", 0.0)) > 0.0
+        ):
+            _ar_b0 = n_ctx + sup_offset          # band start (window idx)
+            if _ar_b0 % npb != 0 or sup_span % npb != 0:
+                raise RuntimeError(
+                    f"dmd_ar_head: band not chunk-aligned (band_start="
+                    f"{_ar_b0}, band_len={sup_span}, npb={npb})."
+                )
+            ar_head = {
+                "band_start": int(_ar_b0),
+                "band_len": int(sup_span),
+                # Clean PAST-ONLY context = the TF window's own content
+                # ahead of the band (``noisy_x`` holds CLEAN content
+                # here — the noising happens later in
+                # ``compute_distribution_matching_loss``): GT ctx in
+                # the default geometry; the detached student overlap on
+                # rolling k>=2; plus any GT/student after-slots
+                # preceding a rand_sup_slot band. Committed into the AR
+                # cache at t=0.
+                "ctx": noisy_x[:, :_ar_b0].detach(),
+                # GT band chunks (world-aligned, match_m-shifted like
+                # every other GT slice this builder makes: gt_target
+                # frame i == world noisy_lo + match_m + i) — the
+                # MAE-vs-GT diagnostics' reference, and the committed
+                # history only in the A/B mode dmd_ar_head_commit="gt".
+                "gt_band": gt_target[:, _ar_b0:_ar_b0 + sup_span].detach(),
+                # STUDENT's own rolled band chunks, CLEAN (``noisy_x``
+                # still holds pre-noising content here) and DETACHED —
+                # committed between band chunks in the default
+                # dmd_ar_head_commit="student" mode so the AR teacher
+                # conditions on the history the student actually has.
+                # Same slice indices as gt_band, so the two are the
+                # same world frames by construction.
+                "stu_band": noisy_x[
+                    :, _ar_b0:_ar_b0 + sup_span
+                ].detach(),
+                # Noisy-side conditional over the SAME 21f window; the
+                # AR helper slices it per chunk via
+                # ``_slice_per_frame_streams``. Deliberately the
+                # PRE-clean-keys dict (``noisy_cond``): the
+                # ``*_clean`` action streams belong to the TF clean_x
+                # feature, which the kv_cache path must not see.
+                "cond": noisy_cond,
+            }
         return {
             "noisy_x": noisy_x,
             "clean_x": clean_x,
@@ -8193,6 +10034,7 @@ class ActionForcingDMD(SelfForcingModel):
             "gt_target": gt_target,
             "gradient_mask": gradient_mask,
             "rope_offset": _rope_offset,
+            "ar_head": ar_head,
         }
 
     def _streaming_clean_cond_slice(
@@ -8342,20 +10184,25 @@ class ActionForcingDMD(SelfForcingModel):
             build_real_view=True,
         )
 
-        # Eval-time stash for sample-video diagnostics. Mirrors the
-        # ``clean_x`` views handed to fake_score / real_score (after
-        # any ``add_noise`` round-trip in ``_build_dmd_context_kwargs``)
-        # so a side-by-side decode shows exactly what each scorer
-        # was conditioned on. No effect when not armed by the trainer.
+        # Eval-time stash for sample-video diagnostics.
+        # CORRECTED 2026-08-17: this point is BEFORE the 42f/asymmetric
+        # branch below, which OVERRIDES the clean_x actually handed to the
+        # scorers (42f replaces it with a pure GT ride slice). Writing
+        # ``clean_x_fake``/``clean_x_real`` here therefore published the
+        # student's own self-view while claiming to mirror the scorer
+        # conditioning — a misleading log that cost real debugging time.
+        # The self-view is still useful, so it is kept under an explicit
+        # name; the AUTHORITATIVE keys are written after the branch
+        # resolves (search "authoritative clean_x stash").
         stash = getattr(self, "_dmd_eval_stash", None)
         if isinstance(stash, dict):
-            stash["clean_x_fake"] = sc_clean_x.detach()
-            stash["clean_x_real"] = (
-                sc_clean_x_real.detach()
-                if sc_clean_x_real is not None
-                else sc_clean_x.detach()
-            )
-            stash["dmd_context"] = "self"
+            stash["clean_x_selfview"] = sc_clean_x.detach()
+            # NOT written here any more: this label captions the
+            # `clean_x_real` video, and that tensor is now the 42f GT slice
+            # written AFTER the branch below — captioning it "self" was the
+            # same lie the index overlay was disabled for. The authoritative
+            # site sets it from the branch that actually ran.
+            stash.pop("dmd_context", None)
             stash["chunk"] = chunk.detach()
             # Raw clean-half z's (one z per chunk, broadcast to per-
             # latent by the dataset's ``encode_z_actions_window``).
@@ -8392,11 +10239,17 @@ class ActionForcingDMD(SelfForcingModel):
                 # offset definition.
                 ride_offset_s = int(s.get("ride_offset_s", 0))
                 motion_chunk_offset = int(s.get("motion_chunk_offset", 0))
-                stash["clean_x_real_zarr_lat_lo"] = (
-                    ride_offset_s + clean_lo_ride
-                )
-                stash["clean_x_real_motion_chunk_offset"] = motion_chunk_offset
-                stash["clean_x_real_npb"] = shift_eval
+                # DISABLED 2026-08-17: these annotations are computed HERE,
+                # from the SELF-VIEW geometry (clean_lo_ride = cf +
+                # noisy_start_sdn - shift), but `clean_x_real` is now written
+                # AFTER the 42f branch and is the GT ride slice starting at
+                # clean_lo — a different tensor. Burning these indices onto
+                # that video mislabels every frame by (cf - n_ctx + npb)
+                # latent frames. An annotation that can lie is worse than no
+                # annotation, so the overlay is dropped rather than guessed.
+                # To restore it, recompute the indices from the 42f
+                # `clean_lo` at the authoritative stash site.
+                _ = (ride_offset_s, motion_chunk_offset, shift_eval)
                 # Ride identifier (zarr file stem) so the overlay can
                 # show which underlying recording the clean_x_real
                 # window came from. Stem only — full paths are too long
@@ -8449,6 +10302,11 @@ class ActionForcingDMD(SelfForcingModel):
             score_clean_x_real = None
             score_aug_t_real = None
             asym_rope_offset = f42["rope_offset"]   # None → keep offset=npb
+            # AR band payload (None unless dmd_ar_head_weight > 0 OR
+            # dmd_ar_critic_weight > 0 — see the builder). Harmless when
+            # only the critic term wants it: the AR head block below
+            # gates on ``dmd_ar_head_weight``, not on the payload.
+            score_ar_head = f42.get("ar_head")
         elif asymmetric:
             asym = self._build_asymmetric_scoring_inputs(chunk, info)
             score_image = asym["noisy_x"]
@@ -8461,6 +10319,7 @@ class ActionForcingDMD(SelfForcingModel):
             score_clean_x_real = None
             score_aug_t_real = None
             asym_rope_offset = asym["rope_offset"]
+            score_ar_head = None      # AR head is 42f-only
         else:
             score_image = chunk
             score_cond = cond_for_scoring
@@ -8472,6 +10331,49 @@ class ActionForcingDMD(SelfForcingModel):
             score_clean_x_real = sc_clean_x_real
             score_aug_t_real = sc_aug_t_real
             asym_rope_offset = None
+            score_ar_head = None      # AR head is 42f-only
+
+        # ---- authoritative clean_x stash -------------------------------
+        # Written HERE, after every branch has resolved, so the logged
+        # sample videos show EXACTLY what fake_score / real_score are
+        # conditioned on — GT in the 42f path, the self-view in the plain
+        # path, whatever the asymmetric builder produced. real falls back
+        # to the fake view only when score_clean_x_real is None, which is
+        # the same fallback _compute_kl_grad applies internally.
+        # Never publish a clean_x view that the scorers did not receive.
+        _stash = getattr(self, "_dmd_eval_stash", None)
+        if isinstance(_stash, dict):
+            if score_clean_x is not None:
+                _stash["clean_x_fake"] = score_clean_x.detach()
+                _stash["clean_x_real"] = (
+                    score_clean_x_real.detach()
+                    if score_clean_x_real is not None
+                    else score_clean_x.detach()
+                )
+            else:
+                # No clean-half conditioning at all on this path; drop any
+                # stale entry rather than leave a previous step's tensor.
+                _stash.pop("clean_x_fake", None)
+                _stash.pop("clean_x_real", None)
+            # NOTE: a `clean_x_source` provenance field was tried here and
+            # REMOVED — it keyed off dmd_42f_enabled alone, so a submit-time
+            # override that put student content into the clean half would
+            # still have reported "42f_gt". A provenance label that can lie
+            # is worse than none: the tensors above are the ground truth.
+            #
+            # The video caption DOES need to say which branch produced the
+            # tensor, so set it HERE (after the branch resolved) rather than
+            # in the pre-branch self-view block, where it captioned the 42f
+            # GT slice as "self".
+            _stash["dmd_context"] = (
+                "42f" if bool(self.dmd_42f_enabled)
+                else ("asymmetric" if asymmetric else "self")
+            )
+            # The per-frame action bars (`clean_z_actions`) are still sliced
+            # at the SELF-VIEW offset and length, so they would mislabel this
+            # tensor exactly as the index overlay did. Drop them for the same
+            # reason; recompute from the 42f clean_lo/N to restore.
+            _stash.pop("clean_z_actions", None)
 
         # Standard DMD: random exit-rung output is graph-on; DMD
         # samples a timestep from the rung-bounded range and computes
@@ -8502,6 +10404,7 @@ class ActionForcingDMD(SelfForcingModel):
                         clean_x=score_clean_x, aug_t=score_aug_t,
                         gt_target=score_gt_target,
                         clean_x_real=None, aug_t_real=None,
+                        ar_head_inputs=score_ar_head,
                     )
                 finally:
                     self.real_score = _saved_real_score
@@ -8524,6 +10427,7 @@ class ActionForcingDMD(SelfForcingModel):
                         clean_x_real=score_clean_x_real,
                         aug_t_real=score_aug_t_real,
                         gt_target=score_gt_target,
+                        ar_head_inputs=score_ar_head,
                     )
             else:
                 dmd_loss, dmd_log = self.compute_distribution_matching_loss(
@@ -8537,6 +10441,7 @@ class ActionForcingDMD(SelfForcingModel):
                     gt_target=score_gt_target,
                     clean_x_real=score_clean_x_real,
                     aug_t_real=score_aug_t_real,
+                    ar_head_inputs=score_ar_head,
                 )
         # Resolved DMD loss weight: applies the start-step gate +
         # linear warmup ramp on top of the static ``dmd_loss_weight``.
@@ -8987,43 +10892,202 @@ class ActionForcingDMD(SelfForcingModel):
             critic_timestep.flatten(0, 1),
         ).unflatten(0, noisy_x.shape[:2])
 
-        with self._maybe_asymmetric_tf_rope_offset(rope_offset):
-            _, pred_fake_image = self.fake_score(
-                noisy_image_or_video=noised,
-                conditional_dict=cond,
+        # ---- AR-SERVED CRITIC TERM (dmd_ar_critic_weight > 0) ------------
+        # Trains ``fake_score`` in the conditional the AR DMD head
+        # actually QUERIES it in: local KV cache, past-only context,
+        # student chunks committed between band chunks, NO ``clean_x``.
+        # Reuses ``_ar_score_band`` verbatim (same prefill / score /
+        # commit schedule, same ``current_start`` arithmetic, same band
+        # slice, same ``_ar_num_chunks`` N) with ``enable_grad=True``;
+        # the ONLY differences from the head's usage are that the
+        # scoring forwards carry grad and that the teacher
+        # (``real_score``) is not involved at all.
+        #
+        # SAME OBJECTIVE AS THE TF TERM. Same ``critic_timestep`` draw,
+        # same ``critic_noise`` draw, same ``noised = add_noise(...)``
+        # input, same x0->flow / x0->noise conversion, same
+        # ``denoising_loss_func`` call, same ``gradient_mask`` — only
+        # sliced to the band the AR pass predicts. Sharing the draws
+        # (rather than sampling fresh ones) is deliberate on two counts:
+        # it makes TF and AR a PAIRED estimate of the same denoising
+        # problem under two serving modes, and it keeps the RNG stream
+        # identical to the TF-only baseline so an AR arm and an mse/kl
+        # arm consume noise in lockstep.
+        #
+        # ORDERING: this runs BEFORE the TF forward on purpose. DDP
+        # arms its reducer on every grad-enabled forward, so exactly one
+        # forward per critic step may run outside ``no_sync()``; when
+        # the TF term is live it is the natural last one, so the AR pass
+        # keeps all N of its forwards inside ``no_sync``
+        # (``ddp_sync_last=False``). On AR-only arms
+        # (``dmd_tf_critic_weight == 0``) there is no TF forward, so the
+        # AR pass's LAST scoring forward takes that role instead.
+        #
+        # COST — this is the dominant new cost of the change. The critic
+        # step runs on EVERY iteration (``dfake_gen_update_ratio`` only
+        # gates the extra GENERATOR step, see
+        # ``trainer/causal_action_forcing_train.py``: "Always run the
+        # critic step (CF parity)"), so this is paid every iteration,
+        # not 4 in 5.
+        # Per critic step it adds ``b0/npb`` no_grad prefill forwards +
+        # ``N`` GRAD-ENABLED scoring forwards + ``N - 1`` no_grad commit
+        # forwards, all SEQUENTIAL (each commit feeds the next score).
+        # GEOMETRY-DEPENDENT — recompute from the arm's own b0/npb/N.
+        # At the queued 3|3|1 geometry (band_start=9, band_len=9, npb=3,
+        # N=3) that is 3 + 3 + 2 = 8 forwards on 3-frame (4,683-token)
+        # chunks: ~37.5k tokens of forward, of which ~14k also carries a
+        # backward -> ~65k token-equivalents (counting bwd ~2x fwd).
+        # For scale, the TF critic forward+backward alone is 42 frames =
+        # ~65.5k tokens -> ~196k token-equivalents, and the critic
+        # iteration's student rollout is a further ~150k. So expect of
+        # order +15-20% of arithmetic, and +20-30% of wall clock once the
+        # poor occupancy of 8 extra small SEQUENTIAL forwards (and their
+        # kernel-launch overhead) is priced in. ``dmd_ar_head_chunks``
+        # caps N and is the lever if that is too much.
+        # MEMORY: with ``fake_score_gradient_checkpointing=true`` (all
+        # queued arms) each grad chunk forward is block-checkpointed, so
+        # the ~86 MB/block ``temp_k``/``temp_v`` clones are recomputed
+        # rather than retained; the added activation footprint is a few
+        # hundred MB, not the ~5 GB/chunk an uncheckpointed pass would
+        # hold. With checkpointing OFF, size for ~5 GB x N.
+        ar_loss = None
+        _ar_log: Dict[str, Any] = {}
+        if self.dmd_ar_critic_weight > 0.0:
+            _ar_inputs = inp.get("ar_head")
+            if _ar_inputs is None:
+                # Rank-symmetric: purely a config / code-path fact
+                # (the payload is built only on the 42f path), so this
+                # raises on every rank or on none — no DDP hang.
+                raise RuntimeError(
+                    "dmd_ar_critic_weight="
+                    f"{self.dmd_ar_critic_weight} > 0 but the critic's "
+                    f"scoring inputs carry no 'ar_head' payload (mode="
+                    f"{mode!r}). The payload is built only by "
+                    "_build_42f_scoring_inputs — check dmd_42f_enabled."
+                )
+            _ar_npb = int(self.num_frame_per_block)
+            _ar_b0 = int(_ar_inputs["band_start"])
+            # Same helper the pass itself uses, so the loss slice can
+            # never disagree with the number of chunks scored.
+            _ar_bl = self._ar_num_chunks(
+                int(_ar_inputs["band_len"]), _ar_npb,
+            ) * _ar_npb
+            # Detach the action streams — same contract as the TF
+            # ``cond`` above: the critic's backward must train ONLY
+            # fake_score params, never the shared action projections
+            # (those are trained by the generator rollout).
+            _ar_in = dict(_ar_inputs)
+            _ar_in["cond"] = {
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in _ar_inputs["cond"].items()
+            }
+            pred_fake_ar = self._ar_score_band(
+                score_module=self.fake_score,
+                noisy_window=noised,
                 timestep=critic_timestep,
-                clean_x=clean_x,
-                aug_t=aug_t,
+                ar_inputs=_ar_in,
+                enable_grad=True,
+                ddp_sync_last=(self.dmd_tf_critic_weight <= 0.0),
             )
-
-        if self.args.denoising_loss_type == "flow":
-            from utils.wan_wrapper import WanDiffusionWrapper
-            flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
-                scheduler=self.scheduler,
-                x0_pred=pred_fake_image.flatten(0, 1),
-                xt=noised.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1),
+            # Drop the rotated-prefix memo the no_grad prefill/commit
+            # forwards populated (grad-enabled forwards never touch it).
+            self._ar_free_rope_prefix_memo(self.fake_score)
+            _ar_sl = slice(_ar_b0, _ar_b0 + _ar_bl)
+            _ar_x = noisy_x[:, _ar_sl]
+            _ar_xt = noised[:, _ar_sl]
+            _ar_noise = critic_noise[:, _ar_sl]
+            _ar_t = critic_timestep[:, _ar_sl]
+            _ar_mask = grad_mask[:, _ar_sl]
+            if self.args.denoising_loss_type == "flow":
+                from utils.wan_wrapper import WanDiffusionWrapper
+                _ar_flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
+                    scheduler=self.scheduler,
+                    x0_pred=pred_fake_ar.flatten(0, 1),
+                    xt=_ar_xt.flatten(0, 1),
+                    timestep=_ar_t.flatten(0, 1),
+                )
+                _ar_pred_noise = None
+            else:
+                _ar_flow_pred = None
+                _ar_pred_noise = self.scheduler.convert_x0_to_noise(
+                    x0=pred_fake_ar.flatten(0, 1),
+                    xt=_ar_xt.flatten(0, 1),
+                    timestep=_ar_t.flatten(0, 1),
+                ).unflatten(0, _ar_x.shape[:2])
+            ar_loss = self.denoising_loss_func(
+                x=_ar_x.flatten(0, 1),
+                x_pred=pred_fake_ar.flatten(0, 1),
+                noise=_ar_noise.flatten(0, 1),
+                noise_pred=_ar_pred_noise,
+                alphas_cumprod=self.scheduler.alphas_cumprod,
+                timestep=_ar_t.flatten(0, 1),
+                flow_pred=_ar_flow_pred,
+                gradient_mask=_ar_mask.flatten(0, 1),
             )
-            pred_fake_noise = None
-        else:
-            flow_pred = None
-            pred_fake_noise = self.scheduler.convert_x0_to_noise(
-                x0=pred_fake_image.flatten(0, 1),
-                xt=noised.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1),
-            ).unflatten(0, noisy_x.shape[:2])
+            _ar_log["critic_ar_loss"] = float(ar_loss.detach().item())
+            _ar_log["critic_ar_chunks"] = float(_ar_bl // _ar_npb)
+            _ar_log["dmd_ar_critic_weight"] = float(self.dmd_ar_critic_weight)
 
-        gradient_mask_flat = grad_mask.flatten(0, 1)
-        denoising_loss = self.denoising_loss_func(
-            x=noisy_x.flatten(0, 1),
-            x_pred=pred_fake_image.flatten(0, 1),
-            noise=critic_noise.flatten(0, 1),
-            noise_pred=pred_fake_noise,
-            alphas_cumprod=self.scheduler.alphas_cumprod,
-            timestep=critic_timestep.flatten(0, 1),
-            flow_pred=flow_pred,
-            gradient_mask=gradient_mask_flat,
-        )
+        # ---- TEACHER-FORCED CRITIC TERM (dmd_tf_critic_weight > 0) -------
+        # Unchanged from the historical path. Skipped entirely (not just
+        # zero-weighted) when the weight is 0, because on an AR-only arm
+        # no TF query of the critic exists, so a TF forward+backward is
+        # pure waste AND actively pulls the critic off the regime it is
+        # used in.
+        denoising_loss = None
+        if self.dmd_tf_critic_weight > 0.0:
+            with self._maybe_asymmetric_tf_rope_offset(rope_offset):
+                _, pred_fake_image = self.fake_score(
+                    noisy_image_or_video=noised,
+                    conditional_dict=cond,
+                    timestep=critic_timestep,
+                    clean_x=clean_x,
+                    aug_t=aug_t,
+                )
+
+            if self.args.denoising_loss_type == "flow":
+                from utils.wan_wrapper import WanDiffusionWrapper
+                flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
+                    scheduler=self.scheduler,
+                    x0_pred=pred_fake_image.flatten(0, 1),
+                    xt=noised.flatten(0, 1),
+                    timestep=critic_timestep.flatten(0, 1),
+                )
+                pred_fake_noise = None
+            else:
+                flow_pred = None
+                pred_fake_noise = self.scheduler.convert_x0_to_noise(
+                    x0=pred_fake_image.flatten(0, 1),
+                    xt=noised.flatten(0, 1),
+                    timestep=critic_timestep.flatten(0, 1),
+                ).unflatten(0, noisy_x.shape[:2])
+
+            gradient_mask_flat = grad_mask.flatten(0, 1)
+            denoising_loss = self.denoising_loss_func(
+                x=noisy_x.flatten(0, 1),
+                x_pred=pred_fake_image.flatten(0, 1),
+                noise=critic_noise.flatten(0, 1),
+                noise_pred=pred_fake_noise,
+                alphas_cumprod=self.scheduler.alphas_cumprod,
+                timestep=critic_timestep.flatten(0, 1),
+                flow_pred=flow_pred,
+                gradient_mask=gradient_mask_flat,
+            )
+            # Weight scaling. At the default 1.0 NO multiply is emitted,
+            # so the TF-only arms stay byte-identical to the historical
+            # path (same as the ``dmd_tf_head_weight`` pattern).
+            if self.dmd_tf_critic_weight != 1.0:
+                denoising_loss = denoising_loss * self.dmd_tf_critic_weight
+
+        # ---- FOLD THE TWO REGIMES INTO ONE LOSS (one backward) ----------
+        if ar_loss is not None:
+            if denoising_loss is not None:
+                _ar_log["critic_tf_loss"] = float(denoising_loss.detach().item())
+            _ar_term = self.dmd_ar_critic_weight * ar_loss
+            denoising_loss = (
+                _ar_term if denoising_loss is None
+                else denoising_loss + _ar_term.to(denoising_loss.dtype)
+            )
         critic_log: Dict[str, Any] = {
             "streaming_new_frames": float(info["new_frames"]),
             "streaming_current_length": float(info["current_length"]),
@@ -9034,6 +11098,7 @@ class ActionForcingDMD(SelfForcingModel):
             # fake_score IS training (see fake_grad_norm).
             "critic_loss": float(denoising_loss.detach().item()),
         }
+        critic_log.update(_ar_log)
         # Train the forward noiser on aligned (rollout1, rollout2) pairs.
         # The 42f/asymmetric critic path returns here BEFORE the FN block
         # in ``compute_critic_loss_streaming``, so the FN was never trained

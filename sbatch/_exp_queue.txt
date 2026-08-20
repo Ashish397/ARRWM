@@ -1,0 +1,20 @@
+gtxn_r1huge|_fgan_holder.sh|ladd_r1_gamma=1000.0 ladd_r1_every_n_steps=10|KL|1.0|true
+r1sync|_fgan_holder.sh|ladd_r1_every_n_steps=10|KL|1.0|true
+r1nowav|_fgan_holder.sh|ladd_r1_every_n_steps=10|KL|1.0|false
+wavLL|_fgan_holder.sh|ladd_r1_every_n_steps=10 ladd_wavelet_hf_drop_ll=false ladd_wavelet_hf_ll_weight=0.15|KL|1.0|true
+wavnoHH|_fgan_holder.sh|ladd_r1_every_n_steps=10 ladd_wavelet_hf_drop_hh=true|KL|1.0|true
+gtvsfake|_fgan_holder.sh|ladd_gt_vs_fake_enabled=true ladd_gt_transition_enabled=false ladd_r1_every_n_steps=10|KL|1.0|true
+trajfull|_tf_holder.sh|dmd_real_traj_max_steps=20|MSE||false
+trajoff|_tf_holder.sh|dmd_real_traj_enabled=false|MSE||false
+arkl_GANsm|_fgan_holder.sh|ladd_r1_every_n_steps=10 ladd_wavelet_hf_drop_ll=false ladd_wavelet_hf_ll_weight=0.15|KL|1.0|true
+dmd3kl_GANsm|_fgan_holder.sh|ladd_r1_every_n_steps=10 ladd_wavelet_hf_drop_ll=false ladd_wavelet_hf_ll_weight=0.15|KL||true
+armse_GANsm|_fgan_holder.sh|ladd_r1_every_n_steps=10 ladd_wavelet_hf_drop_ll=false ladd_wavelet_hf_ll_weight=0.15|MSE|1.0|true
+dmd3mse_GANsm|_fgan_holder.sh|ladd_r1_every_n_steps=10 ladd_wavelet_hf_drop_ll=false ladd_wavelet_hf_ll_weight=0.15|MSE||true
+gtvsfake_v2|_fgan_holder.sh|ladd_gt_vs_fake_enabled=true ladd_gt_transition_enabled=false ladd_gt_vs_fake_match=true ladd_r1_gamma=1e-5 ladd_r1_every_n_steps=10|KL|1.0|true
+cleanfwd3_rope|_tf_holder.sh|dmd_42f_clean_drift_enabled=true dmd_42f_clean_drift_start_step=0 dmd_42f_clean_drift_full_step=0 dmd_42f_clean_drift_chunks=3 dmd_42f_clean_drift_couple_rope=true|KL||false
+cleanfwd3_norope|_tf_holder.sh|dmd_42f_clean_drift_enabled=true dmd_42f_clean_drift_start_step=0 dmd_42f_clean_drift_full_step=0 dmd_42f_clean_drift_chunks=3 dmd_42f_clean_drift_couple_rope=false|KL||false
+gtvsfake_v3|_fgan_holder.sh|ladd_gt_vs_fake_enabled=true ladd_gt_transition_enabled=false ladd_gt_vs_fake_match=true ladd_gt_vs_fake_mag_norm=m1 ladd_r1_gamma=1e-5 ladd_r1_every_n_steps=10|KL|1.0|true
+sa_M2only|_tf_holder.sh|stat_anchor_TV_short_weight=0.0|KL||false
+sa_TVonly|_tf_holder.sh|stat_anchor_M2_short_weight=0.0|KL||false
+gtxn_ganw05|_fgan_holder.sh|ladd_r1_every_n_steps=10 gan_loss_weight=0.5|KL|1.0|true
+gtvsfake_v4|_fgan_holder.sh|ladd_gt_vs_fake_enabled=true ladd_gt_transition_enabled=false ladd_gt_vs_fake_match=true ladd_gt_vs_fake_mag_norm=m1 ladd_r1_gamma=1e-2 ladd_r1_every_n_steps=10|KL|1.0|true
