@@ -1635,6 +1635,50 @@ class ActionForcingTrainingPipeline:
             # no_grad chain anyway, but the explicit detach releases
             # any autograd nodes early — memory hygiene).
             commit_input_clean = cache_pred.detach()
+            # CARN seam affine (latent CARN v0): gated per-channel mean/std
+            # re-anchor of the committed context toward the ride seed's latent
+            # stats -- counters the AR drift walk (DC/color haze, contraction)
+            # INSIDE the loop; affine correction measured ~80% sufficient in
+            # the contraction-law study. lambda=0 (default) = byte-identical.
+            # Temperature scaling (carn_seam_temp, default 1.0 = off): scale
+            # per-channel deviations of the committed context by T to counter
+            # the per-chunk variance contraction (k~0.917 for the 4-rung
+            # sampler => T ~ 1/k). Pure re-inflation, no target stats needed;
+            # composes with (runs before) the affine re-anchor below.
+            _tT = float(getattr(self, "carn_seam_temp", 1.0) or 1.0)
+            if abs(_tT - 1.0) > 1e-6:
+                _x = commit_input_clean.float()
+                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
+                commit_input_clean = (
+                    _mu + _tT * (_x - _mu)
+                ).to(commit_input_clean.dtype)
+            # Global drift counter-bias (CARN repulsor v1): subtract
+            # lambda_d * d_hat (per-channel-mean drift/roll, fitted from the
+            # frozen-model drift probe -- transition cos +0.53, ride cos
+            # +0.74) from every committed chunk. mu-only by design (the
+            # grep-sign study: the mu-half is right-signed; sigma-half is
+            # handled by temp/affine instead).
+            _dl = float(getattr(self, "carn_seam_drift_lambda", 0.0) or 0.0)
+            _dv = getattr(self, "_carn_seam_drift_vec", None)
+            if _dl > 0.0 and _dv is not None:
+                commit_input_clean = (
+                    commit_input_clean.float()
+                    - _dl * _dv.view(1, 1, -1, 1, 1).to(
+                        commit_input_clean.device)
+                ).to(commit_input_clean.dtype)
+            _cl = float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0)
+            _ct = getattr(self, "_carn_seam_target", None)
+            if _cl > 0.0 and _ct is not None:
+                _tm, _tsd = _ct
+                _x = commit_input_clean.float()
+                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
+                _sd = _x.std(dim=(0, 1, 3, 4), keepdim=True).clamp_min(1e-4)
+                _tm_ = _tm.view(1, 1, -1, 1, 1).to(_x)
+                _tsd_ = _tsd.view(1, 1, -1, 1, 1).to(_x)
+                commit_input_clean = (
+                    (_x - _mu) / _sd * (_cl * _tsd_ + (1.0 - _cl) * _sd)
+                    + (_cl * _tm_ + (1.0 - _cl) * _mu)
+                ).to(commit_input_clean.dtype)
             context_timestep = torch.full_like(timestep, self.context_noise)
             if int(self.context_noise) == 0:
                 # See the matching note in generate_chunk_with_cache: the
@@ -2256,6 +2300,50 @@ class ActionForcingTrainingPipeline:
             # rung forward doesn't pull DMD's grad through the prior
             # block's Flash-DMD gen forward).
             commit_input_clean = cache_pred.detach()
+            # CARN seam affine (latent CARN v0): gated per-channel mean/std
+            # re-anchor of the committed context toward the ride seed's latent
+            # stats -- counters the AR drift walk (DC/color haze, contraction)
+            # INSIDE the loop; affine correction measured ~80% sufficient in
+            # the contraction-law study. lambda=0 (default) = byte-identical.
+            # Temperature scaling (carn_seam_temp, default 1.0 = off): scale
+            # per-channel deviations of the committed context by T to counter
+            # the per-chunk variance contraction (k~0.917 for the 4-rung
+            # sampler => T ~ 1/k). Pure re-inflation, no target stats needed;
+            # composes with (runs before) the affine re-anchor below.
+            _tT = float(getattr(self, "carn_seam_temp", 1.0) or 1.0)
+            if abs(_tT - 1.0) > 1e-6:
+                _x = commit_input_clean.float()
+                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
+                commit_input_clean = (
+                    _mu + _tT * (_x - _mu)
+                ).to(commit_input_clean.dtype)
+            # Global drift counter-bias (CARN repulsor v1): subtract
+            # lambda_d * d_hat (per-channel-mean drift/roll, fitted from the
+            # frozen-model drift probe -- transition cos +0.53, ride cos
+            # +0.74) from every committed chunk. mu-only by design (the
+            # grep-sign study: the mu-half is right-signed; sigma-half is
+            # handled by temp/affine instead).
+            _dl = float(getattr(self, "carn_seam_drift_lambda", 0.0) or 0.0)
+            _dv = getattr(self, "_carn_seam_drift_vec", None)
+            if _dl > 0.0 and _dv is not None:
+                commit_input_clean = (
+                    commit_input_clean.float()
+                    - _dl * _dv.view(1, 1, -1, 1, 1).to(
+                        commit_input_clean.device)
+                ).to(commit_input_clean.dtype)
+            _cl = float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0)
+            _ct = getattr(self, "_carn_seam_target", None)
+            if _cl > 0.0 and _ct is not None:
+                _tm, _tsd = _ct
+                _x = commit_input_clean.float()
+                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
+                _sd = _x.std(dim=(0, 1, 3, 4), keepdim=True).clamp_min(1e-4)
+                _tm_ = _tm.view(1, 1, -1, 1, 1).to(_x)
+                _tsd_ = _tsd.view(1, 1, -1, 1, 1).to(_x)
+                commit_input_clean = (
+                    (_x - _mu) / _sd * (_cl * _tsd_ + (1.0 - _cl) * _sd)
+                    + (_cl * _tm_ + (1.0 - _cl) * _mu)
+                ).to(commit_input_clean.dtype)
             context_timestep = torch.full_like(timestep, self.context_noise)
             if int(self.context_noise) == 0:
                 # context_noise=0 did NOT mean "clean". FlowMatchScheduler's

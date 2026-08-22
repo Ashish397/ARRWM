@@ -406,7 +406,6 @@ srun torchrun \
     dmd_42f_clean_match_max_drift_frames=12 \
     dmd_42f_clean_match_min_improve=0.15 \
     dmd_42f_clean_match_forward=false \
-    $DEXTRA \
     gan_enabled=true \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=1.0 \
@@ -445,6 +444,7 @@ srun torchrun \
     ladd_wavelet_hf_augment=true \
     ladd_wavelet_hf_drop_ll=${DROPLL:-true} \
     ladd_wavelet_hf_ll_weight=0.15 \
+    $DEXTRA \
     run_name=dmd10k_${DARM}_j${SLURM_JOB_ID}
 
 echo "DMD10K $DARM completed $(date)"

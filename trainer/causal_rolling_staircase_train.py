@@ -1758,7 +1758,32 @@ class RollingStaircaseDMDTrainer:
         # requeue when fake_score_updates_enabled=true; without these
         # the critic would reset to init each time SLURM bounces the
         # job (auto_resume path only).
-        if self.fake_score_updates_enabled:
+        #
+        # ``resume_load_fake_score`` (2026-08-22, default True =
+        # byte-identical): set False to SKIP restoring the checkpoint's
+        # fake_score + fake_optimizer. Needed by warm starts that pair
+        # auto_resume (generator + step from a prior run's checkpoint)
+        # with ``fake_score_init_from_teacher=true`` — without the skip,
+        # the resume would silently overwrite the teacher-initialized
+        # critic with the checkpoint's critic and the init flag would be
+        # a no-op. CAVEAT: with False, a mid-run SLURM requeue also
+        # re-initializes the critic (from the teacher) instead of
+        # resuming it — acceptable when checkpoint_interval is set high
+        # enough that no mid-run checkpoints exist, which is the warm-
+        # start pattern this serves; do NOT set False on runs that rely
+        # on periodic checkpoints for requeue continuity.
+        _resume_fake = bool(
+            getattr(self.config, "resume_load_fake_score", True)
+        )
+        if self.fake_score_updates_enabled and not _resume_fake:
+            if self.is_main_process:
+                logging.info(
+                    "resume: resume_load_fake_score=false — SKIPPING the "
+                    "checkpoint's fake_score/fake_optimizer restore; the "
+                    "critic keeps its constructed init (generator mirror "
+                    "or fake_score_init_from_teacher)."
+                )
+        if self.fake_score_updates_enabled and _resume_fake:
             fake_module = (
                 self.fake_score_ddp.module
                 if self.fake_score_ddp is not None

@@ -64,6 +64,14 @@ Notes:
   degrades less. Corrected value is `1/32`.
 - **B3/B7/B8** — note `10.9%` is exactly Default's relocation rate and the HF
   denominators coincide with Default's; the signature of row-copying.
+- **B3 threshold fragility (±1 rollout).** No Critic's relocation is **2/75 =
+  2.7% (→3)** as scored on the cluster, and **1/75 = 1.3% (→1)** as scored on
+  the local node. The two runs agree on 74 of 75 rollouts; the single
+  disagreement is `r12_BR`, which sits *on* the 50-inlier threshold (50 vs 44) —
+  cross-node decode noise, not a pipeline difference. **Use 3**, matching the
+  environment the published rows were produced in, and note the ±1 sensitivity
+  where the instrument is described. The same fragility affects any borderline
+  rollout in any model's relocation count.
 
 ---
 
@@ -266,11 +274,18 @@ inverting the variant ordering:
 | No Action Tokens | 39 | 59 |
 | No AdaLN | 136 | 89 |
 
-**Mechanism (structural, not calibration).** The sibling median measures
-degradation *relative to peers*; the real anchor measures it in *absolute*
-terms. Generated video degrades more than real footage broadly, so anchoring to
-real compresses the between-variant spread — exactly the signal Table 14 exists
-to display. No threshold recovers it.
+**Mechanism (CORRECTED).** An earlier draft said the real anchor fails because
+"generated video degrades more than real, so the common offset swamps the
+signal". That explanation is **wrong**: a genuinely *common additive* offset
+shifts every system equally, leaves AUC and rankings unchanged, and can be
+absorbed by recalibrating the threshold. Since the ordering *did* invert after
+total-matched recalibration, the real-to-generated gap must vary **by item**
+and/or interact with system, i.e. it is **reference-domain mismatch**, not a
+constant. Subtracting a well-matched control removes nuisance variance;
+subtracting a poorly-correlated one *adds* it. The peer median is the better
+control because it estimates item difficulty under the generative-model response
+distribution, which real footage does not. Phrase it as blocking / nuisance
+variance, never as "common-mode offset".
 
 **Consequence for the caption, independent of invariance:** HF as deployed is a
 **relative** measure — "degrades more than the fleet median does" — not an
@@ -367,6 +382,29 @@ Ship the reference *statistics*, not the videos:
   descriptors (subsampled if size demands) per scene, so a newcomer matches
   against descriptors rather than videos.
 
+**BUILT AND VALIDATED** — artifacts in `grids/eval/out/`:
+
+- `hf_reference_median_directional.csv` (256 scenes),
+  `hf_reference_median_stationary.csv` (32 scenes) — per-scene
+  `sibling_median_d_blur`, taken as the median of `d_blur` over the 13 panel
+  models (cleaner than `d_blur − x_blur`, which carries stored rounding).
+  *Validated:* recomputing `B` from the CSV alone reproduces `fleet_hf.csv`'s
+  `B` to max |err| = 0.0000 and every Table 14 flag count exactly
+  (14/239, 15/237, 25/237, 45/229, 52/232, 101/236, 95/200); stationary
+  No AdaLN 21/32 likewise.
+- `reloc_reference_pack_3000.npz` (358 MB) — per-scene ORB keypoints and
+  descriptors for the 13 panel models' +6 s end frames plus the 4 real context
+  frames. *Validated:* scoring No Critic against the pack alone, with no other
+  model's video, reproduces same-node live scoring at r = 0.993 with 74/75
+  flags identical. Builder/validator: `grids/eval/reloc_reference_pack.py`.
+- **Ship the 3000-keypoint pack, not the 1000-keypoint subsample.** The smaller
+  pack (146 MB) systematically undercounts inliers (mean −233), drops
+  correlation to 0.909, and pushes borderline rollouts across the threshold; it
+  would need its own recalibrated threshold rather than being a drop-in.
+- **Release text must note the ±1-rollout threshold fragility** (see B3): a
+  newcomer reproducing 1/75 where we report 2/75 is seeing metric noise at the
+  50-inlier boundary, not a broken artifact.
+
 This converts the coupling from a reproducibility hole into a documented,
 shippable constant — a better outcome than the invariance originally sought,
 since both tests showed invariance costs real discriminative power.
@@ -382,16 +420,33 @@ and Table 2 captions):
 > sharpness loss relative to the per-scene fleet median; relocation measures
 > place identity against the best-matching sibling continuation. They therefore
 > differ in kind from style, geometry and conjuration, which are per-rollout and
-> absolute, and they must be interpreted as *comparative* statements about a
-> model relative to the evaluated set, not as standalone properties. We tested
-> reference-free formulations of both — chained self-consistency for relocation,
-> a real-footage anchor for HF — and both lost discriminative power
-> (relocation: AUC 0.864 → 0.757, bootstrap 95% CI [+0.044, +0.180]; HF:
-> AUC 0.730 → 0.643 with a threshold recalibration that inverts the variant
-> ordering). The reference class appears to carry information that a
-> self-referential measure cannot recover. We therefore report both metrics
-> against a **frozen reference panel** and release its per-scene statistics, and
-> leave reference-free formulations to future work.
+> absolute, and must be read as *comparative* statements about a model relative
+> to the evaluated set, not as standalone properties.
+>
+> We tested reference-free formulations of both. For **relocation**, a chained
+> self-consistency score (no external reference) lost discrimination
+> significantly: AUC $0.864 \rightarrow 0.757$ against $27$ human labels,
+> bootstrap $95\%$ CI of the difference $[+0.044, +0.180]$. Its failures
+> concentrate on models that drift *gradually*, which never break local
+> continuity while still ending elsewhere — a global property a local measure
+> cannot recover. For **HF**, anchoring to the real footage instead of the fleet
+> median gave a lower point estimate that is **not statistically separable**
+> (AUC $0.730 \rightarrow 0.643$; bootstrap $95\%$ CI $[-0.029, +0.219]$,
+> spanning zero, on only $20$ human labels); the decisive evidence there is
+> instead distributional — after recalibrating the threshold to match the total
+> flag count, the real-anchored variant still inflates the cleanest variants
+> roughly fivefold and compresses the worst, inverting the variant ordering,
+> because an absolute anchor removes the between-model normalisation the axis
+> depends on.
+>
+> We therefore report both metrics against a **frozen reference panel** and
+> release its per-scene statistics, and leave reference-free formulations to
+> future work.
+
+*Do not* state the two results symmetrically: relocation's loss is significant,
+HF's is inconclusive on AUC and rests on the flag-count/ordering argument. Note
+too that HF's AUC is ground-truth dependent and thin (0.730 on broad blur/haze,
+n=20; 0.873 haze-only, n=12).
 
 Also note in the HF caption that it is a **relative** measure — "degrades more
 than the fleet median does", not an absolute degradation rate — since "HF 6%"
@@ -413,3 +468,270 @@ So they overlap only incidentally. Note the hardware-robustness of HF,
 relocation, geometry, conjuration and style was **not** tested — the generator
 gate only covered Movement and Animation. Any claim about those five being
 hardware-stable would be unsupported.
+
+
+---
+
+## J. Precedent, terminology and protocol (from the methodology review)
+
+An external review of the peer-normalised metrics returned **defensible-with-
+changes**. The frozen-panel plan (§H3) is not ad hoc — it matches established
+practice. Cite these rather than describing the scheme in home-made language:
+
+- **Blocking / randomized block designs** (NIST) — matched inputs are blocks,
+  systems are treatments; blocking removes item-difficulty nuisance variance.
+  This is the correct framing for *why* peer normalisation helps.
+- **Fixed-item IRT calibration / common-item equating** (ETS) — item parameters
+  estimated on a calibration sample, then frozen so later systems are placed on
+  the existing scale. Operationally identical to §H3.
+- **fRMA (frozen RMA)** — invented for exactly our problem: cohort-dependent
+  normalisation is powerful but makes independently-processed cohorts
+  incomparable; the fix is to estimate reference effects once and freeze them.
+  The closest analogue to what we propose.
+- **Tukey two-way / median polish**, **crossed mixed-effects models** — the
+  principled form of what our median approximates.
+- **Demšar within-dataset ranks**, **Bradley–Terry / Elo** — precedent that
+  deliberately pool-relative comparison is legitimate *when the construct is
+  declared relative*.
+
+**J1. Terminology.** Describe the scheme as **peer-referenced, blocked
+evaluation with frozen calibration** (psychometrics: *norm-referenced*, as
+opposed to *criterion-referenced*). Important: a column labelled "% of rollouts
+that relocated" reads as criterion-referenced; if the decision boundary is
+panel-relative, either rename it (e.g. *peer-referenced relocation risk*) or
+justify the threshold against the human labels so it carries an absolute
+meaning.
+
+**J2. Do not call HF "leave-one-out".** `fleet_hf.py` computes
+`groupby("scene").d_blur.transform(lambda s: s - s.median())`, so the panel
+median **includes the evaluated system**; relocation *does* exclude it. Either
+make them consistent or state the difference. Measured impact of switching HF to
+a true leave-one-out median: ±6 rollouts of ~238 per variant (pca8 14→18,
+Batch64 15→17, pca4 25→19, noatok 45→46, pca2 52→51, Batch16 101→102,
+No AdaLN 95→94), no systematic direction, median |ΔB| ≈ 14 against a threshold
+of 150. Ordering is preserved; the cleanest three shuffle within their cluster.
+**Recommendation: disclose, do not re-run.**
+
+**J3. Version the calibration.** Name it (`HF-Cal-v1`, `Reloc-Cal-v1`) and never
+silently update it. If a v2 is ever needed, keep overlap anchors and publish a
+v1↔v2 linking analysis rather than overwriting historical scores.
+
+**J4. Declare that the metrics are transductive.** They use other systems'
+outputs at evaluation time — side information a stand-alone no-reference metric
+does not have. Not leakage if declared; present it as a design feature.
+
+**J5. Diagnostics worth running (cheap — the 13×256 table already exists).**
+- **System × item interaction (DIF).** The two-way model assumes "hard item" is
+  common across systems. If model families have different failure modes, a
+  single item difficulty is not invariant. This is the key validity check before
+  claiming the frozen item effects generalise.
+- **Leave-one-family-out sensitivity** on the reference panel, not just
+  leave-one-model-out (anchor-selection effects do not vanish with sample size).
+- **Paired bootstrap over the 256 inputs**, preserving pairing across systems.
+
+**J6. Estimator upgrade (future work, changes all numbers).** Replace the median
+with a robust two-way calibration `d_si = μ + α_s + β_i + ε_si`, freeze `μ̂` and
+`β̂_i` **but not `α̂_s`** (system effect is the quantity being measured, not
+nuisance), and score future systems as `B = −[d − (μ̂ + β̂_i)]`. Gives a clean
+estimand, uncertainty, and non-additivity diagnostics. Not a submission-time
+change.
+
+**J7. Relocation — harden the reference set (future work).** Replace "max over
+any peer" with a **frozen consensus anchor bank**: build the per-scene geometric
+agreement graph, keep clusters supported by multiple independently-developed
+systems and/or the real reference, and require **top-k support rather than a
+pure max** so a single erroneous anchor cannot validate a candidate. The pure
+max is the manipulable form — one peer suffices to validate another, and
+correlated failures across similar architectures are consensus without truth.
+
+**J8. Strongest objections to pre-empt.** Norm-relative truth (if all 13 fail,
+the median calls failure normal); correlated peer errors (systems are not
+independent annotators); system×item interaction; benchmark aging after
+freezing (anchors have a validity lifetime — psychometrics calls this item
+parameter drift).
+
+**J9. Release catch — scalars are enough for HF, not for relocation.** Publishing
+per-item reference *statistics* lets an outsider score HF (`β̂_i` is a number).
+It does **not** let anyone score relocation: you cannot RANSAC a frame against a
+scalar. The shipped `reloc_reference_pack_3000.npz` (ORB keypoints +
+descriptors, reproduces live same-node scoring at r=0.993, 74/75 flags
+identical) **is** the metric definition, not a convenience artifact, and the
+release text must say so — together with the exact verification procedure
+(ORB config, RANSAC threshold, inlier count) and the ±1-rollout threshold
+fragility already noted in §H4.
+
+**J10. Triage — what actually has to happen before submission.**
+
+*Free (wording only, no numbers change):* J1 terminology; the corrected §H1
+mechanism; J2 self-inclusion disclosure; J3 versioning; J4 transductive
+declaration; J6/J7 stated as future work in the limitations paragraph alongside
+the reference-free note from §H5.
+
+*Cheap (existing 13x256 table, no new generation):* the §J5 diagnostics. The
+system x item interaction test is the load-bearing one — it decides whether
+"hard scene" is a property common to all systems (frozen `β̂_i` generalises) or
+whether model families have disjoint failure modes (a single item difficulty is
+not invariant and the whole calibration is on sand). Run it first.
+
+*Not before submission:* J6 (robust two-way estimator) and J7 (consensus anchor
+bank + top-k). Both change every published number.
+
+---
+
+## K. MEASURED: system x item interaction and panel composition (run 2026-08-20)
+
+The §J5 diagnostic, run on the complete 13x256 `fleet_hf.csv` table
+(`scratchpad/dif.py`). Three results, one of them serious.
+
+**K1. Blocking is justified — item difficulty is the largest systematic term.**
+Least-squares two-way partition of `d_blur`: **item (scene) 27.9%**, system
+12.5%, residual 59.6%. Scene difficulty explains more than twice the variance
+of the system effect we are trying to measure. Removing it is not a
+convenience; an unblocked absolute score is dominated by which scene you drew.
+This is the number to quote when justifying peer normalisation.
+
+**K2. Item effects are moderately reliable, not weak.** Split-half reliability
+of `beta_i` over 500 random splits of the panel: Spearman rho = 0.653
+(95% range 0.468-0.745) at 6-7 systems per half, giving a Spearman-Brown
+full-panel reliability of **0.790**. Tukey's 1-df non-additivity test is
+significant (F(1,3059)=9.51, p=0.002) but accounts for only **0.31%** of the
+residual — with 3,328 cells significance is expected; the effect is negligible.
+Additivity is a reasonable model.
+
+**K3. SERIOUS — family DIF, and our variants hold 7 of 13 panel seats.**
+Item difficulty estimated from our 7 variants vs from the 6 external baselines
+correlates at only **Spearman rho = 0.383** (Pearson 0.494). That is *below the
+2.5th percentile of random within-panel splits* (0.468), so "hard scene" is
+partly family-specific, not a universal constant. Leave-one-family-out confirms
+our family dominates the flat median: dropping the externals leaves
+rho = 0.858 against the full-panel beta, dropping ours leaves only 0.697.
+
+The consequence is a **self-favouring bias**. Our 7 near-identical variants
+(same base model, small ablations) are 7 highly-correlated votes on what
+"normal" degradation looks like, so they collectively define the reference they
+are then scored against. Re-weighting to **one vote per family** (median over
+families of per-family medians; rho = 0.816 vs the flat median, no systematic
+shift, IQR of per-scene shift 41.2) changes the flagged counts as follows:
+
+| system | flat median (deployed) | family-balanced | delta |
+|---|---|---|---|
+| Ours Default (pca8) | 14 | 40 | +26 |
+| Ours Batch64 | 15 | 33 | +18 |
+| Ours pca4 | 25 | 53 | +28 |
+| Ours No Action Tokens | 45 | 70 | +25 |
+| Ours pca2 | 52 | 71 | +19 |
+| Ours Batch16 | 101 | 112 | +11 |
+| Ours No AdaLN | 95 | 113 | +18 |
+| astra | 18 | 19 | +1 |
+| matrixgame | 16 | 16 | 0 |
+| minWM | 3 | 3 | 0 |
+| worldcam | 83 | 90 | +7 |
+| worldplay | 23 | 26 | +3 |
+| yume | 25 | 27 | +2 |
+
+Every one of our variants moves by +11 to +28; every external baseline moves by
+0 to +7. **What survives and what does not:**
+
+- **SURVIVES — all ablation claims.** The within-family ordering is essentially
+  unchanged (only the adjacent pairs pca8/Batch64 and Batch16/No AdaLN swap).
+  "Reduced PCA supervision increases high-frequency degradation" (line ~783)
+  and every Table 14 comparison *among our variants* is robust to the
+  re-weighting. This is the paper's actual contribution and it is safe.
+- **DOES NOT SURVIVE — the absolute rate and cross-family HF comparison.**
+  Default's headline "$6\%$ high-frequency degradation" (line 746) becomes
+  ~17% under a defensible alternative weighting. Worse, under the flat median
+  Default (14) beats astra (18), matrixgame (16), worldplay (23) and yume (25);
+  under family balancing it loses to all four. Any reading of Table 14 as
+  "we degrade less than the baselines" is an artifact of panel composition.
+
+**Required manuscript action.** The existing hedge at lines 746-749 ("trained
+on FrodoBots footage while the baselines are not... robustness on this
+deployment distribution rather than a domain-neutral ranking") is good but
+covers a *different* mechanism (training distribution). Add a second, explicit
+sentence to the same paragraph and to the instrument definition (Supplementary
+~line 1105): the reference median is computed over a panel in which seven of
+thirteen members are variants of a single model, so the high-frequency rate is
+**calibrated to our own family** and cross-family absolute comparisons should
+not be read as a ranking. State the measured sensitivity (rho = 0.383 across
+families vs a 0.468 within-panel chance floor; our rates roughly double under
+one-vote-per-family) rather than hedging vaguely. Present it alongside §H5's
+reference-free-metrics-as-future-work note.
+
+**Do not re-run the numbers.** Family balancing is defensible but not uniquely
+correct, and switching would change every published HF value at submission
+time. Report the deployed flat-median numbers, disclose the sensitivity, and
+fold the balanced variant into the §J6 future-work estimator.
+
+**K4. MEASURED: relocation is more family-biased than HF** (local agent,
+2026-08-20; artifact `out/reloc_family_bias.csv`, per-rollout `c_any`,
+`max_peer`, `max_peer_fam`, `samefam_max`, `c_extreal`, `c_onerep`).
+Full per-scene pairwise RANSAC-verified ORB inlier matrix recomputed from the
+frozen pack (13 systems + 4 real references x 256 scenes; no video decode).
+
+*Who supplies the max, for our systems:* **same-family 80.4%**, real 17.3%, all
+externals combined ~2%. Per variant the max is same-family 77-94% of the time
+(Default 94%, pca4 92%). The exception is No AdaLN at 34% — it is degraded
+enough that it matches real/externals instead. Externals are structurally 0%
+same-family, each being its own family.
+
+*Flag rate (relocated, <50) under three panels:*
+
+| system | n | (a) any peer | (b) 1 rep/family | (c) externals+real |
+|---|---|---|---|---|
+| Default | 239 | 10.0% | 15.1% | **20.1%** |
+| Batch64 | 237 | 8.0% | 11.0% | 17.3% |
+| pca4 | 237 | 13.5% | 17.7% | 28.3% |
+| pca2 | 232 | 15.1% | 19.0% | 25.4% |
+| Batch16 | 236 | 25.0% | 32.2% | 41.5% |
+| No Action Tokens | 229 | 13.5% | 19.7% | 30.6% |
+| No AdaLN | 200 | 27.0% | 29.0% | 30.0% |
+| minWM | 187 | 3.7% | 3.7% | 3.7% |
+| Matrix-Game | 240 | 95.4% | 95.8% | 95.8% |
+| WorldPlay | 238 | 77.3% | 78.2% | 78.6% |
+| WorldCam | 216 | 87.5% | 87.5% | 87.5% |
+| Astra | 215 | 67.0% | 68.4% | 68.8% |
+| Yume | 237 | 58.2% | 59.1% | 59.9% |
+
+Removing same-family peers roughly **doubles every one of our rates** while
+moving every external by **at most one rollout**. That asymmetry is the control:
+it rules out a threshold artifact, because a mis-set threshold would move
+everyone. No AdaLN is the lone ours exception (27.0->30.0) precisely because it
+does not rely on same-family propping.
+
+*Direct propping measure:* **189/1356 = 14%** of our not-relocated rollouts
+survive *only* because another of our own variants matched them (Batch16 22%,
+No Action Tokens 20%, pca4 17%, pca2 12%, Default 11%, Batch64 10%,
+No AdaLN 4%). So the metric is not wholly family-internal — but the bias is
+material and strictly one-directional, and externals cannot access it at all.
+
+**Same verdict as K3, structurally stronger.** Relocation is a `max` over peers
+and therefore monotone in panel size, so this bias can only ever favour the
+family with the most seats. Ordering among our variants survives; the absolute
+rate and the cross-family comparison do not.
+
+**K5. Manuscript text to add** (Table 14 caption and/or the relocation
+instrument definition, Supplementary ~line 1105 region):
+
+> Relocation is a peer-referenced statistic: a rollout is scored by its best
+> geometric agreement with any other panel member. Because seven of the
+> thirteen panel members are variants of a single model while each baseline is
+> architecturally unique, our variants benefit from same-family agreement that
+> the baselines cannot access -- the best-matching peer is another of our own
+> variants for 80.4\% of our rollouts. Scoring only against the external
+> baselines and the real references roughly doubles our relocation rates
+> (Default 10.0\% to 20.1\%, pca4 13.5\% to 28.3\%) while moving every baseline
+> by at most one rollout; the relative ordering among our variants is
+> unaffected. Cross-family relocation rates are therefore panel-dependent and
+> should not be read as a domain-neutral ranking.
+
+The parallel HF sentence is in §K3. Both belong next to the §H5 note that
+reference-free formulations are left to future work.
+
+**K6. OPEN — reconcile 10.0% against the published 11%.** The agent's
+"any peer" Default rate is 10.0% (n=239); Table 14 as published says 11%. The
+13-system panel excludes No Critic in both, so the likely cause is the frozen
+pack reproducing live scoring at r=0.993 (74/75 flags identical), i.e. ~2
+rollouts. **Must be settled before §K5 goes in**, because the caption quotes
+"10.0% to 20.1%" and the base has to match the table. If the pack is the cause,
+either quote the live-scored base (11% -> ~22%) or state that the debiased
+figures are pack-scored.

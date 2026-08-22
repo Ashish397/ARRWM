@@ -402,7 +402,6 @@ srun --jobid=$HOLDER --overlap --nodelist=$NODES --nodes=$NNODE --ntasks-per-nod
     dmd_42f_clean_match_max_drift_frames=12 \
     dmd_42f_clean_match_min_improve=0.15 \
     dmd_42f_clean_match_forward=false \
-    $DEXTRA \
     gan_enabled=${GAN_ON:-true} \
     gan_backbone=ladd_teacher_feat \
     gan_loss_weight=${GANW:-1.0} \
@@ -437,10 +436,11 @@ srun --jobid=$HOLDER --overlap --nodelist=$NODES --nodes=$NNODE --ntasks-per-nod
     ladd_use_csm=true \
     ladd_diff_aug_policy=flip \
     ladd_pair_start_seed_boundary=true \
-    ladd_wavelet_hf_enabled=true \
-    ladd_wavelet_hf_augment=true \
+    ladd_wavelet_hf_enabled=${WAVELET:-true} \
+    ladd_wavelet_hf_augment=${WAVELET:-true} \
     ladd_wavelet_hf_drop_ll=${DROPLL:-true} \
     ladd_wavelet_hf_ll_weight=0.15 \
+    $DEXTRA \
     run_name=dmd10k_${DARM}_h${HOLDER}_${RUNSTAMP}
 
 echo "DMD10K $DARM completed $(date)"

@@ -520,6 +520,7 @@ def compute_stat_anchor_loss(
     long_STD_anchor_override: Optional[torch.Tensor] = None,
     long_M2_anchor_override: Optional[torch.Tensor] = None,
     long_TV_anchor_override: Optional[torch.Tensor] = None,
+    std_one_sided: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
     """Seed-anchored, MSE-with-floor regulariser on three latent summary
     stats — per-frame STD, M2 (= Σ_c σ_c²) and TV (= Σ_c mean|Δx|) —
@@ -660,8 +661,15 @@ def compute_stat_anchor_loss(
         TV_a2_long = None
 
     # Raw MSE values (scalar each).
-    mse_STD_short = (STD_pf - a_STD_short).pow(2).mean()
-    mse_STD_long = (STD_long - a_STD_long).pow(2).mean()
+    if bool(std_one_sided):
+        # One-sided variance FLOOR (2026-08-20): penalize only the deficit
+        # (pred STD below anchor); upside stays free so excursions ("life")
+        # are never taxed. Counters AR variance contraction without pinning.
+        mse_STD_short = torch.relu(a_STD_short - STD_pf).pow(2).mean()
+        mse_STD_long = torch.relu(a_STD_long - STD_long).pow(2).mean()
+    else:
+        mse_STD_short = (STD_pf - a_STD_short).pow(2).mean()
+        mse_STD_long = (STD_long - a_STD_long).pow(2).mean()
     mse_M2_short = (M2_pf - a_M2_short).pow(2).mean()
     mse_M2_long = (M2_long - a_M2_long).pow(2).mean()
     mse_TV_short = (TV_pf - a_TV_short).pow(2).mean()

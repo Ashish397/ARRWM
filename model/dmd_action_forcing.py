@@ -218,6 +218,15 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_asymmetric_scoring_enabled = bool(
             getattr(args, "dmd_asymmetric_scoring_enabled", True)
         )
+        # ``debug_dump_scorer_inputs_every`` (int, default 0 = off): every N
+        # trainer steps, stash DETACHED cpu copies of the 42f scoring inputs
+        # (noisy_x / clean_x / gt_target) on ``self._dbg_scorer_dump``. The
+        # trainer decodes them (plus the GAN disc's real/fake pair slabs) to
+        # a side-by-side grid video under samples/dbg_inputs_step<N>.mp4.
+        # Pure diagnostics: never touches the training path.
+        self.debug_dump_scorer_inputs_every = int(
+            getattr(args, "debug_dump_scorer_inputs_every", 0) or 0
+        )
 
         # ``dmd_42f_enabled`` (gt-context fix): keep v14's EXACT training
         # shape — 21 clean + 21 noisy at tf_rope_offset=npb — but make the
@@ -434,9 +443,88 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_42f_clean_match_forward = bool(
             getattr(args, "dmd_42f_clean_match_forward", False)
         )
+        # ``dmd_42f_clean_match_drift_compose`` (v2, 2026-08-20): apply the
+        # clean DRIFT on top of the MATCHED offset. v1 was withdrawn because it
+        # ran the drift curriculum with NO leak masking -- the band's own GT sat
+        # unmasked in the clean half and the leak GREW along the ramp.
+        # v2 fixes the root cause: fix_clean_counterpart IS match-invariant
+        # (clean slot i holds world noisy_lo+match_m+drift_off+i, noisy slot j
+        # holds noisy_lo+match_m+j, so i = j - drift_off and match_m cancels),
+        # so it is now ALLOWED under match and REQUIRED when composing -- it is
+        # the only drift-aware leak mask. clean_self / clean_self_forward stay
+        # excluded (their rewrites are genuinely not match-aware).
+        self.dmd_42f_clean_match_drift_compose = bool(
+            getattr(args, "dmd_42f_clean_match_drift_compose", False)
+        )
+        if self.dmd_42f_clean_match_drift_compose:
+            if not self.dmd_42f_clean_drift_enabled:
+                raise ValueError(
+                    "dmd_42f_clean_match_drift_compose requires "
+                    "dmd_42f_clean_drift_enabled=true."
+                )
+            if not bool(getattr(
+                    args, "dmd_42f_fix_clean_counterpart", False)):
+                raise ValueError(
+                    "dmd_42f_clean_match_drift_compose requires "
+                    "dmd_42f_fix_clean_counterpart=true: it is the ONLY "
+                    "drift-aware mask for the supervised band's own GT in the "
+                    "clean half. Without it the frozen teacher reads the "
+                    "band's GT and the leak grows along the drift ramp."
+                )
+            if bool(getattr(args, "dmd_42f_clean_self", False)) or bool(
+                    getattr(args, "dmd_42f_clean_self_forward", False)):
+                raise ValueError(
+                    "dmd_42f_clean_match_drift_compose is incompatible with "
+                    "dmd_42f_clean_self / dmd_42f_clean_self_forward (their "
+                    "clean-half rewrites ignore the matched offset)."
+                )
+        self.dmd_only_last_chunk_per_ride = bool(
+            getattr(args, "dmd_only_last_chunk_per_ride", False)
+        )
+        # One-sided STD floor (variance floor: tax deficit only). Off default.
+        self.stat_anchor_std_one_sided = bool(
+            getattr(args, "stat_anchor_std_one_sided", False)
+        )
+        # CARN global-drift counter-bias: lambda + vector file (16 channel
+        # means, fitted by analysis/drift_probe). 0/empty = off.
+        self.carn_seam_drift_lambda = float(
+            getattr(args, "carn_seam_drift_lambda", 0.0))
+        self.carn_seam_drift_file = str(
+            getattr(args, "carn_seam_drift_file", "") or "")
+        # Seam temperature (mechanical variance re-inflation). 1.0 = off.
+        self.carn_seam_temp = float(getattr(args, "carn_seam_temp", 1.0))
+        # f-distill forward-KL mix (mean-seeking aid to DMD's reverse KL).
+        # 0 = pure reverse KL (default). m in (0,1]: per-sample gradient
+        # weight w = (1-m) + m*r_hat, r_hat = exp(centered disc logit) --
+        # the f-distill density-ratio reweighting using the GAN disc we
+        # already train. Mean-seeking: upweights fake samples the disc
+        # finds real-plausible (covers real modes), downweights samples
+        # deep in fake territory.
+        self.dmd_fkl_mix = float(getattr(args, "dmd_fkl_mix", 0.0) or 0.0)
+        # CARN seam affine strength (latent CARN v0). 0 = off.
+        self.carn_seam_affine_lambda = float(
+            getattr(args, "carn_seam_affine_lambda", 0.0)
+        )
+        # Rolling scorer-ctx source (see generate_next_chunk). Default off.
+        self.dmd_rolling_ctx_last_rung = bool(
+            getattr(args, "dmd_rolling_ctx_last_rung", False)
+        )
+        if self.dmd_only_last_chunk_per_ride and bool(
+            getattr(args, "dmd_only_first_chunk_per_ride", False)
+        ):
+            raise ValueError(
+                "dmd_only_last_chunk_per_ride is mutually exclusive with "
+                "dmd_only_first_chunk_per_ride."
+            )
+        # only-last + flash-DMD/GAN is SUPPORTED: the gate skips only the DMD
+        # scorer forward, so the flash slab, the flash-rung anti-collapse and
+        # the stat anchor all still run on skipped rolls and keep the
+        # GAN-supervised rung constrained.
+        _compose = self.dmd_42f_clean_match_drift_compose
         if self.dmd_42f_clean_match_enabled and (
-            self.dmd_42f_clean_drift_enabled
-            or bool(getattr(self, "dmd_42f_fix_clean_counterpart", False))
+            (self.dmd_42f_clean_drift_enabled and not _compose)
+            or (bool(getattr(self, "dmd_42f_fix_clean_counterpart", False))
+                and not _compose)
             or bool(getattr(self, "dmd_42f_clean_self", False))
         ):
             raise ValueError(
@@ -458,6 +546,57 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_only_first_chunk_per_ride = bool(
             getattr(args, "dmd_only_first_chunk_per_ride", False)
         )
+
+        # ``dmd_supervise_roll_mode`` (2026-08-22): which roll(s) of a ride
+        # receive the generator DMD gradient. One of:
+        #   "all"    (default) — DMD fires at EVERY roll (current behavior;
+        #            2-6 correlated reverse-KL terms per ride under random
+        #            depth = a secret LR multiplier on shallow context).
+        #   "last"   — supervise only the deepest roll. Maps onto the
+        #            existing ``dmd_only_last_chunk_per_ride`` machinery
+        #            (setting the mode to "last" is identical to setting
+        #            that legacy flag; both remain supported).
+        #   "random" — supervise ONE roll per ride, index drawn once per
+        #            ride RANK-UNIFORMLY (rank-0 draw + broadcast in the
+        #            trainer, same site/pattern as the random-depth draw)
+        #            in [1, max_rolls]. Every other roll skips the scorer
+        #            via the same ``_dmd_scorer_skip_this_roll`` path as
+        #            only-last. The critic still trains on EVERY roll.
+        # The skip condition MUST stay rank-uniform (the scorer contains
+        # collectives): both operands (target broadcast from rank 0;
+        # chunks_in_ride lockstep via the MAX-reduced reset) are.
+        _srm = str(
+            getattr(args, "dmd_supervise_roll_mode", "all") or "all"
+        ).strip().lower()
+        if _srm not in ("all", "last", "random"):
+            raise ValueError(
+                f"dmd_supervise_roll_mode must be one of 'all'|'last'|"
+                f"'random'; got {_srm!r}."
+            )
+        if _srm == "random" and self.dmd_only_last_chunk_per_ride:
+            raise ValueError(
+                "dmd_supervise_roll_mode='random' is mutually exclusive "
+                "with dmd_only_last_chunk_per_ride=true (set the legacy "
+                "flag false, or use mode 'last')."
+            )
+        if _srm in ("last", "random") and self.dmd_only_first_chunk_per_ride:
+            raise ValueError(
+                f"dmd_supervise_roll_mode={_srm!r} is mutually exclusive "
+                "with dmd_only_first_chunk_per_ride=true."
+            )
+        # Back-compat both ways: legacy flag => mode "last"; mode "last"
+        # => raise the legacy flag so every existing only-last gate
+        # (generator skip, clean_match guard, trainer max_rolls_this_step
+        # plumbing) fires without duplicated conditions.
+        if self.dmd_only_last_chunk_per_ride:
+            _srm = "last"
+        elif _srm == "last":
+            self.dmd_only_last_chunk_per_ride = True
+        self.dmd_supervise_roll_mode = _srm
+        # Per-ride supervised-roll target (mode "random" only). Stamped by
+        # the trainer at the once-per-ride draw site (rank-0 +
+        # dist.broadcast, right after the random-depth draw); 0 = unset.
+        self._dmd_supervise_target_roll = 0
 
         # ---------------------------------------------------------------
         # Online real_teacher (v14-LoRA trained online vs GT video).
@@ -2251,8 +2390,38 @@ class ActionForcingDMD(SelfForcingModel):
 
         # DMD hyperparameters (mirrors CF exactly).
         self.num_train_timestep = int(getattr(args, "num_train_timestep", 1000))
-        self.min_step = int(0.02 * self.num_train_timestep)
-        self.max_step = int(0.98 * self.num_train_timestep)
+        # ``dmd_score_t_min`` / ``dmd_score_t_max`` (2026-08-22): the FINAL
+        # clamp of the continuous DMD score-timestep sampler
+        # (``_sample_dmd_timestep``: uniform [min_score_timestep,
+        # max_score_timestep) -> SD3 shift -> clamp [min_step, max_step]).
+        # Defaults reproduce the legacy hard-coded 0.02/0.98 * T convention
+        # (= [20, 980] at T=1000), so unset configs are byte-identical.
+        # NOTE: the ``dmd_sample_at_rungs=true`` path deliberately BYPASSES
+        # this clamp (the rung ladder is a valid discrete support; clamping
+        # turned rung 1000 into 980). These knobs only shape the continuous
+        # path (``dmd_sample_at_rungs=false``).
+        # SHARED CLAMP (review 2026-08-22): ``_sample_dmd_timestep`` is also
+        # the sampler for the CRITIC's training timestep and the aux-teacher
+        # pass, so these knobs move those draws too. That is deliberate DMD
+        # symmetry (the critic should be trained on the same t-support it is
+        # queried on) — but set them knowing they are not scoring-only.
+        # None-tolerant (a present-but-null YAML key must not int(None)).
+        _t_min = getattr(args, "dmd_score_t_min", None)
+        _t_max = getattr(args, "dmd_score_t_max", None)
+        self.min_step = (
+            int(0.02 * self.num_train_timestep) if _t_min is None
+            else int(_t_min)
+        )
+        self.max_step = (
+            int(0.98 * self.num_train_timestep) if _t_max is None
+            else int(_t_max)
+        )
+        if not (0 <= self.min_step < self.max_step <= self.num_train_timestep):
+            raise ValueError(
+                f"dmd_score_t_min/dmd_score_t_max must satisfy 0 <= min < "
+                f"max <= {self.num_train_timestep}; got "
+                f"[{self.min_step}, {self.max_step}]."
+            )
         if hasattr(args, "real_guidance_scale"):
             self.real_guidance_scale = float(args.real_guidance_scale)
             self.fake_guidance_scale = float(getattr(args, "fake_guidance_scale", 0.0))
@@ -2386,6 +2555,29 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_normalization_denom_floor = float(
             getattr(args, "dmd_normalization_denom_floor", 0.05)
         )
+        # ``dmd_grad_target_norm`` (2026-08-22): CAP-ONLY rescale of the DMD
+        # gradient's mean-abs magnitude to a target tau. Applied AFTER the
+        # eq.(8) normalization + nan_to_num (and the fkl mixing when live),
+        # BEFORE the 0.5*MSE loss surrogate is built — i.e. it targets the
+        # PRE-``dmd_loss_weight_resolved`` gradient, so the warmup ramp
+        # still ramps on top. scale = min(1, tau / mean|grad|): never
+        # amplifies small gradients, only caps large ones. Applied to BOTH
+        # heads (the TF grad inside ``_compute_kl_grad`` and the AR-head
+        # ``grad_ar`` — mandatory: an AR-only arm (dmd_tf_head_weight=0)
+        # would otherwise see the knob as a silent no-op). The metric is
+        # the same mean|grad| that ``dmdtrain_gradient_norm`` /
+        # ``dmd_ar_grad_norm`` log, so those gauges read post-cap values
+        # bounded by tau. Per-rank local math on the rank's own grad — no
+        # collective: each rank's DMD term is its own sample and DDP
+        # averages gradients after backward as usual. None-tolerant;
+        # 0.0 (default) = off, byte-identical.
+        _gtn = getattr(args, "dmd_grad_target_norm", 0.0)
+        self.dmd_grad_target_norm = 0.0 if _gtn is None else float(_gtn)
+        if self.dmd_grad_target_norm < 0.0:
+            raise ValueError(
+                f"dmd_grad_target_norm must be >= 0 (0 = off); got "
+                f"{self.dmd_grad_target_norm}"
+            )
         # --- MAE-based student-vs-teacher DMD downweighting ---
         # The DMD gradient pulls the student toward the frozen teacher
         # (real_score). That is only helpful while the teacher is the
@@ -3152,6 +3344,24 @@ class ActionForcingDMD(SelfForcingModel):
         # Fake-score updates: ON by default for DMD2.
         self.fake_score_updates_enabled = bool(
             getattr(args, "fake_score_updates_enabled", True)
+        )
+        # ``fake_score_init_from_teacher`` (2026-08-22): initialize the
+        # fake_score (critic) from the DIFFUSION TEACHER (real_score after
+        # the v14 LoRA merge) instead of the 4-step ODE-distilled student
+        # clone. Rationale (external DMD review): the fake_score is a SCORE
+        # model trained with a many-step denoising loss; a full diffusion
+        # model is the right prior for it, while the few-step student is
+        # not (DMD2 initializes the fake score from the base diffusion
+        # model, not from the distilled generator). Architecturally clean
+        # here: real_score and fake_score are the SAME WanDiffusionWrapper
+        # (is_causal=False, same 1.3B model, same action patches) — see
+        # model/base.py — so the merged-teacher state_dict maps 1:1 onto
+        # the fake DiT. Default False = byte-identical (generator mirror).
+        # NOTE the trainer-side companion ``resume_load_fake_score=false``:
+        # under auto_resume, _maybe_resume restores ckpt["fake_score"] and
+        # would silently OVERWRITE this init on warm starts.
+        self.fake_score_init_from_teacher = bool(
+            getattr(args, "fake_score_init_from_teacher", False)
         )
 
         # Auxiliary action-supervision heads — instantiated for ODE
@@ -4042,7 +4252,19 @@ class ActionForcingDMD(SelfForcingModel):
         """DMD2 upgrade: fake_score starts as a clone of the generator's
         ODE-init state. Without this, the DMD subtraction kicks off as
         ``real - random`` and the student gets a noisy unhelpful gradient
-        for the first ~hundreds of steps."""
+        for the first ~hundreds of steps.
+
+        ``fake_score_init_from_teacher`` (2026-08-22): AFTER the generator
+        mirror, overwrite with the DIFFUSION TEACHER's weights (real_score
+        post v14-LoRA merge) — the correct prior for a score model (see
+        the config comment). Ordering is deliberate: generator first, then
+        teacher on top, so any fake-only key the teacher state_dict lacks
+        (e.g. head_alt) keeps the closest available init instead of raw
+        pretrained Wan. The teacher path fails LOUD (no try/except): a
+        silent fallback to the ODE-student clone would be exactly the
+        silent-config-no-op failure mode this flag exists to avoid.
+        MUST run after ``_load_real_score_with_v14_lora`` (it does — see
+        the __init__ call order) so the LoRA is already merged."""
         try:
             gen_sd = self.generator.model.state_dict()
             missing, unexpected = self.fake_score.model.load_state_dict(
@@ -4056,6 +4278,59 @@ class ActionForcingDMD(SelfForcingModel):
         except Exception as e:
             if _is_main():
                 logging.warning("[ActionForcingDMD] fake_score mirror failed: %s", e)
+        if not getattr(self, "fake_score_init_from_teacher", False):
+            return
+        # Teacher-source selection (review 2026-08-22). The default frozen
+        # path merge_and_unloads, leaving real_score.model a bare (patched)
+        # WanModel whose keys match fake_score's 1:1. The online-teacher
+        # branch (real_teacher_train_online=true) instead re-wraps the
+        # merged base with a fresh trainable LoRA, and under peft>=0.18 a
+        # PeftModel's get_base_model().state_dict() carries
+        # ``*.base_layer.weight`` / ``*.lora_A.*`` keys — loading that into
+        # a bare WanModel leaves every attention projection MISSING (the
+        # >=90% audit below would raise). So: prefer the bare merged
+        # ``real_score_frozen`` copy when the frozen-pass branch built one;
+        # otherwise refuse the peft-wrapped source loudly instead of
+        # emitting key salad.
+        _frozen = getattr(self, "real_score_frozen", None)
+        if _frozen is not None and getattr(_frozen, "model", None) is not None:
+            src = _frozen.model
+        else:
+            src = self.real_score.model
+            if hasattr(src, "get_base_model"):
+                raise RuntimeError(
+                    "[ActionForcingDMD] fake_score_init_from_teacher=True "
+                    "with a peft-wrapped real_score (real_teacher_train_"
+                    "online=true) and no real_score_frozen copy: the peft "
+                    "state_dict is base_layer/lora_-keyed and cannot "
+                    "initialize the bare fake_score DiT. Enable "
+                    "dmd_frozen_teacher_pass_enabled (which builds the "
+                    "bare merged copy) or run with the frozen teacher."
+                )
+        src_sd = src.state_dict()
+        # load_state_dict(strict=False) still RAISES on shape mismatches;
+        # missing/unexpected key drift is what needs the explicit audit.
+        t_missing, t_unexpected = self.fake_score.model.load_state_dict(
+            src_sd, strict=False,
+        )
+        n_fake = len(self.fake_score.model.state_dict())
+        n_loaded = n_fake - len(t_missing)
+        if n_fake == 0 or n_loaded < 0.9 * n_fake:
+            raise RuntimeError(
+                f"[ActionForcingDMD] fake_score_init_from_teacher=True but "
+                f"only {n_loaded}/{n_fake} fake_score keys were supplied by "
+                f"the teacher state_dict (missing={len(t_missing)}, "
+                f"unexpected={len(t_unexpected)}; first missing: "
+                f"{list(t_missing)[:6]}). The critic would silently remain "
+                f"the ODE-student clone — refusing to continue."
+            )
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] fake_score initialized from the merged "
+                "v14 teacher (real_score): %d/%d keys loaded, missing=%d "
+                "(kept generator-mirror values), unexpected=%d.",
+                n_loaded, n_fake, len(t_missing), len(t_unexpected),
+            )
 
     def _apply_fake_score_lora(self, device) -> None:
         """Wrap ``fake_score.model`` with peft LoRA when
@@ -5141,6 +5416,53 @@ class ActionForcingDMD(SelfForcingModel):
             )
         grad = torch.nan_to_num(grad)
 
+        # ---- f-distill forward-KL mixing (dmd_fkl_mix) ------------------
+        # grad_fKL ~ r(x) * (s_fake - s_real), r = p/q estimated from the
+        # LADD disc's fake-side logit (stashed by the trainer's gen-phase
+        # disc scoring; 1 gen-step stale, acceptable). Cross-rank centering
+        # makes r_hat mean~1 (B=1 per rank, so normalization must span
+        # ranks). The all_reduce is UNCONDITIONAL under mix>0: the stash
+        # read has a 0.0 fallback so every rank participates -- a missing
+        # per-rank stash biases r toward 1, it cannot hang the collective.
+        _fm = float(getattr(self, "dmd_fkl_mix", 0.0) or 0.0)
+        if _fm > 0.0:
+            import math as _math
+            _lv = float(getattr(self, "_fkl_fake_logit", 0.0) or 0.0)
+            if not _math.isfinite(_lv):
+                _lv = 0.0
+            _lt = torch.tensor([_lv], device=grad.device, dtype=torch.float32)
+            # _lt now carries the relativistic gap E[d_fake]-E[d_real].
+            # r_hat_i = exp(gap_i); normalize by the cross-rank mean of
+            # r_hat (not of the gap) so weights average ~1 over the
+            # 8-sample virtual batch (f-distill's batch normalization).
+            _ri = torch.exp(_lt.clamp(-2.0, 2.0))
+            _rsum = _ri.clone()
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.all_reduce(_rsum, op=dist.ReduceOp.SUM)
+                _rbar = _rsum / float(dist.get_world_size())
+            else:
+                _rbar = _ri
+            _rhat = _ri / _rbar.clamp_min(1e-4)
+            grad = grad * ((1.0 - _fm) + _fm * _rhat.view(1, 1, 1, 1, 1))
+            self._fkl_last_rhat = float(_rhat.item())
+
+        # ---- DMD gradient-norm targeting (dmd_grad_target_norm) ---------
+        # Cap-only: scale = min(1, tau / mean|grad|). See the config-parse
+        # comment for placement rationale (post-normalization/fkl,
+        # pre-loss-surrogate => pre-warmup-ramp). mean|grad| == the
+        # ``dmdtrain_gradient_norm`` metric logged below, which therefore
+        # reads the POST-cap value (bounded by tau when the cap binds).
+        _gt_tau = float(getattr(self, "dmd_grad_target_norm", 0.0) or 0.0)
+        _gt_scale_val = 1.0
+        if _gt_tau > 0.0:
+            _gt_m = torch.mean(torch.abs(grad))
+            _gt_scale = torch.clamp(
+                _gt_tau / _gt_m.clamp_min(1e-12), max=1.0,
+            )
+            grad = grad * _gt_scale
+            _gt_scale_val = float(_gt_scale.detach().item())
+        self._dmd_grad_target_scale_last = _gt_scale_val
+
         # Diagnostics: pred_real / pred_fake L2 norms (RMS) for the gen
         # and teacher score outputs at the sampled DMD timestep.
         with torch.no_grad():
@@ -5156,6 +5478,12 @@ class ActionForcingDMD(SelfForcingModel):
             "pred_real_rms": _pred_real_l2,
             "pred_fake_rms": _pred_fake_l2,
         }
+        if float(getattr(self, "dmd_fkl_mix", 0.0) or 0.0) > 0.0:
+            log_dict["fkl_rhat"] = float(getattr(self, "_fkl_last_rhat", 1.0))
+        if float(getattr(self, "dmd_grad_target_norm", 0.0) or 0.0) > 0.0:
+            log_dict["dmd_grad_target_scale"] = float(
+                getattr(self, "_dmd_grad_target_scale_last", 1.0)
+            )
         # Optional eval-time stash so the trainer can decode the
         # scorers' denoised x0 estimates as sample videos. ``None``
         # = capture disabled (default); a dict means the trainer
@@ -6134,6 +6462,15 @@ class ActionForcingDMD(SelfForcingModel):
         gt_target: Optional[torch.Tensor] = None,
         ar_head_inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, dict]:
+        # only-last (dmd_only_last_chunk_per_ride): the caller sets this for
+        # rolls that must not carry DMD gradient. We skip ONLY the real+fake
+        # teacher forwards here -- the caller still runs the flash-slab
+        # surfacing, the flash-rung anti-collapse and the stat anchor, so the
+        # GAN-supervised rung stays constrained on skipped rolls. Returning a
+        # connected zero keeps the generator graph reachable for DDP.
+        if bool(getattr(self, "_dmd_scorer_skip_this_roll", False)):
+            _z = (image_or_video.float() * 0.0).sum().to(image_or_video.dtype)
+            return _z, {"dmd_skipped_non_last_chunk_of_ride": 1.0}
         """CF-parity DMD loss (eq. 7).
 
         Inputs:
@@ -6469,6 +6806,25 @@ class ActionForcingDMD(SelfForcingModel):
                             self.dmd_normalization_denom_floor
                         )
                     grad_ar = torch.nan_to_num(grad_ar)
+                    # ---- gradient-norm targeting, AR head ----------------
+                    # Same cap-only rescale as the TF grad (see
+                    # ``dmd_grad_target_norm`` config comment) with the AR
+                    # band's OWN mean|grad_ar| metric, so an AR-only arm
+                    # (dmd_tf_head_weight=0) gets the cap too instead of a
+                    # silent no-op. ``dmd_ar_grad_norm`` below therefore
+                    # logs the post-cap value.
+                    _gt_tau_ar = float(getattr(
+                        self, "dmd_grad_target_norm", 0.0) or 0.0)
+                    if _gt_tau_ar > 0.0:
+                        _gt_m_ar = torch.mean(torch.abs(grad_ar))
+                        _gt_scale_ar = torch.clamp(
+                            _gt_tau_ar / _gt_m_ar.clamp_min(1e-12),
+                            max=1.0,
+                        )
+                        grad_ar = grad_ar * _gt_scale_ar
+                        dmd_log_dict["dmd_grad_target_scale_ar"] = float(
+                            _gt_scale_ar.detach().item()
+                        )
                     dmd_log_dict["dmd_ar_grad_norm"] = torch.mean(
                         torch.abs(grad_ar)
                     ).detach()
@@ -7100,6 +7456,8 @@ class ActionForcingDMD(SelfForcingModel):
                     M1_long_weight=self.stat_anchor_M1_long_weight,
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
+                    std_one_sided=bool(getattr(
+                        self, "stat_anchor_std_one_sided", False)),
                 )
                 # Anchor SOURCE by mode: 'target_matching' -> per-chunk
                 # k-closest-GT anchors for ALL stats; else -> the GT seed.
@@ -8904,6 +9262,24 @@ class ActionForcingDMD(SelfForcingModel):
         cond_dict, uncond_dict, clean_cond_dict, clean_uncond_dict = (
             self._streaming_build_cond_dicts()
         )
+        # CARN seam affine: publish the ride seed's per-channel latent stats
+        # as the pipeline's re-anchor target (recomputed per call -- cheap,
+        # resets naturally with the ride).
+        if (self.carn_seam_drift_lambda > 0.0 and self.carn_seam_drift_file
+                and getattr(pipe, "_carn_seam_drift_vec", None) is None):
+            import torch as _th
+            pipe._carn_seam_drift_vec = _th.load(
+                self.carn_seam_drift_file, map_location="cpu").float()
+        pipe.carn_seam_drift_lambda = float(self.carn_seam_drift_lambda)
+        pipe.carn_seam_temp = float(getattr(self, "carn_seam_temp", 1.0))
+        pipe.carn_seam_affine_lambda = float(
+            getattr(self, "carn_seam_affine_lambda", 0.0))
+        if float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0) > 0.0:
+            _seed_sa = s["seed_latents"].float()
+            pipe._carn_seam_target = (
+                _seed_sa.mean(dim=(0, 1, 3, 4)),
+                _seed_sa.std(dim=(0, 1, 3, 4)),
+            )
 
         # Two-grad-point rollout (Flash-DMD §3.3): when paper-aligned-
         # adv is on AND we're in a grad-active iter, run an extra
@@ -8945,16 +9321,41 @@ class ActionForcingDMD(SelfForcingModel):
         new_last_rung_chunk = (
             pipe._flash_dmd_gan_output if flash_dmd_enabled else None
         )
+        # Finish-denoised per-chunk pred (refined cache_pred; the content the
+        # KV cache was committed from = inference-parity). None when
+        # flash_dmd_enabled=False. Surfaced for the rollout viz so videos show
+        # deployable output rather than the random exit-rung x0 lottery.
+        info_finish_denoised = getattr(pipe, "_clean_chunk", None)
 
         # Snapshot OLD previous_chunk BEFORE we overwrite — clean_x_self
         # assembly on iter k≥2 needs the iter (k-1) chunk.
         prev_chunk_for_clean = s["previous_chunk"]
 
         # Build chunk_size-length full_chunk via overlap.
+        # ``dmd_rolling_ctx_last_rung`` (2026-08-20 review): the overlap ctx
+        # the DMD scorer sees defaults to the prior iter's EXIT-RUNG x0 -- a
+        # random-rung estimate (t up to 1000 => near-noise x0 ~25% of the
+        # time) -- while the KV cache that actually conditioned generation was
+        # committed from the finish-denoised pred, and inference context is
+        # always finish-denoised. The disc already got this fix
+        # (previous_last_rung_chunk); this extends it to the scorer window.
+        # When on and the flash t=gan_t slab exists, source the overlap from
+        # it (detached ctx only -- the supervised band is untouched).
+        # Default False = byte-identical.
+        _ctx_slab = None
         if overlap > 0:
-            full_chunk = torch.cat(
-                [s["previous_chunk"][:, -overlap:], new_chunk], dim=1,
-            )
+            # NOTE: do NOT blanket-detach here -- dmd_lookback_chunks=1
+            # deliberately stashes an un-detached new-part so the next iter's
+            # overlap carries chunk_k's graph. Detach ONLY the last-rung
+            # override (it is a GAN-slab view; scorer ctx must not backprop
+            # into the flash forward).
+            _ctx_slab = s["previous_chunk"][:, -overlap:]
+            if bool(getattr(self, "dmd_rolling_ctx_last_rung", False)):
+                _plr = s.get("previous_last_rung_chunk")
+                if _plr is not None and _plr.shape[1] >= overlap:
+                    _ctx_slab = _plr[:, -overlap:].detach()
+        if overlap > 0:
+            full_chunk = torch.cat([_ctx_slab, new_chunk], dim=1)
         else:
             full_chunk = new_chunk
 
@@ -9096,6 +9497,10 @@ class ActionForcingDMD(SelfForcingModel):
             # (action_critic) consume it
             # as the G-side fake.
             "flash_dmd_gan_chunk": full_last_rung_chunk,
+            "finish_denoised_chunk": (
+                info_finish_denoised.detach()
+                if info_finish_denoised is not None else None
+            ),
         }
         # Surface MAE from pipeline.
         ext = getattr(pipe, "_last_extension_metrics", None) or {}
@@ -9275,7 +9680,7 @@ class ActionForcingDMD(SelfForcingModel):
 
     def compute_clean_match_offset(
         self, chunk: torch.Tensor, info: Dict[str, Any],
-        chunks_in_ride: int = 1,
+        chunks_in_ride: int = 1, max_rolls: int = 0,
     ) -> Tuple[int, Optional[float]]:
         """Matched-clean-x offset selection (``dmd_42f_clean_match_enabled``).
 
@@ -9311,7 +9716,48 @@ class ActionForcingDMD(SelfForcingModel):
         # never built. Return a no-op there so gate + target stay consistent.
         if (bool(getattr(self, "dmd_only_first_chunk_per_ride", False))
                 and int(chunks_in_ride) > 1):
+            # Clear, don't leave stale: compute_critic_loss_streaming runs on
+            # EVERY roll and shifts its GT slices by this offset, so a value
+            # left over from a previous ride misaligns the critic silently.
+            s["clean_match_offset"] = 0
             return 0, None
+        # Same no-op for only-last: the 42f builder is SKIPPED on non-last
+        # rolls, so computing (and stashing) an offset there would override
+        # the gate for a step whose target is never built.
+        # NOTE: ``info`` here is generate_next_chunk's per-roll dict, which does
+        # NOT carry max_rolls_this_step (that lives in the trainer's train_info,
+        # built later in the step). The cap therefore arrives as an ARGUMENT --
+        # reading it from ``info`` made this guard dead code.
+        if bool(getattr(self, "dmd_only_last_chunk_per_ride", False)):
+            _cap = int(max_rolls or 0)
+            # MUST mirror compute_generator_loss_streaming's skip condition
+            # exactly (cap-only, rank-uniform); if the two disagree, the offset
+            # is skipped for a roll whose 42f target IS built (or vice versa)
+            # and the gate MAE stops matching the target.
+            if _cap > 0 and int(chunks_in_ride) < _cap:
+                s["clean_match_offset"] = 0   # see note above: never leave stale
+                return 0, None
+        # Same mirrored no-op for dmd_supervise_roll_mode="random": on
+        # non-target rolls the DMD scorer forwards are skipped (the 42f
+        # builder itself still runs, feeding the critic with offset 0 —
+        # same as the only-last precedent), so the offset must not be
+        # computed (nor left stale) there. EXACT mirror of the generator
+        # skip INCLUDING the self-healing cap: effective target =
+        # min(target, max_rolls) — ``max_rolls`` here is the same
+        # MIN-reduced ``max_rolls_this_step`` the generator gate reads, so
+        # the two guards stay in lockstep when the capacity clamp shrinks
+        # the cap below the frozen per-ride target. Both operands
+        # rank-uniform (target broadcast from rank 0 at the per-ride draw;
+        # chunks_in_ride lockstep). Target 0 = unset => no skip (matches
+        # the generator gate's fail-closed-to-"all" behavior).
+        if getattr(self, "dmd_supervise_roll_mode", "all") == "random":
+            _target = int(getattr(self, "_dmd_supervise_target_roll", 0) or 0)
+            _cap_r = int(max_rolls or 0)
+            if _target > 0 and _cap_r > 0:
+                _target = min(_target, _cap_r)
+            if _target > 0 and int(chunks_in_ride) != _target:
+                s["clean_match_offset"] = 0   # never leave stale
+                return 0, None
         npb = int(self.num_frame_per_block)
         N = int(self.num_training_frames)
         cf = int(s["cf"])
@@ -9367,12 +9813,26 @@ class ActionForcingDMD(SelfForcingModel):
         # Clean half sits at noisy_lo + clean_base + m; clean_base = -npb
         # (default back-shift) or +npb (forward / future view). Bound m so the
         # clean window AND the gt_target/gt_ctx/gate slices stay in [0, _L].
+        # Worst-case clean offset the builder can ask for. The drift ramps
+        # drift_off over [-npb*dc, +npb*dc]; clamping m against a fixed +-npb
+        # (the pre-compose assumption) under-reserves by (dc-1)*npb and blows
+        # the ride-window bound mid-ramp -- on a SUBSET of ranks, because m is
+        # per-rank => NCCL hang. Reserve BOTH extremes.
+        _dc_b = max(1, int(getattr(self, "dmd_42f_clean_drift_chunks", 1)))
+        _drift_span = npb * _dc_b if bool(getattr(
+            self, "dmd_42f_clean_drift_enabled", False)) else npb
+        if bool(getattr(self, "dmd_42f_clean_match_forward", False)):
+            _drift_span = max(_drift_span, npb)
+        _clean_base_lo = -_drift_span
+        _clean_base_hi = _drift_span
         _clean_base = (
             npb if bool(getattr(self, "dmd_42f_clean_match_forward", False))
             else -npb
         )
-        _lo_base = min(noisy_lo + _clean_base, noisy_lo, chunk_lo_raw)
-        _hi_base = max(noisy_hi, noisy_lo + _clean_base + N, chunk_lo_raw + _clen)
+        _lo_base = min(noisy_lo + _clean_base_lo, noisy_lo, chunk_lo_raw)
+        _hi_base = max(
+            noisy_hi, noisy_lo + _clean_base_hi + N, chunk_lo_raw + _clen,
+        )
         _m_lo = max(-_cap, -_lo_base)
         _m_hi = min(_cap, _L - _hi_base)
         match_m = 0
@@ -9610,7 +10070,9 @@ class ActionForcingDMD(SelfForcingModel):
                     _rope_msg = f"RoPE pinned at npb={npb}"
                 print(
                     f"[42F-DRIFT] step={_cs} frac={_frac:.2f} "
-                    f"drift_off={drift_off} clean_lo={noisy_lo + drift_off} "
+                    f"drift_off={drift_off} "
+                    f"clean_lo={noisy_lo + drift_off + match_m} "
+                    f"(match_m={match_m}) "
                     f"(noisy_lo={noisy_lo}, npb={npb}, {_rope_msg})",
                     file=_sys.stderr, flush=True,
                 )
@@ -9967,8 +10429,14 @@ class ActionForcingDMD(SelfForcingModel):
             _rope_offset = int(-drift_off)
         # Matched + forward: couple the RoPE to the +npb forward clean so the
         # teacher reads the clean half as one chunk AHEAD (rope_offset = -npb).
-        if _match_forward:
-            _rope_offset = int(-drift_off)  # = -npb
+        # Under compose the drift block owns drift_off, so this would silently
+        # convert a content-only (couple_rope=false) run into a RoPE-coupled
+        # one. Only apply the forward coupling when the drift is NOT driving.
+        if _match_forward and not (
+            self.dmd_42f_clean_match_drift_compose
+            and not bool(getattr(self, "dmd_42f_clean_drift_couple_rope", False))
+        ):
+            _rope_offset = int(-drift_off)
         # ---- AR payload (dmd_ar_head_weight / dmd_ar_critic_weight) -------
         # Everything ``_ar_score_band`` needs, derived from the
         # SAME layout arithmetic as the TF window above (n_ctx /
@@ -10089,6 +10557,39 @@ class ActionForcingDMD(SelfForcingModel):
         )
         return cond, uncond
 
+    def _surface_flash_gan_slab(self, info: Dict[str, Any]) -> None:
+        """Publish the flash t=gan_t slab into ``info`` (idempotent, no loss).
+
+        Split out of ``compute_generator_loss_streaming`` so it can run even on
+        rolls whose DMD scorer is skipped (``dmd_only_last_chunk_per_ride``).
+        The slab is what the GAN / action-critic / FN teacher-feat consume; when
+        it is absent those consumers fall back SILENTLY to the random exit-rung
+        x0, so the GAN would train on the wrong noise level with no error. Only
+        the surfacing is hoisted -- every loss term built from the slab stays
+        behind the skip.
+
+        Idempotent: returns early if the slab is already published, so the
+        de-drift is never applied twice.
+        """
+        if not self.flash_dmd_enabled:
+            return
+        if info.get("flash_dmd_gan_x0") is not None:
+            return
+        last_rung_chunk = info.get("flash_dmd_gan_chunk")
+        if last_rung_chunk is None:
+            raise RuntimeError(
+                "flash_dmd_enabled=True but info['flash_dmd_gan_chunk'] is "
+                "None - the rollout must run with flash_dmd_enabled=True so "
+                "the pipeline emits the t=flash_dmd_gan_t output."
+            )
+        info["flash_dmd_gan_x0_raw"] = last_rung_chunk
+        if bool(getattr(self, "reverse_noiser_dedrift_apply_to_flash", False)):
+            last_rung_chunk = self._dedrift_with_reverse_noiser(
+                last_rung_chunk,
+                int(getattr(self, "reverse_noiser_dedrift_level", 1)),
+            )
+        info["flash_dmd_gan_x0"] = last_rung_chunk
+
     def compute_generator_loss_streaming(
         self,
         chunk: torch.Tensor,
@@ -10119,6 +10620,60 @@ class ActionForcingDMD(SelfForcingModel):
                 "dmd_skipped_non_first_chunk_of_ride": 1.0,
                 "streaming_chunks_in_ride": float(chunks_in_ride),
             }
+        # ``dmd_only_last_chunk_per_ride`` (2026-08-20): supervise ONLY the
+        # deepest roll of the ride -- the one whose context is most drifted
+        # from GT. Earlier rolls still run (they build the student context)
+        # but return a connected zero loss and skip the scorer forward, so
+        # they cost a no_grad rollout instead of a full DMD backward.
+        # "Last" tracks ``max_rolls_this_step``, so it follows a depth that
+        # changes over training (step schedule / toothpaste). Mutually
+        # exclusive with only_first. Default False = byte-identical.
+        only_last = bool(
+            getattr(self, "dmd_only_last_chunk_per_ride", False)
+        )
+        # "Last" = reached the cap. Deliberately CAP-ONLY: both operands are
+        # rank-uniform (the cap comes from the step schedule / all-reduced
+        # toothpaste depth; chunks_in_ride is lockstep via the MAX-reduced
+        # reset), so every rank skips or scores together -- mandatory, because
+        # the scorer contains collectives.
+        # NOT included: "or not can_generate_more()". It reads max_length, which
+        # derives from a PER-RANK actual_cap that is never MIN-reduced, so it
+        # can differ across ranks -> some ranks skip, others score -> NCCL hang.
+        # KNOWN LIMITATION as a result: a ride that resets before reaching the
+        # cap (exhausted / mae-collapse / toothpaste-gone) receives NO DMD
+        # gradient on any of its rolls. Inactive in the shipped rolling recipe
+        # (deterministic num_chunks_roll_forward=3, collapse threshold unset,
+        # toothpaste off), and made VISIBLE by dmd_supervised_this_roll below:
+        # if its mean over a run is far below 1/cap, rides are blacking out.
+        _skip_scorer = False
+        if only_last:
+            _cap = int(info.get("max_rolls_this_step", 0) or 0)
+            _skip_scorer = bool(_cap > 0 and chunks_in_ride < _cap)
+        # ``dmd_supervise_roll_mode == "random"`` (2026-08-22): supervise
+        # exactly ONE roll per ride, at the per-ride target index drawn
+        # rank-uniformly by the trainer (rank-0 + broadcast at the
+        # random-depth draw site) and stamped on the model. Same skip
+        # machinery as only-last; MUST stay rank-uniform (the scorer
+        # contains collectives): the target is broadcast, chunks_in_ride
+        # is lockstep via the MAX-reduced reset. Target 0 (unset — e.g.
+        # a config toggling the mode mid-run without the trainer draw)
+        # fails CLOSED to "all" (no skip) rather than blacking out the
+        # ride. SELF-HEALING (review 2026-08-22): the effective target is
+        # min(target, max_rolls_this_step) — when the MIN-reduced capacity
+        # clamp shrinks the cap below the frozen per-ride target, the
+        # supervised roll degrades to the deepest reachable roll instead
+        # of blacking out the ride (the measured only-last pathology the
+        # capacity clamp was built to kill). Both operands rank-uniform
+        # (cap is MIN-reduced; target broadcast). A ride that still resets
+        # early (exhaustion/collapse) gets no DMD gradient — visible via
+        # dmd_supervised_count / dmd_supervised_this_roll.
+        elif getattr(self, "dmd_supervise_roll_mode", "all") == "random":
+            _target = int(getattr(self, "_dmd_supervise_target_roll", 0) or 0)
+            _cap = int(info.get("max_rolls_this_step", 0) or 0)
+            if _target > 0 and _cap > 0:
+                _target = min(_target, _cap)
+            _skip_scorer = bool(_target > 0 and chunks_in_ride != _target)
+        self._dmd_scorer_skip_this_roll = _skip_scorer
 
         # ``info["gradient_mask"]`` is the per-iter overlap-chunk mask
         # (True only on the new frames). It MUST be a tensor — if a
@@ -10292,6 +10847,43 @@ class ActionForcingDMD(SelfForcingModel):
         asymmetric = bool(self.dmd_asymmetric_scoring_enabled)
         if bool(self.dmd_42f_enabled):
             f42 = self._build_42f_scoring_inputs(chunk, info)
+            # ---- flag-gated INPUT DUMP (debug_dump_scorer_inputs_every) --
+            # Stash DETACHED cpu copies of what the DMD scorers actually
+            # see this step so the trainer can decode them side-by-side.
+            # Overwritten per chunk within a step → the LAST (deepest-
+            # drift) rolled chunk of the firing step wins, which is the
+            # interesting one under rolling. try/except: diagnostics must
+            # never be able to crash training.
+            _dbg_every = int(
+                getattr(self, "debug_dump_scorer_inputs_every", 0) or 0
+            )
+            if _dbg_every > 0:
+                try:
+                    _dbg_step = int(info.get("current_step", -1))
+                    # DEBT-based cadence (mirrors the R1 fix): gen steps
+                    # only run every dfake_gen_update_ratio iters, so a
+                    # plain ``step % every == 0`` can be missed forever
+                    # when the residues never align. Fire when >= every
+                    # steps elapsed since the last firing; re-fire within
+                    # the SAME step so the last rolled chunk wins.
+                    _dbg_last = int(
+                        getattr(self, "_dbg_scorer_last_fire", -10 ** 9)
+                    )
+                    if _dbg_step >= 0 and (
+                        _dbg_step == _dbg_last
+                        or _dbg_step - _dbg_last >= _dbg_every
+                    ):
+                        self._dbg_scorer_last_fire = _dbg_step
+                        _dmp: Dict[str, Any] = {"step": _dbg_step}
+                        for _dk in ("noisy_x", "clean_x", "gt_target"):
+                            _dv = f42.get(_dk)
+                            if torch.is_tensor(_dv):
+                                _dmp[_dk] = _dv.detach().to(
+                                    device="cpu", dtype=torch.float32
+                                )
+                        self._dbg_scorer_dump = _dmp
+                except Exception:
+                    pass
             score_image = f42["noisy_x"]
             score_cond = f42["cond"]
             score_uncond = f42["uncond"]
@@ -10447,6 +11039,21 @@ class ActionForcingDMD(SelfForcingModel):
         # linear warmup ramp on top of the static ``dmd_loss_weight``.
         # ``current_step`` was already plumbed via ``info`` (also used
         # by the aux teacher schedule resolver above).
+        # Flag consumed; clear it so it can never leak into another call.
+        self._dmd_scorer_skip_this_roll = False
+        dmd_log["dmd_supervised_this_roll"] = 0.0 if _skip_scorer else 1.0
+        # Cumulative counter: the per-roll gauge is phase-locked OUT of the
+        # wandb cadence (log every 10, gen every 5, depth-4 ride = 20 steps
+        # => the supervised roll lands on the never-logged parity, always).
+        # A monotone counter is visible at ANY cadence.
+        self._dmd_supervised_count = int(getattr(
+            self, "_dmd_supervised_count", 0)) + (0 if _skip_scorer else 1)
+        dmd_log["dmd_supervised_count"] = float(self._dmd_supervised_count)
+        dmd_log["streaming_chunks_in_ride"] = float(chunks_in_ride)
+        if getattr(self, "dmd_supervise_roll_mode", "all") == "random":
+            dmd_log["dmd_supervise_target_roll"] = float(
+                getattr(self, "_dmd_supervise_target_roll", 0) or 0
+            )
         dmd_weight_resolved = self._resolved_dmd_loss_weight(current_step)
         dmd_loss = dmd_loss * dmd_weight_resolved
         # v28+: add the anti-collapse term UNSCALED by dmd_weight_resolved,
@@ -10495,6 +11102,8 @@ class ActionForcingDMD(SelfForcingModel):
                     M1_long_weight=self.stat_anchor_M1_long_weight,
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
+                    std_one_sided=bool(getattr(
+                        self, "stat_anchor_std_one_sided", False)),
                 )
                 if _mode == "target_matching":
                     _matched = self._matched_gt_stat_anchors(chunk.float())
@@ -10567,33 +11176,12 @@ class ActionForcingDMD(SelfForcingModel):
         # rungs (no_grad); GAN supervision is restricted to texture
         # refinement at near-clean noise.
         if self.flash_dmd_enabled:
-            last_rung_chunk = info.get("flash_dmd_gan_chunk")
-            if last_rung_chunk is None:
-                raise RuntimeError(
-                    "flash_dmd_enabled=True but "
-                    "info['flash_dmd_gan_chunk'] is None — the "
-                    "rollout must run with flash_dmd_enabled=True so "
-                    "the pipeline emits the t=flash_dmd_gan_t output."
-                )
-            # Stash the RAW (pre-de-drift) flash slab for FN/cycle training.
-            # The FN must learn the raw student->rollout2 drift map; if it
-            # trained on the de-drifted G(student) output (the GAN's slab below)
-            # it would learn G(student)->rollout2 — the wrong map / a feedback
-            # loop (G inverts F). The two consumers of this slab have opposite
-            # needs: GAN scoring wants de-drifted, FN training wants raw. When
-            # de-drift / apply_to_flash is OFF this is the SAME object as
-            # flash_dmd_gan_x0 below (byte-identical).
-            info["flash_dmd_gan_x0_raw"] = last_rung_chunk
-            # Change-2: under flash_dmd the GAN's gradient-bearing fake is this
-            # separate slab (not train_chunk), so de-drift it here too when
-            # requested, to keep the GAN's GT-grounded gradient flowing through
-            # G into the student. No-op unless both dedrift + apply_to_flash on.
-            if bool(getattr(self, "reverse_noiser_dedrift_apply_to_flash", False)):
-                last_rung_chunk = self._dedrift_with_reverse_noiser(
-                    last_rung_chunk,
-                    int(getattr(self, "reverse_noiser_dedrift_level", 1)),
-                )
-            info["flash_dmd_gan_x0"] = last_rung_chunk
+            # Surfacing lives in _surface_flash_gan_slab (idempotent) so the
+            # skipped-scorer path can publish the same slab. Raises if the
+            # rollout did not emit it.
+            self._surface_flash_gan_slab(info)
+            # Downstream loss terms read the published slab.
+            last_rung_chunk = info["flash_dmd_gan_x0"]
             # v29: also anchor std/mean on the flash-DMD t=gan_t rung's
             # x0. Without this, the GAN-supervised rung is unconstrained
             # by anti-collapse and provides a degenerate-mode escape
