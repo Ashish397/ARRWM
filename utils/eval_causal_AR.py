@@ -166,6 +166,32 @@ def _reset_kv_cache(kv_cache: list) -> None:
         entry["local_end_index"].fill_(0)
 
 
+def _apply_carn_seam_affine(
+    chunk: torch.Tensor,
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+    strength: float,
+) -> torch.Tensor:
+    """Apply the training-time CARN commit transform to one AR chunk."""
+    strength = float(strength)
+    if strength == 0.0:
+        return chunk
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError(
+            f"carn_seam_affine_lambda must be in [0, 1], got {strength}"
+        )
+
+    source_dtype = chunk.dtype
+    x = chunk.float()
+    mean = x.mean(dim=(0, 1, 3, 4), keepdim=True)
+    std = x.std(dim=(0, 1, 3, 4), keepdim=True).clamp_min(1e-4)
+    target_mean = target_mean.to(x).view(1, 1, -1, 1, 1)
+    target_std = target_std.to(x).view(1, 1, -1, 1, 1)
+    blended_mean = strength * target_mean + (1.0 - strength) * mean
+    blended_std = strength * target_std + (1.0 - strength) * std
+    return ((x - mean) / std * blended_std + blended_mean).to(source_dtype)
+
+
 def _set_attention_window(base_dit, *, local_attn_size_frames: int, max_tokens: int) -> None:
     """Propagate ``local_attn_size`` (frames) and ``max_attention_size``
     (tokens) to every attention block + top-level module."""
@@ -283,7 +309,13 @@ class ODEChainPipeline(ChainPipeline):
         log.info("[%s] ODEChainPipeline ready.", self.device)
 
     # ---- load_checkpoint ---------------------------------------------
-    def load_checkpoint(self, student_ckpt: str, vinfo=None):  # type: ignore[override]
+    def load_checkpoint(
+        self,
+        student_ckpt: str,
+        vinfo=None,
+        *,
+        use_ema: bool = False,
+    ):  # type: ignore[override]
         """Overlay the student weights onto the teacher-merged base.
 
         ``vinfo`` is ignored (kept for signature parity with ``ChainPipeline``).
@@ -291,15 +323,21 @@ class ODEChainPipeline(ChainPipeline):
         """
         log.info("[%s] Overlaying student %s", self.device, student_ckpt)
         raw = torch.load(student_ckpt, map_location="cpu", weights_only=False)
+        generator_key = "generator_ema" if use_ema else "generator"
         try:
-            generator_sd = raw["generator"]
+            generator_sd = raw[generator_key]
         except KeyError as exc:
             raise RuntimeError(
-                f"Student checkpoint {student_ckpt} missing 'generator' key; "
+                f"Student checkpoint {student_ckpt} missing {generator_key!r}; "
                 "expected a full-rank trainer snapshot from action_ode_distill."
             ) from exc
 
         self.ode_model.generator.model.load_state_dict(generator_sd, strict=True)
+        log.info(
+            "[%s] Loaded %s student weights.",
+            self.device,
+            "EMA" if use_ema else "online",
+        )
 
         if (
             self.ode_model.action_projection is not None
@@ -490,6 +528,7 @@ class ODEChainPipeline(ChainPipeline):
         context_noise_timestep: float = 0.0,
         ar_cache: bool = True,
         cache_refresh: str = "append",
+        carn_seam_affine_lambda: float = 0.0,
     ) -> torch.Tensor:
         """Streaming AR rollout with a KV cache.
 
@@ -695,6 +734,25 @@ class ODEChainPipeline(ChainPipeline):
         noisy_fa_full = noisy_fa_full.to(device=self.device, dtype=self.dtype)
         prompt_embeds_dev = prompt_embeds.to(device=self.device, dtype=self.dtype)
         initial_latents_dev = initial_latents.to(device=self.device, dtype=self.dtype)
+
+        carn_seam_affine_lambda = float(carn_seam_affine_lambda)
+        if not 0.0 <= carn_seam_affine_lambda <= 1.0:
+            raise SystemExit(
+                "[AR] --carn_seam_affine_lambda must be in [0, 1], got "
+                f"{carn_seam_affine_lambda}"
+            )
+        carn_target = None
+        if carn_seam_affine_lambda > 0.0:
+            seed_float = initial_latents_dev.float()
+            carn_target = (
+                seed_float.mean(dim=(0, 1, 3, 4)),
+                seed_float.std(dim=(0, 1, 3, 4)),
+            )
+            log.info(
+                "[AR] CARN seam affine enabled at commit: lambda=%.3f, "
+                "target=real prefill per-channel mean/std",
+                carn_seam_affine_lambda,
+            )
 
         current_start_frame = 0
         refresh_t_block = torch.full(
@@ -1266,6 +1324,14 @@ class ODEChainPipeline(ChainPipeline):
                 pred_x0 = (_out.view(_C, _B, _F, _H, _W)
                            .permute(1, 2, 0, 3, 4).to(pred_x0.dtype))
 
+            if carn_target is not None:
+                pred_x0 = _apply_carn_seam_affine(
+                    pred_x0,
+                    target_mean=carn_target[0],
+                    target_std=carn_target[1],
+                    strength=carn_seam_affine_lambda,
+                )
+
             generated.append(pred_x0.detach().to(torch.float32))
 
             if cache_refresh == "append":
@@ -1494,6 +1560,11 @@ def main():
     parser.add_argument("--student_ckpt", type=str, required=True,
                         help="Path to the ODE-distilled student snapshot "
                              "(e.g. logs/action_ode_distill_10h/latest_0001000.pt).")
+    parser.add_argument(
+        "--use_ema", action="store_true",
+        help="Evaluate the checkpoint's generator_ema weights instead of its "
+             "online generator weights.",
+    )
     parser.add_argument("--manifest", type=str,
                         default="logs/z_critic_v10_state_tokens/.ride_manifest.pt",
                         help="Optional: used in per-rank mode for fast ride lookup.")
@@ -1550,6 +1621,11 @@ def main():
     parser.add_argument("--context_noise_timestep", type=float, default=0.0,
                         help="AR mode only: timestep passed on the post-denoise / prefill "
                              "cache-refresh forwards. Training uses 0.")
+    parser.add_argument("--carn_seam_affine_lambda", type=float, default=0.0,
+                        help="AR mode only: apply the CARN per-channel mean/std "
+                             "re-anchor to each generated chunk before emission and "
+                             "KV-cache commit. The target is measured once from the "
+                             "real prefill; 0 disables it and the precedent uses 0.5.")
     parser.add_argument("--ar_cache_refresh", choices=["append", "full_fifo"],
                         default="append",
                         help="AR mode only: KV cache maintenance strategy. "
@@ -1753,7 +1829,9 @@ def main():
     # ---- Build pipeline + load student ----
     pipe = ODEChainPipeline(device)
     pipe.build(args.config, use_action_tokens=True)
-    student_step = pipe.load_checkpoint(args.student_ckpt)
+    student_step = pipe.load_checkpoint(
+        args.student_ckpt, use_ema=args.use_ema,
+    )
     pipe.set_denoising_steps(args.denoising_steps)
 
     # ---- Label (drives output subdir + on-video title) ----
@@ -1837,6 +1915,7 @@ def main():
                 context_noise_timestep=args.context_noise_timestep,
                 ar_cache=args.ar_cache,
                 cache_refresh=args.ar_cache_refresh,
+                carn_seam_affine_lambda=args.carn_seam_affine_lambda,
             )
         peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
         reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)

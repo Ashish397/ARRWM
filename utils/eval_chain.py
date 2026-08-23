@@ -248,10 +248,19 @@ def build_all_segment_noisy_frame_actions(
 
 
 def frame_actions_to_chunk_actions(frame_actions: torch.Tensor) -> torch.Tensor:
-    """[1, NUM_FRAMES, 2] → [1, NUM_ACTION_CHUNKS, 2] via mean over each 3-frame block (critic / overlay)."""
+    """Reduce any chunk-aligned frame-action sequence to chunk actions."""
     b, f, d = frame_actions.shape
-    assert f == NUM_FRAMES and d == RAW_ACTION_DIM
-    x = frame_actions.reshape(b, NUM_ACTION_CHUNKS, NUM_FRAME_PER_BLOCK, d)
+    if d != RAW_ACTION_DIM:
+        raise ValueError(
+            f"expected action dim {RAW_ACTION_DIM}, got {d}"
+        )
+    if f % NUM_FRAME_PER_BLOCK != 0:
+        raise ValueError(
+            f"frame count {f} is not divisible by chunk size "
+            f"{NUM_FRAME_PER_BLOCK}"
+        )
+    num_chunks = f // NUM_FRAME_PER_BLOCK
+    x = frame_actions.reshape(b, num_chunks, NUM_FRAME_PER_BLOCK, d)
     return x.mean(dim=2)
 
 

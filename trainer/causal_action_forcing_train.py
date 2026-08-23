@@ -879,6 +879,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             256,
                         )
                     ),
+                    scalar_output=bool(getattr(
+                        self.config, "ladd_scalar_output", False,
+                    )),
+                    freeze_projector_mixing=bool(getattr(
+                        self.config, "ladd_freeze_projector_mixing", False,
+                    )),
                 )
                 # wavelet_hf_augment: ADD the wavelet HF view to the raw latent
                 # (preserve BOTH modalities) instead of REPLACING it. Set
@@ -912,7 +918,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     logging.info(
                         "[ActionForcing] LADD discriminator built: "
                         "blocks=%s dim_teacher=%d dim_proj=%d "
-                        "use_csm=%s cmap_dim=%d wavelet_hf=%s "
+                        "use_csm=%s cmap_dim=%d wavelet_hf=%s scalar=%s "
+                        "freeze_mixing=%s "
                         "params_total=%.2fM params_trainable=%.2fM "
                         "(DDP=%s)",
                         ladd_blocks, _dim_teacher,
@@ -921,6 +928,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         int(getattr(self.config, "ladd_cmap_dim", 64))
                         if _prompt_embed_dim > 0 else 0,
                         bool(_wavelet_hf_enabled),
+                        bool(getattr(self.config, "ladd_scalar_output", False)),
+                        bool(getattr(
+                            self.config, "ladd_freeze_projector_mixing", False,
+                        )),
                         n_total / 1e6, n_train / 1e6,
                         self.r3gan_disc_ddp is not None,
                     )
@@ -2577,23 +2588,65 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             self._save_checkpoint()
 
     # ------------------------------------------------------------------
-    # Checkpoint save/resume — extend the parent to persist the
-    # action_critic state_dict + critic optimizer state when aux
-    # losses are enabled. The parent's path covers the generator /
-    # action_projection / action_token_projection / fake_score /
-    # fake_optimizer / EMA / step. We append the critic-side state
-    # AFTER the parent has written the rest, then re-save the same
-    # file. This avoids forking the parent's serialization layout.
+    # Checkpoint save/resume — extend the parent to persist auxiliary
+    # modules it does not own. The parent already saves the generator,
+    # fake scorer, EMA, CARN, and GAN discriminator/optimizer. Re-appending
+    # GAN state here used to force a redundant read and rewrite of the full
+    # multi-GB checkpoint at every save.
     # ------------------------------------------------------------------
     def _save_checkpoint(self) -> None:
+        eval_path_template = getattr(
+            self.config, "eval_checkpoint_path", None,
+        )
+        if self.is_main_process and eval_path_template:
+            eval_path = Path(
+                str(eval_path_template).format(step=int(self.step))
+            ).expanduser()
+            eval_path.parent.mkdir(parents=True, exist_ok=True)
+            gen_module = (
+                self.generator_ddp.module
+                if self.generator_ddp is not None
+                else self.model.generator.model
+            )
+            eval_state = {
+                "step": self.step,
+                "generator": gen_module.state_dict(),
+                "config_name": os.path.basename(self.config_path),
+            }
+            if self.model.action_projection is not None:
+                eval_state["action_projection"] = (
+                    self.model.action_projection.state_dict()
+                )
+            if getattr(self.model, "action_token_projection", None) is not None:
+                eval_state["action_token_projection"] = (
+                    self.model.action_token_projection.state_dict()
+                )
+            if (
+                bool(getattr(self.config, "eval_checkpoint_include_ema", False))
+                and self.generator_ema is not None
+            ):
+                eval_state["generator_ema"] = self.generator_ema.state_dict()
+            torch.save(eval_state, eval_path)
+            logging.info(
+                "[ActionForcing] Saved minimal evaluation checkpoint: %s",
+                eval_path,
+            )
+
+        if not bool(getattr(self.config, "save_full_checkpoint", True)):
+            if self.is_main_process:
+                logging.info(
+                    "[ActionForcing] save_full_checkpoint=false; skipped full "
+                    "resume-state checkpoint."
+                )
+            return
+
         super()._save_checkpoint()
         if not self.is_main_process:
             return
-        # Either the action critic OR the GAN may need state appended;
-        # fast-path-skip if neither is active.
+        # Fast-path for the common DMD/GAN recipe: all of its state was
+        # already written by the parent.
         if not (
             self.action_critic_loss_active
-            or self.gan_enabled
             or self.real_teacher_train_online
             or self.state_probe_aux_active
         ):
@@ -2606,7 +2659,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         except Exception as exc:
             logging.warning(
                 "[ActionForcing] Could not re-open checkpoint for "
-                "aux/GAN append: %s. Skipping.", exc,
+                "auxiliary append: %s. Skipping.", exc,
             )
             return
         appended = []
@@ -2630,16 +2683,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.state_probe_optimizer.state_dict()
                 )
                 appended.append("state_probe_optimizer")
-        if self.gan_enabled and self.r3gan_disc is not None:
-            disc_module = (
-                self.r3gan_disc_ddp.module if self.r3gan_disc_ddp is not None
-                else self.r3gan_disc
-            )
-            state["r3gan_discriminator"] = disc_module.state_dict()
-            appended.append("r3gan_discriminator")
-            if self.r3gan_optimizer is not None:
-                state["r3gan_optimizer"] = self.r3gan_optimizer.state_dict()
-                appended.append("r3gan_optimizer")
         if self.real_teacher_train_online:
             # FAIL-LOUD on save: silently dropping the LoRA state from
             # the checkpoint pairs with the resume path's silent
@@ -2647,8 +2690,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # training without operator notice. Better to crash the
             # save and require investigation than to leave a
             # checkpoint that quietly discards progress on the next
-            # resume. (action_critic / r3gan retain fail-soft because
-            # they are bootstrapped from fixed checkpoints; only the
+            # resume. (The action critic retains fail-soft behavior because
+            # it is bootstrapped from a fixed checkpoint; only the
             # online-trained LoRA has this asymmetric risk profile.)
             try:
                 from peft import get_peft_model_state_dict
@@ -4740,6 +4783,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 logs["train/r3gan_r1_grad_sq"] = sum(valid_vals) / len(valid_vals)
             else:
                 logs["train/r3gan_r1_grad_sq"] = float("nan")
+        _rt = getattr(self, "_ladd_ring_telemetry", None)
+        if _rt:
+            for _k, _v in _rt.items():
+                logs[f"train/ladd_{_k}"] = float(_v)
         fired_keys = [k for k in logs if "r3gan_r1_fired_" in k]
         if fired_keys:
             logs["train/r3gan_r1_fired"] = max(logs[k] for k in fired_keys)
@@ -4806,6 +4853,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         (offset) lazy cadence. Kept identical across all three D-update
         branches so the offset-vs-R1 OOM guarantee holds everywhere."""
         return gamma > 0.0 and ((current_step - offset) % every_n == 0)
+
+    def _ladd_count_penalty_fires(self, do_r1: bool, do_r2: bool) -> None:
+        """Monotone counters of R1/R2 firings and of D-updates.
+
+        The per-step ``r3gan_r*_fired`` gauges are sampled by wandb every N
+        steps, and N aliases with BOTH the penalty cadence (every 2, offset 1)
+        and the generator-update cadence (``dfake_gen_update_ratio``). The
+        observed consequence was ``r2_fired == 0`` on every logged row of every
+        run -- which is indistinguishable from "R2 never fires at all". These
+        counters are monotone, so a single logged sample settles it:
+        ``r2_fired_total == 0`` late in a run means R2 genuinely never fired.
+        Pure telemetry -- nothing here touches the loss.
+        """
+        self._ladd_dupdate_total = getattr(self, "_ladd_dupdate_total", 0) + 1
+        if do_r1:
+            self._ladd_r1_fire_total = getattr(self, "_ladd_r1_fire_total", 0) + 1
+        if do_r2:
+            self._ladd_r2_fire_total = getattr(self, "_ladd_r2_fire_total", 0) + 1
+
+    def _ladd_penalty_fire_logs(self) -> dict:
+        n = getattr(self, "_ladd_dupdate_total", 0)
+        r1 = getattr(self, "_ladd_r1_fire_total", 0)
+        r2 = getattr(self, "_ladd_r2_fire_total", 0)
+        return {
+            "train/r3gan_disc_updates_total": float(n),
+            "train/r3gan_r1_fired_total": float(r1),
+            "train/r3gan_r2_fired_total": float(r2),
+            "train/r3gan_r1_fire_rate": float(r1) / n if n else 0.0,
+            "train/r3gan_r2_fire_rate": float(r2) / n if n else 0.0,
+        }
 
     def _ladd_disc_update_microbatched(
         self, *, _it, _rn, _fk, _fseg, _fseg_act, real_m, real_m_rat,
@@ -5085,16 +5162,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         current_step: int,
         phase: str = "both",
     ) -> tuple:
-        if getattr(self, "_carn_diag_n", 0) < 6:
-            self._carn_diag_n = getattr(self, "_carn_diag_n", 0) + 1
-            import sys as _sys
-            print(
-                f"[CARN-DIAG] _ladd_run_pair_mode mode={pair_mode!r} phase={phase} "
-                f"carn_knob_model={getattr(self.model, 'ladd_gt_transition_carn_former', 'MISSING')} "
-                f"carn_knob_cfg={getattr(self.config, 'ladd_gt_transition_carn_former', 'MISSING')} "
-                f"fn={getattr(self.model, 'forward_noiser', None) is not None}",
-                file=_sys.stderr, flush=True,
-            )
         """Single D-update + gen-side loss for one pair-construction mode.
 
         Args:
@@ -5678,6 +5745,42 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self.config, "ladd_real_match_fake_t",
                 getattr(self.model, "ladd_real_match_fake_t", False))):
             disc_t_int = flash_t
+        # Diffusion-GAN corruption sampler. The fixed ``flash_t`` path leaves
+        # D solving one narrow low-noise classification problem; opt-in
+        # sampling exposes the transition critic to the diffusion interval.
+        # The sampled scalar is still shared by real and fake, including the
+        # exact scheduler.add_noise path below.
+        # Wavelet-HF has strict precedence: its sub-bands must see clean
+        # latents. Sampling after the clean-wavelet branch used to silently
+        # undo that invariant and turn HF discrimination into broadband-noise
+        # discrimination.
+        if (
+            not wavelet_on
+            and bool(getattr(
+                self.config, "ladd_disc_sample_t",
+                getattr(self.model, "ladd_disc_sample_t", False),
+            ))
+        ):
+            _dt_lo = int(getattr(self.config, "ladd_disc_t_min", 20))
+            _dt_hi = int(getattr(self.config, "ladd_disc_t_max", 980))
+            _dt_shift = float(getattr(
+                self.config, "ladd_disc_timestep_shift", 5.0))
+            if not (0 <= _dt_lo <= _dt_hi <= 1000):
+                raise ValueError(
+                    "ladd_disc_t_min/max must satisfy 0 <= min <= max <= "
+                    f"1000; got [{_dt_lo}, {_dt_hi}]."
+                )
+            _dt = torch.randint(
+                _dt_lo, _dt_hi + 1, (1,), device=device,
+            ).float()
+            if _dt_shift != 1.0:
+                _dt_norm = _dt / 1000.0
+                _dt = 1000.0 * _dt_shift * _dt_norm / (
+                    1.0 + (_dt_shift - 1.0) * _dt_norm
+                )
+            disc_t_int = int(
+                _dt.round().clamp(_dt_lo, _dt_hi).item()
+            )
         bsz_eff = real_chunks_det.shape[0]
         # Per-frame timestep matches the disc input's F dim — which is
         # ``npb`` for single-chunk modes and ``2 * npb`` for gt_transition.
@@ -6174,6 +6277,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
                 Kh = (Kk // 2) if _ring_on else 0
                 _Ksel = Kk - Kh
+                # B9 bank telemetry: without these numbers "cross-ride bank"
+                # is a config string, not a verified mechanism.
+                try:
+                    self._ladd_ring_telemetry = {
+                        "ring_size": int(len(_ring)) if _ring is not None else 0,
+                        "ring_on": 1.0 if _ring_on else 0.0,
+                        "ring_slots_per_fake": float(Kh),
+                        "matched_slots_per_fake": float(_Ksel),
+                    }
+                except Exception:
+                    pass
                 # With half the K-slots served by the ring, halve the
                 # matched-unique cap too so the TOTAL distinct reals
                 # forwarded stays inside the existing memory envelope.
@@ -6903,6 +7017,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             self._ladd_last_r1_step = int(current_step)
                         _do_r2 = self._ladd_r2_fires(
                             _r2_gamma, _r2_every_n, _r2_offset, current_step)
+                        self._ladd_count_penalty_fires(_do_r1, _do_r2)
                         if _micro_groups > 1:
                             _log = self._ladd_disc_update_microbatched(
                                 _it=_it, _rn=_rn, _fk=_fk, _fseg=_fseg,
@@ -7087,6 +7202,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/r3gan_r2_grad_sq": last_r2_grad_sq,
                 "train/r3gan_r2_fired": last_r2_fired,
                 "train/r3gan_r2_gamma": float(_r2_gamma),
+                **self._ladd_penalty_fire_logs(),
                 "train/r3gan_g_loss_raw": gen_gan_main_value,
                 "train/r3gan_g_loss_weighted": gen_gan_weight * gen_gan_main_value,
                 "train/r3gan_g_weight": float(gen_gan_weight),
@@ -7258,6 +7374,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
                 _do_r2 = self._ladd_r2_fires(
                     _r2_gamma, _r2_every_n, _r2_offset, current_step)
+                self._ladd_count_penalty_fires(_do_r1, _do_r2)
 
                 if _do_r1 and _r1_mode == "autograd":
                     combined_logits = disc_for_update(
@@ -7652,6 +7769,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/r3gan_r2_grad_sq": last_r2_grad_sq,
             "train/r3gan_r2_fired": last_r2_fired,
             "train/r3gan_r2_gamma": float(getattr(self.model, "ladd_r2_gamma", 0.0)),
+            **self._ladd_penalty_fire_logs(),
             "train/r3gan_g_loss_raw": gen_gan_main_value,
             "train/r3gan_g_loss_weighted": (
                 gen_gan_weight * gen_gan_main_value
@@ -10430,6 +10548,41 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 current_step=int(self.step),
                 flash_dmd_gan_x0=_flash_dmd_gan_x0,
             )
+            # A3 GRAD TELEMETRY (diagnostic-only, plan 22/8 v2): per-loss
+            # gradients at the LAST requires-grad generator parameter.
+            # ||g_GAN||/||g_rest|| separates weak-vs-destructive; the cosine
+            # detects a small GAN term that FIGHTS the DMD direction
+            # (cos ~ -0.8 = destructive even at tiny loss share). Sparse
+            # (every N gen steps) because it costs two extra grad passes;
+            # try/except so it can never take training down.
+            _tel_n = int(getattr(self.config,
+                                 "gan_grad_telemetry_every", 25) or 0)
+            if _tel_n > 0 and int(self.step) % _tel_n == 0:
+                try:
+                    _p_last = None
+                    for _pn, _pp in self.model.generator.named_parameters():
+                        if _pp.requires_grad:
+                            _p_last = _pp
+                    if _p_last is not None:
+                        _g_rest = torch.autograd.grad(
+                            generator_loss, _p_last, retain_graph=True,
+                            allow_unused=True)[0]
+                        _g_gan = torch.autograd.grad(
+                            gen_gan_loss, _p_last, retain_graph=True,
+                            allow_unused=True)[0]
+                        if _g_rest is not None and _g_gan is not None:
+                            _gr = _g_rest.flatten().float()
+                            _gg = _g_gan.flatten().float()
+                            _nr = float(_gr.norm()); _ng = float(_gg.norm())
+                            out["train/gan_grad_norm"] = _ng
+                            out["train/dmd_grad_norm_shared"] = _nr
+                            out["train/gan_dmd_grad_ratio"] = (
+                                _ng / _nr if _nr > 0 else 0.0)
+                            out["train/gan_dmd_grad_cos"] = float(
+                                torch.dot(_gg, _gr)
+                                / max(_ng * _nr, 1e-12))
+                except Exception as _te:
+                    out["train/gan_grad_telemetry_err"] = 1.0
             generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
             self._mem_step_snapshot("4_after_gan_pre_backward")

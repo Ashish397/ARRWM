@@ -7,7 +7,9 @@
 fully denoised x0 output; ``0`` is the pure-noise starting latent.
 
 The random-timestep recipe draws from a user-configurable subset of those
-snapshots via ``random_steps`` (default ``[0, 36, 44, 46]``). The
+snapshots via ``random_steps`` (default ``[0, 36, 44, 46]``). A config can
+provide its own ``snapshot_steps`` vocabulary for checkpoints recorded on a
+different solver grid, such as v14e's 20-step KL trajectory. The
 ``-1`` / teacher_x0 entry is intentionally NOT in the default pool: at
 timestep 0 the wrapper returns ``pred_x0 == xt`` and the resulting frame
 trains a zero-loss identity example that dilutes the MSE. Opt in by
@@ -66,11 +68,13 @@ def resolve_denoising_step_list(
     usable_stored_indices: Sequence[int] | None = None,
     num_inference_steps: int = EVAL_STEPS,
     shift: float = TIMESTEP_SHIFT,
+    snapshot_steps: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """Return the fp32 teacher-scheduler timestep for each kept snapshot.
 
     Indexing follows the order in ``usable_stored_indices`` (which indexes
-    into ``SNAPSHOT_STEPS``). For the full pool ``[0..6]`` the return is:
+    into ``snapshot_steps``, or ``SNAPSHOT_STEPS`` when omitted). For the
+    default full pool ``[0..6]`` the return is:
 
         denoising_step_list[0] = sched.timesteps[0]   (high, ~999)
         denoising_step_list[1] = sched.timesteps[18]
@@ -85,6 +89,7 @@ def resolve_denoising_step_list(
     if usable_stored_indices is None:
         usable_stored_indices = DEFAULT_USABLE_INDICES
     usable_stored_indices = list(usable_stored_indices)
+    snapshot_steps = list(SNAPSHOT_STEPS if snapshot_steps is None else snapshot_steps)
 
     sched = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
     sched.set_timesteps(num_inference_steps=num_inference_steps, denoising_strength=1.0)
@@ -96,14 +101,25 @@ def resolve_denoising_step_list(
 
     out = []
     for idx in usable_stored_indices:
-        if not (0 <= idx < len(SNAPSHOT_STEPS)):
+        if not (0 <= idx < len(snapshot_steps)):
             raise IndexError(
                 f"usable_stored_indices contains {idx}; must be in "
-                f"[0, {len(SNAPSHOT_STEPS)})"
+                f"[0, {len(snapshot_steps)})"
             )
-        s = SNAPSHOT_STEPS[idx]
-        if s == -1 or s >= N:
+        s = snapshot_steps[idx]
+        if s == -1:
             out.append(torch.tensor(0.0, dtype=torch.float32))
+        elif s < 0:
+            raise ValueError(
+                f"snapshot step {s} is invalid; only -1 may represent "
+                "the clean endpoint"
+            )
+        elif s >= N:
+            raise ValueError(
+                f"snapshot step {s} is outside the {N}-step scheduler; "
+                "set config.snapshot_steps to the vocabulary used to build "
+                "this ODE checkpoint"
+            )
         else:
             out.append(ts[int(s)])
     return torch.stack(out, dim=0)

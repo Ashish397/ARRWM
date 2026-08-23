@@ -270,6 +270,8 @@ unset LOCALDIR APPTAINER_CACHEDIR
 export ARRWM_MANIFEST_PICKLE=/scratch/u6ex/as1748.u6ex/ARRWM/analysis/.dmd_weunz_manifest_min69.pt
 mkdir -p "$LOGDIR" logs
 NNODE=${NNODE:-2}
+NPROC_PER_NODE=${NPROC_PER_NODE:-4}
+CUDA_DEVICES=${CUDA_DEVICES:-0,1,2,3}
 NODES=${NODES:-$(scontrol show hostnames "$(squeue -j $HOLDER -h -o %N)" | head -$NNODE | paste -sd,)}
 MASTER_ADDR=${NODES%%,*}
 MASTER_PORT=$(( 20000 + (HOLDER + PORTOFF) % 40000 ))
@@ -278,9 +280,10 @@ export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 echo "DMD10K arm=$DARM ckpt=$ODE_CKPT steps=$MAXSTEPS nodes=$NNODE $(date)"
 
-srun --jobid=$HOLDER --overlap --nodelist=$NODES --nodes=$NNODE --ntasks-per-node=1 --gpus-per-node=4 --gpu-bind=none --export=ALL,CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+srun --jobid=$HOLDER --overlap --nodelist=$NODES --nodes=$NNODE --ntasks-per-node=1 --gpus-per-node=4 --gpu-bind=none --export=ALL \
+  env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" torchrun \
   --nnodes=$NNODE \
-  --nproc_per_node=4 \
+  --nproc_per_node=$NPROC_PER_NODE \
   --rdzv_id=rw${DARM}$HOLDER$PORTOFF \
   --rdzv_backend=c10d \
   --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \

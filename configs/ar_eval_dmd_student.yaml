@@ -21,25 +21,17 @@ config_name: action_ode_distill
 # ---- Student training recipe ----
 trainer: ode
 
-# Random-mode denoising pool (ODE-step-value vocabulary). Aligned with
-# the Causal-Forcing teacher's ``denoising_step_list: [1000, 750, 500, 250]``
-# (see ``Causal-Forcing/configs/causal_ode_framewise.yaml``). On the
-# FlowMatchScheduler(shift=5.0, extra_one_step=True, N=48) axis used by
-# ``gen_lmdb.py`` for its 7-step trajectory, the closest stored
-# snapshots to those raw timesteps are:
+# Random-mode denoising pool (ODE-step-value vocabulary). The v14e KL
+# checkpoint was recorded on a FlowMatchScheduler(shift=5.0,
+# extra_one_step=True, N=20) trajectory. Its exact stored snapshots are:
 #   0  -> t = 1000.0  (pure noise;  CF=1000)
-#   36 -> t =  625.0  (near CF=750)
-#   40 -> t =  500.0  (exact CF=500)
-#   44 -> t =  312.5  (near CF=250)
-#   46 -> t =  178.6  (extra near-clean finishing step; not in CF pool
-#                      but kept so the student also trains on the
-#                      final-polish regime it will hit at eval time.)
+#   15 -> t =  625.0
+#   18 -> t =  357.14
+#   19 -> t =  208.33
 # ``-1`` / teacher_x0 is intentionally still omitted (timestep 0 is a
 # zero-loss identity).
-random_steps: [0, 36, 40, 44, 46]    # MUST be a subset of schedule.SNAPSHOT_STEPS
-                                     # ([0,18,36,40,44,46,-1]); the probe pops
-                                     # AF_SNAPSHOT_STEPS and pins the real serve
-                                     # rungs via FR_RUNGS=1000,625,357.14,208.33
+snapshot_steps: [0, 15, 18, 19, -1]
+random_steps: [0, 15, 18, 19]
 
 # CF branch weight in the packed dual-forward loss.
 lambda_cf: 1.0

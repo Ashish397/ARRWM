@@ -133,3 +133,73 @@ context noise, warm-start closest ckpt, 60-90min/arm, symlink seeds.
   motion space; residual luminance seam-ratio ~2 is likely benign content
   variation. SEAM = effectively handled by CARN recipe; root-fix lookback
   unnecessary at current evidence.
+
+## 2026-08-22 late — THE FIXED-ROUTE 60 s EVAL LANDED (Step 2 of PLAN_22-8)
+Same Madrid route (20240216101235.zarr +100), seed 42, 4 denoising steps,
+ar_initial_chunks=3, 100 gen chunks (59.6 s), inference-CARN λ0.5, step-200
+checkpoints, both arms fresh from the KL-ODE step-400 init.
+
+NEW INSTRUMENTS (both CPU, offline, in analysis/):
+- `rollout_quality.py` — time-resolved pixel-statistics profile referenced to
+  the REAL SEED (not to the rollout's own first second): sharpness×seed,
+  dark-channel, contrast, median, motion×seed, ORB-vs-seed AND local ORB
+  (0.5 s apart, immune to honest camera motion). Ports fleet_hf /
+  haze_baseline / blind_cpu_metrics from the 14e paper onto one long rollout.
+  Added an `hf_gain` class: this student fails by TEXTURE BLOW-UP, the
+  opposite of the paper's hedging/blur family, so the paper's classifier
+  scored it "clean".
+- `rollout_realism.py` — CLIP ViT-B/32 zero-shot REAL-scene vs MELTED-scene
+  probe + seed-embedding drift. Headline scalar = SURVIVAL TIME (first second
+  at which p_mangle stays high). The paper says structural corruption stays
+  crisp and must be caught by embedding drift; this is that instrument.
+  Validated against my own frame-by-frame read of both videos.
+
+| arm (step 200)            | survival | lap×seed(end) | motion×seed | local-ORB kept |
+|---------------------------|----------|---------------|-------------|----------------|
+| fullcarn_bidir_kl_nogan200| 8 s      | 3.63×         | 0.75×       | 0.41           |
+| fullcarn_bidir_kl_wave01  | 12 s     | 2.98×         | 0.50×       | 0.11           |
+
+VERDICT (wavelet GAN, weight 0.01, action-blind, disc t=0):
+- Criterion 1 (learns): MARGINAL. d_loss 0.659 -> 0.590 over 200 steps.
+- Criterion 2 (controlled pressure): FAIL-LOW. weighted g_loss ~0.0072 vs
+  median DMD 0.61 = ~1.2%, well under the 5-20% band.
+- Criterion 3 (extends stability past the horizon): PASS. Survival 8 -> 12 s
+  (+50%); texture blow-up onset 2 s -> 3 s; end sharpness 3.63x -> 2.98x seed.
+- Criterion 4 (no bad trade): FAIL. Motion drops 0.75x -> 0.50x of the seed's
+  own pace and local geometric coherence collapses (ORB kept 0.41 -> 0.11).
+So: a GAN this weak already buys horizon, and pays in motion. That argues for
+the STRICT assembly (weight 0.03, 5 D-steps, sampled disc-t, action-
+conditioned) rather than against the GAN.
+
+THE FAILURE IS NOT THE 5.25 s CLIFF. Both rollouts are still recognisable
+street scenes well past seed eviction; they then MELT into an iridescent
+corrugated attractor (crisp, high-frequency, geometrically dead) at 8 s
+(no-GAN) / 12 s (wavelet). Onset is gradual, not a step. Pixel stats stay
+healthy through it — hence the CLIP probe.
+
+## Live arms (2026-08-22 22:1x)
+- 6100009: `fullcarn_bidir_kl_strict03` — the STRICT critic on the IDENTICAL
+  DMD recipe as the nogan200 control (new `strict` MODE in
+  sbatch/run_full_carn_probe.sh), so the only delta vs the control is the GAN.
+  Mid-run health at step ~55: d_loss 0.692 -> 0.589 (faster than wave01) and
+  weighted g_loss/DMD ~10-20% = INSIDE the target band. Auto-chains the eval.
+- Queued on pending holders (PLAN v2 items 6 and 8):
+  6100985 `horizon_nogan90`  MODE=none    MAXLEN=90 depth 3-9 (horizon, GAN off)
+  6100986 `horizon_wave90`   MODE=wavelet MAXLEN=90 depth 3-9 (horizon + GAN)
+  6102572 `gan2x2_raw_t0`    MODE=raw     DISC_T=t0      (wavelet x timestep 2x2)
+  6102573 `gan2x2_wave_ts`   MODE=wavelet DISC_T=sampled (wavelet x timestep 2x2)
+
+## Code hygiene (2026-08-22 late)
+- R1/R2 TELEMETRY DEFECT: `r3gan_r2_fired` reads 0 on EVERY logged row of every
+  run. wandb samples every ~10 steps; the R2 cadence is (step-offset)%2 and the
+  GAN only runs on generator steps — the three cadences alias, so the gauge can
+  read 0 forever whether or not R2 fires. Added MONOTONE counters
+  (`r3gan_r{1,2}_fired_total`, `r3gan_disc_updates_total`, and fire RATES) which
+  cannot alias; the next arm settles whether R2 has ever fired. Telemetry only.
+- Removed a stray `[CARN-DIAG]` debug print that spammed stderr and, being
+  placed above the docstring, silently shadowed `_ladd_run_pair_mode.__doc__`.
+- DISK: /lus/lfs1aip2 was at 100% (48 G free). Deleted 850 GB of holder
+  end-save `phase1_step*.pt` written since 2026-08-20 (the class the rules
+  already call invalid warm starts), sparing sbatch (`_j`) runs, the
+  user's preferred `dmd10k_dmd3kl_GAN_h6067260_103050` warm-start source and
+  `rollcarn700_h6089105_022300/phase1_step0000700.pt`. Now 790 G free.

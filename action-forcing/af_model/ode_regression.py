@@ -76,7 +76,6 @@ from af_utils.schedule import (
     NUM_CHUNKS,
     SNAPSHOT_STEPS,
     resolve_denoising_step_list,
-    step_value_to_snap_idx,
 )
 
 
@@ -398,17 +397,25 @@ class ODERegression(nn.Module):
             getattr(config, "ode_chunked_supervision",
                     getattr(config, "chunked_lmdb", False))
         )
+        snapshot_steps = list(getattr(config, "snapshot_steps", SNAPSHOT_STEPS))
         random_steps = list(getattr(config, "random_steps", DEFAULT_RANDOM_STEPS))
         if len(random_steps) == 0:
             raise ValueError("random_steps must contain at least one entry")
         self.random_steps: List[int] = [int(s) for s in random_steps]
-        usable_idx = [step_value_to_snap_idx(s) for s in self.random_steps]
+        try:
+            usable_idx = [snapshot_steps.index(s) for s in self.random_steps]
+        except ValueError as exc:
+            raise ValueError(
+                f"random_steps={self.random_steps} must be a subset of "
+                f"snapshot_steps={snapshot_steps}"
+            ) from exc
         self.usable_stored_indices: List[int] = list(usable_idx)
 
         ds_list = resolve_denoising_step_list(
             usable_stored_indices=usable_idx,
             num_inference_steps=int(getattr(config, "eval_inference_steps", 48)),
             shift=float(model_kwargs.get("timestep_shift", 5.0)),
+            snapshot_steps=snapshot_steps,
         )
         self.register_buffer(
             "denoising_step_list",
@@ -422,22 +429,21 @@ class ODERegression(nn.Module):
         )
 
         # CD rung list = ALL saved snapshot rungs (the dual-CD steps between
-        # ADJACENT saved rungs, independent of the 4 ODE training rungs). 7
-        # rungs: SNAPSHOT_STEPS timesteps ~= [1000, 893, 625, 500, 312.5,
-        # 178.6, 0]. The student-CD/teacher-CD sample an adjacent (n, n+1)
-        # pair from this list so they cover the full denoising path at the
-        # finest saved granularity.
+        # adjacent saved rungs, independent of the random training subset).
+        # The student-CD/teacher-CD sample an adjacent (n, n+1) pair from
+        # this list so they cover the checkpoint's full recorded path.
         cd_list = resolve_denoising_step_list(
-            usable_stored_indices=list(range(len(SNAPSHOT_STEPS))),
+            usable_stored_indices=list(range(len(snapshot_steps))),
             num_inference_steps=int(getattr(config, "eval_inference_steps", 48)),
             shift=float(model_kwargs.get("timestep_shift", 5.0)),
+            snapshot_steps=snapshot_steps,
         )
         self.register_buffer(
             "cd_rung_list", cd_list.to(torch.float32).to(device), persistent=False,
         )
         log.info(
             "ODERegression[CD]: cd_rung_list (all %d saved rungs) timesteps=%s",
-            len(SNAPSHOT_STEPS),
+            len(snapshot_steps),
             [round(float(x), 2) for x in self.cd_rung_list.tolist()],
         )
 

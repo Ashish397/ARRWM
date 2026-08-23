@@ -2555,6 +2555,19 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_normalization_denom_floor = float(
             getattr(args, "dmd_normalization_denom_floor", 0.05)
         )
+        # Normalize the AR score head under the same causal conditional that
+        # produced its score difference. Historically it reused the
+        # teacher-forced full-window denominator, so an AR-only loss still
+        # inherited privileged-future information through its magnitude.
+        # Keep the old path selectable for exact reproduction and ablations.
+        self.dmd_ar_normalization_source = str(
+            getattr(args, "dmd_ar_normalization_source", "ar")
+        ).lower()
+        if self.dmd_ar_normalization_source not in ("ar", "tf"):
+            raise ValueError(
+                "dmd_ar_normalization_source must be 'ar' or 'tf'; got "
+                f"{self.dmd_ar_normalization_source!r}."
+            )
         # ``dmd_grad_target_norm`` (2026-08-22): CAP-ONLY rescale of the DMD
         # gradient's mean-abs magnitude to a target tau. Applied AFTER the
         # eq.(8) normalization + nan_to_num (and the fkl mixing when live),
@@ -4229,6 +4242,21 @@ class ActionForcingDMD(SelfForcingModel):
         # forwards through.
         _apply_v14_lora(self.real_score, merge=True)
         self.real_score.model.tf_use_causal_mask = bool(self.real_teacher_causal_mask)
+        # ``fake_score_causal_mask`` (2026-08-22, asymmetry fix): the fake
+        # score's CausalWanModel was NEVER assigned tf_use_causal_mask, so it
+        # fell to the class default TRUE (causal) while real_score runs
+        # bidirectional (real_teacher_causal_mask=false in current runs).
+        # grad = pred_fake - pred_real then differences two DIFFERENT
+        # conditionals -- the exact "mixed conditionals = biased non-zero
+        # fixed point" failure documented for the AR head v1. Default True
+        # preserves every historical run byte-identically; set false to make
+        # BOTH scorers bidirectional in the DMD phase (per user directive).
+        self.fake_score_causal_mask = bool(
+            getattr(args, "fake_score_causal_mask", True)
+        )
+        self.fake_score.model.tf_use_causal_mask = bool(
+            self.fake_score_causal_mask
+        )
         # Match the dual-teacher branch above, which does call ``.eval()``
         # on its frozen merged copy. ``_apply_v14_lora(merge=True)``
         # returns a module in whatever mode ``merge_and_unload`` left it,
@@ -6776,34 +6804,52 @@ class ActionForcingDMD(SelfForcingModel):
                         self.real_score, self.fake_score,
                     )
                     grad_ar = pred_fake_ar - pred_real_ar
+                    _grad_ar_raw_norm = torch.mean(torch.abs(grad_ar))
+                    _stu_band_det = original_latent.detach()[
+                        :, _ar_b0:_ar_b0 + _ar_bl
+                    ]
+                    # Always compute both denominators for diagnostics. The TF
+                    # value is the historical full 42f-window residual; the AR
+                    # value is local to the causally scored student band.
+                    _p_real_tf = (
+                        original_latent.detach() - pred_real_image_detached
+                    )
+                    _normalizer_tf = torch.abs(_p_real_tf).mean(
+                        dim=[1, 2, 3, 4], keepdim=True,
+                    )
+                    _p_real_ar = _stu_band_det - pred_real_ar
+                    _normalizer_ar = torch.abs(_p_real_ar).mean(
+                        dim=[1, 2, 3, 4], keepdim=True,
+                    )
+                    _norm_floor = float(self.dmd_normalization_denom_floor)
+                    dmd_log_dict["dmd_ar_grad_raw_norm"] = (
+                        _grad_ar_raw_norm.detach()
+                    )
+                    dmd_log_dict["dmd_denom_tf"] = _normalizer_tf.mean().detach()
+                    dmd_log_dict["dmd_denom_ar"] = _normalizer_ar.mean().detach()
+                    dmd_log_dict["dmd_denom_ar_over_tf"] = (
+                        _normalizer_ar / _normalizer_tf.clamp_min(1e-12)
+                    ).mean().detach()
+                    dmd_log_dict["dmd_denom_tf_floor_frac"] = (
+                        _normalizer_tf < _norm_floor
+                    ).float().mean().detach()
+                    dmd_log_dict["dmd_denom_ar_floor_frac"] = (
+                        _normalizer_ar < _norm_floor
+                    ).float().mean().detach()
+                    dmd_log_dict["dmd_ar_norm_source_is_ar"] = float(
+                        self.dmd_ar_normalization_source == "ar"
+                    )
                     if self.dmd_normalization_enabled:
-                        # Eq. (8) normalizer, computed over the SAME
-                        # SUPPORT the TF head uses: the FULL window
-                        # residual ``|x0 - pred_real|.mean(dim=
-                        # [1,2,3,4])``, not the 3-frame band. This is
-                        # byte-for-value the TF head's ``normalizer``
-                        # (same formula, same two tensors —
-                        # ``pred_real_image_detached`` IS the TF
-                        # ``pred_real_image``), recomputed here rather
-                        # than plumbed out of ``_compute_kl_grad`` so
-                        # the default-off path stays untouched.
-                        # ONE normalizer, BOTH heads: a band-only
-                        # normalizer is systematically larger (~18/21
-                        # of the TF window is near-zero-residual GT)
-                        # and its ratio to the TF one DRIFTS as the
-                        # student converges, so ``dmd_ar_head_weight``
-                        # would not be a like-for-like head weight and
-                        # any weight sweep would be measuring the
-                        # drift instead of the head.
-                        _p_real_tf = (
-                            original_latent.detach()
-                            - pred_real_image_detached
+                        # Eq. (8), conditional-local by default. ``tf`` is a
+                        # legacy-only option for reproducing the old shared
+                        # normalization ablation.
+                        _normalizer_used = (
+                            _normalizer_ar
+                            if self.dmd_ar_normalization_source == "ar"
+                            else _normalizer_tf
                         )
-                        _normalizer_ar = torch.abs(_p_real_tf).mean(
-                            dim=[1, 2, 3, 4], keepdim=True,
-                        )
-                        grad_ar = grad_ar / _normalizer_ar.clamp_min(
-                            self.dmd_normalization_denom_floor
+                        grad_ar = grad_ar / _normalizer_used.clamp_min(
+                            _norm_floor
                         )
                     grad_ar = torch.nan_to_num(grad_ar)
                     # ---- gradient-norm targeting, AR head ----------------

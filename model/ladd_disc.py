@@ -684,6 +684,8 @@ class LADDDiscriminator(nn.Module):
         stat_head_frames_per_window: int = 3,
         stat_head_pool_size: int = 4,
         stat_head_hidden_dim: int = 256,
+        scalar_output: bool = False,
+        freeze_projector_mixing: bool = False,
     ):
         super().__init__()
         self.projector = projector  # stored as plain attribute, not nn submodule
@@ -693,6 +695,8 @@ class LADDDiscriminator(nn.Module):
         self.use_csm = bool(use_csm)
         self.cmap_dim = int(cmap_dim)
         self.wavelet_hf_enabled = bool(wavelet_hf_enabled)
+        self.scalar_output = bool(scalar_output)
+        self.freeze_projector_mixing = bool(freeze_projector_mixing)
         # WAN patch_size + per-frame action-token count; needed to
         # reshape the captured token sequence back to the 2D
         # patch-grid layout (T', H', W') + a_per_f-per-frame action
@@ -724,6 +728,10 @@ class LADDDiscriminator(nn.Module):
             )
         else:
             self.csm = None
+        if self.freeze_projector_mixing:
+            self.ccm.requires_grad_(False)
+            if self.csm is not None:
+                self.csm.requires_grad_(False)
         self.heads = nn.ModuleDict(
             {str(i): LADDDiscHead(
                 dim_proj=self.dim_proj,
@@ -900,6 +908,11 @@ class LADDDiscriminator(nn.Module):
             l = l.reshape(B, -1)
             logits_per_scale.append(l)
         visual_logits = torch.cat(logits_per_scale, dim=1)
+        if self.scalar_output:
+            # One invariant critic value per sample. This reduction is part of
+            # D itself, so D/G losses and R1/R2 all differentiate the exact
+            # same scalar instead of summing a resolution-dependent token map.
+            visual_logits = visual_logits.mean(dim=1, keepdim=True)
 
         # Append the parallel stat-head logit. The stat head
         # discriminates std distribution on the RAW input latent
@@ -1115,6 +1128,8 @@ def build_ladd_disc(
     stat_head_frames_per_window: int = 3,
     stat_head_pool_size: int = 4,
     stat_head_hidden_dim: int = 256,
+    scalar_output: bool = False,
+    freeze_projector_mixing: bool = False,
 ) -> LADDDiscriminator:
     """Build a LADD discriminator wired to the existing teacher.
 
@@ -1152,6 +1167,8 @@ def build_ladd_disc(
         stat_head_frames_per_window=stat_head_frames_per_window,
         stat_head_pool_size=stat_head_pool_size,
         stat_head_hidden_dim=stat_head_hidden_dim,
+        scalar_output=scalar_output,
+        freeze_projector_mixing=freeze_projector_mixing,
     )
     return disc
 
