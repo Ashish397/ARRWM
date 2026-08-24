@@ -78,11 +78,36 @@ from torch.utils import swap_tensors as _swap_tensors
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from model.base import SelfForcingModel
+from model.one_forcing_gan import (
+    add_noise_bf,
+    duplicate_conditional_dict,
+    finite_difference_penalty,
+    logit_gap,
+    nearest_gt_l1_match,
+    of_discriminator_loss,
+    of_generator_loss,
+    of_weight_at_step,
+    pair_shared_noise,
+    resolve_of_config,
+    sample_of_timestep,
+    split_logits,
+)
 from pipeline.action_forcing_training import (
     _ACTION_STREAM_KEYS,
     _slice_per_frame_streams,
 )
 from utils.debug_option import DEBUG
+
+# Module names of the One-Forcing discriminator head, in the ONE place
+# they are spelled for the model. ``trainer._build_model`` attaches all
+# three to ``fake_score.model``
+# (``adding_cls_branch(attach_to_model=True)``) and derives
+# ``_of_head_param_names`` from the same three prefixes. Module scope, not
+# a class attribute, so ``of_head_touch`` can be bound to a bare stub in
+# the CPU tests.
+_OF_HEAD_MODULE_NAMES = (
+    "_cls_pred_branch", "_register_tokens", "_gan_ca_blocks",
+)
 
 try:
     import peft  # type: ignore
@@ -172,6 +197,36 @@ class ActionForcingDMD(SelfForcingModel):
         self.action_dims: Optional[List[int]] = (
             list(action_dims_cfg) if action_dims_cfg is not None else None
         )
+
+        # ------------------------------------------------------------------
+        # ONE-FORCING GAN (Option D) — docs/ONE_FORCING_PORT.md.
+        #
+        # Resolved ONCE here off the run config, so every consumer reads the
+        # same numbers and the trainer can echo them. ``resolve_of_config``
+        # is also the single site where the ``gan_of_*`` keys appear as
+        # string literals against a config receiver, which is what registers
+        # them with the trainer's override guard.
+        #
+        # NOTE the head itself is NOT built here. It must be constructed
+        # after ``fake_score`` has been moved to its device/dtype and BEFORE
+        # the trainer DDP-wraps ``fake_score.model`` and builds
+        # ``fake_optimizer`` — see ``adding_cls_branch(attach_to_model=True)``
+        # and ``ActionForcingDMDTrainer._build_model``.
+        # ------------------------------------------------------------------
+        self.of_cfg: Dict[str, Any] = resolve_of_config(args)
+        self.gan_of_enabled: bool = bool(self.of_cfg["gan_of_enabled"])
+        # Set by the trainer at the top of every iter (``_of_current_step``).
+        # Left as None so a caller that forgot gets a loud error instead of
+        # a silent step=0 — which would pin ``gan_of_warmup_steps`` /
+        # ``gan_of_disc_start_step`` at their first-step values forever
+        # while every logged number still looked plausible.
+        self._of_current_step: Optional[int] = None
+        # Per-roll (fake, real, cond) triple resolved by
+        # ``_of_publish_streaming_band`` inside
+        # ``compute_generator_loss_streaming`` and consumed by BOTH the
+        # trainer's G fold and its D fold. Cleared at the top of every
+        # generator-loss call so a stale roll's band can never be reused.
+        self._of_band: Optional[Dict[str, Any]] = None
 
         self.independent_first_frame = False
         self.num_training_frames = int(getattr(args, "num_training_frames", 21))
@@ -330,6 +385,34 @@ class ActionForcingDMD(SelfForcingModel):
         # Iter 1 (overlap=0) keeps the standard layout unchanged.
         self.dmd_42f_rolling_sup_new = bool(
             getattr(args, "dmd_42f_rolling_sup_new", False)
+        )
+
+        # ``dmd_42f_allroll_student_ctx`` ("all-rolling", 2026-08-24): on
+        # rolling iters (dmd_42f_rolling_sup_new + overlap>0) remove the
+        # REMAINING GT content from the DMD scoring windows so everything
+        # the scorers see as context is the student's own rolled output:
+        #   (a) the clean_x half — today positional GT that rolls forward
+        #       — is overlaid with the student's own rolled-window content
+        #       (detached, same world positions) wherever the roll covers
+        #       it; GT is kept ONLY for frames the student has no history
+        #       for (early-ride shortfall / clean_shift_fwd tail), counted
+        #       in the ``dmd42f_allroll_ctx_gt_fallback`` log key;
+        #   (b) the npb GT future scaffold at the structurally-OOD newest
+        #       noisy slot is replaced by a REPEAT of the student's newest
+        #       rolled chunk (detached; in this geometry every new chunk
+        #       is supervised so no newer unsupervised student chunk
+        #       exists). It stays gradient-masked exactly like the GT
+        #       filler it replaces.
+        # The noisy ctx band needs NO change — on rolling iters it is
+        # already the student's own overlap frames (see the rebind in
+        # ``_build_42f_scoring_inputs``; last-rung content when
+        # ``dmd_rolling_ctx_last_rung`` is on, which this inherits).
+        # Iter 1 (overlap=0) keeps its GT layout — nothing else exists at
+        # ride start. Supervised band + gradient masking unchanged; all
+        # tensor SHAPES unchanged (rank-local content substitution only,
+        # no new collectives). Default False = byte-identical.
+        self.dmd_42f_allroll_student_ctx = bool(
+            getattr(args, "dmd_42f_allroll_student_ctx", False)
         )
 
         # ``dmd_42f_gt_anchor``: make the +npb leading-anchor chunk (rolled
@@ -3571,6 +3654,36 @@ class ActionForcingDMD(SelfForcingModel):
         self.boundary_vae_roundtrip: bool = bool(
             getattr(args, "boundary_vae_roundtrip", False)
         )
+        # ``boundary_vae_roundtrip_keep_graph`` (2026-08-24, One-Forcing
+        # smoke post-mortem). MEASURED DEFECT, not a preference: the
+        # round-trip above used to build its replacement chunk with a
+        # ``torch.cat`` executed INSIDE the ``with torch.no_grad():``
+        # block that wraps the VAE decode/encode. ``torch.cat`` under
+        # ``no_grad`` produces a tensor with NO ``grad_fn``, so the whole
+        # rolled chunk came back graph-free on EVERY overlapped roll
+        # (iter k>=2) — the student's supervised band included. Effects,
+        # all silent:
+        #   * the streaming DMD generator loss became a constant on every
+        #     roll after the first (its ``score_image`` is built from this
+        #     chunk), so ``dmd_supervise_roll_mode='random'`` gave a ride
+        #     ZERO generator gradient whenever it drew a target roll > 1;
+        #   * ``generator_loss.requires_grad`` stayed True anyway — the
+        #     phase-LoRA ghost anchor supplies a live ``0.0 * ghost`` term
+        #     — so ``gen_backward_skipped`` never fired and the backward
+        #     ran to completion producing exactly zero gradient.
+        # The `[42F-ROLLING] ... (graph-on=False)` line in every rolling
+        # log with ``boundary_vae_roundtrip: true`` is the fingerprint;
+        # runs with the flag OFF print ``graph-on=True`` at the same
+        # geometry.
+        # Default False = BYTE-IDENTICAL to the measured behaviour (this
+        # is a training-recipe change and needs sign-off, so it does not
+        # switch itself on). True keeps the VAE forwards under
+        # ``no_grad`` and moves ONLY the concatenation out, which is what
+        # the original comment already claimed the code did.
+        self.boundary_vae_roundtrip_keep_graph: bool = bool(
+            getattr(args, "boundary_vae_roundtrip_keep_graph", False)
+        )
+        self._boundary_vae_graph_warned: bool = False
         # Deterministic stride for slide-and-train: when > 0, every
         # ``_streaming_pick_new_frames`` call returns exactly this many
         # ``num_frame_per_block``-chunks (* npb frames) instead of the
@@ -5111,6 +5224,18 @@ class ActionForcingDMD(SelfForcingModel):
         "dmd_fp_gate_min_weight",
     )
 
+    # RATCHET ("capacitor-diode") calibration. Same Class-B discipline:
+    # arming ``dmd_fp_ratchet_enabled`` with any of these unset RAISES.
+    # ``dmd_fp_ratchet_ema`` is the capacitor's time constant and there
+    # is no defensible default for it -- it trades "closes on one noisy
+    # probe" against "never closes inside a short ride", and which side
+    # you want depends on the measured probe variance for THIS
+    # teacher/data pair (the seed-noise floor was 0.0137 mean / 0.0338
+    # worst; see docs/DMD_FINGERPRINT_PROBE.md).
+    _DMD_FP_RATCHET_KEYS = (
+        "dmd_fp_ratchet_ema",
+    )
+
     @staticmethod
     def _dmd_fp_opt_float(args, key):
         """``float(args.key)`` or ``None`` -- never a substituted number.
@@ -5140,6 +5265,12 @@ class ActionForcingDMD(SelfForcingModel):
         for _k in self._DMD_FP_CALIB_KEYS:
             setattr(self, _k, self._dmd_fp_opt_float(args, _k))
         self.dmd_fp_gate_enabled = bool(getattr(args, "dmd_fp_gate_enabled", False))
+        # --- RATCHET: stateful along a ride (see
+        # --- _dmd_fp_ratchet_apply for the full argument) -------------
+        self.dmd_fp_ratchet_enabled = bool(
+            getattr(args, "dmd_fp_ratchet_enabled", False))
+        for _k in self._DMD_FP_RATCHET_KEYS:
+            setattr(self, _k, self._dmd_fp_opt_float(args, _k))
         self._last_dmd_fp_w_per_frame = None
         self._last_dmd_fp_m_per_frame = None
         # Telemetry slots. None (not 0.0) so an unavailable diagnostic is
@@ -5152,6 +5283,349 @@ class ActionForcingDMD(SelfForcingModel):
         self._last_dmd_fp_gate_w_max = None
         self._last_dmd_fp_gate_share = None
         self._last_dmd_fp_calc_idx = None
+        # --- RATCHET state + telemetry -------------------------------
+        # ``reset_dmd_fp_ratchet`` is the ONE place these are cleared and
+        # it is called unconditionally (gate on or off) from the
+        # trainer's ride-setup, so the reset path is exercised on every
+        # run rather than only on armed ones.
+        self._dmd_fp_ratchet_backstop_fires = 0
+        self.reset_dmd_fp_ratchet(reason="init")
+        # Construction is not a ride boundary: zero the counter AFTER the
+        # init reset so the step line's reset count means "ride starts
+        # the hook actually saw", which is the number that has to keep
+        # moving for the ratchet to be safe.
+        self._dmd_fp_ratchet_resets = 0
+        if self._last_dmd_fp_ratchet_resets is not None:
+            self._last_dmd_fp_ratchet_resets = 0.0
+
+    # ------------------------------------------------------------------
+    # RATCHET -- the stateful ("capacitor-diode") wrapper on the gate
+    # ------------------------------------------------------------------
+    def reset_dmd_fp_ratchet(self, *, reason: str = "ride_start") -> None:
+        """Clear the per-ride ratchet state. **The anti-latch mechanism.**
+
+        A running MINIMUM that is never reset latches shut and silently
+        zeroes DMD for the rest of training. That is the dangerous
+        failure mode of this design, so the reset is:
+
+        * **explicit** -- a public method, called by the trainer at the
+          one line that means "new ride" (``_chunks_in_current_ride = 0``
+          in ``_streaming_step``), not inferred from a step counter;
+        * **unconditional** -- it runs whether or not the ratchet is
+          armed, so a default-off run still exercises the call site and
+          a broken hook shows up before anyone arms anything;
+        * **counted** -- ``_last_dmd_fp_ratchet_resets`` reaches the step
+          line, so "the ratchet stopped being reset" is visible as a
+          counter that stops moving while rides keep turning over;
+        * **backstopped** -- ``_dmd_fp_ratchet_observe_depth`` resets
+          LOUDLY if the ride depth ever goes backwards without this
+          having been called (a trainer that does not carry the hook).
+
+        Directly tested: ``test_ratchet_resets_at_ride_boundary`` and
+        ``test_ratchet_without_reset_would_latch_forever``.
+        """
+        self._dmd_fp_ratchet_w = None            # the running MIN vector
+        self._dmd_fp_ratchet_m_ema = None        # the capacitor state
+        self._dmd_fp_ratchet_depth = None        # last observed ride depth
+        self._dmd_fp_ratchet_latch_depth = None  # depth of last MIN decrease
+        self._dmd_fp_ratchet_latched = False     # sticky: diode blocked a rise
+        self._dmd_fp_ratchet_resets = int(
+            getattr(self, "_dmd_fp_ratchet_resets", 0)) + 1
+        self._dmd_fp_ratchet_reason = str(reason)
+        # Telemetry slots back to None -- an unavailable diagnostic is an
+        # ABSENT step-line key, never a forgeable 0.0 (which here would
+        # read as "the ratchet has shut DMD off", a real regime).
+        self._last_dmd_fp_ratchet_w_mean = None
+        self._last_dmd_fp_ratchet_share = None
+        self._last_dmd_fp_ratchet_latched = None
+        self._last_dmd_fp_ratchet_latch_depth = None
+        self._last_dmd_fp_ratchet_depth = None
+        # The reset COUNT is the anti-latch evidence, so it is surfaced
+        # whenever the ratchet is armed -- and only then, because on a
+        # default-off run it is step-line noise with nothing to say. The
+        # hook itself still runs unconditionally; that it is CALLED is
+        # covered by test_trainer_resets_the_ratchet_at_ride_setup.
+        self._last_dmd_fp_ratchet_resets = (
+            float(self._dmd_fp_ratchet_resets)
+            if bool(getattr(self, "dmd_fp_ratchet_enabled", False))
+            else None
+        )
+
+    def _dmd_fp_ratchet_observe_depth(self, chunks_in_ride) -> None:
+        """Record the ride depth, and BACKSTOP a missing explicit reset.
+
+        Called from ``compute_generator_loss_streaming``, which is the
+        one model-side place the trainer's ``_chunks_in_current_ride``
+        is already in scope (``info["chunks_in_current_ride"]``).
+
+        Two jobs:
+
+        1. Supply the DEPTH the ratchet reports as ``latch_depth``. That
+           number is the empirical cross-check on the measured trough:
+           training-time depth is known exactly, so if the running
+           minimum stops decreasing around depth ~16 that independently
+           corroborates the offline depth study's U-shaped ``s`` curve
+           (trough at 16 in 11 of 12 series).
+        2. Detect a ride boundary that arrived WITHOUT
+           ``reset_dmd_fp_ratchet``. A strict DECREASE in depth can only
+           mean a new ride began, so if the explicit hook did not fire
+           (a different trainer, a refactor that dropped the call) reset
+           here and say so on stderr. Latch-forever is the failure this
+           whole method exists to make impossible.
+
+        STRICT decrease, deliberately: several DMD calls can share one
+        depth, and a ``<=`` test would reset the ratchet on every repeat
+        and silently defeat the diode -- the same class of bug in the
+        opposite direction.
+        """
+        d = int(chunks_in_ride)
+        prev = getattr(self, "_dmd_fp_ratchet_depth", None)
+        if prev is not None and d < int(prev):
+            self._dmd_fp_ratchet_backstop_fires = int(
+                getattr(self, "_dmd_fp_ratchet_backstop_fires", 0)) + 1
+            _n = self._dmd_fp_ratchet_backstop_fires
+            self.reset_dmd_fp_ratchet(reason="depth_backstop")
+            self._dmd_fp_ratchet_backstop_fires = _n
+            if _n <= 3:
+                import sys as _sys
+                print(
+                    "[dmd_fp] RATCHET BACKSTOP: ride depth went "
+                    f"{prev} -> {d} without reset_dmd_fp_ratchet() being "
+                    "called. The ratchet was reset here so it cannot "
+                    "latch shut forever, but the trainer's explicit "
+                    "ride-setup hook is MISSING -- fix it. (fire "
+                    f"#{_n})",
+                    file=_sys.stderr, flush=True,
+                )
+        self._dmd_fp_ratchet_depth = d
+        self._last_dmd_fp_ratchet_depth = float(d)
+
+    def _dmd_fp_missing_ratchet_calib(self):
+        """The ratchet Class-B keys still unset, in declaration order."""
+        return [k for k in self._DMD_FP_RATCHET_KEYS
+                if getattr(self, k, None) is None]
+
+    def _dmd_fp_require_ratchet_calib(self, why: str) -> None:
+        """Raise naming EXACTLY which ratchet values are missing."""
+        missing = self._dmd_fp_missing_ratchet_calib()
+        if missing:
+            raise ValueError(
+                f"{why} but these dmd_fp ratchet values are unset: "
+                + ", ".join(missing)
+                + ". They are NOT inheritable defaults -- the EMA time "
+                "constant trades 'closes on one noisy probe' against "
+                "'never closes inside a short ride' and the right side "
+                "depends on the measured probe seed-noise floor for THIS "
+                "teacher/data pair. See docs/DMD_FINGERPRINT_PROBE.md "
+                "and analysis/dmd_fp_depth_study.py. Refusing to run on "
+                "an invented time constant."
+            )
+
+    def _dmd_fp_ratchet_apply(self, w_raw, log_dict):
+        """``w_t = min(w_{t-1}, f(ema(m)_t))`` -- ELEMENTWISE, per ride.
+
+        **Why a stateful gate at all.** The depth study returned
+        ``PROBE CANNOT RANK OFF-MANIFOLD DISTANCE -- GATE NOT VIABLE``,
+        0/8 arms, at t=250/500/750. That verdict stands, and it is a
+        verdict about a MONOTONICITY criterion. The measured ``s``-vs-
+        depth curve is U-SHAPED: near depth 0 the sample sits on the DATA
+        manifold and the teacher's field is locally restoring, so ``s``
+        is high; at large depth the sample has been captured by the
+        MODEL'S OWN attractor, where the field is ALSO locally restoring,
+        so ``s`` is high again. Measured trough at depth 16 in 11 of 12
+        (arm, timestep) series. And the two ends are not separable:
+
+            deepest s minus depth-0 s, over 12 (arm, t) series
+                mean +0.0244, sd 0.0709, 9/12 POSITIVE
+                = 1.78x the MEAN seed-noise floor (0.0137)
+                  but only 0.72x the WORST floor (0.0338)
+
+        So ``s`` -- and therefore ``m`` -- is **non-injective in depth**,
+        and where the two ends do differ the DEEP one scores HIGHER. Any
+        gate that is a pure function of the current ``m`` is ill-posed:
+        the same reading means opposite things. The probe measures "near
+        SOME attractor", which is strictly weaker than "near the DATA
+        manifold".
+
+        **The ratchet is what converts the weaker signal into a usable
+        gate**, using the one extra fact the probe does not have and the
+        trainer does: TIME ORDER. A ride starts on the manifold. So:
+
+        * **DIODE** (``min``): the weight never increases within a ride.
+          The far branch's rising ``m`` therefore can NEVER re-open the
+          gate, and the far side becomes automatically "no" without any
+          threshold needing to know where the trough is. There is
+          deliberately NO trough-location constant in this method.
+        * **CAPACITOR** (``dmd_fp_ratchet_ema``): an EMA on ``m``
+          BEFORE the ``m_lo``/``m_hi``/exponent/min_weight mapping, so
+          the gate closes progressively instead of snapping shut on one
+          noisy probe. The EMA is on ``m`` and not on ``w`` because the
+          mapping is nonlinear (``exponent``) and clamped at both ends:
+          smoothing after the clamp cannot recover a value the clamp has
+          already destroyed.
+
+        **ELEMENTWISE semantics.** ``w_raw`` and the running minimum are
+        ``[F]`` vectors over the band's frames, and the ``min`` is taken
+        frame by frame against the SAME frame index. The per-frame path
+        is preserved exactly -- the measured align cliff lives inside a
+        single band (positive at frames 9-13, -0.53 by 17) and a scalar
+        ratchet would average it away. Frame *i*'s running minimum is
+        driven only by frame *i*'s history, so a band whose tail has
+        drifted still attenuates tail-only. Consequence worth stating:
+        the frame INDEX is the carrier of identity across calls, not the
+        underlying content, which shifts by the rollout stride each roll.
+        That is the same convention the per-frame weights already use.
+
+        A shape change mid-ride RAISES rather than resetting. A reset
+        would re-open the gate on the deep end, which is exactly what the
+        diode exists to prevent, so "I no longer know what to line up
+        with what" must not be resolved silently in the unsafe
+        direction.
+
+        TWO STANDING HAZARDS, recorded rather than silently handled:
+
+        1. **The EMA's time base is the DMD CALL, not the probe.** With
+           ``dmd_fp_every > 1`` the probe's ``m`` is STALE between
+           refreshes and this method charges the capacitor toward the
+           same stale reading on every intervening call, so the
+           effective smoothing is WEAKER than the knob reads and the
+           diode takes several redundant minima of one measurement.
+           Deliberately not special-cased -- skipping stale calls would
+           make the knob mean something different depending on another
+           knob. Run the ratchet at ``dmd_fp_every=1``, and watch
+           ``dmd_fp_gate_w_age`` (already logged) if you do not.
+        2. **With ``dmd_fp_gate_min_weight = 0`` a SINGLE probe reading
+           at/below ``m_lo`` pins the weight at zero for the REST OF THE
+           RIDE.** That is the diode working as specified, but the probe
+           has a measured seed-noise floor (mean 0.0137, worst 0.0338),
+           so one noisy draw can switch DMD off for a whole ride. The
+           capacitor is the intended defence; a nonzero
+           ``dmd_fp_gate_min_weight`` is the belt-and-braces one. Not
+           enforced here -- min_weight is a MEASURED Class-B value and
+           this method must not overrule a measurement -- but it is the
+           first thing to check if ``fp_share`` collapses.
+        """
+        self._dmd_fp_require_ratchet_calib("dmd_fp_ratchet_enabled=true")
+        a = float(self.dmd_fp_ratchet_ema)
+        if not (0.0 <= a < 1.0):
+            raise ValueError(
+                f"dmd_fp_ratchet_ema ({a}) must lie in [0, 1). 0 = no "
+                "smoothing (the gate closes on a single probe); 1 would "
+                "freeze the capacitor at the ride's first reading so the "
+                "gate could never close at all."
+            )
+        if getattr(self, "_dmd_fp_ratchet_depth", None) is None:
+            raise ValueError(
+                "dmd_fp_ratchet_enabled=true but no ride depth has been "
+                "observed. The ratchet is defined PER RIDE and its reset "
+                "is hooked to the ride boundary, so it cannot run on a "
+                "path that has no rides (the non-streaming generator "
+                "loss) or on a trainer that never calls "
+                "_dmd_fp_ratchet_observe_depth. Refusing to accumulate a "
+                "running minimum with no defined reset point -- that is "
+                "the latch-forever failure."
+            )
+        m = getattr(self, "_last_dmd_fp_m_per_frame", None)
+        if m is None:
+            raise ValueError(
+                "dmd_fp_ratchet_enabled=true but no per-frame fingerprint "
+                "score m has been computed. The ratchet smooths m BEFORE "
+                "the response curve, so it needs the raw m the probe "
+                "produces (set dmd_fp_every>=1). Refusing to ratchet a "
+                "weight whose pre-image it does not have."
+            )
+        # ``w_raw`` supplies device/dtype ONLY. The ratchet deliberately
+        # re-derives the weight from the EMA-smoothed m rather than
+        # smoothing the already-mapped w: the mapping is nonlinear and
+        # clamped at both ends, so an EMA after the clamp cannot recover
+        # information the clamp destroyed.
+        m = m.detach().to(device=w_raw.device, dtype=torch.float32)
+        depth = int(self._dmd_fp_ratchet_depth)
+
+        # --- CAPACITOR: EMA on m -------------------------------------
+        prev_e = getattr(self, "_dmd_fp_ratchet_m_ema", None)
+        if prev_e is not None and tuple(prev_e.shape) != tuple(m.shape):
+            raise ValueError(
+                f"dmd_fp ratchet: per-frame m changed shape mid-ride "
+                f"({tuple(prev_e.shape)} -> {tuple(m.shape)}). The "
+                "running minimum is ELEMENTWISE over frame index, so a "
+                "shape change makes the correspondence undefined. NOT "
+                "resetting here on purpose: a reset re-opens the gate on "
+                "the deep end, which is exactly what the diode prevents."
+            )
+        m_ema = m.clone() if prev_e is None else (a * prev_e + (1.0 - a) * m)
+        self._dmd_fp_ratchet_m_ema = m_ema
+
+        # --- the existing (measured) response curve -------------------
+        w_new = self._dmd_fp_gate_weight_from_m(m_ema).to(w_raw.dtype)
+
+        # --- DIODE: running elementwise minimum -----------------------
+        prev_w = getattr(self, "_dmd_fp_ratchet_w", None)
+        if prev_w is None:
+            w_out = w_new
+            decreased = True          # first reading establishes the min
+        else:
+            if tuple(prev_w.shape) != tuple(w_new.shape):
+                raise ValueError(
+                    f"dmd_fp ratchet: per-frame weight changed shape "
+                    f"mid-ride ({tuple(prev_w.shape)} -> "
+                    f"{tuple(w_new.shape)}); the elementwise minimum is "
+                    "undefined. See the m-shape branch above for why "
+                    "this raises instead of resetting."
+                )
+            w_out = torch.minimum(prev_w, w_new)
+            decreased = bool((w_out < prev_w - 1e-12).any())
+        self._dmd_fp_ratchet_w = w_out.detach()
+        if decreased:
+            # Depth of the LAST decrease of the running minimum. On a
+            # U-shaped m this stops moving AT THE TROUGH, so it is a
+            # direct training-time read of the trough depth.
+            self._dmd_fp_ratchet_latch_depth = depth
+        # LATCHED (sticky, per ride): the diode has actually BLOCKED a
+        # rise, i.e. the far-attractor branch tried to re-open the gate
+        # and was refused. This is the event the whole design is for, so
+        # it is reported as an event and not inferred from the weights.
+        if bool((w_new > w_out + 1e-12).any()):
+            self._dmd_fp_ratchet_latched = True
+
+        _out_mean = float(w_out.float().mean())
+        _raw_mean = float(w_new.float().mean())
+        log_dict["dmd_fp_ratchet_w_mean"] = _out_mean
+        log_dict["dmd_fp_ratchet_raw_w_mean"] = _raw_mean
+        log_dict["dmd_fp_ratchet_depth"] = float(depth)
+        log_dict["dmd_fp_ratchet_resets"] = float(
+            getattr(self, "_dmd_fp_ratchet_resets", 0))
+        _latched = 1.0 if self._dmd_fp_ratchet_latched else 0.0
+        log_dict["dmd_fp_ratchet_latched"] = _latched
+        if self._dmd_fp_ratchet_latch_depth is not None:
+            log_dict["dmd_fp_ratchet_latch_depth"] = float(
+                self._dmd_fp_ratchet_latch_depth)
+        # SHARE: what fraction of the UN-ratcheted gate weight survives
+        # the ratchet -- the ratchet's own marginal effect. The absolute
+        # "how much of DMD survives everything" is dmd_fp_gate_share
+        # downstream, which now reads the ratcheted weights. Standing
+        # campaign rule: a gate that reports only raw values can be fully
+        # closed without the step line saying so.
+        if _raw_mean > 1e-12:
+            _share = _out_mean / _raw_mean
+            log_dict["dmd_fp_ratchet_share"] = _share
+            self._last_dmd_fp_ratchet_share = _share
+        else:
+            # Regime flag, never a forgeable share: the response curve
+            # itself is at zero, so "what the ratchet removed" is
+            # undefined rather than 0 or 1.
+            log_dict["dmd_fp_ratchet_raw_closed"] = 1.0
+            self._last_dmd_fp_ratchet_share = None
+        # Stash for the STEP LINE (dmd_log_dict is wandb-only).
+        self._last_dmd_fp_ratchet_w_mean = _out_mean
+        self._last_dmd_fp_ratchet_latched = _latched
+        self._last_dmd_fp_ratchet_latch_depth = (
+            None if self._dmd_fp_ratchet_latch_depth is None
+            else float(self._dmd_fp_ratchet_latch_depth))
+        self._last_dmd_fp_ratchet_depth = float(depth)
+        self._last_dmd_fp_ratchet_resets = float(
+            getattr(self, "_dmd_fp_ratchet_resets", 0))
+        return w_out
 
     def _dmd_fp_missing_calib(self):
         """The Class-B keys that are still unset, in declaration order."""
@@ -5309,6 +5783,25 @@ class ActionForcingDMD(SelfForcingModel):
                     "_dmd_fp_denoise_fn is installed. Refusing to run an "
                     "'attenuated' DMD that is silently un-attenuated."
                 )
+        elif bool(getattr(self, "dmd_fp_ratchet_enabled", False)):
+            # Ratchet armed with the gate OFF would be a silent no-op:
+            # the ratchet MODIFIES the gate's weight and there is no
+            # weight to modify. Loud, not inert.
+            raise ValueError(
+                "dmd_fp_ratchet_enabled=true but dmd_fp_gate_enabled is "
+                "false. The ratchet is a stateful wrapper ON the "
+                "fingerprint gate's per-frame weight -- with the gate "
+                "off there is no weight to ratchet and the flag would "
+                "be silently inert. Set dmd_fp_gate_enabled=true (and "
+                "its Class-B calibration) or turn the ratchet off."
+            )
+        if _fpw is not None and bool(
+                getattr(self, "dmd_fp_ratchet_enabled", False)):
+            # STATEFUL composition: w_t = min(w_{t-1}, f(ema(m)_t)),
+            # elementwise over the band's frames. See
+            # _dmd_fp_ratchet_apply for why a pure function of the
+            # current m is ill-posed (U-shaped, non-injective m-vs-depth).
+            _fpw = self._dmd_fp_ratchet_apply(_fpw, log_dict)
         if _fpw is None:
             # DEFAULT-OFF PATH -- must stay bit-for-bit what it was
             # before the gate existed. Do not "unify" this with the
@@ -8512,6 +9005,1088 @@ class ActionForcingDMD(SelfForcingModel):
             return dmd_loss, dmd_log_dict, aux
         return dmd_loss, dmd_log_dict
 
+    # ==================================================================
+    # ONE-FORCING GAN (Option D) — docs/ONE_FORCING_PORT.md
+    #
+    # The discriminator is the register-token head hosted on the
+    # TRAINABLE ``fake_score`` critic, not on the frozen DMD teacher.
+    # That is the whole point of the arm (GAN_REDESIGN_TWO's decoupling
+    # rule): the disc's feature basis is retrained every iter by the
+    # denoising objective on the current student's own samples, so it
+    # tracks the student's distribution instead of being a frozen
+    # projection of the teacher that DMD already scores with.
+    #
+    # Consequence that drives the wiring: the D loss is ADDED INTO the
+    # existing ``critic_loss`` so one backward and one
+    # ``fake_optimizer.step()`` carry BOTH the denoising and the
+    # adversarial gradient into the same backbone. Giving the disc its
+    # own optimizer would restore exactly the decoupling this arm exists
+    # to remove.
+    # ==================================================================
+
+    def _of_disc_cond(self, cond: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip the teacher-forcing (clean-half) streams from a cond dict.
+
+        ``_build_dmd_context_kwargs`` merges ``_action_modulation_clean`` /
+        ``_action_tokens_clean`` into the scoring cond dict for the
+        denoising forward. The disc forward runs WITHOUT ``clean_x``, so
+        those streams are dead weight there — and leaving them in would
+        make it look, to a reader, as though the disc sees a clean half.
+        """
+        return {
+            k: v for k, v in cond.items()
+            if not k.endswith("_clean")
+        }
+
+    def _of_disc_logits(
+        self,
+        latent: torch.Tensor,
+        cond: Dict[str, Any],
+        timestep: torch.Tensor,
+        unwrapped: bool = False,
+    ) -> torch.Tensor:
+        """One discriminator forward. Returns ``[B, num_class]`` logits.
+
+        ``unwrapped=True`` bypasses the DDP wrapper on ``fake_score.model``
+        by temporarily rebinding the wrapper's ``.model`` to the raw
+        module. This is REQUIRED on the generator step (spec §4): there,
+        the disc must not be trained, so the backward through this forward
+        produces no gradient for any DDP-managed parameter. A DDP forward
+        whose backward never fires the reducer's hooks either hangs the
+        next collective or raises "Expected to have finished reduction" —
+        a multi-node-only failure that a single-node smoke will not show.
+        """
+        wrapper = self.fake_score
+        inner = wrapper._unwrapped_model()
+        prev_model = wrapper.model
+        try:
+            if unwrapped:
+                wrapper.model = inner
+            _flow, _x0, logits = wrapper(
+                noisy_image_or_video=latent,
+                conditional_dict=cond,
+                timestep=timestep,
+                classify_mode=True,
+            )
+        finally:
+            if unwrapped:
+                wrapper.model = prev_model
+        return logits
+
+    @contextmanager
+    def _of_disc_frozen(self):
+        """Freeze every ``fake_score`` parameter for the enclosed block.
+
+        Their ``set_discriminator_requires_grad`` (one_forcing.py ``:92``)
+        is a blanket ``requires_grad_(False)``; we snapshot and restore the
+        per-parameter flags instead of blanket-restoring to True, because
+        this model legitimately freezes subsets of ``fake_score`` in other
+        modes (LoRA-only critics, alt-head experiments) and a blanket
+        restore would silently unfreeze them.
+
+        HARD RULE — any BACKWARD through a forward run inside this block
+        must ALSO run inside this block.
+
+        ``fake_score.model.gradient_checkpointing`` is True in every
+        production OF config, so the disc forward's DiT blocks run under
+        ``torch.utils.checkpoint(use_reentrant=False)``, which replays them
+        at backward time and asserts the replayed saved-tensor list matches
+        the original one. That list DEPENDS ON THIS FLAG: for
+        ``F.linear(x, W)`` autograd saves ``W`` only when ``x`` needs grad
+        and saves ``x`` only when ``W`` needs grad. Inside the block
+        (W frozen) each linear saves ONE tensor; after the ``finally``
+        restores the flags it saves TWO. Deferring the backward past the
+        restore therefore shifts the whole list by one entry per linear and
+        raises ``CheckpointError: Recomputed values ... have different
+        metadata``, with a ``[dim, dim]`` cast weight sitting where an
+        activation is expected.
+
+        That is exactly how the first 8-rank OF smoke died (2026-08-24, all
+        ranks, at ``generator_loss.backward()``), and why
+        ``compute_of_g_loss`` takes ``torch.autograd.grad`` w.r.t. the fake
+        tensor HERE rather than handing the live disc subgraph to the
+        trainer's later backward. It is NOT an autocast cast-cache problem;
+        there is no ``torch.autocast`` anywhere on this path.
+        """
+        params = list(self.fake_score.parameters())
+        saved = [p.requires_grad for p in params]
+        try:
+            for p in params:
+                p.requires_grad_(False)
+            yield
+        finally:
+            for p, flag in zip(params, saved):
+                p.requires_grad_(flag)
+
+    def _of_aligned_real(
+        self,
+        clean_latent: Optional[torch.Tensor],
+        seed_frames: int,
+        rollout_frames: int,
+        scoring_frames: int,
+    ) -> torch.Tensor:
+        """The GT latent window that is FRAME-ALIGNED with the student's
+        scoring window.
+
+        Same arithmetic as ``_slice_baseline_scoring_window`` applies to
+        the per-frame action streams: the scored window is the LAST
+        ``scoring_frames`` of the rollout half, and ``clean_latent``
+        covers ``seed_frames + rollout``. Deriving it here rather than
+        passing a pre-sliced tensor keeps the alignment in ONE place; the
+        trainer's own ``gt_window = latents[:, gen_window_start:
+        gen_window_end]`` is the same slice expressed against the
+        rollout-only view.
+        """
+        if clean_latent is None:
+            raise RuntimeError(
+                "gan_of_enabled=True but no clean_latent reached the OF "
+                "real-sample slicer; the adversarial loss has no real side."
+            )
+        start = int(seed_frames) + int(rollout_frames) - int(scoring_frames)
+        end = start + int(scoring_frames)
+        if start < int(seed_frames) or end > int(clean_latent.shape[1]):
+            raise RuntimeError(
+                f"OF real window [{start}:{end}] falls outside clean_latent "
+                f"of length {int(clean_latent.shape[1])} "
+                f"(seed_frames={seed_frames}, rollout_frames="
+                f"{rollout_frames}, scoring_frames={scoring_frames})."
+            )
+        return clean_latent[:, start:end]
+
+    def _of_real_sample(
+        self,
+        fake_latent: torch.Tensor,
+        aligned_real: torch.Tensor,
+        gt_pool: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Resolve ``gan_of_real_source``.
+
+        ``aligned_gt`` (default, faithful) is the frame-aligned window.
+        ``nearest_match`` retrieves, per sample, the nearest-by-L1 GT
+        window from ``gt_pool`` — our historical LADD behaviour, kept
+        ONLY so it can be measured as a separate variable. It is the
+        condition One-Forcing's Fig. 4 identifies as collapsing the logit
+        gap, so it is not the default and it fails loud when no pool was
+        supplied rather than quietly degrading to ``aligned_gt``.
+        """
+        source = self.of_cfg["gan_of_real_source"]
+        if source == "aligned_gt":
+            return aligned_real.detach(), {}
+        if source == "nearest_match":
+            if gt_pool is None:
+                raise RuntimeError(
+                    "gan_of_real_source='nearest_match' but no GT pool was "
+                    "supplied to the OF loss. The nearest-match retrieval "
+                    "needs the ride's wider latent window to search; pass "
+                    "it or use 'aligned_gt'."
+                )
+            matched, offsets = nearest_gt_l1_match(fake_latent, gt_pool)
+            return matched, {
+                "of_match_offset_mean": float(offsets.float().mean().item()),
+            }
+        raise RuntimeError(f"unknown gan_of_real_source: {source!r}")
+
+    def _of_fake_sample(
+        self,
+        pred_image: torch.Tensor,
+        flash_slab: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Resolve ``gan_of_fake_source``.
+
+        ``pred_image`` (default, faithful) is the SAME tensor DMD scores —
+        One-Forcing's construction, and the reason its G-side gradient and
+        the DMD gradient are directly comparable on one tensor.
+
+        ``flash`` selects the ``flash_dmd_gan_t`` slab, our historical
+        choice. That slab is published ONLY by the streaming rollout
+        (``info['flash_dmd_gan_x0']``, ``_surface_flash_gan_slab``), so
+        the option is reachable only on the streaming trainer path and
+        only with ``flash_dmd_enabled=true``. The trainer refuses the
+        combination at CONSTRUCTION; this is the second gate, and it
+        raises rather than falling back to ``pred_image`` — a silent
+        fallback would run a differently-defined arm under the same
+        flag, which is the failure this campaign keeps paying for.
+        """
+        source = self.of_cfg["gan_of_fake_source"]
+        if source == "pred_image":
+            return pred_image
+        if source == "flash":
+            if flash_slab is None:
+                raise RuntimeError(
+                    "gan_of_fake_source='flash' but no flash_dmd_gan_x0 "
+                    "slab reached the OF loss. The slab is published only "
+                    "by the streaming rollout with flash_dmd_enabled=true; "
+                    "on the non-streaming path use "
+                    "gan_of_fake_source='pred_image'."
+                )
+            return flash_slab
+        raise RuntimeError(f"unknown gan_of_fake_source: {source!r}")
+
+    # ---- streaming-path accessors ------------------------------------
+    # The streaming trainer has a different geometry from
+    # ``_fwdbwd_one_step``: there is no ``clean_latent`` argument and no
+    # ``seed_frames``/``rollout_frames``/``scoring_frames`` triple. The
+    # real side is an absolute-frame slice of the ride window and the
+    # conditioning is the per-iter noisy-half slice. Both are derived
+    # HERE, off the same helpers the streaming DMD/critic use, so the
+    # disc can never be conditioned on (or paired against) a window the
+    # scorers did not see. A disc trained on a misaligned real/cond pair
+    # still trains and still logs a healthy-looking gap.
+
+    def of_streaming_cond(
+        self, info: Dict[str, Any], detach: bool = True,
+    ) -> Dict[str, Any]:
+        """Disc conditioning for the streaming path.
+
+        Exactly ``_streaming_noisy_cond_slice(info)[0]`` — the SAME
+        slice ``compute_generator_loss_streaming`` and
+        ``compute_critic_loss_streaming`` feed their scorers, before
+        ``_build_dmd_context_kwargs`` merges the clean-half streams in
+        (which ``_of_disc_cond`` strips again anyway).
+
+        DETACHED BY DEFAULT, like every neighbouring critic path
+        (``_compute_critic_loss_streaming_gtfix`` and
+        ``_compute_aux_teacher_loss_streaming`` both detach their cond
+        dicts, with the same rationale spelled out). Those slices are
+        GRAPH-CARRYING: they come from the per-iter action-embedding
+        projection built inside ``generate_next_chunk``, so an undetached
+        cond on the D path puts ``action_projection`` /
+        ``action_token_projection`` inside ``critic_loss.backward()``.
+        The resulting gradient is the DISCRIMINATOR's — wrong-signed for
+        the generator that owns those parameters — and it is applied by
+        the GENERATOR's optimizer. It is inert only while
+        ``train_action_projection`` is false; one config line away from a
+        silent wrong-sign update, with nothing in the trace to show it.
+
+        The G path does not depend on this either way (``_of_g_grad``
+        bounds the adversarial gradient at the fake tensor, so no cond
+        gradient is ever materialised), but detaching there too makes
+        that boundary structural instead of incidental and keeps the disc
+        subgraph from sharing saved tensors with the generator's.
+        """
+        cond, _uncond = self._streaming_noisy_cond_slice(info)
+        if not detach:
+            return cond
+        return {
+            k: (v.detach() if torch.is_tensor(v) else v)
+            for k, v in cond.items()
+        }
+
+    def of_streaming_real(
+        self,
+        chunk_lo: int,
+        chunk_hi: int,
+        fake_frames: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(frame-aligned GT window, retrieval pool)`` for streaming.
+
+        ``ride_latents_window[:, chunk_lo:chunk_hi]`` is the streaming
+        analogue of ``_of_aligned_real``: the trainer derives
+        ``chunk_lo = cf + current_length - new_frames - overlap`` — the
+        absolute position of the chunk the student just rolled — so the
+        slice is frame-locked to the fake. It is the same expression the
+        LADD real side uses (``gt_window`` in
+        ``_streaming_train_one_chunk``).
+
+        The pool is ``streaming_state['gt_match_latents']`` when the ride
+        published one (a wider, sometimes whole-ride candidate set) and
+        the ride window otherwise. It is only consumed by
+        ``gan_of_real_source='nearest_match'``.
+
+        Length is asserted rather than trusted: a short tail slice would
+        surface much later as a shape error inside ``pair_shared_noise``,
+        with no hint that the cause was a window running off the end of
+        the ride.
+        """
+        s = self.streaming_state
+        if s is None:
+            raise RuntimeError(
+                "of_streaming_real called with no open streaming sequence."
+            )
+        ride = s["ride_latents_window"]
+        n = int(ride.shape[1])
+        if int(chunk_lo) < 0 or int(chunk_hi) > n:
+            raise RuntimeError(
+                f"OF streaming real window [{chunk_lo}:{chunk_hi}] falls "
+                f"outside ride_latents_window of length {n}."
+            )
+        if int(chunk_hi) - int(chunk_lo) != int(fake_frames):
+            raise RuntimeError(
+                f"OF streaming real window [{chunk_lo}:{chunk_hi}] is "
+                f"{int(chunk_hi) - int(chunk_lo)} frames but the fake "
+                f"sample has {int(fake_frames)}; real and fake must be "
+                "frame-aligned."
+            )
+        aligned = ride[:, int(chunk_lo):int(chunk_hi)]
+        pool = s.get("gt_match_latents")
+        if pool is None:
+            pool = ride
+        return aligned, pool
+
+    # ---- the ATTACH POINT ---------------------------------------------
+    #
+    # Everything below exists to answer ONE question with a tensor rather
+    # than with a comment: which object does the DMD gradient land on?
+    #
+    # The answer, traced on the GPU (2026-08-24, of_smoke_r2):
+    #   * the trainer's ``train_chunk`` is the rolled chunk; it is the
+    #     ROOT of the scoring graph but NOT the scored tensor;
+    #   * ``compute_generator_loss_streaming`` turns it into
+    #     ``score_image`` — ``f42["noisy_x"]`` on the 42f path, the
+    #     asymmetric builder's ``noisy_x`` on the asym path, ``chunk``
+    #     itself on the legacy path — and hands THAT to
+    #     ``compute_distribution_matching_loss``;
+    #   * only part of ``score_image`` carries a graph: the supervised
+    #     band. The rest is GT scaffold and detached student context. The
+    #     frames DMD's gradient actually reaches are exactly the True
+    #     entries of ``score_grad_mask``, which is the mask the DMD loss
+    #     multiplies its gradient by.
+    #
+    # So the One-Forcing fake is ``score_image[:, band]`` and the real is
+    # ``score_gt_target[:, band]``. Both are sliced from tensors that are
+    # frame-aligned BY CONSTRUCTION in every branch (each builder makes
+    # ``gt_target`` the GT counterpart of its own ``noisy_x``, position
+    # for position), so the alignment is not re-derived here and cannot
+    # drift from the scorer's.
+    #
+    # Attaching to the WHOLE ``score_image`` was considered and rejected:
+    # it is literally the tensor DMD scores, but in the 42f geometry 12 of
+    # its 21 frames are GT — the disc's real and fake members would then
+    # be identical over most of the window, which is precisely the
+    # condition One-Forcing's Fig. 4 identifies as collapsing the logit
+    # gap to zero. The band is the largest sub-window on which the two
+    # objectives share a graph AND the pair stays informative.
+    def _of_band_indices(
+        self, grad_mask: Optional[torch.Tensor], num_frames: int,
+    ) -> Tuple[int, int]:
+        """``[lo, hi)`` — the frames DMD's gradient is applied to.
+
+        Read off ``gradient_mask`` rather than re-derived from
+        ``n_ctx``/``sup_offset``/``sup_span``, because that arithmetic
+        already exists in three builders with three different geometries
+        and a fourth copy is a fourth thing to drift. The mask is the
+        single quantity ``compute_distribution_matching_loss`` itself
+        uses.
+
+        Raises on an empty or non-contiguous band instead of guessing: a
+        silently-wrong band would pair the disc's real against the wrong
+        GT frames and still log a healthy gap.
+        """
+        if grad_mask is None:
+            raise RuntimeError(
+                "One-Forcing: the DMD scoring path produced no "
+                "gradient_mask, so the band the adversarial term must "
+                "attach to cannot be identified."
+            )
+        m = grad_mask if grad_mask.dtype == torch.bool else grad_mask.bool()
+        if m.dim() < 2 or int(m.shape[1]) != int(num_frames):
+            raise RuntimeError(
+                f"One-Forcing: gradient_mask frame axis "
+                f"{tuple(m.shape)} does not match the scored tensor's "
+                f"{int(num_frames)} frames."
+            )
+        per_frame = m.transpose(0, 1).reshape(int(m.shape[1]), -1).any(dim=1)
+        idx = torch.nonzero(per_frame, as_tuple=False).flatten().tolist()
+        if not idx:
+            raise RuntimeError(
+                "One-Forcing: the DMD gradient_mask is empty — no frame "
+                "of the scored window carries generator gradient, so the "
+                "adversarial term has no band to share."
+            )
+        lo, hi = int(idx[0]), int(idx[-1]) + 1
+        if len(idx) != hi - lo:
+            raise RuntimeError(
+                f"One-Forcing: the DMD gradient_mask is non-contiguous "
+                f"({idx}); the adversarial band must be one window so "
+                "real and fake stay frame-locked."
+            )
+        return lo, hi
+
+    def _of_publish_streaming_band(
+        self,
+        *,
+        score_image: torch.Tensor,
+        score_gt_target: Optional[torch.Tensor],
+        score_cond: Dict[str, Any],
+        score_grad_mask: Optional[torch.Tensor],
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+        chunk_lo: int,
+        chunk_hi: int,
+        dmd_fired: bool,
+        current_step: int,
+    ) -> None:
+        """Resolve the OF (fake, real, cond) triple and build the G term.
+
+        Called from ``compute_generator_loss_streaming`` immediately after
+        the DMD scorer, which is the only scope that holds
+        ``score_image``. The result is stashed on ``self._of_band`` for
+        the trainer to fold into ``generator_loss`` (G) and into
+        ``critic_loss`` (D). ONE resolution, TWO consumers — so the disc
+        can never be trained on a different distribution from the one the
+        generator is pushed toward.
+
+        FIRING RULE (rank-uniform, and deliberate). The G term fires
+        exactly when the DMD term fires: ``dmd_fired`` is
+        ``not _skip_scorer``, whose operands are the rank-0-broadcast
+        supervise target, the MIN-reduced roll cap and the lockstep
+        ride-depth counter. On a roll the DMD scorer skips, the generator
+        receives no distribution-matching gradient at all, and adding an
+        adversarial push there would make the two objectives shape the
+        student on DIFFERENT rolls — the opposite of the co-occurrence
+        this arm exists to test. The D term is NOT gated this way: the
+        critic trains on every roll, as it always has, and it trains on
+        the same band.
+        """
+        source = self.of_cfg["gan_of_fake_source"]
+        s = self.streaming_state
+        if source == "pred_image":
+            n_f = int(score_image.shape[1])
+            if score_gt_target is None:
+                raise RuntimeError(
+                    "One-Forcing: the DMD scoring path published no "
+                    "gt_target, so the adversarial real side cannot be "
+                    "frame-locked to the fake."
+                )
+            if int(score_gt_target.shape[1]) != n_f:
+                raise RuntimeError(
+                    f"One-Forcing: gt_target has "
+                    f"{int(score_gt_target.shape[1])} frames but the "
+                    f"scored tensor has {n_f}; the two must be the same "
+                    "window for the band slice to stay aligned."
+                )
+            lo, hi = self._of_band_indices(score_grad_mask, n_f)
+            fake = score_image[:, lo:hi]
+            real = score_gt_target[:, lo:hi].detach()
+            cond = _slice_per_frame_streams(
+                self._of_disc_cond(score_cond),
+                frame_start=lo, frame_count=hi - lo,
+            )
+        elif source == "flash":
+            # Layer-on knob: the t=flash_dmd_gan_t slab is a DIFFERENT
+            # sub-graph from the DMD-scored band by design (it is the
+            # variable this option exists to isolate). Its geometry is the
+            # rolled chunk's, not the 21-frame scoring window's, so the
+            # real/cond come from the chunk window.
+            self._surface_flash_gan_slab(info)
+            fake = info.get("flash_dmd_gan_x0")
+            if fake is None:
+                raise RuntimeError(
+                    "gan_of_fake_source='flash' but the rollout published "
+                    "no flash_dmd_gan_x0 slab."
+                )
+            n_f = int(fake.shape[1])
+            real, _pool = self.of_streaming_real(
+                chunk_lo=int(chunk_lo), chunk_hi=int(chunk_lo) + n_f,
+                fake_frames=n_f,
+            )
+            real = real.detach()
+            cond = _slice_per_frame_streams(
+                self._of_disc_cond(self.of_streaming_cond(info)),
+                frame_start=0, frame_count=n_f,
+            )
+            lo, hi = 0, n_f
+        else:
+            raise RuntimeError(f"unknown gan_of_fake_source: {source!r}")
+
+        gt_pool = None
+        if s is not None:
+            gt_pool = s.get("gt_match_latents")
+            if gt_pool is None:
+                gt_pool = s.get("ride_latents_window")
+
+        band: Dict[str, Any] = {
+            "fake": fake,
+            "real": real,
+            "cond": cond,
+            "gt_pool": gt_pool,
+            "score_image": score_image,
+            "band_lo": int(lo),
+            "band_hi": int(hi),
+            "source": str(source),
+            "dmd_fired": bool(dmd_fired),
+            "step": int(current_step),
+            "g_loss": None,
+            "g_fake": None,
+            "g_logs": {"of_g_fired": 0.0},
+        }
+        if dmd_fired:
+            # ``flash_slab=fake`` alongside ``pred_image=fake`` makes
+            # ``_of_fake_sample`` an identity selector: the source knob
+            # was already applied above, on the geometry that knows what
+            # each option means. Passing it twice keeps that helper (and
+            # its tests) untouched instead of adding a bypass.
+            g_loss, g_fake, g_logs = self.compute_of_g_loss(
+                pred_image=fake,
+                real_latent=real,
+                cond_for_scoring=cond,
+                current_step=self.of_step(),
+                gt_pool=gt_pool,
+                flash_slab=fake,
+            )
+            g_logs = dict(g_logs)
+            g_logs["of_g_fired"] = 1.0 if g_loss is not None else 0.0
+            band["g_loss"] = g_loss
+            band["g_fake"] = g_fake
+            band["g_logs"] = g_logs
+        band["g_logs"]["of_band_lo"] = float(lo)
+        band["g_logs"]["of_band_frames"] = float(hi - lo)
+        band["g_logs"]["of_band_graph_on"] = (
+            1.0 if bool(fake.requires_grad) else 0.0
+        )
+        self._of_band = band
+
+    def of_streaming_band(self) -> Dict[str, Any]:
+        """The band this roll's generator scoring path published.
+
+        Fails loud rather than returning ``None``: every consumer of this
+        stash would otherwise degrade to "the adversarial term did not run
+        this step" with no error, which is the silent-null-result mode the
+        whole arm is built to avoid.
+        """
+        band = getattr(self, "_of_band", None)
+        if band is None:
+            raise RuntimeError(
+                "One-Forcing: no adversarial band was published this "
+                "roll. ``_of_publish_streaming_band`` runs inside "
+                "``compute_generator_loss_streaming``; if that method was "
+                "skipped or returned early, the G and D terms have no "
+                "shared fake and must not silently fall back to a "
+                "different tensor."
+            )
+        return band
+
+    def of_cond_for_scoring(
+        self,
+        conditional_dict: Dict[str, Any],
+        rollout_frames: int,
+        scoring_frames: int,
+        seed_frames: int,
+    ) -> Dict[str, Any]:
+        """Slice the trainer's full-window cond dict to the scored window.
+
+        Exposed so the TRAINER's generator step uses the SAME slicer the
+        model's own scoring path uses (``_slice_baseline_scoring_window``)
+        instead of re-deriving the offsets. A disc conditioned on
+        misaligned action streams would still train and still log a
+        healthy-looking gap.
+        """
+        return _slice_baseline_scoring_window(
+            conditional_dict,
+            rollout_frames=int(rollout_frames),
+            num_training_frames=int(scoring_frames),
+            seed_frames=int(seed_frames),
+        )
+
+    def of_step(self) -> int:
+        """Current global step, published by the trainer each iter.
+
+        Fails loud rather than defaulting to 0: a silent 0 would freeze
+        ``gan_of_disc_start_step`` / ``gan_of_warmup_steps`` at their
+        first-step values for the whole run while ``of_d_weight`` kept
+        logging a plausible number.
+        """
+        if self._of_current_step is None:
+            raise RuntimeError(
+                "One-Forcing GAN is enabled but the trainer never published "
+                "`model._of_current_step`. The warmup/start-step schedule "
+                "cannot be evaluated. Set it at the top of every iter."
+            )
+        return int(self._of_current_step)
+
+    def of_head_touch(self) -> Optional[torch.Tensor]:
+        """Exactly-zero scalar that ties EVERY disc-head parameter into
+        whatever backward consumes it. Returns ``None`` when no head is
+        attached.
+
+        WHY THIS EXISTS — a multi-node-only hard error (2026-08-24 review,
+        reproduced on gloo).
+
+        The head lives INSIDE the DDP-wrapped ``fake_score.model``, and
+        ``fake_score`` is wrapped with ``find_unused_parameters=False``
+        (see the DDP wrap in ``trainer/causal_action_forcing_train.py``;
+        ``fake_alt_head_enabled``, the only thing that would flip it to
+        True, is refused for this arm). Under that setting DDP's reducer
+        expects an autograd hook to fire for every ``requires_grad``
+        parameter on every backward; if one never fires, the NEXT
+        iteration's ``_rebuild_buckets`` raises "Expected to have finished
+        reduction in the prior iteration before starting a new one".
+
+        The head is reached by exactly one forward: the ``classify_mode``
+        disc forward in ``compute_of_d_loss``. The denoising forward does
+        not touch it. So whenever the D loss is INACTIVE — which is
+        precisely what ``gan_of_disc_start_step > 0`` (warmup) and
+        ``gan_of_d_weight = 0`` (the G-only ablation) are FOR, both
+        advertised in the flag table — the critic backward left the head
+        ungradiented and the run died on the following step. Raising on
+        those configs instead would be deleting the ablations; this makes
+        them work.
+
+        ``p.sum(dtype=float32) ... * 0.0`` is a real graph with a real
+        AccumulateGrad hook per parameter and a gradient of EXACTLY zero,
+        so the reducer is satisfied and no weight moves. It costs one
+        small reduction kernel per head tensor (~50 of them), versus the
+        alternative of running the full 1.3B disc forward and multiplying
+        the loss by zero — same zero gradient, whole-DiT price, every step
+        of the warmup.
+
+        TWO CONSEQUENCES, both recorded rather than hidden:
+          * fp32 accumulation is deliberate. The params are bf16 and a
+            bf16 running sum over ~10^7 elements is the one place this
+            could overflow to inf, and ``inf * 0.0`` is NaN — which would
+            poison ``critic_loss`` from a term whose whole point is to be
+            inert. A NaN/inf HEAD parameter still propagates (0 * NaN =
+            NaN); that is left alone on purpose, because a head that has
+            gone non-finite is a fault we want surfaced, not masked.
+          * with a nonzero ``fake_weight_decay`` an AdamW step now sees
+            grad=0 rather than grad=None for the head, and decoupled
+            weight decay applies on grad=0 (torch skips only ``grad is
+            None`` params). The head therefore decays during a
+            ``disc_start_step`` warmup. That is unavoidable — running the
+            forward-times-zero variant produces the identical zero
+            gradient — and it is why ``gan_of_disc_start_step`` should be
+            small if ``fake_weight_decay`` is not 0.
+        """
+        inner = self.fake_score._unwrapped_model()
+        acc: Optional[torch.Tensor] = None
+        for _name in _OF_HEAD_MODULE_NAMES:
+            mod = getattr(inner, _name, None)
+            if mod is None:
+                continue
+            for p in mod.parameters():
+                if not p.requires_grad:
+                    continue
+                term = p.sum(dtype=torch.float32)
+                acc = term if acc is None else acc + term
+        if acc is None:
+            return None
+        return acc * 0.0
+
+    def _of_sample_timestep(
+        self, batch_size: int, num_frames: int, device: torch.device,
+    ) -> torch.Tensor:
+        return sample_of_timestep(
+            batch_size=batch_size,
+            num_frames=num_frames,
+            t_min=self.of_cfg["gan_of_t_min"],
+            t_max=self.of_cfg["gan_of_t_max"],
+            shift=self.of_cfg["gan_of_timestep_shift"],
+            device=device,
+        )
+
+    def compute_of_d_loss(
+        self,
+        fake_latent: torch.Tensor,
+        real_latent: torch.Tensor,
+        cond_for_scoring: Dict[str, Any],
+        current_step: int,
+        telemetry: bool = True,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        """D-side term, added into ``critic_loss``.
+
+        ``fake_latent`` MUST already be detached (it comes from the
+        critic step's ``no_grad`` rollout); asserted, because a live
+        generator graph here would push adversarial gradient into the
+        student on the critic step — silently, and in the wrong
+        direction.
+
+        Real and fake are noised at ONE freshly sampled shared timestep
+        with (by default) ONE shared epsilon, concatenated, and pushed
+        through a SINGLE disc forward. One forward rather than two is not
+        only cheaper: it guarantees both members see identical
+        conditioning tensors and identical module state (dropout masks
+        included), so the logit gap cannot be an artefact of the two
+        calls differing.
+
+        NO ``_of_disc_frozen`` HERE, and that is what makes this side safe
+        from the checkpoint-replay failure that forced the G side into the
+        ``autograd.grad`` form. Under
+        ``fake_score_gradient_checkpointing=true`` the disc forward below is
+        replayed by the caller's ``critic_loss.backward()``, and the replay
+        only matches if every ``requires_grad`` flag it reads is unchanged
+        since the forward. On this path they are: D WANTS its own gradient,
+        so nothing is frozen, and nothing between this call and the caller's
+        backward touches a ``fake_score`` flag (verified for both D call
+        sites — the main one and the ``streaming_fake_updates_per_gen``
+        inner loop). Do not add a freeze/restore around this forward; if a
+        future variant needs one, it must take the backward inside it, the
+        way ``compute_of_g_loss`` does.
+
+        WHAT THE CLASSIFY FORWARD DOES **NOT** REACH, recorded so a future
+        change does not turn it into a landmine. ``classify_mode`` returns
+        the register-token logits and never runs the DiT's own output
+        stage (``wan/modules/model.py``: the ``if classify_mode`` block
+        returns before ``self.head``), so a classify-ONLY backward leaves
+        EXACTLY three ``fake_score`` parameters ungradiented:
+        ``head.modulation``, ``head.head.weight``, ``head.head.bias``.
+        That is harmless TODAY only because this term is always summed
+        into the denoising ``critic_loss``, whose forward DOES run
+        ``self.head`` — one backward covers both. If anyone ever gives
+        the D term its own backward or its own optimizer step, those
+        three become ungradiented members of a
+        ``find_unused_parameters=False`` reducer and the run dies on the
+        next step with "Expected to have finished reduction" — the same
+        failure ``of_head_touch`` exists to prevent from the other side.
+        (A second, independent reason not to decouple this term.)
+
+        ``telemetry=False`` drops the seven ``.item()`` calls in the log
+        dict — seven GPU syncs per D call, and this method runs
+        ``1 + streaming_fake_updates_per_gen`` times per step. The weight
+        (already a Python float) is logged unconditionally, so
+        ``of_d_weight``'s trace stays dense. The trainer passes the
+        ``gan_of_telemetry_every`` cadence, a pure function of the global
+        step and therefore rank-uniform.
+
+        NEVER RETURNS ``None`` WHILE A HEAD IS ATTACHED. Even with every
+        weight at zero it returns ``of_head_touch()``, an exactly-zero
+        scalar carrying an autograd edge to every head parameter. See that
+        method: without it, ``gan_of_disc_start_step > 0`` and
+        ``gan_of_d_weight = 0`` are both multi-node crashes.
+        """
+        d_weight = of_weight_at_step(
+            self.of_cfg["gan_of_d_weight"], int(current_step),
+            self.of_cfg["gan_of_disc_start_step"],
+            self.of_cfg["gan_of_warmup_steps"],
+        )
+        r1_w = self.of_cfg["gan_of_r1_weight"]
+        r2_w = self.of_cfg["gan_of_r2_weight"]
+        touch = self.of_head_touch()
+        if d_weight <= 0.0 and r1_w <= 0.0 and r2_w <= 0.0:
+            return touch, {"of_d_weight": float(d_weight)}
+        if fake_latent.requires_grad:
+            raise RuntimeError(
+                "compute_of_d_loss received a fake sample that still "
+                "requires grad. The D step must consume a DETACHED "
+                "rollout — otherwise the disc's backward would reach the "
+                "generator."
+            )
+
+        B, Fr = int(fake_latent.shape[0]), int(fake_latent.shape[1])
+        real_latent = real_latent.to(
+            device=fake_latent.device, dtype=fake_latent.dtype,
+        ).detach()
+        timestep = self._of_sample_timestep(B, Fr, fake_latent.device)
+        eps_fake, eps_real = pair_shared_noise(
+            fake_latent, real_latent,
+            shared=bool(self.of_cfg["gan_of_shared_noise"]),
+        )
+        noisy_fake = add_noise_bf(
+            self.scheduler, fake_latent, eps_fake, timestep,
+        )
+        noisy_real = add_noise_bf(
+            self.scheduler, real_latent, eps_real, timestep,
+        )
+
+        cond = self._of_disc_cond(cond_for_scoring)
+        cond_2b = duplicate_conditional_dict(cond)
+        logits = self._of_disc_logits(
+            latent=torch.cat([noisy_fake, noisy_real], dim=0),
+            cond=cond_2b,
+            timestep=torch.cat([timestep, timestep], dim=0),
+        )
+        fake_logit, real_logit = split_logits(logits, B)
+
+        d_loss = of_discriminator_loss(
+            real_logit=real_logit,
+            fake_logit=fake_logit,
+            relativistic=bool(self.of_cfg["gan_of_relativistic"]),
+            d_weight=d_weight,
+        )
+        total = d_loss
+
+        # R1 / R2 finite-difference penalties. Off by default (the paper's
+        # framewise recipe has neither). Each costs one extra disc forward,
+        # so they are computed only when their weight is live.
+        r1_val = 0.0
+        r2_val = 0.0
+        if r1_w > 0.0:
+            sigma = self.of_cfg["gan_of_r1_sigma"]
+            pert = noisy_real + sigma * torch.randn_like(noisy_real)
+            pert_logit = self._of_disc_logits(pert, cond, timestep)
+            r1 = finite_difference_penalty(pert_logit, real_logit, sigma, r1_w)
+            total = total + 0.5 * r1
+            if telemetry:
+                r1_val = float(r1.detach().item())
+        if r2_w > 0.0:
+            sigma = self.of_cfg["gan_of_r2_sigma"]
+            pert = noisy_fake + sigma * torch.randn_like(noisy_fake)
+            pert_logit = self._of_disc_logits(pert, cond, timestep)
+            r2 = finite_difference_penalty(pert_logit, fake_logit, sigma, r2_w)
+            total = total + 0.5 * r2
+            if telemetry:
+                r2_val = float(r2.detach().item())
+
+        # Belt-and-braces: the classify forward above already gradients
+        # every head parameter, so this adds an exact zero to a live term.
+        # Added unconditionally anyway so the invariant "the D term always
+        # carries an edge to the whole head" holds without a reader having
+        # to prove which branch ran.
+        if touch is not None:
+            total = total + touch
+
+        logs: Dict[str, float] = {"of_d_weight": float(d_weight)}
+        if telemetry:
+            logs.update({
+                "of_d_loss": float(d_loss.detach().item()),
+                "of_d_real": float(real_logit.detach().float().mean().item()),
+                "of_d_fake": float(fake_logit.detach().float().mean().item()),
+                "of_logit_gap": float(
+                    logit_gap(real_logit, fake_logit).detach().item()
+                ),
+                "of_d_timestep": float(timestep[:, 0].float().mean().item()),
+                "of_r1_loss": r1_val,
+                "of_r2_loss": r2_val,
+            })
+        return total, logs
+
+    def _of_g_surrogate(
+        self,
+        fake_latent: torch.Tensor,
+        gan_grad: torch.Tensor,
+        g_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        """A scalar with ``g_loss``'s VALUE and ``gan_grad``'s GRADIENT.
+
+        This is the reference implementation's construction expressed as a
+        loss instead of as a manual backward. ``one_forcing.py``
+        ``generator_loss_and_backward`` (:415-465) does::
+
+            gan_grad = torch.autograd.grad(gan_g_loss, pred_image)[0]
+            pred_grad = dmd_grad + gan_grad
+            torch.autograd.backward(pred_image, pred_grad)
+
+        i.e. the adversarial signal enters as a GRADIENT ON THE FAKE
+        TENSOR, never as a live disc subgraph hanging off the generator's
+        backward. Our trainer sums many terms (DMD, LADD, pixel, LPIPS,
+        sc-DMD, CD, ghost anchor) into ONE ``generator_loss`` and takes one
+        backward, so we cannot hand it a raw grad; ``(fake * grad).sum()``
+        is the scalar whose derivative w.r.t. ``fake_latent`` is EXACTLY
+        ``gan_grad``, which makes it the same thing the reference adds into
+        ``pred_grad``. It reaches the generator through the very tensor DMD
+        scores, unchanged.
+
+        ``- surrogate.detach() + g_loss.detach()`` leaves the derivative
+        untouched (both addends are constants) and restores the term's
+        VALUE to the adversarial loss, so ``out['generator_loss']`` and
+        ``of_g_loss`` keep meaning what they meant before the restructure
+        rather than logging a meaningless inner product.
+
+        Computed in fp32: ``fake_latent`` is bf16 and the raw inner product
+        over ~2M elements is the one place a bf16 accumulation could
+        produce a non-finite value that the ``- detach()`` cancellation
+        would turn into NaN instead of cancelling. The gradient is
+        unaffected either way — ``mul`` backward with a unit upstream grad
+        returns ``gan_grad`` bit-for-bit.
+        """
+        surrogate = (fake_latent.float() * gan_grad.float()).sum()
+        return surrogate - surrogate.detach() + g_loss.detach()
+
+    def _of_g_grad(
+        self,
+        g_loss: torch.Tensor,
+        fake_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        """``d(g_loss)/d(fake_latent)``, taken while the disc is frozen.
+
+        MUST be called inside ``_of_disc_frozen`` — see the hard rule in
+        that context manager's docstring. Taking it here rather than
+        letting the trainer's ``generator_loss.backward()`` walk the disc
+        subgraph is what makes the checkpoint replay see the same
+        ``requires_grad`` flags it saw on the way in.
+
+        ``retain_graph`` is deliberately left at its default False: the
+        disc subgraph has exactly one consumer and freeing it here also
+        drops the disc's checkpoint frames, which the old attached form
+        held alive across a ``backward(retain_graph=True)`` spanning the
+        whole generator graph.
+
+        Every failure mode raises. The pre-restructure code could not tell
+        "the adversarial term is wired to the generator" from "the
+        adversarial term silently has no path to it": a ``g_loss`` with no
+        graph simply added a constant to ``generator_loss`` and logged a
+        perfectly healthy ``of_g_loss`` forever.
+
+        ONE DELIBERATE SEMANTIC DIFFERENCE from the attached form, recorded
+        because it is invisible in the diff. ``cond_for_scoring`` can carry
+        a live ``action_projection`` subgraph (the streaming cond slices
+        are graph-carrying — see the ``streaming_fake_updates_per_gen``
+        guard in the trainer). Handing the disc subgraph to the generator's
+        backward would therefore have pushed adversarial gradient into the
+        ACTION ENCODER through the disc's own conditioning input, on top of
+        the intended path through the fake video. Bounding the grad at
+        ``fake_latent`` drops that channel. That is the reference's
+        behaviour (``autograd.grad(gan_g_loss, pred_image)``, one_forcing.py
+        :415-465), it is what ``compute_of_g_loss``'s "no gradient for any
+        DDP-managed parameter" invariant already said out loud, and it
+        closes a channel where the encoder could have moved the disc's
+        logit by reshaping the CONDITIONING rather than the video. The
+        generator still receives the full adversarial gradient through
+        ``fake_latent``, which is the tensor DMD scores. No behaviour was
+        lost in practice: the attached form never completed a single
+        training step.
+        """
+        if not fake_latent.requires_grad:
+            raise RuntimeError(
+                "One-Forcing G term: the fake tensor carries no autograd "
+                "graph, so the adversarial gradient cannot reach the "
+                "generator. With gan_of_fake_source='pred_image' this "
+                "means the rollout chunk arrived detached; with 'flash' it "
+                "means the flash_dmd_gan_x0 slab was published detached."
+            )
+        if not g_loss.requires_grad:
+            raise RuntimeError(
+                "One-Forcing G term: of_generator_loss produced a scalar "
+                "with no autograd graph. The disc forward is not "
+                "differentiating back into the fake sample."
+            )
+        grad = torch.autograd.grad(
+            g_loss, fake_latent, allow_unused=True,
+        )[0]
+        if grad is None:
+            raise RuntimeError(
+                "One-Forcing G term: d(g_loss)/d(fake) is None — the disc "
+                "forward does not depend on the fake tensor at all."
+            )
+        return grad
+
+    def compute_of_g_loss(
+        self,
+        pred_image: torch.Tensor,
+        real_latent: torch.Tensor,
+        cond_for_scoring: Dict[str, Any],
+        current_step: int,
+        gt_pool: Optional[torch.Tensor] = None,
+        flash_slab: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        """G-side term, added into ``generator_loss`` before its single
+        backward.
+
+        Returns ``(weighted_term, fake_tensor_used, logs)``. The second
+        element is handed back so the trainer can measure the GAN-vs-DMD
+        gradient ratio ON THAT TENSOR (spec §Telemetry) rather than at
+        some parameter whose identity varies between arms — the
+        single-probe-point caveat recorded in ``GAN_REDESIGN_TWO.md``.
+
+        THREE invariants here, none visible from the code:
+          * the disc must NOT be trained by this forward — hence
+            ``_of_disc_frozen``;
+          * the forward must NOT go through DDP — hence
+            ``unwrapped=True``. See ``_of_disc_logits``.
+          * the disc BACKWARD must happen inside ``_of_disc_frozen`` too —
+            hence ``_of_g_grad`` / ``_of_g_surrogate``, which convert the
+            disc subgraph into a gradient on ``fake_latent`` before the
+            freeze is lifted. See ``_of_disc_frozen``'s hard rule; the
+            attached form crashed all 8 ranks of the first GPU smoke under
+            ``fake_score_gradient_checkpointing=true``.
+
+        ``weighted_term`` is therefore NOT the disc subgraph: it is a
+        scalar carrying the adversarial loss's value and the adversarial
+        gradient w.r.t. the fake tensor. Everything downstream — the sum
+        into ``generator_loss``, ``_of_grad_telemetry``'s
+        ``autograd.grad(gan_term, probe_tensor)``, the single
+        ``generator_loss.backward()`` — behaves exactly as before, because
+        both the value and the derivative are preserved. What changes is
+        that the derivative was already computed, so nothing re-enters the
+        checkpointed disc later.
+        """
+        g_weight = of_weight_at_step(
+            self.of_cfg["gan_of_g_weight"], int(current_step),
+            self.of_cfg["gan_of_disc_start_step"],
+            self.of_cfg["gan_of_warmup_steps"],
+        )
+        if g_weight <= 0.0:
+            return None, None, {"of_g_weight": float(g_weight)}
+
+        fake_latent = self._of_fake_sample(pred_image, flash_slab)
+        # Resolved even on the non-relativistic path, where the real member
+        # is unused (the reference zeroes it). Deliberate: it keeps a
+        # misconfigured ``gan_of_real_source`` failing loud on the FIRST
+        # generator step instead of waiting for a critic step, and with the
+        # default ``aligned_gt`` it is a no-op slice.
+        real_sample, match_logs = self._of_real_sample(
+            fake_latent, real_latent, gt_pool,
+        )
+        real_sample = real_sample.to(
+            device=fake_latent.device, dtype=fake_latent.dtype,
+        ).detach()
+
+        B, Fr = int(fake_latent.shape[0]), int(fake_latent.shape[1])
+        timestep = self._of_sample_timestep(B, Fr, fake_latent.device)
+        relativistic = bool(self.of_cfg["gan_of_relativistic"])
+        cond = self._of_disc_cond(cond_for_scoring)
+
+        with self._of_disc_frozen():
+            if relativistic:
+                # The relativistic variant needs BOTH logits, paired at
+                # the SAME t. The epsilon pairing follows
+                # ``gan_of_shared_noise`` — the same knob the D side uses,
+                # and TRUE by default, so by default both members are
+                # corrupted by one shared epsilon. (The reference's own
+                # generator-side relativistic branch, one_forcing.py
+                # :251-255, calls ``_prepare_noisy_latent`` twice and so
+                # draws an independent epsilon per member; set
+                # ``gan_of_shared_noise=false`` to reproduce that. Shared
+                # is our default on both sides because it is what makes
+                # the logit gap attributable to content rather than to
+                # the draw.)
+                eps_fake, eps_real = pair_shared_noise(
+                    fake_latent, real_sample,
+                    shared=bool(self.of_cfg["gan_of_shared_noise"]),
+                )
+                noisy_fake = add_noise_bf(
+                    self.scheduler, fake_latent, eps_fake, timestep,
+                )
+                noisy_real = add_noise_bf(
+                    self.scheduler, real_sample, eps_real, timestep,
+                )
+                logits = self._of_disc_logits(
+                    latent=torch.cat([noisy_fake, noisy_real], dim=0),
+                    cond=duplicate_conditional_dict(cond),
+                    timestep=torch.cat([timestep, timestep], dim=0),
+                    unwrapped=True,
+                )
+                fake_logit, real_logit = split_logits(logits, B)
+            else:
+                # Faithful default: the real member is not needed at all
+                # (one_forcing.py :241-249 zeroes it), so we do not pay
+                # for a second row block.
+                eps_fake = torch.randn_like(fake_latent)
+                noisy_fake = add_noise_bf(
+                    self.scheduler, fake_latent, eps_fake, timestep,
+                )
+                fake_logit = self._of_disc_logits(
+                    latent=noisy_fake, cond=cond, timestep=timestep,
+                    unwrapped=True,
+                )
+                real_logit = None
+
+            # Loss AND its gradient w.r.t. the fake tensor, both still
+            # inside the freeze. Moving ``of_generator_loss`` in here is
+            # numerically a no-op (it reads logits and a float weight); it
+            # is in the block only so ``_of_g_grad`` can be, which is the
+            # part that matters.
+            g_loss = of_generator_loss(
+                fake_logit=fake_logit,
+                real_logit=real_logit,
+                relativistic=relativistic,
+                g_weight=g_weight,
+            )
+            gan_grad = self._of_g_grad(g_loss, fake_latent)
+
+        term = self._of_g_surrogate(fake_latent, gan_grad, g_loss)
+        logs = {
+            "of_g_loss": float(g_loss.detach().item()),
+            "of_g_weight": float(g_weight),
+            "of_g_d_fake": float(fake_logit.detach().float().mean().item()),
+            "of_g_timestep": float(timestep[:, 0].float().mean().item()),
+        }
+        if real_logit is not None:
+            logs["of_g_d_real"] = float(
+                real_logit.detach().float().mean().item()
+            )
+        logs.update(match_logs)
+        return term, fake_latent, logs
+
     def critic_loss(
         self,
         image_or_video_shape,
@@ -8694,7 +10269,41 @@ class ActionForcingDMD(SelfForcingModel):
         ) or {}
         for k, v in ext_metrics.items():
             critic_log[k] = v
-        return denoising_loss, critic_log
+
+        # ---- ONE-FORCING D term (Option D) --------------------------------
+        # Added to the SAME loss the denoising objective produced, so the
+        # trainer's single ``critic_loss.backward()`` +
+        # ``fake_optimizer.step()`` carry both gradients into the backbone
+        # at once. Placed here, after the denoising loss, so an exception
+        # in the GAN branch cannot leave a half-built denoising graph.
+        #
+        # ``generated_image`` came out of a ``no_grad`` rollout and is
+        # therefore already detached — ``compute_of_d_loss`` asserts it.
+        critic_total = denoising_loss
+        if self.gan_of_enabled:
+            of_real = self._of_aligned_real(
+                clean_latent=clean_latent,
+                seed_frames=seed_frames,
+                rollout_frames=rollout_frames,
+                scoring_frames=int(scoring_shape[1]),
+            )
+            of_real_resolved, of_match_logs = self._of_real_sample(
+                fake_latent=generated_image,
+                aligned_real=of_real,
+                gt_pool=clean_latent,
+            )
+            of_d_loss, of_logs = self.compute_of_d_loss(
+                fake_latent=generated_image,
+                real_latent=of_real_resolved,
+                cond_for_scoring=cond_for_scoring,
+                current_step=self.of_step(),
+            )
+            critic_log.update(of_match_logs)
+            critic_log.update(of_logs)
+            if of_d_loss is not None:
+                critic_total = critic_total + of_d_loss
+
+        return critic_total, critic_log
 
     # ==================================================================
     # STREAMING MODE — LongLive-style persistent-state DMD
@@ -10298,6 +11907,119 @@ class ActionForcingDMD(SelfForcingModel):
             idx = _py_random.randint(0, len(candidates) - 1)
         return int(candidates[idx])
 
+    def _boundary_vae_roundtrip(
+        self,
+        full_chunk: torch.Tensor,
+        prev_chunk_for_clean: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Replace ``full_chunk[:, 0:1]`` with a VAE decode->encode of the
+        seam frame, returning the rebuilt chunk.
+
+        THE GRAPH IS THE WHOLE POINT OF THIS METHOD EXISTING.
+
+        The VAE forwards must stay under ``no_grad`` (they are a
+        re-anchoring device, not a differentiable transform, and the seam
+        frame sits in the overlap region where ``gradient_mask`` is False
+        anyway). The CONCATENATION must NOT: ``torch.cat`` executed inside
+        a ``no_grad`` block returns a tensor with no ``grad_fn``, which
+        severs the student's rollout graph for the ENTIRE chunk —
+        including the supervised band that carries the DMD gradient.
+
+        That is exactly what the previous inline version did, while its
+        comment asserted the opposite ("this does NOT break gradient flow
+        on the new frames"). Measured consequences, every one of them
+        silent, on any rolling run with ``boundary_vae_roundtrip: true``:
+
+          * ``compute_generator_loss_streaming`` builds ``score_image``
+            out of this chunk, so the DMD generator loss was a CONSTANT on
+            every roll with overlap (i.e. every roll after the first).
+            ``dmd_supervise_roll_mode='random'`` draws its supervised roll
+            uniformly in ``[1, max_rolls]``, so most rides received no
+            generator gradient at all.
+          * ``generator_loss.requires_grad`` stayed True regardless,
+            because ``_phase_lora_ghost_anchor`` folds in a live
+            ``0.0 * ghost`` term. The DDP-lockstep
+            ``gen_backward_skipped`` telemetry therefore reported a
+            healthy 0.0 while the backward produced exactly zero gradient.
+          * The only visible fingerprint was the ``[42F-ROLLING] ...
+            (graph-on=False)`` debug line, printed twice per process and
+            never alarmed on.
+
+        ``boundary_vae_roundtrip_keep_graph`` (default False) selects the
+        behaviour. False reproduces the measured legacy output BIT FOR BIT
+        (same values, same absence of a graph) because flipping it is a
+        training-recipe change; True fixes the severing.
+        """
+        with torch.no_grad():
+            from einops import rearrange as _rearrange
+            # WAN VAE Conv3d kernels are fp32; the streaming
+            # latents are bf16 (`dtype`). Cast to fp32 for the
+            # VAE forwards and back to bf16 after — preserves
+            # downstream contract while satisfying the conv's
+            # weight/input dtype invariant.
+            ctx_latents = torch.cat(
+                [prev_chunk_for_clean, full_chunk[:, 0:1]], dim=1,
+            ).to(torch.float32)
+            # Cached-decode path: keeps the WAN VAE's temporal
+            # feat_map populated across calls so the unconditioned
+            # init-frame brightness anomaly isn't re-injected
+            # every iter (would otherwise leak into the boundary
+            # latent via the re-encode and compound across iters).
+            pixels = self.vae.decode_to_pixel(
+                ctx_latents, use_cache=True,
+            )
+            last_frame_btchw = pixels[:, -1:, ...].to(torch.float32)
+            last_frame_bcthw = _rearrange(
+                last_frame_btchw, "b t c h w -> b c t h w",
+            )
+            image_latent = self.vae.encode_to_latent(
+                last_frame_bcthw,
+            ).to(dtype)
+            if not self.boundary_vae_roundtrip_keep_graph:
+                # LEGACY (measured) behaviour: the cat runs here, under
+                # no_grad, and the returned chunk carries no graph.
+                out_legacy = torch.cat(
+                    [image_latent, full_chunk[:, 1:]], dim=1,
+                )
+                self._warn_boundary_vae_graph_severed(full_chunk)
+                return out_legacy
+        # Fixed path: identical values, cat OUTSIDE the no_grad block, so
+        # ``full_chunk[:, 1:]`` keeps its ``grad_fn`` and the supervised
+        # band still differentiates back into the generator.
+        return torch.cat([image_latent, full_chunk[:, 1:]], dim=1)
+
+    def _warn_boundary_vae_graph_severed(
+        self, full_chunk: torch.Tensor,
+    ) -> None:
+        """One-shot LOUD warning that this roll's student graph is gone.
+
+        Emitted only when the legacy path actually destroyed a live graph
+        (``full_chunk.requires_grad``), so a no_grad prebuild rollout —
+        where there was never a graph to lose — stays quiet.
+        """
+        if self._boundary_vae_graph_warned:
+            return
+        if not bool(full_chunk.requires_grad):
+            return
+        self._boundary_vae_graph_warned = True
+        import sys as _sys
+        msg = (
+            "[ActionForcing][BOUNDARY-VAE] boundary_vae_roundtrip=true is "
+            "SEVERING the student rollout graph on every overlapped roll: "
+            "the replacement cat runs under torch.no_grad(), so the chunk "
+            "handed to compute_generator_loss_streaming has no grad_fn and "
+            "the streaming DMD generator loss is a CONSTANT on this and "
+            "every later roll of the ride. generator_loss.requires_grad "
+            "stays True via the phase-LoRA ghost anchor, so nothing else "
+            "reports it. Set boundary_vae_roundtrip_keep_graph=true to "
+            "keep the VAE forwards under no_grad while preserving the "
+            "graph, or boundary_vae_roundtrip=false to drop the "
+            "round-trip."
+        )
+        logging.warning(msg)
+        print(msg, file=_sys.stderr, flush=True)
+
     def generate_next_chunk(
         self, requires_grad: bool = True,
         compute_baseline_mae: bool = True,
@@ -10545,45 +12267,23 @@ class ActionForcingDMD(SelfForcingModel):
         # analog of CF's "first frame of the trailing-21". Decode the
         # prior chunk + that boundary latent for VAE temporal context,
         # take the last pixel frame, and re-encode it to a fresh
-        # single-frame latent on the image manifold. The replacement is
-        # no_grad; the boundary lives at gradient_mask[:, 0] = False
-        # already (overlap region) so this does NOT break gradient flow
-        # on the new frames. Saved into ``s["previous_chunk"]`` below
-        # so next iter's clean_x_self / overlap inherits the on-manifold
-        # boundary instead of needing to re-anchor.
+        # single-frame latent on the image manifold. Saved into
+        # ``s["previous_chunk"]`` below so next iter's clean_x_self /
+        # overlap inherits the on-manifold boundary instead of needing to
+        # re-anchor.
+        #
+        # Extracted into ``_boundary_vae_roundtrip`` so the graph
+        # behaviour is unit-testable without a pipeline, a ride or a real
+        # VAE — see that method for the measured no_grad-cat defect and
+        # the ``boundary_vae_roundtrip_keep_graph`` flag.
         if (
             self.boundary_vae_roundtrip
             and overlap > 0
             and prev_chunk_for_clean is not None
         ):
-            with torch.no_grad():
-                from einops import rearrange as _rearrange
-                # WAN VAE Conv3d kernels are fp32; the streaming
-                # latents are bf16 (`dtype`). Cast to fp32 for the
-                # VAE forwards and back to bf16 after — preserves
-                # downstream contract while satisfying the conv's
-                # weight/input dtype invariant.
-                ctx_latents = torch.cat(
-                    [prev_chunk_for_clean, full_chunk[:, 0:1]], dim=1,
-                ).to(torch.float32)
-                # Cached-decode path: keeps the WAN VAE's temporal
-                # feat_map populated across calls so the unconditioned
-                # init-frame brightness anomaly isn't re-injected
-                # every iter (would otherwise leak into the boundary
-                # latent via the re-encode and compound across iters).
-                pixels = self.vae.decode_to_pixel(
-                    ctx_latents, use_cache=True,
-                )
-                last_frame_btchw = pixels[:, -1:, ...].to(torch.float32)
-                last_frame_bcthw = _rearrange(
-                    last_frame_btchw, "b t c h w -> b c t h w",
-                )
-                image_latent = self.vae.encode_to_latent(
-                    last_frame_bcthw,
-                ).to(dtype)
-                full_chunk = torch.cat(
-                    [image_latent, full_chunk[:, 1:]], dim=1,
-                )
+            full_chunk = self._boundary_vae_roundtrip(
+                full_chunk, prev_chunk_for_clean, dtype,
+            )
 
         # Save full_chunk as previous_chunk for the NEXT iter.
         #
@@ -11151,8 +12851,30 @@ class ActionForcingDMD(SelfForcingModel):
             bool(getattr(self, "dmd_42f_rolling_sup_new", False))
             and int(info.get("overlap", 0)) > 0
         )
+        # ---- all-rolling (dmd_42f_allroll_student_ctx) ------------------
+        # Active only on rolling iters; iter 1 (overlap=0) keeps its GT
+        # layout (the unavoidable ride-start seed). Pure python bindings
+        # here — no tensor op, byte-identical when the flag is off.
+        _allroll_flag = bool(
+            getattr(self, "dmd_42f_allroll_student_ctx", False)
+        )
+        _allroll = _allroll_flag and _rolling
+        _prebind_chunk = None
+        _allroll_stu_chunks = 0    # chunks substituted with student content
+        _allroll_gt_fb = 0         # chunks left GT for lack of student history
         if _rolling:
             _ovl = int(info["overlap"])
+            if _allroll:
+                # Keep a handle on the PRE-rebind chunk: it covers world
+                # [chunk_lo_raw, chunk_lo_raw + chunk.shape[1]) =
+                # [chunk_lo + _ovl - ...] — i.e. the full rolled window
+                # including the overlap band the rebind below drops. The
+                # clean_x overlay sources from it so the clean half holds
+                # EXACTLY the same student content the noisy ctx band is
+                # built from (incl. the dmd_rolling_ctx_last_rung
+                # last-rung overlap sourcing done upstream in
+                # generate_next_chunk).
+                _prebind_chunk = chunk
             _nf = int(info["new_frames"])
             if _nf % npb != 0 or _nf <= 0:
                 raise RuntimeError(
@@ -11348,11 +13070,32 @@ class ActionForcingDMD(SelfForcingModel):
         else:
             sup_span = sup_frames
         if _rolling:
-            gt_future = ride_lat[
-                :,
-                chunk_lo + sup_frames + match_m
-                : chunk_lo + sup_frames + gt_after_frames + match_m,
-            ].to(dtype=chunk.dtype, device=chunk.device).detach()
+            if _allroll:
+                # all-rolling: NO GT in the noisy window. The newest slot
+                # (structurally OOD, gradient-masked — the mask below never
+                # covers it) is filled by REPEATING the student's newest
+                # rolled chunk: in this geometry every new chunk is
+                # supervised, so no newer unsupervised student chunk exists
+                # to place there. Detached content-only filler, exactly
+                # like the GT scaffold it replaces. Same shape as the GT
+                # slice ([B, gt_after_frames, ...]) — DDP-safe.
+                _last_stu = chunk[
+                    :, n_ctx + sup_frames - npb: n_ctx + sup_frames
+                ].detach()
+                if gt_after_frames == npb:
+                    gt_future = _last_stu
+                else:
+                    _n_rep = (gt_after_frames + npb - 1) // npb
+                    gt_future = torch.cat(
+                        [_last_stu] * _n_rep, dim=1,
+                    )[:, :gt_after_frames]
+                _allroll_stu_chunks += (gt_after_frames + npb - 1) // npb
+            else:
+                gt_future = ride_lat[
+                    :,
+                    chunk_lo + sup_frames + match_m
+                    : chunk_lo + sup_frames + gt_after_frames + match_m,
+                ].to(dtype=chunk.dtype, device=chunk.device).detach()
             _sup_block = chunk[:, n_ctx:n_ctx + sup_frames]
             parts = [gt_ctx, _sup_block, gt_future]
             if getattr(self, "_rolling_42f_dbg", 0) < 2:
@@ -11443,6 +13186,33 @@ class ActionForcingDMD(SelfForcingModel):
         clean_x = ride_lat[:, clean_lo:clean_lo + N].to(
             dtype=chunk.dtype, device=chunk.device,
         ).detach()
+        # ---- all-rolling clean_x (dmd_42f_allroll_student_ctx) ----------
+        # Overlay the clean half with the student's own rolled-window
+        # content (detached) at the SAME world positions, sourced from the
+        # PRE-rebind chunk (world [chunk_lo - _ovl, chunk_lo + sup_frames);
+        # its overlap band is what the noisy ctx was built from, so clean
+        # and noisy agree wherever both hold student content — the
+        # fix_clean_counterpart principle). Frames outside the student's
+        # roll (early-ride shortfall when _ovl < n_ctx + npb, or a
+        # clean_shift_fwd tail) FALL BACK to the GT already in place and
+        # are counted. Content-only, same shape, rank-local — DDP-safe
+        # (per-rank coverage can differ only via per-rank clean_lo
+        # (match_m), which alters slice CONTENT, never shapes).
+        if _allroll:
+            _stu_w0 = chunk_lo - _ovl                       # roll world start
+            _stu_w1 = chunk_lo + sup_frames                 # roll world end
+            _cov_lo = max(clean_lo, _stu_w0)
+            _cov_hi = min(clean_lo + N, _stu_w1)
+            if _cov_hi > _cov_lo:
+                clean_x = clean_x.clone()
+                clean_x[:, _cov_lo - clean_lo: _cov_hi - clean_lo] = (
+                    _prebind_chunk[
+                        :, _cov_lo - _stu_w0: _cov_hi - _stu_w0
+                    ].detach().to(dtype=clean_x.dtype, device=clean_x.device)
+                )
+            _cov = max(0, _cov_hi - _cov_lo)
+            _allroll_stu_chunks += _cov // npb
+            _allroll_gt_fb += (N - _cov + npb - 1) // npb
         # G4 hybrid: overwrite the student-covered span of the clean half with
         # the student's OWN rolled content, leaving GT outside it.
         if bool(getattr(self, "dmd_42f_clean_self_forward", False)):
@@ -11690,7 +13460,7 @@ class ActionForcingDMD(SelfForcingModel):
                 # feature, which the kv_cache path must not see.
                 "cond": noisy_cond,
             }
-        return {
+        out = {
             "noisy_x": noisy_x,
             "clean_x": clean_x,
             "aug_t": aug_t,
@@ -11701,6 +13471,25 @@ class ActionForcingDMD(SelfForcingModel):
             "rope_offset": _rope_offset,
             "ar_head": ar_head,
         }
+        if _allroll_flag:
+            # all-rolling telemetry (flag-on only; keys absent otherwise so
+            # the flag-off return dict is unchanged). Zero on iter 1
+            # (overlap=0: GT seed layout, deliberately untouched).
+            out["dmd42f_allroll_ctx_student_chunks"] = int(_allroll_stu_chunks)
+            out["dmd42f_allroll_ctx_gt_fallback"] = int(_allroll_gt_fb)
+            if _is_main():
+                _cs_ar = int(info.get("current_step", 0))
+                _dbg_n = int(getattr(self, "_allroll_dbg", 0))
+                if _dbg_n < 4 or _cs_ar % 25 == 0:
+                    self._allroll_dbg = _dbg_n + 1
+                    import sys as _sys
+                    print(
+                        f"[42F-ALLROLL] step={_cs_ar} rolling={_rolling} "
+                        f"student_chunks={_allroll_stu_chunks} "
+                        f"gt_fallback={_allroll_gt_fb}",
+                        file=_sys.stderr, flush=True,
+                    )
+        return out
 
     def _streaming_clean_cond_slice(
         self, info: Dict[str, Any],
@@ -11808,6 +13597,21 @@ class ActionForcingDMD(SelfForcingModel):
         """
         s = self.streaming_state
         chunks_in_ride = int(info.get("chunks_in_current_ride", 1))
+        # Drop last roll's adversarial band FIRST. If this call raises,
+        # returns early, or a future refactor moves the publication site,
+        # the trainer's G/D folds hit ``of_streaming_band``'s loud error
+        # instead of quietly re-using the previous roll's tensors (whose
+        # graph is by then freed and whose GT window belongs to a
+        # different position in the ride).
+        self._of_band = None
+        # Feed the fingerprint RATCHET the ride depth. Before the
+        # only_first/only_last early returns on purpose: the ratchet must
+        # keep tracking depth across rolls that skip the scorer, and the
+        # depth-backstop reset (which is what makes latch-forever
+        # impossible) has to see every roll, not only supervised ones.
+        # No-op unless dmd_fp_ratchet_enabled -- but the depth bookkeeping
+        # itself is unconditional so an armed run never starts blind.
+        self._dmd_fp_ratchet_observe_depth(chunks_in_ride)
         only_first = bool(
             getattr(self, "dmd_only_first_chunk_per_ride", False)
         )
@@ -12232,6 +14036,39 @@ class ActionForcingDMD(SelfForcingModel):
                     aug_t_real=score_aug_t_real,
                     ar_head_inputs=score_ar_head,
                 )
+        # ---- ONE-FORCING (Option D): publish the band + build the G term
+        # HERE, immediately after the DMD scorer, with ``score_image`` /
+        # ``score_gt_target`` / ``score_cond`` / ``score_grad_mask`` still
+        # in scope. This is the ONLY place in the process that holds the
+        # tensor the DMD gradient is actually applied to; anywhere else
+        # the identity has to be re-derived, and the previous trainer-side
+        # attach point re-derived it WRONG. See
+        # ``_of_publish_streaming_band``.
+        if self.gan_of_enabled:
+            self._of_publish_streaming_band(
+                score_image=score_image,
+                score_gt_target=score_gt_target,
+                score_cond=score_cond,
+                score_grad_mask=score_grad_mask,
+                chunk=chunk,
+                info=info,
+                chunk_lo=chunk_lo,
+                chunk_hi=chunk_hi,
+                dmd_fired=(not _skip_scorer),
+                current_step=current_step,
+            )
+        # Graph tripwire for the DMD term itself. ``score_image`` is built
+        # out of the rolled chunk; when the rollout arrives detached (the
+        # ``boundary_vae_roundtrip`` no_grad-cat defect, a no-grad
+        # prebuild, a future refactor) the DMD loss is a CONSTANT and the
+        # phase-LoRA ghost anchor keeps ``generator_loss.requires_grad``
+        # True, so NOTHING else in the trace says so. Logged rather than
+        # raised: legitimate configs (dmd_loss_weight=0 probes) reach here
+        # with no graph, and a raise on a rank-uniform-but-unexpected path
+        # is worse than a gauge that reads 0.0.
+        dmd_log["dmd_sup_band_graph_on"] = (
+            1.0 if bool(score_image.requires_grad) else 0.0
+        )
         # Resolved DMD loss weight: applies the start-step gate +
         # linear warmup ramp on top of the static ``dmd_loss_weight``.
         # ``current_step`` was already plumbed via ``info`` (also used

@@ -562,3 +562,185 @@ dmd_fp_gate_min_weight: null    # floor on the weight (0 = DMD can be fully off)
 # The floor is AFFINE, not a clamp: a clamped floor of 0.3 with exponent 2
 # would silently kill the bottom half of the calibrated range.
 dmd_fp_gate_enabled: false      # arm the gate (requires every Class-B value)
+#
+#   RATCHET ("capacitor-diode") -- the STATEFUL wrapper on the gate.
+#
+#     Why. The depth study returned "PROBE CANNOT RANK OFF-MANIFOLD
+#     DISTANCE -- GATE NOT VIABLE", 0/8 arms, at t=250/500/750. That
+#     verdict STANDS and is not being reinterpreted; it is a verdict
+#     about a MONOTONICITY criterion, and the measured geometry does not
+#     satisfy monotonicity. The s-vs-depth curve is U-SHAPED: near depth
+#     0 the sample is on the DATA manifold and the teacher's field is
+#     locally restoring (s high); at large depth the sample has been
+#     captured by the MODEL'S OWN attractor, where the field is ALSO
+#     locally restoring (s high again). Measured trough at depth 16 in
+#     11 of 12 (arm, timestep) series. The two ends are not separable:
+#     deepest-s minus depth-0-s over 12 series = mean +0.0244, sd 0.0709,
+#     9/12 POSITIVE -- 1.78x the MEAN seed-noise floor (0.0137) but only
+#     0.72x the WORST floor (0.0338), and where they DO differ the DEEP
+#     end scores HIGHER. So m is NON-INJECTIVE in depth and any gate
+#     that is a pure function of the current m is ill-posed. The probe
+#     measures "near SOME attractor", which is weaker than "near the
+#     DATA manifold". The ratchet is what converts the weaker signal
+#     into a usable gate, using the one fact the probe lacks: TIME
+#     ORDER. A ride starts on the manifold.
+#
+#         w_t = min(w_{t-1}, f(ema(m)_t))      reset at RIDE start
+#
+#     DIODE (min): the weight never rises within a ride, so the far
+#     branch's rising m can never RE-OPEN the gate. The far side becomes
+#     automatically "no" without any threshold knowing where the trough
+#     is -- there is deliberately NO trough-location constant.
+#     CAPACITOR (ema): smooths m BEFORE the m_lo/m_hi/exponent ramp so
+#     the gate closes progressively instead of snapping on one noisy
+#     probe. On m and not on w because the ramp is nonlinear and clamped
+#     at both ends.
+#
+#     RESET is hooked to the trainer's ride-setup line (the same place
+#     _chunks_in_current_ride goes to 0), NOT to a step counter. A
+#     running minimum that never resets latches shut and silently kills
+#     DMD for the rest of training -- so the reset is explicit, counted
+#     on the step line (fp_rt_rst), and backstopped in the model by a
+#     LOUD reset if ride depth ever goes backwards without it.
+#
+#     Arming the ratchet requires dmd_fp_gate_enabled=true (it wraps that
+#     gate's weight; armed without it, it would be silently inert -> it
+#     raises) AND every value below set (same Class-B discipline).
+dmd_fp_ratchet_enabled: false   # arm the per-ride ratchet
+dmd_fp_ratchet_ema: null        # capacitor time constant, [0, 1)
+                                #   0   = no smoothing (closes on ONE probe)
+                                #   ->1 = slower; 1 is rejected (would freeze
+                                #         the capacitor so the gate never closes)
+                                #   <- set against the MEASURED probe seed-noise
+                                #      floor (mean 0.0137 / worst 0.0338)
+#     TWO HAZARDS when arming (see _dmd_fp_ratchet_apply):
+#       * the EMA's time base is the DMD CALL, not the probe -- with
+#         dmd_fp_every > 1 the capacitor charges on STALE m and the
+#         effective smoothing is weaker than the knob reads. Run the
+#         ratchet at dmd_fp_every: 1.
+#       * with dmd_fp_gate_min_weight: 0 a SINGLE probe reading at/below
+#         m_lo pins the weight at zero for the REST OF THE RIDE. That is
+#         the diode working as specified, but the probe's seed-noise
+#         floor is 0.0137 mean / 0.0338 worst, so one noisy draw can
+#         switch DMD off for a whole ride. The capacitor is the intended
+#         defence; a nonzero min_weight is the belt-and-braces one.
+# Step line: fp_rt_w (mean running-min weight), fp_rt_shr (share of the
+# un-ratcheted gate weight retained), fp_rt_lat (1 once the diode has
+# BLOCKED a rise this ride), fp_rt_d (ride depth of the last decrease of
+# the running min = the training-time read of the trough), fp_rt_rst
+# (ride resets the hook has seen -- if this stops moving while rides turn
+# over, the ratchet is latching forever).
+
+# ---------------------------------------------------------------------------
+# ONE-FORCING GAN — OPTION D (arXiv 2605.23458 port). docs/ONE_FORCING_PORT.md
+# ---------------------------------------------------------------------------
+# The discriminator is a register-token head hosted on the TRAINABLE
+# ``fake_score`` critic, not on the frozen DMD teacher. That obeys
+# GAN_REDESIGN_TWO's decoupling rule (the disc is not built from
+# ``real_score``) and adds a property options A/B/C do not have: the disc
+# backbone is retrained every iter by the denoising objective on the current
+# student's own samples, so its feature basis tracks the student instead of
+# being a frozen projection of the teacher DMD already scores with.
+#
+# Defaults below are One-Forcing's own FRAMEWISE configuration
+# (ARRWM_data/one_forcing/config.yaml), except the master gate, which is off.
+# Every key is read at a literal ``getattr(cfg, "...")`` site in
+# ``model/one_forcing_gan.py::resolve_of_config``, so the override guard
+# sources them for real.
+#
+# HARD CONSTRAINTS (the trainer raises at CONSTRUCTION, it does not warn):
+#   * ``gan_of_enabled`` and ``gan_enabled`` (LADD) are mutually exclusive.
+#   * ``streaming_mode`` must be TRUE. Streaming is the PRIMARY and only
+#     wired path: the D term is folded into the streaming critic loss by
+#     ``_of_streaming_d_term`` and has no non-streaming call site, so on
+#     ``streaming_mode: false`` the generator would train against a
+#     never-updated random-init discriminator while every ``of_*`` log
+#     still read healthy. (Streaming is the base default, so this costs
+#     nothing real.)
+#   * ``fake_score_updates_enabled`` must be true — the disc IS that critic.
+#   * ``fake_alt_head_enabled`` must be false — it flips the fake_score DDP
+#     reducer to find_unused_parameters=True, which cannot take the two
+#     grad-on fake_score forwards (denoise + disc) this critic step runs
+#     before its single backward.
+#   * ``fake_score`` must not carry a state-token branch (the classify
+#     forward does not thread state tokens).
+
+# MASTER GATE. false = byte-identical: no head is constructed, no disc
+# forward runs, no extra RNG is drawn, and not one ``of_*`` key is logged.
+gan_of_enabled: false
+
+# Adversarial weights. The reference folds these INTO the returned term, so
+# ``of_g_loss`` / ``of_d_loss`` are logged post-weight; divide by
+# ``gan_of_g_weight`` for the unweighted gradient share (the trainer
+# publishes that as ``of_gan_dmd_ratio_unweighted``).
+gan_of_g_weight: 0.03
+gan_of_d_weight: 0.03
+
+# Head geometry. ``feature_layers`` are the transformer blocks tapped; one
+# register token + one stack of ``blocks_per_token`` cross-attn blocks is
+# built per tap, paired IN ORDER, so the list must be ascending. Our legacy
+# head was heavier (taps [7,13,21,29], 2 blocks/token, 4-layer residual MLP,
+# dropout 0.2); these are the paper's lighter framewise shape.
+gan_of_feature_layers: [21, 29]
+gan_of_blocks_per_token: 1
+gan_of_block_ffn_dim: 2048
+gan_of_block_num_heads: 12
+gan_of_head_hidden_dim: 1536
+# ``head_num_layers: 1`` IS the paper's head: LayerNorm/Linear/SiLU/Linear.
+# ``2`` is NOT that shape — it inserts a ResidualMLPBlock and a trailing
+# second LayerNorm, i.e. strictly heavier than the reference. ``0`` is
+# refused (it would drop the final output projection).
+gan_of_head_num_layers: 1
+gan_of_head_dropout: 0.0        # the paper has none
+
+# Disc timestep: one draw per sample, uniform over frames, SD3-shifted.
+# The D step uses ONE sample of this for BOTH members.
+gan_of_t_min: 20
+gan_of_t_max: 980
+gan_of_timestep_shift: 5.0
+
+# Loss form. The paper's framewise recipe is plain non-saturating softplus
+# with no R1/R2; the relativistic variants exist for ablation only.
+gan_of_relativistic: false
+gan_of_shared_noise: true       # real and fake share epsilon in the D loss
+gan_of_r1_weight: 0.0
+gan_of_r2_weight: 0.0
+gan_of_r1_sigma: 0.01
+gan_of_r2_sigma: 0.01
+
+# Schedule. Both 0 = the paper's recipe (no ramp, disc live from step 0).
+# Both knobs (and ``gan_of_d_weight: 0`` for a G-only ablation) are live:
+# while the D loss is inactive the head is still tied into the critic
+# backward by a zero-valued touch term (``ActionForcingDMD.of_head_touch``),
+# without which an ungradiented head deadlocks the fake_score DDP reducer.
+# CAVEAT: that touch means grad=0 rather than grad=None for the head, so a
+# nonzero ``fake_weight_decay`` decays the head during a start-step warmup.
+gan_of_disc_start_step: 0
+gan_of_warmup_steps: 0
+
+# LAYER-ON KNOBS — our two historical ideas, so they can be tested
+# SEPARATELY, LATER. The initial arm runs both at the faithful default.
+#   fake_source "pred_image" = the SAME tensor DMD scores (faithful).
+#               "flash"      = the flash_dmd_gan_t slab, our historical
+#                              choice. REACHABLE: the slab is published by
+#                              the streaming rollout, which is the path this
+#                              arm runs on. It additionally REQUIRES
+#                              ``flash_dmd_enabled: true`` (without it the
+#                              slab is never produced) — refused at
+#                              construction, never silently downgraded to
+#                              "pred_image".
+#   real_source "aligned_gt"    = the frame-aligned GT window (faithful).
+#               "nearest_match" = LADD-style nearest-by-L1 retrieval. This is
+#                              precisely the condition the paper's Fig. 4
+#                              blames for collapsing the logit gap to ~0.
+gan_of_fake_source: "pred_image"
+gan_of_real_source: "aligned_gt"
+
+# Telemetry cadence (steps) for the logit gap and the GAN:DMD gradient
+# ratio/cosine measured on ``pred_image``. The LOGIT GAP is this arm's
+# primary go/no-go instrument. It also gates the D side's seven per-call
+# ``.item()`` GPU syncs (x ``1 + streaming_fake_updates_per_gen`` calls an
+# iteration). ``of_d_weight`` is logged every step regardless. The extra
+# fake_score updates log under an ``of_inner_`` prefix so they cannot
+# overwrite the main D step's numbers.
+gan_of_telemetry_every: 25

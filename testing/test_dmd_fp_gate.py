@@ -51,6 +51,9 @@ LOSS = ActionForcingDMD._dmd_loss_with_fp_gate
 PROBE_PARAMS = ActionForcingDMD._dmd_fp_probe_params
 MISSING = ActionForcingDMD._dmd_fp_missing_calib
 CALIB_KEYS = ActionForcingDMD._DMD_FP_CALIB_KEYS
+RATCHET_KEYS = ActionForcingDMD._DMD_FP_RATCHET_KEYS
+RESET = ActionForcingDMD.reset_dmd_fp_ratchet
+OBSERVE = ActionForcingDMD._dmd_fp_ratchet_observe_depth
 
 SHAPE = (1, 6, 4, 8, 8)
 
@@ -60,10 +63,20 @@ class _Stub:
 
     # the methods under test call each other through self
     _DMD_FP_CALIB_KEYS = CALIB_KEYS
+    _DMD_FP_RATCHET_KEYS = RATCHET_KEYS
     _dmd_fp_opt_float = staticmethod(ActionForcingDMD._dmd_fp_opt_float)
     _dmd_fp_missing_calib = ActionForcingDMD._dmd_fp_missing_calib
     _dmd_fp_require_calib = ActionForcingDMD._dmd_fp_require_calib
     _dmd_fp_gate_weight_from_m = ActionForcingDMD._dmd_fp_gate_weight_from_m
+    # ratchet
+    reset_dmd_fp_ratchet = ActionForcingDMD.reset_dmd_fp_ratchet
+    _dmd_fp_ratchet_observe_depth = (
+        ActionForcingDMD._dmd_fp_ratchet_observe_depth)
+    _dmd_fp_missing_ratchet_calib = (
+        ActionForcingDMD._dmd_fp_missing_ratchet_calib)
+    _dmd_fp_require_ratchet_calib = (
+        ActionForcingDMD._dmd_fp_require_ratchet_calib)
+    _dmd_fp_ratchet_apply = ActionForcingDMD._dmd_fp_ratchet_apply
 
 
 def _cfg(**kw):
@@ -910,3 +923,620 @@ def test_compute_kl_grad_installs_the_hook_via_the_tested_helper():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ===========================================================================
+# THE RATCHET -- "capacitor-diode", the stateful wrapper on the gate
+#
+# WHY it exists (and why these tests are shaped as they are): the depth
+# study returned "PROBE CANNOT RANK OFF-MANIFOLD DISTANCE -- GATE NOT
+# VIABLE", 0/8 arms, at t=250/500/750. That verdict STANDS. It is a
+# verdict about a MONOTONICITY criterion, and the measured s-vs-depth
+# curve is U-SHAPED (trough at depth 16 in 11 of 12 (arm, timestep)
+# series): high near depth 0 because the sample is on the DATA manifold,
+# high again at large depth because it has been captured by the MODEL'S
+# OWN attractor -- the teacher's field is locally restoring in both
+# basins. deepest-s minus depth-0-s over 12 series: mean +0.0244, sd
+# 0.0709, 9/12 POSITIVE (1.78x the MEAN seed-noise floor 0.0137, but only
+# 0.72x the WORST floor 0.0338), i.e. the two ends are statistically
+# indistinguishable and where they differ the DEEP end scores HIGHER.
+#
+# So m is NON-INJECTIVE in depth and any gate that is a pure function of
+# the current m is ill-posed. The ratchet adds the one thing the probe
+# does not have: TIME ORDER, via a per-ride running minimum.
+#
+#   DIODE     w_t = min(w_{t-1}, ...)   -- the far branch can never
+#                                          RE-OPEN the gate
+#   CAPACITOR ema on m BEFORE the ramp  -- closes progressively
+#
+# The DANGEROUS failure mode is the opposite one: a running minimum that
+# never resets latches shut and silently zeroes DMD for the rest of
+# training. Hence the reset tests below are the load-bearing ones.
+# ===========================================================================
+APPLY = ActionForcingDMD._dmd_fp_ratchet_apply
+
+
+def _ratchet(ema=0.0, m_lo=0.0, m_hi=1.0, ex=1.0, mw=0.0, **over):
+    """An armed gate + armed ratchet, with NO ride depth observed yet."""
+    return _armed(
+        dmd_fp_m_lo=m_lo, dmd_fp_m_hi=m_hi,
+        dmd_fp_gate_exponent=ex, dmd_fp_gate_min_weight=mw,
+        dmd_fp_ratchet_enabled=True, dmd_fp_ratchet_ema=ema, **over)
+
+
+def _rstep(s, m_vec, depth, log=None):
+    """One DMD call at ride depth ``depth``, probe reporting ``m_vec``.
+
+    Drives the REAL composition path (`_dmd_loss_with_fp_gate`), not the
+    ratchet in isolation, so these tests also pin that the ratchet's
+    output is what actually weights the loss.
+    """
+    OBSERVE(s, depth)
+    m = torch.as_tensor(m_vec, dtype=torch.float32)
+    s._last_dmd_fp_m_per_frame = m
+    # what the probe stashes: the UN-ratcheted per-frame weight
+    s._last_dmd_fp_w_per_frame = WFROM_M(s, m)
+    x = torch.zeros(*SHAPE, requires_grad=True)
+    g = torch.full(SHAPE, 0.5)
+    mask = torch.ones(SHAPE, dtype=torch.bool)
+    lg = {} if log is None else log
+    loss = LOSS(s, x, g, mask, lg)
+    return lg, loss, x
+
+
+def _flat(v):
+    """A uniform per-frame m vector -- the scalar-like case."""
+    return [float(v)] * SHAPE[1]
+
+
+# The measured shape, coarsened: falling to a trough then rising back
+# ABOVE where it started. Index 4 is the trough (the study's depth 16).
+U_SHAPED_M = [0.90, 0.70, 0.50, 0.35, 0.25, 0.40, 0.60, 0.85, 0.95]
+U_TROUGH_IDX = 4
+
+
+# ---------------------------------------------------------------------------
+# DIODE: monotone non-increase within a ride
+# ---------------------------------------------------------------------------
+def test_ratchet_never_rises_within_a_ride():
+    """THE diode property. Feed the U-shaped m the study measured and
+    assert the weight never rises -- the far (attractor) branch's rising
+    m must NEVER re-open the gate.
+
+    MUTATION: `w_out = w_new` (i.e. use f(m_t) directly instead of the
+    running min) in `_dmd_fp_ratchet_apply` -> the weight tracks the U
+    straight back up and this goes red.
+    """
+    s = _ratchet(ema=0.0)
+    seen = []
+    for d, mv in enumerate(U_SHAPED_M):
+        _rstep(s, _flat(mv), depth=d)
+        seen.append(s._last_dmd_fp_ratchet_w_mean)
+    assert all(b <= a + 1e-9 for a, b in zip(seen, seen[1:])), seen
+    # and it is HELD at the trough, not merely non-increasing by luck
+    assert seen[-1] == pytest.approx(min(U_SHAPED_M), abs=1e-6)
+    # the un-ratcheted gate would have re-opened all the way to 0.95
+    assert WFROM_M(s, U_SHAPED_M[-1]) == pytest.approx(0.95)
+
+
+def test_ratchet_output_is_what_actually_weights_the_loss():
+    """A running minimum nobody applies is the same silent failure one
+    level along.
+
+    MUTATION: return `w_raw` from `_dmd_fp_ratchet_apply` -> red.
+    """
+    s = _ratchet(ema=0.0)
+    _rstep(s, _flat(0.2), depth=0)                 # min pinned at 0.2
+    _, loss, x = _rstep(s, _flat(1.0), depth=1)    # probe says wide open
+    loss.backward()
+    per_frame = x.grad.abs().flatten(2).sum(-1).flatten()
+    # weighted MEAN with a uniform weight is scale-free, so check the
+    # telemetry the loss reduction actually used
+    assert s._last_dmd_fp_gate_w_mean == pytest.approx(0.2)
+    assert float(per_frame[0]) > 0.0
+
+
+def test_ratchet_latch_depth_is_the_trough():
+    """`fp_rt_d` = ride depth at which the running MIN last decreased. On
+    a U-shaped m that stops moving AT THE TROUGH, which is the
+    training-time cross-check on the offline study's depth-16 trough.
+
+    MUTATION: set the latch depth on every call (drop the `if decreased`)
+    -> it tracks the current depth to 8 and this goes red.
+    """
+    s = _ratchet(ema=0.0)
+    for d, mv in enumerate(U_SHAPED_M):
+        _rstep(s, _flat(mv), depth=d)
+    assert s._last_dmd_fp_ratchet_latch_depth == pytest.approx(
+        float(U_TROUGH_IDX))
+    # and the diode is recorded as having BLOCKED a rise
+    assert s._last_dmd_fp_ratchet_latched == pytest.approx(1.0)
+
+
+def test_latched_is_zero_while_m_is_still_falling():
+    """Not sticky-on from the start: the flag means "the diode refused a
+    rise", which has not happened yet on a monotone descent.
+
+    MUTATION (M27): set `latched` unconditionally -> red."""
+    s = _ratchet(ema=0.0)
+    for d, mv in enumerate(U_SHAPED_M[:U_TROUGH_IDX + 1]):
+        _rstep(s, _flat(mv), depth=d)
+    assert s._last_dmd_fp_ratchet_latched == pytest.approx(0.0)
+    assert s._last_dmd_fp_ratchet_latch_depth == pytest.approx(
+        float(U_TROUGH_IDX))
+
+
+# ---------------------------------------------------------------------------
+# RESET -- the anti-latch-forever tests. The dangerous direction.
+# ---------------------------------------------------------------------------
+def test_ratchet_resets_at_ride_boundary_restoring_full_weight():
+    """THE anti-latch test. A ratchet that never resets latches shut and
+    silently kills DMD for the rest of training.
+
+    MUTATION: make `reset_dmd_fp_ratchet` a no-op body (`pass`) -> the
+    new ride inherits the old ride's 0.1 minimum and this goes red.
+    """
+    s = _ratchet(ema=0.0)
+    for d, mv in enumerate([0.9, 0.5, 0.1]):
+        _rstep(s, _flat(mv), depth=d)
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.1)
+    RESET(s, reason="ride_setup")                  # <- the ride boundary
+    assert s._last_dmd_fp_ratchet_w_mean is None   # state truly cleared
+    _rstep(s, _flat(0.9), depth=0)                 # fresh ride, near-manifold
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.9)
+    assert s._last_dmd_fp_ratchet_latched == pytest.approx(0.0)
+
+
+def test_reset_clears_every_piece_of_ratchet_state():
+    """Partial reset is the same bug with extra steps: a surviving EMA or
+    latch depth carries the old ride's history into the new one.
+
+    MUTATION (M24): leave `_dmd_fp_ratchet_m_ema` alone in the reset ->
+    red."""
+    s = _ratchet(ema=0.5)
+    for d, mv in enumerate([0.9, 0.5, 0.1]):
+        _rstep(s, _flat(mv), depth=d)
+    RESET(s, reason="ride_setup")
+    for a in ("_dmd_fp_ratchet_w", "_dmd_fp_ratchet_m_ema",
+              "_dmd_fp_ratchet_depth", "_dmd_fp_ratchet_latch_depth",
+              "_last_dmd_fp_ratchet_w_mean", "_last_dmd_fp_ratchet_share",
+              "_last_dmd_fp_ratchet_latched",
+              "_last_dmd_fp_ratchet_latch_depth",
+              "_last_dmd_fp_ratchet_depth"):
+        assert getattr(s, a) is None, f"{a} survived the reset"
+    assert s._dmd_fp_ratchet_latched is False
+
+
+def test_reset_is_counted_so_a_stalled_hook_is_visible():
+    """If rides turn over and this counter stops moving, the ratchet is
+    latching forever. That has to be readable off the step line.
+
+    MUTATION (M26): drop the `+ 1` from the reset counter -> red."""
+    s = _ratchet(ema=0.0)
+    assert s._last_dmd_fp_ratchet_resets == pytest.approx(0.0)
+    RESET(s, reason="ride_setup")
+    RESET(s, reason="ride_setup")
+    assert s._last_dmd_fp_ratchet_resets == pytest.approx(2.0)
+
+
+def test_reset_count_is_absent_when_the_ratchet_is_off():
+    """Step-line hygiene: nothing to say on a default-off run.
+
+    MUTATION (M23): publish the count unconditionally -> red, and it
+    takes `test_no_forgeable_ratchet_zeros_before_anything_is_measured`
+    with it. That is the point: 0.0 is a real value here."""
+    s = _Stub()
+    INIT(s, _cfg())
+    assert s._last_dmd_fp_ratchet_resets is None
+    RESET(s, reason="ride_setup")
+    assert s._last_dmd_fp_ratchet_resets is None
+
+
+def test_depth_backstop_resets_loudly_when_the_hook_is_missing(capsys):
+    """BACKSTOP. A ride boundary that arrives without the explicit reset
+    (a trainer that lost the hook) must NOT latch the gate forever. A
+    strict decrease in ride depth can only mean a new ride, so reset --
+    and say so on stderr, because the missing hook is still a bug.
+
+    MUTATION: delete the backstop branch from
+    `_dmd_fp_ratchet_observe_depth` -> the second ride inherits the first
+    ride's 0.1 minimum forever and this goes red.
+    """
+    s = _ratchet(ema=0.0)
+    for d, mv in enumerate([0.9, 0.5, 0.1]):
+        _rstep(s, _flat(mv), depth=d)
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.1)
+    _rstep(s, _flat(0.9), depth=0)          # new ride, NO explicit reset
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.9)
+    err = capsys.readouterr().err
+    assert "RATCHET BACKSTOP" in err
+    assert "reset_dmd_fp_ratchet" in err
+
+
+def test_repeated_depth_does_NOT_reset_the_ratchet():
+    """The backstop tests a STRICT decrease on purpose. Several DMD calls
+    can share one ride depth, and a `<=` test would reset on every repeat
+    -- silently defeating the diode, i.e. the same bug in the opposite
+    direction and much harder to see.
+
+    MUTATION: `d <= prev` in `_dmd_fp_ratchet_observe_depth` -> the
+    second call at depth 3 resets and the weight jumps back to 0.9, red.
+    """
+    s = _ratchet(ema=0.0)
+    _rstep(s, _flat(0.2), depth=3)
+    _rstep(s, _flat(0.9), depth=3)          # same depth, m recovered
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.2)
+
+
+def test_ratchet_refuses_to_run_with_no_ride_depth_observed():
+    """No ride => no defined reset point => the latch-forever failure.
+    Refuse rather than accumulate a minimum that can never be cleared
+    (e.g. the non-streaming generator loss, which has no rides).
+
+    MUTATION (M12): drop the depth check -> the ratchet happily starts
+    accumulating with no defined reset point, red."""
+    s = _ratchet(ema=0.0)
+    s._last_dmd_fp_m_per_frame = torch.full((SHAPE[1],), 0.5)
+    s._last_dmd_fp_w_per_frame = torch.full((SHAPE[1],), 0.5)
+    with pytest.raises(ValueError, match="no ride depth"):
+        LOSS(s, torch.randn(*SHAPE, requires_grad=True), torch.randn(*SHAPE),
+             torch.ones(SHAPE, dtype=torch.bool), {})
+
+
+# ---------------------------------------------------------------------------
+# CAPACITOR: the EMA time constant
+# ---------------------------------------------------------------------------
+def test_ema_time_constant_actually_smooths():
+    """The capacitor. With ema>0 a single large drop in m must NOT close
+    the gate all the way in one step.
+
+    MUTATION: ignore `dmd_fp_ratchet_ema` (use m directly) -> the smoothed
+    weight equals the unsmoothed 0.1 and this goes red.
+    """
+    fast = _ratchet(ema=0.0)
+    slow = _ratchet(ema=0.8)
+    for s in (fast, slow):
+        _rstep(s, _flat(0.9), depth=0)
+        _rstep(s, _flat(0.1), depth=1)
+    assert fast._last_dmd_fp_ratchet_w_mean == pytest.approx(0.1)
+    # ema on m BEFORE the ramp: 0.8*0.9 + 0.2*0.1 = 0.74
+    assert slow._last_dmd_fp_ratchet_w_mean == pytest.approx(0.74, abs=1e-6)
+    assert slow._last_dmd_fp_ratchet_w_mean > fast._last_dmd_fp_ratchet_w_mean
+
+
+def test_ema_still_converges_so_the_gate_can_close():
+    """A capacitor that never charges is a gate that never closes.
+
+    MUTATION (M29): `m_ema = prev_e` (a == 1 in effect) -> the gate holds
+    at 0.9 forever, red."""
+    s = _ratchet(ema=0.8)
+    _rstep(s, _flat(0.9), depth=0)
+    for d in range(1, 40):
+        _rstep(s, _flat(0.0), depth=d)
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.0, abs=1e-3)
+
+
+def test_ema_is_applied_to_m_not_to_the_mapped_weight():
+    """Smoothing AFTER the ramp cannot recover what the ramp's clamp has
+    already destroyed. With m_lo=0.4 both m=0.2 and m=0.0 map to w=0, so
+    a w-side EMA cannot tell them apart; an m-side EMA can.
+
+    MUTATION: `w_ema = a*prev_w + (1-a)*f(m)` -> both stubs below agree
+    and this goes red.
+    """
+    a, lo, hi = 0.5, 0.4, 1.0
+    s1 = _ratchet(ema=a, m_lo=lo, m_hi=hi)
+    s2 = _ratchet(ema=a, m_lo=lo, m_hi=hi)
+    _rstep(s1, _flat(1.0), depth=0)
+    _rstep(s2, _flat(1.0), depth=0)
+    _rstep(s1, _flat(0.2), depth=1)
+    _rstep(s2, _flat(0.0), depth=1)
+    # m-side: ema(m) = 0.6 vs 0.5 -> w = 1/3 vs 1/6. Distinguishable.
+    assert s1._last_dmd_fp_ratchet_w_mean == pytest.approx(
+        (0.6 - lo) / (hi - lo), abs=1e-6)
+    assert s2._last_dmd_fp_ratchet_w_mean == pytest.approx(
+        (0.5 - lo) / (hi - lo), abs=1e-6)
+    assert s1._last_dmd_fp_ratchet_w_mean != pytest.approx(
+        s2._last_dmd_fp_ratchet_w_mean)
+
+
+@pytest.mark.parametrize("bad", [1.0, 1.5, -0.1])
+def test_incoherent_ema_raises(bad):
+    """1.0 would freeze the capacitor at the ride's first reading, so the
+    gate could never close at all -- inert, not conservative.
+
+    MUTATION (M18): drop the range check -> red on all three values."""
+    s = _ratchet(ema=bad)
+    OBSERVE(s, 1)
+    s._last_dmd_fp_m_per_frame = torch.full((SHAPE[1],), 0.5)
+    with pytest.raises(ValueError, match="dmd_fp_ratchet_ema"):
+        APPLY(s, torch.full((SHAPE[1],), 0.5), {})
+
+
+# ---------------------------------------------------------------------------
+# ELEMENTWISE per-frame semantics survive the ratchet
+# ---------------------------------------------------------------------------
+def test_ratchet_is_elementwise_over_frames_not_a_scalar():
+    """The measured align cliff lives INSIDE one band (positive at frames
+    9-13, -0.53 by 17). Frame i's running minimum must be driven only by
+    frame i's history, so a band whose TAIL has drifted still attenuates
+    TAIL-ONLY.
+
+    MUTATION: collapse to a scalar before the min
+    (`w_new = w_new.mean().expand_as(w_new)`) -> the head is dragged down
+    with the tail and this goes red.
+    """
+    s = _ratchet(ema=0.0)
+    _rstep(s, _flat(1.0), depth=0)
+    # tail drifts, head does not
+    _rstep(s, [1.0, 1.0, 1.0, 0.5, 0.2, 0.05], depth=1)
+    w = s._dmd_fp_ratchet_w
+    assert torch.allclose(
+        w.float(), torch.tensor([1.0, 1.0, 1.0, 0.5, 0.2, 0.05]), atol=1e-6)
+    # ...and the head stays open when the tail's minimum is already shut
+    _, loss, x = _rstep(s, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0], depth=2)
+    assert torch.allclose(
+        s._dmd_fp_ratchet_w.float(),
+        torch.tensor([1.0, 1.0, 1.0, 0.5, 0.2, 0.05]), atol=1e-6)
+    loss.backward()
+    per_frame = x.grad.abs().flatten(2).sum(-1).flatten()
+    head, tail = float(per_frame[0]), float(per_frame[-1])
+    assert tail < head, f"tail {tail} not attenuated vs head {head}"
+    ratios = [float(per_frame[i] / per_frame[0]) for i in range(SHAPE[1])]
+    assert ratios == pytest.approx(
+        [1.0, 1.0, 1.0, 0.5, 0.2, 0.05], rel=1e-5)
+
+
+def test_ratchet_shape_change_mid_ride_raises_rather_than_resetting():
+    """A reset here would RE-OPEN the gate on the deep end -- exactly what
+    the diode exists to prevent. "I no longer know what to line up with
+    what" must not be resolved silently in the unsafe direction.
+
+    MUTATION (M17b): drop both shape guards and silently null the state
+    (previous EMA and previous running min) instead -> no raise, red."""
+    s = _ratchet(ema=0.0)
+    _rstep(s, _flat(0.5), depth=0)
+    OBSERVE(s, 1)
+    s._last_dmd_fp_m_per_frame = torch.full((SHAPE[1] - 1,), 0.5)
+    with pytest.raises(ValueError, match="changed shape mid-ride"):
+        APPLY(s, torch.full((SHAPE[1] - 1,), 0.5), {})
+
+
+# ---------------------------------------------------------------------------
+# fail-loud arming
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("missing_key", list(RATCHET_KEYS))
+def test_ratchet_armed_with_unset_knobs_raises_and_names_them(missing_key):
+    """Same Class-B discipline as the gate: an unmeasured constant must
+    not be silently inherited.
+
+    MUTATION: drop the `_dmd_fp_require_ratchet_calib` call from
+    `_dmd_fp_ratchet_apply` -> no raise, red.
+    """
+    _kw = dict(dmd_fp_ratchet_enabled=True, dmd_fp_ratchet_ema=0.5)
+    _kw[missing_key] = None
+    s = _armed(**_kw)
+    OBSERVE(s, 1)
+    s._last_dmd_fp_m_per_frame = torch.full((SHAPE[1],), 0.5)
+    s._last_dmd_fp_w_per_frame = torch.full((SHAPE[1],), 0.5)
+    with pytest.raises(ValueError) as ei:
+        LOSS(s, torch.randn(*SHAPE, requires_grad=True), torch.randn(*SHAPE),
+             torch.ones(SHAPE, dtype=torch.bool), {})
+    assert missing_key in str(ei.value)
+
+
+def test_ratchet_class_b_knobs_are_none_when_absent_from_config():
+    """MUTATION (M22): `float(getattr(args, "dmd_fp_ratchet_ema", 0.9))`
+    -> the time constant comes back invented, red."""
+    s = _Stub()
+    INIT(s, _cfg())
+    assert s.dmd_fp_ratchet_enabled is False
+    for k in RATCHET_KEYS:
+        assert getattr(s, k) is None, f"{k} was silently defaulted"
+    assert sorted(ActionForcingDMD._dmd_fp_missing_ratchet_calib(s)) == \
+        sorted(RATCHET_KEYS)
+
+
+def test_ratchet_armed_without_the_gate_raises():
+    """The ratchet MODIFIES the gate's per-frame weight. With the gate off
+    there is nothing to modify and the flag would be silently inert --
+    the exact failure mode this campaign keeps rediscovering.
+
+    MUTATION (M14): drop the elif branch -> silently inert, red."""
+    s = _armed(dmd_fp_gate_enabled=False,
+               dmd_fp_ratchet_enabled=True, dmd_fp_ratchet_ema=0.5)
+    with pytest.raises(ValueError, match="dmd_fp_gate_enabled is"):
+        LOSS(s, torch.randn(*SHAPE, requires_grad=True), torch.randn(*SHAPE),
+             torch.ones(SHAPE, dtype=torch.bool), {})
+
+
+def test_ratchet_without_a_per_frame_m_raises():
+    """The ratchet smooths m BEFORE the ramp, so it needs m's pre-image.
+    Ratcheting a weight whose m it does not have would silently switch
+    the capacitor off.
+
+    MUTATION (M13): fall back to `m = w_raw` -> no raise, red."""
+    s = _ratchet(ema=0.5)
+    OBSERVE(s, 1)
+    s._last_dmd_fp_m_per_frame = None
+    s._last_dmd_fp_w_per_frame = torch.full((SHAPE[1],), 0.5)
+    with pytest.raises(ValueError, match="no per-frame fingerprint score m"):
+        LOSS(s, torch.randn(*SHAPE, requires_grad=True), torch.randn(*SHAPE),
+             torch.ones(SHAPE, dtype=torch.bool), {})
+
+
+# ---------------------------------------------------------------------------
+# default-off byte-identical, and telemetry
+# ---------------------------------------------------------------------------
+def test_ratchet_default_off_is_bitwise_identical_and_silent():
+    """The whole feature must be invisible until armed.
+
+    MUTATION (M25): default `dmd_fp_ratchet_enabled` to True -> the
+    shipped-default run trips the "ratchet armed, gate off" raise, red.
+    """
+    torch.manual_seed(11)
+    s = _Stub()
+    INIT(s, _cfg())                     # shipped default: nothing set
+    assert s.dmd_fp_ratchet_enabled is False
+    x = torch.randn(*SHAPE, dtype=torch.float32, requires_grad=True)
+    g = torch.randn(*SHAPE, dtype=torch.float32)
+    mask = torch.rand(SHAPE) > 0.3
+    log = {}
+    got = LOSS(s, x, g, mask, log)
+    ref = 0.5 * F.mse_loss(
+        x.double()[mask], (x.double() - g.double()).detach()[mask],
+        reduction="mean")
+    assert torch.equal(got.detach(), ref.detach())
+    assert torch.equal(torch.autograd.grad(got, x, retain_graph=True)[0],
+                       torch.autograd.grad(ref, x)[0])
+    assert not [k for k in log if "ratchet" in k], log
+
+
+def test_gate_on_ratchet_off_is_unchanged_by_the_ratchet_landing():
+    """The gate's own behaviour must not move because the ratchet exists.
+
+    MUTATION: apply the ratchet whenever a per-frame m is present -> red.
+    """
+    w = [1.0, 1.0, 1.0, 0.5, 0.2, 0.05]
+    s, x, g, mask = _equal_error_band(w)
+    s._last_dmd_fp_m_per_frame = torch.as_tensor(w)   # probe HAS run
+    assert s.dmd_fp_ratchet_enabled is False
+    log = {}
+    LOSS(s, x, g, mask, log)
+    assert s._last_dmd_fp_gate_w_mean == pytest.approx(sum(w) / len(w))
+    assert not [k for k in log if "ratchet" in k], log
+
+
+def test_ratchet_telemetry_is_stashed_on_the_model_for_the_step_line():
+    """dmd_log_dict is wandb-only. The trainer reads model attributes.
+
+    MUTATION: write the ratchet values only into `log_dict` -> red.
+    """
+    s = _ratchet(ema=0.0)
+    log = {}
+    _rstep(s, _flat(0.8), depth=0)
+    _rstep(s, _flat(0.4), depth=1, log=log)
+    _rstep(s, _flat(0.9), depth=2, log=log)
+    assert s._last_dmd_fp_ratchet_w_mean == pytest.approx(0.4)
+    assert s._last_dmd_fp_ratchet_latched == pytest.approx(1.0)
+    assert s._last_dmd_fp_ratchet_latch_depth == pytest.approx(1.0)
+    assert s._last_dmd_fp_ratchet_depth == pytest.approx(2.0)
+    for k in ("dmd_fp_ratchet_w_mean", "dmd_fp_ratchet_raw_w_mean",
+              "dmd_fp_ratchet_share", "dmd_fp_ratchet_latched",
+              "dmd_fp_ratchet_latch_depth", "dmd_fp_ratchet_depth",
+              "dmd_fp_ratchet_resets"):
+        assert k in log, k
+
+
+def test_ratchet_share_reports_the_retained_fraction_of_dmd():
+    """SHARE, not raw values -- standing campaign rule. `fp_rt_shr` is the
+    ratchet's OWN marginal effect (retained / un-ratcheted); `fp_share`
+    downstream is the absolute share of DMD that survives everything, and
+    it must already include the ratchet.
+
+    MUTATION (M9): `return w_raw` from `_dmd_fp_ratchet_apply` -> both
+    the ratchet share and the absolute fp_share report 0.9, red.
+    """
+    s = _ratchet(ema=0.0)
+    _rstep(s, _flat(0.3), depth=0)
+    log, _, _ = _rstep(s, _flat(0.9), depth=1)
+    assert log["dmd_fp_ratchet_raw_w_mean"] == pytest.approx(0.9)
+    assert log["dmd_fp_ratchet_w_mean"] == pytest.approx(0.3)
+    assert log["dmd_fp_ratchet_share"] == pytest.approx(0.3 / 0.9)
+    # the ABSOLUTE share of DMD surviving the whole gate
+    assert log["dmd_fp_gate_share"] == pytest.approx(0.3)
+
+
+def test_ratchet_share_is_absent_not_forged_when_the_ramp_is_at_zero():
+    """"What fraction did the ratchet remove" is UNDEFINED when the
+    response curve itself is at zero. A 0.0 or 1.0 there would be a
+    forgeable number inside the metric's meaningful range.
+
+    MUTATION (M16): emit the share unconditionally (0/0 guard removed) ->
+    red."""
+    s = _ratchet(ema=0.0)
+    log, _, _ = _rstep(s, _flat(0.0), depth=0)
+    assert "dmd_fp_ratchet_share" not in log
+    assert log["dmd_fp_ratchet_raw_closed"] == pytest.approx(1.0)
+    assert s._last_dmd_fp_ratchet_share is None
+
+
+def test_no_forgeable_ratchet_zeros_before_anything_is_measured():
+    """MUTATIONS (M23, M24): publish the reset count unconditionally /
+    leave the EMA behind on reset -> red."""
+    s = _Stub()
+    INIT(s, _cfg())
+    for a in ("_last_dmd_fp_ratchet_w_mean", "_last_dmd_fp_ratchet_share",
+              "_last_dmd_fp_ratchet_latched",
+              "_last_dmd_fp_ratchet_latch_depth",
+              "_last_dmd_fp_ratchet_depth", "_last_dmd_fp_ratchet_resets",
+              "_dmd_fp_ratchet_w", "_dmd_fp_ratchet_m_ema"):
+        assert getattr(s, a) is None, f"{a} was pre-filled"
+
+
+# ---------------------------------------------------------------------------
+# the wiring nobody can see from inside the model
+# ---------------------------------------------------------------------------
+def _src(*parts):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return open(os.path.join(root, *parts)).read()
+
+
+def test_trainer_resets_the_ratchet_at_the_RIDE_BOUNDARY():
+    """Hooked to the ride-setup line, NOT to a step counter. This is the
+    anti-latch-forever wiring and it is invisible from the model side.
+
+    MUTATION: delete the `reset_dmd_fp_ratchet` call from the trainer ->
+    red (and the run would latch shut after its first ride).
+    """
+    txt = _src("trainer", "causal_action_forcing_train.py")
+    marker = "self._chunks_in_current_ride = 0"
+    assert marker in txt
+    i = txt.index(marker)
+    window = txt[i:i + 1500]
+    assert "self.model.reset_dmd_fp_ratchet(" in window, (
+        "the ratchet reset is not adjacent to the ride-boundary line")
+    # exactly one reset call site -- two would mean one of them is
+    # keyed on something that is not a ride
+    assert txt.count("reset_dmd_fp_ratchet(") == 1
+
+
+def test_model_feeds_ride_depth_to_the_ratchet_before_any_early_return():
+    """The depth backstop has to see EVERY roll, including the ones the
+    only_first / only_last gates skip -- otherwise a skipped roll can
+    carry a stale depth across a ride boundary.
+
+    MUTATION: move the `_dmd_fp_ratchet_observe_depth` call below the
+    `only_first` early return -> red.
+    """
+    txt = _src("model", "dmd_action_forcing.py")
+    i = txt.index("def compute_generator_loss_streaming")
+    body = txt[i:i + 6000]
+    assert "self._dmd_fp_ratchet_observe_depth(chunks_in_ride)" in body
+    assert (body.index("self._dmd_fp_ratchet_observe_depth(chunks_in_ride)")
+            < body.index("dmd_skipped_non_first_chunk_of_ride"))
+
+
+def test_trainer_step_line_reads_the_ratchet_attributes():
+    """MUTATION (M20): delete the fp_rt_* rows from the trainer's getattr
+    tuple -> red. A stashed attribute nobody reads is the same silent
+    failure one level along."""
+    txt = _src("trainer", "causal_action_forcing_train.py")
+    for a in ("_last_dmd_fp_ratchet_w_mean", "_last_dmd_fp_ratchet_share",
+              "_last_dmd_fp_ratchet_latched",
+              "_last_dmd_fp_ratchet_latch_depth",
+              "_last_dmd_fp_ratchet_resets"):
+        assert a in txt, f"{a} never read by the trainer step line"
+
+
+def test_yaml_declares_the_ratchet_keys():
+    """MUTATIONS (M28, M30): ship `dmd_fp_ratchet_ema: 0.9`, or ship
+    `dmd_fp_ratchet_enabled: true` -> red. A flag with no yaml key is
+    un-settable; a yaml key shipped pre-filled is the guessed default
+    coming back in through the config instead of through the code."""
+    import re
+    txt = _src("configs", "action_forcing_phase3_dmd.yaml")
+    assert re.search(r"^dmd_fp_ratchet_enabled: *false", txt, re.M)
+    for k in RATCHET_KEYS:
+        assert re.search(rf"^{k}: *null", txt, re.M), (
+            f"{k} must ship as null -- it is a MEASURED value")

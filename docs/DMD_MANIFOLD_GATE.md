@@ -199,6 +199,84 @@ an instrumentation change plus one short run, not a standalone probe.
       `logs/dmd_gate_trace_h6109490_155407.jsonl`, wiring verified in the
       run's own resolved config)
 - [ ] Gate armed against the measured threshold
+- [x] Depth study run on the SUPERSEDING fingerprint probe. Verdict
+      `PROBE CANNOT RANK OFF-MANIFOLD DISTANCE -- GATE NOT VIABLE`,
+      0/8 arms — see §6b for the two-basin reading and why a gate that is
+      a pure function of the current score is ill-posed
+- [x] Stateful ratchet landed on the fingerprint gate (default-off,
+      byte-identical). `docs/DMD_FINGERPRINT_PROBE.md` §3.3
+
+## 6b. THE DEPTH STUDY VERDICT, AND THE TWO-BASIN READING
+
+**2026-08-24.** `analysis/dmd_fp_depth_study.py` returned
+
+```
+PROBE CANNOT RANK OFF-MANIFOLD DISTANCE -- GATE NOT VIABLE
+```
+
+**0 of 8 arms**, consistent across `t = 250 / 500 / 750`. Recorded as
+printed. Not overwritten, not spun.
+
+The verdict indicts the **criterion**, not the probe. The criterion was
+**monotonicity** — "does `s` fall as the sample gets further off-manifold"
+— and the measured geometry is **U-shaped**, which is the expected shape
+once §1's thesis is taken seriously in both directions:
+
+* near depth 0 the sample is near the **DATA manifold**, the teacher's
+  field is locally restoring, `s` is high;
+* at large depth the sample has been captured by the **MODEL'S OWN
+  ATTRACTOR** — the degenerate fixed point §1 predicts — where the field
+  is **also** locally restoring, so `s` is high **again**;
+* the trough between them is the transition. **Measured: trough at depth
+  16 in 11 of 12 (arm, timestep) series.**
+
+DMD points toward its nearest attractor. Near the manifold that
+attractor *is* the manifold; far away it is the model's own fixed point,
+and `s` alone cannot distinguish them. The numbers confirm it:
+
+```
+deepest s minus depth-0 s, over 12 (arm, t) series:
+    mean +0.0244, sd 0.0709, 9/12 POSITIVE
+    = 1.78x the MEAN seed-noise floor (0.0137)
+      but only 0.72x the WORST floor  (0.0338)
+```
+
+Below the worst seed floor: depth 0 and depth 32 are **statistically
+indistinguishable** by `s`, and where they *do* differ the **DEEP** end
+scores **HIGHER**.
+
+**`s` and `m` are non-injective in depth**, so **any gate that is a pure
+function of the current `m` is ill-posed** — the same reading means
+opposite things. This applies to the `e`-keyed gate in this document too,
+for the same structural reason and independently of §8's separate
+falsification of `e`: a scalar read of "how far is the teacher from this
+sample" has the same two-basin ambiguity.
+
+**What the probe measures is "near SOME attractor"** — strictly weaker
+than "near the DATA manifold", which is what §1's thesis needs. The claim
+is narrowed here rather than defended.
+
+**The ratchet is what converts the weaker signal into a usable gate.** It
+adds the one fact the probe lacks and the trainer has — TIME ORDER, since
+a ride *starts* on the manifold:
+
+```
+    w_t = min( w_{t-1}, f(ema(m)_t) )      reset at RIDE start
+```
+
+Full treatment, telemetry, reset semantics and the latch-forever hazard:
+`docs/DMD_FINGERPRINT_PROBE.md` §3.3. The short version: the `min`
+(diode) means the far branch's rising `m` can never re-open the gate, so
+no threshold has to know where the trough is; the EMA (capacitor) closes
+it progressively; and the reset is hooked to the trainer's ride boundary,
+counted on the step line, and backstopped by a loud in-model reset,
+because a running minimum that never resets silently zeroes DMD for the
+rest of training.
+
+This does **not** rehabilitate the verdict. The gate remains not viable
+as a pure function of `m`. The ratchet is a different object — a gate on
+`m`'s history within a ride — and it is only as sound as the assumption
+that the ride began on the manifold.
 
 ## 7. Telemetry bug found while building this (worth generalising)
 

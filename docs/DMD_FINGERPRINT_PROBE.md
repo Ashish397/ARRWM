@@ -217,6 +217,183 @@ so an unavailable diagnostic is an *absent key*, never a forgeable `0.0`
 `dmd_fp_gate_w_age` (wandb) counts DMD calls since the last probe, so a
 gate attenuating on frozen weights is visible.
 
+### 3.3 THE DEPTH STUDY RESULT — two basins, and why a pure function of `m` is ill-posed
+
+**The verdict, unaltered.** `analysis/dmd_fp_depth_study.py` returned
+
+```
+PROBE CANNOT RANK OFF-MANIFOLD DISTANCE -- GATE NOT VIABLE
+```
+
+**0 of 8 arms**, consistent across `t = 250 / 500 / 750`. That verdict
+stands and is not being reinterpreted, softened, or overwritten. It is
+recorded here exactly as the study printed it.
+
+What it is a verdict *about* matters, though. The study's criterion was
+**monotonicity**: it asked whether `s` (and therefore `m`) *falls* as the
+sample is pushed further off-manifold, i.e. whether `m` can RANK
+off-manifold distance. The measured geometry does not satisfy that
+criterion, and there is a reason it does not.
+
+#### The measured curve is U-shaped
+
+| | |
+|---|---|
+| shape of `s` vs depth | **U-shaped** |
+| trough location | **depth 16**, in **11 of 12** (arm, timestep) series |
+
+Two basins, and the probe's mechanism is locally identical in both:
+
+* **Near depth 0** the sample is near the **DATA manifold**. The
+  teacher's field is locally restoring there, so a structured
+  displacement gets pushed back and `s` is high.
+* **At large depth** the sample has been captured by the **MODEL'S OWN
+  ATTRACTOR** — its degenerate fixed point. The field is *also* locally
+  restoring there, so a structured displacement gets pushed back again
+  and `s` is high **again**.
+* The **trough between them is the transition**, where the sample is
+  near neither.
+
+DMD points toward its nearest attractor. Near the manifold that
+attractor **is** the manifold; far away it is the model's own fixed
+point. **The probe cannot tell those two apart from `s` alone.**
+
+#### The two ends are not separable, and the deep end scores HIGHER
+
+```
+deepest s minus depth-0 s, over 12 (arm, t) series:
+    mean  = +0.0244      sd 0.0709      9/12 POSITIVE
+    = 1.78x the MEAN seed-noise floor  (0.0137)
+      but only 0.72x the WORST floor   (0.0338)
+```
+
+Below the worst-case seed floor, so depth 0 and depth 32 are
+**statistically indistinguishable** by `s` — and in the direction they do
+differ, the **DEEP** end scores **higher**.
+
+#### Consequence: `s` and `m` are NON-INJECTIVE in depth
+
+The same reading means opposite things. Therefore **any gate that is a
+pure function of the current `m` is ill-posed** — not badly tuned, not
+under-calibrated, *ill-posed*. No choice of `m_lo` / `m_hi` / exponent
+fixes a mapping whose input does not determine its answer.
+
+#### What the probe actually measures
+
+`m` measures **"near SOME attractor"**. That is strictly **weaker** than
+**"near the DATA manifold"**, which is what the gate needs and what §2
+implicitly claimed. The claim is hereby narrowed, not defended.
+
+#### The ratchet is what converts the weaker signal into a usable gate
+
+The one fact the probe does not have and the trainer does is **TIME
+ORDER**: a ride *starts* on the manifold and drifts away from it. Adding
+that turns a non-injective instantaneous reading into a usable one.
+
+```
+    w_t = min( w_{t-1}, f(ema(m)_t) )        reset at RIDE start
+```
+
+* **DIODE** (`min`). The weight never increases within a ride, so the far
+  (attractor) branch's rising `m` can **never re-open** the gate. The far
+  side becomes automatically "no" **without any threshold needing to know
+  where the trough is** — there is deliberately no trough-location
+  constant anywhere in the implementation.
+* **CAPACITOR** (`dmd_fp_ratchet_ema`). An EMA on `m` **before** the
+  `m_lo`/`m_hi`/exponent/`min_weight` ramp, so the gate closes
+  progressively instead of snapping shut on one noisy probe. On `m` and
+  not on `w` because the ramp is nonlinear and clamped at both ends: an
+  EMA applied after the clamp cannot recover what the clamp destroyed.
+* **ELEMENTWISE.** The running minimum is a `[F]` vector and the `min` is
+  taken frame by frame against the same frame index, so the per-frame
+  path is preserved exactly — the align cliff lives inside a single band
+  and a scalar ratchet would average it away. Frame *index* is the
+  carrier of identity across calls, not the underlying content (which
+  shifts by the rollout stride each roll) — the same convention the
+  per-frame weights already use.
+
+**This does not rehabilitate the study's verdict.** The gate is still not
+viable *as a pure function of `m`*. The ratchet is a different object: it
+is a gate on `m`'s **history within a ride**, and it is viable only to
+the extent that "the ride began on the manifold" is true.
+
+#### RESET — the dangerous direction
+
+A running minimum that never resets **latches shut and silently zeroes
+DMD for the rest of training**. That is the failure mode of this design,
+so the reset is:
+
+* **explicit** — `reset_dmd_fp_ratchet()`, called by the trainer at the
+  one line that means "new ride" (`self._chunks_in_current_ride = 0` in
+  `_streaming_step`), **not** keyed on a step counter;
+* **unconditional** — it runs whether or not the ratchet is armed, so
+  default-off runs exercise the call site;
+* **counted** — `fp_rt_rst` on the step line. If rides turn over and that
+  number stops moving, the ratchet is latching;
+* **backstopped** — `_dmd_fp_ratchet_observe_depth` resets **loudly** on
+  stderr if ride depth ever goes *backwards* without the explicit reset.
+  The test is a **strict** decrease: several DMD calls can share one
+  depth, and a `<=` test would reset on every repeat and silently defeat
+  the diode — the same class of bug in the opposite direction.
+
+A mid-ride **shape change raises** rather than resetting: a reset there
+would re-open the gate on the deep end, which is exactly what the diode
+exists to prevent.
+
+#### Ratchet telemetry (step line)
+
+| key | meaning |
+|---|---|
+| `fp_rt_w` | mean running-minimum weight in force |
+| `fp_rt_shr` | **SHARE** of the un-ratcheted gate weight retained — the ratchet's own marginal effect (`fp_share` remains the absolute share of DMD surviving everything, and now includes the ratchet) |
+| `fp_rt_lat` | 1.0 once the diode has **BLOCKED a rise** this ride |
+| `fp_rt_d` | ride depth at which the running minimum **last decreased** |
+| `fp_rt_rst` | ride resets the hook has seen |
+
+`fp_rt_d` is the **empirical cross-check on the trough**. Training-time
+depth is known exactly (`_chunks_in_current_ride`), and on a U-shaped `m`
+the running minimum stops decreasing *at the trough*. If `fp_rt_d`
+settles near ~16 that independently corroborates the offline study's
+depth-16 measurement from a completely different code path. **Caveat
+worth stating up front:** the ratchet resets per ride, so it can only
+observe depths the ride actually reaches — `max_rolls_per_ride` well
+below 16 means `fp_rt_d` will sit at the ride's own cap and corroborates
+nothing.
+
+#### Standing hazards when arming the ratchet
+
+Recorded rather than silently handled:
+
+1. **The EMA's time base is the DMD call, not the probe.** With
+   `dmd_fp_every > 1` the probe's `m` is stale between refreshes and the
+   capacitor charges toward the same stale reading on every intervening
+   call — effective smoothing is *weaker* than the knob reads, and the
+   diode takes several redundant minima of one measurement. Deliberately
+   not special-cased (that would make one knob's meaning depend on
+   another's). Run the ratchet at `dmd_fp_every: 1`, and watch
+   `dmd_fp_gate_w_age` if you do not.
+2. **`dmd_fp_gate_min_weight = 0` + one bad probe = DMD off for the whole
+   ride.** A single reading at or below `m_lo` pins the running minimum
+   at zero and the diode never lets it back up. That is the design
+   working as specified, but the probe's seed-noise floor is 0.0137 mean
+   / 0.0338 worst, so *one noisy draw* can do it. The capacitor is the
+   intended defence; a nonzero `min_weight` is the belt-and-braces one.
+   Not enforced in code — `min_weight` is a measured Class-B value and
+   the ratchet must not overrule a measurement — but it is the first
+   thing to check if `fp_share` collapses.
+3. **Per-rank state under DDP.** The ratchet is derived from the
+   per-rank probe and holds per-rank state, so ranks can carry different
+   weights. That was already true of the un-ratcheted per-frame gate and
+   the ratchet adds no collectives, so there is no new hang surface — but
+   the DMD term is then a cross-rank average over *differently* weighted
+   local terms, which is worth knowing before reading `fp_share` as a
+   global quantity.
+
+Class-B discipline applies: `dmd_fp_ratchet_ema` ships `null` and arming
+`dmd_fp_ratchet_enabled` without it raises, naming it. Arming the ratchet
+with `dmd_fp_gate_enabled=false` also raises — it wraps that gate's
+weight, so with the gate off it would be silently inert.
+
 ## 4. Cost
 
 One extra teacher forward per probed sample per noise draw. Gated by
@@ -239,10 +416,35 @@ scope, so calibration costs no extra data plumbing.
       after four simultaneous defects — see §6. Tests:
       `testing/test_dmd_fp_gate.py`, one per defect, each verified red
       against that defect restored.
+- [x] **Depth study RUN. Verdict: `PROBE CANNOT RANK OFF-MANIFOLD
+      DISTANCE -- GATE NOT VIABLE`, 0/8 arms, t=250/500/750.** Recorded
+      as printed; see §3.3. The criterion was MONOTONICITY and the
+      measured geometry is U-shaped (trough at depth 16, 11/12 series),
+      with the two ends statistically indistinguishable (deepest minus
+      depth-0: mean +0.0244, 9/12 positive, 0.72x the WORST seed floor)
+      and the deep end scoring HIGHER where they differ. `m` is
+      NON-INJECTIVE in depth, so a gate that is a pure function of `m`
+      is ill-posed.
+- [x] Ratchet ("capacitor-diode") landed — the stateful per-ride
+      `w_t = min(w_{t-1}, f(ema(m)_t))` that converts the weaker
+      "near SOME attractor" signal into a usable gate by adding TIME
+      ORDER (§3.3). Default-off, byte-identical; `dmd_fp_ratchet_ema`
+      ships `null` and arming without it raises. Tests:
+      `testing/test_dmd_fp_gate.py`, each verified red under a targeted
+      mutation.
 - [ ] **Correlation against the measured `align` cliff — the arming
       gate.** Still the precondition. If `m` does not track the cliff,
-      it is not measuring what it claims and must not be armed.
+      it is not measuring what it claims and must not be armed. NOTE
+      this is now a weaker precondition than it reads: §3.3 shows `m`
+      answers "near SOME attractor", so tracking the cliff is necessary
+      and not sufficient.
 - [ ] Fill the six Class-B values from `analysis/dmd_fp_depth_study.py`
+- [ ] Measure `dmd_fp_ratchet_ema` against the probe's seed-noise floor
+      (mean 0.0137 / worst 0.0338) — it is the only ratchet knob and it
+      ships `null`
+- [ ] **Confirm rides are deep enough to reach the trough.** The ratchet
+      resets per ride; if `max_rolls_per_ride` << 16 it can never observe
+      the far basin and the diode has nothing to block.
 
 ## 6. Known-defect history — the in-training denoise hook
 

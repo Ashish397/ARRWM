@@ -786,10 +786,27 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # TODO: Tune the number of blocks for feature extraction
         final_x = None
+        # Discriminator tap layers. Historically hard-coded to
+        # ``[7, 13, 21, 29]`` HERE as well as in
+        # ``WanDiffusionWrapper.adding_cls_branch``, so a caller that
+        # changed the head's register count got a silent index error (or,
+        # worse, a silently truncated tap set) rather than a different
+        # tap schedule. ``adding_cls_branch`` now writes the resolved list
+        # onto the model as ``_gan_feature_layers``; absent that attribute
+        # this falls back to the historical list, so every pre-existing
+        # caller is byte-identical.
+        _gan_taps = getattr(self, "_gan_feature_layers", None) or [7, 13, 21, 29]
         if classify_mode:
             assert register_tokens is not None
             assert gan_ca_blocks is not None
             assert cls_pred_branch is not None
+            if len(gan_ca_blocks) != len(_gan_taps):
+                raise RuntimeError(
+                    f"classify_mode: {len(gan_ca_blocks)} cross-attn block "
+                    f"stacks but {len(_gan_taps)} tap layers {_gan_taps}. "
+                    "One register token is paired with one tap IN ORDER; a "
+                    "mismatch would silently drop or mispair taps."
+                )
 
             final_x = []
             registers = repeat(register_tokens(), "n d -> b n d", b=x.shape[0])
@@ -822,7 +839,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 # everything the caller wants.
                 return x
 
-            if classify_mode and ii in [7, 13, 21, 29]:
+            if classify_mode and ii in _gan_taps:
                 gan_token = registers[:, gan_idx: gan_idx + 1]
                 # Apply multiple GanAttentionBlocks sequentially for progressive feature refinement
                 token_features = gan_token

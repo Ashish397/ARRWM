@@ -365,6 +365,95 @@ def _patch_bidirectional_self_attn_for_action(attn) -> None:
     attn._action_attn_patched = True
 
 
+# The shared per-forward self-attn state, with the "not set" sentinel each
+# field falls back to. These are exactly the defaults ``forward_with_action``
+# itself uses when it reads them, so save/restore round-trips a module that
+# never had them set.
+_TF_ATTN_STATE_DEFAULTS = (
+    ("action_tokens_per_frame", 0),
+    ("tf_rope_offset", 0),
+    ("tf_num_clean_frames", None),
+    ("tf_num_noisy_frames", None),
+)
+
+
+def tf_state_checkpoint_forward(
+    module,
+    *,
+    action_tokens_per_frame,
+    tf_rope_offset,
+    tf_num_clean_frames,
+    tf_num_noisy_frames,
+):
+    """A ``custom_forward`` for ``torch.utils.checkpoint`` that carries its
+    OWN teacher-forcing state.
+
+    WHY THIS EXISTS — the checkpoint-replay corruption class.
+
+    The bidirectional forwards publish their per-forward TF state onto
+    SHARED module attributes (``block.self_attn.tf_rope_offset`` and
+    friends) before the block loop, and
+    ``_patch_bidirectional_self_attn_for_action``'s ``forward_with_action``
+    reads them with ``getattr`` AT CALL TIME. Under
+    ``torch.utils.checkpoint(use_reentrant=False)`` a block is called a
+    SECOND time — at backward, to recompute its activations — and reads
+    whatever those attributes hold *then*, not what they held on the way
+    in.
+
+    That is a live corruption whenever two forwards through the SAME model
+    straddle one backward with different TF state. The One-Forcing critic
+    step is exactly that shape:
+
+      (a) the denoising forward runs WITH ``clean_x``   -> tf_rope_offset=npb
+      (b) the disc ``classify_mode`` forward runs WITHOUT it -> 0
+      (c) one ``critic_loss.backward()`` replays (a)'s checkpointed
+          blocks, which now read (b)'s values.
+
+    The two branches of ``forward_with_action`` save DIFFERENT NUMBERS of
+    tensors (``tf_off > 0`` runs 4x ``rope_apply`` + 4x
+    ``_merge_action_tokens`` + 2x ``cat``; ``tf_off == 0`` runs 2x each),
+    so the replay dies with "A different number of tensors was saved
+    during the original forward and recomputation" — or, worse, silently
+    RoPEs the recomputed activations at the wrong positions when the
+    counts happen to line up.
+
+    Restoring the attributes after (b) does NOT fix it: both replays
+    happen after both forwards, so any single global value is wrong for
+    one of them. The state has to travel with the closure, which is what
+    this does. Each closure re-asserts ITS OWN captured state before
+    calling the block and puts back whatever it found afterwards, so the
+    two forwards' replays each see their own state and nothing else on the
+    model observes a change.
+
+    On the ORIGINAL forward the captured values are already the live ones
+    (the caller's loop just wrote them), so this is an exact no-op: no
+    arithmetic changes and no RNG is drawn. The non-checkpointed branch
+    (``gradient_checkpointing`` off, or ``no_grad``) never goes through
+    here and is untouched.
+    """
+    tf_state = (
+        action_tokens_per_frame,
+        tf_rope_offset,
+        tf_num_clean_frames,
+        tf_num_noisy_frames,
+    )
+
+    def custom_forward(*inputs, **kw):
+        attn = module.self_attn
+        prev = [
+            getattr(attn, f, dflt) for f, dflt in _TF_ATTN_STATE_DEFAULTS
+        ]
+        for (f, _d), v in zip(_TF_ATTN_STATE_DEFAULTS, tf_state):
+            setattr(attn, f, v)
+        try:
+            return module(*inputs, **kw)
+        finally:
+            for (f, _d), v in zip(_TF_ATTN_STATE_DEFAULTS, prev):
+                setattr(attn, f, v)
+
+    return custom_forward
+
+
 def _bidir_forward_with_action_tokens(
     self,
     x,
@@ -379,6 +468,11 @@ def _bidir_forward_with_action_tokens(
     action_tokens_clean=None,
     state_tokens=None,
     state_tokens_clean=None,
+    classify_mode=False,
+    register_tokens=None,
+    cls_pred_branch=None,
+    gan_ca_blocks=None,
+    concat_time_embeddings=False,
 ):
     """Replacement ``_forward`` body for the bidirectional WanModel that
     interleaves Stream-B action tokens per frame before the transformer
@@ -404,10 +498,31 @@ def _bidir_forward_with_action_tokens(
     special block_mask machinery needed (cf. CausalWanModel which DOES
     need the TF block_mask + rope_offset).
 
-    classify_mode / regress_mode are intentionally unsupported here —
-    those code paths power the GAN critic heads and Phase-1 rolling-
-    staircase DMD has the GAN disabled. If re-enabled they need their
-    own action-token handling.
+    ``classify_mode`` (ONE-FORCING / Option D, ``docs/ONE_FORCING_PORT.md``)
+    taps the register-token discriminator head off this same forward. It
+    was previously refused here — the refusal was correct while nothing
+    had done the action-token work, because the upstream classify path in
+    ``wan/modules/model.py`` builds the sequence WITHOUT Stream B and would
+    have fed the DiT 1560 tokens/frame where its weights expect 1561.
+
+    Three properties of the implementation below matter and are not
+    visible from the code:
+      * The disc reads the SAME interleaved, action-conditioned sequence
+        the critic's denoising forward reads. An action-blind disc would
+        be scoring "is this a plausible video" instead of "is this a
+        plausible video GIVEN these actions", which is the whole reason
+        the critic backbone is the host.
+      * Taps run on ``x`` AFTER the block, i.e. on the full sequence
+        including the per-frame action/state tokens and the (zero) tail
+        padding. That is deliberate: the tap is a learned cross-attention
+        POOL over tokens, not a per-frame readout, so a fixed slice would
+        only throw information away.
+      * ``clean_x`` (teacher forcing) is REFUSED in classify mode. The
+        disc's two members must differ only in their latent content; a
+        clean half would either be shared (wasted compute) or member-
+        specific (a leak). One-Forcing has no TF half at all.
+
+    ``regress_mode`` remains unsupported here and still raises upstream.
     """
     if self.model_type == "i2v":
         assert clip_fea is not None and y is not None
@@ -431,6 +546,20 @@ def _bidir_forward_with_action_tokens(
             "action_tokens=None; Stream B is advertised by "
             "action_tokens_per_frame > 0 but no tokens were provided."
         )
+    if classify_mode:
+        if clean_x is not None:
+            raise RuntimeError(
+                "classify_mode does not accept clean_x (teacher forcing). "
+                "The One-Forcing discriminator scores the noised window "
+                "alone; see the docstring."
+            )
+        if register_tokens is None or cls_pred_branch is None \
+                or gan_ca_blocks is None:
+            raise RuntimeError(
+                "classify_mode requires register_tokens / cls_pred_branch / "
+                "gan_ca_blocks; call adding_cls_branch(...) on the wrapper "
+                "first."
+            )
     if s_per_f > 0 and state_tokens is None:
         raise RuntimeError(
             "_bidir_forward_with_action_tokens called with "
@@ -707,13 +836,45 @@ def _bidir_forward_with_action_tokens(
         context_lens=context_lens,
     )
 
+    # TF state travels WITH the checkpointed closure — see
+    # ``tf_state_checkpoint_forward``.
     def create_custom_forward(module):
-        def custom_forward(*inputs, **kw):
-            return module(*inputs, **kw)
+        return tf_state_checkpoint_forward(
+            module,
+            action_tokens_per_frame=a_per_f,
+            tf_rope_offset=tf_rope_offset,
+            tf_num_clean_frames=(
+                num_clean_frames if clean_x is not None else None
+            ),
+            tf_num_noisy_frames=(
+                num_frames_local if clean_x is not None else None
+            ),
+        )
 
-        return custom_forward
+    # ONE-FORCING discriminator taps. ``_gan_feature_layers`` is written
+    # onto the model by ``WanDiffusionWrapper.adding_cls_branch``; the
+    # fallback keeps parity with the upstream classify path in
+    # ``wan/modules/model.py`` for any caller that never set it.
+    gan_taps = getattr(self, "_gan_feature_layers", None) or [7, 13, 21, 29]
+    gan_features = None
+    if classify_mode:
+        if len(gan_ca_blocks) != len(gan_taps):
+            raise RuntimeError(
+                f"classify_mode: {len(gan_ca_blocks)} cross-attn block "
+                f"stacks but {len(gan_taps)} tap layers {gan_taps}. One "
+                "register token is paired with one tap IN ORDER."
+            )
+        if max(gan_taps) >= len(self.blocks):
+            raise RuntimeError(
+                f"gan_feature_layers {gan_taps} taps past the last block "
+                f"index {len(self.blocks) - 1}."
+            )
+        gan_features = []
+        gan_registers = register_tokens().unsqueeze(0).expand(
+            x.shape[0], -1, -1,
+        )
 
-    for block in self.blocks:
+    for _blk_idx, block in enumerate(self.blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             x = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(block),
@@ -723,6 +884,13 @@ def _bidir_forward_with_action_tokens(
             )
         else:
             x = block(x, **block_kwargs)
+
+        if classify_mode and _blk_idx in gan_taps:
+            _tap_idx = gan_taps.index(_blk_idx)
+            token_features = gan_registers[:, _tap_idx: _tap_idx + 1]
+            for ca_block in gan_ca_blocks[_tap_idx]:
+                token_features = ca_block(x, token_features)
+            gan_features.append(token_features)
 
     # Teacher-forcing: keep only the noisy half (the second half of the
     # joint sequence). The clean half is the first F*frame_seqlen tokens.
@@ -756,6 +924,24 @@ def _bidir_forward_with_action_tokens(
     x_framed = x_framed * (1 + mod_scale) + mod_shift
     x = head_lin(x_framed.flatten(1, 2))
     x = self.unpatchify(x, grid_sizes)
+    if classify_mode:
+        if concat_time_embeddings:
+            # Upstream's variant appends ``10 * e[:, None, :]`` with ``e``
+            # shaped [B, C] (one t per sample). Our ``e`` is [B*F, C]
+            # because the action-forcing scorers pass a PER-FRAME t, so
+            # the concat would silently broadcast a B*F-row vector against
+            # a B-row head input. Refuse rather than produce a head that
+            # trains on a mis-shaped feature.
+            raise RuntimeError(
+                "concat_time_embeddings=True is not supported on the "
+                "action-token classify path (per-frame time embedding is "
+                "[B*F, C], not [B, C]). Leave it False."
+            )
+        gan_features = torch.cat(gan_features, dim=1)
+        logits = cls_pred_branch(
+            gan_features.view(gan_features.shape[0], -1)
+        )
+        return torch.stack(x), logits
     return torch.stack(x)
 
 
@@ -1117,7 +1303,15 @@ def _bidir_cached_forward_via_causal_twin(
 # drop and now raises — that swallow is exactly what hid the missing KV
 # cache through the whole AR-head bring-up.
 _STREAM_B_CONSUMED_KWARGS = frozenset(
-    {"clip_fea", "y", "classify_mode", "regress_mode"}
+    {
+        "clip_fea", "y", "classify_mode", "regress_mode",
+        # One-Forcing discriminator head (Option D). These are genuinely
+        # consumed by ``_bidir_forward_with_action_tokens`` now; listing
+        # them here is what stops the no-silent-swallow guard below from
+        # rejecting the disc forward.
+        "register_tokens", "cls_pred_branch", "gan_ca_blocks",
+        "concat_time_embeddings",
+    }
 )
 # Cache kwargs are consumed by the causal-view dispatch instead.
 _CACHE_KWARGS = ("kv_cache", "crossattn_cache", "current_start", "cache_start")
@@ -1251,14 +1445,17 @@ def patch_bidirectional_wan_model_for_action(model):
                     y=kwargs.get("y"),
                 )
             if a_per_f > 0 and action_tokens is not None:
-                # classify_mode / regress_mode don't support Stream B yet.
-                if kwargs.get("classify_mode", False) or kwargs.get(
-                    "regress_mode", False
-                ):
+                # ``classify_mode`` IS supported alongside Stream B as of
+                # the One-Forcing port (Option D) — the taps run on the
+                # interleaved, action-conditioned sequence inside
+                # ``_bidir_forward_with_action_tokens``. ``regress_mode``
+                # still is not: nothing has done its action-token work, and
+                # falling through would build a 1560-token/frame sequence
+                # for weights trained at 1561.
+                if kwargs.get("regress_mode", False):
                     raise RuntimeError(
-                        "classify_mode / regress_mode are not supported "
-                        "alongside Stream B. Disable GAN or drop Stream B "
-                        "for the critic head forward."
+                        "regress_mode is not supported alongside Stream B. "
+                        "Drop Stream B for the regression head forward."
                     )
                 # NO SILENT SWALLOW. Historically every unrecognised
                 # kwarg fell into ``**kwargs`` here and was dropped
@@ -1297,6 +1494,13 @@ def patch_bidirectional_wan_model_for_action(model):
                     action_tokens_clean=action_tokens_clean,
                     state_tokens=state_tokens,
                     state_tokens_clean=state_tokens_clean,
+                    classify_mode=bool(kwargs.get("classify_mode", False)),
+                    register_tokens=kwargs.get("register_tokens"),
+                    cls_pred_branch=kwargs.get("cls_pred_branch"),
+                    gan_ca_blocks=kwargs.get("gan_ca_blocks"),
+                    concat_time_embeddings=bool(
+                        kwargs.get("concat_time_embeddings", False)
+                    ),
                 )
             return orig_fwd(x, t, context, seq_len, *args, **kwargs)
         finally:
@@ -1542,10 +1746,22 @@ def _tf_only_forward_for_bidir_wan(
         context_lens=context_lens,
     )
 
+    # Same capture-the-TF-state-in-the-closure discipline as
+    # ``_bidir_forward_with_action_tokens`` — see
+    # ``tf_state_checkpoint_forward``. The loop above writes only the
+    # first two fields; the other two are captured AS-FOUND (this path
+    # serves the foreign TF-only teacher, which never sets them) so this
+    # stays an exact no-op on the original forward.
     def _create_custom_forward(module):
-        def _fwd(*inputs, **kw):
-            return module(*inputs, **kw)
-        return _fwd
+        return tf_state_checkpoint_forward(
+            module,
+            action_tokens_per_frame=0,
+            tf_rope_offset=num_frames_local,
+            tf_num_clean_frames=getattr(
+                module.self_attn, "tf_num_clean_frames", None),
+            tf_num_noisy_frames=getattr(
+                module.self_attn, "tf_num_noisy_frames", None),
+        )
 
     x_joint_ = x_joint
     for block in self.blocks:

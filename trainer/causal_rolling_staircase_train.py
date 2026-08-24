@@ -1740,6 +1740,21 @@ class RollingStaircaseDMDTrainer:
         if self.is_main_process:
             logging.info("Auto-resuming from %s", path)
         state = torch.load(path, map_location="cpu")
+        # WHAT THIS RESUME RESTORED, published for subclasses.
+        #
+        # ``ActionForcingDMDTrainer._of_verify_disc_resume`` needs to know
+        # which ``fake_score`` tensors the checkpoint carried, and used to
+        # answer that with a SECOND ``torch.load`` of this same file — on
+        # every rank, of a ~25GB checkpoint, 4 ranks to a node, purely to
+        # read a key list. These two attributes are that key list.
+        #   ``None``  = the fake_score restore was not attempted on this
+        #               path (critic updates off, or resume_load_fake_score
+        #               false) — "unknown", not "empty".
+        #   ``set()`` = attempted, but the checkpoint had no fake_score.
+        # Set BEFORE any load below so an exception mid-resume cannot
+        # leave a stale value from a previous call.
+        self._resume_ckpt_path = path
+        self._resume_fake_score_keys: Optional[set] = None
         # When ``strict_resume_load`` is set, raise on any missing or
         # unexpected key in the resumed generator / action_projection /
         # action_token_projection / fake_score loads. Default False to
@@ -1834,6 +1849,7 @@ class RollingStaircaseDMDTrainer:
                 else self.model.fake_score.model
             )
             fake_sd = state.get("fake_score")
+            self._resume_fake_score_keys = set(fake_sd or {})
             if fake_sd is not None:
                 f_missing, f_unexpected = fake_module.load_state_dict(
                     fake_sd, strict=False
@@ -1860,8 +1876,31 @@ class RollingStaircaseDMDTrainer:
                     try:
                         self.fake_optimizer.load_state_dict(fake_opt_sd)
                     except Exception as e:
-                        logging.warning(
-                            "fake_optimizer state load failed: %s", e
+                        # LOUD, and it says what was actually lost.
+                        #
+                        # The commonest cause is a PARAM-GROUP SIZE
+                        # CHANGE: resuming a run whose critic gained
+                        # parameters since the checkpoint was written
+                        # (e.g. a One-Forcing discriminator head attached
+                        # to ``fake_score.model``) makes
+                        # ``load_state_dict`` raise "loaded state dict
+                        # contains a parameter group that doesn't match".
+                        # The swallow then reset ALL critic momentum —
+                        # every Adam moment for the entire 1.3B backbone,
+                        # not just the new params — at WARNING level, in
+                        # the middle of a resume nobody rereads. A cold
+                        # critic optimizer after a requeue is a real
+                        # discontinuity in the DMD2 two-time-scale and it
+                        # must not be a line you can miss.
+                        logging.error(
+                            "resume: fake_optimizer state load FAILED (%s). "
+                            "ALL critic optimizer state (Adam moments, step "
+                            "counts) for the ENTIRE fake_score is now RESET, "
+                            "not just for any newly added parameters. If the "
+                            "critic gained parameters since this checkpoint "
+                            "(e.g. a discriminator head), that is expected "
+                            "and the reset is real; the run continues with a "
+                            "cold critic optimizer.", e,
                         )
                 elif self.is_main_process:
                     logging.warning(

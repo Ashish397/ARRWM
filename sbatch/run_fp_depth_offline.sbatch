@@ -54,12 +54,29 @@
 # one (perturb, scale, timestep) setting; the script REFUSES to pool them and
 # prints the applicable floor in its own PROBE SETTINGS block.
 #
-# ALIGNMENT TRAP, handled in code, not assumed: load_latent_chunk applies
-# _LATENT_HEAD_DROP internally while eval_causal_AR slices the raw zarr.
-# The study measures |rollout_k - GT(k+shift)| over the first 10 chunks and
-# REFUSES TO RUN unless shift 0 is the best match (verified 2026-08-24:
-# shift 0 wins over -3..+3 aggregated across all 26 arms; a single chunk
-# cannot resolve it, the aggregate can).
+# ALIGNMENT TRAP, settled IN CODE: load_latent_chunk slices
+# [start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP] while eval_causal_AR
+# slices the RAW zarr. Those two conventions are IDENTICAL iff
+# _LATENT_HEAD_DROP == 0, which it is (utils/zarr_dataset.py:76). So shift 0
+# is correct BY CONSTRUCTION, and the study asserts exactly that
+# (assert_head_drop_convention) on every arm.
+#
+# THE DATA STATISTIC CANNOT CONFIRM IT, and is no longer asked to. Measured
+# 2026-08-24 on the reference ride, first 10 chunks: GT SELF-difference is
+# ~0.198 at +-1, 0.233 at +-2, 0.27 at +-3, while |rollout - GT| at shift 0
+# is 0.32-0.46 -- larger than GT differs from itself at ANY shift in range.
+# The argmin therefore tracks each MODEL's temporal drift, not the indexing:
+# per-arm best shift over the 26 arms is {-3:3, -1:3, 0:4, +1:1, +2:14, +3:1}
+# (plurality +2), and in aggregate shift 0 (0.36221) beats +2 (0.36269) by
+# only 0.13%. Since every arm shares one zarr / latent_start_offset=100 /
+# ar_initial_chunks=3, alignment CANNOT legitimately differ per arm, so a
+# per-arm "argmin == 0" assertion was never supportable and is not made.
+# What remains is a GROSS-ERROR bound (--align-max-rel-excess, default 0.15):
+# shift 0 may not be worse than the best shift by more than that. 0.15 clears
+# the measured drift ceiling (strict03 prefers -3 by 8.9%, wave01 5.2%,
+# wave_ts 4.8%) and still catches a whole-chunk shift. The GT self-difference
+# profile prints beside the rollout profile on every run, with an explicit
+# DRIFT-DOMINATED line, so nobody re-reads the statistic as confirmation.
 #
 # THE long36 ARM IS REFERENCE-FREE BY CONSTRUCTION: those rollouts used
 # CONSTANT COMPASS ACTIONS (|z|=0.5), so the model was deliberately steered
@@ -108,6 +125,7 @@ export ARRWM_ACTION_ENCODER=pca_raw
 export TMPDIR=/tmp
 unset LOCALDIR APPTAINER_CACHEDIR
 export OMP_NUM_THREADS=8
+export PYTHONPATH=/scratch/u6ex/as1748.u6ex/ARRWM:${PYTHONPATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 test -f "$ODE_CKPT"

@@ -25,9 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analysis.dmd_fp_depth_study import (  # noqa: E402
     ARM_GT, ARM_ROLL, ARM_VARMATCH, apply_channel_gain, assert_gt_alignment,
-    auc_below, calibrate, discover_flowrec_arms, extrapolate_depth_for_auc,
+    assert_head_drop_convention, auc_below, calibrate, discover_flowrec_arms,
+    extrapolate_depth_for_auc,
     fingerprint, flowrec_committed, fp_draw, fp_perturb_from_draw,
-    frames_for_depth, gt_alignment_profile, linear_trend, load_latent_dumps,
+    frames_for_depth, gt_alignment_profile, gt_self_difference_profile,
+    linear_trend, load_latent_dumps,
     mean_sem, per_channel_std, plan_depths, print_flowrec_report,
     print_report, quantiles, rebin_depth, required_effect_size,
     seed_noise_floor, split_seed_tag, summarize, variance_gain,
@@ -954,16 +956,44 @@ def test_seed_noise_floor_is_measured_or_omitted_never_zero():
     assert fl["n_points"] == 1
 
 
-def test_gt_alignment_profile_and_hard_assert(tmp_path):
-    """A misaligned GT pairing must STOP the run, not skew it quietly.
+def test_head_drop_convention_is_the_real_guard(monkeypatch):
+    """The GT pairing convention is checked in CODE, not inferred from data.
 
-    ``load_latent_chunk`` applies ``_LATENT_HEAD_DROP`` while the AR eval
-    slices the raw zarr; the conventions agree only at 0. A silent
-    one-chunk shift would corrupt every drift number and the GT arm.
+    ``ZarrRideDataset.load_latent_chunk`` slices
+    ``[start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]`` while
+    ``utils/eval_causal_AR.py`` slices the RAW zarr. The two agree iff
+    ``_LATENT_HEAD_DROP == 0``, so this is an exact check with a definite
+    answer -- unlike the data profile, which is drift-dominated (see the
+    next test).
 
-    MUTATION (verified RED): make ``assert_gt_alignment`` warn instead of
-    raising -- the ``pytest.raises`` block fails and a misaligned pairing
-    would sail through.
+    MUTATION (verified RED): make ``assert_head_drop_convention`` return
+    the value instead of raising when it is non-zero -- the
+    ``pytest.raises`` block fails and a flipped head-drop would silently
+    offset every GT target by one frame.
+    """
+    import utils.zarr_dataset as zd
+
+    assert zd._LATENT_HEAD_DROP == 0     # the shipped value
+    assert assert_head_drop_convention(where="ok") == 0   # no raise
+
+    monkeypatch.setattr(zd, "_LATENT_HEAD_DROP", 1, raising=True)
+    with pytest.raises(SystemExit, match="_LATENT_HEAD_DROP"):
+        assert_head_drop_convention(where="armA")
+
+
+def test_gt_alignment_is_gross_error_only_not_an_argmin_assert(caplog):
+    """Only a WHOLE-CHUNK misalignment may stop the run; drift may not.
+
+    The old guard asserted ``argmin == 0`` per arm. That was never
+    supportable: all 26 texture_abc arms share one zarr, one
+    ``latent_start_offset`` and one ``ar_initial_chunks``, yet 14 of them
+    individually prefer shift +2 and the aggregate prefers 0 by 0.13%.
+    The argmin measures each MODEL's temporal drift. What survives is a
+    relative-excess bound on shift 0.
+
+    MUTATION (verified RED): restore ``if best != 0: raise`` in
+    ``assert_gt_alignment`` -- the drift-scale case below raises and the
+    study is blocked on real data again.
     """
     g = torch.Generator().manual_seed(4)
     truth = torch.randn(60, 4, 5, 5, generator=g)          # 60 GT frames
@@ -977,13 +1007,117 @@ def test_gt_alignment_profile_and_hard_assert(tmp_path):
     assert prof[0] == pytest.approx(0.0, abs=1e-6)
     assert_gt_alignment(prof, where="aligned")             # no raise
 
+    # GENUINE whole-chunk misalignment: shift 0 far worse than the best.
     shifted = [truth[12 + 3 * k: 15 + 3 * k].unsqueeze(0) for k in range(8)]
     bad = gt_alignment_profile(shifted, loader, 9, n_depths=8)
     assert min(bad, key=lambda k: bad[k]) == 3   # one CHUNK = 3 frames
     with pytest.raises(SystemExit, match="OFF BY"):
         assert_gt_alignment(bad, where="shifted")
+
+    # DRIFT-SCALE preference for a non-zero shift must NOT raise: this is
+    # the real-data shape (aggregate 0.36221 at 0 vs 0.36269 at +2, and
+    # per-arm margins of a few percent in either direction).
+    caplog.set_level("INFO")
+    drift = {-3: 0.3400, -2: 0.3550, -1: 0.3600, 0: 0.36221,
+             1: 0.3630, 2: 0.36269, 3: 0.3700}
+    assert min(drift, key=lambda k: drift[k]) == -3
+    assert_gt_alignment(drift, where="driftarm")           # no raise
+    assert "argmin is NOT asserted" in caplog.text
+
+    # The worst REAL arm: strict03 prefers -3 by 8.9%, all drift. Must pass
+    # at the default, or the study stays blocked on real data.
+    strict03 = {-3: 0.3300, -2: 0.3450, -1: 0.3540, 0: 0.35937,
+                1: 0.3600, 2: 0.3590, 3: 0.3650}
+    assert (strict03[0] - strict03[-3]) / strict03[-3] == pytest.approx(
+        0.089, abs=5e-4)
+    assert_gt_alignment(strict03, where="strict03")        # no raise
+
+    # ... but the same shape past the bound does raise.
+    with pytest.raises(SystemExit, match="align-max-rel-excess"):
+        assert_gt_alignment(drift, where="driftarm", max_rel_excess=0.001)
+
     with pytest.raises(SystemExit):
         assert_gt_alignment({}, where="empty")
+    with pytest.raises(SystemExit, match="no shift-0"):
+        assert_gt_alignment({1: 0.1, 2: 0.2}, where="noshift0")
+
+
+def test_gt_self_difference_profile_reports_resolving_power(caplog):
+    """The drift-dominated verdict must print on NORMAL runs, not failures.
+
+    ``|GT(s) - GT(s+d)|`` is how far apart GT frames are from each other.
+    When rollout-vs-GT at shift 0 already exceeds that at +-1 (measured:
+    0.32-0.46 vs ~0.198), a one-frame misindexing moves the statistic by
+    less than the drift floor and the profile CANNOT confirm the
+    convention.
+
+    MUTATION (verified RED): drop the ``self_profile`` branch from
+    ``assert_gt_alignment``, or log it only inside the failure path --
+    the ``DRIFT-DOMINATED`` assertion fails and a passing ``argmin == 0``
+    could be re-read as confirmation of the indexing again.
+    """
+    g = torch.Generator().manual_seed(11)
+    truth = torch.randn(60, 4, 5, 5, generator=g)
+
+    def loader(s, e):
+        return truth[s:e].unsqueeze(0)
+
+    self_prof = gt_self_difference_profile(loader, 9, n_depths=8)
+    assert self_prof[0] == pytest.approx(0.0, abs=1e-9)   # 0 by definition
+    assert self_prof[1] > 0.0 and self_prof[-1] > 0.0
+
+    # Drift-dominated: rollout-vs-GT at 0 above the GT self-difference.
+    caplog.set_level("INFO")
+    big = self_prof[1] * 2.0
+    prof = {-1: big * 1.01, 0: big, 1: big * 1.01}
+    assert_gt_alignment(prof, where="dd", self_profile=self_prof)
+    assert "GT SELF-difference by shift" in caplog.text
+    assert "DRIFT-DOMINATED" in caplog.text
+    assert "CANNOT confirm the indexing convention" in caplog.text
+
+    # Resolvable regime (rollout far closer than GT differs from itself):
+    # no drift-dominated claim is made.
+    caplog.clear()
+    small = self_prof[1] * 0.1
+    assert_gt_alignment({-1: small * 3, 0: small, 1: small * 3},
+                        where="res", self_profile=self_prof)
+    assert "GT SELF-difference by shift" in caplog.text
+    assert "DRIFT-DOMINATED" not in caplog.text
+
+
+def test_align_max_rel_excess_flows_config_to_consumer():
+    """The gross-error bound is a FLAG, and the caller actually passes it.
+
+    MUTATION (verified RED): drop ``--align-max-rel-excess`` from
+    ``build_parser`` (AttributeError on the default), or hardcode
+    ``max_rel_excess=0.05`` at the ``run_flowrec`` call site (the source
+    assertion fails) -- the knob would exist in name only.
+    """
+    import inspect
+
+    from analysis.dmd_fp_depth_study import (
+        ALIGN_MAX_REL_EXCESS, build_parser, run_flowrec)
+
+    p = build_parser()
+    d = p.parse_args(["--out", "x.jsonl"])
+    assert d.align_max_rel_excess == pytest.approx(ALIGN_MAX_REL_EXCESS)
+    # The default must clear the MEASURED drift ceiling (strict03 prefers
+    # -3 by 8.9% purely from drift) or the guard false-positives and the
+    # study stays blocked for the wrong reason.
+    assert ALIGN_MAX_REL_EXCESS > 0.089
+    d2 = p.parse_args(["--out", "x.jsonl", "--align-max-rel-excess", "0.2"])
+    assert d2.align_max_rel_excess == pytest.approx(0.2)
+
+    src = inspect.getsource(run_flowrec)
+    assert "max_rel_excess=args.align_max_rel_excess" in src
+    assert "assert_head_drop_convention(" in src
+    assert "gt_self_difference_profile(" in src
+
+    # And the consumer honours it: same profile fails tight, passes wide.
+    prof = {-1: 0.30, 0: 0.33, 1: 0.34}
+    with pytest.raises(SystemExit):
+        assert_gt_alignment(prof, where="tight", max_rel_excess=0.05)
+    assert_gt_alignment(prof, where="wide", max_rel_excess=0.20)
 
 
 def test_discover_flowrec_arms_reads_metadata_and_tf_position(tmp_path):

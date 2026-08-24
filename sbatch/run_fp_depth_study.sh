@@ -69,6 +69,7 @@ export ARRWM_ACTION_ENCODER=pca_raw
 export TMPDIR=/tmp
 unset LOCALDIR APPTAINER_CACHEDIR
 export OMP_NUM_THREADS=8
+export PYTHONPATH=/scratch/u6ex/as1748.u6ex/ARRWM:${PYTHONPATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Per-TAG rendezvous port so two studies on the same holder cannot collide.
 # Single process, but the port is still reserved for the pattern's sake and

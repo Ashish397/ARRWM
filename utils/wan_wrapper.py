@@ -325,58 +325,126 @@ class WanDiffusionWrapper(torch.nn.Module):
         return getattr(self._unwrapped_model(), "head_alt", None) is not None
 
     def adding_cls_branch(
-        self, 
-        atten_dim=1536, 
-        num_class=1, 
+        self,
+        atten_dim=1536,
+        num_class=1,
         hidden_dim=3072,
         num_layers=4,
         dropout=0.2,
         gan_blocks_per_token=2,
+        layer_indices=None,
+        block_ffn_dim=8192,
+        block_num_heads=12,
+        attach_to_model=False,
     ) -> None:
         """
         Add classification branch with deeper layers, dropout, and residual connections.
-        
+
         Args:
             atten_dim: Attention dimension (default 1536)
             num_class: Number of output classes (default 1 for binary real/fake)
             hidden_dim: Hidden dimension for intermediate layers (default 3072)
-            num_layers: Number of residual layers in classification head (default 4)
+            num_layers: Depth of the classification head (default 4).
+                ``1`` = the One-Forcing paper's shape exactly —
+                ``LayerNorm / Linear / SiLU / [Dropout] / Linear``, no
+                residual block and no second LayerNorm. ``>= 2`` is the
+                historical shape: ``num_layers - 1`` ``ResidualMLPBlock``s
+                between the SiLU and a trailing ``LayerNorm + Linear``.
+                NOTE the two are not a continuum — ``2`` is strictly
+                heavier than the paper, not equal to it.
             dropout: Dropout rate (default 0.2)
             gan_blocks_per_token: Number of GanAttentionBlocks to stack per register token (default 2).
                                  Using multiple blocks allows progressive refinement of features
                                  from each transformer layer, improving feature extraction.
+            layer_indices: Transformer block indices to tap. ``None`` keeps
+                the historical hard-coded ``[7, 13, 21, 29]`` (WP: this list
+                used to ALSO be hard-coded in ``wan/modules/model.py:825``,
+                so a caller could not change it even in principle). One
+                register token + one stack of ``gan_blocks_per_token``
+                cross-attn blocks is built per tap, and the model-side loop
+                pairs tap i with token i IN ORDER — the list must be
+                ascending, which ``model/one_forcing_gan.validate_of_config``
+                enforces for the OF arm.
+            block_ffn_dim / block_num_heads: GanAttentionBlock geometry.
+                Defaults are the historical ``GanAttentionBlock()`` defaults;
+                One-Forcing's framewise config uses ffn_dim 2048.
+            attach_to_model: WHERE the new parameters live.
+
+                ``False`` (default, historical): on the WRAPPER. Fine for the
+                legacy ``model/dmd2*.py`` users, which neither DDP-wrap nor
+                checkpoint these params.
+
+                ``True`` (the One-Forcing arm): on the underlying WanModel,
+                i.e. ``fake_score.model``. This is load-bearing for THREE
+                separate reasons and all three are silent failures if it is
+                wrong:
+                  1. ``trainer/causal_action_forcing_train.py`` DDP-wraps
+                     ``model.fake_score.model``. Params hanging off the
+                     wrapper are OUTSIDE that wrap, so their gradients would
+                     never be all-reduced — each rank would train its own
+                     private discriminator and nothing would say so.
+                  2. ``trainer/causal_rolling_staircase_train.py`` builds
+                     ``fake_optimizer`` from
+                     ``self.model.fake_score.model.parameters()``. Wrapper
+                     params are simply absent from it — the head would never
+                     be stepped.
+                  3. The same trainer saves/restores ``state["fake_score"] =
+                     fake_module.state_dict()`` off that same inner model, so
+                     attaching there is what makes the disc round-trip a
+                     checkpoint instead of silently resetting on resume.
+                It must therefore be called BEFORE the DDP wrap and before
+                the optimizer is built (``_build_model`` does both, in that
+                order).
         """
         # Multi-scale feature extraction: default to extracting from more layers
-        layer_indices = [7, 13, 21, 29]
+        if layer_indices is None:
+            layer_indices = [7, 13, 21, 29]
+        layer_indices = [int(v) for v in layer_indices]
         num_registers = len(layer_indices)
-                
+
         # Input dimension: num_registers * atten_dim
         input_dim = num_registers * atten_dim
-        
+
         # Build deeper classification head with residual connections
         layers = []
-        
+
         # Initial projection and normalization
         layers.append(nn.LayerNorm(input_dim))
         layers.append(nn.Linear(input_dim, hidden_dim))
         layers.append(nn.SiLU())
         if dropout > 0.0:
             layers.append(nn.Dropout(dropout))
-        
-        # Residual blocks
-        for _ in range(num_layers - 1):  # -1 because we have final layer
-            layers.append(ResidualMLPBlock(hidden_dim, dropout=dropout))
-        
-        # Final output layer (no residual connection)
-        layers.append(nn.LayerNorm(hidden_dim))
-        layers.append(nn.Linear(hidden_dim, num_class))
-        
-        self._cls_pred_branch = nn.Sequential(*layers)
-        self._cls_pred_branch.requires_grad_(True)
-        
+
+        if num_layers <= 1:
+            # PAPER SHAPE (One-Forcing, ``one_forcing/utils/wan_wrapper.py``
+            # :224-229): LayerNorm / Linear / SiLU / Linear, and nothing
+            # else. This branch exists because ``num_layers=2`` does NOT
+            # produce it — it produces
+            # ``[LayerNorm, Linear, SiLU, ResidualMLPBlock, LayerNorm,
+            # Linear]``, i.e. a residual MLP block and a second LayerNorm
+            # the reference does not have. The docs, the config comment and
+            # this file all claimed otherwise for the OF arm, and
+            # ``validate_of_config`` refused ``num_layers < 2``, so the
+            # shape everything said we were running was UNREACHABLE.
+            # ``num_layers >= 2`` keeps its historical meaning exactly, so
+            # the legacy ``model/dmd2*.py`` callers (default 4) are
+            # byte-identical.
+            layers.append(nn.Linear(hidden_dim, num_class))
+        else:
+            # Residual blocks
+            for _ in range(num_layers - 1):  # -1 because we have final layer
+                layers.append(ResidualMLPBlock(hidden_dim, dropout=dropout))
+
+            # Final output layer (no residual connection)
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.Linear(hidden_dim, num_class))
+
+        cls_pred_branch = nn.Sequential(*layers)
+        cls_pred_branch.requires_grad_(True)
+
         # Register tokens for each layer we extract from
-        self._register_tokens = RegisterTokens(num_registers=num_registers, dim=atten_dim)
-        self._register_tokens.requires_grad_(True)
+        register_tokens = RegisterTokens(num_registers=num_registers, dim=atten_dim)
+        register_tokens.requires_grad_(True)
 
         # Stack multiple GAN cross-attention blocks per token for richer feature extraction
         # Structure: ModuleList[ModuleList[GanAttentionBlock]] - one ModuleList per token
@@ -384,12 +452,61 @@ class WanDiffusionWrapper(torch.nn.Module):
         for _ in range(num_registers):
             token_blocks = []
             for _ in range(gan_blocks_per_token):
-                block = GanAttentionBlock()
+                block = GanAttentionBlock(
+                    dim=atten_dim,
+                    ffn_dim=block_ffn_dim,
+                    num_heads=block_num_heads,
+                )
                 token_blocks.append(block)
             gan_ca_blocks.append(nn.ModuleList(token_blocks))
-        self._gan_ca_blocks = nn.ModuleList(gan_ca_blocks)
-        self._gan_ca_blocks.requires_grad_(True)
+        gan_ca_blocks = nn.ModuleList(gan_ca_blocks)
+        gan_ca_blocks.requires_grad_(True)
+
+        host = self._unwrapped_model() if attach_to_model else self
+        host._cls_pred_branch = cls_pred_branch
+        host._register_tokens = register_tokens
+        host._gan_ca_blocks = gan_ca_blocks
+        # The tap list is read by the block loops in
+        # ``wan/modules/model.py`` and ``model/action_model_patch.py``; it
+        # lives on the MODEL in both attach modes because that is the object
+        # those loops have as ``self``.
+        self._unwrapped_model()._gan_feature_layers = layer_indices
         # self.has_cls_branch = True
+
+    def _cls_branch_modules(self):
+        """Return ``(register_tokens, cls_pred_branch, gan_ca_blocks)``.
+
+        Resolves whichever attach mode ``adding_cls_branch`` used. Reading
+        the model-attached copies through ``_unwrapped_model()`` is safe
+        under DDP: the modules are still submodules of the DDP-wrapped
+        WanModel, so passing them as arguments into that module's own
+        forward leaves the reducer armed exactly as if they had been used
+        via ``self.<name>`` inside it.
+        """
+        if getattr(self, "_cls_pred_branch", None) is not None:
+            return (
+                self._register_tokens,
+                self._cls_pred_branch,
+                self._gan_ca_blocks,
+            )
+        m = self._unwrapped_model()
+        cls_branch = getattr(m, "_cls_pred_branch", None)
+        if cls_branch is None:
+            raise RuntimeError(
+                "classify_mode requested but no discriminator head exists "
+                "on this wrapper or its model. Call adding_cls_branch(...) "
+                "first (for the One-Forcing arm this happens in the "
+                "trainer's _build_model, before the DDP wrap)."
+            )
+        return m._register_tokens, cls_branch, m._gan_ca_blocks
+
+    @property
+    def has_cls_branch(self) -> bool:
+        if getattr(self, "_cls_pred_branch", None) is not None:
+            return True
+        return getattr(
+            self._unwrapped_model(), "_cls_pred_branch", None,
+        ) is not None
 
     def adding_rgs_branch(
         self,
@@ -690,14 +807,20 @@ class WanDiffusionWrapper(torch.nn.Module):
             else:
                 flow_pred = model_out.permute(0, 2, 1, 3, 4)
         elif classify_mode:
+            # ``_cls_branch_modules`` resolves the head wherever
+            # ``adding_cls_branch`` attached it (wrapper for the legacy
+            # dmd2* users, inner model for the One-Forcing arm — see the
+            # ``attach_to_model`` docstring for why that distinction is
+            # load-bearing under DDP).
+            _reg_tok, _cls_head, _ca_blocks = self._cls_branch_modules()
             flow_pred, logits = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
                 classify_mode=True,
-                register_tokens=self._register_tokens,
-                cls_pred_branch=self._cls_pred_branch,
-                gan_ca_blocks=self._gan_ca_blocks,
+                register_tokens=_reg_tok,
+                cls_pred_branch=_cls_head,
+                gan_ca_blocks=_ca_blocks,
                 concat_time_embeddings=concat_time_embeddings,
                 **action_mod_kwargs,
             )
