@@ -15,6 +15,11 @@ cd /scratch/u6ex/as1748.u6ex/ARRWM
 : "${ARM:?set ARM to the run label}"
 : "${CKPT:?set CKPT to the evaluation checkpoint}"
 EVAL_CHUNKS=${EVAL_CHUNKS:-100}
+# Noise control. WITHOUT ODE_FLOW_REC set, utils/eval_causal_AR.py:974-979
+# leaves the block-noise generator as None and torch.randn draws from the
+# GLOBAL RNG -- which this --seed sets. ODE_FLOW_SEED is consulted ONLY
+# inside `if _fr_dir:`, so varying it alone changes NOTHING here.
+EVAL_SEED=${EVAL_SEED:-42}
 STEPTAG=${STEPTAG:-step200}
 
 source /scratch/u6ex/as1748.u6ex/miniforge3/bin/activate
@@ -42,7 +47,7 @@ CUDA_VISIBLE_DEVICES=0 WORLD_SIZE=1 LOCAL_RANK=0 python utils/eval_causal_AR.py 
   --caption_root /projects/u6ex/fbots/frodobots_captions/train \
   --motion_root /projects/u6ex/fbots/frodobots_motion \
   --ss_vae_checkpoint action_query/checkpoints/ss_vae_8free.pt \
-  --seed 42 \
+  --seed "$EVAL_SEED" \
   --denoising_steps 4 \
   --mode ar \
   --ar_initial_chunks 3 \

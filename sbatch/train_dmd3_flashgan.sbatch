@@ -417,7 +417,6 @@ srun torchrun \
     gan_warmup_shape=linear \
     gan_max_grad_norm=10.0 \
     gan_r1_gamma=2.0 \
-    gan_r2_gamma=1.0 \
     gan_weight_decay=0 \
     gan_gate_couple_enabled=false \
     ladd_cmap_dim=64 \
@@ -428,12 +427,8 @@ srun torchrun \
     ladd_r1_gamma=10 \
     ladd_r1_num_samples=6 \
     ladd_r1_every_n_steps=8 \
-    ladd_r1_once_per_step=true \
     ladd_r1_normalize_tokens=true \
     ladd_r1_sigma=0.01 \
-    ladd_r2_gamma=0 \
-    ladd_r2_every_n_steps=2 \
-    ladd_r2_phase_offset=1 \
     ladd_use_csm=true \
     ladd_use_lateral_proj=false \
     ladd_use_prompt_cond=false \

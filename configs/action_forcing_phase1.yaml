@@ -666,7 +666,7 @@ gan_sam2_frame_pool_topk: 4
 # pixel disc's logit values AND its gradient field w.r.t. the input
 # latent. The generator gets its GAN gradient from the critic, never
 # from the pixel disc. Architectural fix for the OOM in
-# ``_compute_r3gan_losses`` where the G-side V+SAM2 forward + R1/R2
+# ``_compute_r3gan_losses`` where the G-side V+SAM2 forward + R1
 # graph blows the 95 GB GPU budget.
 gan_sam2_distilled_critic: false
 # Critic warmup: until step >= warmup, gen GAN loss = 0 (critic

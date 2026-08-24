@@ -693,6 +693,7 @@ class WanModel(ModelMixin, ConfigMixin):
         clip_fea=None,
         y=None,
         compute_alt_head: bool = False,
+        max_block=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -710,6 +711,18 @@ class WanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            max_block (`int`, *optional*):
+                FEATURE-TAP mode (WP-14B, ``model/ladd_disc.py``). When
+                given, the block loop stops after block index
+                ``max_block`` and the function returns the raw token
+                tensor ``[B, L, dim]`` WITHOUT running ``head`` /
+                ``unpatchify``. Callers in this mode read intermediate
+                block outputs through forward hooks and discard the
+                return value; the head is skipped both because it is
+                dead compute and because it does not accept the
+                per-frame timestep embedding that the blocks do
+                (``e`` is [B*F, dim] there, while ``Head`` expects
+                [B, dim]). ``None`` (default) is the unchanged path.
 
         Returns:
             List[Tensor]:
@@ -803,6 +816,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 )
             else:
                 x = block(x, **kwargs)
+
+            if max_block is not None and ii >= int(max_block):
+                # Feature-tap early exit: hooks have already captured
+                # everything the caller wants.
+                return x
 
             if classify_mode and ii in [7, 13, 21, 29]:
                 gan_token = registers[:, gan_idx: gan_idx + 1]

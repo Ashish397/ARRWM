@@ -429,11 +429,9 @@ srun torchrun \
     ladd_disc_micro_batch_groups=2 \
     ladd_r1_gamma=1e6 \
     ladd_r1_every_n_steps=1 \
-    ladd_r1_once_per_step=false \
     ladd_r1_num_samples=6 \
     ladd_r1_normalize_tokens=true \
     ladd_r1_sigma=0.01 \
-    ladd_r2_gamma=0 \
     ladd_cmap_dim=64 \
     ladd_proj_dim=512 \
     ladd_disc_head_kernel=3 \

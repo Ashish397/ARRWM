@@ -1,4 +1,36 @@
 #!/bin/bash
+# #####################################################################
+# ##  NEVER EDIT THIS SCRIPT WHILE A RUN IS EXECUTING IT.            ##
+# #####################################################################
+# bash does not slurp a script into memory. It reads it incrementally
+# and remembers a BYTE OFFSET into the file. Editing the file IN PLACE
+# (`vi`, `sed -i` on some builds, an editor that truncates+rewrites,
+# any tool that keeps the same inode) makes the running shell resume at
+# a stale offset in changed bytes -- it will execute a fragment of a
+# line, skip a command, or silently run the wrong branch. It does not
+# error; it corrupts the tail of the run.
+#
+# HIT FOR REAL on 2026-08-22: this file and `run_ganfix_poolrich.sh`
+# were edited at 10:27 while the 09:47 poolrich run was executing both,
+# putting the chained eval at risk.
+#
+# BEFORE editing, check what is live:
+#     squeue -u $USER
+#     ls logs/.holder_cmd_*.sh logs/.holder_running_*.sh
+#     tail -1 logs/hold-*_<jobid>.out      # "HOLDER command exit=" = idle
+#
+# THE REMEDY -- write a temp file in the SAME directory and rename over
+# the original. rename(2) is atomic and gives the new content a NEW
+# inode, so a running bash keeps reading the old inode to completion:
+#     cp script.sh script.sh.tmp
+#     <edit script.sh.tmp>
+#     mv -f script.sh.tmp script.sh          # atomic, same filesystem
+# In Python: write the temp, then `os.replace(tmp, path)`
+# (plus `shutil.copymode(path, tmp)` to keep the +x bit).
+#
+# If a run IS live and you cannot wait: CLONE the script to a new name
+# and edit the clone. Never touch the one being executed.
+# #####################################################################
 HOLDER=${HOLDER:?}
 PORTOFF=${PORTOFF:?}
 RUNSTAMP=${RUNSTAMP:?}
@@ -413,7 +445,6 @@ srun --jobid=$HOLDER --overlap --nodelist=$NODES --nodes=$NNODE --ntasks-per-nod
     gan_warmup_shape=linear \
     gan_max_grad_norm=10.0 \
     gan_r1_gamma=2.0 \
-    gan_r2_gamma=1.0 \
     gan_weight_decay=0 \
     gan_gate_couple_enabled=false \
     ladd_cmap_dim=64 \
@@ -424,12 +455,8 @@ srun --jobid=$HOLDER --overlap --nodelist=$NODES --nodes=$NNODE --ntasks-per-nod
     ladd_r1_gamma=10 \
     ladd_r1_num_samples=6 \
     ladd_r1_every_n_steps=8 \
-    ladd_r1_once_per_step=true \
     ladd_r1_normalize_tokens=true \
     ladd_r1_sigma=0.01 \
-    ladd_r2_gamma=0 \
-    ladd_r2_every_n_steps=2 \
-    ladd_r2_phase_offset=1 \
     ladd_use_csm=true \
     ladd_use_lateral_proj=false \
     ladd_use_prompt_cond=false \

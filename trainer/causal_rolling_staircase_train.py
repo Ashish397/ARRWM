@@ -335,6 +335,13 @@ class RollingStaircaseDMDTrainer:
             level=level,
             format=f"%(asctime)s [rank {self.rank}] %(levelname)s %(message)s",
         )
+        # ``basicConfig`` is a SILENT NO-OP when any import (torch elastic,
+        # wandb, ...) has already installed a root handler -- the level above
+        # is then never applied, root stays at the WARNING default, and every
+        # ``logging.info`` in the trainer vanishes (measured: INFO count = 0
+        # in full run logs, 2026-08-24). Set the level explicitly; this
+        # touches no handlers, so deliberately-installed ones are preserved.
+        logging.getLogger().setLevel(level)
 
     def _seed_per_rank(self) -> None:
         """Set ``(seed + global_rank)`` on torch / cuda / numpy / random.
@@ -1635,6 +1642,43 @@ class RollingStaircaseDMDTrainer:
                     state["r3gan_optimizer"] = (
                         self.r3gan_optimizer.state_dict()
                     )
+        # WP-PIXGAN — pixel-texture critic + its Adam, under ITS OWN GATE.
+        # ``gan_pixel_texture_enabled`` is independent of ``gan_enabled``:
+        # in the pixel arm the transition GAN is OFF, so folding this into
+        # the branch above would mean the pixel critic is never saved and is
+        # silently re-initialised on every resume — the known trap
+        # (docs/WP_PIXGAN.md §3). The restore side FAILS LOUD on a missing
+        # key, so a mis-gated save here surfaces immediately instead of
+        # quietly corrupting the adversarial signal. Unwrap DDP if wrapped.
+        if getattr(self, "gan_pixel_texture_enabled", False):
+            _pix = getattr(self, "pixel_texture_disc", None)
+            if _pix is not None:
+                _pix_mod = (
+                    self.pixel_texture_disc_ddp.module
+                    if getattr(self, "pixel_texture_disc_ddp", None) is not None
+                    else _pix
+                )
+                # Keys MUST match the restore side in
+                # ActionForcingDMDTrainer._maybe_resume
+                # ("pixel_texture_disc" / "pix_optimizer").
+                state["pixel_texture_disc"] = _pix_mod.state_dict()
+                if getattr(self, "pix_optimizer", None) is not None:
+                    state["pix_optimizer"] = self.pix_optimizer.state_dict()
+        # WP-SURROGATE (B3) — latent surrogate critic + its optimizer,
+        # gated on the ATTRIBUTES EXISTING, never on ``gan_enabled`` (the
+        # B1(d) trap) nor on any other package's gate. Spec §4.4: a
+        # silently re-initialised surrogate is WORSE than a missing one —
+        # zero-init hands the generator a zero gradient that reads as "GAN
+        # term present and quiet". Restore side raises on a missing key
+        # when ``surrogate_critic_enabled`` is true.
+        _sur = getattr(self, "latent_texture_critic", None)
+        if _sur is not None:
+            _sur_mod = _sur.module if hasattr(_sur, "module") else _sur
+            state["latent_texture_critic"] = _sur_mod.state_dict()
+            if getattr(self, "latent_critic_optimizer", None) is not None:
+                state["latent_critic_optimizer"] = (
+                    self.latent_critic_optimizer.state_dict()
+                )
         # ForwardNoiser (CARN) + its optimizer — same rationale (a fresh
         # zero-init FN at resume restarts the learned +1 drift operator).
         _fn = getattr(self.model, "forward_noiser", None)

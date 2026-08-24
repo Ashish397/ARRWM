@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -72,7 +72,6 @@ from model.r3gan import (
     rpgan_d_loss_allpairs,
     rpgan_g_loss_allpairs,
     r1_penalty,
-    r2_penalty,
 )
 from pipeline.action_forcing_training import ActionForcingTrainingPipeline
 from utils.infinity_rope import install as _install_infinity_rope
@@ -130,6 +129,180 @@ def _chunk_actions(per_frame: torch.Tensor, chunk_frames: int) -> torch.Tensor:
     return trimmed.reshape(B, n_chunks, chunk_frames, D).mean(dim=2)
 
 
+def grad_at(
+    loss: torch.Tensor,
+    params,
+    *,
+    retain_graph: bool = True,
+) -> Optional[torch.Tensor]:
+    """Gradient of ``loss`` at ``params``, FLATTENED — or ``None``.
+
+    WP-PIXGAN T3-C.  Shared by the LADD path (WP-14B) and the pixel path,
+    so it lives at MODULE level in this file: the LADD branch can call it
+    with no import at all, and nothing pixel-specific is dragged in.
+
+    Args:
+        loss: any graph-bearing scalar (or non-scalar — ``grad_outputs``
+            is not supplied, so a non-scalar raises exactly as
+            ``torch.autograd.grad`` would).
+        params: a SINGLE ``torch.Tensor`` or an iterable of tensors.  The
+            single-tensor form is the one the A7 probe uses (``_p_last``,
+            the last ``requires_grad`` generator parameter) and it is what
+            keeps the probe affordable — one parameter, not the whole net.
+        retain_graph: forwarded to ``torch.autograd.grad``.  Default True
+            because every caller so far measures SEVERAL losses that share
+            one graph.
+
+    Returns:
+        A detached 1-D ``float32`` tensor: the per-param gradients
+        flattened and concatenated in the order given.  ``None`` when the
+        gradient does not exist.
+
+    WHY A VECTOR AND NOT A RATIO (this is load-bearing, do not "simplify"):
+
+      * The readout that separates "small but ALIGNED" from "small and
+        actively FIGHTING DMD" is the cosine
+        ``dot(g_a, g_b) / (|g_a| |g_b|)``, which needs the vectors.  A
+        helper returning ratios cannot produce it.
+      * Vectors let ONE backward serve every ratio AND every cosine.  Two
+        ratio-returning calls would each re-backprop the shared DMD term;
+        on the LADD path that second pass runs through a checkpointed
+        teacher recompute costing ~11 s and ~37 GiB per fire.  Callers
+        therefore take one vector per loss and combine them locally.
+
+    WHY ``None`` AND NEVER ``0.0`` (docs/WP_PIXGAN.md §16/§19/§21):
+        ``0.0`` is a FORGEABLE ZERO — indistinguishable from the genuine
+        reading "this term contributes nothing", which is a live disputed
+        conclusion in this campaign.  ``None`` is not a number and cannot
+        be mistaken for one; the call site logs its own distinct error
+        key.  ``allow_unused=True`` is kept so an unused param yields
+        ``None`` rather than an exception, and if ANY requested param is
+        unused the whole call returns ``None`` — a partially-filled vector
+        would not be layout-comparable with the other loss's vector, and
+        zero-filling the hole would re-import the forged zero.
+    """
+    if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+        return None
+    if isinstance(params, torch.Tensor):
+        plist = [params]
+    else:
+        plist = [p for p in params]
+    if not plist:
+        return None
+    grads = torch.autograd.grad(
+        loss, plist, retain_graph=retain_graph, allow_unused=True,
+    )
+    if any(g is None for g in grads):
+        return None
+    return torch.cat([g.detach().flatten().float() for g in grads])
+
+
+def ladd_unweighted_ratio(
+    *,
+    gg: Optional[torch.Tensor],
+    gr: Optional[torch.Tensor],
+    mode_count: Optional[int],
+    total_weight: Optional[float],
+    stat_value: Optional[float],
+    pix_folded: bool,
+) -> Dict[str, float]:
+    """WP-14B: the LADD term's gradient ratio/norm AT WEIGHT 1.0.
+
+    Pure function — no trainer, no ``self`` — so the guard logic is
+    unit-testable without a CUDA-touching import. All five inputs are
+    values the caller has ALREADY computed; this function only decides
+    whether dividing ``gg`` by ``total_weight`` is a valid way to recover
+    the unweighted norm, and does the division.
+
+    DIVISION, NOT RAW-THREADING: ``_ladd_run_pair_mode`` (the function
+    that actually produces the LADD term) is ~2900 lines with delicate
+    R1-fire-rate cadence semantics documented in its own header comment.
+    Threading a second raw tensor out of both its return sites, through
+    ``_compute_ladd_losses``'s per-mode summation, was judged higher-risk
+    than exploiting linearity: when ``gg`` truly equals
+    ``total_weight * (the LADD term's own gradient)`` — which is exactly
+    what the five guards below establish — then
+    ``‖raw grad‖ = ‖gg‖ / total_weight`` is EXACT, not approximate, and
+    needs no extra backward (``gg`` is already computed by the caller for
+    the existing A7 telemetry).
+
+    Tradeoff, stated plainly: unlike a raw-threaded term (e.g. the pixel
+    path's ``pix_raw``), this CANNOT answer a true weight-free probe —
+    ``total_weight == 0`` leaves ``gg`` with no graph at all, hence no
+    caller-supplied value for it. It only works retroactively on a run
+    with weight > 0, which is what the campaign settled on after the
+    weight-probe identity was verified on wandb history ("a division over
+    the first ~50 steps of any arm now suffices") — this closes exactly
+    that gap and no more.
+
+    The cosine between ``gg`` and ``gr`` is NOT recomputed here: cosine is
+    scale-invariant for a positive multiplier, so the existing
+    ``train/gan_dmd_grad_cos`` (computed by the caller from the same two
+    vectors) already IS the unweighted cosine.
+
+    Args:
+        gg: gradient of the (possibly weighted, possibly multi-term) GAN
+            loss at the probe parameter — the caller's existing ``_gg``.
+        gr: gradient of the non-GAN generator loss at the same
+            parameter — the caller's existing ``_gr`` (the A7 denominator).
+        mode_count: how many LADD pair-modes were enabled this call.
+            Anything other than 1 means ``gg`` is a SUM of differently-
+            weighted per-mode terms, so no single scalar recovers an
+            unweighted value for any one of them.
+        total_weight: the LIVE resolved multiplier — ``per-mode weight
+            (e.g. ladd_gt_transition_weight) x gen_gan_weight`` — stashed
+            by the caller at the moment ``_ladd_run_pair_mode`` computed
+            it. Never re-derived from cfg (the class of bug this exists
+            to avoid: two echoes reporting config while runtime differed).
+        stat_value: the LIVE ``gen_gan_stat_value`` from the same call.
+            Must be exactly 0.0 — nonzero means the stat-head sideband is
+            additively folded into the LADD term, breaking the pure-
+            scalar-multiple precondition the division depends on.
+        pix_folded: whether the pixel G-term has been added into the same
+            ``gen_gan_loss`` this call's ``gg`` was differentiated from.
+            If so ``gg`` is LADD+pixel mixed and dividing it by the
+            LADD-only ``total_weight`` would not isolate the LADD term.
+
+    Returns:
+        A dict of ``train/ladd_gan_grad_*`` keys. On any guard failure,
+        ``train/ladd_gan_grad_unweighted_unavailable=1.0`` plus exactly
+        one ``..._reason_*`` key — never a forgeable ``0.0`` standing in
+        for "the term contributes nothing" (docs/WP_PIXGAN.md §16/§19/§21;
+        the same discipline ``grad_at`` above documents at length).
+    """
+    out: Dict[str, float] = {}
+    if pix_folded:
+        out["train/ladd_gan_grad_unweighted_unavailable"] = 1.0
+        out["train/ladd_gan_grad_unweighted_reason_pix_folded"] = 1.0
+        return out
+    if mode_count != 1:
+        out["train/ladd_gan_grad_unweighted_unavailable"] = 1.0
+        out["train/ladd_gan_grad_unweighted_reason_multimode"] = float(
+            mode_count or 0)
+        return out
+    if stat_value is None or stat_value != 0.0:
+        out["train/ladd_gan_grad_unweighted_unavailable"] = 1.0
+        out["train/ladd_gan_grad_unweighted_reason_stat_active"] = 1.0
+        return out
+    if total_weight is None or total_weight <= 0.0:
+        out["train/ladd_gan_grad_unweighted_unavailable"] = 1.0
+        out["train/ladd_gan_grad_unweighted_reason_weight_unavailable"] = 1.0
+        return out
+    if gg is None or gr is None:
+        out["train/ladd_gan_grad_unweighted_unavailable"] = 1.0
+        out["train/ladd_gan_grad_unweighted_reason_no_grad"] = 1.0
+        return out
+    ng_raw = float(gg.norm()) / total_weight
+    out["train/ladd_gan_grad_norm_unweighted"] = ng_raw
+    nr = float(gr.norm())
+    if nr > 0.0:
+        out["train/ladd_gan_grad_ratio_unweighted"] = ng_raw / nr
+    else:
+        out["train/ladd_gan_grad_unweighted_unavailable"] = 1.0
+        out["train/ladd_gan_grad_unweighted_reason_dmd_denom_zero"] = 1.0
+    return out
+
+
 class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     """CF-style DMD2 trainer for the Action-Forcing (no-staircase) Phase-1 recipe.
 
@@ -155,7 +328,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     state probe head is still instantiated (for ODE checkpoint
     parity) and remains frozen.
 
-    R3GAN (RpGAN + R1 + R2) is OPT-IN via ``gan_enabled: true``. When
+    R3GAN (RpGAN + R1) is OPT-IN via ``gan_enabled: true``. When
     enabled the trainer:
 
       - builds ``model.r3gan.R3GANDiscriminator3D`` on the latent
@@ -169,8 +342,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                                      last num_training_
                                                      frames)
         and runs:
-            * D-update (RpGAN-D + R1 on real + R2 on fake; backward
-              into D only — fake is detached so no flow into G);
+            * D-update (RpGAN-D + R1 on real; backward into D only —
+              fake is detached so no flow into G);
             * G's RpGAN term added to the generator loss (graph flows
               through ``pred_image`` -> generator);
       - persists / resumes ``r3gan_discriminator`` +
@@ -669,7 +842,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
 
         # ------------------------------------------------------------------
-        # R3GAN — RpGAN + R1 + R2 discriminator (opt-in via ``gan_enabled``).
+        # R3GAN — RpGAN + R1 discriminator (opt-in via ``gan_enabled``).
         # Built in fp32 to keep the gradient-penalty (second-order)
         # arithmetic numerically clean. The discriminator operates on
         # the same latent video tensor the student predicts; both real
@@ -704,6 +877,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 ladd_blocks = list(
                     getattr(self.config, "ladd_feature_blocks", []) or []
                 )
+                # Did the config name the taps, or are we about to
+                # auto-derive them? The 14B backbone branch below refuses
+                # to run on auto-derived taps (the 40-block default is
+                # [8, 16, 24, 32, 39] -> a full 28 GB load).
+                _ladd_blocks_explicit = bool(ladd_blocks)
                 # Pull the underlying WanModel's transformer blocks from
                 # real_score. Walk all submodules (handles arbitrary
                 # wrap depth: DDP / WanDiffusionWrapper / v14 LoRA /
@@ -796,8 +974,99 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         if _v > 0:
                             _a_per_f = _v
                             break
+                # ===== WP-14B: independent frozen 14B projection backbone =====
+                # ``ladd_disc_backbone_model_name`` (default "" = OFF,
+                # byte-identical legacy behaviour) swaps the network the
+                # disc PROJECTS ONTO from ``real_score`` — the same v14e
+                # teacher the student is distilled from, hence largely
+                # redundant with the DMD term (GAN_REDESIGN Point 6) — to a
+                # stock Wan2.1-T2V-14B PREFIX: blocks 0..max(taps) only,
+                # frozen, bf16 (~6.8 GB for taps [0, 2, 4, 8]).
+                # ``real_score`` / ``real_name`` are NOT touched; DMD keeps
+                # its teacher untouched.
+                _ladd_backbone = None
+                _ladd_bk_name = str(
+                    getattr(self.config, "ladd_disc_backbone_model_name", "")
+                    or ""
+                )
+                if _ladd_bk_name:
+                    from model.wan14b_prefix import load_wan14b_prefix
+                    if not _ladd_blocks_explicit:
+                        raise ValueError(
+                            "ladd_disc_backbone_model_name is set but "
+                            "``ladd_feature_blocks`` is empty. The 14B "
+                            "backbone requires EXPLICIT shallow taps (e.g. "
+                            "[0, 2, 4, 8]); the auto-default for a 40-block "
+                            "teacher is [8, 16, 24, 32, 39], which would "
+                            "load the full 28 GB model."
+                        )
+                    _bk_dtype_name = str(getattr(
+                        self.config, "ladd_disc_backbone_dtype", "bfloat16"
+                    ))
+                    _bk_dtype = getattr(torch, _bk_dtype_name, None)
+                    if not isinstance(_bk_dtype, torch.dtype):
+                        raise ValueError(
+                            "ladd_disc_backbone_dtype must name a torch "
+                            f"dtype; got {_bk_dtype_name!r}."
+                        )
+                    _bk_max_tap = max(int(b) for b in ladd_blocks)
+                    _ladd_backbone = load_wan14b_prefix(
+                        _ladd_bk_name,
+                        max_block=_bk_max_tap,
+                        device=self.device,
+                        dtype=_bk_dtype,
+                        load_head=bool(getattr(
+                            self.config,
+                            "ladd_disc_backbone_load_head",
+                            True,
+                        )),
+                    )
+                    _bk_layers = len(_ladd_backbone.blocks)
+                    # Hard assert: max(taps) < num_layers_loaded.
+                    assert _bk_max_tap < _bk_layers, (
+                        f"LADD 14B backbone: deepest tap {_bk_max_tap} >= "
+                        f"{_bk_layers} blocks loaded."
+                    )
+                    # Use the BACKBONE's own tokenisation params, never
+                    # real_score's. ``a_per_f`` is hard 0: stock T2V has no
+                    # action tokens, and harvesting
+                    # ``action_tokens_per_frame=1`` off real_score would
+                    # silently mis-slice the head reshape.
+                    _dim_teacher = int(_ladd_backbone.dim)
+                    _patch_size = tuple(
+                        int(p) for p in _ladd_backbone.patch_size
+                    )
+                    _a_per_f = 0
+                    if self.is_main_process:
+                        # print+flush, NOT logging.info: this run's
+                        # ``logging.info`` calls are silently suppressed
+                        # (0 hits across two full smoke logs tonight,
+                        # WARNING/ERROR unaffected -- root cause unknown).
+                        # ``[ROLL]``/``[LADD-DIAG]``/``[42F-DRIFT]`` below
+                        # already use this pattern and are proven to
+                        # survive; this diagnostic exists specifically to
+                        # settle "did the resolved value reach the
+                        # process", so it must not be one more line that
+                        # silently vanishes.
+                        print(
+                            "[ActionForcing] LADD disc backbone OVERRIDE: "
+                            "%s blocks=%d/%d taps=%s dim_teacher=%d "
+                            "patch=%s a_per_f=0 dtype=%s (real_score "
+                            "untouched)" % (
+                                _ladd_bk_name, _bk_layers,
+                                int(getattr(
+                                    _ladd_backbone,
+                                    "_wan14b_prefix_ckpt_num_layers",
+                                    _bk_layers,
+                                )),
+                                ladd_blocks, _dim_teacher, _patch_size,
+                                _bk_dtype_name,
+                            ),
+                            file=sys.stderr, flush=True,
+                        )
                 disc = build_ladd_disc(
                     real_score=_real_score,
+                    backbone=_ladd_backbone,
                     block_indices=ladd_blocks,
                     dim_teacher=_dim_teacher,
                     dim_proj=int(
@@ -915,72 +1184,344 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         p.numel() for p in disc.parameters()
                         if p.requires_grad
                     )
-                    logging.info(
+                    # print+flush, NOT logging.info: see the note at the
+                    # OVERRIDE line above -- this run's logging.info calls
+                    # are silently suppressed (0 hits across two full smoke
+                    # logs, WARNING/ERROR unaffected), so the two
+                    # diagnostics below (pre-existing + the resolved-value
+                    # echo) are converted to the pattern already proven to
+                    # survive in this file.
+                    print(
                         "[ActionForcing] LADD discriminator built: "
                         "blocks=%s dim_teacher=%d dim_proj=%d "
                         "use_csm=%s cmap_dim=%d wavelet_hf=%s scalar=%s "
                         "freeze_mixing=%s "
                         "params_total=%.2fM params_trainable=%.2fM "
-                        "(DDP=%s)",
-                        ladd_blocks, _dim_teacher,
-                        int(getattr(self.config, "ladd_proj_dim", 256)),
-                        bool(getattr(self.config, "ladd_use_csm", True)),
-                        int(getattr(self.config, "ladd_cmap_dim", 64))
-                        if _prompt_embed_dim > 0 else 0,
-                        bool(_wavelet_hf_enabled),
-                        bool(getattr(self.config, "ladd_scalar_output", False)),
-                        bool(getattr(
-                            self.config, "ladd_freeze_projector_mixing", False,
-                        )),
-                        n_total / 1e6, n_train / 1e6,
-                        self.r3gan_disc_ddp is not None,
+                        "(DDP=%s)" % (
+                            ladd_blocks, _dim_teacher,
+                            int(getattr(self.config, "ladd_proj_dim", 256)),
+                            bool(getattr(self.config, "ladd_use_csm", True)),
+                            int(getattr(self.config, "ladd_cmap_dim", 64))
+                            if _prompt_embed_dim > 0 else 0,
+                            bool(_wavelet_hf_enabled),
+                            bool(getattr(
+                                self.config, "ladd_scalar_output", False)),
+                            bool(getattr(
+                                self.config,
+                                "ladd_freeze_projector_mixing", False,
+                            )),
+                            n_total / 1e6, n_train / 1e6,
+                            self.r3gan_disc_ddp is not None,
+                        ),
+                        file=sys.stderr, flush=True,
+                    )
+                    # WP-14B resolved-value echo, promised after tonight's
+                    # 14B-smoke OOM investigation: the launch script showed
+                    # ``ladd_gen_guidance_micro_batch_groups=16`` and the
+                    # smoke still OOM'd, and the reason took a manual trace
+                    # of the holder script + $DEXTRA merge order to find --
+                    # a launch line looking right is not proof it reached
+                    # this process. These three EXACT getattr chains are
+                    # copy-pasted from their consumer sites (not
+                    # re-derived, so this cannot itself become one of the
+                    # two-echoes-disagreeing bugs PIXGAN's review found
+                    # elsewhere): a divergence between what a launch script
+                    # intended and what ``self.config``/``self.model``
+                    # actually hold is now visible at build time, before
+                    # any step runs, rather than only inferable from an
+                    # OOM stack trace afterward.
+                    print(
+                        "[ActionForcing] LADD resolved knobs (build-time, "
+                        "read from the SAME objects the per-step code "
+                        "reads): ladd_gen_guidance_micro_batch_groups=%s "
+                        "ladd_disc_micro_batch_groups=%s "
+                        "ladd_gt_transition_match_max_real=%s" % (
+                            getattr(
+                                self.config,
+                                "ladd_gen_guidance_micro_batch_groups",
+                                getattr(
+                                    self.model,
+                                    "ladd_gen_guidance_micro_batch_groups",
+                                    1)),
+                            getattr(
+                                self.config, "ladd_disc_micro_batch_groups",
+                                getattr(self.model,
+                                        "ladd_disc_micro_batch_groups", 1)),
+                            getattr(self.model,
+                                    "ladd_gt_transition_match_max_real", 12),
+                        ),
+                        file=sys.stderr, flush=True,
                     )
 
-                # R1/R2 cadence sanity. The R2 (fake-side) penalty is
-                # supposed to fire on steps OFFSET from R1's so their two
-                # perturbed-input disc forwards never stack in the same
-                # D-update (OOM guard). That guarantee only holds when
-                # BOTH cadences are >= 2: if either ``ladd_r1_every_n_steps``
-                # or ``ladd_r2_every_n_steps`` is 1 (fires every step), the
-                # offset cannot separate them and both perturbed forwards
-                # land together. Detect any real collision over the LCM
-                # period and warn loudly — silent OOM is the failure mode
-                # this whole offset machinery exists to avoid.
-                _r2_g = float(getattr(self.model, "ladd_r2_gamma", 0.0))
-                if _r2_g > 0.0 and self.is_main_process:
-                    import math as _m
-                    _r1_e = max(1, int(getattr(
-                        self.model, "ladd_r1_every_n_steps", 1)))
-                    _r2_e = max(1, int(getattr(
-                        self.model, "ladd_r2_every_n_steps", _r1_e)))
-                    _r2_o = int(getattr(self.model, "ladd_r2_phase_offset", 1))
-                    _period = _r1_e * _r2_e // _m.gcd(_r1_e, _r2_e)
-                    _collisions = [
-                        s for s in range(_period)
-                        if s % _r1_e == 0 and (s - _r2_o) % _r2_e == 0
-                    ]
-                    if _collisions:
-                        logging.warning(
-                            "[ActionForcing] LADD R2 enabled "
-                            "(ladd_r2_gamma=%.4g) but R1 and R2 CO-FIRE on "
-                            "steps %s of every %d (r1_every=%d, r2_every=%d, "
-                            "r2_phase_offset=%d). On those steps BOTH the "
-                            "perturbed-real and perturbed-fake disc forwards "
-                            "run in one D-update — the OOM the offset is "
-                            "meant to prevent. For a clean offset set BOTH "
-                            "cadences >= 2 (e.g. r1_every=2, r2_every=2, "
-                            "offset=1 -> R1 even / R2 odd).",
-                            _r2_g, _collisions, _period, _r1_e, _r2_e, _r2_o,
-                        )
-                    else:
-                        logging.info(
-                            "[ActionForcing] LADD R2 enabled "
-                            "(ladd_r2_gamma=%.4g); R1/R2 fire on disjoint "
-                            "steps (r1_every=%d, r2_every=%d, offset=%d) — "
-                            "no perturbed-forward stacking.",
-                            _r2_g, _r1_e, _r2_e, _r2_o,
-                        )
 
+        # ------------------------------------------------------------------
+        # WP-PIXGAN (B1 / T3) — pixel-space texture PatchGAN critic.
+        # Spec: docs/TEXTURE_GAN_DESIGN.md §4 / §5.2, docs/WP_PIXGAN.md §1.
+        #
+        # Gate: ``gan_pixel_texture_enabled`` (default False). This is NOT a
+        # new ``gan_backbone`` value — ``gan_backbone`` stays
+        # "ladd_teacher_feat" and in the pixel arm the transition GAN is OFF
+        # (``gan_enabled: false``). The two critics are INDEPENDENT and may be
+        # independently on/off; nothing in this block reads ``gan_enabled``.
+        #
+        # Built in fp32 for the same reason as the LADD critic: the §5.3 R1
+        # finite-difference estimator is arithmetically delicate.
+        #
+        # The architecture is frozen by §4 (3->64->128->256->1, k4/k4/k4/k3,
+        # spectral norm everywhere, GroupNorm(8) on the two middle blocks) and
+        # deliberately exposes no config knobs — see model/pixel_texture_disc.py.
+        # ------------------------------------------------------------------
+        self.gan_pixel_texture_enabled = bool(
+            getattr(self.config, "gan_pixel_texture_enabled", False)
+        )
+        # FROZEN CONTRACT 1 (docs/WP_PIXGAN.md §1): the trainer attribute MUST
+        # be named exactly ``pixel_texture_disc`` — with that name
+        # ``model/disc_holdout_probe.py`` (``disc_holdout_probe_critic_attr``
+        # defaults to "pixel_texture_disc") needs zero edits. Do not rename.
+        self.pixel_texture_disc: Optional[torch.nn.Module] = None
+        self.pixel_texture_disc_ddp: Optional[DDP] = None
+        if self.gan_pixel_texture_enabled:
+            # CONFIG-RESOLUTION TIME. Every pix_* invariant (the A24 band
+            # pin, the degenerate-count checks, a frozen real pool, an
+            # uncalibrated pix_r1_gamma) is checked HERE, at construction,
+            # before a single step runs -- not inside whichever consumer
+            # happens to reach its own copy of the check first. An arm that
+            # is misconfigured should not reach gan_disc_start_step to find
+            # out. Return value discarded: this call is the CHECK; the
+            # consumers resolve again when they need the numbers.
+            self._pix_resolve_cfg()
+            from model.pixel_texture_disc import PixelTextureDisc
+            pix_disc = PixelTextureDisc()
+            # Same device/dtype placement idiom as the LADD critic above.
+            pix_disc.to(device=self.device, dtype=torch.float32)
+            pix_disc.train()
+            self.pixel_texture_disc = pix_disc
+            if self.world_size > 1:
+                # ``find_unused_parameters=False``: every parameter
+                # participates in the graph on a D update. NOTE the R1
+                # subsample branch — ``conv4.bias`` receives an exactly-zero
+                # (but materialised, not ``None``) gradient from R1 alone,
+                # which DDP accepts; see model/pixel_texture_disc.py's header.
+                self.pixel_texture_disc_ddp = DDP(
+                    pix_disc,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=False,
+                    broadcast_buffers=False,
+                )
+            if self.is_main_process:
+                _pix_total = sum(p.numel() for p in pix_disc.parameters())
+                _pix_train = sum(
+                    p.numel() for p in pix_disc.parameters()
+                    if p.requires_grad
+                )
+                # WARNING, not info: a WIRING claim (was D actually
+                # DDP-wrapped? did the arm come up at all?) plus the
+                # param counts §12 calibration reads. ``logging.info`` in
+                # this trainer is invisible whenever a root handler is
+                # installed before basicConfig runs -- see
+                # ``_pix_emit_actionable``. The stderr leg that helper
+                # also carries cannot be added here: this block is exec'd
+                # by testing/test_pixgan_trainer_wiring.py against a
+                # namespace holding a recording ``logging`` stub and no
+                # ``sys``, and that file is not this package's to change.
+                # WARNING alone already clears the failure mode.
+                logging.warning(
+                    "[ActionForcing] Pixel-texture discriminator built: "
+                    "params_total=%.2fM params_trainable=%.2fM "
+                    "(DDP=%s, gan_enabled=%s)",
+                    _pix_total / 1e6, _pix_train / 1e6,
+                    self.pixel_texture_disc_ddp is not None,
+                    self.gan_enabled,
+                )
+
+        # ------------------------------------------------------------------
+        # WP-SURROGATE (B3) — latent surrogate critic. BUILD STEP ONLY this
+        # window; see docs/WP_SURROGATE.md for the full mechanism. Sits
+        # immediately after the pixel critic above because that critic IS
+        # this one's teacher (``pixel_texture_disc o decode``) — matching
+        # the teacher-before-student ordering the mechanism uses everywhere
+        # else.
+        #
+        # Gate: ``surrogate_critic_enabled`` (default False), independent
+        # of ``gan_pixel_texture_enabled`` AT BUILD TIME — the critic can
+        # be constructed with no teacher connected. A real distillation
+        # step needs the pixel critic, but nothing here enforces that
+        # dependency at BUILD time. The per-step wiring is landed
+        # (2026-08-24, MAIN under researcher order,
+        # docs/TASK_SURROGATE_CONSUMPTION.md): consumption branch in
+        # ``_compute_pixel_texture_g_loss``, distillation in
+        # ``_maybe_run_surrogate_distillation`` (called right after the
+        # pixel D-updates), FAIL-LOUD save/resume (save block in
+        # causal_rolling_staircase_train.py, restore in ``_maybe_resume``
+        # here). ``_maybe_run_surrogate_distillation`` enforces the
+        # teacher dependency at RUN time (missing pixel disc -> regime
+        # flag, missing distiller while enabled -> raise).
+        #
+        # ``build_from_config`` (model/latent_texture_critic.py) is the
+        # ONLY place these config keys are read — the fix for the seam
+        # class this campaign kept finding (a knob read off two different
+        # objects, or read correctly but never observably reaching its
+        # consumer). This block is therefore exactly the four-line call the
+        # seam tests were written against, plus a resolved-value echo
+        # (docs/WP_PIXGAN.md's rule: log what was ACTUALLY built off the
+        # live objects, not what the config requested).
+        # ------------------------------------------------------------------
+        from model.latent_texture_critic import build_from_config
+        (
+            self.latent_texture_critic,
+            self.latent_critic_optimizer,
+            self.latent_texture_distiller,
+        ) = build_from_config(self.config, device=self.device)
+        # Derived, never independently read off config — so this flag can
+        # never drift from what was actually built (the seam class above).
+        self.surrogate_critic_enabled = self.latent_texture_critic is not None
+        if self.surrogate_critic_enabled and self.is_main_process:
+            logging.info(
+                "[ActionForcing] Latent surrogate critic built: "
+                "params=%.2fM d_model=%d num_blocks=%d "
+                "pix_teacher_refresh_every=%d grad_loss_normalize=%s "
+                "grad_loss_weight=%.4g value_loss_weight=%.4g "
+                "cache_capacity=%d teacher_use_checkpoint=%s",
+                self.latent_texture_critic.num_params / 1e6,
+                self.latent_texture_critic.d_model,
+                self.latent_texture_critic.num_blocks,
+                self.latent_texture_distiller.pix_teacher_refresh_every,
+                self.latent_texture_distiller.grad_loss_normalize,
+                self.latent_texture_distiller.grad_loss_weight,
+                self.latent_texture_distiller.value_loss_weight,
+                self.latent_texture_distiller.cache.capacity,
+                self.latent_texture_distiller.teacher_use_checkpoint,
+            )
+            if (not getattr(self, "gan_pixel_texture_enabled", False)
+                    and str(getattr(
+                        self.config, "surrogate_teacher_backbone", "pixel",
+                    )) == "pixel"
+                    and self.is_main_process):
+                # Found on the 2026-08-24 consumption-wiring review: BOTH
+                # consumption sites are structurally gated on the pixel
+                # critic being present (``_compute_pixel_texture_g_loss``
+                # returns before ever reaching the surrogate branch when
+                # ``gan_pixel_texture_enabled`` is False;
+                # ``_maybe_run_surrogate_distillation`` early-returns on
+                # ``pixel_texture_disc is None``, which is exactly this
+                # case). So this exact configuration builds a full critic
+                # + optimizer + distiller that will NEVER train and NEVER
+                # be consumed for the whole run -- indistinguishable, from
+                # the INFO line above, from a working surrogate. A WARNING
+                # here (not a raise -- validating gate combinations is out
+                # of this window's authorized scope, docs/
+                # TASK_SURROGATE_CONSUMPTION.md §5) closes the "looks
+                # active, is inert" gap the campaign kept finding
+                # elsewhere, without changing what any existing config does.
+                logging.warning(
+                    "[ActionForcing] surrogate_critic_enabled=true but "
+                    "gan_pixel_texture_enabled=false: the surrogate critic "
+                    "just built will NEVER train (no teacher) and NEVER be "
+                    "consumed by the generator (the G-term branch is "
+                    "unreachable without the pixel critic) for this entire "
+                    "run. This is not an error, but it is very likely not "
+                    "what was intended -- set gan_pixel_texture_enabled=true "
+                    "as well, or surrogate_critic_enabled=false.",
+                )
+
+        # ------------------------------------------------------------------
+        # WP-SURROGATE (B3) — TEACHER BACKBONE selection (researcher
+        # directive, 2026-08-24 afternoon): this branch's surrogate teacher
+        # must be a PRETRAINED pixel discriminator, not the from-scratch
+        # PatchGAN. ``surrogate_teacher_backbone: sam2`` restores the
+        # 835b1df teacher identity — frozen SAM2 Hiera-B+ encoder +
+        # trainable ADM 2D heads (model/r3gan_sam2.py, restored verbatim).
+        # Default stays "pixel" so every existing config is byte-identical;
+        # the from-scratch teacher remains available to B1's own arm.
+        # ------------------------------------------------------------------
+        self.surrogate_teacher_backbone = str(
+            getattr(self.config, "surrogate_teacher_backbone", "pixel")
+        )
+        self.sam2_teacher_disc = None
+        self.sam2_teacher_optimizer = None
+        if (self.surrogate_critic_enabled
+                and self.surrogate_teacher_backbone in ("sam2", "dinov2", "convnext")):
+            _bk = self.surrogate_teacher_backbone
+            if _bk != "sam2":
+                # dinov2 / convnext -- pretrained ALTERNATIVES so the
+                # teacher basis is measured, not assumed. Same ADM heads
+                # as sam2 (pretrained_pixel_disc reuses _R3GANDiscHeads
+                # verbatim), so an arm-to-arm delta is attributable to the
+                # FEATURE BASIS alone. res=None -> that backbone's own
+                # default, each clearing the head's 8x8 minimum.
+                from model.pretrained_pixel_disc import PretrainedPixelDisc
+                _res = getattr(self.config, f"surrogate_{_bk}_resolution", None)
+                _var = getattr(self.config, f"surrogate_{_bk}_variant", None)
+                _lay = getattr(self.config, f"surrogate_{_bk}_layers", None)
+                _s2 = PretrainedPixelDisc(
+                    _bk,
+                    variant=(str(_var) if _var else None),
+                    layers=(list(_lay) if _lay else None),
+                    image_resolution=(int(_res) if _res else None),
+                    device=self.device, dtype=torch.float32,
+                    pad_to_square=bool(getattr(
+                        self.config, f"surrogate_{_bk}_pad_to_square", True)),
+                    frame_pool=str(getattr(
+                        self.config, f"surrogate_{_bk}_frame_pool", "mean")),
+                )
+            else:
+                from model.r3gan_sam2 import R3GANDiscriminatorSAM2Pixel
+                _s2_ckpt = getattr(
+                    self.config, "surrogate_sam2_checkpoint_path", None,
+                )
+                _s2_cfg = getattr(
+                    self.config, "surrogate_sam2_config_path", None,
+                )
+                if not _s2_ckpt or not _s2_cfg:
+                    raise ValueError(
+                        "surrogate_teacher_backbone=sam2 requires "
+                        "surrogate_sam2_checkpoint_path and "
+                        "surrogate_sam2_config_path."
+                    )
+                _s2 = R3GANDiscriminatorSAM2Pixel(
+                    sam2_checkpoint_path=str(_s2_ckpt),
+                    sam2_config_path=str(_s2_cfg),
+                    image_resolution=int(getattr(
+                        self.config, "surrogate_sam2_resolution", 512)),
+                    device=self.device,
+                    dtype=torch.float32,
+                    preserve_aspect=bool(getattr(
+                        self.config, "surrogate_sam2_preserve_aspect", True)),
+                    pad_to_square=bool(getattr(
+                        self.config, "surrogate_sam2_pad_to_square", False)),
+                    frame_pool=str(getattr(
+                        self.config, "surrogate_sam2_frame_pool", "mean")),
+                )
+            _s2.train()  # heads -> train; encoder pinned eval by class
+            self.sam2_teacher_disc = _s2
+            self.sam2_teacher_optimizer = torch.optim.Adam(
+                _s2.heads_module.parameters(),
+                lr=float(getattr(
+                    self.config, f"surrogate_{_bk}_lr",
+                    getattr(self.config, "surrogate_sam2_lr", 2e-4))),
+                betas=(0.0, 0.9),
+            )
+            # NOTE deliberately NO DDP wrap in this window: the SAM2 heads
+            # D-update runs identically on every rank (crops come from the
+            # rank-synced private generator), and the smoke asserts
+            # mechanics, not multi-rank optimality. Heads-only DDP (the
+            # ancestor's gan_sam2_distilled_critic topology) is the
+            # follow-up when this graduates from smoke to arm.
+            if self.is_main_process:
+                _s2_total = sum(p.numel() for p in _s2.parameters())
+                _s2_train = sum(
+                    p.numel() for p in _s2.heads_module.parameters()
+                    if p.requires_grad
+                )
+                logging.info(
+                    "[ActionForcing] PRETRAINED surrogate teacher built: "
+                    "backbone=%s params_total=%.1fM heads_trainable=%.2fM "
+                    "resolution=%d lr=%.2g (encoder frozen)",
+                    self.surrogate_teacher_backbone, _s2_total / 1e6, _s2_train / 1e6,
+                    _s2.image_resolution,
+                    self.sam2_teacher_optimizer.param_groups[0]["lr"],
+                )
 
         # ------------------------------------------------------------------
         # SC-DMD (Salt) — semigroup defect regularizer. Default OFF.
@@ -1236,6 +1777,88 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # simulation inside generator_loss / critic_loss.
         self.model.inference_pipeline = self.pipeline
 
+        # ------------------------------------------------------------------
+        # WP-PIXGAN (B1 / T3-B) — CONFIG -> PIPELINE SEAM for the A23 gate.
+        #
+        # ``pipeline/action_forcing_training.py`` reads this gate as a PLAIN
+        # ATTRIBUTE ON ITSELF inside
+        # ``ActionForcingTrainingPipeline.generate_chunk_with_cache``:
+        # ``getattr(self, "pix_finish_grad_enabled", False)``. That is that
+        # file's convention and not ours to change. This trainer reads the
+        # knob off ``self.config``. Nothing connected the two, so
+        # ``pix_finish_grad_enabled=true`` on the launch line set the
+        # trainer's view True while the pipeline's stayed False: the grad
+        # buffer was never built, ``finish_denoised_chunk_grad`` published
+        # None, and the ladder-fake path could not run at all. Found by a
+        # live 60-step smoke; the override guard's "merged silently, NO
+        # effect" report was a TRUE POSITIVE.
+        #
+        # THE RECEIVER IS ``self.pipeline``, NOT ``self.model``. Both exist
+        # and both are plausible: ``self.model`` is the ActionForcingDMD
+        # module and ``self.pipeline`` is the ActionForcingTrainingPipeline,
+        # and the trainer even cross-links them
+        # (``self.model.inference_pipeline = self.pipeline`` above). Setting
+        # the flag on ``self.model`` compiles, runs, logs, and does nothing
+        # whatsoever — a silent no-op indistinguishable from the original
+        # bug. ``test_flag_lands_on_the_object_whose_class_reads_it`` pins
+        # the receiver by PARSING which class performs the read, so this
+        # cannot drift back.
+        #
+        # Set UNCONDITIONALLY (both True and False), never conditionally:
+        # behaviourally byte-identical when off, because the pipeline's own
+        # read defaults to False when the attribute is absent; but an
+        # explicit False is DISTINGUISHABLE from "nobody ever set it", which
+        # is the difference between a configured-off arm and this exact
+        # plumbing bug recurring silently.
+        # ------------------------------------------------------------------
+        self.pipeline.pix_finish_grad_enabled = bool(
+            getattr(self.config, "pix_finish_grad_enabled", False)
+        )
+        if self.is_main_process:
+            # WARNING + stderr, not info. This line is the ONLY runtime
+            # evidence that the A23 gate reached the object whose class
+            # reads it; the bug it exists to expose (set on self.model
+            # instead of self.pipeline) is a silent no-op that every
+            # value-level check still passes. A proof-of-connection that
+            # is itself only conditionally connected proves nothing --
+            # ``logging.info`` here is invisible whenever a root handler
+            # is installed before basicConfig runs. See
+            # ``_pix_emit_actionable`` for the mechanism; emitted inline
+            # rather than through it because this block is exec'd as a
+            # SEAM fixture against a bare namespace with no bound methods.
+            _a23_msg = (
+                "[ActionForcing] A23 pipeline gate propagated to %s: "
+                "pix_finish_grad_enabled=%s" % (
+                    type(self.pipeline).__name__,
+                    self.pipeline.pix_finish_grad_enabled,
+                )
+            )
+            logging.warning(_a23_msg)
+            print(_a23_msg, file=sys.stderr, flush=True)
+
+        # ------------------------------------------------------------------
+        # exit_exclude_last_rung (MAIN 14:1x, RESEARCHER-APPROVED for the KV
+        # recompute-order probe): excludes the last denoising rung from the
+        # streaming exit draw so the A23 grad path always has a finish rung
+        # to attach to. Default False = byte-identical (the pipeline call
+        # site's previous hardcoded value). This CHANGES THE DMD EXIT
+        # DISTRIBUTION when on -- probe/diagnostic use only, never a
+        # default. Same set-unconditionally + WARNING-echo discipline as
+        # the A23 gate above (same silent-no-op plumbing hazard).
+        # ------------------------------------------------------------------
+        self.pipeline.exit_exclude_last_rung = bool(
+            getattr(self.config, "exit_exclude_last_rung", False)
+        )
+        if self.is_main_process and self.pipeline.exit_exclude_last_rung:
+            _eelr_msg = (
+                "[ActionForcing] exit_exclude_last_rung=True propagated to "
+                "%s: streaming exit rungs sampled from [0, K-1) -- DMD exit "
+                "distribution CHANGED (KV-probe regime)."
+                % type(self.pipeline).__name__
+            )
+            logging.warning(_eelr_msg)
+            print(_eelr_msg, file=sys.stderr, flush=True)
+
         if self.is_main_process:
             logging.info(
                 "[ActionForcing] Pipeline: num_frame_per_block=%d "
@@ -1448,7 +2071,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # ------------------------------------------------------------------
         self.gan_loss_weight = float(getattr(cfg, "gan_loss_weight", 0.05))
         self.gan_r1_gamma = float(getattr(cfg, "gan_r1_gamma", 1.0))
-        self.gan_r2_gamma = float(getattr(cfg, "gan_r2_gamma", 1.0))
         # GAN-vs-DMD rebalancing under the MAE gate. When the MAE gate cuts the
         # DMD weight (teacher unreliable, esp. at high t), the GAN otherwise runs
         # at full strength and can drag the student off the teacher manifold onto
@@ -1518,6 +2140,86 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.gan_max_grad_norm = float(
             getattr(cfg, "gan_max_grad_norm", self.max_grad_norm)
         )
+        # ------------------------------------------------------------------
+        # A4 ``gan_grad_target_norm`` was REMOVED 2026-08-23 (researcher
+        # decision, GAN_REDESIGN.md A4/A15): the cap-only gen-side GAN
+        # gradient rescale was unusable as built (no nan_to_num guard, tau
+        # measured post-``gan_loss_weight``/warmup AND diluted by zero-grad
+        # frames, and one extra teacher-class backward per CHUNK with no
+        # cadence knob). The method, both call sites, the knob parse and all
+        # five ``gan_grad_cap_*`` log keys are gone. A correct gradient
+        # governor can be rebuilt if the need is demonstrated. NOT related to
+        # ``dmd_grad_target_norm``, which is a different, live, DMD-side knob.
+        # The A7 grad telemetry (``gan_grad_telemetry_every`` ->
+        # ``train/gan_grad_norm`` / ``gan_dmd_grad_ratio`` /
+        # ``gan_dmd_grad_cos``) is UNCHANGED and now reports the UNCAPPED
+        # gen-side GAN gradient (previously it read post-cap).
+        # ------------------------------------------------------------------
+        # A5: no-grad decoder tripwire. Every ``texture_tripwire_every``
+        # OUTER steps, decode a small slice of the generator's latents under
+        # ``torch.no_grad()`` and run the anisotropic texture battery
+        # (analysis/texture_stats.py) on the decoded pixels, logging the
+        # result. Purpose: catch a critic gaming a latent-space objective
+        # into decoder artefacts DURING training instead of discovering it in
+        # a 60 s eval two hours later. No backward, no graph, no gradient —
+        # cannot change training behaviour by construction. 0 (default) = off.
+        _ttw = getattr(cfg, "texture_tripwire_every", 0)
+        self.texture_tripwire_every = int(_ttw or 0)
+        if self.texture_tripwire_every < 0:
+            raise ValueError(
+                f"texture_tripwire_every must be >= 0 (0 = off); got "
+                f"{self.texture_tripwire_every}"
+            )
+        # Number of LATENT frames decoded per tripwire fire (the WAN VAE
+        # expands 4x temporally, so 2 latent frames ~ 8 pixel frames).
+        self.texture_tripwire_frames = int(
+            getattr(cfg, "texture_tripwire_frames", 2) or 2
+        )
+        # HF band cut as a fraction of Nyquist (texture_stats convention).
+        self.texture_tripwire_hf_cut = float(
+            getattr(cfg, "texture_tripwire_hf_cut", 0.25)
+        )
+        # When true, ALSO decode the co-located GT latents and log the
+        # sample/reference ratio per battery term (``battery_delta``). Costs
+        # a second no-grad decode; off by default so the tripwire stays cheap.
+        self.texture_tripwire_gt_ref = bool(
+            getattr(cfg, "texture_tripwire_gt_ref", False)
+        )
+        # ------------------------------------------------------------------
+        # A6: real-sample diversity telemetry. Pure logging, no behaviour
+        # change: per discriminator batch, count the unique source rides, the
+        # unique source windows and the repeat rate over the real slots the
+        # D actually consumes. Makes "is the real pool actually diverse"
+        # checkable — it currently is not (docs flag it [UNVERIFIED]).
+        # A6 completion (2026-08-23): covers BOTH real-draw paths now — the
+        # matched draw (inside ``_match_select``) and the POSITIONAL draw,
+        # which the R3 directive ``ladd_gt_transition_match=false`` routes
+        # every step through and which used to emit ZERO keys silently.
+        # Positional rows carry ``gan_real_div_positional=1.0`` so the two
+        # estimators can never be confused, and the telemetry dict is reset
+        # at the top of ``_ladd_run_pair_mode`` so a skipped D-update can no
+        # longer re-emit the previous step's counts as if they were fresh.
+        # False (default) = off, byte-identical.
+        self.gan_real_diversity_log = bool(
+            getattr(cfg, "gan_real_diversity_log", False)
+        )
+        # ------------------------------------------------------------------
+        # A22: held-out discriminator generalisation probe. Default OFF
+        # (``disc_holdout_probe_every=0``) => byte-identical. Only the hot
+        # gate is cached on ``self``; every other knob is read lazily off
+        # ``self.config`` inside ``model/disc_holdout_probe.py`` (see
+        # ``DEFAULTS`` there), so this block never has to grow.
+        # Asks "is D MEMORISING its real training crops?" — distinct from the
+        # A14 positive control ("has D learned to recognise obvious
+        # corruption?") and from the fixed-route eval.
+        # ------------------------------------------------------------------
+        _dhp_every = int(getattr(cfg, "disc_holdout_probe_every", 0) or 0)
+        if _dhp_every < 0:
+            raise ValueError(
+                f"disc_holdout_probe_every must be >= 0 (0 = off); got "
+                f"{_dhp_every}"
+            )
+        self.disc_holdout_probe_every = _dhp_every
         self.r3gan_optimizer: Optional[torch.optim.Optimizer] = None
         if self.gan_enabled and self.r3gan_disc is not None:
             disc_lr = float(getattr(cfg, "gan_lr", 2e-4))
@@ -1546,12 +2248,56 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 logging.info(
                     "[ActionForcing] R3GAN optimizer built: AdamW "
                     "lr=%.2e betas=%s wd=%.4f params=%.2fM "
-                    "(loss_weight=%.4f, R1_gamma=%.3f, R2_gamma=%.3f, "
+                    "(loss_weight=%.4f, R1_gamma=%.3f, "
                     "warmup_steps=%d, gan_updates_per_step=%d)",
                     disc_lr, disc_betas, disc_wd, n_params / 1e6,
                     self.gan_loss_weight, self.gan_r1_gamma,
-                    self.gan_r2_gamma, self.gan_warmup_steps,
+                    self.gan_warmup_steps,
                     self.gan_updates_per_step,
+                )
+
+        # ------------------------------------------------------------------
+        # WP-PIXGAN §5.2 — the pixel critic's own optimizer.
+        # Adam (NOT AdamW: the LADD path above uses AdamW, the pixel spec
+        # says plain Adam — follow the spec), betas (0.0, 0.9),
+        # lr=``pix_gan_lr`` (1e-5). Gated on ``gan_pixel_texture_enabled``
+        # ONLY — independent of ``gan_enabled``.
+        # ------------------------------------------------------------------
+        self.pix_optimizer: Optional[torch.optim.Optimizer] = None
+        if (self.gan_pixel_texture_enabled
+                and self.pixel_texture_disc is not None):
+            from model.pixel_texture_disc import PIX_GAN_BETAS, PIX_GAN_LR
+            pix_lr = float(getattr(cfg, "pix_gan_lr", PIX_GAN_LR))
+            pix_betas = tuple(
+                float(b) for b in getattr(cfg, "pix_gan_betas", PIX_GAN_BETAS)
+            )
+            pix_params = [
+                p for p in self.pixel_texture_disc.parameters()
+                if p.requires_grad
+            ]
+            if not pix_params:
+                raise RuntimeError(
+                    "pixel_texture_disc has no trainable parameters; check "
+                    "the constructor."
+                )
+            self.pix_optimizer = torch.optim.Adam(
+                pix_params,
+                lr=pix_lr,
+                betas=pix_betas,
+            )
+            if self.is_main_process:
+                _pix_n = sum(p.numel() for p in pix_params)
+                # WARNING, not info: ``pix_gan_lr`` / ``pix_gan_betas`` at
+                # their ONE resolution point. This is the number
+                # ``_pix_optimizer_hyper`` later re-reads off param_groups
+                # for the rule-4 echo, and it is a direct §12 calibration
+                # input -- exactly the class that must not be decided by
+                # import order. Same no-stderr-leg reason as the disc
+                # build above.
+                logging.warning(
+                    "[ActionForcing] Pixel-texture optimizer built: Adam "
+                    "lr=%.2e betas=%s params=%.2fM",
+                    pix_lr, pix_betas, _pix_n / 1e6,
                 )
 
         # GAN warmup / disc-start schedule (used by the LADD path).
@@ -2297,6 +3043,79 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _c_corr = generator_log_dict.get("train/critic_disc_corr")
                 if _c_corr is not None:
                     msg_parts.append(f"c_corr={float(_c_corr):+.3f}")
+                # WP-SURROGATE: the two keys that make c_corr DECIDABLE
+                # from the terminal trace alone. Added because the
+                # 2026-08-24 backbone comparison produced a clean sign
+                # flip (sam2 +0.44 vs dinov2 -0.52 at matched step 51)
+                # that could NOT be diagnosed live: c_corr alone cannot
+                # distinguish "the critic is anti-fitting a good teacher"
+                # from "the teacher's values are noise, so any
+                # correlation with them is arbitrary". The first is a
+                # surrogate bug; the second is a teacher that is not
+                # separating real from fake -- opposite fixes.
+                #   t_dloss = the PRETRAINED teacher's own NS-logistic
+                #             D-loss (2*ln2 = 1.386 at init; FLAT means
+                #             the teacher never learned, which makes
+                #             c_corr meaningless rather than alarming)
+                #   c_vloss = the critic's value-distillation MSE (if
+                #             this FALLS while c_corr goes negative, the
+                #             two are inconsistent and something is
+                #             genuinely wrong)
+                _t_dloss = generator_log_dict.get(
+                    "train/surrogate_sam2_d_loss")
+                if _t_dloss is not None:
+                    msg_parts.append(f"t_dloss={float(_t_dloss):.4f}")
+                _c_vloss = generator_log_dict.get(
+                    "train/critic_value_loss")
+                if _c_vloss is not None:
+                    msg_parts.append(f"c_vloss={float(_c_vloss):.4g}")
+                # MANIFOLD GATE measurement (docs/DMD_MANIFOLD_GATE.md).
+                # These two ARE the experiment: dmd_err is DMD's own
+                # error |x0 - pred_real| (teacher competence here), and
+                # align = cos(-grad, GT - x0) is whether the DMD update
+                # actually points at the manifold. align going NEGATIVE
+                # as dmd_err grows is the thesis; the crossover is the
+                # gate threshold. Both on the step line so the crossover
+                # is readable from the terminal trace alone.
+                # Read off the MODEL, not the log dict: dmd_log_dict is
+                # wandb-only and never reaches stderr, so a dict lookup
+                # here silently finds nothing forever. getattr on the
+                # model is the path already proven by
+                # _last_dmd_mae_gate_weight below.
+                for _a, _lbl, _fmt in (
+                    ("_last_dmd_align", "align", "+.3f"),
+                    ("_last_dmd_err", "dmd_err", ".4f"),
+                    ("_last_dmd_gt_dist", "gt_dist", ".4f"),
+                    ("_last_dmd_err_gate_weight", "eg_w", ".3f"),
+                    ("_last_dmd_align_manifold", "align_mf", "+.3f"),
+                    # FINGERPRINT gate (docs/DMD_FINGERPRINT_PROBE.md) —
+                    # the signal that SUPERSEDES eg_w. fp_m is the
+                    # calibrated manifold-localisation score; fp_w* are
+                    # the per-frame weights actually applied to the DMD
+                    # term; fp_share is the mean weight as a fraction of
+                    # the unattenuated 1.0, i.e. how much of DMD survives
+                    # the gate. All start None, so an unavailable one is
+                    # an ABSENT key, never a forgeable 0.0 (which would
+                    # read as "DMD fully gated off").
+                    ("_last_dmd_fp_m", "fp_m", ".3f"),
+                    ("_last_dmd_fp_gate_w_mean", "fp_w", ".3f"),
+                    ("_last_dmd_fp_gate_w_min", "fp_wmin", ".3f"),
+                    ("_last_dmd_fp_gate_w_max", "fp_wmax", ".3f"),
+                    ("_last_dmd_fp_gate_share", "fp_share", ".3f"),
+                ):
+                    _v = getattr(self.model, _a, None)
+                    if _v is not None:
+                        msg_parts.append(f"{_lbl}={float(_v):{_fmt}}")
+                _t_dreal = generator_log_dict.get(
+                    "train/surrogate_sam2_d_real")
+                _t_dfake = generator_log_dict.get(
+                    "train/surrogate_sam2_d_fake")
+                if _t_dreal is not None and _t_dfake is not None:
+                    # Separation, not the raw scores: this is the single
+                    # number that says whether the teacher can tell real
+                    # from fake at all. ~0 => teacher is blind.
+                    msg_parts.append(
+                        f"t_sep={float(_t_dreal) - float(_t_dfake):+.3f}")
                 # MAE diagnostics: surface baseline_last_chunk_mae +
                 # baseline_avg_rollout_mae to stdout so we can detect
                 # student collapse from the iter trace alone (the
@@ -2728,6 +3547,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if not (
             self.action_critic_loss_active
             or self.gan_enabled
+            # WP-PIXGAN: the pixel critic is gated on
+            # ``gan_pixel_texture_enabled``, NOT on ``gan_enabled`` (the two
+            # critics are independent). Without this clause the pixel restore
+            # below would never run and the critic would silently re-init on
+            # every resume — the exact trap this chunk exists to close.
+            or getattr(self, "gan_pixel_texture_enabled", False)
+            # WP-SURROGATE: same trap, same fix, added on review (B3's own
+            # consumption wiring never trains the critic without the pixel
+            # disc present — see ``_maybe_run_surrogate_distillation``'s
+            # graceful no-teacher skip — so ``gan_pixel_texture_enabled``
+            # above already covers every configuration that has real state
+            # to lose. Listed explicitly anyway: that safety currently
+            # depends on an invariant enforced nowhere else, and defense in
+            # depth here costs one line.
+            or getattr(self, "surrogate_critic_enabled", False)
             or self.real_teacher_train_online
             or self.state_probe_aux_active
         ):
@@ -2836,6 +3670,163 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             "resume: r3gan_optimizer load failed: %s. "
                             "Starting r3gan optim from fresh state.", exc,
                         )
+        # ------------------------------------------------------------------
+        # WP-PIXGAN — pixel-texture critic + its Adam. FAIL LOUD.
+        #
+        # Written by ``trainer/causal_rolling_staircase_train.py`` (grep
+        # ``pixel_texture_disc`` in the checkpoint save block); keys
+        # "pixel_texture_disc" / "pix_optimizer" on both sides.
+        #
+        # DO NOT "fix" this back to the tolerant LADD behaviour twenty lines
+        # above. That path deliberately drops shape-mismatched CCM keys and
+        # only logs, because a LADD disc whose cmap_dim changed should still
+        # warm-start its matching 95%. The pixel critic has a FROZEN §4
+        # architecture — there is no legitimate shape drift — and a critic
+        # that silently re-initialises mid-run restarts its warmup and
+        # corrupts the adversarial signal *invisibly*: D collapses back to
+        # ln 2, the G-term goes to noise, and nothing in the logs says so.
+        # A missing key or an unclean load is therefore a HARD ERROR.
+        #
+        # If you are deliberately turning the pixel arm on from a checkpoint
+        # that predates it, start a fresh log_dir (or auto_resume=false) —
+        # do not weaken this check.
+        # ------------------------------------------------------------------
+        if (getattr(self, "gan_pixel_texture_enabled", False)
+                and getattr(self, "pixel_texture_disc", None) is not None):
+            pix_module = (
+                self.pixel_texture_disc_ddp.module
+                if getattr(self, "pixel_texture_disc_ddp", None) is not None
+                else self.pixel_texture_disc
+            )
+            if "pixel_texture_disc" not in state:
+                raise RuntimeError(
+                    "resume: gan_pixel_texture_enabled=true but checkpoint "
+                    f"{path} has no 'pixel_texture_disc' key. Continuing "
+                    "would silently re-initialise the pixel critic, "
+                    "restarting its warmup and corrupting the adversarial "
+                    "signal with no visible symptom. Either resume from a "
+                    "checkpoint written with the pixel arm on, or start a "
+                    "fresh run (auto_resume=false / new log_dir)."
+                )
+            try:
+                pix_missing, pix_unexpected = pix_module.load_state_dict(
+                    state["pixel_texture_disc"], strict=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "resume: 'pixel_texture_disc' state_dict from "
+                    f"{path} did not load cleanly: {exc}. The §4 pixel-critic "
+                    "architecture is frozen, so this means the checkpoint "
+                    "does not belong to this critic. Refusing to continue "
+                    "with a partially-initialised critic."
+                ) from exc
+            if pix_missing or pix_unexpected:
+                # strict=True already raises on these; belt-and-braces so a
+                # future torch that softens strict= cannot reopen the trap.
+                raise RuntimeError(
+                    "resume: 'pixel_texture_disc' loaded with "
+                    f"missing={list(pix_missing)} "
+                    f"unexpected={list(pix_unexpected)} from {path}. "
+                    "A partially-restored critic is a silently corrupted "
+                    "adversarial signal; refusing to continue."
+                )
+            if self.is_main_process:
+                logging.info(
+                    "resume: pixel_texture_disc restored (strict) from %s",
+                    path,
+                )
+            if getattr(self, "pix_optimizer", None) is not None:
+                if "pix_optimizer" not in state:
+                    raise RuntimeError(
+                        "resume: gan_pixel_texture_enabled=true but "
+                        f"checkpoint {path} has no 'pix_optimizer' key. "
+                        "Adam betas (0.0, 0.9) carry the critic's second "
+                        "moment; dropping it silently changes the effective "
+                        "critic learning rate mid-run. Refusing to continue."
+                    )
+                try:
+                    self.pix_optimizer.load_state_dict(state["pix_optimizer"])
+                except Exception as exc:
+                    raise RuntimeError(
+                        "resume: 'pix_optimizer' state from "
+                        f"{path} did not load: {exc}. Unlike the r3gan "
+                        "optimizer above, this is NOT recoverable by "
+                        "restarting from fresh optimizer state — that would "
+                        "silently reset the critic's Adam moments mid-run."
+                    ) from exc
+                if self.is_main_process:
+                    logging.info("resume: pix_optimizer state restored")
+        # ------------------------------------------------------------------
+        # WP-SURROGATE (B3) — latent surrogate critic + its optimizer.
+        # FAIL LOUD, same rationale as the pixel critic above (spec
+        # WP_SURROGATE.md §4.4): a silently re-initialised surrogate hands
+        # the generator a near-zero gradient that reads as "GAN term
+        # present and quiet" on every dashboard. Missing key while enabled
+        # is a HARD ERROR; resume from a pre-surrogate checkpoint means a
+        # fresh log_dir / auto_resume=false, not a weakened check.
+        # ------------------------------------------------------------------
+        if (bool(getattr(self, "surrogate_critic_enabled", False))
+                and getattr(self, "latent_texture_critic", None) is not None):
+            _sur_mod = (
+                self.latent_texture_critic.module
+                if hasattr(self.latent_texture_critic, "module")
+                else self.latent_texture_critic
+            )
+            if "latent_texture_critic" not in state:
+                raise RuntimeError(
+                    "resume: surrogate_critic_enabled=true but checkpoint "
+                    f"{path} has no 'latent_texture_critic' key. Continuing "
+                    "would silently re-initialise the surrogate critic — the "
+                    "generator would consume a zero-init critic whose "
+                    "gradient is noise, with no visible symptom. Resume from "
+                    "a checkpoint written with the surrogate on, or start a "
+                    "fresh run (auto_resume=false / new log_dir)."
+                )
+            try:
+                sur_missing, sur_unexpected = _sur_mod.load_state_dict(
+                    state["latent_texture_critic"], strict=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "resume: 'latent_texture_critic' state_dict from "
+                    f"{path} did not load cleanly: {exc}. Refusing to "
+                    "continue with a partially-initialised surrogate critic."
+                ) from exc
+            if sur_missing or sur_unexpected:
+                raise RuntimeError(
+                    "resume: 'latent_texture_critic' loaded with "
+                    f"missing={list(sur_missing)} "
+                    f"unexpected={list(sur_unexpected)} from {path}. "
+                    "Refusing to continue."
+                )
+            if self.is_main_process:
+                logging.info(
+                    "resume: latent_texture_critic restored (strict) from %s",
+                    path,
+                )
+            if getattr(self, "latent_critic_optimizer", None) is not None:
+                if "latent_critic_optimizer" not in state:
+                    raise RuntimeError(
+                        "resume: surrogate_critic_enabled=true but "
+                        f"checkpoint {path} has no 'latent_critic_optimizer' "
+                        "key. Dropping the Adam moments silently changes the "
+                        "effective critic learning rate mid-run. Refusing to "
+                        "continue."
+                    )
+                try:
+                    self.latent_critic_optimizer.load_state_dict(
+                        state["latent_critic_optimizer"],
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "resume: 'latent_critic_optimizer' state from "
+                        f"{path} did not load: {exc}. Refusing to restart "
+                        "from fresh optimizer state mid-run."
+                    ) from exc
+                if self.is_main_process:
+                    logging.info(
+                        "resume: latent_critic_optimizer state restored",
+                    )
         # ForwardNoiser (CARN) + its optimizer.
         _fn = getattr(self.model, "forward_noiser", None)
         if _fn is not None and "forward_noiser" in state:
@@ -3653,7 +4644,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return action_loss, state_probe_loss, logs
 
     # ------------------------------------------------------------------
-    # R3GAN — RpGAN + R1 + R2.
+    # R3GAN — RpGAN + R1.
     # Trains a separate 3D-conv discriminator on
     #   real = ride["latents"][:, gen_window_start:gen_window_end]
     #   fake = aux["pred_image"]
@@ -3877,6 +4868,2988 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
         logs["train/lpips_n_frames"] = float(n_pick)
         return loss.to(pred_image.dtype), logs
+
+    def _vae_decode_nograd(self, latent: torch.Tensor) -> torch.Tensor:
+        """No-grad VAE decode — the cheap twin of ``_vae_decode_grad``.
+
+        Same self-seeding (``seed_first=True``) decode geometry, but the
+        input is detached and the whole forward runs under ``no_grad`` (no
+        checkpointing needed: nothing is recomputed because there is no
+        backward). Returns ``[B, F_pix, 3, H, W]`` in ``[-1, 1]``.
+
+        Used by the A5 texture tripwire. Deliberately separate from
+        ``_vae_decode_grad`` so no call site can accidentally attach a graph
+        to the tripwire.
+        """
+        vae = getattr(self.model, "vae", None)
+        if vae is None:
+            raise RuntimeError("_vae_decode_nograd requires self.model.vae.")
+        with torch.no_grad():
+            return vae.decode_to_pixel(
+                latent.detach().to(torch.float32), seed_first=True,
+            )
+
+    def _maybe_texture_tripwire(
+        self,
+        pred_latents: torch.Tensor,
+        logs: Dict[str, float],
+        gt_latents: Optional[torch.Tensor] = None,
+    ) -> None:
+        """A5 — no-grad decoder tripwire (default OFF).
+
+        Every ``texture_tripwire_every`` OUTER training steps, decode a
+        small slice of the generator's latents under ``no_grad`` and run the
+        anisotropic texture battery (``analysis/texture_stats.py``) on the
+        decoded pixels. Logged under ``train/tripwire_*``.
+
+        Why decoded pixels and not latents: the A/B/C diagnostic located the
+        failure in the student latent but it is RENDERED as banding — a
+        critic gaming a latent-space objective can look fine in the latent
+        and pathological once decoded. This is the in-training early warning
+        for exactly that, instead of finding it in a 60 s eval two hours
+        later.
+
+        Contract: no gradient, no backward, no state mutation on the model,
+        no collective. ``_streaming_train_one_chunk`` runs several times per
+        outer step, so a ``_tripwire_last_step`` latch keeps it to one fire
+        per step. Any exception is swallowed into a counter — a diagnostic
+        must never take training down.
+        """
+        every = int(getattr(self, "texture_tripwire_every", 0) or 0)
+        if every <= 0 or pred_latents is None:
+            return
+        step = int(getattr(self, "step", 0))
+        if step % every != 0:
+            return
+        if getattr(self, "_tripwire_last_step", None) == step:
+            return
+        self._tripwire_last_step = step
+        try:
+            from analysis.texture_stats import texture_battery, battery_delta
+
+            n_lat = int(pred_latents.shape[1])
+            n_pick = max(1, min(int(self.texture_tripwire_frames), n_lat))
+            # Deterministic slice (the LAST n_pick latent frames): the
+            # tripwire is a trend readout across steps, so a fixed rule
+            # beats a random draw whose variance would swamp the signal.
+            lat = pred_latents[:1, n_lat - n_pick:].detach()
+            hf_cut = float(getattr(self, "texture_tripwire_hf_cut", 0.25))
+            # Defragment before the decode: the decoder wants a large
+            # contiguous workspace and the gen rollout's live activations
+            # leave only fragmented gaps (same reason the graph-on
+            # perceptual decode does this). Only runs on tripwire steps.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            pix = self._vae_decode_nograd(lat)
+            with torch.no_grad():
+                sample = texture_battery(
+                    ((pix.float() + 1.0) * 0.5).clamp(0.0, 1.0),
+                    hf_cut=hf_cut,
+                )
+            for k, v in sample.items():
+                logs[f"train/tripwire_{k}"] = float(v)
+            logs["train/tripwire_fired"] = 1.0
+            logs["train/tripwire_n_lat_frames"] = float(n_pick)
+            if bool(getattr(self, "texture_tripwire_gt_ref", False)) and (
+                gt_latents is not None
+            ):
+                gt_lat = gt_latents[:1, -n_pick:].detach()
+                gt_pix = self._vae_decode_nograd(gt_lat)
+                with torch.no_grad():
+                    ref = texture_battery(
+                        ((gt_pix.float() + 1.0) * 0.5).clamp(0.0, 1.0),
+                        hf_cut=hf_cut,
+                    )
+                for k, v in ref.items():
+                    logs[f"train/tripwire_gt_{k}"] = float(v)
+                for k, v in battery_delta(sample, ref).items():
+                    logs[f"train/tripwire_ratio_{k}"] = float(v)
+            del pix
+        except Exception as _e:  # pragma: no cover - diagnostic only
+            logs["train/tripwire_err"] = 1.0
+            if getattr(self, "is_main_process", True) and getattr(
+                self, "_tripwire_err_logged", 0,
+            ) < 3:
+                self._tripwire_err_logged = getattr(
+                    self, "_tripwire_err_logged", 0) + 1
+                logging.warning(
+                    "[TEXTURE-TRIPWIRE] failed at step %d: %s "
+                    "(diagnostic only; training unaffected)", step, _e,
+                )
+
+    # ==================================================================
+    # WP-PIXGAN (B1 / T3-B) -- real+fake supply and the D-update loop.
+    #
+    # Spec: docs/TEXTURE_GAN_DESIGN.md §2/§3/§5.2/§5.3, docs/WP_PIXGAN.md
+    # §1 (contracts), §2 (fixed decisions), §9 (the §6 memory-budget
+    # CORRECTION -- decode cost scales with pix_crops_per_step ONLY,
+    # because model/disc_holdout_probe.py::_decode_crops decodes the whole
+    # latent crop and only THEN draws the pixel-frame subset).
+    #
+    # Everything in this block is gated on ``gan_pixel_texture_enabled``
+    # (built by T3-A, default False). When the gate is off nothing here
+    # runs, nothing decodes, no log key is emitted and -- critically --
+    # no RNG is consumed: every draw below comes from a PRIVATE
+    # ``torch.Generator`` created inside the gated branch, never from the
+    # global stream.
+    #
+    # NOT in this chunk (T3-C owns them): the generator-side G-term into
+    # ``gen_gan_loss``, the full §7 telemetry surface, the ``pix_*``
+    # config block.
+    # ==================================================================
+
+    # A20/A24/A21 invariants, restated as code-visible constants so a
+    # config typo cannot silently relax them.
+    PIX_BAND_COUNT_PINNED = 3          # A24 -- COARSE thirds, permanent
+    PIX_A21_SUPPORT_FLOOR = 4096       # A21 -- distinct source frames
+    #: A21 -- the STEADY-STATE pool's nominal ceiling
+    #: (``pix_real_pool_windows x pix_lat_frames_per_crop``) measured in
+    #: units of :data:`PIX_A21_SUPPORT_FLOOR`.  A pool that lands ON the
+    #: floor has no margin at all: windows overlap inside a ride (a window
+    #: at ``s`` contributes ``{s, s+1}``, so a window at ``s+1`` adds only
+    #: one new frame), which is why 2,048 x 2 measured 4,069..4,085 rather
+    #: than 4,096 across seeds.  Below this ratio the pool alone cannot
+    #: carry the claim and it rests ENTIRELY on continuous refresh, which
+    #: is a warning, not a failure -- refresh is unbounded, so the floor is
+    #: still reachable.  The FAILURE is the measured one below.
+    PIX_A21_POOL_MARGIN_MIN = 1.25
+    #: A21 -- D-updates allowed to bring the pool from cold to its cap
+    #: before ``pix_a21_support_ok`` stops being a warm-up reading and
+    #: becomes a hard claim.  Default for ``pix_real_pool_warm_updates``.
+    PIX_REAL_POOL_WARM_UPDATES = 64
+    #: A20/A21 -- how many D-updates of drawn source frames the rolling
+    #: reuse gauge remembers.  Default for ``pix_real_reuse_horizon``.
+    PIX_REAL_REUSE_HORIZON = 32
+    #: A20 -- ``pix_real_repeat_frac`` alarm.  The gauge measures GENUINE
+    #: source-frame overlap among one D-update's reals, so a small nonzero
+    #: reading is the expected signature of independent sampling and must
+    #: NOT be fatal (forcing it to exactly 0 is forcing without-replacement
+    #: sampling, i.e. the opposite of independence).  What is fatal is a
+    #: STRUCTURAL break: if frame-within-crop expansion ever leaked to the
+    #: real side, every crop's ``k_frames`` images would share one source
+    #: frame and the fraction would jump to ``(k-1)/k >= 0.5``.  A
+    #: coincidence cannot reach half the batch.
+    PIX_A20_REPEAT_ALARM = 0.5
+    #: §5.3 -- the shipped ``PIX_R1_GAMMA``.  Measured INERT on BOTH
+    #: architectures (R1/d_loss ~ 5e-6 norm-free, ~6e-4 normed; see
+    #: ``model/pixel_texture_disc.py``'s INERT-GAMMA WARNING), so a config
+    #: carrying it is indistinguishable from a config that never
+    #: calibrated.  ``_pix_resolve_r1_gamma`` refuses it.
+    PIX_R1_GAMMA_INERT = 1.0
+
+    # ------------------------------------------------------------------
+    # CONFIG RESOLUTION -- the single place every pix_* knob becomes a
+    # number, and the ONLY place the invariants are checked.
+    # ------------------------------------------------------------------
+    def _pix_resolve_r1_gamma(self) -> float:
+        """§5.3 -- resolve ``pix_r1_gamma``, LOUDLY.
+
+        Symmetry with ``pix_gan_weight``.  That knob is routed through
+        ``model.pixel_texture_disc.resolve_gan_weight(..., strict=True)``
+        so an uncalibrated weight RAISES, and the reason is that a
+        withdrawn default is worse than no default: it launches, it looks
+        configured, and it is wrong.  ``pix_r1_gamma`` was in exactly the
+        same position with none of the protection -- its module default
+        ``PIX_R1_GAMMA = 1.0`` is MEASURED INERT on both architectures
+        (R1/d_loss ~= 3.7e-06..7.6e-06 norm-free, 4.5e-04..9.6e-04 normed,
+        against ``d_loss = 2 ln 2``; the gamma that would put R1 at 0.1 %
+        of ``d_loss`` is 131..273 on the shipped build).  So an arm could
+        launch with R1 switched OFF while ``train/pix_r1_rate`` read a
+        confident 1.00: the penalty fires on every D-update and
+        contributes nothing.
+
+        Both "absent" and "still carrying the inert shipped default" are
+        therefore refused.  Two values pass:
+
+          * any calibrated positive gamma (calibrate from a measured
+            ``train/pix_r1_grad_sq_mean``, §5.3);
+          * an explicit ``0.0`` -- R1 deliberately OFF, the exact analogue
+            of the ``pix_gan_weight=0.0`` weight-free probe.  It is a
+            choice, it is visible in the resolved-config echo, and
+            ``train/pix_r1_disabled`` marks it in the trace.
+
+        There is no acknowledgement flag for 1.0.  An arm that genuinely
+        wants no R1 asks for 0.0 and says so.
+        """
+        raw = getattr(self.config, "pix_r1_gamma", None)
+        if raw is None:
+            raise ValueError(
+                "pix_r1_gamma is not calibrated (None). §5.3's gamma is "
+                "tied to the crop it was measured at and was NEVER "
+                "calibrated on the shipped norm-free critic; there is no "
+                "value to inherit. Calibrate it from a measured "
+                "train/pix_r1_grad_sq_mean, or pass an explicit 0.0 to run "
+                "with R1 deliberately OFF."
+            )
+        try:
+            g = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"pix_r1_gamma={raw!r} is not a number."
+            )
+        if not math.isfinite(g):
+            raise ValueError(
+                f"pix_r1_gamma={g!r} is not finite."
+            )
+        if g < 0.0:
+            raise ValueError(
+                f"pix_r1_gamma={g} is negative: R1 is a PENALTY, and a "
+                "negative gamma rewards a sharp critic."
+            )
+        if g == float(self.PIX_R1_GAMMA_INERT):
+            raise ValueError(
+                "pix_r1_gamma=%r is the INERT shipped default and is "
+                "REFUSED. It is not a weak setting, it is an absent one: "
+                "at this gamma R1/d_loss measures 3.7e-06..7.6e-06 on the "
+                "shipped norm-free critic (4.5e-04..9.6e-04 with the "
+                "GroupNorm), i.e. below 0.001 %% of d_loss, so the arm "
+                "would train with R1 OFF while train/pix_r1_rate reads "
+                "1.00. The gamma that puts R1 at 0.1 %% of d_loss is "
+                "131..273. Calibrate from a measured "
+                "train/pix_r1_grad_sq_mean, or pass an explicit 0.0 to "
+                "mean it." % (self.PIX_R1_GAMMA_INERT,)
+            )
+        return g
+
+    def _pix_resolve_cfg(self) -> Dict[str, Any]:
+        """Resolve + VALIDATE the whole ``pix_*`` block, once, up front.
+
+        Every invariant that a config typo could relax lives HERE, not in
+        one of the consumers.  The A24 band pin used to sit inside the
+        D-loop, AFTER two early returns, while
+        :meth:`_compute_pixel_texture_g_loss` read ``pix_band_count`` with
+        no pin at all and ran EARLIER in the step.  A pin enforced by one
+        of two consumers, late, is a pin with a hole in it; a pin enforced
+        at resolution time is enforced for everyone who resolves, which is
+        now both consumers and the constructor.
+
+        Raises (never warns) on: a tightened A24 band count, degenerate
+        crop/frame counts, ``pix_reals_per_fake < 1``, a frozen real pool
+        (``pix_real_pool_refresh < 1`` -- A21 requires CONTINUOUS refresh,
+        so 0 is not "cheap", it is the memorisation hazard by
+        construction), and an uncalibrated ``pix_r1_gamma``.
+
+        WARNS once on a real pool whose steady-state ceiling does not
+        clear :data:`PIX_A21_SUPPORT_FLOOR` by
+        :data:`PIX_A21_POOL_MARGIN_MIN`.  Not fatal, and deliberately so:
+        since refresh keeps admitting after the pool reaches its cap
+        (FIFO eviction), cumulative distinct-source support is UNBOUNDED
+        in the pool size and the floor stays reachable from any pool.  The
+        margin is about how much of the claim the pool itself carries.
+        The claim that DOES fail hard is the measured one, asserted in the
+        D-loop once warm-up is over.
+        """
+        from model.pixel_texture_disc import (
+            PIX_BAND_COUNT, PIX_CROP_LAT, PIX_CROPS_PER_STEP,
+            PIX_DECODE_BORDER_TRIM, PIX_FRAMES_PER_CROP, PIX_LOSS_FORM,
+            PIX_R1_SIGMA, PIX_REALS_PER_FAKE,
+        )
+
+        cfg = self.config
+        crop_lat = tuple(getattr(cfg, "pix_crop_lat", PIX_CROP_LAT))
+        n_bands = int(getattr(cfg, "pix_band_count", PIX_BAND_COUNT))
+        # A24 is PINNED. pix_band_count is registered so an override is not
+        # misreported, not so it can be tightened: every approach toward
+        # exact-y matching (more bands, per-row bands, bands that scale with
+        # row count, +-tolerance matching) is forbidden and permanent.
+        if n_bands != self.PIX_BAND_COUNT_PINNED:
+            raise ValueError(
+                f"pix_band_count={n_bands} rejected. A24 pins COARSE thirds "
+                f"({self.PIX_BAND_COUNT_PINNED}); raising the band count is "
+                "the first step toward exact-y matching, which is forbidden "
+                "and permanent (docs/WP_PIXGAN.md §2)."
+            )
+        n_crops = int(getattr(cfg, "pix_crops_per_step", PIX_CROPS_PER_STEP))
+        k_frames = int(getattr(cfg, "pix_frames_per_crop", PIX_FRAMES_PER_CROP))
+        if n_crops < 1 or k_frames < 1:
+            raise ValueError(
+                f"pix_crops_per_step={n_crops} / pix_frames_per_crop="
+                f"{k_frames} must both be >= 1. A degenerate count would "
+                "produce empty crop/origin lists and turn the §7 means into "
+                "forged zeros."
+            )
+        reals_per_fake = int(
+            getattr(cfg, "pix_reals_per_fake", PIX_REALS_PER_FAKE)
+        )
+        if reals_per_fake < 1:
+            raise ValueError(
+                "pix_reals_per_fake must be >= 1: A20 is an invariant (one "
+                "independently sourced real per fake), not a budget."
+            )
+        lat_frames = max(1, int(getattr(cfg, "pix_lat_frames_per_crop", 2)))
+        pool_windows = int(getattr(cfg, "pix_real_pool_windows", 2048))
+        if pool_windows < 1:
+            raise ValueError(
+                f"pix_real_pool_windows={pool_windows} must be >= 1."
+            )
+        refresh = int(getattr(cfg, "pix_real_pool_refresh", 8))
+        if refresh < 1:
+            raise ValueError(
+                f"pix_real_pool_refresh={refresh} rejected. A21 requires the "
+                "real pool to be CONTINUOUSLY REFRESHED -- 0 freezes it into "
+                "exactly the mini-dataset D can memorise, which is the "
+                "hazard A21 exists to prevent, not a cheaper setting."
+            )
+        warm_updates = int(getattr(
+            cfg, "pix_real_pool_warm_updates", self.PIX_REAL_POOL_WARM_UPDATES,
+        ))
+        if warm_updates < 1:
+            raise ValueError(
+                f"pix_real_pool_warm_updates={warm_updates} must be >= 1."
+            )
+        reuse_horizon = int(getattr(
+            cfg, "pix_real_reuse_horizon", self.PIX_REAL_REUSE_HORIZON,
+        ))
+        if reuse_horizon < 1:
+            raise ValueError(
+                f"pix_real_reuse_horizon={reuse_horizon} must be >= 1."
+            )
+        r1_num = getattr(cfg, "pix_r1_num_samples", None)
+        r1_num = None if r1_num is None else int(r1_num)
+        r1_gamma = self._pix_resolve_r1_gamma()
+        # Knobs that used to be read straight off ``cfg`` at their consumer
+        # AND again, independently, in the resolved-config echo. That is the
+        # second-resolution-point defect wearing a different hat: the echo
+        # is the artefact a reader TRUSTS to settle what ran, so an echo
+        # sourced from anywhere other than the resolution point is the one
+        # place a drift is guaranteed not to be noticed.
+        #
+        # Not routed here, deliberately (each has a consumer that must not
+        # reach a validating resolver):
+        #   pix_finish_grad_enabled -- read in _build_pipeline, OUTSIDE the
+        #     pixel gate; resolving there would raise for every non-pixgan
+        #     run. The D-loop reads it ONCE into a local instead.
+        #   pix_gan_weight -- its authoritative resolution is
+        #     model.pixel_texture_disc.resolve_gan_weight(strict=True) in
+        #     _pix_gen_weight; a second, laxer copy here is the exact defect
+        #     this block exists to prevent.
+        #   pix_poscontrol_* -- _pix_positive_control must do NO work when
+        #     off (§8.1: not a tensor, not a decode, not an RNG draw), and a
+        #     whole-block resolve above its gate is work.
+        r1_every_n = int(getattr(cfg, "pix_r1_every_n", 1))
+        seed = int(getattr(cfg, "pix_seed", 20260823))
+        rank_synced = bool(
+            getattr(cfg, "pix_real_draw_rank_synced", False)
+        )
+        # §5.2 / RESEARCHER EXPOSURE DIRECTIVE (2026-08-24) --
+        # ``pix_gan_updates_per_step`` is FOLLOW-BY-DEFAULT: null/absent
+        # means "follow ``gan_updates_per_step``" (5 in the ganfix arms,
+        # matching the LADD disc's cadence), and a pinned integer still
+        # wins if set. The old shape -- a getattr whose DEFAULT was the
+        # follow -- meant the config's pinned 1 silently capped the pixel
+        # critic at 1/5th of the LADD cadence while reading as if it
+        # followed. Resolved HERE (one read site); the derived value AND
+        # its source are echoed (``pix_gan_updates_per_step_derived`` /
+        # ``..._followed``) so the trace settles what ran.
+        _updates_pinned = getattr(cfg, "pix_gan_updates_per_step", None)
+        if _updates_pinned is None:
+            n_updates = int(getattr(self, "gan_updates_per_step", 1))
+            updates_followed = True
+        else:
+            n_updates = int(_updates_pinned)
+            updates_followed = False
+        if n_updates < 0:
+            raise ValueError(
+                f"pix_gan_updates_per_step={n_updates} must be >= 0 "
+                "(0 = no D-updates this step; negative is meaningless)."
+            )
+
+        pool_ceiling = int(pool_windows) * int(lat_frames)
+        pool_margin = float(pool_ceiling) / float(self.PIX_A21_SUPPORT_FLOOR)
+        if (pool_margin < float(self.PIX_A21_POOL_MARGIN_MIN)
+                and not getattr(self, "_pix_pool_margin_warned", False)):
+            self._pix_pool_margin_warned = True
+            logging.warning(
+                "[pixgan] A21: pix_real_pool_windows=%d x "
+                "pix_lat_frames_per_crop=%d = %d nominal source frames, "
+                "only %.2fx the %d floor (want >= %.2fx). Windows OVERLAP "
+                "inside a ride, so the realised ceiling is below the "
+                "nominal one; the A21 claim then rests entirely on "
+                "continuous refresh (%d window(s)/D-update).",
+                pool_windows, lat_frames, pool_ceiling, pool_margin,
+                int(self.PIX_A21_SUPPORT_FLOOR),
+                float(self.PIX_A21_POOL_MARGIN_MIN), refresh,
+            )
+
+        return {
+            "crop_lat": crop_lat,
+            "crop_rows": int(crop_lat[0]),
+            "crop_cols": int(crop_lat[1]),
+            "n_crops": n_crops,
+            "k_frames": k_frames,
+            "n_bands": n_bands,
+            "reals_per_fake": reals_per_fake,
+            "lat_frames": lat_frames,
+            "border": int(
+                getattr(cfg, "pix_decode_border_trim", PIX_DECODE_BORDER_TRIM)
+            ),
+            "loss_form": str(getattr(cfg, "pix_loss_form", PIX_LOSS_FORM)),
+            "decode_batch": int(getattr(cfg, "pix_decode_batch", 4)),
+            "r1_gamma": r1_gamma,
+            "r1_sigma": float(getattr(cfg, "pix_r1_sigma", PIX_R1_SIGMA)),
+            "r1_num": r1_num,
+            "pool_windows": pool_windows,
+            "pool_refresh": refresh,
+            "pool_warm_updates": warm_updates,
+            "reuse_horizon": reuse_horizon,
+            "pool_ceiling_frames": pool_ceiling,
+            "pool_margin": pool_margin,
+            "r1_every_n": r1_every_n,
+            "seed": seed,
+            "real_draw_rank_synced": rank_synced,
+            "n_updates": int(n_updates),
+            "n_updates_followed": bool(updates_followed),
+        }
+
+    def _pix_sync_generator(
+        self, current_step: int, update_idx: int, *, salt: int = 0,
+    ) -> torch.Generator:
+        """A rank-consistent CPU ``torch.Generator`` for one D-update.
+
+        DDP contract (mirrors ``_sample_critic_grad_frame_indices``): the
+        SEED is drawn on rank 0 and ``dist.broadcast``-ed, so every draw
+        taken from the returned generator is bit-identical on every rank.
+        That is strictly stronger than broadcasting each index tensor and
+        costs one 1-element collective per D-update instead of one per
+        draw.  The band plan, the crop offsets, the pixel-frame subset and
+        the R1 subsample all come from this generator.
+
+        It is a PRIVATE generator: it never touches the global RNG stream,
+        which is what makes the gate-off path byte-identical (no global
+        draw is added, and no draw is re-ordered).
+
+        ``salt`` separates independent draw streams inside one update.
+        """
+        base = int(self._pix_resolve_cfg()["seed"])
+        val = (
+            base * 1000003
+            + int(current_step) * 9176
+            + int(update_idx) * 31
+            + int(salt) * 7919
+        ) % (2 ** 31 - 1)
+        dev = self.device if torch.cuda.is_available() else torch.device("cpu")
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            t = (
+                torch.tensor([val], dtype=torch.long, device=dev)
+                if rank == 0
+                else torch.empty(1, dtype=torch.long, device=dev)
+            )
+            dist.broadcast(t, src=0)
+            val = int(t.item())
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(val))
+        return gen
+
+    def _pix_rank_generator(self, current_step: int, update_idx: int) -> torch.Generator:
+        """Per-RANK generator for the real-supply *data* draws.
+
+        Deliberately NOT rank-synced.  Which ride/window each rank loads is
+        a data-sharding decision, exactly like the training batch: if every
+        rank loaded the identical reals the effective real support would be
+        divided by ``world_size`` for no benefit.  Nothing computed from
+        this generator enters a quantity that is all-reduced across ranks
+        -- the D gradient is averaged over per-rank *samples*, which is the
+        whole point of data-parallel training.  Draws that DO feed a shared
+        quantity (band plan, crop offsets, R1 subsample/eps) come from
+        :meth:`_pix_sync_generator` instead.
+
+        Set ``pix_real_draw_rank_synced: true`` to force the rank-synced
+        stream here as well (diagnostic only -- it shrinks real support).
+        """
+        rc = self._pix_resolve_cfg()
+        if bool(rc["real_draw_rank_synced"]):
+            return self._pix_sync_generator(current_step, update_idx, salt=5)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        base = int(rc["seed"])
+        val = (
+            base * 7919
+            + int(current_step) * 104729
+            + int(update_idx) * 1301
+            + (rank + 1) * 15485863
+        ) % (2 ** 31 - 1)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(val))
+        return gen
+
+    # ------------------------------------------------------------------
+    # §3.6 / A24 -- the crop helper.  COMMITTED CROSS-PACKAGE CONTRACT.
+    # ------------------------------------------------------------------
+    def _pix_take_crops_with_origins(
+        self,
+        source: torch.Tensor,
+        *,
+        n_crops: int,
+        crop_rows: int,
+        crop_cols: int,
+        n_bands: int,
+        gen: torch.Generator,
+        bands: Optional[Sequence[int]] = None,
+        offs_y: Optional[Sequence[int]] = None,
+    ) -> Tuple[torch.Tensor, List[int], List[int], List[int]]:
+        """Draw ``n_crops`` latent crops AND RETURN THEIR ORIGINS.
+
+        ``source``: ``[N, F, C, H, W]`` latents.  Pure slicing -- the
+        autograd graph of ``source`` is preserved, so this is the helper
+        both the grad-on fake path and the ``no_grad`` D-loop use.  What
+        separates grad from no-grad is the *decode* helper you call next
+        (:meth:`_pix_decode_crops_grad` vs
+        :meth:`_pix_decode_crops_nograd`), which are two DIFFERENTLY NAMED
+        functions on purpose (docs/WP_PIXGAN.md §4 commitment 1): a
+        ``no_grad`` helper with a ``grad=True`` flag would let a caller
+        land on the wrong one by defaulting.
+
+        Returns ``(crops, ys, xs, bands)``:
+          * ``crops``: ``[n_crops, F, C, crop_rows, crop_cols]``
+          * ``ys``:    top-row origin of each crop, in **LATENT rows**
+          * ``xs``:    left-col origin of each crop, in **LATENT cols**
+          * ``bands``: A24 band index of each crop, in ``[0, n_bands)``
+
+        WHY the origins are returned (docs/WP_PIXGAN.md §4 commitment 2):
+        ``model/disc_holdout_probe.py::take_crops`` draws ``x`` internally
+        and throws it away, and that file is not WP-PIXGAN's to edit.
+        WP-SURROGATE (B3) consumes ``(y0, x0)`` in latent rows/cols for its
+        positional embedding, so this signature is a recorded commitment --
+        it is stable and must not be reordered.
+
+        ``ys`` still comes from ``disc_holdout_probe.band_plan``, so A24's
+        coarse banding is bit-for-bit the probe's: the admissible offset
+        range is split into ``n_bands`` equal bins and the band index is
+        drawn uniformly.  ``xs`` is drawn uniformly and independently --
+        horizontal position is not stratified (dashcam content is not
+        horizontally structured the way sky/building/road is vertically).
+
+        ``bands``/``offs_y`` may be supplied to REPLAY a fake's plan onto
+        the real side; that is how the A24 real/fake band pairing is
+        enforced (every paired real is drawn from the same band, and the
+        mismatch counter is asserted 0).
+        """
+        from model.disc_holdout_probe import band_plan
+
+        if source.dim() != 5:
+            raise ValueError(
+                "_pix_take_crops_with_origins expects [N,F,C,H,W]; got "
+                f"{tuple(source.shape)}"
+            )
+        n, _f, _c, h, w = source.shape
+        cr = min(int(crop_rows), int(h))
+        cc = min(int(crop_cols), int(w))
+        if bands is None or offs_y is None:
+            b_list, y_list = band_plan(
+                int(n_crops), int(h), cr, int(n_bands), gen,
+            )
+        else:
+            b_list = [int(b) for b in bands]
+            y_list = [int(y) for y in offs_y]
+            if len(b_list) != int(n_crops) or len(y_list) != int(n_crops):
+                raise ValueError(
+                    "_pix_take_crops_with_origins: replayed bands/offs_y must "
+                    f"have length n_crops={int(n_crops)}"
+                )
+        x_hi = max(1, int(w) - cc + 1)
+        picks: List[torch.Tensor] = []
+        ys: List[int] = []
+        xs: List[int] = []
+        for y in y_list:
+            i = int(torch.randint(0, int(n), (1,), generator=gen).item())
+            x0 = int(torch.randint(0, x_hi, (1,), generator=gen).item())
+            y0 = max(0, min(int(y), int(h) - cr))
+            picks.append(source[i, :, :, y0:y0 + cr, x0:x0 + cc])
+            ys.append(int(y0))
+            xs.append(int(x0))
+        return torch.stack(picks, dim=0), ys, xs, [int(b) for b in b_list]
+
+    # ------------------------------------------------------------------
+    # §3.2 -- latent-crop-then-decode.  TWO helpers, two names.
+    # ------------------------------------------------------------------
+    def _pix_vae_dtype(self) -> torch.dtype:
+        """The dtype the WAN VAE's own weights are in -- DERIVED, not assumed.
+
+        The WAN VAE is loaded in fp32 while the streaming latents this
+        trainer carries are bf16, and ``F.conv3d`` refuses the mix:
+
+            RuntimeError: Input type (c10::BFloat16) and bias type (float)
+                          should be the same
+
+        That is the exact crash that killed run 6113341 at step ~16 in
+        ``wan/modules/vae.py`` (``x = self.conv2(z)``), and it is the SAME
+        hazard ``configs/action_forcing_phase3_dmd.yaml`` documents on
+        ``boundary_vae_roundtrip: false`` -- disabled there rather than
+        fixed.  The other decode call sites never tripped it because they
+        cast the decode's OUTPUT (``_vae_decode_grad(x).to(float32)``),
+        not its INPUT, and their paths are gated off in this config; the
+        pixel critic is the first consumer to hand the decoder a bf16
+        latent with grad attached.
+
+        Derived from the VAE's first parameter (falling back to its first
+        floating-point buffer) so it stays correct if the VAE is ever
+        loaded in another precision -- a hard-coded ``float32`` would
+        silently become the same class of bug in reverse.  ``float32`` is
+        the last-resort fallback: it is what the shipped WAN VAE uses and
+        what ``_vae_decode_nograd`` already forces unconditionally, so a
+        paramless stub keeps today's behaviour exactly.
+
+        WP-PIXGAN owns this helper and BOTH decode helpers call it, which
+        is what makes the real and the fake side dtype-identical by
+        construction (§5.2: the two sides are compared by a texture critic,
+        so any precision asymmetry between them is a real/fake tell that
+        has nothing to do with texture).
+        """
+        vae = getattr(getattr(self, "model", None), "vae", None)
+        if vae is not None and hasattr(vae, "parameters"):
+            for p in vae.parameters():
+                return p.dtype
+        if vae is not None and hasattr(vae, "buffers"):
+            for b in vae.buffers():
+                if b.is_floating_point():
+                    return b.dtype
+        return torch.float32
+
+    def _pix_decode_crops_grad(
+        self,
+        crops: torch.Tensor,
+        *,
+        border: int,
+        n_frames: int,
+        decode_batch: int,
+        gen: torch.Generator,
+    ) -> torch.Tensor:
+        """GRAPH-ON decode of latent crops -> ``[n * k, 3, H, W]`` pixels.
+
+        The fake-side decode, and the ONLY grad-on one.  Uses
+        ``_vae_decode_grad`` (checkpointed VAE forward) so gradient flows
+        back through the decoder to the latent crop and thence to the
+        generator.  ``model/disc_holdout_probe.py::_decode_crops`` is
+        ``no_grad`` and is REAL-side only (§5.2 mandates no_grad there).
+
+        ``torch.cuda.empty_cache()`` FIRST, before the decode: the decoder
+        wants a large contiguous workspace and the gen rollout's live
+        activations leave only fragmented gaps.  Without it the allocation
+        fails at step 2+ even with sufficient free memory -- the same
+        precedent as ``_maybe_texture_tripwire`` and the LPIPS/perceptual
+        decode call site.
+
+        Frame selection happens strictly AFTER decode (docs/WP_PIXGAN.md
+        §9), matching ``_decode_crops`` exactly, so real and fake see the
+        identical geometry and the identical selection rule.
+        """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        vdt = self._pix_vae_dtype()
+        outs: List[torch.Tensor] = []
+        step = max(1, int(decode_batch))
+        for i in range(0, int(crops.shape[0]), step):
+            # Cast to the VAE's OWN dtype before the decode (the run-6113341
+            # bf16-latent/fp32-conv crash).  ``.to`` is differentiable, so the
+            # graph back to the latent crop -- and thence to the generator --
+            # survives; that is asserted by
+            # ``test_grad_decode_flows_gradient_through_the_dtype_cast``.
+            # Cast PER SUB-BATCH, not on the whole crop set, so the widened
+            # copy is bounded by ``decode_batch`` rather than ``n_crops``.
+            sub = crops[i:i + step].to(vdt)
+            pix = self._vae_decode_grad(sub)           # [b, F_pix, 3, H, W]
+            b = int(border)
+            if b > 0 and pix.shape[-2] > 2 * b and pix.shape[-1] > 2 * b:
+                pix = pix[..., b:-b, b:-b]
+            f_pix = int(pix.shape[1])
+            k = max(1, min(int(n_frames), f_pix))
+            sel = torch.randperm(f_pix, generator=gen)[:k].tolist()
+            outs.append(
+                pix[:, sel].reshape(-1, *pix.shape[2:]).to(torch.float32)
+            )
+        return torch.cat(outs, dim=0)
+
+    def _pix_decode_crops_nograd(
+        self,
+        crops: torch.Tensor,
+        *,
+        border: int,
+        n_frames: int,
+        decode_batch: int,
+        gen: torch.Generator,
+    ) -> torch.Tensor:
+        """NO-GRAD decode -> ``[n * k, 3, H, W]`` on ``self.device``.
+
+        Thin wrapper over ``model/disc_holdout_probe.py::_decode_crops`` so
+        the D-loop and the A22 probe are the same code path byte for byte
+        (that helper returns CPU tensors; we move them back to the training
+        device).  §5.2: the D-update's decodes are ``no_grad`` with
+        DETACHED inputs on BOTH sides -- D is trained on pixels, not
+        through the generator.
+        """
+        from model.disc_holdout_probe import _decode_crops
+
+        # IDENTICAL dtype treatment to the grad twin: same derivation
+        # (``_pix_vae_dtype``), same cast, applied before the decode on both
+        # sides.  This helper serves BOTH the fake side (bf16 rollout
+        # latents) and the real side (fp32 pool draws) of the D-update, so
+        # without it the critic would see one dtype for the fake and another
+        # for the real -- a tell unrelated to texture.
+        px = _decode_crops(
+            self,
+            crops.detach().to(self._pix_vae_dtype()),
+            border=int(border),
+            n_frames=int(n_frames),
+            decode_batch=int(decode_batch),
+            gen=gen,
+        )
+        return px.to(self.device, torch.float32)
+
+    # ------------------------------------------------------------------
+    # §3.1 / A23 -- the FAKE, mask-selected.
+    # ------------------------------------------------------------------
+    def _pix_select_fake_latents(
+        self, info: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Resolve the critic's fake latents from the rollout ``info``.
+
+        Two sources, and A23 IS OVERTURNED (docs/WP_PIXGAN.md §6.0 -- the
+        d=0.109 verdict was a single-seed read on ``hv_anisotropy``, a
+        voter the campaign's own noise protocol flags as noise-dominated;
+        seeds 42/43/44 give .1093/.0113/.0128 and the >=3-seed protocol
+        returns EQUIVALENT).  The fake source is therefore an EXPERIMENTAL
+        VARIABLE and both paths must work:
+
+          ``pix_finish_grad_enabled=false``  (DEFAULT)
+              -> ``info["flash_dmd_gan_x0"]``, the flash t=60 x0.
+          ``pix_finish_grad_enabled=true``
+              -> ``info["finish_denoised_chunk_grad"]``, the
+                 inference-parity ladder endpoint published by T1.
+
+        THE MASK IS MANDATORY on the grad path.  That buffer is partially
+        detached BY DESIGN: 14.3 % of frames carry no graph on a 7-block
+        rollout (the trailing block of multi-block calls mirrors
+        ``flash_grad_active``), plus ~1/K more from blocks that exit at the
+        last rung and have no post-exit rung to attach.  Buffer-level
+        ``requires_grad`` reads True regardless, so averaging the G-loss
+        over the whole chunk would silently dilute the adversarial signal
+        by that fraction with nothing saying so.  Absent or all-False mask
+        => FAIL LOUD, never a silent fall-through to the whole chunk.
+
+        Returns ``(latents [B, L, C, H, W], logs)`` where ``L`` is a
+        CONTIGUOUS run of ``pix_lat_frames_per_crop`` mask-valid latent
+        frames.  Contiguity is not cosmetic: the VAE decode is temporal, so
+        a gappy frame set would decode differently from the reals' always
+        contiguous windows and hand the critic a real/fake tell that has
+        nothing to do with texture.
+        """
+        use_grad_src = bool(
+            getattr(self.config, "pix_finish_grad_enabled", False)
+        )
+        logs: Dict[str, float] = {
+            "train/pix_fake_source_ladder": 1.0 if use_grad_src else 0.0,
+        }
+        # ONE RESOLUTION POINT (see _pix_pool_fill): the resolver already
+        # applies the same max(1, .) floor to this key, so re-defaulting it
+        # here bought nothing and could only ever disagree.
+        want_l = int(self._pix_resolve_cfg()["lat_frames"])
+
+        if not use_grad_src:
+            z = info.get("flash_dmd_gan_x0")
+            if z is None:
+                z = info.get("flash_dmd_gan_x0_raw")
+            if z is None:
+                raise RuntimeError(
+                    "gan_pixel_texture_enabled=true with "
+                    "pix_finish_grad_enabled=false requires "
+                    "info['flash_dmd_gan_x0'] (the flash t=60 x0). It is "
+                    "absent -- enable the flash-DMD path or set "
+                    "pix_finish_grad_enabled=true to use the ladder "
+                    "endpoint. Refusing to substitute another tensor."
+                )
+            n_lat = int(z.shape[1])
+            l = min(want_l, n_lat)
+            start = n_lat - l
+            # FORGEABLE-ZERO RULE: pix_finish_grad_frames /
+            # _frames_total / _frac are §6.2 measurements OF THE A23 GRAD
+            # BUFFER. On the flash path that buffer is never consulted, so
+            # emitting them here would report a dilution measurement for a
+            # computation that did not run (and "0 no-rung frames" is the
+            # HEALTHY reading, which is exactly the forgery that matters).
+            # They are OMITTED; ``pix_fake_source_ladder`` = 0.0 is the
+            # regime flag that says why they are absent.
+            logs["train/pix_fake_lat_frames"] = float(l)
+            return z[:, start:start + l], logs
+
+        z = info.get("finish_denoised_chunk_grad")
+        if z is None:
+            raise RuntimeError(
+                "pix_finish_grad_enabled=true but "
+                "info['finish_denoised_chunk_grad'] is absent. T1 publishes "
+                "it only when its own gate is on; check the pipeline flag. "
+                "Refusing to fall back to flash_dmd_gan_x0 silently -- the "
+                "fake source is the experimental variable (WP_PIXGAN §6.0) "
+                "and must never be swapped behind the arm's back."
+            )
+        mask = info.get("finish_denoised_chunk_grad_mask")
+        if mask is None:
+            raise RuntimeError(
+                "info['finish_denoised_chunk_grad'] is present but "
+                "info['finish_denoised_chunk_grad_mask'] is MISSING. The "
+                "grad buffer is partially detached by design (14.3 % of "
+                "frames carry no graph on a 7-block rollout, WP_PIXGAN "
+                "§6.2); consuming it unmasked silently dilutes the "
+                "adversarial signal. Refusing to proceed."
+            )
+        m = torch.as_tensor(mask).reshape(-1).to(torch.bool)
+        n_lat = int(z.shape[1])
+        if int(m.numel()) != n_lat:
+            raise RuntimeError(
+                "finish_denoised_chunk_grad_mask has "
+                f"{int(m.numel())} entries but the grad buffer has {n_lat} "
+                "latent frames; the mask does not describe this buffer."
+            )
+        n_valid = int(m.sum().item())
+        logs["train/pix_finish_grad_frames"] = float(n_valid)
+        logs["train/pix_finish_grad_frames_total"] = float(n_lat)
+        logs["train/pix_finish_grad_frac"] = (
+            float(n_valid) / float(max(1, n_lat))
+        )
+        if n_valid == 0:
+            raise RuntimeError(
+                "finish_denoised_chunk_grad_mask is ALL-FALSE: not one "
+                "latent frame in this chunk carries a graph, so the pixel "
+                "critic would train on a detached fake and the G-term would "
+                "be identically zero. Failing loud (WP_PIXGAN §6.2)."
+            )
+        # Pick a contiguous mask-valid run. Preference order:
+        #   1. the LATEST run long enough to supply ``want_l`` frames --
+        #      the ladder endpoint's NEWEST frames are the ones inference
+        #      actually commits, so a stale early run is the worse sample
+        #      even when it is longer;
+        #   2. otherwise the LONGEST run, and take what it has.
+        # Then the last ``want_l`` frames of the chosen run.
+        runs: List[Tuple[int, int]] = []
+        lo = None
+        for i in range(n_lat + 1):
+            on = i < n_lat and bool(m[i].item())
+            if on and lo is None:
+                lo = i
+            elif not on and lo is not None:
+                runs.append((lo, i - lo))
+                lo = None
+        long_enough = [r for r in runs if r[1] >= want_l]
+        if long_enough:
+            best_lo, best_len = long_enough[-1]
+        else:
+            best_lo, best_len = max(runs, key=lambda r: r[1])
+        l = min(want_l, best_len)
+        start = best_lo + best_len - l
+        logs["train/pix_fake_lat_frames"] = float(l)
+        logs["train/pix_fake_lat_run"] = float(best_len)
+        return z[:, start:start + l], logs
+
+    # ------------------------------------------------------------------
+    # §3.4 / A20 / A21 / A22 / A24 -- the REAL supply.
+    # ------------------------------------------------------------------
+    def _pix_train_ride_paths(self, *, step: Optional[int] = None) -> List[Any]:
+        """A22 -- the real supply's ride list, PROVED disjoint from the
+        reserved rides.
+
+        Sourced from the post-holdout-filter training ride list (the list
+        the ``DistributedSampler`` indexes, i.e. the only thing training
+        ever sees) and then re-checked against
+        ``disc_holdout_probe._holdout_names`` on every rebuild. A holdout
+        list leaked into training once before (GAN_REDESIGN A22), so this
+        is a hard failure, not a warning: a leaked reserved ride makes the
+        held-out generalisation measurement meaningless while still looking
+        healthy.
+        """
+        from model.disc_holdout_probe import (
+            _holdout_names, _train_ride_paths, ride_key,
+        )
+
+        paths = list(_train_ride_paths(self))
+        if not paths:
+            raise RuntimeError(
+                "pixel-texture GAN: the real supply needs "
+                "trainer.dataset._rides, which is empty/absent. A21 "
+                "requires reals drawn from the full training dataset; "
+                "refusing to fall back to the current ride window."
+            )
+        held = set(_holdout_names(self))
+        leaked = sorted({ride_key(p) for p in paths} & held)
+        self._pix_holdout_checked = 1.0
+        self._pix_holdout_n = float(len(held))
+        self._pix_holdout_leak = float(len(leaked))
+        # FRESHNESS. ``_pix_holdout_leak`` is a SAFETY CLAIM, and a safety
+        # claim that is re-published without being re-computed is defeated
+        # by staleness rather than by omission -- the same failure reached
+        # by a quieter route. This method is the only writer, so it stamps
+        # the step it ran at and the D-loop refuses to publish a value that
+        # was not recomputed for the step it is logging.
+        if step is not None:
+            self._pix_holdout_checked_step = int(step)
+        if leaked:
+            raise RuntimeError(
+                "A22 VIOLATION: %d reserved ride(s) are present in the "
+                "pixel critic's real supply: %s. Reserved rides must be "
+                "provably absent from training reals."
+                % (len(leaked), leaked[:8])
+            )
+        return paths
+
+    def _pix_latent_len(self, path: Any) -> int:
+        cache = getattr(self, "_pix_lat_len_cache", None)
+        if cache is None:
+            cache = {}
+            self._pix_lat_len_cache = cache
+        key = str(path)
+        if key not in cache:
+            from model.disc_holdout_probe import _latent_len
+            try:
+                cache[key] = int(_latent_len(path))
+            except Exception:
+                # Do NOT cache the failure: a transient zarr hiccup would
+                # otherwise blacklist a ride for the rest of the run.
+                return 0
+        return int(cache[key])
+
+    def _pix_pool_fill(
+        self,
+        n_new: int,
+        *,
+        gen: torch.Generator,
+        crop_rows: int,
+        crop_cols: int,
+        n_bands: int,
+        lat_frames: int,
+        force_band: Optional[int] = None,
+        step: Optional[int] = None,
+    ) -> int:
+        """Admit ``n_new`` fresh real windows into the A21 support pool.
+
+        A21 prefers NO cache -- fresh GT latent frames from the full
+        training dataset per D update, via
+        ``ZarrRideDataset.load_latent_chunk`` (the primitive
+        ``disc_holdout_probe.build_latent_pool`` itself uses). At
+        ``pix_crops_per_step=4``/``pix_frames_per_crop=3`` A20 needs 12
+        independently sourced reals per D-update and
+        ``pix_gan_updates_per_step=5``, i.e. 60 zarr window loads per
+        training step, which puts the loader squarely on the critical path
+        (WP_PIXGAN §3). So a cache is permitted -- but only under A21's
+        terms, all of which are enforced here:
+
+          * >= ``PIX_A21_SUPPORT_FLOOR`` (4,096) DISTINCT source frames,
+            8-16k preferred (``pix_real_pool_windows`` x
+            ``pix_lat_frames_per_crop``);
+          * CONTINUOUSLY REFRESHED -- ``pix_real_pool_refresh`` fresh
+            windows admitted per D-update FOREVER, including after the
+            pool has reached ``pix_real_pool_windows``, at which point the
+            FIFO branch below starts evicting the oldest window per
+            admission. Admission is the ONLY thing that grows A21 support,
+            so stopping at the cap would freeze support at the cap's
+            ceiling -- ``pix_real_pool_windows x pix_lat_frames_per_crop``,
+            which at the shipped 2,048 x 2 was 4,096 EXACTLY the floor, and
+            below it in practice because windows overlap inside a ride.
+            Support would then never pass the floor, the pool would be the
+            frozen mini-dataset A21 forbids, and the A22 holdout check
+            (reached only from here) would go stale. One bug, three
+            symptoms; the cure is that the cap bounds MEMORY, never
+            refresh;
+          * CROSS-RIDE -- the ride is redrawn per window;
+          * UNIFORM WITHIN THE BAND -- never similarity- or
+            nearest-matched (retrieval-matched reals are scope-frozen).
+
+        Each entry is cropped AT LOAD to one A24 band, so the pool is
+        band-stratified and the paired draw in :meth:`_pix_draw_reals`
+        can always honour "same band as its fake" exactly.
+
+        Storage is fp16 on CPU: 2,048 windows x 2 latent frames x 16 ch x
+        24 x 32 = ~100 MB, versus ~1.6 GB if full 60x104 frames were kept.
+        """
+        from utils.zarr_dataset import ZarrRideDataset
+        from model.disc_holdout_probe import band_plan, ride_key
+
+        paths = self._pix_train_ride_paths(step=step)
+        pool = getattr(self, "_pix_real_pool", None)
+        if pool is None:
+            pool = []
+            self._pix_real_pool = pool
+        support = getattr(self, "_pix_real_support", None)
+        if support is None:
+            support = set()
+            self._pix_real_support = support
+        rides_seen = getattr(self, "_pix_real_rides", None)
+        if rides_seen is None:
+            rides_seen = set()
+            self._pix_real_rides = rides_seen
+
+        lf = max(1, int(lat_frames))
+        admitted = 0
+        attempts = 0
+        max_attempts = max(8, int(n_new) * 8)
+        while admitted < int(n_new) and attempts < max_attempts:
+            attempts += 1
+            pi = int(torch.randint(0, len(paths), (1,), generator=gen).item())
+            p = paths[pi]
+            n_lat = self._pix_latent_len(p)
+            if n_lat < lf:
+                continue
+            hi = n_lat - lf
+            start = (
+                0 if hi <= 0
+                else int(torch.randint(0, hi + 1, (1,), generator=gen).item())
+            )
+            try:
+                lat = ZarrRideDataset.load_latent_chunk(
+                    str(p), start, start + lf,
+                )
+            except Exception as exc:                      # pragma: no cover
+                logging.warning(
+                    "[pixgan] load_latent_chunk %s failed: %r", p, exc,
+                )
+                continue
+            lat = torch.as_tensor(lat)
+            if int(lat.shape[0]) != lf:
+                continue
+            h, w = int(lat.shape[-2]), int(lat.shape[-1])
+            cr = min(int(crop_rows), h)
+            cc = min(int(crop_cols), w)
+            if force_band is None:
+                b_list, y_list = band_plan(1, h, cr, int(n_bands), gen)
+                band, y0 = int(b_list[0]), int(y_list[0])
+            else:
+                band = int(force_band)
+                _b, y_list = band_plan(1, h, cr, int(n_bands), gen)
+                # Re-draw the offset inside the FORCED band, using the same
+                # bin arithmetic band_plan uses (A24 thirds), so a forced
+                # band is geometrically indistinguishable from a drawn one.
+                max_off = max(0, h - cr)
+                nb = max(1, int(n_bands))
+                lo = int(round(band * max_off / nb))
+                hib = max(int(round((band + 1) * max_off / nb)), lo)
+                y0 = (
+                    lo if hib <= lo
+                    else int(torch.randint(
+                        lo, hib + 1, (1,), generator=gen).item())
+                )
+            x_hi = max(1, w - cc + 1)
+            x0 = int(torch.randint(0, x_hi, (1,), generator=gen).item())
+            y0 = max(0, min(int(y0), h - cr))
+            crop = lat[:, :, y0:y0 + cr, x0:x0 + cc].to(torch.float16)
+            rk = ride_key(p)
+            pool.append({
+                "lat": crop,
+                "band": int(band),
+                "y0": int(y0),
+                "x0": int(x0),
+                "ride": rk,
+                "start": int(start),
+                # The window's SOURCE FRAME span. A20's "independent" is
+                # about source frames, not pool indices, and two windows
+                # whose spans intersect are not two independent reals -- so
+                # the span has to be recorded at admission, not guessed at
+                # draw time from a per-call ``lat_frames``.
+                "nf": int(lf),
+                "uid": (rk, int(start), int(y0), int(x0)),
+            })
+            rides_seen.add(rk)
+            # A21 support is a MEASURED claim: count distinct (ride, latent
+            # frame index) identities actually admitted, never infer it from
+            # the loader's nominal size.
+            if len(support) < 400000:
+                for j in range(lf):
+                    support.add((rk, int(start) + j))
+            admitted += 1
+            # §7 A21 -- MONOTONE cache-refresh counter (never a per-step
+            # gauge: the per-step gauge is exactly what aliased to a
+            # permanent 0 and produced the "R2 never fired" false alarm).
+            self._pix_pool_refresh_total = int(
+                getattr(self, "_pix_pool_refresh_total", 0)
+            ) + 1
+
+        # ONE RESOLUTION POINT. This used to read pix_real_pool_windows
+        # with its OWN getattr default (2048) while _pix_resolve_cfg --
+        # the single resolve-and-validate point for the whole pix_* block,
+        # called from the constructor so a misconfigured arm fails early
+        # -- resolved the same key independently. Two resolution points
+        # that can disagree, with nothing enforcing agreement, is exactly
+        # the A21 blocker shape: with the key present both said 4096, but
+        # an override typo or a config predating the block would silently
+        # halve A21's ceiling here to 2048 while the VALIDATED value, the
+        # A21 margin warning and the resolved-config echo all still said
+        # otherwise. Resolve through the resolver; never re-default.
+        cap = max(int(n_new), int(self._pix_resolve_cfg()["pool_windows"]))
+        if len(pool) > cap:                       # FIFO -> continuous refresh
+            del pool[: len(pool) - cap]
+        return admitted
+
+    def _pix_draw_reals(
+        self,
+        bands: Sequence[int],
+        *,
+        gen: torch.Generator,
+        crop_rows: int,
+        crop_cols: int,
+        n_bands: int,
+        lat_frames: int,
+        reuse_horizon: Optional[int] = None,
+        step: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, List[int], Dict[str, float]]:
+        """A20 + A24 -- one independently sourced real per fake, same band.
+
+        ``bands`` is the fake side's per-IMAGE band list (length =
+        ``pix_crops_per_step * pix_frames_per_crop *
+        pix_reals_per_fake``). For every entry we draw a pool window whose
+        band EQUALS that fake's band; if the band is short of stock we load
+        fresh windows forced into that band rather than relaxing the
+        pairing. The returned ``real_bands`` are then compared elementwise
+        by the caller and the mismatch counter must be 0.
+
+        "Independent" is the strong reading (docs/WP_PIXGAN.md §2, A20):
+        the SOURCE FRAME is drawn independently. Three frames from one
+        decoded crop, or from one ride window, are NOT three independent
+        reals -- so this returns one image per entry, each from its own
+        (ride, start, y0, x0) window. Frame-within-crop expansion is a
+        FAKE-SIDE device only and must never leak here.
+
+        ``pix_real_repeat_frac`` MEASURES that, and it is measured at the
+        level A20 is about. It used to be computed as
+        ``len(set(uids)) < len(uids)`` over indices drawn WITHOUT
+        REPLACEMENT (the ``used`` set below), which is 0 by construction:
+        two distinct pool indices can only share a uid if the identical
+        window was admitted twice, so the gauge could not move and the
+        guard reading it could not fire. It now counts reals whose SOURCE
+        FRAME SPAN -- ``{(ride, start+j)}`` over the window's ``nf``
+        frames, recorded at admission -- intersects that of an earlier
+        real in the SAME D-update. Overlapping spans are the real hazard:
+        a window at ``s`` and a window at ``s+1`` decode largely the same
+        GT, and if frame-within-crop expansion ever leaked to the real
+        side every crop's ``k_frames`` images would share ONE span.
+
+        Because the gauge now measures something real it is no longer
+        required to be exactly 0. Independent sampling from a finite
+        support produces occasional coincidences -- demanding zero is
+        demanding WITHOUT-replacement sampling, i.e. the opposite of
+        independence -- so the caller's guard trips at
+        ``PIX_A20_REPEAT_ALARM`` (half the batch), which coincidence
+        cannot reach and a structural leak reaches immediately.
+
+        ``pix_real_recent_reuse_frac`` is the same measurement across
+        TIME: the share of this update's reals whose span was already
+        drawn within the last ``reuse_horizon`` D-updates. That is the
+        memorisation-facing number -- a pool that has stopped refreshing
+        keeps re-serving the same spans and this rises, while a pool under
+        continuous refresh holds it near the sampling-coincidence rate.
+
+        Exact-y matching, per-row bands, bands that scale with row count
+        and +-tolerance matching are FORBIDDEN AND PERMANENT (A24). This
+        function only ever compares the coarse band INDEX.
+        """
+        n_req = len(bands)
+        pool = getattr(self, "_pix_real_pool", None) or []
+        by_band: Dict[int, List[int]] = {}
+        for i, e in enumerate(pool):
+            by_band.setdefault(int(e["band"]), []).append(i)
+
+        need: Dict[int, int] = {}
+        for b in bands:
+            need[int(b)] = need.get(int(b), 0) + 1
+        for b, k in need.items():
+            have = len(by_band.get(int(b), ()))
+            if have < k:
+                self._pix_pool_fill(
+                    k - have, gen=gen, crop_rows=crop_rows,
+                    crop_cols=crop_cols, n_bands=n_bands,
+                    lat_frames=lat_frames, force_band=int(b), step=step,
+                )
+        pool = getattr(self, "_pix_real_pool", None) or []
+        by_band = {}
+        for i, e in enumerate(pool):
+            by_band.setdefault(int(e["band"]), []).append(i)
+
+        used: set = set()
+        chosen: List[int] = []
+        for b in bands:
+            cand = [i for i in by_band.get(int(b), ()) if i not in used]
+            if not cand:
+                raise RuntimeError(
+                    "pixel-texture GAN: no un-used real window left in band "
+                    f"{int(b)} (pool={len(pool)}). A20 forbids reusing a real "
+                    "inside one D-update; raise pix_real_pool_windows."
+                )
+            j = int(torch.randint(0, len(cand), (1,), generator=gen).item())
+            idx = int(cand[j])
+            used.add(idx)
+            chosen.append(idx)
+
+        lat = torch.stack(
+            [pool[i]["lat"].to(torch.float32) for i in chosen], dim=0,
+        ).to(self.device)
+        real_bands = [int(pool[i]["band"]) for i in chosen]
+        uids = [pool[i]["uid"] for i in chosen]
+        n_distinct = len(set(uids))
+        n_windows = len({(u[0], u[1]) for u in uids})
+        n_rides = len({u[0] for u in uids})
+
+        # --- A20, measured on SOURCE FRAMES (see the docstring) ---------
+        frame_sets: List[set] = [
+            {
+                (pool[i]["ride"], int(pool[i]["start"]) + j)
+                for j in range(max(1, int(pool[i].get("nf", 1))))
+            }
+            for i in chosen
+        ]
+        seen_frames: set = set()
+        n_overlap = 0
+        for fs in frame_sets:
+            if fs & seen_frames:
+                n_overlap += 1
+            seen_frames |= fs
+        repeat_frac = float(n_overlap) / float(max(1, n_req))
+
+        # --- the same thing across TIME: rolling source-frame reuse -----
+        horizon = int(
+            self.PIX_REAL_REUSE_HORIZON if reuse_horizon is None
+            else reuse_horizon
+        )
+        horizon = max(1, horizon)
+        ring = getattr(self, "_pix_recent_frames", None)
+        if ring is None:
+            ring = []
+            self._pix_recent_frames = ring
+        prior: set = set()
+        for older in ring:
+            prior |= older
+        n_reuse = sum(1 for fs in frame_sets if fs & prior)
+        reuse_frac = float(n_reuse) / float(max(1, n_req))
+        ring.append(set(seen_frames))
+        if len(ring) > horizon:
+            del ring[: len(ring) - horizon]
+
+        logs = {
+            # A20 -- genuine source-frame overlap inside this D-update.
+            "train/pix_real_repeat_frac": repeat_frac,
+            # A20/A21 -- genuine source-frame reuse over the last
+            # ``horizon`` D-updates. Rises when the pool stops refreshing.
+            "train/pix_real_recent_reuse_frac": reuse_frac,
+            # How many D-updates that reuse figure looks back over. Emitted
+            # so an early, near-empty ring is not misread as a clean
+            # history (it is a SHORT one).
+            "train/pix_real_reuse_span_updates": float(len(ring)),
+            "train/pix_real_reuse_span_frames": float(len(prior)),
+            # STRUCTURALLY PINNED, kept only as a build assertion: the draw
+            # below is without replacement over pool INDICES, so distinct
+            # uids are guaranteed and this equals the request size unless
+            # the draw itself is broken. It is NOT A20 evidence -- that is
+            # ``pix_real_repeat_frac`` above.
+            "train/pix_real_distinct_sources": float(n_distinct),
+            # Distinct SOURCE FRAMES behind this update's reals: the union
+            # of the drawn spans, so ``n_req * nf`` when nothing overlaps
+            # and less when it does.
+            "train/pix_real_unique_frames": float(len(seen_frames)),
+            "train/pix_real_unique_windows": float(n_windows),
+            "train/pix_real_unique_rides": float(n_rides),
+            "train/pix_real_pool_windows": float(len(pool)),
+            # §7 A21 "if a cache is used at all": the pool IS the cache.
+            "train/pix_real_cache_size": float(len(pool)),
+            "train/pix_real_cache_refresh_total": float(
+                getattr(self, "_pix_pool_refresh_total", 0)
+            ),
+            "train/pix_real_support_frames": float(
+                len(getattr(self, "_pix_real_support", ()) or ())
+            ),
+            "train/pix_real_support_rides": float(
+                len(getattr(self, "_pix_real_rides", ()) or ())
+            ),
+        }
+        return lat, real_bands, logs
+
+    # ------------------------------------------------------------------
+    # §5.2 / §5.3 -- the D-update loop.
+    # ------------------------------------------------------------------
+    def _pix_disc_module(self) -> torch.nn.Module:
+        """DDP wrapper if there is one, raw module otherwise."""
+        d = getattr(self, "pixel_texture_disc_ddp", None)
+        return d if d is not None else self.pixel_texture_disc
+
+    def _pix_counters(self):
+        c = getattr(self, "_pix_counters_obj", None)
+        if c is None:
+            from model.pixel_texture_disc import PixCounters
+            # pix_r1_every_n = 1: R1 fires on EVERY D-update, target
+            # pix_r1_rate == 1.00. Cost is bounded by pix_r1_num_samples
+            # subsampling, NEVER by raising every_n -- that reintroduces the
+            # silent-cadence bug class (A10/A16, TEXTURE_GAN_DESIGN §5.4).
+            c = PixCounters(
+                r1_every_n=int(self._pix_resolve_cfg()["r1_every_n"])
+            )
+            self._pix_counters_obj = c
+        return c
+
+    def _pix_optimizer_hyper(self) -> Dict[str, Any]:
+        """The pixel critic's LIVE optimizer hyper-parameters, for the echo.
+
+        Standing rule 4: a launch line's REQUESTED value and the EFFECTIVE
+        value can differ, and only the effective one settles anything. The
+        rule exists because two sessions independently reached a wrong
+        conclusion about a micro-batch knob whose effective value was
+        assembled across two files.
+
+        ``pix_gan_lr`` / ``pix_gan_betas`` are the place in the
+        resolved-config echo where that gap can open with NO config
+        involved at all. ``_build_optimizer`` is what turned the config
+        into the ``param_groups`` entry that actually steps D; everything
+        after construction -- a resume restoring an optimizer state dict, a
+        scheduler, a hand-edited param group -- moves the live value while
+        the config sits unchanged. An echo sourced from ``cfg`` then
+        reports a number nothing uses, WHILE LOOKING AUTHORITATIVE: rule 4
+        defeated by the exact class rule 4 was written to catch.
+
+        So these are read off the optimizer, and two situations are refused
+        a plausible-looking number:
+
+          * no optimizer / no param groups / a non-finite or missing entry
+            -> the value is OMITTED and ``<name>_unavailable`` is emitted.
+            ``PIX_GAN_LR`` is the constructor's default, not an
+            observation; printing it when nothing was built is a forged
+            reading of the kind §21 keeps producing.
+          * param groups that DISAGREE -> the single value is omitted,
+            ``<name>_param_group_disagreement`` + ``<name>_min`` /
+            ``<name>_max`` are emitted, and a WARNING is logged. Reporting
+            ``param_groups[0]`` would hide the split behind a number that
+            is true of exactly one group; the split IS the finding.
+
+        Freshly computed at every emission -- never cached, so the flags
+        describe the optimizer as it is when the echo is written.
+        """
+        opt = getattr(self, "pix_optimizer", None)
+        groups = list(getattr(opt, "param_groups", None) or ())
+        out: Dict[str, Any] = {
+            "pix_gan_optimizer_param_groups": int(len(groups)),
+        }
+
+        def _emit(name: str, pick) -> None:
+            vals: List[float] = []
+            for g in groups:
+                try:
+                    v = float(pick(g))
+                except (KeyError, IndexError, TypeError, ValueError):
+                    out[f"{name}_unavailable"] = True
+                    return
+                if not math.isfinite(v):
+                    out[f"{name}_unavailable"] = True
+                    return
+                vals.append(v)
+            if not vals:
+                out[f"{name}_unavailable"] = True
+                return
+            uniq = sorted(set(vals))
+            if len(uniq) > 1:
+                out[f"{name}_param_group_disagreement"] = True
+                out[f"{name}_min"] = uniq[0]
+                out[f"{name}_max"] = uniq[-1]
+                logging.warning(
+                    "[pixgan] %s DIFFERS across the pixel optimizer's %d "
+                    "param groups (%s). No single value is echoed; "
+                    "train/pix_cfg_%s_min / _max carry the split.",
+                    name, len(groups),
+                    ", ".join(repr(v) for v in uniq), name,
+                )
+                return
+            out[name] = uniq[0]
+
+        _emit("pix_gan_lr", lambda g: g["lr"])
+        _emit("pix_gan_beta1", lambda g: g["betas"][0])
+        _emit("pix_gan_beta2", lambda g: g["betas"][1])
+        return out
+
+    def _pix_emit_actionable(self, msg: str) -> None:
+        """Emit an ACTIONABLE ``pix_*`` line on a path that SURVIVES.
+
+        The rule-4 instrument was itself an instance of the defect class it
+        was built to catch: computed correctly, wired to a channel that
+        does not reach the run log.
+
+        ``trainer/causal_rolling_staircase_train.py`` configures logging
+        with::
+
+            level = logging.INFO if self.is_main_process else logging.WARNING
+            logging.basicConfig(level=level, format=...)
+
+        with NO ``force=True``. ``logging.basicConfig`` is a documented
+        SILENT NO-OP when the root logger already has handlers, so if any
+        import along the way (a library, the launcher, torch/DDP) installs
+        a root handler first, the level is never applied, root stays at
+        Python's default WARNING, and every ``logging.info`` in the trainer
+        vanishes. Two full smoke logs tonight had 0 INFO hits with
+        WARNING/ERROR unaffected -- see the ``[ROLL]`` / ``[LADD-DIAG]``
+        notes at the LADD disc build, which already carry this pattern.
+
+        Whether it bites depends on IMPORT ORDER. An instrument whose
+        visibility is decided by import order is not an instrument. So this
+        does not gamble on the root level:
+
+          * ``logging.warning`` -- survives a WARNING-level root, and keeps
+            the line in whatever handler/formatter/file the run configured.
+          * ``print(..., file=sys.stderr, flush=True)`` -- survives even a
+            root with NO usable handler at all, which the logging leg
+            cannot. Same belt-and-braces pair as
+            ``pipeline/action_forcing_training.py:701-702``.
+
+        NOT fixed by adding ``force=True`` upstream: that file is not this
+        package's, other packages depend on its behaviour, and forcing
+        would clobber a root handler someone installed deliberately.
+
+        Main-process gated HERE as well as at every call site, so a future
+        caller cannot turn this into per-rank stderr spam. Callers own
+        once-per-run latching (the echo's ``_pix_cfg_echoed``). ``msg`` is
+        pre-rendered and passed with NO logging args, so a ``%`` inside a
+        resolved value cannot raise in the formatter.
+        """
+        if not getattr(self, "is_main_process", True):
+            return
+        logging.warning(msg)
+        print(msg, file=sys.stderr, flush=True)
+
+    def _pix_echo_resolved_config(
+        self,
+        logs: Dict[str, float],
+        *,
+        resolved: Dict[str, Any],
+    ) -> None:
+        """ONE-TIME echo of the RESOLVED value of every ``pix_*`` knob.
+
+        Not a nicety. An hour-old incident in this campaign: two sessions
+        independently concluded a 14B smoke's
+        ``ladd_gen_guidance_micro_batch_groups`` had fallen back to its
+        default because the launch script's DEXTRA did not name it. Both
+        were wrong -- the script launches through a HOLDER whose own fixed
+        arg list passes the knob one level up, and the resolved value was 4
+        all along. Every launcher-level check either session made was
+        accurate and the conclusion still came out wrong, because the
+        effective value is assembled across two files. **Only the resolved
+        value settles it.**
+
+        B1 has the identical exposure: ``pix_decode_batch`` controls the
+        grad-decode micro-batch size (the expensive, G-side memory knob) and
+        was previously visible only through ``train/pix_decodes``, a count.
+
+        DERIVED, NOT REQUESTED. Where a value is clamped by a tensor
+        dimension the DERIVED value is echoed -- ``crop_rows`` after
+        ``min(pix_crop_lat[0], H_lat)``, the border after ``_decode_crops``
+        declines to trim a too-small crop, the latent-frame count after the
+        mask-valid run bounds it, the pixel-frame count after
+        ``min(pix_frames_per_crop, F_pix)``. The gap between requested and
+        derived is the entire point, so both are emitted where they can
+        differ.
+
+        ``pix_band_count`` is echoed explicitly every run (§7): a silently
+        tightened banding must be visible in the TRACE, not only in a diff.
+
+        Main process only, once per run (``_pix_cfg_echoed`` latch), and
+        entirely inside the ``gan_pixel_texture_enabled`` gate, so
+        byte-identical-off is unaffected. ``pix_r1_num_samples=None`` is
+        echoed as **-1**, a sentinel OUTSIDE the knob's meaningful range
+        (>= 1), never as 0 -- 0 would read as a real setting.
+
+        EMITTED VIA ``_pix_emit_actionable``, never ``logging.info``: see
+        that helper for why an INFO-only echo is invisible in production
+        for reasons that come down to import order.
+        """
+        if getattr(self, "_pix_cfg_echoed", False):
+            return
+        self._pix_cfg_echoed = True
+        for k, v in resolved.items():
+            if isinstance(v, bool):
+                logs[f"train/pix_cfg_{k}"] = 1.0 if v else 0.0
+            elif isinstance(v, (int, float)):
+                logs[f"train/pix_cfg_{k}"] = float(v)
+        if not getattr(self, "is_main_process", True):
+            return
+        self._pix_emit_actionable(
+            "[ActionForcing] WP-PIXGAN resolved config (DERIVED values, "
+            "not launch-line requests): "
+            + " ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
+        )
+
+    # ------------------------------------------------------------------
+    # §5.5 / §12 -- the GENERATOR-side pixel term.
+    # ------------------------------------------------------------------
+    def _pix_emit_grad_ratio(
+        self,
+        out: Dict[str, float],
+        *,
+        pix_raw: torch.Tensor,
+        dmd_vec: Optional[torch.Tensor],
+        param: torch.Tensor,
+    ) -> None:
+        """Publish the UNWEIGHTED pixel grad ratio (§12 step 1).
+
+        ``pix_raw`` is the PRE-WEIGHT ``g_loss``, so this is the ratio the
+        pixel term WOULD have at weight 1.0. That is the number the §12
+        calibration needs and the one a weight-free probe cannot get any
+        other way: at ``pix_gan_weight=0`` the applied term contributes no
+        gradient at all, so every weighted readout is exactly 0.0 and
+        settles nothing. The ratio is linear in the weight, so
+        ``pix_gan_weight = 0.10 / r`` lands §5.5's 5-20 % band directly.
+
+        ``dmd_vec`` is PASSED IN, never recomputed: one backward of the
+        shared DMD term serves the A7 ratio, the A7 cosine, this ratio and
+        this cosine. Recomputing it would re-run a checkpointed teacher
+        recompute (~11 s / ~37 GiB on the LADD path) for a vector already
+        in hand -- which is exactly why ``grad_at`` returns VECTORS and not
+        ratios.
+
+        DENOMINATOR RULE, and it is the point of the whole helper: when the
+        denominator is zero the ratio is OMITTED and a distinct reason key
+        is emitted instead. The neighbouring A7 line does
+        ``_ng / _nr if _nr > 0 else 0.0``, and that 0.0 cannot be told
+        apart from "the GAN term contributes nothing" -- opposite
+        conclusions, identical logged number, and the second one is a live
+        disputed claim in this campaign. The A7 line's behaviour is
+        UNCHANGED (recorded runs depend on it); this one does not copy it.
+        """
+        pg = grad_at(pix_raw, param, retain_graph=True)
+        if pg is None:
+            # NOT 0.0 -- a forged zero (docs/WP_PIXGAN.md §21 instance 3,
+            # where a placeholder 0.0 was even pinned by a test).
+            out["train/pix_gan_grad_unavailable"] = 1.0
+            return
+        n_pg = float(pg.norm())
+        out["train/pix_gan_grad_norm_unweighted"] = n_pg
+        if dmd_vec is None:
+            out["train/pix_gan_grad_denom_unavailable"] = 1.0
+            return
+        n_dmd = float(dmd_vec.norm())
+        if n_dmd <= 0.0:
+            out["train/pix_gan_grad_denom_zero"] = 1.0
+            out["train/pix_gan_grad_cos_undefined"] = 1.0
+            return
+        out["train/pix_gan_grad_ratio"] = n_pg / n_dmd
+        if n_pg > 0.0:
+            out["train/pix_gan_grad_cos"] = float(
+                torch.dot(pg, dmd_vec) / (n_pg * n_dmd)
+            )
+        else:
+            out["train/pix_gan_grad_cos_undefined"] = 1.0
+
+    def _pix_standalone_grad_telemetry(
+        self,
+        generator_loss: torch.Tensor,
+        pix_raw: torch.Tensor,
+        out: Dict[str, float],
+        *,
+        current_step: int,
+    ) -> None:
+        """A7-equivalent probe for the arm that runs with the LADD GAN OFF.
+
+        Same cadence knob (``gan_grad_telemetry_every``), same anchor (the
+        last ``requires_grad`` generator parameter), same helper for the
+        ratio -- so the pixel arm's calibration read is identical whether
+        or not the transition GAN happens to be enabled, instead of being
+        available on one path only. try/except with the A7 error key so
+        telemetry can never take a run down.
+        """
+        tel = int(getattr(self.config, "gan_grad_telemetry_every", 25) or 0)
+        if tel <= 0 or int(current_step) % tel != 0:
+            return
+        try:
+            p_last = None
+            for _pn, _pp in self.model.generator.named_parameters():
+                if _pp.requires_grad:
+                    p_last = _pp
+            if p_last is None:
+                return
+            dmd_vec = grad_at(generator_loss, p_last, retain_graph=True)
+            if dmd_vec is not None:
+                out["train/dmd_grad_norm_shared"] = float(dmd_vec.norm())
+            self._pix_emit_grad_ratio(
+                out, pix_raw=pix_raw, dmd_vec=dmd_vec, param=p_last,
+            )
+        except Exception:
+            out["train/gan_grad_telemetry_err"] = 1.0
+
+    def _pix_positive_control(
+        self,
+        real_lat: torch.Tensor,
+        student_px: torch.Tensor,
+        disc: torch.nn.Module,
+        *,
+        current_step: int,
+        update_idx: int,
+        border: int,
+        k_frames: int,
+        decode_batch: int,
+    ) -> Dict[str, float]:
+        """§8.1 positive control -- makes ``pix_d_loss ~ ln 2`` DECIDABLE.
+
+        ``d_loss ~ ln 2`` reads identically for "critic undertrained" and
+        "design wrong", and that ambiguity has cost this campaign
+        repeatedly. Every ``pix_poscontrol_every`` steps this scores, under
+        ``no_grad`` and off the training graph, GT vs a C1-corrupted GT
+        (the control) and GT vs the student (the arm), and publishes the
+        §8.1 decision-table inputs plus ``pix_poscontrol_rank_ok``.
+
+        The clean and corrupted decodes use two generators seeded
+        IDENTICALLY (salt 23), so the post-decode frame selection is the
+        same on both sides and the pair differs only by the C1
+        perturbation -- the whole readout is a paired comparison and an
+        unmatched frame subset would silently confound it.
+
+        DEFAULT OFF (``pix_poscontrol_every = 0``) and, when off, not a
+        single tensor, decode or RNG draw happens here. On off-cadence
+        steps NOTHING is emitted rather than a stale or zeroed row.
+        """
+        every = int(getattr(self.config, "pix_poscontrol_every", 0) or 0)
+        if every <= 0 or int(update_idx) != 0:
+            return {}
+        if int(current_step) % every != 0:
+            return {}
+        from model.pixel_texture_disc import (
+            c1_structured_hf, positive_control_readout,
+        )
+
+        amp = float(getattr(self.config, "pix_poscontrol_amplitude", 0.5))
+        n_boot = int(getattr(self.config, "pix_poscontrol_boot", 1000))
+        try:
+            with torch.no_grad():
+                g_clean = self._pix_sync_generator(
+                    int(current_step), int(update_idx), salt=23)
+                g_corr = self._pix_sync_generator(
+                    int(current_step), int(update_idx), salt=23)
+                g_c1 = self._pix_sync_generator(
+                    int(current_step), int(update_idx), salt=29)
+                corr_lat = c1_structured_hf(real_lat, amp, generator=g_c1)
+                clean_px = self._pix_decode_crops_nograd(
+                    real_lat, border=border, n_frames=k_frames,
+                    decode_batch=decode_batch, gen=g_clean,
+                )
+                corr_px = self._pix_decode_crops_nograd(
+                    corr_lat, border=border, n_frames=k_frames,
+                    decode_batch=decode_batch, gen=g_corr,
+                )
+                readout = positive_control_readout(
+                    disc, clean_px, corr_px, student_px=student_px,
+                    n_boot=n_boot, generator=g_c1,
+                )
+            out = {f"train/{k}": float(v) for k, v in readout.items()}
+            out["train/pix_poscontrol_amplitude"] = amp
+            return out
+        except Exception:
+            # A diagnostic must never take a training run down, and it must
+            # not fake a reading either: the error key is DISTINCT from any
+            # separation value (A7 precedent).
+            return {"train/pix_poscontrol_err": 1.0}
+
+    def _pix_r1_grad_share(
+        self,
+        d_term: torch.Tensor,
+        r1_term: torch.Tensor,
+        *,
+        current_step: int,
+    ) -> Dict[str, float]:
+        """R1's SHARE of the D-side gradient -- not just its magnitude.
+
+        §7 requires ``pix_r1_grad_sq``, pre-γ and mean-reduced. That is a
+        MAGNITUDE, and R1 is the one term in this build where too-weak and
+        too-strong have OPPOSITE failure modes -- an unregularised D that
+        runs away, versus a D pinned so hard it cannot separate real from
+        fake at all. **No value of a magnitude distinguishes those two**:
+        the same ``pix_r1_grad_sq`` reads high whether γ is doing useful
+        work or crushing the critic, because the number says nothing about
+        what it is being compared against. A SHARE does:
+
+            share = ||∇_θ R1|| / (||∇_θ R1|| + ||∇_θ d_loss||)
+
+        -> ~0 means the penalty is decorative (unregularised regime);
+        -> ~1 means the penalty owns the D step (pinned regime);
+        and the accompanying cosine says whether R1 pulls WITH or AGAINST
+        the separation direction. This is docs/WP_PIXGAN.md §21's named
+        pattern (#1 and #2 are both "value, not share") applied before it
+        can bite a third time.
+
+        Measured POST-γ deliberately: the question is what the penalty AS
+        APPLIED does to the step. ``pix_r1_grad_sq`` stays pre-γ per §7, so
+        both readings are available and neither is inferable from the other.
+
+        Cadenced with the A7 probe (``gan_grad_telemetry_every``) because
+        it costs two extra backwards through the critic; on off-cadence
+        steps NOTHING is emitted -- a missing key honestly reads "not
+        measured" (§16/§19), where a 0.0 would read "decorative penalty".
+        Anchored on one parameter (the critic's last ``requires_grad``
+        param), exactly like the A7 probe, which is what keeps it cheap.
+        """
+        tel = int(getattr(self.config, "gan_grad_telemetry_every", 25) or 0)
+        if tel <= 0 or int(current_step) % tel != 0:
+            return {}
+        try:
+            p_last = None
+            for _p in self.pixel_texture_disc.parameters():
+                if _p.requires_grad:
+                    p_last = _p
+            if p_last is None:
+                return {"train/pix_r1_grad_share_unavailable": 1.0}
+            g_r1 = grad_at(r1_term, p_last, retain_graph=True)
+            g_d = grad_at(d_term, p_last, retain_graph=True)
+            if g_r1 is None or g_d is None:
+                return {"train/pix_r1_grad_share_unavailable": 1.0}
+            n_r1 = float(g_r1.norm())
+            n_d = float(g_d.norm())
+            logs = {
+                "train/pix_r1_grad_norm": n_r1,
+                "train/pix_d_grad_norm": n_d,
+            }
+            den = n_r1 + n_d
+            if den > 0.0:
+                logs["train/pix_r1_grad_share"] = n_r1 / den
+            else:
+                # OMITTED, not 0.0: 0.0 is the "decorative penalty"
+                # reading and would be indistinguishable from "both
+                # gradients vanished".
+                logs["train/pix_r1_grad_share_denom_zero"] = 1.0
+            if n_r1 > 0.0 and n_d > 0.0:
+                logs["train/pix_r1_d_grad_cos"] = float(
+                    torch.dot(g_r1, g_d) / (n_r1 * n_d)
+                )
+            return logs
+        except Exception:
+            # Telemetry can never take a training run down (A7 precedent).
+            return {"train/pix_r1_grad_share_err": 1.0}
+
+    def _pix_band_histogram(
+        self,
+        bands: Sequence[int],
+        n_bands: int,
+        *,
+        prefix: str = "pix_",
+    ) -> Dict[str, float]:
+        """§7 crop-band histogram -- fraction of crops in each A24 band.
+
+        Emitted as a COMPLETE set or not at all, so a ``0.0`` here is the
+        honest reading "no crop landed in this band" rather than a
+        placeholder for a computation that did not run: the set's presence
+        is itself the regime flag (§16/§19).
+        """
+        n = max(1, len(list(bands)))
+        counts = [0] * max(1, int(n_bands))
+        for b in bands:
+            i = int(b)
+            if 0 <= i < len(counts):
+                counts[i] += 1
+        out = {
+            f"train/{prefix}band_frac_{i}": float(c) / float(n)
+            for i, c in enumerate(counts)
+        }
+        out[f"train/{prefix}band_count"] = float(int(n_bands))
+        return out
+
+    def _pix_g_snapshot_disc(self) -> torch.nn.Module:
+        """The critic COPY the G-term scores against, and why one is needed.
+
+        MEASURED, not assumed: the G-term forward happens in the gen-loss
+        block, T3-B's D-loop calls ``pix_optimizer.step()`` later in the
+        SAME iteration, and ``generator_loss.backward()`` runs later still.
+        Adam's step is in-place on the critic weights, so backward through
+        a graph built on the live module raises
+
+            "one of the variables needed for gradient computation has been
+            modified by an inplace operation ... expected version 1"
+
+        (reproduced on CPU before this was written; it fires even with the
+        critic's ``requires_grad`` set False, because the version check is
+        on the SAVED tensor, not on its grad-ness).  The LADD path dodges
+        the same hazard by deferring its disc update
+        (``ladd_defer_disc_update``); the pixel path cannot, because the
+        D-loop's position is T3-B's and the A22 probe reads after it.
+
+        So the G-term scores a snapshot refreshed from the live critic at
+        the top of every G-term call.  Three consequences, all wanted:
+          * the later in-place optimizer step cannot corrupt this graph;
+          * NO gradient ever lands on the real critic's ``.grad`` (the
+            snapshot's params are ``requires_grad=False``), so the G
+            backward cannot pollute the next D-update;
+          * G is trained against D as of the start of the step -- ordinary
+            alternating-GAN semantics.
+
+        ``eval()`` because the only mode-dependent piece in
+        ``PixelTextureDisc`` is spectral norm's power iteration (GroupNorm
+        and LeakyReLU are mode-independent, and there is no dropout or
+        batchnorm): eval reuses the live critic's current ``u``/``v``, so
+        the snapshot forward is deterministic and free of side effects.
+        """
+        import copy
+
+        disc = self.pixel_texture_disc
+        snap = getattr(self, "_pix_g_disc_snapshot", None)
+        if snap is None:
+            snap = copy.deepcopy(disc)
+            for _p in snap.parameters():
+                _p.requires_grad_(False)
+            self._pix_g_disc_snapshot = snap
+        with torch.no_grad():
+            snap.load_state_dict(disc.state_dict())
+        snap.eval()
+        return snap
+
+    def _pix_gen_weight(self, current_step: int) -> float:
+        """Resolved gen-side pixel weight for this step (0 before D starts).
+
+        ``pix_gan_weight`` has NO DEFAULT (TEXTURE_GAN_DESIGN §5.5 withdrew
+        0.03; docs/WP_PIXGAN.md §24 forbids inheriting the LADD arms'
+        0.65-0.80 / 0.054 -- different domain, reduction, loss form and
+        critic).  It is resolved through
+        ``model.pixel_texture_disc.resolve_gan_weight(v, strict=True)``, so
+        its ABSENCE RAISES.  An explicit ``0.0`` is legal and is exactly
+        the §12 weight-free probe: no gradient is contributed, while the
+        UNWEIGHTED ratio telemetry still reads the term's would-be share.
+
+        The ramp mirrors the LADD gen-side one (``gan_warmup_steps`` with
+        ``gan_warmup_shape``), anchored at ``gan_disc_start_step`` -- the
+        same step T3-B's D-loop starts at, so G never scores an untrained
+        critic.
+        """
+        from model.pixel_texture_disc import resolve_gan_weight
+
+        base = resolve_gan_weight(
+            getattr(self.config, "pix_gan_weight", None), strict=True,
+        )
+        start = int(getattr(self, "gan_disc_start_step", 0))
+        if int(current_step) < start:
+            return 0.0
+        warm = int(getattr(self, "gan_warmup_steps", 0) or 0)
+        if warm > 0 and int(current_step) < start + warm:
+            ramp = self._gan_warmup_shape_apply(
+                (int(current_step) - start) / max(1, warm)
+            )
+            return float(base) * float(ramp)
+        return float(base)
+
+    def _maybe_run_surrogate_distillation(
+        self,
+        info: Dict[str, Any],
+        out: Dict[str, float],
+        *,
+        current_step: int,
+    ) -> None:
+        """WP-SURROGATE (B3) distillation step -- wired by MAIN under
+        researcher order (docs/TASK_SURROGATE_CONSUMPTION.md; spec =
+        WP_SURROGATE.md §4.2/§4.3).
+
+        Runs immediately AFTER the pixel D-updates so the critic fits the
+        JUST-UPDATED disc (spec §4.3). Gate-off is byte-identical: no RNG
+        draw, no log key, no tensor touched -- every draw below comes from
+        a private generator created inside the gate.
+
+        Real crops are drawn READ-ONLY from ``_pix_real_pool`` -- option
+        (a) of WP-PIXGAN's 2026-08-24 review: NEVER via
+        ``_pix_draw_reals``, whose ``_pix_recent_frames`` ring is A20
+        state owned by the D-loop; a second caller would make
+        ``pix_real_reuse_frac`` describe draws the D-loop never made
+        (spuriously tripping, or masking, an A20 alarm). No admission, no
+        eviction, no counters here: A20/A21 telemetry keeps describing
+        exactly the D-loop.
+        """
+        if not bool(getattr(self, "surrogate_critic_enabled", False)):
+            return
+        distiller = getattr(self, "latent_texture_distiller", None)
+        critic = getattr(self, "latent_texture_critic", None)
+        if distiller is None or critic is None:
+            raise RuntimeError(
+                "surrogate_critic_enabled is True but the distiller/critic "
+                "attributes are missing -- the build step did not run (or a "
+                "resume dropped them). Failing loud: a silently skipped "
+                "distillation leaves the generator consuming a never-"
+                "trained critic, which reads as 'GAN term present and "
+                "quiet' on every dashboard."
+            )
+        # Teacher selection. NOTE this block was silently LOST once (an
+        # edit script asserted out before writing, and only its second
+        # half was re-applied): `backbone` went undefined, the guard below
+        # fell through to the pixel disc, and in surrogate-only mode that
+        # is None -- so two full 60-step "SAM2 surrogate" smokes ran with
+        # the distillation never executing and every log looking healthy.
+        # The regime flag was doing its job; nobody read it. Hence the
+        # explicit assertion under it.
+        backbone = str(getattr(self, "surrogate_teacher_backbone", "pixel"))
+        teacher_disc = (
+            getattr(self, "sam2_teacher_disc", None)
+            if backbone in ("sam2", "dinov2", "convnext")
+            else getattr(self, "pixel_texture_disc", None)
+        )
+        if teacher_disc is None:
+            # No teacher: nothing to distill from. Regime flag, never
+            # silence (forgeable-zero rule).
+            out["train/surrogate_distill_no_teacher"] = 1.0
+            out["train/surrogate_distill_ran"] = 0.0
+            return
+        if int(current_step) < int(getattr(self, "gan_disc_start_step", 0)):
+            out["train/surrogate_distill_warmup_skipped"] = 1.0
+            return
+
+        rc = self._pix_resolve_cfg()
+        n_crops = rc["n_crops"]
+        crop_rows, crop_cols = rc["crop_rows"], rc["crop_cols"]
+        n_bands = rc["n_bands"]
+        border = rc["border"]
+
+        # Distinct salt: D-loop uses salt 0 (default), the G-term salt 11;
+        # the distiller's crops must be neither.
+        gen = self._pix_sync_generator(int(current_step), 0, salt=13)
+
+        # Fake crops: mask-selected BEFORE the crop draw (the
+        # zero-gradient trap -- a crop from a detached frame yields a
+        # teacher gradient of exactly zero, and the Sobolev term would
+        # faithfully learn "no gradient here" for ordinary texture; under
+        # the normalized loss an all-zero target is numerically loud, not
+        # ignorable). Then DETACHED: the distiller owns its own graph.
+        fake_lat, _fake_logs = self._pix_select_fake_latents(info)
+        crops_f, ys_f, _xs_f, _bands_f = self._pix_take_crops_with_origins(
+            fake_lat.detach(),
+            n_crops=n_crops, crop_rows=crop_rows, crop_cols=crop_cols,
+            n_bands=n_bands, gen=gen,
+        )
+
+        # Real crops: read-only pool draw (see docstring) -- EXCEPT in
+        # surrogate-only SAM2 mode, where the pixel D-loop (the pool's
+        # only producer) never runs and the pool would stay empty forever:
+        # the SAM2 heads would train against no reals, the distiller would
+        # fit a fake-only value field, and every metric would look healthy
+        # -- the exact looks-active-is-inert shape this campaign keeps
+        # finding. So THIS mode admits its own windows via the same
+        # ``_pix_pool_fill`` primitive the D-loop uses (A21 semantics
+        # preserved: cross-ride, band-stratified, FIFO-refreshed), sized
+        # to 2x the per-step draw with one fresh admission per step.
+        if backbone in ("sam2", "dinov2", "convnext"):
+            _pool_now = len(getattr(self, "_pix_real_pool", None) or ())
+            _want = max(1, 2 * int(n_crops) - _pool_now)
+            self._pix_pool_fill(
+                _want, gen=gen, crop_rows=crop_rows, crop_cols=crop_cols,
+                n_bands=n_bands, lat_frames=int(rc["lat_frames"]),
+                step=int(current_step),
+            )
+        pool = getattr(self, "_pix_real_pool", None) or []
+        z_real = None
+        origin_real: Optional[List[int]] = None
+        if pool:
+            n_draw = min(int(n_crops), len(pool))
+            perm = torch.randperm(
+                len(pool), generator=gen, device=gen.device,
+            )
+            entries = [pool[int(i)] for i in perm[:n_draw].tolist()]
+            z_real = torch.stack([
+                e["lat"].to(crops_f.device, crops_f.dtype)
+                for e in entries
+            ]).detach()
+            # LatentTextureCritic.forward's ``latent_origin`` is ONE
+            # (y0, x0) pair applied to the WHOLE batch in a single call
+            # (model/latent_texture_critic.py:403-410) -- it is not a
+            # per-crop list. Found on review: a first draft passed the
+            # raw per-crop y-list here, which ``step()`` -> ``compute_
+            # teacher_targets`` reads as ``(origin[0], origin[1])``
+            # (:693) -- i.e. crop 0's y as y0 and crop 1's y MISREAD as
+            # x0, with every other crop's origin silently dropped. Fixed
+            # to a single representative: mean y across the batch (x is
+            # 0 by construction -- A24 does not band-match horizontal
+            # position, TEXTURE_GAN_DESIGN.md §3.6, so there is no
+            # meaningful x to average). This is the batch-shared-origin
+            # approximation the module's own docs call "a positional
+            # prior, not an index" -- correct as far as it goes, but a
+            # coarser one than per-crop origins would give; see
+            # WP_SURROGATE.md §4.3 for the open item to do this properly
+            # if it turns out to matter.
+            origin_real = [
+                int(round(sum(int(e["y0"]) for e in entries) / len(entries))),
+                0,
+            ]
+        else:
+            out["train/surrogate_distill_no_reals"] = 1.0
+
+        # ---- SAM2 backbone: heads D-update BEFORE distillation --------
+        # The pretrained-teacher branch (researcher directive 2026-08-24).
+        # The frozen Hiera encoder needs no update; the ADM heads DO -- a
+        # surrogate distilled from never-trained heads learns noise. One
+        # (or ``surrogate_sam2_updates_per_step``) NS-logistic update on
+        # this step's real/fake crops, decoded under no_grad (D inputs are
+        # detached by definition; only head params receive grad). This is
+        # deliberately simpler than the ancestor's full RpGAN+R1+R2 --
+        # mechanics first; the penalty stack is a follow-up once the smoke
+        # proves the path.
+        if backbone in ("sam2", "dinov2", "convnext") and z_real is not None:
+            _s2_opt = getattr(self, "sam2_teacher_optimizer", None)
+            if _s2_opt is not None:
+                with torch.no_grad():
+                    _rp = self._vae_decode_grad(
+                        z_real.to(self._pix_vae_dtype())).float()
+                    _fp = self._vae_decode_grad(
+                        crops_f.to(self._pix_vae_dtype())).float()
+                    if border > 0:
+                        _rp = _rp[..., border:-border, border:-border]
+                        _fp = _fp[..., border:-border, border:-border]
+                _n_upd = max(1, int(getattr(
+                    self.config, "surrogate_sam2_updates_per_step", 1)))
+                for _k in range(_n_upd):
+                    _dr = teacher_disc(_rp)
+                    _df = teacher_disc(_fp)
+                    _d_loss = (
+                        torch.nn.functional.softplus(-_dr).mean()
+                        + torch.nn.functional.softplus(_df).mean()
+                    )
+                    _s2_opt.zero_grad(set_to_none=True)
+                    _d_loss.backward()
+                    _s2_opt.step()
+                out["train/surrogate_sam2_d_loss"] = float(_d_loss.detach())
+                out["train/surrogate_sam2_d_real"] = float(
+                    _dr.detach().mean())
+                out["train/surrogate_sam2_d_fake"] = float(
+                    _df.detach().mean())
+                self._sam2_d_updates_total = (
+                    int(getattr(self, "_sam2_d_updates_total", 0)) + _n_upd
+                )
+                out["train/surrogate_sam2_d_updates_total"] = float(
+                    self._sam2_d_updates_total)
+
+        def _teacher(z_crop: torch.Tensor) -> torch.Tensor:
+            # Spec §4.2 closure: graph-on checkpointed decode + border trim
+            # + the JUST-UPDATED teacher. ``empty_cache`` first -- the
+            # step-2 allocator failure on graph-on decodes is measured-real.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # DTYPE (MAIN 13:1x, PIXGAN-authorized swap): fp32 VAE convs
+            # reject bf16 latents (the step-16 pixgan200 crash). This
+            # closure calls _vae_decode_grad DIRECTLY -- not the fixed
+            # _pix_decode_crops_* helpers -- so it takes the same derived
+            # cast. .to() is differentiable; real and fake crops share
+            # this one closure, so both sides get identical treatment.
+            # float32 into the disc mirrors the helpers' output contract.
+            px = self._vae_decode_grad(z_crop.to(self._pix_vae_dtype()))
+            if border > 0:
+                px = px[..., border:-border, border:-border]
+            if backbone in ("sam2", "dinov2", "convnext"):
+                # Pretrained disc consumes [N, F, 3, H, W] whole and returns [N]
+                # per-sample logits (frame-pooled inside);
+                # reduce_patch_logits accepts [N] unchanged. Gradient flows
+                # through the frozen encoder to px to z_crop -- encoder
+                # params get no grad, the input path does (the ancestor's
+                # documented G-path memory shape, now paid only every
+                # pix_teacher_refresh_every steps, under the distiller's
+                # own checkpointing).
+                return teacher_disc(px.to(torch.float32))
+            n, f = int(px.shape[0]), int(px.shape[1])
+            logits = self.pixel_texture_disc(
+                px.flatten(0, 1).to(torch.float32))
+            return logits.reshape(n, f, *logits.shape[1:])
+
+        logs = distiller.step(
+            z_real=z_real,
+            z_fake=crops_f,
+            teacher_value_fn=_teacher,
+            current_step=int(current_step),
+            optimizer=getattr(self, "latent_critic_optimizer", None),
+            origin_real=origin_real,
+            # Same batch-shared-origin fix as ``origin_real`` above.
+            origin_fake=[int(round(sum(ys_f) / len(ys_f))), 0] if ys_f else None,
+        )
+        out.update(logs)
+        out["train/surrogate_distill_ran"] = 1.0
+        out["train/surrogate_teacher_is_pretrained"] = (
+            1.0 if backbone in ("sam2", "dinov2", "convnext") else 0.0
+        )
+        # Periodic direct-vs-surrogate gradient audit -- the honest readout
+        # for the whole package (docs/WP_SURROGATE.md §2c): cosine between
+        # the gradient the generator WOULD get from the true teacher and
+        # the one the surrogate actually serves, on this step's fake crops.
+        # Found inert on 2026-08-24: ``surrogate_grad_check_every`` was
+        # threaded into the distiller by build_from_config but NO trainer
+        # call site ever fired the audit -- the same knob-present-but-
+        # unconsumed shape as pix_finish_grad_enabled. This is the call
+        # site. Costs one extra teacher fwd+grad, hence the cadence gate.
+        if distiller.should_grad_check(int(current_step)):
+            try:
+                chk = distiller.surrogate_grad_check(
+                    crops_f,
+                    _teacher,
+                    origin=(
+                        [int(round(sum(ys_f) / len(ys_f))), 0]
+                        if ys_f else None
+                    ),
+                    current_step=int(current_step),
+                )
+                out.update(chk)
+            except Exception as exc:
+                # The audit is telemetry: it must never kill a step. But
+                # never silently either (forgeable-zero rule).
+                out["train/surrogate_check_err"] = 1.0
+                if self.is_main_process:
+                    logging.warning(
+                        "[ActionForcing] surrogate_grad_check failed: %s",
+                        exc,
+                    )
+
+    def _surrogate_g_snapshot_critic(self) -> torch.nn.Module:
+        """The latent-critic COPY the surrogate G-term scores against.
+
+        EXACTLY B1's ``_pix_g_snapshot_disc`` hazard, on the surrogate
+        path, and it is an autograd CORRECTNESS bug rather than the
+        staleness question §4.3 of docs/WP_SURROGATE.md analysed:
+
+          * the G-term forward runs in the gen-loss block;
+          * ``_maybe_run_surrogate_distillation`` calls
+            ``latent_critic_optimizer.step()`` LATER in the same iteration;
+          * ``generator_loss.backward()`` runs later still.
+
+        Adam's step is in-place on the critic weights, so the backward
+        through a graph built on the LIVE critic raises
+
+            "one of the variables needed for gradient computation has been
+             modified by an inplace operation: [512, 1] ... expected
+             version 3"
+
+        -- observed on all 8 ranks at step 21, the first distillation
+        step, in both the dinov2 and sam2 arms. Note this fires even
+        though ``generator_surrogate_loss`` sets ``requires_grad_(False)``
+        on the critic: the version counter is checked on the SAVED tensor,
+        not on its grad-ness (B1 documented the identical trap; I had read
+        that docstring and still had to rediscover it from a stack trace).
+
+        Snapshot semantics, all three wanted and all three matching B1:
+          * the later in-place optimizer step cannot corrupt this graph;
+          * no gradient ever lands on the real critic's ``.grad``, so the
+            G backward cannot pollute the next distillation step;
+          * G is trained against the critic as of the START of the step --
+            ordinary alternating-GAN semantics, and the same one-step
+            offset §4.3 already accepted and logs as
+            ``surrogate_staleness_steps``.
+        """
+        import copy
+
+        critic = self.latent_texture_critic
+        snap = getattr(self, "_surrogate_g_critic_snapshot", None)
+        if snap is None:
+            snap = copy.deepcopy(critic)
+            self._surrogate_g_critic_snapshot = snap
+        with torch.no_grad():
+            snap.load_state_dict(critic.state_dict())
+        # Re-frozen EVERY call, not just at creation:
+        # ``generator_surrogate_loss`` restores ``requires_grad_(True)`` in
+        # its finally-block (correct for the live critic it was written
+        # for), which would otherwise leave the snapshot accumulating a
+        # ``.grad`` it has no optimizer to consume -- a slow leak.
+        snap.requires_grad_(False)
+        snap.eval()
+        return snap
+
+    def _compute_pixel_texture_g_loss(
+        self,
+        info: Dict[str, Any],
+        *,
+        current_step: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        """WP-PIXGAN T3-C -- the pixel G-term, added into ``gen_gan_loss``.
+
+        Returns ``(weighted, raw, logs)``:
+          * ``weighted``: ``w * g_loss`` to add into ``gen_gan_loss``, or
+            ``None`` when ``w == 0`` (nothing is added -- that is the §12
+            weight-free probe regime, and adding ``0.0 * g`` would only
+            buy a zero-gradient backward through the decoder);
+          * ``raw``: the UNWEIGHTED ``g_loss`` tensor, still graph-bearing.
+            The A7 block differentiates THIS to publish the ratio the
+            pixel term WOULD have at weight 1.0 (§12 step 1); without it a
+            weight-free probe reads exactly 0.0 and settles nothing;
+          * ``logs``: §7 keys, emitted only on the path that computed them.
+
+        Same geometry as the D-loop by construction (same crop helper,
+        same band plan, same frame count, same border trim), so the
+        critic sees fake pixels drawn exactly as it was trained -- but a
+        SEPARATE private generator stream (salt 11) so the G crops are not
+        the D crops, and a GRAPH-ON decode (``_pix_decode_crops_grad``),
+        which is the whole point of the term.
+        """
+        _sur_on = bool(getattr(self, "surrogate_critic_enabled", False))
+        if not (bool(getattr(self, "gan_pixel_texture_enabled", False))
+                or _sur_on):
+            return None, None, {}
+        if getattr(self, "pixel_texture_disc", None) is None and not _sur_on:
+            return None, None, {}
+        # A24/A21/§5.3 resolution happens HERE, above the warm-up return.
+        # This consumer runs EARLIER in the step than the D-loop, so a pin
+        # that only the D-loop enforced was a pin this path had already run
+        # past. Resolution is the checkpoint; both consumers pass through it
+        # and neither owns it.
+        rc = self._pix_resolve_cfg()
+        logs: Dict[str, float] = {}
+        start = int(getattr(self, "gan_disc_start_step", 0))
+        if int(current_step) < start:
+            # Regime flag, not a value: ``pix_g_loss`` is OMITTED here
+            # rather than zero-filled (docs/WP_PIXGAN.md §16 forgeable
+            # zeros -- 0.0 is a meaningful g_loss).
+            logs["train/pix_g_warmup_skipped"] = 1.0
+            return None, None, logs
+
+        from model.pixel_texture_disc import (
+            g_loss, patch_logit_spatial_variance,
+        )
+
+        crop_lat = rc["crop_lat"]
+        n_crops = rc["n_crops"]
+        k_frames = rc["k_frames"]
+        n_bands = rc["n_bands"]
+        border = rc["border"]
+        loss_form = rc["loss_form"]
+        decode_batch = rc["decode_batch"]
+
+        weight = self._pix_gen_weight(int(current_step))
+
+        fake_lat, fake_logs = self._pix_select_fake_latents(info)
+        logs.update(fake_logs)
+        if not fake_lat.requires_grad:
+            # The term would be a constant: no gradient to the generator,
+            # so it is neither added nor measured. Distinct reason key --
+            # never a 0.0 ratio (docs/WP_PIXGAN.md §21 instance 3).
+            logs["train/pix_g_fake_no_grad"] = 1.0
+            return None, None, logs
+
+        # ------------------------------------------------------------------
+        # WP-SURROGATE (B3) consumption branch -- MAIN, researcher-ordered
+        # (docs/TASK_SURROGATE_CONSUMPTION.md). When the surrogate critic is
+        # enabled, the generator's texture gradient comes from the LATENT
+        # surrogate instead of the decode->disc direct path. The two are
+        # ALTERNATIVES, never summed (WP_SURROGATE.md §4.3): this branch
+        # returns before the decode path. Contract preserved: ``raw`` is the
+        # UNWEIGHTED surrogate loss (the A7 probe differentiates it
+        # unchanged); ``weighted`` is ``w*raw`` or None at w==0; the direct
+        # path's decode/disc log keys are OMITTED here -- they would report
+        # a computation that did not run (forgeable-zero rule). Ordering
+        # note, recorded deviation from §4.3 same-step order: this consumer
+        # runs EARLIER in the step than the D-loop (see docstring above), so
+        # the critic consumed here was distilled at the END of the PREVIOUS
+        # step -- one step stale, symmetric with the direct path's
+        # pre-update disc snapshot, keeping the alternatives comparable.
+        if bool(getattr(self, "surrogate_critic_enabled", False)):
+            from model.latent_texture_critic import generator_surrogate_loss
+
+            critic = (
+                self._surrogate_g_snapshot_critic()
+                if self.latent_texture_critic is not None else None
+            )
+            if critic is None:
+                # Gate says enabled but the build produced nothing: this is
+                # the exact silent-skew class; fail loud, never fall back to
+                # the direct path behind the arm's back.
+                raise RuntimeError(
+                    "surrogate_critic_enabled is True but "
+                    "latent_texture_critic is None -- the build step did "
+                    "not run or was resumed without its keys. Refusing to "
+                    "fall back to the direct pixel path silently."
+                )
+            raw_sur, sur_logs = generator_surrogate_loss(
+                critic, fake_lat, weight=1.0,
+            )
+            logs.update(sur_logs)
+            # The module computed at weight=1.0 (that call IS the raw /
+            # probe form); re-state the APPLIED weight so the echoes
+            # describe what actually entered the loss, not the probe call
+            # (echoes-read-runtime rule).
+            logs["train/surrogate_g_weight"] = float(weight)
+            logs["train/surrogate_g_weighted"] = (
+                float(weight) * float(logs.get("train/surrogate_g_main", 0.0))
+            )
+            logs["train/surrogate_consumed"] = 1.0
+            logs["train/surrogate_staleness_steps"] = 1.0
+            logs["train/pix_g_weight"] = float(weight)
+            weighted_sur = (
+                (raw_sur * float(weight)) if weight != 0.0 else None
+            )
+            return weighted_sur, raw_sur, logs
+
+        gen = self._pix_sync_generator(int(current_step), 0, salt=11)
+        crops, ys, xs, bands = self._pix_take_crops_with_origins(
+            fake_lat,
+            n_crops=n_crops,
+            crop_rows=int(crop_lat[0]),
+            crop_cols=int(crop_lat[1]),
+            n_bands=n_bands,
+            gen=gen,
+        )
+        fake_px = self._pix_decode_crops_grad(
+            crops, border=border, n_frames=k_frames,
+            decode_batch=decode_batch, gen=gen,
+        )
+        snap = self._pix_g_snapshot_disc()
+        fake_logits = snap(fake_px)
+        raw = g_loss(fake_logits, loss_form=loss_form)
+
+        logs["train/pix_g_loss"] = float(raw.detach())
+        logs["train/pix_g_weight"] = float(weight)
+        logs["train/pix_g_images"] = float(int(fake_px.shape[0]))
+        logs["train/pix_g_fake_logit_mean"] = float(
+            fake_logits.detach().mean()
+        )
+        logs["train/pix_g_patch_logit_spatial_var"] = float(
+            patch_logit_spatial_variance(fake_logits.detach())
+        )
+        logs.update(self._pix_band_histogram(bands, n_bands, prefix="pix_g_"))
+        weighted = (raw * float(weight)) if weight != 0.0 else None
+        return weighted, raw, logs
+
+    def _maybe_run_pixel_texture_d_updates(
+        self,
+        info: Dict[str, Any],
+        out: Dict[str, float],
+        *,
+        current_step: int,
+        chunk_depth: Optional[int] = None,
+    ) -> None:
+        """WP-PIXGAN T3-B -- run this step's pixel-critic D updates.
+
+        Gated on ``gan_pixel_texture_enabled`` (T3-A). When off this
+        returns before touching anything: no decode, no dataset read, no
+        RNG draw (every draw below comes from a private generator created
+        inside the gate) and no log key. That is the byte-identical-off
+        guarantee, and ``testing/test_pixgan_trainer_supply.py`` asserts it
+        against the global RNG state.
+
+        Cadence: ``pix_gan_updates_per_step`` FOLLOWS ``gan_updates_per_step``
+        (5 in the ganfix arms, 1 by config default) and the D pass is
+        deferred until ``gan_disc_start_step`` exactly like the LADD path.
+        ``gan_warmup_steps`` is the GENERATOR-side ramp and does not gate D
+        -- T3-C consumes it for the G-term.
+
+        Each update, per §5.2:
+          1. resolve the fake latents (mask-selected on the grad path);
+          2. draw ``pix_crops_per_step`` latent crops + their origins;
+          3. DETACH and decode both sides under ``no_grad`` (D is trained
+             on pixels, not through the generator);
+          4. one independently sourced real per fake, SAME A24 band;
+          5. ``d_loss`` + ``r1_penalty`` (every update), step
+             ``pix_optimizer``.
+
+        EXPOSURE (researcher directive, 2026-08-24): the critic needs A
+        LOT of exposure to fakes and equivalent reals --
+        ``pix_crops_per_step=8`` x ``pix_frames_per_crop=3`` x
+        (``pix_gan_updates_per_step`` following ``gan_updates_per_step`` =
+        5 in the ganfix arms) = 120 fakes + 120 band-matched independent
+        reals per training step, every fake decoded from THIS step's
+        chunk. Exposure is COUNTED (``pix_fake_images_total`` /
+        ``pix_real_images_total``, decode-window count, wall-time delta),
+        never assumed: the real-side decodes are no_grad but land on the
+        critical path (§6), so the cost is measured here too.
+
+        NO FAKE-SIDE MEMORY -- deliberate and load-bearing (researcher,
+        2026-08-24): the axes along which texture collapse happens are
+        always changing; it is the POSITIVE samples that stay in the same
+        style. The negatives will always be changing in style -- D needs
+        the CURRENT degenerate collapse, not all historic ones, and
+        long-term memory on the fake side makes the discriminator's job
+        HARDER. Cache the stationary class, never the moving one: real
+        style is stationary, so the large continuously-refreshed real pool
+        (A21) stays; the fake distribution is non-stationary by direction,
+        so every fake is drawn LIVE. A SimGAN-style fake replay ring was
+        designed and WITHDRAWN on exactly this reasoning -- do not re-add
+        one.
+
+        ``chunk_depth`` is the 0-based AR chunk index of this step's
+        trained chunk within the current ride's rollout, threaded from
+        ``_streaming_train_one_chunk`` where the chunk identity is known.
+        It feeds the coarse fake-depth histogram, so "the D sees drifted
+        fakes" is a number, not a hope. ``None`` = depth unmeasured: the
+        histogram keys are OMITTED, never zero-filled.
+        """
+        if not bool(getattr(self, "gan_pixel_texture_enabled", False)):
+            return
+        if getattr(self, "pixel_texture_disc", None) is None:
+            return
+        if getattr(self, "pix_optimizer", None) is None:
+            return
+        # Re-assert the CONFIG->PIPELINE seam (see the propagation at
+        # ``self.model = model``). Idempotent bool setattr; inside the gate so
+        # the off path is untouched. A flag that survives construction but not
+        # a pipeline rebuild is the same bug with a longer fuse.
+        # ONE read per function: the resolved-config echo below reports
+        # THIS local rather than taking a second getattr of its own. The
+        # knob is not resolver-owned because _build_pipeline reads it
+        # outside the pixel gate, where the validating resolver must never
+        # be reached -- but two reads inside ONE function was pure drift
+        # surface with nothing bought.
+        _finish_grad = bool(
+            getattr(self.config, "pix_finish_grad_enabled", False)
+        )
+        _pipe = getattr(self, "pipeline", None)
+        if _pipe is not None:
+            _pipe.pix_finish_grad_enabled = _finish_grad
+        start = int(getattr(self, "gan_disc_start_step", 0))
+        if int(current_step) < start:
+            out["train/pix_d_updates"] = 0.0
+            out["train/pix_d_warmup_skipped"] = 1.0
+            return
+
+        from model.pixel_texture_disc import (
+            d_loss, patch_logit_spatial_variance, r1_penalty,
+        )
+
+        # §6 -- the real-side decodes are no_grad but the loader lands on
+        # the CRITICAL PATH, and at 8 crops x 5 updates the cost must be
+        # MEASURED, not assumed: decode-window count and the D-block's
+        # wall-time delta are accumulated here and logged once per step.
+        _t_pix0 = time.monotonic()
+        _decode_windows_step = 0
+
+        cfg = self.config
+        # ONE resolution point (see _pix_resolve_cfg). The A24 band pin used
+        # to live HERE, after the two early returns above, while the G-side
+        # consumer read pix_band_count with no pin at all and ran earlier in
+        # the step; it is now enforced wherever the config is resolved.
+        rc = self._pix_resolve_cfg()
+        crop_lat = rc["crop_lat"]
+        crop_rows, crop_cols = rc["crop_rows"], rc["crop_cols"]
+        n_crops = rc["n_crops"]
+        k_frames = rc["k_frames"]
+        n_bands = rc["n_bands"]
+        reals_per_fake = rc["reals_per_fake"]
+        border = rc["border"]
+        loss_form = rc["loss_form"]
+        r1_gamma = rc["r1_gamma"]
+        r1_sigma = rc["r1_sigma"]
+        r1_num = rc["r1_num"]
+        decode_batch = rc["decode_batch"]
+        lat_frames = rc["lat_frames"]
+        n_updates = rc["n_updates"]
+
+        counters = self._pix_counters()
+        disc = self._pix_disc_module()
+        raw_disc = self.pixel_texture_disc
+        band_mismatch = int(getattr(self, "_pix_band_mismatch", 0))
+        logs: Dict[str, float] = {}
+        n_done = 0
+
+        for u in range(max(0, n_updates)):
+            gen = self._pix_sync_generator(current_step, u)
+            rgen = self._pix_rank_generator(current_step, u)
+
+            # A21 CONTINUOUS REFRESH -- forever, NOT "until the pool is
+            # full".
+            #
+            # The previous rule was ``min(pool_target - pool_now, ...)``,
+            # which reaches 0 the moment the pool reaches its cap and stays
+            # there. Since admission is the only thing that grows A21
+            # support, that froze support at the pool's ceiling
+            # (windows x lat_frames = 4,096 at the shipped 2,048 x 2 --
+            # EXACTLY PIX_A21_SUPPORT_FLOOR, and measurably below it once
+            # windows overlap inside a ride), so pix_a21_support_ok could
+            # never be 1; it froze the FIFO branch in _pix_pool_fill into
+            # dead code, making the pool the memorisable mini-dataset A21
+            # forbids; and it stopped calling _pix_train_ride_paths, so the
+            # A22 holdout claim went stale and was re-published unchanged.
+            #
+            # So: ``_refresh`` windows EVERY update regardless of pool size,
+            # plus a warm-up rate while the pool is still cold. The cap
+            # bounds MEMORY (FIFO eviction in _pix_pool_fill); it must never
+            # bound refresh.
+            _pool_now = len(getattr(self, "_pix_real_pool", None) or ())
+            _pool_target = rc["pool_windows"]
+            _refresh = rc["pool_refresh"]
+            # Warm-up rate: reach the cap in pix_real_pool_warm_updates
+            # D-updates instead of pool_target/refresh of them (2,048/8 =
+            # 256 updates, i.e. a 300-step arm would spend 85 % of its life
+            # below the floor even with refresh fixed).
+            _warm_rate = max(
+                _refresh,
+                -(-_pool_target // max(1, rc["pool_warm_updates"])),
+            )
+            # Enough stock to serve one D-update's paired draw even on the
+            # very first update; _pix_draw_reals force-fills short bands
+            # anyway, this just avoids doing it one window at a time.
+            _warm_min = n_crops * k_frames * reals_per_fake * 2
+            if _pool_now >= _pool_target:
+                _grow = _refresh
+            else:
+                _grow = min(
+                    _warm_rate, max(_refresh, _pool_target - _pool_now),
+                )
+            if _pool_now < _warm_min:
+                _grow = max(_grow, min(_warm_min - _pool_now, _pool_target))
+            if _grow > 0:
+                self._pix_pool_fill(
+                    _grow, gen=rgen, crop_rows=crop_rows,
+                    crop_cols=crop_cols, n_bands=n_bands,
+                    lat_frames=lat_frames, step=int(current_step),
+                )
+
+            # LIVE fakes ONLY -- researcher (2026-08-24), verbatim in
+            # substance: "The axes along which texture collapse happens
+            # are always changing. It is the POSITIVE samples that stay in
+            # the same style -- that is what we want to get to. The
+            # negatives will always be changing in style; we need to know
+            # the CURRENT degenerate texture collapse, not all historic
+            # ones. Long-term memory on the fake side makes the
+            # discriminator's job HARDER." A fake replay ring was designed
+            # and WITHDRAWN on that reasoning: cache the stationary class
+            # (the reals -- the A21 pool above), never the moving one. Do
+            # not re-add a fake-side history buffer.
+            fake_lat, fake_logs = self._pix_select_fake_latents(info)
+            logs.update(fake_logs)
+            # §5.2: D sees DETACHED pixels on both sides.
+            crops, ys, xs, bands = self._pix_take_crops_with_origins(
+                fake_lat.detach(),
+                n_crops=n_crops, crop_rows=crop_rows, crop_cols=crop_cols,
+                n_bands=n_bands, gen=gen,
+            )
+            fake_px = self._pix_decode_crops_nograd(
+                crops, border=border, n_frames=k_frames,
+                decode_batch=decode_batch, gen=gen,
+            )
+            n_fake = int(fake_px.shape[0])
+            if not getattr(self, "_pix_cfg_echoed", False):
+                # Derived-vs-requested is read off the ACTUAL tensors: the
+                # crop helper clamps rows/cols to the latent grid, and
+                # _decode_crops declines to trim a crop smaller than 2*border.
+                _dh, _dw = int(fake_px.shape[-2]), int(fake_px.shape[-1])
+                self._pix_echo_resolved_config(logs, resolved={
+                    "gan_pixel_texture_enabled": bool(
+                        self.gan_pixel_texture_enabled),
+                    "pix_finish_grad_enabled": bool(_finish_grad),
+                    "pix_crop_lat_rows_requested": int(crop_lat[0]),
+                    "pix_crop_lat_cols_requested": int(crop_lat[1]),
+                    "pix_crop_lat_rows_derived": int(crops.shape[-2]),
+                    "pix_crop_lat_cols_derived": int(crops.shape[-1]),
+                    "pix_crops_per_step": int(n_crops),
+                    "pix_frames_per_crop_requested": int(k_frames),
+                    "pix_frames_per_crop_derived": int(
+                        n_fake // max(1, int(crops.shape[0]))),
+                    "pix_lat_frames_per_crop_requested": int(lat_frames),
+                    "pix_lat_frames_per_crop_derived": int(
+                        fake_lat.shape[1]),
+                    "pix_band_count": int(n_bands),
+                    "pix_reals_per_fake": int(reals_per_fake),
+                    "pix_decode_batch": int(decode_batch),
+                    "pix_decode_border_trim_requested": int(border),
+                    "pix_decode_border_trim_derived": int(
+                        (int(crops.shape[-2]) * 8 - _dh) // 2),
+                    "pix_loss_form": loss_form,
+                    "pix_loss_form_is_hinge": bool(loss_form == "hinge"),
+                    # RESOLVED through _pix_resolve_r1_gamma: neither
+                    # absent nor the inert shipped 1.0 can reach here.
+                    "pix_r1_gamma": float(r1_gamma),
+                    # An explicit 0.0 is legal and means R1 deliberately
+                    # OFF -- marked, never inferred from the gamma float.
+                    "pix_r1_disabled": bool(float(r1_gamma) == 0.0),
+                    "pix_r1_sigma": float(r1_sigma),
+                    # WHAT RAN, not what was asked: PixCounters applies
+                    # its own max(1, .) floor, so a config 0 executes as
+                    # cadence 1 and a cfg-sourced echo would report 0.
+                    "pix_r1_every_n": int(counters.r1_every_n),
+                    # -1 = "all reals", a sentinel OUTSIDE the >=1 range.
+                    "pix_r1_num_samples": (-1 if r1_num is None
+                                           else int(r1_num)),
+                    # OFF THE OPTIMIZER, never off cfg. _build_optimizer
+                    # is what built the number that actually steps D; see
+                    # _pix_optimizer_hyper for why a cfg-sourced lr is the
+                    # rule-4 defect and what it emits instead of a
+                    # plausible default.
+                    **self._pix_optimizer_hyper(),
+                    "pix_gan_updates_per_step_derived": int(n_updates),
+                    # TRUE = the value above was FOLLOWED from
+                    # ``gan_updates_per_step`` (config null/absent);
+                    # FALSE = a pinned ``pix_gan_updates_per_step`` won.
+                    "pix_gan_updates_per_step_followed": bool(
+                        rc["n_updates_followed"]),
+                    "pix_real_pool_windows": int(rc["pool_windows"]),
+                    "pix_real_pool_refresh": int(rc["pool_refresh"]),
+                    "pix_real_pool_warm_updates": int(
+                        rc["pool_warm_updates"]),
+                    # DERIVED: windows admitted per D-update while the pool
+                    # is still cold. pix_real_pool_refresh is the STEADY
+                    # rate and does not describe warm-up at all.
+                    "pix_real_pool_warm_rate_derived": int(_warm_rate),
+                    "pix_real_reuse_horizon": int(rc["reuse_horizon"]),
+                    # DERIVED: the steady-state pool's nominal source-frame
+                    # ceiling and its margin over PIX_A21_SUPPORT_FLOOR.
+                    # 2048 x 2 = 4096 = 1.00x is the configuration that
+                    # could never pass.
+                    "pix_a21_support_floor": int(
+                        self.PIX_A21_SUPPORT_FLOOR),
+                    "pix_a21_pool_ceiling_frames_derived": int(
+                        rc["pool_ceiling_frames"]),
+                    "pix_a21_pool_margin_derived": float(rc["pool_margin"]),
+                    "pix_real_draw_rank_synced": bool(
+                        rc["real_draw_rank_synced"]),
+                    # ---- T3-C additions. DERIVED values, not requests.
+                    #
+                    # ``pix_gan_weight`` is echoed as its CALIBRATED-ness
+                    # first: the resolved number is only echoed when one
+                    # exists, because ``None`` has no honest float and 0.0
+                    # is a legal calibrated weight (the §12 weight-free
+                    # probe), so a 0.0 here would be unreadable. The loud
+                    # failure for an uncalibrated weight lives in
+                    # ``_pix_gen_weight`` (resolve_gan_weight strict=True),
+                    # which runs in the gen block BEFORE this echo.
+                    "pix_gan_weight_calibrated": bool(
+                        getattr(cfg, "pix_gan_weight", None) is not None),
+                    # The gen-side ramp is DERIVED from two knobs that are
+                    # not named ``pix_*`` at all -- which is precisely the
+                    # "effective value assembled elsewhere and never
+                    # logged" trap of §21.
+                    "pix_g_start_step_derived": int(
+                        getattr(self, "gan_disc_start_step", 0)),
+                    "pix_g_warmup_steps_derived": int(
+                        getattr(self, "gan_warmup_steps", 0) or 0),
+                    "pix_g_warmup_shape_is_linear": bool(
+                        str(getattr(self, "gan_warmup_shape", "linear"))
+                        == "linear"),
+                    "pix_grad_telemetry_every_derived": int(
+                        getattr(cfg, "gan_grad_telemetry_every", 25) or 0),
+                    "pix_poscontrol_every": int(
+                        getattr(cfg, "pix_poscontrol_every", 0) or 0),
+                    "pix_poscontrol_amplitude": float(
+                        getattr(cfg, "pix_poscontrol_amplitude", 0.5)),
+                    "pix_poscontrol_boot": int(
+                        getattr(cfg, "pix_poscontrol_boot", 1000)),
+                    "pix_seed": int(rc["seed"]),
+                })
+            # A24 pairing: the band of every fake IMAGE (a crop contributes
+            # k_frames images, all from the same crop and so the same band).
+            per_image_bands: List[int] = []
+            for b in bands:
+                per_image_bands.extend([int(b)] * max(1, k_frames))
+            per_image_bands = per_image_bands[:n_fake]
+            real_bands_req = per_image_bands * reals_per_fake
+
+            real_lat, real_bands, real_logs = self._pix_draw_reals(
+                real_bands_req, gen=rgen, crop_rows=crop_rows,
+                crop_cols=crop_cols, n_bands=n_bands, lat_frames=lat_frames,
+                reuse_horizon=rc["reuse_horizon"], step=int(current_step),
+            )
+            # One image per real window -- n_frames=1. Frame-within-crop
+            # expansion is a FAKE-side device (A20) and must not leak here.
+            real_px = self._pix_decode_crops_nograd(
+                real_lat, border=border, n_frames=1,
+                decode_batch=decode_batch, gen=gen,
+            )
+            logs.update(real_logs)
+            mism = sum(
+                1 for a, b in zip(real_bands_req, real_bands) if int(a) != int(b)
+            )
+            band_mismatch += int(mism)
+            if mism:
+                raise RuntimeError(
+                    f"A24 VIOLATION: {mism}/{len(real_bands_req)} paired reals "
+                    "came from a different band than their fake."
+                )
+            if int(real_px.shape[0]) != n_fake * reals_per_fake:
+                raise RuntimeError(
+                    "A20 VIOLATION: %d reals for %d fakes (reals_per_fake=%d)."
+                    % (int(real_px.shape[0]), n_fake, reals_per_fake)
+                )
+            # A20 -- pix_real_repeat_frac now MEASURES source-frame overlap
+            # (see _pix_draw_reals), so it can move, and the threshold is
+            # set where only a STRUCTURAL break can reach: coincidental
+            # overlap between independently drawn windows cannot put half a
+            # batch on shared source frames, while frame-within-crop
+            # expansion leaking to the real side would put (k-1)/k of it
+            # there immediately. Demanding exactly 0 would demand
+            # without-replacement sampling, which is not what "independent"
+            # means -- and was in any case unreachable: the old gauge
+            # compared pool INDICES drawn without replacement against
+            # themselves and was pinned at 0.
+            _rep = float(real_logs["train/pix_real_repeat_frac"])
+            if _rep > float(self.PIX_A20_REPEAT_ALARM):
+                raise RuntimeError(
+                    "A20 VIOLATION: pix_real_repeat_frac=%.4f exceeds the "
+                    "%.2f alarm. %d of this D-update's %d reals share a "
+                    "SOURCE FRAME span with an earlier real, which is far "
+                    "past any sampling coincidence: the reals are not "
+                    "independently sourced. Frame-within-crop expansion is "
+                    "a FAKE-side device only and must never leak to the "
+                    "real side."
+                    % (_rep, float(self.PIX_A20_REPEAT_ALARM),
+                       int(round(_rep * len(real_bands_req))),
+                       len(real_bands_req))
+                )
+
+            real_px = real_px.detach()
+            fake_px = fake_px.detach()
+
+            self.pix_optimizer.zero_grad(set_to_none=True)
+            real_logits = disc(real_px)
+            fake_logits = disc(fake_px)
+            d_out = d_loss(real_logits, fake_logits, loss_form=loss_form)
+
+            # R1 on EVERY D-update (pix_r1_every_n = 1). ``indices`` and
+            # ``eps`` are passed EXPLICITLY and drawn from the rank-0
+            # broadcast-seeded generator, so the perturbation is identical
+            # on every rank and the all-reduce averages a consistent
+            # gradient (the failure mode _sample_critic_grad_frame_indices
+            # exists to prevent).
+            n_real = int(real_px.shape[0])
+            idx = None
+            if r1_num is not None and int(r1_num) < n_real:
+                idx = torch.randperm(n_real, generator=gen)[: int(r1_num)]
+                idx = idx.to(self.device, torch.long)
+                if dist.is_initialized():
+                    dist.broadcast(idx, src=0)
+            n_pert = n_real if idx is None else int(idx.numel())
+            eps = torch.randn(
+                (n_pert, *real_px.shape[1:]), generator=gen,
+                dtype=torch.float32,
+            ).to(self.device, real_px.dtype)
+            if dist.is_initialized():
+                dist.broadcast(eps, src=0)
+            fired = counters.should_fire_r1()
+            r1_out = r1_penalty(
+                disc, real_px, gamma=r1_gamma, sigma=r1_sigma,
+                num_samples=None, indices=idx, eps=eps,
+            )
+            # T3-C -- R1's SHARE of the D-side gradient (see the helper's
+            # docstring: a magnitude cannot separate "penalty decorative"
+            # from "penalty pinning the critic"; a share can). Runs BEFORE
+            # the backward so the graph is still intact, and it uses
+            # ``retain_graph=True`` so ``total.backward()`` below is
+            # unaffected.
+            logs.update(self._pix_r1_grad_share(
+                d_out["d_loss"], r1_out["r1"], current_step=current_step,
+            ))
+            total = d_out["d_loss"] + r1_out["r1"]
+            total.backward()
+            self.pix_optimizer.step()
+            # gsq is passed, not just the fired flag: a SINGLE draw of the
+            # finite-difference gsq is 126% relative sd at the spec crop
+            # (300 draws spanned 2.3e-09..9.0e-03), so 5.3's gamma
+            # calibration and 5.4's row-one read cannot use the per-step
+            # ``train/pix_r1_grad_sq`` below. The estimator is unbiased, so
+            # the running mean PixCounters keeps is the usable statistic --
+            # and it stays empty unless the value is handed over here.
+            counters.note_d_update(
+                r1_fired=True, gsq=float(r1_out["gsq"]),
+            )
+            n_done += 1
+
+            logs["train/pix_d_loss"] = float(d_out["d_loss"].detach())
+            logs["train/pix_d_real_mean"] = float(d_out["d_real_mean"])
+            logs["train/pix_d_fake_mean"] = float(d_out["d_fake_mean"])
+            logs["train/pix_r1_grad_sq"] = float(r1_out["gsq"])
+            logs["train/pix_r1_n_used"] = float(r1_out["n_used"])
+            # P is read off the TENSOR (660 post-trim, not the doc's 768).
+            logs["train/pix_patch_count"] = float(r1_out["P"])
+            logs["train/pix_fake_images"] = float(n_fake)
+            logs["train/pix_real_images"] = float(int(real_px.shape[0]))
+            logs["train/pix_crop_y0_mean"] = float(sum(ys)) / max(1, len(ys))
+            logs["train/pix_crop_x0_mean"] = float(sum(xs)) / max(1, len(xs))
+            logs["train/pix_decodes"] = float(
+                n_crops + int(real_lat.shape[0])
+            )
+            _decode_windows_step += int(n_crops) + int(real_lat.shape[0])
+            # RESEARCHER EXPOSURE DIRECTIVE (2026-08-24) -- monotone
+            # exposure totals, kept on ``self`` so they survive across
+            # steps and the trace carries "how much has D actually seen"
+            # as a number rather than an assumption.
+            self._pix_fake_images_total = (
+                int(getattr(self, "_pix_fake_images_total", 0))
+                + int(n_fake)
+            )
+            self._pix_real_images_total = (
+                int(getattr(self, "_pix_real_images_total", 0))
+                + int(real_px.shape[0])
+            )
+            # Coarse fake-depth histogram (0-1 / 2-3 / 4+ AR chunks deep):
+            # cumulative image counts per bin, so "the D sees drifted
+            # fakes" is a number. OMITTED when no depth tag was threaded
+            # in (never zero-filled -- forgeable-zero rule below).
+            if chunk_depth is not None:
+                _d = int(chunk_depth)
+                _bin = "0_1" if _d <= 1 else ("2_3" if _d <= 3 else "4p")
+                _hist = getattr(self, "_pix_fake_depth_hist", None)
+                if _hist is None:
+                    _hist = {"0_1": 0, "2_3": 0, "4p": 0}
+                    self._pix_fake_depth_hist = _hist
+                _hist[_bin] += int(n_fake)
+                logs["train/pix_fake_depth"] = float(_d)
+                for _bn, _bc in _hist.items():
+                    logs[
+                        "train/pix_fake_depth_images_" + _bn
+                    ] = float(_bc)
+            # §7 -- patch-logit spatial variance: is the critic using
+            # LOCALITY, or has it collapsed to a global constant scored per
+            # patch? Both sides, because a critic that varies over real
+            # crops and is flat over fakes is a different diagnosis from one
+            # that is flat on both.
+            logs["train/pix_patch_logit_spatial_var_real"] = float(
+                patch_logit_spatial_variance(real_logits.detach())
+            )
+            logs["train/pix_patch_logit_spatial_var_fake"] = float(
+                patch_logit_spatial_variance(fake_logits.detach())
+            )
+            # §7 -- crop-band histogram + the mandated per-run echo of
+            # ``pix_band_count`` itself, so a silently tightened A24 banding
+            # shows up in the trace and not only in a diff.
+            logs.update(self._pix_band_histogram(bands, n_bands))
+            # §7 / §8.1 -- the positive control (default OFF).
+            logs.update(self._pix_positive_control(
+                real_lat, fake_px, disc,
+                current_step=int(current_step), update_idx=int(u),
+                border=border, k_frames=k_frames, decode_batch=decode_batch,
+            ))
+            del real_px, fake_px, real_logits, fake_logits, crops, real_lat
+
+        # ------------------------------------------------------------------
+        # FORGEABLE-ZERO RULE (three instances found across three packages):
+        # a diagnostic must never be given a placeholder value inside its own
+        # meaningful range. Several keys here have 0.0 as their REQUIRED
+        # HEALTHY VALUE (pix_real_repeat_frac, pix_band_mismatch,
+        # pix_holdout_leak) or as a SPECIFIC ALARM (pix_r1_rate < 0.99 is a
+        # build bug; pix_a21_support_ok). Zero-filling any of them on a path
+        # that did not run certifies a perfect result for a computation that
+        # never happened -- strictly worse than reporting nothing.
+        #
+        # So: everything below is emitted ONLY when the loop actually ran.
+        # ``pix_d_updates`` is a COUNT, not a health reading, and doubles as
+        # the regime flag -- 0 there means "no D-update happened", which is
+        # what makes the absent keys interpretable rather than mysterious.
+        # ------------------------------------------------------------------
+        self._pix_band_mismatch = int(band_mismatch)
+        logs["train/pix_d_updates"] = float(n_done)
+        if n_done > 0:
+            # Exposure totals + measured cost (researcher directive) --
+            # emitted only when the loop actually ran (forgeable-zero
+            # rule: a 0.0 wall-time on a skipped path would certify a
+            # free D-block that never executed).
+            logs["train/pix_fake_images_total"] = float(
+                getattr(self, "_pix_fake_images_total", 0)
+            )
+            logs["train/pix_real_images_total"] = float(
+                getattr(self, "_pix_real_images_total", 0)
+            )
+            logs["train/pix_decode_windows_step"] = float(
+                _decode_windows_step
+            )
+            logs["train/pix_d_block_wall_s"] = float(
+                time.monotonic() - _t_pix0
+            )
+            logs["train/pix_band_mismatch"] = float(band_mismatch)
+            logs["train/pix_d_updates_total"] = float(counters.dupdate_total)
+            logs["train/pix_r1_fires_total"] = float(counters.r1_fired_total)
+            # Guarded against the 0/0 derivation: PixCounters.r1_rate is
+            # fired/max(1, updates), which reads 0.0 -- a FALSE build-bug
+            # alarm -- before the first update.
+            if int(counters.dupdate_total) > 0:
+                logs["train/pix_r1_rate"] = float(counters.r1_rate)
+            # The USABLE gsq statistic (see note_d_update above). Emitted
+            # only once observed -- a 0.0 running mean would read as "R1
+            # measures no gradient on the reals", a real alarm, rather than
+            # "nobody has handed us a value yet" (forgeable-zero rule).
+            _gsq_mean = counters.r1_grad_sq_mean
+            if _gsq_mean is not None:
+                logs["train/pix_r1_grad_sq_mean"] = float(_gsq_mean)
+                logs["train/pix_r1_grad_sq_n"] = float(
+                    counters.r1_grad_sq_samples
+                )
+            # ----------------------------------------------------------
+            # SAFETY CLAIMS -- a DIFFERENT rule from the diagnostics above.
+            #
+            # A diagnostic answers "how is it going" and MAY be silent: a
+            # missing key honestly reads as "not measured". A safety claim
+            # answers "is this run valid", and for those silence and
+            # "clean" are too easily confused -- a reader (or a script)
+            # that sees no ``pix_holdout_leak`` concludes there was no
+            # leak, which is the very failure being guarded against
+            # arrived at by another route.
+            #
+            # So on any path where the D-loop actually ran these are
+            # MANDATORY, and if the underlying check could not run we
+            # RAISE naming what could not be verified -- never omit, never
+            # default. This matches ``model/disc_holdout_probe.py``, which
+            # already fails CLOSED with explicit INVALID_NO_HOLDOUT_ROOT /
+            # INVALID_NO_TRAIN_RIDES codes rather than a quiet pass; it is
+            # deliberately not a second convention.
+            # ----------------------------------------------------------
+            _checked = float(getattr(self, "_pix_holdout_checked", 0.0))
+            if _checked < 1.0:
+                raise RuntimeError(
+                    "A22 UNVERIFIABLE: %d pixel-critic D-update(s) ran but "
+                    "the holdout disjointness check never did, so "
+                    "train/pix_holdout_leak cannot be asserted for this "
+                    "step. A holdout list leaked into training once before; "
+                    "an unverified run must fail, not log nothing."
+                    % int(n_done)
+                )
+            # ...and it must not be STALE. ``_pix_holdout_checked`` is a
+            # sticky attribute: once the pool stopped refreshing, the
+            # ``< 1.0`` gate above kept passing on a flag set hundreds of
+            # steps earlier and this block re-published a leak value that
+            # had not been recomputed since, every step, as if fresh. A
+            # safety claim defeated by staleness is defeated just as
+            # thoroughly as one that was omitted, so the stamp has to match
+            # THIS step. Refresh guarantees it does (A21 admits every
+            # D-update, and admission runs the A22 check); this asserts it
+            # instead of assuming it.
+            _checked_at = getattr(self, "_pix_holdout_checked_step", None)
+            if _checked_at is None or int(_checked_at) != int(current_step):
+                raise RuntimeError(
+                    "A22 STALE: %d pixel-critic D-update(s) ran at step %d "
+                    "but the holdout disjointness check last ran at step "
+                    "%s. train/pix_holdout_leak would be a re-publication "
+                    "of an older step's result, which reads exactly like a "
+                    "fresh all-clear. A21's continuous refresh re-runs the "
+                    "check on every D-update; if it did not, the real pool "
+                    "has stopped refreshing."
+                    % (int(n_done), int(current_step),
+                       "never" if _checked_at is None else int(_checked_at))
+                )
+            logs["train/pix_holdout_checked"] = _checked
+            logs["train/pix_holdout_checked_step"] = float(int(_checked_at))
+            logs["train/pix_holdout_rides"] = float(
+                getattr(self, "_pix_holdout_n", 0.0)
+            )
+            logs["train/pix_holdout_leak"] = float(
+                getattr(self, "_pix_holdout_leak", 0.0)
+            )
+            # A21 is a MEASURED claim -- never assumed from the loader. A
+            # forged or absent 1.0 would certify the 4,096 distinct-source-
+            # frame floor without measuring it.
+            _support = getattr(self, "_pix_real_support", None)
+            if _support is None:
+                raise RuntimeError(
+                    "A21 UNVERIFIABLE: %d pixel-critic D-update(s) ran but "
+                    "the real-support identity set was never built, so the "
+                    "%d distinct-source-frame floor cannot be asserted. A21 "
+                    "is a measured claim; refusing to certify it silently."
+                    % (int(n_done), int(self.PIX_A21_SUPPORT_FLOOR))
+                )
+            _n_sup = int(len(_support))
+            _warm_n = int(rc["pool_warm_updates"])
+            _warming = int(counters.dupdate_total) <= _warm_n
+            logs["train/pix_real_support_frames"] = float(_n_sup)
+            logs["train/pix_a21_support_ok"] = float(
+                1.0 if _n_sup >= self.PIX_A21_SUPPORT_FLOOR else 0.0
+            )
+            # Support is CUMULATIVE and starts at zero, so a 0 here is
+            # honest while the pool is still filling -- and the WARM-UP
+            # REGIME KEY is what stops that honest 0 being read as a
+            # violation. It is also what stops the regime lasting forever:
+            # once warm-up is over an unmet floor is a hard failure, not a
+            # logged 0.0. That is the difference between the fixed code and
+            # the old one, where 0.0 was emitted on every step of the run
+            # and the arm quietly certified its own A21 violation for its
+            # whole life.
+            if _warming:
+                logs["train/pix_a21_warming"] = 1.0
+                logs["train/pix_a21_warm_updates_left"] = float(
+                    max(0, _warm_n - int(counters.dupdate_total))
+                )
+            elif _n_sup < self.PIX_A21_SUPPORT_FLOOR:
+                raise RuntimeError(
+                    "A21 VIOLATION: after %d D-update(s) (warm-up = %d) the "
+                    "pixel critic's real supply has covered only %d distinct "
+                    "source frames, below the %d floor. Pool=%d/%d windows, "
+                    "%d admission(s) total, refresh=%d/update. The floor is "
+                    "not a target to log progress against: reals drawn from "
+                    "a support this small are a mini-dataset the critic can "
+                    "memorise, which is what A21 exists to prevent."
+                    % (int(counters.dupdate_total), _warm_n, _n_sup,
+                       int(self.PIX_A21_SUPPORT_FLOOR),
+                       len(getattr(self, "_pix_real_pool", None) or ()),
+                       int(rc["pool_windows"]),
+                       int(getattr(self, "_pix_pool_refresh_total", 0)),
+                       int(rc["pool_refresh"]))
+                )
+            # A21's other half, echoed every step it is claimed: how much of
+            # the support the STEADY-STATE pool carries on its own. A pool
+            # sitting at 1.00x the floor carries none of it.
+            logs["train/pix_a21_pool_ceiling_frames"] = float(
+                rc["pool_ceiling_frames"]
+            )
+            logs["train/pix_a21_pool_margin"] = float(rc["pool_margin"])
+        out.update(logs)
 
     def _gan_warmup_shape_apply(self, t_normalized: float) -> float:
         """Apply ``self.gan_warmup_shape`` to a normalised ramp position
@@ -4677,6 +8650,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         gen_loss_total = zero
         logs: dict = {}
+        # WP-14B unweighted-ratio call site: reset every call so a call
+        # that never reaches a weighted ``generator_gan_loss`` (all modes
+        # warmup-gated, or a d_only-only call) cannot leave the A7 caller
+        # reading a stale weight from a PREVIOUS step. Set to a real float
+        # only inside ``_ladd_run_pair_mode``'s weighted-assignment branch.
+        self._ladd_last_gen_gan_weight = None
+        self._ladd_last_gen_gan_weight_mode = None
+        self._ladd_last_gen_gan_stat_value = None
+        self._ladd_last_total_weight = None
 
         # Two-phase orchestration when MORE THAN ONE pair-mode is
         # enabled (gt_vs_fake + adjacent_chunks): we must run ALL
@@ -4698,6 +8680,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if gt_xn_enabled:
             # Real source is GT for gt_transition (the whole point).
             enabled_modes.append(("gt_transition", gt_detached, "_gtxn"))
+
+        # WP-14B unweighted-ratio call site: the division below is exact
+        # only when exactly ONE pair-mode is active (otherwise
+        # ``gen_gan_loss`` is a SUM of differently-weighted per-mode
+        # terms and no single scalar recovers an unweighted value). The
+        # A7 caller reads this to decide whether to compute the ratio at
+        # all, rather than silently mis-scoping a multi-mode combination
+        # as if it were one term.
+        self._ladd_last_mode_count = len(enabled_modes)
 
         two_phase = len(enabled_modes) > 1
 
@@ -4742,6 +8733,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
             else:
                 w = float(getattr(self.model, "ladd_adjacent_chunks_weight", 1.0))
+            # WP-14B unweighted-ratio call site: fold this mode's
+            # per-mode weight into the stash ``_ladd_run_pair_mode`` just
+            # left for us, giving the A7 caller the TOTAL multiplier
+            # (``w * gen_gan_weight``) applied to this mode's raw g_rp on
+            # its path into ``gen_loss_total``. Guarded on the mode
+            # actually matching -- a mismatch means the stash is stale
+            # (e.g. this mode's call never reached the weighted branch,
+            # so ``_ladd_last_gen_gan_weight_mode`` still names whichever
+            # mode set it last) and must not be read as this mode's value.
+            if self._ladd_last_gen_gan_weight_mode == mode_name:
+                self._ladd_last_total_weight = (
+                    w * self._ladd_last_gen_gan_weight)
             gen_loss_total = gen_loss_total + w * g_loss
             for k, v in partial_logs.items():
                 logs[k + suffix] = v
@@ -4757,12 +8760,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "train/r3gan_d_loss_stat",
                     "train/r3gan_r1", "train/r3gan_r1_grad_sq",
                     "train/r3gan_r1_fired",
-                    "train/r3gan_r2", "train/r3gan_r2_grad_sq",
-                    "train/r3gan_r2_fired",
+                    # A16-D1: the per-block R1 fire count and the per-mode
+                    # penalty counters are produced by the D-update, which in
+                    # two-phase runs happens ONLY in the ``d_only`` call.
+                    "train/r3gan_r1_block_fires",
+                    "train/r3gan_r1_mode_updates_total",
+                    "train/r3gan_r1_mode_penalties_total",
+                    "train/r3gan_r1_mode_fire_rate",
                     "train/ladd_match_n_real", "train/ladd_n_real",
                 ):
                     if _dk in _dl:
                         logs[_dk + suffix] = _dl[_dk]
+                # ---- A6/D2 (2026-08-23): real-diversity keys are written by
+                # the matched ``_match_select`` draw, which in a two-phase
+                # (multi-mode) run happens in the ``d_only`` call. The
+                # whitelist above enumerated only ``r3gan_*`` /
+                # ``ladd_*_n_real``, so every ``gan_real_div_*`` /
+                # ``gan_real_*`` key produced by the D-update was DROPPED, and
+                # the ``g_only`` call emitted none of its own during critic
+                # warmup / zero gen weight. Net effect with
+                # ``gan_real_diversity_log=true`` and two modes: ZERO A6 keys,
+                # indistinguishable from the flag being off. Overlay by PREFIX
+                # so future A6 keys are covered automatically. When
+                # ``gan_real_diversity_log`` is off no such key exists and this
+                # loop is a no-op.
+                for _dk, _dv in _dl.items():
+                    if _dk.startswith("train/gan_real_"):
+                        # The D-update's draw is authoritative: it is what the
+                        # discriminator actually trained against this step.
+                        logs[_dk + suffix] = _dv
 
         # Top-level (non-suffixed) R1 traces so the wandb plot is
         # findable as ``train/r3gan_r1*`` without the ``_gt`` / ``_adj``
@@ -4787,9 +8813,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if _rt:
             for _k, _v in _rt.items():
                 logs[f"train/ladd_{_k}"] = float(_v)
-        fired_keys = [k for k in logs if "r3gan_r1_fired_" in k]
+        # A16-D1: EXACT key match. The old ``"r3gan_r1_fired_" in k``
+        # substring test also matched ``train/r3gan_r1_fired_total_<mode>`` --
+        # a MONOTONE COUNTER -- so the top-level 0/1 gauge reported the
+        # cumulative fire count (hundreds) instead of "did R1 fire this step".
+        fired_keys = [
+            k for k in (
+                "train/r3gan_r1_fired_gt",
+                "train/r3gan_r1_fired_adj",
+                "train/r3gan_r1_fired_gtxn",
+            ) if k in logs
+        ]
         if fired_keys:
             logs["train/r3gan_r1_fired"] = max(logs[k] for k in fired_keys)
+        # A16-D1: per-mode R1 fire rates aggregated to the top level. The OR'd
+        # ``r3gan_r1_fired`` above cannot show failure (b) (one mode starved
+        # while another fires); the MIN of the per-mode lifetime fire rates
+        # can -- it reads 0.0 for as long as ANY enabled mode has never had a
+        # single R1 applied.
+        _mode_rate_keys = [
+            k for k in (
+                "train/r3gan_r1_mode_fire_rate_gt",
+                "train/r3gan_r1_mode_fire_rate_adj",
+                "train/r3gan_r1_mode_fire_rate_gtxn",
+            ) if k in logs
+        ]
+        if _mode_rate_keys:
+            logs["train/r3gan_r1_fire_rate_min_mode"] = min(
+                logs[k] for k in _mode_rate_keys)
+            logs["train/r3gan_r1_modes_with_penalty"] = float(sum(
+                1 for k in _mode_rate_keys if logs[k] > 0.0))
         # Top-level r3gan_r1 = mean of the γ-weighted per-mode losses.
         r1_loss_keys = [
             k for k in logs
@@ -4801,95 +8854,190 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         ]
         if r1_loss_keys:
             logs["train/r3gan_r1"] = sum(logs[k] for k in r1_loss_keys) / len(r1_loss_keys)
-        # R2 top-level traces — mirror the R1 aggregation above so the
-        # ``train/r3gan_r2*`` keys are findable without the per-mode
-        # suffix dance.
-        r2_keys = [k for k in logs if "r3gan_r2_grad_sq_" in k]
-        if r2_keys:
-            valid_vals = [
-                logs[k] for k in r2_keys
-                if isinstance(logs[k], float) and not _math.isnan(logs[k])
-            ]
-            if valid_vals:
-                logs["train/r3gan_r2_grad_sq"] = sum(valid_vals) / len(valid_vals)
-            else:
-                logs["train/r3gan_r2_grad_sq"] = float("nan")
-        r2_fired_keys = [k for k in logs if "r3gan_r2_fired_" in k]
-        if r2_fired_keys:
-            logs["train/r3gan_r2_fired"] = max(logs[k] for k in r2_fired_keys)
-        r2_loss_keys = [
-            k for k in logs
-            if k in (
-                "train/r3gan_r2_gt",
-                "train/r3gan_r2_adj",
-                "train/r3gan_r2_gtxn",
-            )
-        ]
-        if r2_loss_keys:
-            logs["train/r3gan_r2"] = sum(logs[k] for k in r2_loss_keys) / len(r2_loss_keys)
         return gen_loss_total, logs
 
-    def _ladd_r2_knobs(self, r1_every_n: int, r1_sigma: float):
-        """Read the R2 (fake-side gradient penalty) knobs off the model.
-
-        Returns ``(gamma, every_n, phase_offset, sigma)``. ``every_n``
-        and ``sigma`` fall back to the R1 values when unset. ``gamma=0``
-        (default) means R2 is OFF. The phase offset desynchronizes R1
-        and R2 firing so their perturbed-input forwards don't stack in
-        the same D-update (OOM guard) — see ``ladd_r2_phase_offset``.
-        """
-        gamma = float(getattr(self.model, "ladd_r2_gamma", 0.0))
-        every_n = max(1, int(
-            getattr(self.model, "ladd_r2_every_n_steps", r1_every_n)))
-        offset = int(getattr(self.model, "ladd_r2_phase_offset", 1))
-        sigma = float(getattr(self.model, "ladd_r2_sigma", r1_sigma))
-        return gamma, every_n, offset, sigma
-
-    @staticmethod
-    def _ladd_r2_fires(
-        gamma: float, every_n: int, offset: int, current_step: int,
+    # ------------------------------------------------------------------
+    # A16-D1 (2026-08-23): R1 cadence semantics, stated ONCE, here.
+    # ------------------------------------------------------------------
+    # ``ladd_r1_every_n_steps`` (N) is a cadence over TRAINING STEPS, not
+    # over D-update iterations and not over pair modes. The contract:
+    #
+    #   * On a step where a given pair mode's R1 debt is due, R1 fires on
+    #     EVERY one of that mode's ``gan_updates_per_step`` (S) D-updates.
+    #     Lazy-R1 amortises COST over steps (StyleGAN2 lazy regularisation);
+    #     it was never meant to thin the penalty WITHIN a step. N=1 must mean
+    #     "R1 on every D-update", which is what the pre-unification positional
+    #     modulo already did (S of S).
+    #   * The debt latch is keyed by ``pair_mode``. Each enabled mode
+    #     (gt_vs_fake / adjacent_chunks / gt_transition) trains the shared
+    #     disc against its OWN real distribution, so each needs its own
+    #     gradient penalty; one mode firing must never spend another mode's
+    #     debt. With M modes enabled, a due step applies M*S R1 penalties.
+    #   * The latch is NOT keyed by path (matched vs positional). Within one
+    #     step a mode runs EITHER the matched branch OR the positional branch
+    #     (the matched branch returns before the positional loop), and across
+    #     steps a ``[LADD-MATCH-FALLBACK]`` must not reset the cadence: it is
+    #     the same D head either way. Keying by path would let a fallback
+    #     step fire R1 immediately after a matched fire, and would restore
+    #     exactly the double-fire A16 set out to remove.
+    #   * The latch is written ONCE PER D-UPDATE BLOCK (i.e. once per
+    #     ``(step, pair_mode)``), BEFORE the ``for _it in range(S)`` loop --
+    #     never inside it. Writing it inside the loop is what made the first
+    #     iteration spend the debt and starve iterations 2..S.
+    #
+    # Debt (``step - last_fire >= N``) rather than ``step % N``: the GAN only
+    # runs on generator iters, so an exact modulo can be missed forever when
+    # N and ``dfake_gen_update_ratio`` are not commensurate.
+    #
+    # FIRE-RATE TABLE -- R1 applications per DUE step (S = gan_updates_per_step,
+    # M = number of enabled pair modes):
+    #
+    #   path        unified=False (legacy)      unified=True (before D1)   unified=True (after D1)
+    #   positional  M*S  (step % N, per iter)   1  (global latch, 1st iter)  M*S
+    #   matched     1    (global latch)         1                            M*S
+    #   mixed       M*S + 1 (can double-fire)   1                            M*S
+    #
+    # ``ladd_r1_unified_cadence`` stays DEFAULT FALSE, and when false every
+    # expression below is the legacy one, evaluated verbatim.
+    # ------------------------------------------------------------------
+    def _ladd_r1_block_due(
+        self, pair_mode: str, current_step: int, every_n: int
     ) -> bool:
-        """R2 fires when its gamma is on AND the step is on R2's
-        (offset) lazy cadence. Kept identical across all three D-update
-        branches so the offset-vs-R1 OOM guarantee holds everywhere."""
-        return gamma > 0.0 and ((current_step - offset) % every_n == 0)
+        """Per-``pair_mode`` R1 debt latch for ONE D-update block.
 
-    def _ladd_count_penalty_fires(self, do_r1: bool, do_r2: bool) -> None:
-        """Monotone counters of R1/R2 firings and of D-updates.
+        Call EXACTLY ONCE per ``(current_step, pair_mode)`` D-update block,
+        before the ``gan_updates_per_step`` loop; the returned decision then
+        applies to every iteration of that loop. Returns True and spends the
+        debt, or False and leaves it standing.
+        """
+        store = getattr(self, "_ladd_last_r1_step_by_mode", None)
+        if store is None:
+            store = {}
+            self._ladd_last_r1_step_by_mode = store
+        key = str(pair_mode)
+        every_n = max(1, int(every_n))
+        last = int(store.get(key, -10 ** 9))
+        due = (int(current_step) - last) >= every_n
+        if due:
+            store[key] = int(current_step)
+            # Keep the legacy single-slot latch in sync so any reader of
+            # ``_ladd_last_r1_step`` (telemetry, resume logic) still sees the
+            # most recent firing.
+            self._ladd_last_r1_step = int(current_step)
+        return due
 
-        The per-step ``r3gan_r*_fired`` gauges are sampled by wandb every N
-        steps, and N aliases with BOTH the penalty cadence (every 2, offset 1)
-        and the generator-update cadence (``dfake_gen_update_ratio``). The
-        observed consequence was ``r2_fired == 0`` on every logged row of every
-        run -- which is indistinguishable from "R2 never fires at all". These
-        counters are monotone, so a single logged sample settles it:
-        ``r2_fired_total == 0`` late in a run means R2 genuinely never fired.
+    def _ladd_count_penalty_fires(
+        self, do_r1: bool, pair_mode: Optional[str] = None
+    ) -> None:
+        """Monotone counters of R1 firings and of D-updates.
+
+        The per-step ``r3gan_r1_fired`` gauge is sampled by wandb every N
+        steps, and N aliases with BOTH the penalty cadence and the
+        generator-update cadence (``dfake_gen_update_ratio``), so a logged
+        0 is indistinguishable from "R1 never fires at all". These counters
+        are monotone, so a single logged sample settles it:
+        ``r1_fired_total == 0`` late in a run means R1 genuinely never fired.
+
+        A16-D1: also counts PER PAIR MODE. The global counters cannot show
+        the (b) failure (one mode's R1 permanently zero while the OR'd
+        top-level gauge reads 1); the per-mode pair can, and
+        ``_ladd_penalty_fire_logs(pair_mode)`` surfaces it.
         Pure telemetry -- nothing here touches the loss.
         """
         self._ladd_dupdate_total = getattr(self, "_ladd_dupdate_total", 0) + 1
         if do_r1:
             self._ladd_r1_fire_total = getattr(self, "_ladd_r1_fire_total", 0) + 1
-        if do_r2:
-            self._ladd_r2_fire_total = getattr(self, "_ladd_r2_fire_total", 0) + 1
+        if pair_mode is None:
+            return
+        _du = getattr(self, "_ladd_dupdate_by_mode", None)
+        if _du is None:
+            _du = {}
+            self._ladd_dupdate_by_mode = _du
+        _fi = getattr(self, "_ladd_r1_fire_by_mode", None)
+        if _fi is None:
+            _fi = {}
+            self._ladd_r1_fire_by_mode = _fi
+        key = str(pair_mode)
+        _du[key] = _du.get(key, 0) + 1
+        _fi[key] = _fi.get(key, 0) + (1 if do_r1 else 0)
 
-    def _ladd_penalty_fire_logs(self) -> dict:
+    def _ladd_penalty_fire_logs(self, pair_mode: Optional[str] = None) -> dict:
         n = getattr(self, "_ladd_dupdate_total", 0)
         r1 = getattr(self, "_ladd_r1_fire_total", 0)
-        r2 = getattr(self, "_ladd_r2_fire_total", 0)
-        return {
+        out = {
             "train/r3gan_disc_updates_total": float(n),
             "train/r3gan_r1_fired_total": float(r1),
-            "train/r3gan_r2_fired_total": float(r2),
             "train/r3gan_r1_fire_rate": float(r1) / n if n else 0.0,
-            "train/r3gan_r2_fire_rate": float(r2) / n if n else 0.0,
+        }
+        if pair_mode is None:
+            return out
+        # A16-D1 per-mode telemetry. ``_compute_ladd_losses`` appends the
+        # mode suffix to every returned key, so these read as e.g.
+        # ``train/r3gan_r1_mode_fire_rate_gtxn``. Deliberately NOT named
+        # ``*r3gan_r1_fired_*``: the top-level aggregation matches on that
+        # substring and would otherwise pick up a monotone counter.
+        _du = getattr(self, "_ladd_dupdate_by_mode", None) or {}
+        _fi = getattr(self, "_ladd_r1_fire_by_mode", None) or {}
+        key = str(pair_mode)
+        nm = int(_du.get(key, 0))
+        rm = int(_fi.get(key, 0))
+        out["train/r3gan_r1_mode_updates_total"] = float(nm)
+        out["train/r3gan_r1_mode_penalties_total"] = float(rm)
+        out["train/r3gan_r1_mode_fire_rate"] = (
+            float(rm) / nm if nm else 0.0
+        )
+        return out
+
+    # ------------------------------------------------------------------
+    # A6-D2 (2026-08-23): real-diversity telemetry must survive the
+    # two-phase (multi-pair-mode) split.
+    # ------------------------------------------------------------------
+    # ``_match_select`` -- the only writer -- runs in the ``d_only`` call
+    # (the D-update) and, only once the critic warmup is over AND the gen GAN
+    # weight is non-zero, in the ``g_only`` call. ``_ladd_run_pair_mode``
+    # reset the attribute to None at entry of BOTH calls, and the two-phase
+    # overlay whitelist in ``_compute_ladd_losses`` copied only ``r3gan_*`` /
+    # ``ladd_*_n_real`` keys back from the ``d_only`` logs. Result with
+    # ``gan_real_diversity_log=true`` and >1 pair mode: the d_only draw's keys
+    # were dropped by the whitelist and the g_only call had nothing to emit --
+    # ZERO A6 keys, indistinguishable from the flag being off.
+    #
+    # Fix, two halves: the overlay is now prefix-based (see
+    # ``_compute_ladd_losses``), and the draw is stashed PER STEP PER
+    # PAIR MODE here, so a call that does not itself draw (g_only during
+    # warmup) can still report this step's D-update draw. Cross-step
+    # staleness -- the bug the original A6 reset removed -- is still
+    # impossible: the store is discarded the moment ``current_step`` changes.
+    def _ladd_stash_real_div(
+        self, pair_mode: str, current_step: int, payload: dict
+    ) -> None:
+        self._ladd_real_div_telemetry = payload
+        if getattr(self, "_ladd_real_div_step", None) != int(current_step):
+            self._ladd_real_div_step = int(current_step)
+            self._ladd_real_div_by_mode = {}
+        store = getattr(self, "_ladd_real_div_by_mode", None)
+        if store is None:
+            store = {}
+            self._ladd_real_div_by_mode = store
+        store[str(pair_mode)] = payload
+
+    def _ladd_real_div_logs(self, pair_mode: str, current_step: int) -> dict:
+        """``train/gan_real_*`` keys for this (step, pair_mode), or ``{}``."""
+        cur = getattr(self, "_ladd_real_div_telemetry", None)
+        if not cur and (
+                getattr(self, "_ladd_real_div_step", None) == int(current_step)):
+            cur = (getattr(self, "_ladd_real_div_by_mode", None)
+                   or {}).get(str(pair_mode))
+        return {
+            f"train/{_dk}": float(_dv) for _dk, _dv in (cur or {}).items()
         }
 
     def _ladd_disc_update_microbatched(
         self, *, _it, _rn, _fk, _fseg, _fseg_act, real_m, real_m_rat,
-        real_m_ram, group_flat, _do_r1, _do_r2, n_pairs, B, Kk, _m_fwd,
+        real_m_ram, group_flat, _do_r1, n_pairs, B, Kk, _m_fwd,
         real_m_rpe=None,
         disc_for_update, _disc_no_sync, rpgan_d_loss, _K_stat, _W_stat,
-        _r1_sigma, _r1_gamma, _r2_sigma, _r2_gamma, _r1_num_samples,
+        _r1_sigma, _r1_gamma, _r1_num_samples,
         current_step, _micro_groups,
     ):
         """Memory-fix micro-batched D-update (ON path; default-OFF leaves
@@ -4913,9 +9061,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             bit (up to fp summation order). The optional K_stat/W_stat
             channel-split term is the same row-mean on a disjoint token slice
             and is split identically.
-          * R2 (fake-side penalty): a mean over ``n_fake`` fakes; each fake
-            belongs to exactly one group, so per-group ``_gsq2`` partials
-            (sum-of-squares / n_fake_total) sum to the full R2.
           * FD-R1 (real-side penalty): a mean over the (subsampled) unique
             reals. R1 reals are chosen GLOBALLY (deterministic subsample,
             seeded by current_step), then each is forwarded in the FIRST
@@ -4930,7 +9075,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
         Returns a dict of the SAME logging scalars the inline path writes
         (aggregated: d_loss/d_loss_stat are the full-batch means, d_real/
-        d_fake are full-batch logit means, r1/r2 are the full penalties).
+        d_fake are full-batch logit means, r1 is the full penalty).
         """
         device = _rn.device
         n_fake = n_pairs * B
@@ -4970,10 +9115,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if u in r1_set and u not in r1_owner:
                         r1_owner[u] = g
 
-        # ----- R2 fake-side eps (one draw for the whole update) -----
-        eps_f_full = None
-        if _do_r2:
-            eps_f_full = _r2_sigma * torch.randn_like(_fk)
         # R1 real-side eps (one draw, indexed per group below).
         eps_r_full = None
         if _do_r1 and M_r1 > 0:
@@ -4987,13 +9128,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         d_loss_acc = 0.0
         d_loss_stat_acc = 0.0
         r1_acc = 0.0
-        r2_acc = 0.0
         r1_gsq_acc = 0.0
-        r2_gsq_acc = 0.0
 
         self._mem_step_snapshot(
-            f"disc_it{_it}_micro_pre_groups_G{G}"
-            f"_r1{int(_do_r1)}_r2{int(_do_r2)}")
+            f"disc_it{_it}_micro_pre_groups_G{G}_r1{int(_do_r1)}")
         for g in range(G):
             lo, hi = bounds[g], bounds[g + 1]
             if hi <= lo:
@@ -5049,9 +9187,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 rpe_pert = (rpe_g.index_select(0, pos)
                             if rpe_g is not None else None)
                 _segs.append((rn_pert, rat_pert, ram_pert, rpe_pert))
-            if _do_r2:
-                eps_f_g = eps_f_full[lo:hi]
-                _segs.append((fk_g + eps_f_g, fa0_g, fa1_g))
 
             _outs = _m_fwd(disc_for_update, _segs)
             d_r_g, d_f_g = _outs[0], _outs[1]
@@ -5104,26 +9239,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 r1_g = d_r_g.sum() * 0.0
 
-            # ---- R2 partial (sum-of-sq over group fakes / n_fake total) ----
-            if _do_r2:
-                d_f_pert_g = _outs[_nxt]
-                _nxt += 1
-                gsq2_terms = ((d_f_pert_g.sum(dim=1) - d_f_g.sum(dim=1))
-                              / _r2_sigma).pow(2)
-                gsq2_part = gsq2_terms.sum() / float(n_fake)
-                r2_g = 0.5 * _r2_gamma * gsq2_part
-                r2_acc += float(r2_g.detach().item())
-                r2_gsq_acc += float(gsq2_part.detach().item())
-            else:
-                r2_g = d_f_g.sum() * 0.0
-
             # ---- accumulate logit-mean stats (full-batch d_real/d_fake) ----
             sum_d_r += d_r_g.detach().double().sum()
             cnt_d_r += int(d_r_g.numel())
             sum_d_f += d_f_g.detach().double().sum()
             cnt_d_f += int(d_f_g.numel())
 
-            loss_g = d_rp_g + r1_g + r2_g
+            loss_g = d_rp_g + r1_g
             is_last = (g == G - 1)
             if is_last:
                 loss_g.backward()
@@ -5145,11 +9267,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "d_real": float((sum_d_r / max(1, cnt_d_r)).item()),
             "d_fake": float((sum_d_f / max(1, cnt_d_f)).item()),
             "r1": r1_acc,
-            "r2": r2_acc,
             "r1_grad_sq": r1_gsq_acc if (_do_r1 and M_r1 > 0) else 0.0,
             "r1_fired": 1.0 if (_do_r1 and M_r1 > 0) else 0.0,
-            "r2_grad_sq": r2_gsq_acc if _do_r2 else 0.0,
-            "r2_fired": 1.0 if _do_r2 else 0.0,
         }
 
     def _ladd_run_pair_mode(
@@ -5180,6 +9299,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         """
         from model.r3gan import rpgan_d_loss, rpgan_g_loss, r1_penalty
         from model.ladd_disc import latent_diff_augment
+
+        # ---- A6 (2026-08-23): reset the real-diversity telemetry ---------
+        # ``_ladd_real_div_telemetry`` is written inside the matched
+        # ``_match_select`` closure and read when the logs dict is built. It
+        # was NEVER cleared, so any step that did NOT run a matched real draw
+        # (D-update skipped during ``gan_disc_start_step`` warmup, gen-side
+        # gated off, a positional/fallback step, a mode that returned early)
+        # re-emitted the PREVIOUS step's counts as if they were fresh. Clear
+        # it at entry so a missing draw shows up as absent keys (or the
+        # explicit positional marker below) instead of stale ones. Pure
+        # telemetry: with ``gan_real_diversity_log`` off (default) nothing
+        # ever writes the attribute, so this is a no-op.
+        #
+        # D2 (2026-08-23): the clear is still cross-STEP correct, but a
+        # WITHIN-step fallback now exists -- ``_ladd_stash_real_div`` keeps
+        # this step's draw per pair_mode, so the two-phase ``g_only`` call
+        # (which does not draw during critic warmup) reports the ``d_only``
+        # D-update's draw instead of nothing. See ``_ladd_real_div_logs``.
+        self._ladd_real_div_telemetry = None
 
         device = fake_src_grad.device
         zero = torch.zeros((), device=device, dtype=torch.float32)
@@ -6042,11 +10180,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         #     only the iters where R1 has a real value.
         last_r1_grad_sq = float("nan")
         last_r1_fired = 0.0
-        # R2 (fake-side penalty) counterparts — same NaN-when-not-fired
-        # convention as R1 so wandb plots gaps rather than 0s.
-        last_r2 = 0.0
-        last_r2_grad_sq = float("nan")
-        last_r2_fired = 0.0
+        # A16-D1: R1 applications made by THIS (step, pair_mode) D-update
+        # block. NaN when ``ladd_r1_unified_cadence`` is off (the legacy
+        # per-iteration latch/modulo has no block-level answer), so the trace
+        # plots a gap instead of a misleading 0.
+        last_r1_block_fires = float("nan")
 
         # ===== Content-MATCHED wide GT (gt_transition; all_pairs=false) =====
         # For each fake transition, score it ONLY against its K GT
@@ -6101,8 +10239,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _r1_every_n = max(1, int(
                 getattr(self.model, "ladd_r1_every_n_steps", 1)))
             _r1_sigma = float(getattr(self.model, "ladd_r1_sigma", 0.01))
-            _r2_gamma, _r2_every_n, _r2_offset, _r2_sigma = self._ladd_r2_knobs(
-                _r1_every_n, _r1_sigma)
             _K_stat = int(getattr(self.r3gan_disc, "stat_logit_count", 0))
             _W_stat = float(getattr(
                 self.model, "ladd_stat_head_loss_weight", 1.0))
@@ -6682,6 +10818,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # row carries its OWN ride's actions and prompt embeds.
                 rpe = None
                 self._ladd_ring_last_n = 0.0
+                _div_picks = []          # A6: ring entries used this draw
                 if Kh > 0:
                     _ring_list = list(_ring)
                     _n_mu = int(ru.shape[0])
@@ -6693,6 +10830,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     _rperm = torch.randperm(
                         len(_ring_list), generator=g).tolist()
                     _picks = [_ring_list[i] for i in _rperm[:_R]]
+                    _div_picks = _picks  # A6 (reference, not a copy)
                     _ring_lat = []
                     for _ent in _picks:
                         _rl = _ent["lat"].to(
@@ -6749,6 +10887,70 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         rat = torch.zeros_like(rat)
                     if ram is not None:
                         ram = torch.zeros_like(ram)
+                # ---- A6: real-sample diversity telemetry (default OFF) ----
+                # Pure logging. Answers "is the real pool actually diverse"
+                # for the batch the D is about to consume, which the docs
+                # currently flag [UNVERIFIED]. Counted over the real SLOTS
+                # the D really sees (``gm``, one row id per (fake, k) slot),
+                # not over the candidate pool — a wide pool that always
+                # resolves to the same 3 nearest GT chunks is not diverse.
+                #   * matched rows are ride-local  -> key (cur_ride, b, u)
+                #   * cross-ride ring rows carry their own provenance tag
+                # ``repeat_rate`` = 1 - unique_windows / slots: 0.0 = every
+                # slot a different source window, ->1.0 = the same handful of
+                # reals shown over and over.
+                if bool(getattr(self, "gan_real_diversity_log", False)):
+                    try:
+                        _cur_ride = ""
+                        _ss_d = getattr(self.model, "streaming_state", None)
+                        if isinstance(_ss_d, dict):
+                            _cur_ride = str(_ss_d.get("zarr_path", "") or "")
+                        _row_src = [
+                            (_cur_ride, int(_b), int(_u))
+                            for (_b, _u) in rows_bu
+                        ]
+                        _n_matched_rows = len(_row_src)
+                        _n_unknown = 0
+                        for _i_pk, _pk in enumerate(_div_picks):
+                            _sk = _pk.get("src") if isinstance(_pk, dict) \
+                                else None
+                            if _sk is None:
+                                # Entry pushed before the flag was on: keep
+                                # it a DISTINCT window (so the window count
+                                # stays right) but an unknown ride, and count
+                                # it so the number is never quietly wrong.
+                                _n_unknown += 1
+                                _row_src.append(
+                                    ("<unknown-ride>", -1, -1 - _i_pk))
+                            else:
+                                _row_src.append(
+                                    (str(_sk[0]), -2, int(_sk[1])))
+                        _gm_flat_l = gm.reshape(-1).tolist()
+                        _slots = len(_gm_flat_l)
+                        _used = [int(_r) for _r in _gm_flat_l
+                                 if 0 <= int(_r) < len(_row_src)]
+                        _src_used = [_row_src[_r] for _r in _used]
+                        _uniq_win = len(set(_src_used))
+                        _uniq_rides = len({_t[0] for _t in _src_used})
+                        _n_ring_slots = sum(
+                            1 for _r in _used if _r >= _n_matched_rows)
+                        self._ladd_stash_real_div(pair_mode, current_step, {
+                            "gan_real_slots_total": float(_slots),
+                            "gan_real_unique_rows": float(len(set(_used))),
+                            "gan_real_unique_rides": float(_uniq_rides),
+                            "gan_real_unique_windows": float(_uniq_win),
+                            "gan_real_repeat_rate": (
+                                1.0 - (_uniq_win / float(_slots))
+                                if _slots > 0 else 0.0),
+                            "gan_real_ring_slot_frac": (
+                                _n_ring_slots / float(_slots)
+                                if _slots > 0 else 0.0),
+                            "gan_real_src_untagged": float(_n_unknown),
+                        })
+                    except Exception:
+                        self._ladd_stash_real_div(pair_mode, current_step, {
+                            "gan_real_div_err": 1.0,
+                        })
                 return ru, rat, ram, rpe, gflat
 
             def _m_noise(x):
@@ -6885,9 +11087,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 current_step < int(getattr(self, "gan_disc_start_step", 0)))
             last_d_loss = last_d_real = last_d_fake = 0.0
             last_r1 = last_r1_grad_sq = last_r1_fired = 0.0
-            last_r2 = last_r2_grad_sq = last_r2_fired = 0.0
             last_d_loss_stat = last_d_real_stat = last_d_fake_stat = 0.0
             last_n_real = 0.0
+            # A16-D1 telemetry: how many R1 penalties this (step, pair_mode)
+            # D-update BLOCK actually applies. NaN when the unified cadence is
+            # off (the legacy per-iteration latch has no block-level answer),
+            # so the trace plots a gap rather than a misleading 0.
+            last_r1_block_fires = float("nan")
             _fseg_act = (fake_action_tokens, fake_action_modulation)
 
             # ---- D-updates (resample each fake's K matched GT FRESH per
@@ -6911,7 +11117,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             #     existing single-batch path (verbatim).
             #   ladd_r1_num_samples (int, default 0): when >0, compute FD-R1
             #     on at most this many UNIQUE reals (deterministic subsample
-            #     seeded by current_step); 0 = all reals (current).
+            #     seeded by current_step); 0 = all reals (current). A17
+            #     (2026-08-23): honoured on BOTH matched paths now — it used
+            #     to apply only when ladd_disc_micro_batch_groups > 1 and was
+            #     silently ignored on the inline path. NOT read by the
+            #     POSITIONAL D-loop, which has no unique-real structure (its
+            #     reals are the ride's own positional chunks).
             _micro_groups = int(getattr(
                 self.config, "ladd_disc_micro_batch_groups",
                 getattr(self.model, "ladd_disc_micro_batch_groups", 1)))
@@ -6932,9 +11143,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
             def _run_disc_updates():
                 nonlocal last_d_loss, last_d_real, last_d_fake, last_r1
-                nonlocal last_r2, last_r1_grad_sq, last_r1_fired
-                nonlocal last_r2_grad_sq, last_r2_fired, last_d_loss_stat
+                nonlocal last_r1_grad_sq, last_r1_fired, last_d_loss_stat
                 nonlocal last_n_real
+                nonlocal last_r1_block_fires
+                # ---- A16-D1: R1 cadence decided ONCE for this D-update
+                # block (see ``_ladd_r1_block_due`` for the full contract +
+                # fire-rate table). ``ladd_r1_unified_cadence`` default False
+                # => ``_r1_block_due`` stays None and the legacy per-iteration
+                # latch below is evaluated verbatim (byte-identical).
+                _r1_unified_m = bool(getattr(
+                    self.config, "ladd_r1_unified_cadence",
+                    getattr(self.model, "ladd_r1_unified_cadence", False)))
+                _r1_block_due = None
+                if _r1_unified_m and n_disc_updates > 0 and (
+                        self.r3gan_optimizer is not None):
+                    _r1_block_due = self._ladd_r1_block_due(
+                        pair_mode, current_step, _r1_every_n)
+                    last_r1_block_fires = float(
+                        n_disc_updates if _r1_block_due else 0)
                 if n_disc_updates > 0 and self.r3gan_optimizer is not None:
                     for _it in range(n_disc_updates):
                         self.r3gan_optimizer.zero_grad(set_to_none=True)
@@ -6989,15 +11215,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             except Exception:
                                 pass
                         _fseg = (_fk, _fseg_act[0], _fseg_act[1])
-                        # R1 (real-side) + R2 (fake-side) gradient penalties,
-                        # each on its own lazy cadence. The perturbed
-                        # segments are appended to the SINGLE batched disc
-                        # forward only on the steps they fire (offset so the
-                        # two never stack — OOM guard).
-                        # R1 cadence. By default R1 fires on ALL n_disc_updates
-                        # of a fire-step (heavy). ladd_r1_once_per_step (default
-                        # off) restricts it to the FIRST update only (1-of-N) so
-                        # the per-fire-step R1 dose is cut ~n_disc_updates-fold.
+                        # R1 (real-side) gradient penalty on its own lazy
+                        # cadence. The perturbed real segment is appended to
+                        # the SINGLE batched disc forward only on the steps
+                        # it fires.
                         # DEBT-BASED cadence (2026-08-19). The old
                         # ``current_step % _r1_every_n == 0`` required EXACT
                         # alignment, but the GAN only runs on generator iters
@@ -7007,17 +11228,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         # at least _r1_every_n steps have elapsed since the
                         # last ACTUAL firing -- slightly delayed at times, but
                         # it can never be skipped indefinitely.
-                        _last_r1_at = int(getattr(self, "_ladd_last_r1_step", -10**9))
-                        _do_r1 = (current_step - _last_r1_at >= _r1_every_n) and (
-                            _it == 0 or not bool(getattr(
-                                self.config, "ladd_r1_once_per_step",
-                                getattr(self.model, "ladd_r1_once_per_step",
-                                        False))))
-                        if _do_r1:
-                            self._ladd_last_r1_step = int(current_step)
-                        _do_r2 = self._ladd_r2_fires(
-                            _r2_gamma, _r2_every_n, _r2_offset, current_step)
-                        self._ladd_count_penalty_fires(_do_r1, _do_r2)
+                        # A16-D1: with ``ladd_r1_unified_cadence`` the whole
+                        # block shares ONE decision (per pair_mode), so all
+                        # ``n_disc_updates`` iterations fire on a due step
+                        # instead of only the first. Default OFF -> the legacy
+                        # per-iteration global latch below runs verbatim.
+                        if _r1_block_due is None:
+                            _last_r1_at = int(getattr(self, "_ladd_last_r1_step", -10**9))
+                            _do_r1 = (current_step - _last_r1_at >= _r1_every_n)
+                            if _do_r1:
+                                self._ladd_last_r1_step = int(current_step)
+                        else:
+                            _do_r1 = bool(_r1_block_due)
+                        self._ladd_count_penalty_fires(_do_r1, pair_mode)
                         if _micro_groups > 1:
                             _log = self._ladd_disc_update_microbatched(
                                 _it=_it, _rn=_rn, _fk=_fk, _fseg=_fseg,
@@ -7025,13 +11248,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                 real_m_rat=real_m_rat, real_m_ram=real_m_ram,
                                 real_m_rpe=real_m_rpe,
                                 group_flat=group_flat, _do_r1=_do_r1,
-                                _do_r2=_do_r2, n_pairs=n_pairs, B=B, Kk=Kk,
+                                n_pairs=n_pairs, B=B, Kk=Kk,
                                 _m_fwd=_m_fwd, disc_for_update=disc_for_update,
                                 _disc_no_sync=_disc_no_sync,
                                 rpgan_d_loss=rpgan_d_loss, _K_stat=_K_stat,
                                 _W_stat=_W_stat, _r1_sigma=_r1_sigma,
-                                _r1_gamma=_r1_gamma, _r2_sigma=_r2_sigma,
-                                _r2_gamma=_r2_gamma,
+                                _r1_gamma=_r1_gamma,
                                 _r1_num_samples=_r1_num_samples,
                                 current_step=current_step,
                                 _micro_groups=_micro_groups)
@@ -7039,28 +11261,76 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             last_d_real = _log["d_real"]
                             last_d_fake = _log["d_fake"]
                             last_r1 = max(last_r1, _log["r1"])
-                            last_r2 = max(last_r2, _log["r2"])
                             last_r1_grad_sq = max(last_r1_grad_sq, _log["r1_grad_sq"])
                             last_r1_fired = max(last_r1_fired, _log["r1_fired"])
-                            last_r2_grad_sq = max(last_r2_grad_sq, _log["r2_grad_sq"])
-                            last_r2_fired = _log["r2_fired"]
                             last_d_loss_stat = _log["d_loss_stat"]
                             continue
                         _segs = [
                             (_rn, real_m_rat, real_m_ram, real_m_rpe),
                             _fseg]
+                        # ---- A17 (2026-08-23): honour ladd_r1_num_samples
+                        # on the INLINE matched path too. It used to be read
+                        # only by ``_ladd_disc_update_microbatched``, so with
+                        # ``ladd_disc_micro_batch_groups=1`` (the raw_t0
+                        # default) a recipe asking for 6 R1 reals silently
+                        # perturbed and forwarded ALL of them — the exact
+                        # cost/memory the knob exists to bound. Subsample the
+                        # UNIQUE reals with the SAME deterministic,
+                        # DDP-consistent seeding the micro-batched path uses
+                        # (identical rows for identical step/_it), perturb
+                        # only those, and take the FD against the matching
+                        # baseline rows. The estimator stays unbiased: the
+                        # full penalty is a mean of per-real squared FDs, and
+                        # this is the mean over a uniform random subset of
+                        # exactly those terms. ``ladd_r1_num_samples <= 0``
+                        # (default) or >= n_uniq => ``_r1_rows is None`` and
+                        # every expression below is the verbatim old code
+                        # (byte-identical, same RNG draw).
+                        _r1_rows = None
                         if _do_r1:
-                            _eps_r = _r1_sigma * torch.randn_like(_rn)
+                            _n_uniq_i = int(_rn.shape[0])
+                            if 0 < _r1_num_samples < _n_uniq_i:
+                                _gseed = (int(current_step) * 1000003 + 7
+                                          + int(_it) * 9176)
+                                _gcpu = torch.Generator(
+                                    device="cpu").manual_seed(_gseed)
+                                _r1_rows = torch.randperm(
+                                    _n_uniq_i, generator=_gcpu
+                                )[:_r1_num_samples].sort().values.to(
+                                    _rn.device)
+                                if not getattr(
+                                        self, "_ladd_r1_inline_sub_warned",
+                                        False):
+                                    self._ladd_r1_inline_sub_warned = True
+                                    import sys as _sys_r1
+                                    print(
+                                        "[LADD-R1] inline matched path: "
+                                        f"ladd_r1_num_samples="
+                                        f"{_r1_num_samples} < n_unique_reals"
+                                        f"={_n_uniq_i} -> R1 perturbs a "
+                                        "deterministic subsample (A17). Was "
+                                        "silently ignored on this path "
+                                        "before 2026-08-23.",
+                                        file=_sys_r1, flush=True)
+                        if _do_r1:
+                            if _r1_rows is None:
+                                _rn_r1 = _rn
+                                _rat_r1, _ram_r1, _rpe_r1 = (
+                                    real_m_rat, real_m_ram, real_m_rpe)
+                            else:
+                                _rn_r1 = _rn.index_select(0, _r1_rows)
+                                _sel = (lambda _t: None if _t is None
+                                        else _t.index_select(0, _r1_rows))
+                                _rat_r1 = _sel(real_m_rat)
+                                _ram_r1 = _sel(real_m_ram)
+                                _rpe_r1 = _sel(real_m_rpe)
+                            _eps_r = _r1_sigma * torch.randn_like(_rn_r1)
                             _segs.append(
-                                (_rn + _eps_r, real_m_rat, real_m_ram,
-                                 real_m_rpe))
-                        if _do_r2:
-                            _eps_f = _r2_sigma * torch.randn_like(_fk)
-                            _segs.append(
-                                (_fk + _eps_f, _fseg_act[0], _fseg_act[1]))
+                                (_rn_r1 + _eps_r, _rat_r1, _ram_r1,
+                                 _rpe_r1))
                         self._mem_step_snapshot(
                             f"disc_it{_it}_pre_fwd_nseg{len(_segs)}"
-                            f"_r1{int(_do_r1)}_r2{int(_do_r2)}")
+                            f"_r1{int(_do_r1)}")
                         _outs = _m_fwd(disc_for_update, _segs)
                         self._mem_step_snapshot(f"disc_it{_it}_post_fwd")
                         d_r, d_f = _outs[0], _outs[1]
@@ -7079,28 +11349,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                     getattr(self.model,
                                             "ladd_r1_normalize_tokens", False)))
                                 else 1.0)
+                            # A17: baseline rows must line up with the
+                            # perturbed segment. ``_r1_rows is None`` (the
+                            # default) => ``_d_r_base is d_r``, verbatim.
+                            _d_r_base = (
+                                d_r if _r1_rows is None
+                                else d_r.index_select(0, _r1_rows))
                             _gsq = (
-                                ((d_r_pert.sum(dim=1) - d_r.sum(dim=1))
+                                ((d_r_pert.sum(dim=1) - _d_r_base.sum(dim=1))
                                  / (_r1_sigma * _r1_tok)).pow(2).mean())
                             r1 = 0.5 * _r1_gamma * _gsq
                             last_r1_grad_sq = float(_gsq.detach().item())
                             last_r1_fired = 1.0
                         else:
                             r1 = d_r.sum() * 0.0
-                        if _do_r2:
-                            d_f_pert = _outs[_nxt]
-                            _nxt += 1
-                            _gsq2 = (
-                                ((d_f_pert.sum(dim=1) - d_f.sum(dim=1))
-                                 / _r2_sigma).pow(2).mean())
-                            r2 = 0.5 * _r2_gamma * _gsq2
-                            last_r2_grad_sq = float(_gsq2.detach().item())
-                            last_r2_fired = 1.0
-                        else:
-                            r2 = d_f.sum() * 0.0
                         d_rp, _dstat = _m_rp(d_r, d_f, False, group_flat)
                         self._mem_step_snapshot(f"disc_it{_it}_pre_bwd")
-                        (d_rp + r1 + r2).backward()
+                        (d_rp + r1).backward()
                         self._mem_step_snapshot(f"disc_it{_it}_post_bwd")
                         if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
                             torch.nn.utils.clip_grad_norm_(
@@ -7112,7 +11377,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         last_d_real = float(d_r.detach().mean().item())
                         last_d_fake = float(d_f.detach().mean().item())
                         last_r1 = float(r1.detach().item())
-                        last_r2 = float(r2.detach().item())
                         last_d_loss_stat = _dstat
             if bool(getattr(self.config, "ladd_defer_disc_update", False)):
                 self._ladd_pending_disc = _run_disc_updates
@@ -7184,6 +11448,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     generator_gan_loss = (
                         gen_gan_weight * g_rp.to(pred_image_dtype))
                     gen_gan_main_value = float(g_rp.detach().item())
+                    # WP-14B unweighted-ratio call site: stash the LIVE
+                    # resolved multiplier for THIS pair_mode's g_rp, not a
+                    # value re-derived from cfg. Written only here, inside
+                    # the branch that actually produced a weighted
+                    # ``generator_gan_loss`` -- a d_only-phase call, a
+                    # warmup-gated call, or a zero-weight call never
+                    # reaches this line, so the stash cannot claim a
+                    # multiplier for a loss that was never weighted.
+                    # ``gen_gan_stat_value`` accompanies it unconditionally
+                    # (0.0 when the stat sideband is off), letting the A7
+                    # caller verify the sideband contributed nothing before
+                    # treating ``generator_gan_loss`` as a pure scalar
+                    # multiple of ``g_rp`` (the precondition the division
+                    # below depends on).
+                    self._ladd_last_gen_gan_weight = float(gen_gan_weight)
+                    self._ladd_last_gen_gan_weight_mode = pair_mode
+                    self._ladd_last_gen_gan_stat_value = float(
+                        gen_gan_stat_value)
                 finally:
                     disc_for_guidance.requires_grad_(True)
                     if _disc_was_training:
@@ -7198,11 +11480,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/r3gan_r1_grad_sq": last_r1_grad_sq,
                 "train/r3gan_r1_fired": last_r1_fired,
                 "train/r3gan_r1_gamma": float(_r1_gamma),
-                "train/r3gan_r2": last_r2,
-                "train/r3gan_r2_grad_sq": last_r2_grad_sq,
-                "train/r3gan_r2_fired": last_r2_fired,
-                "train/r3gan_r2_gamma": float(_r2_gamma),
-                **self._ladd_penalty_fire_logs(),
+                # A16-D1: applications of R1 in THIS (step, pair_mode) block.
+                # Under the unified cadence a due step reads
+                # ``gan_updates_per_step``; the pre-D1 bug read 1.
+                # CAVEAT: with ``ladd_defer_disc_update`` the D-update runs
+                # AFTER this logs dict is built, so this key (like every other
+                # D-side key on that path) stays at its NaN init. The
+                # ``r3gan_r1_mode_*`` counters below live on ``self`` and are
+                # therefore defer-correct -- read those to audit the rate.
+                "train/r3gan_r1_block_fires": last_r1_block_fires,
+                **self._ladd_penalty_fire_logs(pair_mode),
                 "train/r3gan_g_loss_raw": gen_gan_main_value,
                 "train/r3gan_g_loss_weighted": gen_gan_weight * gen_gan_main_value,
                 "train/r3gan_g_weight": float(gen_gan_weight),
@@ -7229,6 +11516,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     getattr(self, "_ladd_ring_last_n", 0.0)),
                 "train/ladd_ring_size": float(
                     len(getattr(self, "_ladd_real_ring", None) or [])),
+                # A6 real-sample diversity telemetry (empty dict => no keys
+                # emitted when gan_real_diversity_log is off). D2: falls back
+                # to THIS STEP's stashed per-pair_mode draw when this
+                # particular call did not itself draw (two-phase ``g_only``
+                # during critic warmup / zero gen weight).
+                **self._ladd_real_div_logs(pair_mode, current_step),
                 "train/r3gan_d_loss_stat": last_d_loss_stat,
                 "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
                 "train/r3gan_stat_loss_weight": float(
@@ -7279,6 +11572,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     )
                 )
 
+        # ---- A16-D1: unified R1 cadence decided ONCE for this positional
+        # D-update block, BEFORE the ``gan_updates_per_step`` loop, and keyed
+        # by ``pair_mode``. See ``_ladd_r1_block_due`` for the contract and
+        # the fire-rate table. Default OFF => ``_r1_block_due_pos`` is None
+        # and the legacy ``current_step % _r1_every_n`` expression inside the
+        # loop is evaluated verbatim (byte-identical when off).
+        _r1_unified_pos = bool(getattr(
+            self.config, "ladd_r1_unified_cadence",
+            getattr(self.model, "ladd_r1_unified_cadence", False)))
+        _r1_every_n_pos = max(1, int(
+            getattr(self.model, "ladd_r1_every_n_steps", 1)))
+        _r1_block_due_pos = None
+        if (_r1_unified_pos and n_disc_updates > 0
+                and self.r3gan_optimizer is not None):
+            _r1_block_due_pos = self._ladd_r1_block_due(
+                pair_mode, current_step, _r1_every_n_pos)
+            last_r1_block_fires = float(
+                n_disc_updates if _r1_block_due_pos else 0)
         if n_disc_updates > 0 and self.r3gan_optimizer is not None:
             for _ in range(n_disc_updates):
                 self.r3gan_optimizer.zero_grad(set_to_none=True)
@@ -7359,22 +11670,68 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _r1_every_n = max(1, int(
                     getattr(self.model, "ladd_r1_every_n_steps", 1)
                 ))
-                _do_r1 = (current_step % _r1_every_n == 0)
+                # ---- A16 (2026-08-23) + D1 (2026-08-23): cadence -----------
+                # The MATCHED D-update uses a DEBT LATCH; this positional loop
+                # used a bare ``current_step % _r1_every_n``, with no latch and
+                # no shared state. On any run that mixes the paths
+                # (``ladd_gt_transition_match`` on + a ``[LADD-MATCH-FALLBACK]``
+                # step, or several pair modes per step) R1 could DOUBLE-FIRE at
+                # one step, or fire on a step the matched latch had already
+                # "spent".
+                #
+                # A16 unified the two behind a SINGLE GLOBAL latch evaluated
+                # INSIDE this loop. D1 found that this starved R1 three ways —
+                # (a) iterations 2..S of the same block always saw delta==0,
+                # (b) the first pair mode to run spent the shared debt and every
+                # later mode's R1 was permanently zero, (c) with
+                # ``ladd_defer_disc_update`` the positional loop claimed the
+                # latch before the deferred MATCHED D-update ran, so the matched
+                # head lost its R1. The latch is now per-``pair_mode`` and is
+                # evaluated ONCE PER BLOCK (hoisted above this loop); see
+                # ``_ladd_r1_block_due`` for the contract + fire-rate table.
+                #
+                # ``ladd_r1_unified_cadence`` stays default False =>
+                # ``_r1_block_due_pos`` is None and the modulo expression below
+                # is evaluated verbatim, touching no shared state
+                # (byte-identical). Set it together with
+                # ``ladd_r1_normalize_tokens`` on any patch-logit arm.
+                if _r1_block_due_pos is not None:
+                    _do_r1 = bool(_r1_block_due_pos)
+                else:
+                    _do_r1 = (current_step % _r1_every_n == 0)
                 _r1_gamma = float(
                     getattr(self.model, "ladd_r1_gamma", 1.0)
                 )
                 _r1_sigma = float(
                     getattr(self.model, "ladd_r1_sigma", 0.01)
                 )
-                # R2 (fake-side penalty) — on its own offset cadence so
-                # its perturbed-fake forward never stacks with R1's
-                # perturbed-real forward in the same D-update (OOM guard).
-                _r2_gamma, _r2_every_n, _r2_offset, _r2_sigma = (
-                    self._ladd_r2_knobs(_r1_every_n, _r1_sigma)
-                )
-                _do_r2 = self._ladd_r2_fires(
-                    _r2_gamma, _r2_every_n, _r2_offset, current_step)
-                self._ladd_count_penalty_fires(_do_r1, _do_r2)
+                # ---- A16: token normalisation for BOTH positional R1
+                # estimators. The two MATCHED estimators (inline ~:7213 and
+                # micro-batched ~:5213) already honour
+                # ``ladd_r1_normalize_tokens``; these two did NOT, so with
+                # ``ladd_gt_transition_match=false`` EVERY step estimated
+                # ‖∇_x Σ_i D_i‖² instead of ‖∇_x MEAN_i D_i‖² — a ~T²
+                # overshoot (T ≈ 47k tokens on a patch-logit disc ⇒ ~1e9×),
+                # which makes a γ calibrated on the matched path
+                # catastrophically oversized here. ∇ MEAN = ∇ SUM / T, so
+                # the normalised grad_sq is the raw one divided by T².
+                # Default False => ``_r1_tok`` is 1.0 and both expressions
+                # below are evaluated verbatim (byte-identical when off).
+                _r1_norm_tok = bool(getattr(
+                    self.config, "ladd_r1_normalize_tokens",
+                    getattr(self.model,
+                            "ladd_r1_normalize_tokens", False)))
+
+                def _r1_tok_count(_logits):
+                    # Token count T of the disc's per-sample logit map; 1.0
+                    # when normalisation is off, and 1.0 for a scalar-output
+                    # disc (where sum == mean and the two agree already).
+                    if not _r1_norm_tok:
+                        return 1.0
+                    return float(
+                        _logits.shape[1] if _logits.dim() > 1 else 1)
+
+                self._ladd_count_penalty_fires(_do_r1, pair_mode)
 
                 if _do_r1 and _r1_mode == "autograd":
                     combined_logits = disc_for_update(
@@ -7400,49 +11757,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     _r1_grad_sq_raw = (
                         real_grads_only.flatten(1).pow(2).sum(dim=1).mean()
                     )
+                    # A16: ∇_x MEAN_i D_i = (∇_x Σ_i D_i) / T, so the
+                    # token-normalised squared norm is the raw one over T².
+                    # No-op (skipped entirely) when the flag is off.
+                    _tokN = _r1_tok_count(d_real_logits)
+                    if _tokN != 1.0:
+                        _r1_grad_sq_raw = _r1_grad_sq_raw / (_tokN * _tokN)
                     r1 = 0.5 * _r1_gamma * _r1_grad_sq_raw
                     last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
                     last_r1_fired = 1.0
-                    # Autograd R2: separate ∇ of the FAKE logits w.r.t.
-                    # the (fake half of the) combined input. d_fake only
-                    # depends on the fake rows, so the real-row grads are
-                    # zero — we slice the fake half explicitly.
-                    if _do_r2:
-                        grads_f = torch.autograd.grad(
-                            d_fake_logits.sum(),
-                            combined_in,
-                            create_graph=True,
-                            retain_graph=True,
-                        )[0]
-                        fake_grads_only = grads_f[B_pair_d:]
-                        _r2_grad_sq_raw = (
-                            fake_grads_only.flatten(1).pow(2).sum(dim=1).mean()
-                        )
-                        r2 = 0.5 * _r2_gamma * _r2_grad_sq_raw
-                        last_r2_grad_sq = float(_r2_grad_sq_raw.detach().item())
-                        last_r2_fired = 1.0
-                    else:
-                        r2 = combined_logits.sum() * 0.0
-                elif (_do_r1 and _r1_mode == "fd") or _do_r2:
-                    # Finite-difference R1 and/or R2. Detach inputs (no
-                    # second-order graph). Append the perturbed real
-                    # (R1) and/or perturbed fake (R2) segment to ONE
-                    # batched disc forward — only the segment(s) that
-                    # fire this step are appended (offset → at most one
-                    # of R1/R2 here per step under equal cadences).
-                    # NOTE: reaching this branch with ``_do_r1`` True
+                elif _do_r1 and _r1_mode == "fd":
+                    # Finite-difference R1. Detach inputs (no second-order
+                    # graph). Append the perturbed real segment to ONE
+                    # batched disc forward. NOTE: reaching this branch
                     # implies ``_r1_mode == "fd"`` — the autograd+R1 case
-                    # is fully handled above, so ``_do_r1`` here always
-                    # means an FD R1.
+                    # is fully handled above.
                     real_part = combined_in[:B_pair_d].detach()
                     fake_part = combined_in[B_pair_d:].detach()
                     _fd_segs = [real_part, fake_part]
                     if _do_r1:
                         eps_real = _r1_sigma * torch.randn_like(real_part)
                         _fd_segs.append(real_part + eps_real)
-                    if _do_r2:
-                        eps_fake = _r2_sigma * torch.randn_like(fake_part)
-                        _fd_segs.append(fake_part + eps_fake)
                     _n_seg = len(_fd_segs)
                     combined_in_fd = torch.cat(_fd_segs, dim=0)
                     _disc_t_d_fd = torch.cat([t_disc] * _n_seg, dim=0)
@@ -7457,17 +11792,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     if _combined_cond_extra is not None:
                         # The combined dict has [real, fake] sub-batches
                         # along dim 0. Append the real slice for the R1
-                        # segment and/or the fake slice for the R2
                         # segment, matching ``_fd_segs`` order.
                         _cond_extra_fd = {}
                         for k, v in _combined_cond_extra.items():
                             real_v = v[:B_pair_d]
-                            fake_v = v[B_pair_d:]
                             _parts = [v]
                             if _do_r1:
                                 _parts.append(real_v)
-                            if _do_r2:
-                                _parts.append(fake_v)
                             _cond_extra_fd[k] = torch.cat(_parts, dim=0)
                     combined_logits = disc_for_update(
                         x_noisy=combined_in_fd,
@@ -7492,29 +11823,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         _off += B_pair_d
                         d_real_sum = d_real_logits.sum(dim=1)
                         d_real_pert_sum = d_real_perturbed.sum(dim=1)
+                        # A16: divide the summed-logit finite difference by
+                        # T (``ladd_r1_normalize_tokens``) so this estimates
+                        # ‖∇_x MEAN_i D_i‖², identical in scale to both
+                        # matched estimators. ``_tokN == 1.0`` when the flag
+                        # is off, and ``_r1_sigma * 1.0 == _r1_sigma``
+                        # exactly in IEEE754 => byte-identical.
+                        _tokN = _r1_tok_count(d_real_logits)
                         _r1_grad_sq_raw = (
-                            (d_real_pert_sum - d_real_sum) / _r1_sigma
+                            (d_real_pert_sum - d_real_sum)
+                            / (_r1_sigma * _tokN)
                         ).pow(2).mean()
                         r1 = 0.5 * _r1_gamma * _r1_grad_sq_raw
                         last_r1_grad_sq = float(_r1_grad_sq_raw.detach().item())
                         last_r1_fired = 1.0
                     else:
                         r1 = d_real_logits.sum() * 0.0
-                    if _do_r2:
-                        d_fake_perturbed = combined_logits[_off:_off + B_pair_d]
-                        _off += B_pair_d
-                        d_fake_sum = d_fake_logits.sum(dim=1)
-                        d_fake_pert_sum = d_fake_perturbed.sum(dim=1)
-                        _r2_grad_sq_raw = (
-                            (d_fake_pert_sum - d_fake_sum) / _r2_sigma
-                        ).pow(2).mean()
-                        r2 = 0.5 * _r2_gamma * _r2_grad_sq_raw
-                        last_r2_grad_sq = float(_r2_grad_sq_raw.detach().item())
-                        last_r2_fired = 1.0
-                    else:
-                        r2 = d_fake_logits.sum() * 0.0
                 else:
-                    # Neither R1 nor R2 fires this iter (lazy). Detached
+                    # R1 doesn't fire this iter (lazy). Detached
                     # forward for stability + memory.
                     combined_logits = disc_for_update(
                         x_noisy=combined_in.detach(),
@@ -7526,7 +11852,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     d_real_logits = combined_logits[:B_pair_d]
                     d_fake_logits = combined_logits[B_pair_d:]
                     r1 = combined_logits.sum() * 0.0  # graph-connected zero
-                    r2 = combined_logits.sum() * 0.0
                 # Per-token RpGAN: feed the full [B, K·T'·H'·W']
                 # logit tensors directly. ``rpgan_d_loss = softplus(
                 # d_fake - d_real).mean()`` is elementwise, so this
@@ -7569,7 +11894,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     last_d_loss_stat = 0.0
                     last_d_real_stat = 0.0
                     last_d_fake_stat = 0.0
-                d_total = d_rp + r1 + r2
+                d_total = d_rp + r1
                 d_total.backward()
                 if self.gan_max_grad_norm and self.gan_max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -7582,7 +11907,6 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 last_d_real = float(d_real_logits.detach().mean().item())
                 last_d_fake = float(d_fake_logits.detach().mean().item())
                 last_r1 = float(r1.detach().item())
-                last_r2 = float(r2.detach().item())
             self._mem_step_snapshot(f"ladd_{pair_mode}_b_post_d_update")
 
         # ----- Gen-side -----
@@ -7731,6 +12055,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     gen_gan_weight * g_rp.to(pred_image_dtype)
                 )
                 gen_gan_main_value = float(g_rp.detach().item())
+                # WP-14B unweighted-ratio call site (mirrors the matched
+                # branch above -- see its comment for the full rationale).
+                self._ladd_last_gen_gan_weight = float(gen_gan_weight)
+                self._ladd_last_gen_gan_weight_mode = pair_mode
+                self._ladd_last_gen_gan_stat_value = float(gen_gan_stat_value)
             finally:
                 disc_for_guidance.requires_grad_(True)
                 if disc_was_training:
@@ -7738,6 +12067,60 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             generator_gan_loss = zero
         self._mem_step_snapshot(f"ladd_{pair_mode}_c_post_g_forward")
+
+        # ---- A6 (2026-08-23): real-diversity telemetry, POSITIONAL path ---
+        # The original A6 block lives inside the matched ``_match_select``
+        # closure, so with ``ladd_gt_transition_match=false`` — the exact
+        # configuration directive R3 prescribes — it emitted ZERO keys and
+        # the absence was indistinguishable from "diversity is fine". Cover
+        # the positional path here with the same key names, plus an explicit
+        # ``gan_real_div_positional`` marker so a reader can tell which
+        # estimator produced the numbers (they mean different things: the
+        # matched draw can pull cross-ride ring reals, the positional draw
+        # is by construction ONE ride per step, so ``unique_rides`` is 1 and
+        # the only real variable is how many distinct source windows the
+        # D sees). ``gan_real_div_unavailable=1.0`` is emitted if the source
+        # bookkeeping cannot be reconstructed, so the gap is never silent.
+        # Gated on ``gan_real_diversity_log`` (default False) => no keys and
+        # no work when off: byte-identical.
+        _div_pos = {}
+        if bool(getattr(self, "gan_real_diversity_log", False)):
+            try:
+                _cur_ride_p = ""
+                _ss_p = getattr(self.model, "streaming_state", None)
+                if isinstance(_ss_p, dict):
+                    _cur_ride_p = str(_ss_p.get("zarr_path", "") or "")
+                _slots_p = int(real_chunks_det.shape[0])
+                # Rows are chunk-major / batch-minor (torch.cat over pairs of
+                # [B, ...] slabs), so row r came from source window
+                # ``real_positions[r // B]`` of the current ride.
+                _bs_p = max(1, _slots_p // max(1, n_pairs))
+                _src_p = []
+                for _r_i in range(_slots_p):
+                    _k_i = _r_i // _bs_p
+                    _pos_i = (real_positions[_k_i]
+                              if _k_i < len(real_positions) else -1)
+                    _src_p.append((_cur_ride_p, _r_i % _bs_p, int(_pos_i)))
+                _uw_p = len(set(_src_p))
+                _div_pos = {
+                    "train/gan_real_div_positional": 1.0,
+                    "train/gan_real_slots_total": float(_slots_p),
+                    "train/gan_real_unique_rows": float(_uw_p),
+                    "train/gan_real_unique_rides": float(
+                        len({_t[0] for _t in _src_p})),
+                    "train/gan_real_unique_windows": float(_uw_p),
+                    "train/gan_real_repeat_rate": (
+                        1.0 - (_uw_p / float(_slots_p))
+                        if _slots_p > 0 else 0.0),
+                    # No cross-ride replay ring on this path, by construction.
+                    "train/gan_real_ring_slot_frac": 0.0,
+                    "train/gan_real_src_untagged": 0.0,
+                }
+            except Exception:
+                _div_pos = {
+                    "train/gan_real_div_positional": 1.0,
+                    "train/gan_real_div_unavailable": 1.0,
+                }
 
         logs = {
             "train/r3gan_disc_skipped": 1.0 if disc_skipped else 0.0,
@@ -7750,26 +12133,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # ``r3gan_r1_grad_sq`` key below to see the underlying
             # gradient norm regardless of γ + lazy schedule.
             "train/r3gan_r1": last_r1,
-            # Raw ‖∇_x Σ_i D_i‖² estimate — γ-free, lazy-aware (NaN on
+            # Raw squared-gradient estimate — γ-free, lazy-aware (NaN on
             # iters where R1 didn't actually fire so wandb plots gaps).
+            # A16: this is ‖∇_x Σ_i D_i‖² by default and
+            # ‖∇_x MEAN_i D_i‖² when ``ladd_r1_normalize_tokens`` is set —
+            # the SAME convention as both matched estimators, so the four
+            # R1 traces are now directly comparable.
             # This is the right knob to watch when calibrating
             # ``ladd_r1_gamma``: if it stays ~0, R1 has nothing to bite
             # on; if it climbs into the thousands, the disc is becoming
             # sharp and γ should go up.
             "train/r3gan_r1_grad_sq": last_r1_grad_sq,
             # 1.0 iff R1 was actually computed this disc-update iter
-            # (i.e. ``current_step % ladd_r1_every_n_steps == 0`` AND
-            # the disc isn't in warmup). Lets the user filter the
+            # (``current_step % ladd_r1_every_n_steps == 0``, or the shared
+            # debt latch when ``ladd_r1_unified_cadence`` is on, AND the
+            # disc isn't in warmup). Lets the user filter the
             # ``r3gan_r1`` / ``r3gan_r1_grad_sq`` traces to only the
             # iters where the values are meaningful.
             "train/r3gan_r1_fired": last_r1_fired,
             "train/r3gan_r1_gamma": float(_r1_gamma) if "_r1_gamma" in locals() else float(getattr(self.model, "ladd_r1_gamma", 1.0)),
-            # R2 (fake-side penalty) counterparts of the R1 traces above.
-            "train/r3gan_r2": last_r2,
-            "train/r3gan_r2_grad_sq": last_r2_grad_sq,
-            "train/r3gan_r2_fired": last_r2_fired,
-            "train/r3gan_r2_gamma": float(getattr(self.model, "ladd_r2_gamma", 0.0)),
-            **self._ladd_penalty_fire_logs(),
+            # A16-D1: R1 applications in THIS (step, pair_mode) block.
+            "train/r3gan_r1_block_fires": last_r1_block_fires,
+            **self._ladd_penalty_fire_logs(pair_mode),
             "train/r3gan_g_loss_raw": gen_gan_main_value,
             "train/r3gan_g_loss_weighted": (
                 gen_gan_weight * gen_gan_main_value
@@ -7789,6 +12174,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/r3gan_stat_loss_weight": float(
                 getattr(self.model, "ladd_stat_head_loss_weight", 1.0)
             ),
+            # A6: positional-path real-diversity telemetry (empty dict =>
+            # no keys emitted when gan_real_diversity_log is off).
+            **_div_pos,
         }
         return generator_gan_loss, logs
 
@@ -8599,6 +12987,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         m = getattr(self, "model", None)
         names_trainer = [
             "r3gan_disc", "r3gan_disc_ddp", "r3gan_optimizer",
+            # WP-PIXGAN: the pixel-texture critic allocates GPU memory the
+            # moment it is built. This inventory exists to reveal exactly
+            # that, so a new critic MUST appear here.
+            "pixel_texture_disc", "pixel_texture_disc_ddp", "pix_optimizer",
             "forward_noiser_optimizer", "reverse_noiser_optimizer",
             "state_probe_optimizer",
             "real_teacher_optimizer", "critic_optimizer",
@@ -8633,6 +13025,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # Booleans / config-derived flags that toggle subsystems
             flags = [
                 "gan_enabled", "gan_backbone",
+                "gan_pixel_texture_enabled",
                 "flash_dmd_enabled", "boundary_vae_roundtrip",
                 "dmd_frozen_teacher_pass_enabled",
                 "real_teacher_train_online",
@@ -9676,7 +14069,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # _prebuild_rollout2 + seed-prefill mini-rollouts (no_grad, freed
             # immediately) but their blocks stay reserved in the caching
             # allocator. This SAME step then runs a full training step ending
-            # in the GAN disc R1/R2 double-backward (heavy); the setup residual
+            # in the GAN disc R1 double-backward (heavy); the setup residual
             # stacks under that backward and tips fresh-ride steps over (the
             # observed OOM missed by ~40 MB). Return the freed setup blocks to
             # the allocator now so the training forward/backward allocates from
@@ -10350,6 +14743,61 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             train_chunk,
             int(getattr(self.model, "reverse_noiser_dedrift_level", 1)),
         )
+        # CARN pair-swap test (researcher, 2026-08-24): DEDICATED corrector
+        # training backward. The legacy mse-fold rides the FAKE-SCORE inner
+        # backward, which is 0 in this arm (streaming_fake_updates_per_gen=0
+        # per the fold guard) -- without this block the FN loss is computed,
+        # printed, and NEVER trained (the first 120-step arm proved it:
+        # eval ckpts carried no FN and gen max|arm-ctl| was 4.6e-5 = kernel
+        # noise). Inputs are detached, so this graph touches ONLY the FN;
+        # the unconditional FN-optimizer stepping later this iteration
+        # consumes the grads (DDP wrapper handles the all-reduce; the model
+        # batches all pairs into ONE forward per backward).
+        if (
+            getattr(self.model, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt"
+            and getattr(self.model, "forward_noiser", None) is not None
+        ):
+            _fn_w = float(getattr(
+                self.model, "forward_noiser_loss_weight", 1.0))
+            if _fn_w > 0.0:
+                _fn_log: dict = {}
+                _fn_loss = self.model._compute_fn_loss_rollout_to_gt(
+                    _raw_train_chunk.detach(), train_info, _fn_log,
+                )
+                if _fn_loss is not None and _fn_loss.requires_grad:
+                    (_fn_w * _fn_loss).backward()
+                    self._carntx_step_ctr = getattr(
+                        self, "_carntx_step_ctr", 0) + 1
+                    if (self._carntx_step_ctr % 10 == 1
+                            and self.is_main_process):
+                        import sys as _sys
+                        _fni = self.model.forward_noiser
+                        _fni = _fni.module if hasattr(_fni, "module") else _fni
+                        _wn = float(sum(
+                            q.detach().float().pow(2).sum()
+                            for q in _fni.parameters()).sqrt())
+                        print(
+                            f"[CARNTX] step={int(self.step)} "
+                            f"fn_loss={float(_fn_loss.detach()):.5f} "
+                            f"fn_wnorm={_wn:.3f} "
+                            f"n_pairs={_fn_log.get('forward_noiser_n_pairs')}",
+                            file=_sys.stderr, flush=True)
+                    # Persist the corrector: the first arm saved NOTHING
+                    # (eval ckpt has no FN state). Rank-0, every 50 steps
+                    # and at the end.
+                    if self.is_main_process and (
+                        int(self.step) % 25 == 0
+                        or int(self.step) >= int(getattr(
+                            self.config, "max_steps", 10**9)) - 1
+                    ):
+                        _fni = self.model.forward_noiser
+                        _fni = (_fni.module
+                                if hasattr(_fni, "module") else _fni)
+                        torch.save(
+                            _fni.state_dict(),
+                            str(self.log_dir /
+                                f"fn_corrector_step{int(self.step):04d}.pt"),
+                        )
         gen_loss_dmd, gen_log = self.model.compute_generator_loss_streaming(
             train_chunk, train_info,
         )
@@ -10524,6 +14972,44 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 out.update(aux_disc_logs)
                 self._mem_step_snapshot("3b_after_aux_disc")
 
+        # ------------------------------------------------------------------
+        # WP-PIXGAN T3-C -- the pixel G-term, computed at the OUTER level.
+        #
+        # It is computed HERE, before the ``gan_active`` branch, because the
+        # pixel arm is specced to run with the transition GAN OFF (T3-A's own
+        # stub sets ``gan_enabled=False``), and ``gen_gan_loss`` exists only
+        # inside that branch. Folding the term in there and nowhere else
+        # would give an arm that trains its critic every step and applies
+        # ZERO gradient from it to the generator -- compiles, runs, logs
+        # cheerfully, measures nothing (docs/WP_PIXGAN.md §16/§22, and the
+        # reason §21 names "both endpoints, not the path between").
+        #
+        # So there are two application paths and the trace SAYS WHICH ONE
+        # ran (``train/pix_g_in_gen_gan_loss``):
+        #   gan_active  -> folded into ``gen_gan_loss`` before the A7 block,
+        #                  so A7 measures it with no extra wiring (§5.5);
+        #   otherwise   -> added straight to ``generator_loss`` below, with
+        #                  the same UNWEIGHTED ratio published by the same
+        #                  helper the A7 path calls.
+        # When the arm is off the helper returns ``(None, None, {})`` before
+        # touching anything: no tensor, no backward, no RNG draw, no key.
+        # ------------------------------------------------------------------
+        _pix_g_w = None
+        _pix_g_raw = None
+        _pix_g_folded = False
+        # Surrogate-only mode (surrogate on, pixel gate off -- the SAM2-
+        # teacher branch) also enters: the helper's surrogate branch
+        # serves the G-term from the latent critic and returns before any
+        # pixel-disc code. Gate-off (both false) is unchanged.
+        if (bool(getattr(self, "gan_pixel_texture_enabled", False))
+                or bool(getattr(self, "surrogate_critic_enabled", False))):
+            _pix_g_w, _pix_g_raw, _pix_g_logs = (
+                self._compute_pixel_texture_g_loss(
+                    train_info, current_step=int(self.step),
+                )
+            )
+            out.update(_pix_g_logs)
+
         if gan_active:
             gt_window = state["ride_latents_window"][:, chunk_lo:chunk_hi]
             # Stash the latent chunk_lo on streaming_state so
@@ -10548,6 +15034,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 current_step=int(self.step),
                 flash_dmd_gan_x0=_flash_dmd_gan_x0,
             )
+            # (A4 gan_grad_target_norm cap REMOVED 2026-08-23 — it used to
+            # rescale gen_gan_loss here, immediately before the telemetry
+            # below. ``train/gan_grad_norm`` therefore now reports the
+            # UNCAPPED gen-side GAN gradient.)
+            # WP-PIXGAN T3-C: the pixel G-term is folded into
+            # ``gen_gan_loss`` HERE -- BEFORE the A7 block below -- so the
+            # existing ``gan_grad_norm`` / ``gan_dmd_grad_ratio`` /
+            # ``gan_dmd_grad_cos`` measure it with no extra wiring, which is
+            # what TEXTURE_GAN_DESIGN §5.5 asks for.
+            if _pix_g_w is not None:
+                gen_gan_loss = gen_gan_loss + _pix_g_w
+                _pix_g_folded = True
+
             # A3 GRAD TELEMETRY (diagnostic-only, plan 22/8 v2): per-loss
             # gradients at the LAST requires-grad generator parameter.
             # ||g_GAN||/||g_rest|| separates weak-vs-destructive; the cosine
@@ -10564,15 +15063,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         if _pp.requires_grad:
                             _p_last = _pp
                     if _p_last is not None:
-                        _g_rest = torch.autograd.grad(
-                            generator_loss, _p_last, retain_graph=True,
-                            allow_unused=True)[0]
-                        _g_gan = torch.autograd.grad(
-                            gen_gan_loss, _p_last, retain_graph=True,
-                            allow_unused=True)[0]
-                        if _g_rest is not None and _g_gan is not None:
-                            _gr = _g_rest.flatten().float()
-                            _gg = _g_gan.flatten().float()
+                        # T3-C: refactored onto the module-level ``grad_at``
+                        # so WP-14B's LADD branch and the pixel path share ONE
+                        # implementation. Outputs are byte-identical to the
+                        # inline ``torch.autograd.grad(...)[0]`` pair this
+                        # replaced, INCLUDING the failure regime: the old code
+                        # let a graph-free loss raise out of ``autograd.grad``
+                        # into the ``except`` below (-> gan_grad_telemetry_err
+                        # = 1.0), whereas ``grad_at`` returns None there by
+                        # design. The explicit raise preserves the recorded
+                        # behaviour rather than silently converting an error
+                        # regime into a silent one.
+                        if not (generator_loss.requires_grad
+                                and gen_gan_loss.requires_grad):
+                            raise RuntimeError(
+                                "A7 grad telemetry: a loss carries no "
+                                "autograd graph"
+                            )
+                        _gr = grad_at(
+                            generator_loss, _p_last, retain_graph=True)
+                        _gg = grad_at(
+                            gen_gan_loss, _p_last, retain_graph=True)
+                        if _gr is not None and _gg is not None:
                             _nr = float(_gr.norm()); _ng = float(_gg.norm())
                             out["train/gan_grad_norm"] = _ng
                             out["train/dmd_grad_norm_shared"] = _nr
@@ -10581,11 +15093,81 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             out["train/gan_dmd_grad_cos"] = float(
                                 torch.dot(_gg, _gr)
                                 / max(_ng * _nr, 1e-12))
+                        # ---- T3-C: the UNWEIGHTED pixel ratio (§12 step 1).
+                        # Deliberately OUTSIDE the block above, not nested in
+                        # it: that block needs ``_gg`` (the grad of the whole
+                        # ``gen_gan_loss``), and in the weight-free probe the
+                        # pixel weight is 0 and the LADD weight may be 0 too,
+                        # so ``_gg`` can legitimately be None on exactly the
+                        # run this readout exists for.
+                        #
+                        # ``_gr`` is REUSED, not recomputed: one backward of
+                        # the shared DMD term serves the A7 ratio, the A7
+                        # cosine, this ratio and this cosine. Recomputing it
+                        # would re-run a checkpointed teacher recompute
+                        # (~11 s / ~37 GiB on the LADD path) for a number we
+                        # already hold -- which is the whole reason
+                        # ``grad_at`` returns VECTORS and not ratios.
+                        #
+                        # It is the ratio the pixel term WOULD have at weight
+                        # 1.0 (``_pix_g_raw`` is pre-weight), because the
+                        # ratio is linear in the weight, so
+                        # ``pix_gan_weight = 0.10 / r`` solves §5.5's 5-20%
+                        # band in one short probe.
+                        if _pix_g_raw is not None:
+                            self._pix_emit_grad_ratio(
+                                out, pix_raw=_pix_g_raw, dmd_vec=_gr,
+                                param=_p_last,
+                            )
+
+                        # ---- WP-14B: the UNWEIGHTED LADD ratio. See the
+                        # module-level ``ladd_unweighted_ratio`` docstring
+                        # for the full rationale (division vs raw-
+                        # threading, the weight-free-probe limitation, why
+                        # the cosine above already covers the unweighted
+                        # case). Every input here is a LIVE value stashed
+                        # at the moment ``_ladd_run_pair_mode`` computed
+                        # it, never re-derived from cfg.
+                        out.update(ladd_unweighted_ratio(
+                            gg=_gg, gr=_gr,
+                            mode_count=getattr(
+                                self, "_ladd_last_mode_count", None),
+                            total_weight=getattr(
+                                self, "_ladd_last_total_weight", None),
+                            stat_value=getattr(
+                                self, "_ladd_last_gen_gan_stat_value", None),
+                            pix_folded=_pix_g_folded,
+                        ))
                 except Exception as _te:
                     out["train/gan_grad_telemetry_err"] = 1.0
             generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
             self._mem_step_snapshot("4_after_gan_pre_backward")
+
+        # T3-C -- the pixel G-term's SECOND application path (transition GAN
+        # off). Telemetry FIRST, against ``generator_loss`` as it stands
+        # BEFORE the pixel term is added -- exactly the quantity the A7 block
+        # differentiates on the other path -- then the term is applied.
+        if _pix_g_raw is not None:
+            # WHICH PATH ACTUALLY RAN, in the trace. §21's sixth instance is
+            # a knob whose effective value is assembled across files and
+            # never logged; two packages then reached a wrong conclusion
+            # from accurate launcher-level evidence. This is the same shape,
+            # so it is logged rather than inferred from the config.
+            out["train/pix_g_via_gen_gan_loss"] = 1.0 if gan_active else 0.0
+            out["train/pix_g_applied"] = (
+                1.0 if _pix_g_w is not None else 0.0
+            )
+            if not gan_active:
+                # Telemetry FIRST, against ``generator_loss`` as it stands
+                # BEFORE the pixel term is added -- exactly the quantity the
+                # A7 block differentiates on the other path -- then apply.
+                self._pix_standalone_grad_telemetry(
+                    generator_loss, _pix_g_raw, out,
+                    current_step=int(self.step),
+                )
+                if _pix_g_w is not None:
+                    generator_loss = generator_loss + _pix_g_w
 
         # Pixel-space perceptual losses (LPIPS + pixel reconstruction).
         # Direct anti-blur + anti-drift signals on a graph-on decoded
@@ -10611,6 +15193,77 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             generator_loss = generator_loss + perc_loss
             out.update(perc_logs)
+
+        # A5: no-grad decoder tripwire (default OFF, texture_tripwire_every
+        # = 0). Decodes a small slice of the generator's latents WITHOUT a
+        # graph and logs the anisotropic texture battery on the decoded
+        # pixels, so a critic gaming a latent objective into decoder
+        # artefacts shows up here at training time rather than in a 60 s
+        # eval two hours later. Read directly off ``ride_latents_window``
+        # for the GT reference so the call does not depend on ``gt_window``
+        # (which only exists on the gan_active branch).
+        # Flag-checked at the CALL SITE as well as inside the helper so the
+        # GT slice below is not even materialised when the tripwire is off
+        # (strict zero-cost / byte-identical default).
+        if int(getattr(self, "texture_tripwire_every", 0) or 0) > 0:
+            self._maybe_texture_tripwire(
+                train_chunk,
+                out,
+                gt_latents=state["ride_latents_window"][:, chunk_lo:chunk_hi],
+            )
+
+        # A22: held-out discriminator generalisation probe (default OFF,
+        # disc_holdout_probe_every = 0). Scores D(decode(GT)) vs D(decode(fake))
+        # on TRAIN rides and on rides reserved out of the training supply, and
+        # reports both margins + both accuracies, so "D is memorising its real
+        # crops" is separable from "D has learned real texture". Also runs the
+        # holdout-integrity guards (a prior holdout list leaked into training
+        # once before — GAN_REDESIGN A22). No grad, no collective, no state
+        # mutation; see ``model/disc_holdout_probe.py`` for the interpretation
+        # table and the B2 integration point.
+        # WP-PIXGAN (B1 / T3-B): the pixel-texture critic's D-update loop.
+        # Gated on ``gan_pixel_texture_enabled`` (default False) and checked
+        # HERE as well as inside the helper, so that when the arm is off this
+        # call site materialises nothing at all -- byte-identical off, with
+        # no decode, no dataset read, no RNG draw and no log key. It runs
+        # BEFORE the A22 probe so the probe scores the same fake tensor the
+        # critic was just trained against (``register_fake_source``), which
+        # is what makes the train-vs-held-out margins comparable.
+        if bool(getattr(self, "gan_pixel_texture_enabled", False)):
+            _pix_fake_lat, _ = self._pix_select_fake_latents(train_info)
+            from model.disc_holdout_probe import register_fake_source
+            register_fake_source(self, _pix_fake_lat.detach())
+            # Depth tag for the exposure telemetry: the 0-based AR chunk
+            # index within the current ride's rollout, derived HERE where
+            # the chunk identity is known (``_chunks_in_current_ride`` was
+            # incremented for THIS chunk at the top of the streaming step)
+            # and threaded through as an argument rather than guessed from
+            # trainer state inside the helper.
+            self._maybe_run_pixel_texture_d_updates(
+                train_info, out, current_step=int(self.step),
+                chunk_depth=max(
+                    0,
+                    int(getattr(self, "_chunks_in_current_ride", 1)) - 1,
+                ),
+            )
+            # WP-SURROGATE (B3) consumption wiring, distillation half
+            # (MAIN, researcher-ordered; docs/TASK_SURROGATE_CONSUMPTION.md
+            # §3.2). Spec §4.3 ordering: the critic fits the JUST-UPDATED
+            # disc, hence immediately after the D-updates. Own gate inside.
+            self._maybe_run_surrogate_distillation(
+                train_info, out, current_step=int(self.step),
+            )
+        elif bool(getattr(self, "surrogate_critic_enabled", False)):
+            # Surrogate-only mode (SAM2-teacher branch): no pixel D-loop
+            # exists, but the distillation still must run every step. Its
+            # own internal gate keeps true-off byte-identical.
+            self._maybe_run_surrogate_distillation(
+                train_info, out, current_step=int(self.step),
+            )
+
+        if int(getattr(self, "disc_holdout_probe_every", 0) or 0) > 0:
+            from model.disc_holdout_probe import maybe_run_holdout_probe
+            maybe_run_holdout_probe(self, train_chunk, out)
 
         if sc_dmd_active:
             sc_loss_raw, sc_logs = self.model.sc_dmd_loss(
@@ -10840,6 +15493,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # RAW rollout1 (pre-de-drift) — the cycle learns the student's true
             # rollout1->rollout2 drift, not G's own de-drifted output.
             fn_tf_logs = self._train_forward_noiser_tf(_raw_train_chunk, train_info)
+            # CARN reverse test (researcher, 2026-08-24): persist the h1
+            # reverse-trained corrector + a wnorm proof line, so the run is
+            # never verdict-less (the first swap arm saved NOTHING and its
+            # training could not be audited post-hoc). Additive, gated on the
+            # h1-reverse-cumulative flag set only.
+            if (
+                bool(getattr(self.model, "forward_noiser_reverse", False))
+                and not bool(getattr(
+                    self.model, "forward_noiser_chain_levels", True))
+                and self.is_main_process
+                and int(self.step) % 25 == 0
+            ):
+                _fnm = self.model.forward_noiser
+                _fnm = _fnm.module if hasattr(_fnm, "module") else _fnm
+                _wn = float(sum(
+                    q.detach().float().pow(2).sum()
+                    for q in _fnm.parameters()).sqrt())
+                import sys as _sys
+                print(
+                    f"[CARN-REV] step={int(self.step)} fn_wnorm={_wn:.4f} "
+                    f"tf_loss={fn_tf_logs.get('train/fn_tf_loss')} "
+                    f"tf_pairs={fn_tf_logs.get('train/fn_tf_pairs')}",
+                    file=_sys.stderr, flush=True)
+                torch.save(
+                    _fnm.state_dict(),
+                    str(self.log_dir /
+                        f"fn_rev_step{int(self.step):04d}.pt"),
+                )
             out.update(fn_tf_logs)
             self._mem_step_snapshot("6b_after_fn_tf_backward")
 
@@ -11066,6 +15747,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 return False
         ride_len = int(ride["latents"].shape[1])
 
+        # A22 real-supply tripwire (default OFF). THIS is the single funnel
+        # through which a dataset ride becomes discriminator "real" data:
+        # everything below feeds ``streaming_state['ride_latents_window']``
+        # (positional + wide real draws), ``gt_match_latents`` (matched real
+        # draw) and ``self._ladd_real_ring`` (cross-ride replay real draw).
+        # Tallying the ride here therefore counts EVERY held-out ride that
+        # could reach the critic; the emitted ``train/dhp_leak_seen`` must
+        # stay 0. Placed BEFORE any consumer so a leak is recorded even if
+        # setup later bails. Zero cost when the probe is off.
+        if int(getattr(self, "disc_holdout_probe_every", 0) or 0) > 0:
+            from model.disc_holdout_probe import note_real_supply_ride
+            note_real_supply_ride(self, ride.get("zarr_path", ""))
+
         # Rolling GT-headroom, reserved UP FRONT (before picking s).
         #   * dmd_42f_rolling_sup_new: +npb GT scaffold beyond the newest
         #     rolled frame (the masked OOD slot).
@@ -11234,13 +15928,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     for _u in _starts:
                         _lo_r = _u * _npb_r
                         _hi_r = (_u + 2) * _npb_r
-                        self._ladd_real_ring.append({
+                        _ring_entry = {
                             "lat": _gm_lat[0, _lo_r:_hi_r]
                             .detach().to("cpu").clone(),
                             "act": _gm_act[:, _lo_r:_hi_r]
                             .detach().to("cpu").clone(),
                             "pe": _pe_cpu,  # shared per ride (reference)
-                        })
+                        }
+                        # A6: provenance tag (two small python objects, read
+                        # ONLY by the diversity telemetry). Gated so the ring
+                        # entry is byte-identical when the telemetry is off.
+                        if bool(getattr(
+                                self, "gan_real_diversity_log", False)):
+                            _ring_entry["src"] = (
+                                str(ride.get("zarr_path", "")), int(_u),
+                            )
+                        self._ladd_real_ring.append(_ring_entry)
 
         # Telemetry: stash the ride's absolute zarr-latent offset ``s``
         # and its motion.npy chunk offset on streaming_state so the
@@ -11524,6 +16227,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if ride is None:
             return None
 
+        # A22 real-supply tripwire, LEGACY (streaming_mode=false) branch.
+        # This path feeds ``latents`` -> ``gt_window`` -> the R3GAN/LADD real
+        # side without ever touching ``_streaming_setup_sequence_from_ride``,
+        # so it needs its own tally. The two hooks are mutually exclusive
+        # (``streaming_mode`` picks exactly one), so no double counting.
+        if int(getattr(self, "disc_holdout_probe_every", 0) or 0) > 0:
+            from model.disc_holdout_probe import note_real_supply_ride
+            note_real_supply_ride(self, ride.get("zarr_path", ""))
+
         ride_len = int(ride["latents"].shape[1])
         # Total rolled length includes the leading anchor chunk
         # (= ``anchor`` = npb frames at the front so batch-1 clean_x_self
@@ -11731,6 +16443,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         gt_latents_window=gt_window,
                         current_step=int(self.step),
                     )
+                    # (A4 gan_grad_target_norm cap REMOVED 2026-08-23.)
                     generator_loss = generator_loss + gen_gan_loss
                     merged.update(gan_logs)
 
@@ -11971,6 +16684,416 @@ def _load_config_with_extends(path: str) -> "OmegaConf":
     return _load(path)
 
 
+# ----------------------------------------------------------------------
+# A18(ii) — dotlist-override guard.
+#
+# ``OmegaConf.from_dotlist`` + ``OmegaConf.merge`` accept ANY key: there is
+# no schema, no allowlist and no typo check, so a stale or misspelled
+# ``key=value`` on the launch command line merges into the config in
+# perfect silence and is then never read. This has already cost three
+# experiment readings (``ladd_gt_transition_action_blind`` — read only off
+# ``self.model``, which never binds it from args, so every "action-blind"
+# arm actually ran action-CONDITIONED; ``ladd_gt_transition_cross_equalize``
+# and ``ladd_r1_once_per_step`` — zero code references at all).
+#
+# The guard below re-derives the allowlist FROM THE SOURCE at startup
+# rather than hard-coding one (a hard-coded list would go stale in exactly
+# the way the flags it protects did). It walks the repo's ``.py`` files and
+# records, for every identifier starting with one of
+# ``_OVERRIDE_GUARD_PREFIXES``, whether it is ever read *off a config-like
+# object* — ``getattr(self.config, "k", ...)``, ``args.k``, ``cfg.get("k")``,
+# ``OmegaConf.select(cfg, "k")``. A key read only off some OTHER object
+# (e.g. ``getattr(self.model, "k", False)``) is NOT counted as sourced,
+# because that is precisely the ``action_blind`` failure: the read succeeds,
+# returns the default, and the override never arrives.
+#
+# Fail-loud, not fail-closed: by default this only emits ``logging.error``.
+# Set ``strict_override_keys=true`` to escalate to a hard raise. Every
+# failure mode of the scan itself (unreadable tree, unexpected layout,
+# implausibly small result) degrades to a silent no-op, so the guard can
+# never take a training run down on its own.
+# ----------------------------------------------------------------------
+# D14: `disc_holdout_probe_` is guarded too. A typo'd
+# `disc_holdout_probe_evrey=50` is otherwise accepted silently by
+# OmegaConf.from_dotlist and the probe simply never fires -- the exact
+# failure class this guard exists for, on the one instrument whose job is
+# to catch contaminated experiments.
+_OVERRIDE_GUARD_PREFIXES = ("gan_", "ladd_", "pix_", "disc_holdout_probe_")
+_OVERRIDE_GUARD_SKIP_DIRS = frozenset({
+    "wandb", "logs", "eval", "checkpoints", "__pycache__", "node_modules",
+    "venv", "data", "docs", "outputs", "results", "analysis",
+})
+# Receiver names that mean "this is the run config": a read off one of
+# these is a genuine consumer of the override.
+_OVERRIDE_GUARD_CONFIG_RECEIVERS = frozenset({
+    "args", "config", "cfg", "conf", "opts", "hparams",
+})
+# A18-D3 (2026-08-23) -- EXPLICIT REGISTRATION HOOK.
+#
+# A module that reads its knobs through a *variable* key (the
+# ``getattr(getattr(trainer, "config", None), key, None)`` idiom in
+# ``model/disc_holdout_probe.py``, or ``model/pixel_texture_disc.py``'s
+# ``PIX_DEFAULTS`` table) has NO literal ``getattr(config, "<key>", ...)``
+# site for the textual scan to find. Before this hook every such knob was
+# reported as "merged silently, no effect" -- and under
+# ``strict_override_keys=true`` that FALSE POSITIVE kills the job before the
+# trainer is even constructed. ``pix_`` is a guarded prefix reserved for the
+# B2 pixel-texture critic, which is specced with ~15 ``pix_*`` knobs, so the
+# blast radius was an entire planned arm.
+#
+# Any module may therefore declare its config keys by assigning a
+# module-level list/tuple/set/dict of string literals to one of these names.
+# The scan below also harvests, automatically:
+#   * nested config receivers -- ``getattr(getattr(t, "config", None), "k", d)``;
+#   * ``DEFAULTS``-style tables -- every module-level all-string-keyed dict
+#     literal in a module that reads config with a NON-literal key.
+_OVERRIDE_GUARD_REGISTRY_NAMES = frozenset({
+    "CONFIG_KEYS", "OVERRIDE_GUARD_KEYS", "_OVERRIDE_GUARD_KEYS",
+    "CONFIG_OVERRIDE_KEYS",
+})
+
+# WP-PIXGAN (B1/T3) — EXPLICIT ``pix_*`` REGISTRATION.
+#
+# MEASURED, not assumed (T3-A ran the scan above against
+# ``model/pixel_texture_disc.py`` and it returned the EMPTY SET): the
+# ``DEFAULTS``-style auto-harvest does NOT pick up ``PIX_DEFAULTS``. The
+# harvest is gated on ``reads_variable_key`` — the module must itself read
+# config through a non-literal key — and ``model/pixel_texture_disc.py``
+# reads config *not at all* by design ("This module never reads yaml";
+# every ``pix_*`` value is a constructor or function argument). So the
+# harvest's precondition can never be met there and the A18-D3 comment's
+# claim, while true of ``model/disc_holdout_probe.py``, does not cover this
+# module. Hence this explicit table, which the scan always trusts.
+#
+# Mirrors ``model/pixel_texture_disc.py::PIX_DEFAULTS`` (string literals,
+# because the harvest is an AST pass and cannot import). Keep in sync.
+#
+# TRADE-OFF, stated so the next chunk can act on it: a key listed here is
+# allowlisted whether or not anything reads it, so as the later T3 chunks
+# land real ``getattr(config, "pix_...", ...)`` sites they should DELETE the
+# corresponding entries from this list and let the scan find them for real.
+# The list exists because an unsourced ``pix_*`` override is a FALSE
+# POSITIVE that kills the job before the trainer is constructed under
+# ``strict_override_keys=true``, and the blast radius is the whole arm.
+#
+# T3-B PRUNE (2026-08-23): the eleven supply/D-loop keys that were listed
+# here -- pix_crop_lat, pix_frames_per_crop, pix_crops_per_step,
+# pix_band_count, pix_reals_per_fake, pix_loss_form, pix_r1_gamma,
+# pix_r1_sigma, pix_r1_every_n, pix_r1_num_samples, pix_decode_border_trim
+# -- have been DELETED because T3-B now reads every one of them at a
+# literal ``getattr(cfg, "<key>", ...)`` site in this file. Verified by
+# running the scan with this table emptied. Keeping them registered would
+# allowlist them whether or not anything read them, which is exactly the
+# regression-masking the T3-A comment above warned about.
+#
+# T3-C PRUNE (2026-08-23): the table is now EMPTY, and that is the finished
+# state, not an oversight. The last entry, ``pix_gan_weight``, was deleted
+# because T3-C reads it at literal ``getattr(cfg, "pix_gan_weight", None)``
+# sites (``_pix_gen_weight``, and the resolved-config echo), so the scan
+# sources it for real. VERIFIED by running ``_scan_config_sourced_keys`` with
+# this table emptied: it returns ``pix_gan_weight``.
+#
+# Emptying it is the POINT, not a tidy-up. A registered key is allowlisted
+# whether or not anything reads it, so leaving entries here would mask
+# exactly the regression the guard exists to catch: if a future edit deletes
+# a read site, the override must START being reported as unsourced, and a
+# stale registration would keep certifying it as fine.
+#
+# The list stays DEFINED (it is one of ``_OVERRIDE_GUARD_REGISTRY_NAMES``)
+# so a module that reads config through a VARIABLE key can register again if
+# one ever appears. There is no ``pix_r2_*`` entry and never will be
+# (R2 is deleted -- WP_PIXGAN section 2).
+_OVERRIDE_GUARD_KEYS = []
+
+
+def _ast_config_sourced_keys(prefixes, src):
+    """AST half of the override-guard scan (A18-D3).
+
+    Returns the set of prefixed keys this source reads off a config-like
+    object, covering the three idioms the textual scan structurally cannot
+    see. Any parse failure returns the empty set -- the textual scan still
+    runs, so this can only ever ADD keys, never remove them.
+    """
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+
+    def _pref(name):
+        return isinstance(name, str) and name.startswith(tuple(prefixes))
+
+    def _is_cfg_expr(node, depth=0):
+        """Is ``node`` an expression that evaluates to the run config?"""
+        if depth > 4 or node is None:
+            return False
+        if isinstance(node, ast.Name):
+            return node.id in _OVERRIDE_GUARD_CONFIG_RECEIVERS
+        if isinstance(node, ast.Attribute):
+            # ``self.config`` / ``trainer.cfg`` / ``self.args``
+            return node.attr in _OVERRIDE_GUARD_CONFIG_RECEIVERS
+        if isinstance(node, ast.Call):
+            f = node.func
+            # ``getattr(<anything>, "config", <default>)`` -> the config.
+            if isinstance(f, ast.Name) and f.id == "getattr" and len(node.args) >= 2:
+                a1 = node.args[1]
+                if (isinstance(a1, ast.Constant)
+                        and isinstance(a1.value, str)
+                        and a1.value in _OVERRIDE_GUARD_CONFIG_RECEIVERS):
+                    return True
+            # ``x.get("config")`` -- same shape, same meaning.
+            if (isinstance(f, ast.Attribute) and f.attr == "get"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                    and node.args[0].value
+                    in _OVERRIDE_GUARD_CONFIG_RECEIVERS):
+                return True
+        if isinstance(node, ast.BoolOp):      # ``cfg or {}``
+            return any(_is_cfg_expr(v, depth + 1) for v in node.values)
+        if isinstance(node, ast.IfExp):
+            return (_is_cfg_expr(node.body, depth + 1)
+                    or _is_cfg_expr(node.orelse, depth + 1))
+        return False
+
+    found = set()
+    reads_variable_key = False
+
+    for node in ast.walk(tree):
+        # ``cfg.key`` / ``self.config.key``
+        if isinstance(node, ast.Attribute):
+            if _pref(node.attr) and _is_cfg_expr(node.value):
+                found.add(node.attr)
+        # ``cfg["key"]``
+        elif isinstance(node, ast.Subscript):
+            sl = node.slice
+            if (isinstance(sl, ast.Constant) and isinstance(sl.value, str)
+                    and _pref(sl.value) and _is_cfg_expr(node.value)):
+                found.add(sl.value)
+        elif isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name) and f.id == "getattr" and len(node.args) >= 2:
+                recv, key = node.args[0], node.args[1]
+                if _is_cfg_expr(recv):
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        if _pref(key.value):
+                            found.add(key.value)
+                    else:
+                        # ``getattr(config, key, default)`` -- key is a
+                        # variable. This module dispatches its knobs through
+                        # a table; enable the DEFAULTS harvest below.
+                        reads_variable_key = True
+            elif isinstance(f, ast.Attribute) and f.attr == "get":
+                if node.args and _is_cfg_expr(f.value):
+                    key = node.args[0]
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        if _pref(key.value):
+                            found.add(key.value)
+                    else:
+                        reads_variable_key = True
+            elif (isinstance(f, ast.Attribute) and f.attr == "select"
+                    and isinstance(f.value, ast.Name)
+                    and f.value.id == "OmegaConf" and len(node.args) >= 2):
+                key = node.args[1]
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    if _pref(key.value):
+                        found.add(key.value)
+
+    # ---- module-level tables -------------------------------------------
+    dict_tables = []
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if value is None:
+            continue
+        names = {t.id for t in targets}
+        literals = None
+        if isinstance(value, ast.Dict):
+            ks = value.keys
+            if ks and all(isinstance(k, ast.Constant)
+                          and isinstance(k.value, str) for k in ks):
+                literals = [k.value for k in ks]
+        elif isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            els = value.elts
+            if els and all(isinstance(e, ast.Constant)
+                           and isinstance(e.value, str) for e in els):
+                literals = [e.value for e in els]
+        if literals is None:
+            continue
+        if names & _OVERRIDE_GUARD_REGISTRY_NAMES:
+            # Explicit registration -- always trusted.
+            found.update(k for k in literals if _pref(k))
+        elif isinstance(value, ast.Dict):
+            dict_tables.append(literals)
+
+    if reads_variable_key:
+        # ``DEFAULTS``-style harvest. Only when the module demonstrably reads
+        # config with a variable key, so a plain lookup table in an unrelated
+        # module is never mistaken for a config consumer.
+        for literals in dict_tables:
+            found.update(k for k in literals if _pref(k))
+
+    return found
+
+
+def _scan_config_sourced_keys(prefixes, root):
+    """Return the set of prefixed config keys the source actually reads
+    off a config-like object, or ``None`` if the scan could not run."""
+    import re
+
+    tok = re.compile(
+        r"(?:" + "|".join(re.escape(p) for p in prefixes) + r")[A-Za-z0-9_]+"
+    )
+    re_comment = re.compile(r"^\s*#")
+    re_receiver = re.compile(r"([A-Za-z_][A-Za-z0-9_.]*)\.$")
+    re_getattr = re.compile(r"getattr\( ?([^,()]+?) ?, ?[\"']$")
+    re_dictget = re.compile(r"([A-Za-z_][A-Za-z0-9_.]*) ?\. ?get\( ?[\"']$")
+    re_subscript = re.compile(r"([A-Za-z_][A-Za-z0-9_.]*) ?\[ ?[\"']$")
+    re_select = re.compile(r"OmegaConf\.select\( ?([^,()]+?) ?, ?[\"']$")
+
+    def _is_config_receiver(expr):
+        if not expr:
+            return False
+        tail = expr.strip().split(".")[-1].strip("\"'[] ")
+        return tail in _OVERRIDE_GUARD_CONFIG_RECEIVERS
+
+    sourced, n_files = set(), 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _OVERRIDE_GUARD_SKIP_DIRS and not d.startswith(".")
+        ]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            try:
+                with open(os.path.join(dirpath, name),
+                          encoding="utf-8", errors="ignore") as fh:
+                    src = fh.read()
+            except OSError:
+                continue
+            n_files += 1
+            if not any(p in src for p in prefixes):
+                continue
+            # Drop whole-line comments (so a key merely DISCUSSED in a
+            # doc block is not mistaken for a consumer), then collapse
+            # whitespace so multi-line ``getattr(\n  self.config,\n
+            # "key",\n  default)`` calls match the same patterns as
+            # single-line ones.
+            body = " ".join(
+                ln for ln in src.split("\n") if not re_comment.match(ln)
+            )
+            body = re.sub(r"\s+", " ", body)
+            for m in tok.finditer(body):
+                key = m.group(0)
+                if key in sourced:
+                    continue
+                before = body[max(0, m.start() - 160):m.start()]
+                recv = None
+                if before.endswith("."):
+                    mm = re_receiver.search(before)
+                    recv = mm.group(1) if mm else None
+                elif before.endswith(("\"", "'")):
+                    for rx in (re_getattr, re_dictget, re_subscript, re_select):
+                        mm = rx.search(before)
+                        if mm:
+                            recv = mm.group(1)
+                            break
+                if _is_config_receiver(recv):
+                    sourced.add(key)
+            # A18-D3: AST pass. Strictly ADDITIVE -- it can only widen the
+            # allowlist, so a key the textual scan already found stays found
+            # and no new false NEGATIVE is possible from a parse failure.
+            # NOT pre-filtered on a cheap substring test: a gate that misses
+            # a variant spelling (nested getattr split across lines, a
+            # differently-named table) silently restores the FALSE POSITIVE
+            # this fix exists to remove, and under ``strict_override_keys``
+            # that is a dead job. Measured cost of the AST pass over the whole
+            # repo is ~14 s on top of the ~50 s the textual walk already
+            # costs, once, at startup.
+            sourced |= _ast_config_sourced_keys(prefixes, src)
+    if n_files < 10:
+        # Repo layout is not what we expect -> do not pretend to know.
+        return None
+    return sourced
+
+
+class OverrideGuardError(RuntimeError):
+    """The ONLY exception ``_warn_ignored_override_keys`` may escape with.
+
+    A18-D8 (2026-08-23): the guard used to end with ``except RuntimeError:
+    raise``, which re-raised EVERY RuntimeError the scan itself could throw --
+    ``RecursionError`` is a RuntimeError subclass, and ``ast``/``os.walk`` on a
+    pathological tree can raise it. That directly contradicted the guard's own
+    contract ("every failure mode of the scan itself degrades to a silent
+    no-op, so the guard can never take a training run down on its own"): a
+    scan bug became a dead job at startup. The strict verdict is now recorded
+    in a local and raised AFTER the try block, so nothing raised from INSIDE
+    the try can ever escape.
+
+    Subclasses RuntimeError so any existing ``except RuntimeError`` around the
+    launcher keeps working.
+    """
+
+
+def _warn_ignored_override_keys(overrides, cfg):
+    """Report ``key=value`` overrides that the code never actually reads.
+
+    ``overrides`` is the raw ``--override`` dotlist. Only keys starting with
+    ``_OVERRIDE_GUARD_PREFIXES`` are checked. Emits ``logging.error``; if
+    ``strict_override_keys`` is true in ``cfg``, raises
+    ``OverrideGuardError`` instead -- and ONLY that, never an incidental
+    RuntimeError from the scan (A18-D8).
+    """
+    _strict_failure = None
+    try:
+        requested = []
+        for item in overrides:
+            key = str(item).split("=", 1)[0].strip()
+            # dotlist keys may be nested (``a.b=c``); the leaf is what a
+            # ``getattr(config, ...)`` consumer would name.
+            leaf = key.split(".")[-1]
+            if leaf.startswith(_OVERRIDE_GUARD_PREFIXES):
+                requested.append((key, leaf))
+        if not requested:
+            return
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sourced = _scan_config_sourced_keys(_OVERRIDE_GUARD_PREFIXES, root)
+        if not sourced:
+            return
+        ignored = sorted({k for k, leaf in requested if leaf not in sourced})
+        if not ignored:
+            return
+        strict = bool(OmegaConf.select(cfg, "strict_override_keys") or False)
+        msg = (
+            "[override-guard] %d override key(s) are NOT read off the config "
+            "anywhere in the source tree -- they merged silently and have NO "
+            "effect on this run: %s. (Scanned %s for reads of the form "
+            "getattr(config/args, \"<key>\", ...) / config.<key> / "
+            "cfg.get(\"<key>\"). A key read only off some other object, e.g. "
+            "getattr(self.model, \"<key>\"), does NOT count -- that is the "
+            "ladd_gt_transition_action_blind failure mode.) Fix the launch "
+            "script or wire the key up; set strict_override_keys=true to make "
+            "this a hard error."
+        ) % (len(ignored), ", ".join(ignored), root)
+        if strict:
+            # A18-D8: record, do NOT raise from inside the try -- see
+            # ``OverrideGuardError``.
+            _strict_failure = msg
+        elif str(os.environ.get("RANK", "0")) == "0":
+            logging.error(msg)
+    except Exception as exc:  # never take a run down on the guard's account
+        logging.debug("[override-guard] skipped (%s: %s)", type(exc).__name__, exc)
+    if _strict_failure is not None:
+        raise OverrideGuardError(_strict_failure)
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(
@@ -11984,6 +17107,9 @@ def main() -> None:
     if args.override:
         override = OmegaConf.from_dotlist(list(args.override))
         cfg = OmegaConf.merge(base, override)
+        # A18(ii): dotlist merge accepts unknown keys silently -- flag
+        # any gan_/ladd_/pix_ override the source never reads.
+        _warn_ignored_override_keys(list(args.override), cfg)
     else:
         cfg = base
 

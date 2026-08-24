@@ -235,7 +235,150 @@ as canonical (`model/anti_collapse.py`): per-frame **M2** = Σ_c σ_c² over
    spectrum. It bounds blur but cannot separately fix the low-band inflation.
    That is (b)'s job; (a) is the cheap 80% version.
 
-### (b) Radial-spectrum re-anchor at commit — cost: one fft2/ifft2 per commit (9×16×60×104, trivial) — **the aimed shot**
+### (b) Spectrum re-anchor at commit — cost: one fft2/ifft2 per commit (9×16×60×104, trivial) — **the aimed shot, but it must be ANISOTROPIC**
+
+> ## STATUS / CORRECTION — 2026-08-23: the radial form below is SUPERSEDED
+>
+> **This is `GAN_REDESIGN.md` execution item A9 (Point 10a). The radial version
+> specified in the rest of this subsection CANNOT SEE the student's actual
+> failure mode and must not be built as written.** Everything below the box is
+> retained as the original design record; the replacement spec follows the box.
+>
+> ### What changed
+>
+> The A/B/C diagnostic (2026-08-23; A = real, B = VAE round-trip of real,
+> C = student rollout) measured the drift on the same ride with directional
+> instruments for the first time, and the failure turned out to be **strongly
+> ANISOTROPIC**:
+>
+> | quantity | A (real) | C_early | C_late |
+> |---|---|---|---|
+> | fy/fx spectral anisotropy | **1.10** | 0.93 | **0.36** |
+> | angular entropy (normalised) | **0.98** | — | **0.84** |
+> | HF power vs real | 1.0 | 1.49× (~10 s) | 2.21× (~25 s), 3.6× (~60 s) |
+>
+> Spectral energy that was broadly spread over orientations concentrates into a
+> narrow family — **the mathematical counterpart of the visible horizontal
+> banding**. And note the sign of the HF term: the student is **not losing
+> texture, it is recursively manufacturing it** (1.49 → 2.21 → 3.6 with depth).
+> So the corrector's question is *not* "is there enough HF energy" but
+> "**is this natural multi-orientation texture, or high-energy structured fake
+> texture**".
+>
+> ### Why a radially-AVERAGED anchor is blind to it — two independent reasons
+>
+> 1. **The statistic cannot see the mode.** A pure horizontal band has its energy
+>    concentrated on the `f_y` axis — a near-delta in orientation at a given
+>    radius. `P_c(b) = mean |X|² in radial bin b` averages over orientation at
+>    fixed radius, so that spike is **smeared into a bin it shares with benign
+>    isotropic detail**. Two chunks with identical radial profiles can have
+>    completely different angular distributions: one natural, one striped. The
+>    radial profile is the *marginal over θ* of the statistic we actually need,
+>    and marginalising is exactly the operation that destroys the signal.
+> 2. **The operator cannot fix the mode, even given a perfect target.** The
+>    proposed gain `G` is a **zero-phase radial filter** built by
+>    *"radially-smooth interpolation"* — it is by construction **isotropic**, so
+>    it multiplies every orientation at radius `r` by the same number. An
+>    orientation-independent gain **commutes with rotation and therefore cannot
+>    change any orientation ratio**. The defect breaks rotational symmetry; the
+>    corrector preserves it. It is in the wrong group.
+>
+> **The failure mode this creates is worse than a no-op:** a radial anchor can be
+> **satisfied while banding worsens**. Once high-band radial power has been
+> restored to the seed's level, the anchor reports success and goes quiet — and
+> the cheapest way for the student to supply that radial power is exactly the
+> stripe energy the anchor cannot distinguish. Since `g_c(b) > 1` in the
+> high band (the measured drift is high-band *loss*, z=1.33), the radial filter
+> would **re-inflate the striped orientation along with everything else**, i.e.
+> actively amplify the banding it was designed to prevent.
+>
+> ### The anisotropic replacement — what (b) should actually match
+>
+> Match the **ORIENTATION-RESOLVED** spectrum, not the radial profile. Three
+> statistics, read **jointly**:
+>
+> * **2D-binned log power** — bin over `(radius × orientation)`, not radius
+>   alone. The radial profile of Section 2 is recovered as the θ-marginal, so
+>   **nothing measured so far is lost**; the binning is strictly refined.
+> * **Separate horizontal / vertical directional band powers** — the explicit
+>   `p_fy` vs `p_fx` axis-wedge readout, plus the normalised angular entropy over
+>   the orientation histogram, which is the scalar that moved 0.98 → 0.84.
+> * **Haar LH / HL / HH power** — `HL` is HF along height (horizontal
+>   edges/stripes), `LH` is HF along width; the `HL/LH` ratio is a direct,
+>   fft-free directional-imbalance readout, undecimated so resolution is
+>   preserved.
+>
+> Two properties of the target that are easy to get wrong:
+>
+> * **The target is "close to the real distribution", never "large" and never
+>   "maximally isotropic".** Real dashcam footage measures anisotropy **1.10**,
+>   not 1.0 — driving scenes contain legitimately oriented structure (horizon,
+>   road edges, façades). The statistic is **two-sided**: C_late's 0.36 is a
+>   miss in the *opposite* direction from the real value. Pull toward the seed's
+>   own measured orientation profile (EMA'd exactly like `(μ*, σ*)` under
+>   candidate (d)), never toward a symmetric ideal.
+> * **Anisotropy alone is gameable** — it can be satisfied by replacing
+>   directional stripes with isotropic high-frequency **snow**. `hf_power` must
+>   move toward the reference *at the same time*. This is why the battery is read
+>   jointly and why no single term may be used as the success criterion.
+>
+> ### Implementation — it already exists, and this is the FOURTH consumer
+>
+> **`analysis/texture_stats.py`** (read it before writing anything):
+>
+> | function | gives |
+> |---|---|
+> | `directional_spectrum(x, hf_cut, n_wedges)` | `hv_anisotropy`, `angular_entropy`, `angular_hist`, `hf_power` — orientation wedges over the rfft2 half-plane |
+> | `haar_band_power(x)` | `LH`, `HL`, `HH` mean power + `hl_lh_ratio` (undecimated Haar SWT) |
+> | `hf_kurtosis(x)`, `hf_channel_covariance(x)` | HF tail shape; HF cross-channel correlation (the Section-2 z=1.18 eigenspectrum defect) |
+> | `texture_battery(x)`, `battery_delta(sample, ref)` | the joint battery, and its ratio to a reference (1.0 on every term = indistinguishable) |
+>
+> It is torch-first and differentiable, `numpy` in/out only at the metric
+> boundary, and has **no trainer dependency** — so the same code is a metric, a
+> tripwire and a loss.
+>
+> **CARN-v2 candidate (b) is the fourth consumer of that one module**, alongside:
+>
+> | | consumer | role |
+> |---|---|---|
+> | A1 | `analysis/rollout_quality.py` | the rollout quality **metric** |
+> | A5 | no-grad decoder **tripwire** | training-time early warning |
+> | B1 | non-adversarial **anchor loss** (arm J) | differentiable, ungameable |
+> | **A9** | **CARN-v2 (b), this section** | commit-site **corrector** |
+>
+> **Build it once.** If the corrector's notion of "spectrum" drifts from the
+> metric's, the corrector and the instrument disagree and neither verdict is
+> readable — which is precisely the class of error that made the
+> orientation-blind instruments invert the `wave90` vs `nogan90` ranking.
+>
+> ### Concrete deltas to the op below
+>
+> 1. `P_c(b)` → `P_c(b, θ)`: 2D bins over `(r, θ)`; gain
+>    `g_c(b,θ) = sqrt(λ_sp·P*_c(b,θ)/P_c(b,θ) + (1−λ_sp))`, interpolated smoothly
+>    in **both** `r` and `θ` to avoid wedge-edge ringing. Knobs gain a
+>    `carn_seam_spec_wedges` (suggest 8, matching `directional_spectrum`'s
+>    default) next to `carn_seam_spec_bins`.
+> 2. **Phase still untouched** — magnitude-only, so the filter still cannot move
+>    content. But an orientation-selective gain is a *stronger* intervention than
+>    an isotropic one: it can suppress genuinely oriented real structure. Keep
+>    `carn_seam_spec_lambda` low (0.3 or below) and the gain clamp **tighter**
+>    than the radial version's `g_max=2.0`.
+> 3. **DC exclusion stands** (`g(0)=1`) for the same reason as before — DC is
+>    owned by the affine's μ and the drift-vec term.
+> 4. **Success criterion changes accordingly.** Rerun the probe dump with v2 on
+>    and recompute Section 2's table **and** `texture_battery`: success is
+>    high-band z → parity with natural scale, signed low-band walk → ~0, **and**
+>    `hv_anisotropy` holding near the real ~1.10 with `angular_entropy` staying
+>    ≈0.98 across all four rolls — not merely at roll 2.
+>
+> **Unaffected by this correction:** Section 2's measured drift anatomy and
+> Section 3's AR(1) λ analysis stand exactly as written. Section 2 binned
+> radially because that is what the probe computed; the z=1.33 high-band finding
+> is **correct but incomplete**, and the 2D binning strictly subsumes it.
+
+---
+
+#### Original radial design (retained for the record — superseded by the box above)
 
 Directly targets the z=1.33 finding, and bounds blur (high loss) *and*
 cartoon/haze (low gain) simultaneously because it matches the whole profile:
@@ -303,10 +446,13 @@ survives (d).
    staleness, and makes every other candidate's target better.
 3. **(a)** per-frame σ + TV gain — one afternoon, reuses `anti_collapse.py`
    machinery, bounds blur.
-4. **(b)** radial-spectrum re-anchor — the aimed shot at the top-z residual;
-   validate with the same probe pipeline (rerun the dump with v2 on, recompute
-   the Section-2 table; success = high-band z → ~parity with natural scale and
-   the signed low-band walk → ~0).
+4. **(b)** spectrum re-anchor — the aimed shot at the top-z residual, **in its
+   anisotropic (orientation-resolved) form only; the radial form is superseded —
+   see the STATUS box in §4(b)**. Validate with the same probe pipeline (rerun
+   the dump with v2 on, recompute the Section-2 table; success = high-band z →
+   ~parity with natural scale, the signed low-band walk → ~0, **and**
+   `hv_anisotropy` ≈ the real ~1.10 with `angular_entropy` ≈ 0.98 held across
+   all four rolls).
 5. **(cov)** low-λ channel recolor only if the eigenspectrum z stays >1 with
    (b) on.
 6. **(c)** residual MLP only on evidence from step 1.

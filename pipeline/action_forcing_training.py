@@ -1059,6 +1059,13 @@ class ActionForcingTrainingPipeline:
         # ``flash_dmd_enabled=False`` so the aux pass falls back to
         # the legacy ``_streaming_build_clean_x_self`` path.
         self._clean_chunk: Optional[torch.Tensor] = None
+        # A23: this path never builds the grad twin, so clear any stale
+        # buffer left by a previous ``generate_chunk_with_cache`` call
+        # rather than letting a consumer read a graph from a different
+        # rollout. (No behavioural change: nothing reads this attribute
+        # unless the A23 gate is on.)
+        self._clean_chunk_grad: Optional[torch.Tensor] = None
+        self._clean_chunk_grad_mask: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (= cache_pred at the
         batch_size, num_frames, num_channels, height, width = noise.shape
 
@@ -1956,6 +1963,55 @@ class ActionForcingTrainingPipeline:
         # cache_pred, detached). See ``__init__`` docstring for
         # consumer details.
         self._clean_chunk: Optional[torch.Tensor] = None
+        # A23 / WP-PIXGAN. Reset per-call GRAD twin of ``_clean_chunk``
+        # (gate ``pix_finish_grad_enabled``). Holds the LADDER-ENDPOINT
+        # x0 -- the tensor ``utils/eval_causal_AR.py`` commits and
+        # renders -- WITH an autograd path back to the generator
+        # weights, so a pixel-space critic can be fed an
+        # inference-parity fake instead of the t=60 flash tensor.
+        # ``None`` whenever the gate is off.
+        self._clean_chunk_grad: Optional[torch.Tensor] = None
+        # Frame-level attachment mask for the buffer above, ``[F]``
+        # bool. Published only together with the buffer.
+        self._clean_chunk_grad_mask: Optional[torch.Tensor] = None
+        # Per-call A23 telemetry; populated ONLY when the gate is on.
+        self._pix_finish_grad_stats: dict = {}
+
+        # A23 gate. Read the way every other knob on this class is read
+        # (plain attribute set by the trainer; absent => OFF). Default
+        # False keeps this method byte-identical to the pre-A23 code:
+        # no new tensor allocation, no new forward, no new RNG draw, no
+        # new key on anything the caller can observe.
+        pix_finish_grad = bool(
+            getattr(self, "pix_finish_grad_enabled", False)
+        )
+
+        # A24 / WP-PIXGAN KV-commit tripwire gate. ``pix_kv_commit_check_every``
+        # (int, default 0 = OFF) — read as a plain attribute on the PIPELINE,
+        # exactly like ``pix_finish_grad_enabled`` above. 0 keeps this method
+        # byte-identical: no fingerprint, no tensor, no RNG draw, no new key.
+        _kv_check_every = int(
+            getattr(self, "pix_kv_commit_check_every", 0) or 0
+        )
+        kv_commit_check = False
+        if _kv_check_every > 0:
+            self._pix_kv_commit_stats = {}
+            # Verify any record left pending by a PREVIOUS armed call. By
+            # the time the next rollout starts, that step's ``.backward()``
+            # has run. This is the FALLBACK site (site_code=2) and is
+            # weaker than the primary one — other forwards may have touched
+            # the slots in between — so it is labelled, never conflated.
+            # PRIMARY site: the trainer calling ``pix_kv_commit_verify()``
+            # right after ``generator_loss.backward()`` (site_code=1).
+            _kv_deferred = self._pix_kv_commit_run_verify(site_code=2)
+            if _kv_deferred:
+                self._last_extension_metrics.update(_kv_deferred)
+            _kv_n = int(getattr(self, "_pix_kv_commit_calls", 0)) + 1
+            self._pix_kv_commit_calls = _kv_n
+            kv_commit_check = ((_kv_n - 1) % _kv_check_every) == 0
+            self._pix_kv_commit_pending = [] if kv_commit_check else None
+            if kv_commit_check:
+                self._pix_kv_commit_cache_tag = self._pix_kv_cache_tag()
 
         batch_size, num_frames, _, _, _ = noise.shape
         npb = self.num_frame_per_block
@@ -1989,6 +2045,55 @@ class ActionForcingTrainingPipeline:
         # KV cache, so exposing that ``cache_pred`` to downstream
         # consumers is free.
         clean_chunk = torch.zeros_like(noise)
+        # A23 grad twin of ``clean_chunk``. Allocated the same way but
+        # ONLY under the gate (the retained one-rung graph is real
+        # memory). Written with the GRAD-CARRYING ladder-endpoint
+        # tensor at the same index slice; ``clean_chunk`` itself keeps
+        # its ``.detach()`` and is untouched.
+        #
+        # NOTE on values: with ``flash_dmd_enabled=True`` the two
+        # buffers hold DIFFERENT tensors by design --
+        # ``clean_chunk`` = the t=flash_dmd_gan_t flash x0 (what
+        # training commits), ``clean_chunk_grad`` = the PRE-FLASH
+        # ladder endpoint (what inference commits). That divergence is
+        # the entire point of A23; see the one-shot notice below.
+        #
+        # AND: only the frames whose ``clean_chunk_grad_mask`` entry is
+        # True are written at all. Frames with no grad rung to attach
+        # (trailing block of a multi-block call; a block that exited at
+        # the last rung) keep this buffer's ZEROS init -- they are NOT
+        # backfilled with ``cache_pred``, because with flash on that is
+        # the flash tensor and writing it presents the exact thing A23
+        # excludes as the ladder endpoint. Zeros here mean "not
+        # measured", and the mask says which.
+        clean_chunk_grad = (
+            torch.zeros_like(noise) if pix_finish_grad else None
+        )
+        # A23 FRAME-LEVEL attachment mask, ``[F]`` bool over the SAME
+        # frame axis as ``clean_chunk_grad``. ``True`` = that frame's
+        # slice was written with a graph-carrying tensor.
+        #
+        # This exists because ``clean_chunk_grad.requires_grad`` is a
+        # WHOLE-BUFFER property: it flips True as soon as ONE block
+        # attaches. On a multi-block call the TRAILING block is
+        # deliberately detached (see ``finish_grad_active`` below), and
+        # so is any block that had no post-exit rung to attach to. A
+        # consumer that reduced its generator loss over the whole
+        # chunk would then silently average in frames with no path to
+        # the generator -- diluting the adversarial signal by
+        # 1/num_blocks with nothing in the logs saying so. Consumers
+        # MUST select on this mask instead of assuming the whole chunk
+        # is live.
+        clean_chunk_grad_mask = (
+            torch.zeros(num_frames, dtype=torch.bool, device=noise.device)
+            if pix_finish_grad else None
+        )
+        # A23 per-call counters (blocks that attached a grad rung /
+        # blocks that could not because the ladder had no post-exit
+        # rung left to run).
+        _pix_fg_attached = 0
+        _pix_fg_no_rung = 0
+        _pix_fg_nograd = 0
 
         num_denoising_steps = len(self.denoising_step_list)
         # Cold-start only (warm_start removed). Every block uses the
@@ -1996,7 +2101,11 @@ class ActionForcingTrainingPipeline:
         exit_flags = self.generate_and_sync_list(
             len(all_num_frames), num_denoising_steps, device=noise.device,
             sync=sync_exit_flags, force_exit_step=force_exit_step,
-            exclude_last_rung=False,
+            # Trainer-set attr (default False = the old hardcoded value).
+            # True = KV-probe regime (researcher-approved 14:0x): reserves
+            # a finish rung so the A23 grad path can attach.
+            exclude_last_rung=bool(
+                getattr(self, "exit_exclude_last_rung", False)),
         )
         # In streaming mode the generator's gradient gate is not the
         # rollout-vs-warmup split — it's a single flag from the caller.
@@ -2014,6 +2123,16 @@ class ActionForcingTrainingPipeline:
                 frame_start=current_start_frame,
                 frame_count=current_num_frames,
             )
+            if kv_commit_check:
+                # A24: this block's K/V slot window, and the fingerprints of
+                # the checkpointed forwards that write into it.
+                _kv_h_exit = None
+                _kv_h_finish = None
+                _kv_h_flash = None
+                _kv_tok_a = current_start_frame * self.frame_seq_length
+                _kv_tok_b = _kv_tok_a + (
+                    current_num_frames * self.frame_seq_length
+                )
 
             # Cold-start: pure noise input + full denoising ladder.
             noisy_input = noise[
@@ -2131,11 +2250,44 @@ class ActionForcingTrainingPipeline:
                         _, denoised_pred = _ckpt(
                             _exit_fn, noisy_input, use_reentrant=False,
                         )
+                        if kv_commit_check:
+                            _kv_h_exit = self._pix_kv_hash_slots(
+                                _kv_tok_a, _kv_tok_b)
                     exit_index = index
                     break
 
             # Post-exit no_grad chain through remaining rungs. Ends
             # with ``cache_pred`` = clean x0 estimate at the last rung.
+            #
+            # A23 (``pix_finish_grad_enabled``, default OFF): the LAST
+            # rung of this loop -- and only the last -- runs WITH grad
+            # under ``_ckpt(..., use_reentrant=False)``, so the ladder
+            # endpoint (the tensor inference commits and renders) can
+            # be handed to a pixel critic with a path back to the
+            # generator weights. Every earlier rung stays ``no_grad``,
+            # and the grad rung's INPUT is built from the DETACHED
+            # previous rung output, so exactly ONE rung's worth of
+            # activation graph is retained per block.
+            #
+            # The grad output is captured into ``finish_grad_pred`` and
+            # ``cache_pred`` is IMMEDIATELY re-detached, so the flash
+            # forward, ``output``, the ``clean_chunk`` buffer and the
+            # Step-3.4 K/V commit below all see exactly the tensor they
+            # saw before this change (paper 3.3 cross-timestep
+            # decoupling: the commit must stay graph-free).
+            _last_blk = (block_index == len(all_num_frames) - 1)
+            _multi_blk = (len(all_num_frames) > 1)
+            # Mirror ``flash_grad_active`` below: honour the caller's
+            # grad gate, and skip the trailing block of MULTI-block
+            # calls (the heavy iter-1 rollout) for the same memory
+            # reason the flash forward does. Single-block calls (the
+            # 99% streaming case) always keep the grad rung.
+            finish_grad_active = (
+                pix_finish_grad
+                and requires_grad
+                and not (_last_blk and _multi_blk)
+            )
+            finish_grad_pred: Optional[torch.Tensor] = None
             cache_pred = denoised_pred.detach()
             for j in range(exit_index + 1, num_denoising_steps):
                 # Phase-LoRA dispatch per rung; see the equivalent
@@ -2154,15 +2306,85 @@ class ActionForcingTrainingPipeline:
                     ),
                 ).unflatten(0, denoised_pred.shape[:2])
                 step_t = torch.full_like(timestep, next_t_value)
-                with torch.no_grad():
-                    _, cache_pred = self.generator(
-                        noisy_image_or_video=cache_input,
-                        conditional_dict=block_cond,
-                        timestep=step_t,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
+                if finish_grad_active and j == num_denoising_steps - 1:
+                    # Grad-on FINAL finish rung. Same idiom as the
+                    # ``_exit_fn`` / ``_flash_fn`` checkpoints: default
+                    # -args closure for by-value capture, Phase-LoRA
+                    # dispatch INSIDE the fn (with re_arm, this is a
+                    # grad-on site) so backward-time recompute routes
+                    # to the same adapter. Input explicitly detached:
+                    # the previous rungs were ``no_grad`` so it is
+                    # already graph-free, but the detach makes the
+                    # one-rung bound structural rather than incidental.
+                    def _finish_fn(
+                        x,
+                        _self=self,
+                        _gen=self.generator,
+                        _cond=block_cond,
+                        _t=step_t,
+                        _kv=self.kv_cache1,
+                        _xa=self.crossattn_cache,
+                        _start=current_start_frame * self.frame_seq_length,
+                        _idx=j,
+                        _ns=num_denoising_steps,
+                    ):
+                        _self._maybe_set_phase_lora_for_step(_idx, _ns)
+                        return _gen(
+                            noisy_image_or_video=x,
+                            conditional_dict=_cond,
+                            timestep=_t,
+                            kv_cache=_kv,
+                            crossattn_cache=_xa,
+                            current_start=_start,
+                        )
+
+                    _, finish_grad_pred = _ckpt(
+                        _finish_fn, cache_input.detach(),
+                        use_reentrant=False,
                     )
+                    # Everything downstream keeps the pre-A23 tensor.
+                    cache_pred = finish_grad_pred.detach()
+                    if kv_commit_check:
+                        _kv_h_finish = self._pix_kv_hash_slots(
+                            _kv_tok_a, _kv_tok_b)
+                else:
+                    with torch.no_grad():
+                        _, cache_pred = self.generator(
+                            noisy_image_or_video=cache_input,
+                            conditional_dict=block_cond,
+                            timestep=step_t,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
+
+            if finish_grad_active:
+                # Explicit, LOUD handling of the "no finish rung to
+                # attach" case: when the block's random exit rung IS
+                # the last rung, ``range(exit_index + 1, K)`` is empty
+                # and there is no post-exit forward to hang a graph on.
+                # ``cache_pred`` is then the exit rung's own output --
+                # which IS the ladder endpoint numerically, but we
+                # deliberately do NOT reuse the exit-rung graph here
+                # (it is already owned by the DMD path; sharing it
+                # would make a second .backward() on the pixel term a
+                # double-backward error). The slice is written
+                # detached and counted, never silently passed off as
+                # grad-carrying: ``_publish`` below drops the whole
+                # buffer to ``None`` if NOTHING in it carries grad.
+                if finish_grad_pred is None:
+                    _pix_fg_no_rung += 1
+                    self._warn_once_pix_finish_grad_no_rung(
+                        exit_index, num_denoising_steps,
+                    )
+                elif not finish_grad_pred.requires_grad:
+                    # Should not happen (requires_grad=True caller +
+                    # trainable generator), but a grad-less tensor here
+                    # would silently defeat the whole feature.
+                    _pix_fg_nograd += 1
+                    self._warn_once_pix_finish_grad_nograd()
+                else:
+                    _pix_fg_attached += 1
 
             # Flash-DMD t=flash_dmd_gan_t grad-on forward (per block,
             # no final-block restriction). Inputs: noised cache_pred
@@ -2242,6 +2464,9 @@ class ActionForcingTrainingPipeline:
                     _, flash_dmd_pred = _ckpt(
                         _flash_fn, flash_input, use_reentrant=False,
                     )
+                    if kv_commit_check:
+                        _kv_h_flash = self._pix_kv_hash_slots(
+                            _kv_tok_a, _kv_tok_b)
                 else:
                     # Phase-LoRA dispatch for the no_grad flash branch.
                     # See inference_with_trajectory's twin for rationale.
@@ -2291,6 +2516,66 @@ class ActionForcingTrainingPipeline:
                     :,
                     block_start_in_noise: block_start_in_noise + current_num_frames,
                 ] = cache_pred.detach()
+
+            # A23 grad twin. Written at the SAME index slice, and ONLY
+            # ever with ``finish_grad_pred`` -- the PRE-FLASH ladder
+            # endpoint. Never ``cache_pred``, which by this point has
+            # been overwritten with the t=flash_dmd_gan_t flash output
+            # when ``flash_dmd_enabled`` is on. That is the whole A23
+            # fix: the critic's fake must be the tensor inference
+            # commits (t~208 ladder endpoint), not the t=60 flash
+            # prediction.
+            #
+            # NO FALLBACK WRITE. This branch used to fall back to
+            # ``cache_pred.detach()`` when there was no finish rung to
+            # attach, with a comment claiming the slice is written with
+            # ``finish_grad_pred`` "never ``cache_pred``". The code did
+            # the opposite of its comment, and with flash ON it wrote
+            # the FLASH tensor: measured on a 9-frame / 3-block flash-ON
+            # call, ``clean_chunk_grad[:, 6:9]`` came back bit-identical
+            # (max|diff| = 0.0) to the t=60 flash output -- precisely
+            # the tensor A23 exists to exclude. The mask read False, so
+            # a compliant consumer was safe, but any consumer or viz
+            # decoding the whole buffer saw the wrong tensor presented
+            # as the ladder endpoint.
+            #
+            # The fallback slices are therefore LEFT AT THEIR ZEROS
+            # INIT. One invariant, no flash-dependence: a frame of
+            # ``clean_chunk_grad`` is the ladder endpoint iff its mask
+            # entry is True, and is exactly zeros otherwise. Zeros
+            # cannot be mistaken for a prediction; the flash tensor can.
+            # Consumers that want a value for the detached frames must
+            # read ``clean_chunk`` (which still holds ``cache_pred`` for
+            # every frame) and know what they are getting.
+            if clean_chunk_grad is not None:
+                _grad_live = False
+                if finish_grad_pred is not None:
+                    assert (
+                        flash_dmd_pred is None
+                        or finish_grad_pred is not flash_dmd_pred
+                    ), (
+                        "pix_finish_grad: the grad buffer would hold the "
+                        "FLASH output instead of the ladder endpoint -- "
+                        "this defeats the A23 inference-parity fix."
+                    )
+                    if flash_dmd_enabled:
+                        self._warn_once_pix_finish_grad_flash_on()
+                    _grad_live = bool(finish_grad_pred.requires_grad)
+                    clean_chunk_grad[
+                        :,
+                        block_start_in_noise:
+                        block_start_in_noise + current_num_frames,
+                    ] = finish_grad_pred
+                # else: ``finish_grad_active`` was False for this block
+                # (trailing block of a multi-block call, or a no-grad
+                # caller) OR the block exited at the last rung so there
+                # was no finish rung to attach to. Nothing is written --
+                # the slice stays zeros and the mask stays False.
+                if clean_chunk_grad_mask is not None:
+                    clean_chunk_grad_mask[
+                        block_start_in_noise:
+                        block_start_in_noise + current_num_frames
+                    ] = _grad_live
 
             # Cache-update commit at t=context_noise. Runs in BOTH
             # modes — see ``inference_with_trajectory`` for the full
@@ -2383,6 +2668,24 @@ class ActionForcingTrainingPipeline:
                     current_start=current_start_frame * self.frame_seq_length,
                 )
 
+            if kv_commit_check:
+                # A24: Step 3.4's commit is the LAST forward writer of these
+                # slots and the state that must survive backward. Fingerprint
+                # it now; the post-backward comparison happens in
+                # ``pix_kv_commit_verify`` / the deferred site above.
+                if self._pix_kv_commit_pending is None:
+                    self._pix_kv_commit_pending = []
+                self._pix_kv_commit_pending.append({
+                    "block_index": int(block_index),
+                    "frame_start": int(current_start_frame),
+                    "tok_a": int(_kv_tok_a),
+                    "tok_b": int(_kv_tok_b),
+                    "commit": self._pix_kv_hash_slots(_kv_tok_a, _kv_tok_b),
+                    "exit": _kv_h_exit,
+                    "finish": _kv_h_finish,
+                    "flash": _kv_h_flash,
+                })
+
             current_start_frame += current_num_frames
 
         # Compute denoised_t_from / denoised_t_to from block 0's
@@ -2406,8 +2709,358 @@ class ActionForcingTrainingPipeline:
         self._flash_dmd_gan_output = flash_dmd_gan_output
         # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
+        # A23 stash. Published ONLY when the buffer actually carries a
+        # graph -- a grad-less buffer here would be silently useless to
+        # the pixel critic (its G-loss would have no path to the
+        # generator), so it is dropped to ``None`` and the reason is in
+        # ``_pix_finish_grad_stats`` / the one-shot warnings above.
+        if clean_chunk_grad is not None and clean_chunk_grad.requires_grad:
+            self._clean_chunk_grad = clean_chunk_grad
+            # The mask travels WITH the buffer and is never published
+            # without it. ``clean_chunk_grad[:, mask]`` is the only
+            # slice a consumer may treat as adversarially live.
+            self._clean_chunk_grad_mask = clean_chunk_grad_mask
+        else:
+            self._clean_chunk_grad = None
+            self._clean_chunk_grad_mask = None
+        if pix_finish_grad:
+            _live_frames = (
+                int(clean_chunk_grad_mask.sum().item())
+                if clean_chunk_grad_mask is not None else 0
+            )
+            self._pix_finish_grad_stats = {
+                "pix_finish_grad_blocks": float(_pix_fg_attached),
+                "pix_finish_grad_no_rung": float(_pix_fg_no_rung),
+                "pix_finish_grad_nograd": float(_pix_fg_nograd),
+                "pix_finish_grad_published": float(
+                    self._clean_chunk_grad is not None
+                ),
+                # Frame-level attachment. The DILUTION a consumer would
+                # silently eat if it ignored the mask is exactly
+                # 1 - frames/frames_total; log it from day one.
+                "pix_finish_grad_frames": float(_live_frames),
+                "pix_finish_grad_frames_total": float(num_frames),
+            }
+            # Surface through the existing per-call metrics channel so
+            # the counters land in the trainer's info dict / logs with
+            # no consumer-side change. Gated: when the A23 flag is off
+            # this dict is left exactly as the pre-A23 code left it.
+            self._last_extension_metrics.update(self._pix_finish_grad_stats)
 
         return output, denoised_t_from, denoised_t_to
+
+    # -----------------------------------------------------------------
+    # A24 / WP-PIXGAN — KV-COMMIT TRIPWIRE  (``pix_kv_commit_check_every``)
+    #
+    # THE HAZARD. ``_exit_fn`` / ``_finish_fn`` / ``_flash_fn`` are all
+    # run under ``_ckpt(..., use_reentrant=False)``, and every one of them
+    # WRITES the block's K/V slots as a side effect of the generator
+    # forward. In FORWARD order the last writer is Step 3.4's
+    # context-noise commit (``commit_input_clean = cache_pred.detach()``),
+    # which is exactly the graph-free state paper §3.3 requires. At
+    # BACKWARD each of those checkpoints is RECOMPUTED, in REVERSE order,
+    # and each recompute re-writes the SAME slots. Nothing re-runs the
+    # Step-3.4 commit afterwards, so the slots can end the step holding a
+    # recompute's K/V instead of the commit's. The corruption is finite,
+    # well-scaled and silent.
+    #
+    # The existing safety notes on those checkpoints reason about
+    # recompute READS being stable; they say nothing about recompute
+    # WRITES. A23 added a SECOND KV-writing checkpoint (``_finish_fn``)
+    # next to the pre-existing ``_flash_fn``, which is why this tripwire
+    # exists.
+    #
+    # WHAT IT DOES. On an armed call the pipeline fingerprints the K/V
+    # slot window of every transformer block at four points per block:
+    # after the exit-rung checkpoint, after the finish-rung checkpoint,
+    # after the flash checkpoint, and after Step 3.4's commit. The commit
+    # fingerprint is the reference. A SECOND fingerprint of the same
+    # window, taken AFTER ``.backward()``, is compared against it; the
+    # three intermediate fingerprints let a mismatch be attributed to the
+    # recompute that produced it.
+    #
+    # OMIT-NEVER-FAKE. ``pix_kv_commit_match`` is emitted ONLY when two
+    # real fingerprints of the same live buffer were actually compared.
+    # If the cache was reset/reallocated in between, or there was nothing
+    # to hash, the key is ABSENT and ``pix_kv_commit_skipped`` is emitted
+    # instead. A forged 1.0 here is precisely the failure this package
+    # is hunting, so there is no code path that can produce one.
+    # -----------------------------------------------------------------
+
+    # [present, sum, sum-of-squares, token-position moment,
+    #  channel-position moment]
+    _PIX_KV_STATS = 5
+
+    def _pix_kv_cache_tag(self):
+        """Identity of the CURRENT ``kv_cache1`` buffers. Used to refuse a
+        comparison across a ``reset_cache_state`` / re-allocation (which
+        would compare fingerprints of two different tensors). ``id()``
+        alone is not enough (ids get recycled), so the layer-0 storage
+        pointer and element count are folded in."""
+        c = self.kv_cache1
+        if c is None or len(c) == 0:
+            return None
+        k0 = c[0].get("k") if isinstance(c[0], dict) else None
+        if torch.is_tensor(k0):
+            return (id(c), len(c), int(k0.data_ptr()), int(k0.numel()))
+        return (id(c), len(c), -1, -1)
+
+    def _pix_kv_hash_slots(self, tok_a: int, tok_b: int):
+        """Cheap deterministic fingerprint of the K/V token window
+        ``[tok_a, tok_b)`` across every transformer block.
+
+        Returns ``[num_blocks, 2, 5]`` float64 (k and v; presence, sum,
+        sum-of-squares, token-position moment, channel-position moment)
+        on the cache's device, or ``None`` when there is nothing to hash.
+
+        Cost: two reductions plus two tiny weighted sums per (block, k/v).
+        No full-size temporaries (``torch.dot`` instead of ``(x*x).sum()``)
+        and NO RNG — ``arange``/``sin``/``cos`` only — so arming the
+        tripwire cannot shift the sampler's RNG stream for the frames it
+        is measuring.
+        """
+        cache = self.kv_cache1
+        if cache is None or len(cache) == 0:
+            return None
+        rows = []
+        dev = None
+        any_present = False
+        for blk in cache:
+            for key in ("k", "v"):
+                t = blk.get(key) if isinstance(blk, dict) else None
+                if not torch.is_tensor(t) or t.dim() < 2:
+                    rows.append(None)
+                    continue
+                a = max(0, int(tok_a))
+                b = min(int(t.shape[1]), int(tok_b))
+                if b <= a:
+                    rows.append(None)
+                    continue
+                with torch.no_grad():
+                    x = t[:, a:b].detach().to(torch.float32)
+                    dev = x.device
+                    flat = x.reshape(-1)
+                    s_sum = flat.sum()
+                    s_sq = torch.dot(flat, flat)
+                    t_axes = tuple(
+                        i for i in range(x.dim()) if i != 1
+                    )
+                    per_t = x.sum(dim=t_axes)
+                    per_d = x.sum(dim=tuple(range(x.dim() - 1)))
+                    r_t = torch.arange(
+                        per_t.numel(), device=x.device, dtype=torch.float32)
+                    r_d = torch.arange(
+                        per_d.numel(), device=x.device, dtype=torch.float32)
+                    s_t = (
+                        per_t * torch.sin(r_t * 0.7548776662466927 + 0.5)
+                    ).sum()
+                    s_d = (
+                        per_d * torch.cos(r_d * 0.5698402909980532 + 1.5)
+                    ).sum()
+                    rows.append(
+                        torch.stack([
+                            torch.ones_like(s_sum), s_sum, s_sq, s_t, s_d,
+                        ]).to(torch.float64)
+                    )
+                    any_present = True
+        if not any_present:
+            return None
+        absent = torch.zeros(
+            self._PIX_KV_STATS, dtype=torch.float64, device=dev)
+        rows = [r if r is not None else absent for r in rows]
+        return torch.stack(rows).reshape(len(cache), 2, self._PIX_KV_STATS)
+
+    @staticmethod
+    def _pix_kv_rel_delta(a, b):
+        """Per-block max RELATIVE fingerprint delta -> ``[num_blocks]``."""
+        r = (a - b).abs() / b.abs().clamp_min(1e-8)
+        return r.reshape(r.shape[0], -1).max(dim=1).values
+
+    def _pix_kv_blame(self, post, rec, tol: float) -> float:
+        """Attribute a mismatch to the recompute that produced it.
+
+        1 = exit-rung recompute, 2 = finish-rung recompute (A23),
+        3 = flash recompute, -1 = matches none of them (unknown).
+        Probed in the order they would SURVIVE: backward recomputes in
+        reverse forward order, so the last writer standing is the
+        EARLIEST forward that touched the slots (the exit rung).
+        """
+        for code, key in ((1, "exit"), (2, "finish"), (3, "flash")):
+            cand = rec.get(key)
+            if cand is None or cand.shape != post.shape:
+                continue
+            if float(self._pix_kv_rel_delta(post, cand).max().item()) <= tol:
+                return float(code)
+        return -1.0
+
+    def _pix_kv_commit_run_verify(self, *, site_code: int) -> dict:
+        """Second half of the tripwire: re-fingerprint every recorded slot
+        window and compare against the Step-3.4 commit fingerprint.
+
+        Consumes the pending record (one-shot). Returns a metrics dict;
+        empty when nothing was pending.
+        """
+        recs = getattr(self, "_pix_kv_commit_pending", None)
+        if not recs:
+            return {}
+        self._pix_kv_commit_pending = None
+        tol = float(getattr(self, "pix_kv_commit_check_tol", 1e-5) or 0.0)
+        tag = getattr(self, "_pix_kv_commit_cache_tag", None)
+        now = self._pix_kv_cache_tag()
+        skipped = {
+            "pix_kv_commit_skipped": 1.0,
+            "pix_kv_commit_site_code": float(site_code),
+        }
+        if tag is None or now is None or tag != now:
+            # Cache reset / re-allocated between the commit and here.
+            # No comparison is possible; emit NO match key.
+            self._pix_kv_commit_stats = skipped
+            return skipped
+        checked = 0
+        mismatched = 0
+        worst = 0.0
+        first_blk = -1
+        first_layer = -1
+        blame = -1.0
+        for rec in recs:
+            ref = rec.get("commit")
+            if ref is None:
+                continue
+            post = self._pix_kv_hash_slots(rec["tok_a"], rec["tok_b"])
+            if post is None or post.shape != ref.shape:
+                continue
+            checked += 1
+            d = self._pix_kv_rel_delta(post, ref)
+            m = float(d.max().item())
+            if m > worst:
+                worst = m
+            if m > tol:
+                mismatched += 1
+                if first_blk < 0:
+                    first_blk = int(rec["block_index"])
+                    first_layer = int(torch.argmax(d).item())
+                    blame = self._pix_kv_blame(post, rec, tol)
+        if checked == 0:
+            self._pix_kv_commit_stats = skipped
+            return skipped
+        out = {
+            "pix_kv_commit_match": 1.0 if mismatched == 0 else 0.0,
+            "pix_kv_commit_checked_blocks": float(checked),
+            "pix_kv_commit_mismatch_blocks": float(mismatched),
+            "pix_kv_commit_max_rel_delta": float(worst),
+            "pix_kv_commit_site_code": float(site_code),
+        }
+        if mismatched:
+            out["pix_kv_commit_first_mismatch_block"] = float(first_blk)
+            out["pix_kv_commit_first_mismatch_layer"] = float(first_layer)
+            out["pix_kv_commit_blame"] = blame
+            self._pix_warn_once(
+                "kv_commit_mismatch",
+                "[ActionForcing][A24] pix_kv_commit tripwire FIRED: the K/V "
+                "slots written by Step 3.4's context-noise commit did NOT "
+                "survive backward. first_mismatch_block=%d layer=%d "
+                "blame=%d (1=exit-rung recompute, 2=finish-rung recompute, "
+                "3=flash recompute, -1=unknown) max_rel_delta=%.3e "
+                "site_code=%d (1=post_backward, 2=deferred_next_call). "
+                "Paper 3.3 cross-timestep decoupling is violated for this "
+                "step: the next block/step reads a recompute's K/V."
+                % (first_blk, first_layer, int(blame), worst, site_code),
+            )
+        self._pix_kv_commit_stats = out
+        return out
+
+    def pix_kv_commit_verify(self) -> dict:
+        """POST-BACKWARD half of the KV-commit tripwire — PUBLIC HOOK.
+
+        The pipeline cannot reach a post-backward point on its own, so the
+        TRAINER must call this. EXACT CALL SITE (the only correct one):
+
+            ``trainer/causal_action_forcing_train.py``, in
+            ``_streaming_step``, IMMEDIATELY after the generator backward
+
+                if gen_should_backward:
+                    generator_loss.backward(retain_graph=True)
+                out.update(                                   # <-- ADD
+                    self.model.inference_pipeline                # <-- ADD
+                        .pix_kv_commit_verify())                # <-- ADD
+
+        NOTE the receiver: ``self.model.inference_pipeline`` — the
+        PIPELINE object, which is also where the trainer must set
+        ``pix_kv_commit_check_every``. Setting the flag on ``self.model``
+        is a silent no-op.
+
+        Returns ``{}`` when the flag is off or nothing is pending, so the
+        call is safe to leave in unconditionally.
+        """
+        if int(getattr(self, "pix_kv_commit_check_every", 0) or 0) <= 0:
+            return {}
+        return self._pix_kv_commit_run_verify(site_code=1)
+
+    # -----------------------------------------------------------------
+    # A23 / WP-PIXGAN one-shot notices. Deduped per process so a 600-
+    # step run cannot drown in them, but LOUD (warning + stderr) the
+    # first time, because every one of these means the pixel critic's
+    # fake is not what the design says it is.
+    # -----------------------------------------------------------------
+    def _pix_warn_once(self, key: str, msg: str) -> None:
+        seen = getattr(self, "_pix_finish_grad_warned", None)
+        if seen is None:
+            seen = set()
+            self._pix_finish_grad_warned = seen
+        if key in seen:
+            return
+        seen.add(key)
+        import logging as _logging
+        import sys as _sys
+        _logging.warning(msg)
+        print(msg, file=_sys.stderr, flush=True)
+
+    def _warn_once_pix_finish_grad_no_rung(
+        self, exit_index: int, num_denoising_steps: int
+    ) -> None:
+        self._pix_warn_once(
+            "no_rung",
+            "[ActionForcing][A23] pix_finish_grad_enabled=True but this "
+            f"block exited at rung {exit_index} of {num_denoising_steps} "
+            "(the LAST rung), so the post-exit finish loop was empty and "
+            "there was no finish rung to attach a gradient to. That "
+            "block's slice of ``_clean_chunk_grad`` is left at its ZEROS "
+            "init (mask False) — it is NOT backfilled with the detached "
+            "``cache_pred``, which with flash on would be the t=60 flash "
+            "tensor. This "
+            "happens ~1/K of the time with a uniform exit-rung draw; to "
+            "eliminate it, have the caller reserve the last rung "
+            "(generate_and_sync_list(exclude_last_rung=True)) or pin "
+            "force_exit_step < K-1. Counted in "
+            "``_pix_finish_grad_stats['pix_finish_grad_no_rung']``.",
+        )
+
+    def _warn_once_pix_finish_grad_nograd(self) -> None:
+        self._pix_warn_once(
+            "nograd",
+            "[ActionForcing][A23] pix_finish_grad_enabled=True and a "
+            "finish rung ran, but its output does NOT require grad — the "
+            "generator has no trainable parameters reachable from this "
+            "forward. The pixel critic's generator term would be a no-op. "
+            "Check that the student (or its LoRA adapters) is unfrozen.",
+        )
+
+    def _warn_once_pix_finish_grad_flash_on(self) -> None:
+        self._pix_warn_once(
+            "flash_on",
+            "[ActionForcing][A23] pix_finish_grad_enabled=True together "
+            "with flash_dmd_enabled=True. ``_clean_chunk`` (detached) "
+            "holds the t=flash_dmd_gan_t FLASH tensor as before, while "
+            "``_clean_chunk_grad`` holds the PRE-FLASH ladder endpoint — "
+            "the tensor utils/eval_causal_AR.py actually commits and "
+            "renders — on its MASK-TRUE frames only, and exact zeros "
+            "elsewhere. The two buffers therefore DIFFER in value by "
+            "design. Any consumer that wants inference parity (the A23 "
+            "fake) must read ``finish_denoised_chunk_grad`` AND select "
+            "on ``finish_denoised_chunk_grad_mask``; decoding the whole "
+            "buffer will decode zeros for the detached frames. Not "
+            "``finish_denoised_chunk`` and not ``flash_dmd_gan_x0``.",
+        )
 
     def _clear_cache_gradients(self) -> None:
         """Detach K/V tensors in the persistent caches so any autograd

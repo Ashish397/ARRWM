@@ -719,7 +719,7 @@ instrument definition, Supplementary ~line 1105 region):
 > the baselines cannot access -- the best-matching peer is another of our own
 > variants for 80.4\% of our rollouts. Scoring only against the external
 > baselines and the real references roughly doubles our relocation rates
-> (Default 10.0\% to 20.1\%, pca4 13.5\% to 28.3\%) while moving every baseline
+> (Default 11\% to 21\%, pca4 13\% to 28\%) while moving every baseline
 > by at most one rollout; the relative ordering among our variants is
 > unaffected. Cross-family relocation rates are therefore panel-dependent and
 > should not be read as a domain-neutral ranking.
@@ -727,11 +727,48 @@ instrument definition, Supplementary ~line 1105 region):
 The parallel HF sentence is in §K3. Both belong next to the §H5 note that
 reference-free formulations are left to future work.
 
-**K6. OPEN — reconcile 10.0% against the published 11%.** The agent's
-"any peer" Default rate is 10.0% (n=239); Table 14 as published says 11%. The
-13-system panel excludes No Critic in both, so the likely cause is the frozen
-pack reproducing live scoring at r=0.993 (74/75 flags identical), i.e. ~2
-rollouts. **Must be settled before §K5 goes in**, because the caption quotes
-"10.0% to 20.1%" and the base has to match the table. If the pack is the cause,
-either quote the live-scored base (11% -> ~22%) or state that the debiased
-figures are pack-scored.
+**K6. RESOLVED — 10.0% vs 11% is a decoder difference, not a pack error.** The
+frozen pack extracts frames with imageio, the deployed Table 14 with cv2; that
+moves ~2 borderline rollouts on the same node (Default: pack 24 = 10.0%, live
+26 = 11%). The *delta* from removing same-family peers is decoder-robust, so
+**quote the live base with the pack delta** — these match Table 14 and are the
+numbers used in §K5:
+
+| variant | live base | live debiased (externals+real) |
+|---|---|---|
+| Default | 11% | 21% |
+| Batch64 | 9% | 18% |
+| pca4 | 13% | 28% |
+| pca2 | 15% | 25% |
+| Batch16 | 26% | 42% |
+| No Action Tokens | 14% | 31% |
+| No AdaLN | 28% | 31% |
+
+"Roughly doubles" is unchanged. Panel (b) provenance: fixed representative
+(pca8; pca4 when scoring pca8), leave-self-out, not resampled — (c) is the
+clean column and the one §K5 quotes.
+
+**K7. Peer-reference audit — exactly 2 of 7 instruments are panel-dependent.**
+Verified in code by the local agent. Panel-dependent: **HF** (sibling median)
+and **relocation** (peer consensus). Panel-*independent*: **style** (DINOv2
+drift vs the rollout's own context frames), **geometry** (Qwen3-VL vs the
+shared real seed `real_rXX`, not sibling outputs), **conjuration** (purely
+temporal within the single rollout), **static** (ORB vs the rollout's own
+first-generated frame). This materially narrows the §H5/§K limitation and
+should be stated explicitly — see §K8.
+
+**K8. Sentence for the limitation paragraph.**
+
+> Five of our seven quality instruments are panel-independent: style, geometry,
+> conjuration and static are computed against each rollout's own context, its
+> real seed, or its own earlier frames, and are unchanged by which other models
+> are evaluated. Only high-frequency degradation and relocation are
+> peer-referenced, and only those two carry the panel-dependence discussed
+> above.
+
+**K9. Calibration versioning shipped.** `HF-Cal-v1` stamped as a `cal_version`
+column on both HF reference CSVs; `Reloc-Cal-v1.json` written beside the
+descriptor pack (md5 `a1e6a3e5...` plus the full ORB/RANSAC spec: ORB
+nfeatures=3000; frames to 640x352 grayscale; BF NORM_HAMMING crossCheck=True;
+`cv2.findHomography(..., RANSAC, ransacReprojThreshold=5.0)`; score = inlier
+mask sum; consensus = max over panel members; relocated iff < 50).

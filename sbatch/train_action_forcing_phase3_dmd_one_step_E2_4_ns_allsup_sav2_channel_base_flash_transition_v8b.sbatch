@@ -13,7 +13,7 @@
 # =====================================================================
 # Phase-3 DMD one-step — single frozen teacher, no aux pass.
 #
-# v8b = v8a (v6e + R2) + DMD convergence-awareness:
+# v8b = v8a (v6e) + DMD convergence-awareness:
 #   * dmd_normalization_enabled=false — use the RAW (pred_fake -
 #     pred_real) gradient so the DMD signal decays naturally as the
 #     teacher agrees with the student (the normalized form AMPLIFIES
@@ -25,7 +25,8 @@
 #     teacher). r_full=2.0, ema=0.9, min_weight=0.0. Also logs
 #     gen/student_mae_vs_gt so the per-chunk crossover is finally
 #     visible on the same basis as gen/real_score_mae_vs_gt.
-#   * Carries v8a's R2 (every-2 / offset-1) and everything else from v6e.
+#   * Carries everything else from v6e. (R2 was removed from the
+#     codebase 2026-08-23; the GAN is R1-only.)
 #
 # 21-frame window, 200-step max. GAN ON (ladd_teacher_feat).
 # =====================================================================
@@ -68,7 +69,6 @@ echo "Starting Phase-3 DMD ONE-STEP (v8b = v8a + dmd-norm-off + MAE gate) on $(d
 echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed)."
 echo "  * 1 roll per ride (fresh seed each step)."
 echo "  * GAN: ON (ladd_teacher_feat, content-matched gt_transition)."
-echo "  * R2: ON, gamma=0.02, every-2 / offset-1 (R1 even, R2 odd)."
 echo "  * dmd_normalization_enabled=false (raw decaying DMD gradient)."
 echo "  * MAE gate: ON (r_full=2.0, ema=0.9, min_weight=0.0)."
 echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
@@ -161,9 +161,6 @@ srun torchrun \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.02 \
     ladd_r1_every_n_steps=2 \
-    ladd_r2_gamma=0.02 \
-    ladd_r2_every_n_steps=2 \
-    ladd_r2_phase_offset=1 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=7 \
     ladd_wavelet_hf_enabled=true \

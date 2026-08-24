@@ -1,4 +1,4 @@
-"""R3GAN — RpGAN + R1 + R2 discriminator and losses for latent video.
+"""R3GAN — RpGAN + R1 discriminator and losses for latent video.
 
 This module wires the **R3GAN** ("Re-GAN") training recipe from
 *Huang et al., "The GAN is dead; long live the GAN! A Modern Baseline
@@ -15,8 +15,8 @@ fitness, and the ``adding_cls_branch`` is brittle to checkpoint /
 RoPE-cache changes.
 
 R3GAN is a clean alternative: a *separate* discriminator with a
-**provably locally convergent** loss (RpGAN + zero-centered R1 + R2
-gradient penalties; Section 2 of the paper). The loss is
+**provably locally convergent** loss (RpGAN + a zero-centered R1
+gradient penalty; Section 2 of the paper). The loss is
 architecture-agnostic — convergence guarantees come from the loss
 formulation, not the backbone — so we keep a small modernized 3D
 ConvNet that operates directly on the student's latent video output.
@@ -44,24 +44,22 @@ Let ``f(x) = softplus(x) = log(1 + e^x)``. With ``D := D_ψ`` and
 D loss (minimize over ψ):
     L_D = E[ f( D(x_fake) - D(x_real) ) ]
         + (γ/2) * E_{x_real}[ ||∇_{x_real} D(x_real)||² ]   <-- R1
-        + (γ/2) * E_{x_fake}[ ||∇_{x_fake} D(x_fake)||² ]   <-- R2
 
 G loss (minimize over θ):
     L_G = E[ f( D(x_real) - D(x_fake) ) ]
 
 Notes
 -----
-* R1 + R2 are computed with ``torch.autograd.grad(... create_graph=
+* R1 is computed with ``torch.autograd.grad(... create_graph=
   True)`` so the second-order term flows into D's update. The fake
-  gradient penalty (R2) is computed on the **detached** fake
-  (``pred_image.detach()``) so no gradient flows back to G during
-  the D-update.
+  is **detached** (``pred_image.detach()``) in the D-update so no
+  gradient flows back to G.
 * The G-loss path uses the **same** discriminator with frozen
   parameters (``requires_grad_(False)``). DDP doesn't fire on D
   during the G-update; D's gradients are all-reduced in its own
   D-update backward pass.
 * R3GAN's recommended γ depends on dataset; for our 16-channel
-  latent video we default to ``gan_r1_gamma=1.0, gan_r2_gamma=1.0``
+  latent video we default to ``gan_r1_gamma=1.0``
   (the paper uses γ in [0.01, 100]; 1.0 is the median of their
   ablations). Tune via YAML.
 
@@ -321,36 +319,3 @@ def r1_penalty(
     )[0]
     penalty = 0.5 * gamma * grads.flatten(1).pow(2).sum(dim=1).mean()
     return penalty, d_real
-
-
-def r2_penalty(
-    discriminator: nn.Module,
-    fake_input: torch.Tensor,
-    *,
-    gamma: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Zero-centered gradient penalty on **fake** samples (R2).
-
-    R2(θ, ψ) = (γ/2) * E_{x~pθ}[ ||∇_x D_ψ(x)||² ]
-
-    Same contract as ``r1_penalty``: ``fake_input`` must have
-    ``requires_grad=True``. The fake samples should be **detached**
-    from the generator before being re-flagged for grad, so this
-    penalty does NOT push gradients back into the generator (we
-    only want it to constrain D's gradient norm on the fake
-    distribution).
-    """
-    if not fake_input.requires_grad:
-        raise RuntimeError(
-            "r2_penalty: fake_input must have requires_grad=True so "
-            "the gradient ∇_x D(x) is well-defined."
-        )
-    d_fake = discriminator(fake_input)
-    grads = torch.autograd.grad(
-        outputs=d_fake.sum(),
-        inputs=fake_input,
-        create_graph=True,
-        retain_graph=True,
-    )[0]
-    penalty = 0.5 * gamma * grads.flatten(1).pow(2).sum(dim=1).mean()
-    return penalty, d_fake

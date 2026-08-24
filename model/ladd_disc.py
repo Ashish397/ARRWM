@@ -84,7 +84,19 @@ class WanFeatureProjector:
         real_score: the WAN teacher wrapper (e.g.
             ``WanDiffusionWrapper``). The underlying ``WanModel`` is
             accessed via ``.model`` (or unwrapped if DDP-wrapped).
+            Ignored entirely when ``backbone`` is given.
         block_indices: list of ``transformer_blocks`` indices to hook.
+        backbone: optional RAW ``WanModel`` to tap INSTEAD of
+            ``real_score`` (WP-14B: the frozen Wan2.1-T2V-14B prefix
+            built by ``model/wan14b_prefix.py``). Passing the raw model
+            deliberately bypasses ``WanDiffusionWrapper``: the wrapper
+            consumes the model output (``utils/wan_wrapper.py:749-753``
+            unpacks ``flow_pred`` -> x0), which a truncated prefix
+            cannot produce, and it forces its own padded
+            ``self.seq_len`` token budget (18721) that would quadruple
+            the cost of a 3-frame disc chunk at dim=5120. In this mode
+            the projector calls the model directly with ``seq_len`` set
+            to the chunk's ACTUAL token count.
         latent_input_carries_grad: if True, asserts the input has
             ``requires_grad=True`` on disc forward (gen-side path).
             Even when teacher params are frozen, the captured features
@@ -98,8 +110,43 @@ class WanFeatureProjector:
         self,
         real_score: nn.Module,
         block_indices: List[int],
+        backbone: Optional[nn.Module] = None,
     ):
         self.real_score = real_score
+        # WP-14B: raw-WanModel backbone mode. ``None`` => legacy
+        # ``real_score``-wrapper mode (byte-identical to before).
+        self.backbone = backbone
+        self._raw_cond_extra_warned = False
+        # Does the raw backbone support the feature-tap early exit
+        # (``wan/modules/model.py`` ``max_block``)? Without it the
+        # forward would run ``head``, which cannot consume the per-frame
+        # timestep embedding the blocks use.
+        self._backbone_supports_max_block = False
+        if backbone is not None:
+            import inspect
+            _fwd = getattr(backbone, "_forward", None) or backbone.forward
+            try:
+                self._backbone_supports_max_block = (
+                    "max_block" in inspect.signature(_fwd).parameters
+                )
+            except (TypeError, ValueError):
+                self._backbone_supports_max_block = False
+            if not self._backbone_supports_max_block:
+                # Raised HERE, at construction, rather than at the first
+                # disc forward: by then ~7 GB/rank is resident, training
+                # has started, and the error surfaces from inside a
+                # checkpointed recompute closure buried in torch's replay
+                # machinery. The condition is fully known now.
+                raise RuntimeError(
+                    "WanFeatureProjector: backbone "
+                    f"{type(backbone).__name__} does not accept a "
+                    "``max_block`` argument, so the feature-tap early exit "
+                    "cannot be plumbed. Every block above the deepest tap "
+                    "would run, plus the head — dead compute that does NOT "
+                    "reliably crash (``Head.forward`` broadcasts, so B=1 "
+                    "completes silently and only B>1 raises). Pass a raw "
+                    "``wan.modules.model.WanModel`` (model/wan14b_prefix.py)."
+                )
         self.block_indices = sorted(set(int(i) for i in block_indices))
         # NOTE: no persistent forward hooks are installed. Every call
         # to ``real_score`` from elsewhere in the trainer (DMD scoring,
@@ -120,7 +167,21 @@ class WanFeatureProjector:
         the first ModuleList named ``transformer_blocks`` or ``blocks``
         with at least 10 entries (WAN 1.3B has 30; the threshold guards
         against picking up some other small ModuleList by accident).
+
+        In raw-backbone mode the blocks are simply ``backbone.blocks``
+        — the >=10 threshold must NOT apply there, since a tap-truncated
+        14B prefix has as few as ``max(taps) + 1`` blocks.
         """
+        if self.backbone is not None:
+            for attr in ("blocks", "transformer_blocks"):
+                b = getattr(self.backbone, attr, None)
+                if isinstance(b, nn.ModuleList) and len(b) > 0:
+                    return b
+            raise AttributeError(
+                "WanFeatureProjector: ``backbone`` has no non-empty "
+                "``blocks``/``transformer_blocks`` ModuleList "
+                f"(type={type(self.backbone).__name__})."
+            )
         for candidate in [self.real_score] + list(
             self.real_score.modules()
         ):
@@ -134,6 +195,64 @@ class WanFeatureProjector:
             "Expected attribute ``transformer_blocks`` or ``blocks`` on "
             "some submodule with >=10 entries."
         )
+
+    def _raw_backbone_seq_len(self, x_noisy: torch.Tensor) -> int:
+        """Token count of ``x_noisy`` under the raw backbone's patchifier.
+
+        This is the ACTUAL disc-chunk token count
+        ``T' * H' * W' = (F/pt) * (H/ph) * (W/pw)`` — never the
+        wrapper's padded budget. ``WanModel._forward`` pads the patch
+        sequence up to ``seq_len`` (``wan/modules/model.py:735-741``)
+        and every block then runs at that length, so handing it the
+        wrapper's 18721 would burn ~4x the attention/FFN cost of a
+        3-frame chunk at dim=5120 on pure zero padding.
+
+        No action tokens are involved: the raw T2V backbone has no
+        action-token plumbing, which is exactly why the disc must be
+        built with ``action_tokens_per_frame=0`` in this mode.
+        """
+        bk = self.backbone
+        _ps_attr = getattr(bk, "patch_size", None)
+        if _ps_attr is None:
+            # Defaulting to Wan's (1, 2, 2) would silently produce a token
+            # count for a patchifier the backbone may not have — the same
+            # vacuous-check trap already closed for ``in_dim`` below.
+            raise AttributeError(
+                "WanFeatureProjector(raw backbone): backbone "
+                f"{type(bk).__name__} has no ``patch_size``; refusing to "
+                "guess the tokenisation."
+            )
+        ps = tuple(int(p) for p in _ps_attr)
+        if x_noisy.dim() != 5:
+            raise ValueError(
+                "WanFeatureProjector(raw backbone): expected x_noisy "
+                f"[B, F, C, H, W]; got shape {tuple(x_noisy.shape)}."
+            )
+        _B, F_in, C_in, H_in, W_in = x_noisy.shape
+        in_dim = getattr(bk, "in_dim", None)
+        if in_dim is None:
+            raise AttributeError(
+                "WanFeatureProjector(raw backbone): backbone has no "
+                "``in_dim``; cannot validate the latent channel count. "
+                "(Defaulting it to the input's own C would make this "
+                "check vacuous.)"
+            )
+        in_dim = int(in_dim)
+        if C_in != in_dim:
+            raise ValueError(
+                "WanFeatureProjector(raw backbone): latent channel count "
+                f"{C_in} != backbone in_dim {in_dim}."
+            )
+        for name, size, patch in (
+            ("F", F_in, ps[0]), ("H", H_in, ps[1]), ("W", W_in, ps[2]),
+        ):
+            if size % patch != 0:
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): input "
+                    f"{name}={size} is not divisible by patch {patch} "
+                    f"(patch_size={ps})."
+                )
+        return (F_in // ps[0]) * (H_in // ps[1]) * (W_in // ps[2])
 
     def _validate_block_indices(self) -> None:
         blocks = self._find_blocks()
@@ -176,7 +295,10 @@ class WanFeatureProjector:
         # the teacher's parameter dtype and cast all float tensors
         # going into the teacher to match. Hook outputs come back in
         # bf16, and CCM's first Linear casts them to fp32 again.
-        teacher_dtype = next(self.real_score.parameters()).dtype
+        teacher_module = (
+            self.backbone if self.backbone is not None else self.real_score
+        )
+        teacher_dtype = next(teacher_module.parameters()).dtype
 
         def _cast_if_float(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if t is None or not torch.is_floating_point(t):
@@ -211,6 +333,74 @@ class WanFeatureProjector:
         if seq_len is not None:
             kwargs["seq_len"] = seq_len
 
+        # ---- raw-WanModel backbone (WP-14B) argument prep ----------
+        raw_ctx = None
+        raw_t = None
+        raw_seq_len = None
+        if self.backbone is not None:
+            if clean_x is not None or aug_t is not None:
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): ``clean_x`` / "
+                    "``aug_t`` are teacher-forcing arguments of "
+                    "``WanDiffusionWrapper`` and have no equivalent on a "
+                    "raw WanModel. Silently dropping them would change "
+                    "the disc's conditioning, so this is fail-loud."
+                )
+            raw_seq_len = self._raw_backbone_seq_len(x_noisy_cast)
+            if seq_len is not None and int(seq_len) != raw_seq_len:
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): caller passed "
+                    f"seq_len={int(seq_len)} but the chunk's actual token "
+                    f"count is {raw_seq_len}. The raw backbone must run at "
+                    "the actual token count (see ``_raw_backbone_seq_len``)."
+                )
+            if conditional_extra and not self._raw_cond_extra_warned:
+                # Stock T2V has no action-token plumbing. This is the
+                # documented distribution shift of the 14B arm, not a
+                # silent bug — say it once, loudly, then proceed.
+                logging.warning(
+                    "[LADD/14B] raw backbone ignores conditional_extra "
+                    "keys %s (no action-token support in stock Wan T2V). "
+                    "The disc MUST be built with "
+                    "action_tokens_per_frame=0 in this mode.",
+                    sorted(conditional_extra.keys()),
+                )
+                self._raw_cond_extra_warned = True
+            raw_ctx = cond_dict["prompt_embeds"]
+            if raw_ctx is None or raw_ctx.dim() != 3:
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): prompt_embeds must "
+                    f"be [B, L, text_dim]; got "
+                    f"{None if raw_ctx is None else tuple(raw_ctx.shape)}."
+                )
+            _text_len = int(getattr(self.backbone, "text_len", 512))
+            if raw_ctx.shape[1] > _text_len:
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): prompt length "
+                    f"{raw_ctx.shape[1]} exceeds the backbone's text_len "
+                    f"{_text_len}."
+                )
+            _text_dim = int(getattr(self.backbone, "text_dim", 4096))
+            if raw_ctx.shape[2] != _text_dim:
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): prompt embed dim "
+                    f"{raw_ctx.shape[2]} != backbone text_dim {_text_dim}."
+                )
+            # Per-frame timesteps: WanModel derives the modulation frame
+            # count from ``t.shape`` (e0 is unflattened to [B, T', 6, dim]
+            # at ``wan/modules/model.py:742-744``), so t must be [B, T'].
+            _pt = int(tuple(getattr(self.backbone, "patch_size", (1, 2, 2)))[0])
+            _T_prime = x_noisy_cast.shape[1] // _pt
+            raw_t = timestep
+            if raw_t.dim() == 1:
+                raw_t = raw_t[:, None].expand(-1, _T_prime)
+            if tuple(raw_t.shape) != (x_noisy_cast.shape[0], _T_prime):
+                raise ValueError(
+                    "WanFeatureProjector(raw backbone): timestep shape "
+                    f"{tuple(raw_t.shape)} != expected "
+                    f"({x_noisy_cast.shape[0]}, {_T_prime})."
+                )
+
         # Outer-level gradient checkpointing on the projector's teacher
         # forward (v28A OOM mitigation 4). Wraps the entire teacher call
         # in ``torch.utils.checkpoint.checkpoint(use_reentrant=False)``
@@ -225,7 +415,6 @@ class WanFeatureProjector:
         # False`` keeps autograd's connection through replay.
         block_indices_sorted = sorted(self.block_indices)
         local_feats: Dict[int, torch.Tensor] = {}
-        hook_handles = []
         blocks = self._find_blocks()
 
         def _make_local_hook(block_idx: int):
@@ -234,15 +423,47 @@ class WanFeatureProjector:
                 local_feats[block_idx] = feat
             return _local_hook
 
-        for idx in block_indices_sorted:
-            hook_handles.append(
-                blocks[idx].register_forward_hook(_make_local_hook(idx))
-            )
-
         def _run_teacher(x):
-            kwargs_local = dict(kwargs)
-            kwargs_local["noisy_image_or_video"] = x
-            _ = self.real_score(**kwargs_local)
+            # Hooks are installed INSIDE the checkpointed function, not
+            # around it. ``checkpoint(use_reentrant=False)`` re-executes
+            # this body during BACKWARD; with the hooks installed
+            # outside and removed in an outer ``finally``, the replay
+            # would find ``local_feats`` empty and raise KeyError on the
+            # return line. Today it survives only because autograd stops
+            # the replay early (``_StopRecomputationError``) a few ops
+            # before that line — and the ``max_block`` early exit
+            # shortens the region, moving the stop point closer to it.
+            # Installing per-call makes the replay correct on its own
+            # terms instead of relying on where the stop lands.
+            hs = [
+                blocks[i].register_forward_hook(_make_local_hook(i))
+                for i in block_indices_sorted
+            ]
+            try:
+                return _teacher_body(x)
+            finally:
+                for h in hs:
+                    h.remove()
+
+        def _teacher_body(x):
+            if self.backbone is not None:
+                # Raw WanModel: [B, F, C, H, W] -> [B, C, F, H, W], the
+                # layout ``WanDiffusionWrapper`` also permutes into
+                # (utils/wan_wrapper.py:703). The return value is
+                # DISCARDED — only the hooked block outputs matter, which
+                # is why a truncated prefix (random/zeroed head) is fine.
+                raw_kwargs = {"max_block": max(block_indices_sorted)}
+                _ = self.backbone(
+                    x.permute(0, 2, 1, 3, 4),
+                    t=raw_t,
+                    context=raw_ctx,
+                    seq_len=raw_seq_len,
+                    **raw_kwargs,
+                )
+            else:
+                kwargs_local = dict(kwargs)
+                kwargs_local["noisy_image_or_video"] = x
+                _ = self.real_score(**kwargs_local)
             return tuple(local_feats[i] for i in block_indices_sorted)
 
         try:
@@ -255,8 +476,6 @@ class WanFeatureProjector:
             else:
                 feat_tuple = _run_teacher(x_noisy_cast)
         finally:
-            for h in hook_handles:
-                h.remove()
             local_feats.clear()
         return {
             idx: feat_tuple[i] for i, idx in enumerate(block_indices_sorted)
@@ -303,7 +522,7 @@ class LADDChannelMixer(nn.Module):
         for idx in self.block_indices:
             feat = features[idx]
             # feat may arrive as bf16 from the WAN forward; project to
-            # fp32 for downstream R1/R2 stability.
+            # fp32 for downstream R1 stability.
             out[idx] = self.proj[str(idx)](feat.float())
         return out
 
@@ -910,7 +1129,7 @@ class LADDDiscriminator(nn.Module):
         visual_logits = torch.cat(logits_per_scale, dim=1)
         if self.scalar_output:
             # One invariant critic value per sample. This reduction is part of
-            # D itself, so D/G losses and R1/R2 all differentiate the exact
+            # D itself, so D/G losses and R1 all differentiate the exact
             # same scalar instead of summing a resolution-dependent token map.
             visual_logits = visual_logits.mean(dim=1, keepdim=True)
 
@@ -1130,6 +1349,7 @@ def build_ladd_disc(
     stat_head_hidden_dim: int = 256,
     scalar_output: bool = False,
     freeze_projector_mixing: bool = False,
+    backbone: Optional[nn.Module] = None,
 ) -> LADDDiscriminator:
     """Build a LADD discriminator wired to the existing teacher.
 
@@ -1140,10 +1360,75 @@ def build_ladd_disc(
     ``patch_size`` + ``action_tokens_per_frame`` describe how the WAN
     teacher tokenises its input — needed so the heads can fold the
     captured token sequence back to a 2D (H'×W') patch grid per frame.
+
+    ``backbone`` (WP-14B) swaps the tapped network for a raw
+    ``WanModel`` — e.g. the frozen Wan2.1-T2V-14B prefix from
+    ``model/wan14b_prefix.py`` — leaving ``real_score`` untouched. When
+    it is given, the caller MUST pass that backbone's own
+    ``dim_teacher`` / ``patch_size`` and ``action_tokens_per_frame=0``.
     """
+    if backbone is not None:
+        _blocks_attr = getattr(backbone, "blocks", None)
+        _n_layers = len(_blocks_attr) if _blocks_attr is not None else 0
+        if _n_layers == 0:
+            raise ValueError(
+                "build_ladd_disc: backbone has no non-empty ``blocks`` "
+                f"ModuleList (type={type(backbone).__name__}). Pass a RAW "
+                "WanModel — a DDP/compiled/wrapper object is not supported "
+                "here, and would otherwise be reported as '0 blocks loaded'."
+            )
+        _tap_list = [int(i) for i in block_indices]
+        if not _tap_list:
+            raise ValueError(
+                "build_ladd_disc: block_indices is empty. The backbone path "
+                "requires EXPLICIT shallow taps (e.g. [0, 2, 4, 8])."
+            )
+        _max_tap = max(_tap_list)
+        # Hard assert (GAN_REDESIGN B2 step (d)).
+        if _max_tap >= _n_layers:
+            raise ValueError(
+                f"build_ladd_disc: deepest tap {_max_tap} >= "
+                f"{_n_layers} blocks loaded in the backbone prefix. "
+                "``ladd_feature_blocks`` must satisfy "
+                "max(taps) < num_layers_loaded."
+            )
+        if int(action_tokens_per_frame) != 0:
+            raise ValueError(
+                "build_ladd_disc: a raw backbone has no action tokens; "
+                f"got action_tokens_per_frame={action_tokens_per_frame}. "
+                "Pass 0 — harvesting the value from real_score silently "
+                "mis-slices the token reshape."
+            )
+        _bk_dim = int(getattr(backbone, "dim", dim_teacher))
+        if int(dim_teacher) != _bk_dim:
+            raise ValueError(
+                f"build_ladd_disc: dim_teacher={dim_teacher} does not match "
+                f"the backbone's hidden dim {_bk_dim}."
+            )
+        # patch_size must match too. A COARSER disc patch than the
+        # backbone's is silent: the backbone emits more tokens than the
+        # heads expect, the disc slices the first ``real_tokens`` and
+        # reshapes them into a wrong grid, and the run continues on a
+        # bogus spatial layout. (The opposite direction raises.)
+        _bk_ps = getattr(backbone, "patch_size", None)
+        if _bk_ps is None:
+            raise ValueError(
+                "build_ladd_disc: backbone "
+                f"{type(backbone).__name__} exposes no ``patch_size``, so "
+                "the token->patch-grid reshape cannot be validated. Pass a "
+                "raw WanModel."
+            )
+        _bk_ps = tuple(int(p) for p in _bk_ps)
+        if tuple(int(p) for p in patch_size) != _bk_ps:
+            raise ValueError(
+                f"build_ladd_disc: patch_size={tuple(patch_size)} does "
+                f"not match the backbone's {_bk_ps}. A mismatch here "
+                "mis-slices the token->patch-grid reshape silently."
+            )
     projector = WanFeatureProjector(
         real_score=real_score,
         block_indices=block_indices,
+        backbone=backbone,
     )
     disc = LADDDiscriminator(
         projector=projector,

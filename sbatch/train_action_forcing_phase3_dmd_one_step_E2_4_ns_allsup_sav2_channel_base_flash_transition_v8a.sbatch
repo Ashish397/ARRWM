@@ -13,13 +13,12 @@
 # =====================================================================
 # Phase-3 DMD one-step — single frozen teacher, no aux pass.
 #
-# v8a = v6e (content-matched gt_transition GAN, match_k=4) + R2.
-#   * Adds the R3GAN fake-side gradient penalty (R2) alongside R1.
-#   * R1 and R2 each run on an every-2 cadence, offset by 1 so their
-#     perturbed-input disc forwards land on DISJOINT steps (R1 on even,
-#     R2 on odd) — no OOM stacking. NOTE: this halves R1's firing rate
-#     vs v6e (which ran R1 every step); that's the cost of the offset.
-#   * ladd_r2_gamma=0.02 (matched to R1's gamma as a starting point).
+# v8a = v6e (content-matched gt_transition GAN, match_k=4).
+#   * HISTORICAL: this arm originally added the R3GAN fake-side
+#     gradient penalty (R2) on an every-2 / offset-1 cadence. R2 was
+#     REMOVED from the codebase (2026-08-23, R1-only GAN), so those
+#     overrides are gone. R1 still runs on its every-2 cadence, which
+#     halves its firing rate vs v6e (which ran R1 every step).
 #   * Everything else matches v6e.
 #
 # 21-frame window, 200-step max. GAN ON (ladd_teacher_feat).
@@ -59,12 +58,11 @@ export ARRWM_ROPE_DEBUG=1
 
 echo "CONFIG=$CONFIG"
 echo "LOGDIR=$LOGDIR"
-echo "Starting Phase-3 DMD ONE-STEP (v8a = v6e + R2) on $(date)"
+echo "Starting Phase-3 DMD ONE-STEP (v8a = v6e, R1-only GAN) on $(date)"
 echo "  * Supervise the FIRST rolled chunk only; cf=18 (6-chunk seed),"
 echo "    teacher clean context = GT[0:21] (7 chunks); rope_offset=21."
 echo "  * 1 roll per ride (fresh seed each step)."
 echo "  * GAN: ON (ladd_teacher_feat, content-matched gt_transition)."
-echo "  * R2: ON, gamma=0.02, every-2 / offset-1 (R1 even, R2 odd)."
 echo "  * Teacher: single frozen merged-v14 (no online, no aux pass)."
 echo "  * wandb_project=longlive-phase-3."
 
@@ -151,9 +149,6 @@ srun torchrun \
     ladd_disc_loss_weight=1.0 \
     ladd_r1_gamma=0.02 \
     ladd_r1_every_n_steps=2 \
-    ladd_r2_gamma=0.02 \
-    ladd_r2_every_n_steps=2 \
-    ladd_r2_phase_offset=1 \
     ladd_diff_aug_policy=flip,cutout,translation \
     ladd_pairs_per_step=7 \
     ladd_wavelet_hf_enabled=true \

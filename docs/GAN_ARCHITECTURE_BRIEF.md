@@ -185,10 +185,24 @@ Consequences to weigh:
 
 ## 6. Conditioning
 
-- **Action conditioning.** `ladd_gt_transition_action_blind=true` in the wavelet
-  and raw arms — the critic sees **no action**, so a transition that is
-  photographically plausible but inconsistent with the commanded motion is
-  accepted. `false` in the `strict03` arm.
+- **Action conditioning. CORRECTION 2026-08-23 — this knob has NEVER had any
+  effect. Every GAN arm ever run was ACTION-CONDITIONED.**
+  `ladd_gt_transition_action_blind` is read only as
+  `getattr(self.model, "ladd_gt_transition_action_blind", False)`
+  (`trainer/causal_action_forcing_train.py`, 2 sites), but
+  `ActionForcingDMD.__init__` **never parses it from `args`** — unlike every
+  sibling knob (e.g. `ladd_gt_transition_match` at
+  `model/dmd_action_forcing.py:2022`). There is no `__getattr__` passthrough and
+  no `setattr` loop, so the attribute does not exist and the `getattr` default
+  `False` is returned on every call.
+  Consequence: the wavelet/raw arms set `...action_blind=true` in their DEXTRA
+  and ran **action-conditioned anyway**. The "action-blind vs strict" contrast
+  reported for `wave01` / `horizon_wave90` vs `strict03` **was never realised** —
+  those arms differed in the wavelet stage, weight, D-steps and disc timestep,
+  but NOT in action conditioning. Any conclusion resting on that contrast is
+  void. (Root cause is generic: the trainer parses `--override` with
+  `OmegaConf.from_dotlist` + `merge`, which silently accepts unknown keys — no
+  allowlist, no typo check.)
 - **Prompt conditioning.** `ladd_use_prompt_cond=false`, `ladd_cmap_dim=0` in all
   current arms, so the StyleGAN-T-style projection-discriminator inner product is
   disabled and the head's `cls` conv emits a plain 1-channel logit
@@ -218,12 +232,34 @@ style), `γ_R1 = γ_R2 = 1.0`, `ladd_r1_num_samples=6`,
 fires on an **exact modulo** cadence `(step - offset) % every_n == 0` with
 `every_n=2, offset=1`, intended to be disjoint from R1 as an OOM guard.
 
-> **Known defect.** `r3gan_r2_fired` reads **0 on every logged row of every run
-> we have**. wandb samples every ~10 steps; that cadence aliases with both the R2
-> parity cadence and the generator-update cadence (`dfake_gen_update_ratio=5`),
-> so the gauge can read 0 whether or not R2 fires. Monotone counters have now
-> been added but have not yet reported. **Treat "we ran R1+R2" as unproven — it
-> may have been R1-only throughout.**
+> **RESOLVED 2026-08-23 — R2 does fire; the gauge was a sampling alias.**
+> `r3gan_r2_fired` read **0 on every logged row of every historical run**, because
+> wandb samples every ~10 steps and that cadence aliases with both the R2 parity
+> cadence and the generator-update cadence (`dfake_gen_update_ratio=5`). Monotone
+> counters added 2026-08-23 now report `r3gan_r2_fired_total = 85` over `175`
+> disc updates — a **48.6 %** fire rate. **"We ran R1+R2" is TRUE.**
+>
+> **However the counters expose an unintended IMBALANCE.** In the `gt_transition`
+> arms **R1 fires at 0.20 while R2 fires at 0.49** — the fake-side penalty applied
+> **2.4x more often** than the real-side one, because `ladd_r1_once_per_step=true`
+> caps R1 at the first of `gan_updates_per_step=5` updates while R2 has no cap.
+> A `gt_vs_fake` arm is balanced (0.53/0.47), so this is specific to that flag
+> combination. **R3GAN's stability argument assumes balanced R1+R2**, so the
+> effective regularisation in every 5-D-step arm was asymmetric in a way nobody
+> intended.
+
+> **DEFECT 2026-08-23 — diff-aug asymmetry in the matched path.** The D-update
+> augments the REAL side only (`latent_diff_augment(_rn, _rn, policy=flip)`) and
+> passes the fake through un-augmented; the G-side augments both but with
+> DIFFERENT seeds. Affects every `ladd_gt_transition_match=true` arm.
+> **Adversarially reviewed — the consequence that matters is NOT mirror parity**
+> (which is faint after scalar mean-pooling and largely self-cancels, since the
+> G-side fake IS flipped 50% of the time). It is: **(1)** the real latent is
+> mirrored while its ACTION TOKENS are not, so ~50% of reals are
+> action-image-inconsistent while 100% of fakes are consistent — the critic can
+> learn "image contradicts the steering => real", which is directly adversarial
+> to an action-conditioned critic; and **(2)** D is trained on never-flipped
+> fakes but queried on 50%-flipped fakes on the G side. See `ROLLING_CAMPAIGN.md`.
 
 **Optimiser / schedule.** `gan_lr` 5e-6 (wavelet/raw arms) or 1e-5 (strict),
 betas `[0.0, 0.9]`, `gan_max_grad_norm=10`, `gan_disc_start_step=20`,
@@ -258,9 +294,9 @@ denoising steps, 3 real seed chunks, 100 generated chunks, inference-CARN λ0.5)
 | arm | GAN | weight | D-steps | disc t | action | outcome |
 |---|---|---|---|---|---|---|
 | `fullcarn_bidir_kl_nogan200` | off | — | — | — | — | melts ≈8 s |
-| `fullcarn_bidir_kl_wave01` | wavelet | 0.01 | 1 | 0 | blind | holds ≈12 s, then melts |
+| `fullcarn_bidir_kl_wave01` | wavelet | 0.01 | 1 | 0 | ~~blind~~ **cond.** | holds ≈12 s, then melts |
 | `horizon_nogan90` | off | — | — | — | — | melts ≈12–16 s |
-| `horizon_wave90` | wavelet | 0.01 | 1 | 0 | blind | holds ≈16 s, then **scanline banding / total texture death** |
+| `horizon_wave90` | wavelet | 0.01 | 1 | 0 | ~~blind~~ **cond.** | holds ≈16 s, then **scanline banding / total texture death** |
 | `fullcarn_bidir_kl_strict03` | raw | 0.03 | 5 | sampled | conditioned | eval pending |
 
 **Critic health (from W&B history, not summaries):**

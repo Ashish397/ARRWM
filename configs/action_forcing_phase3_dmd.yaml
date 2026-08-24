@@ -45,7 +45,7 @@ holdout_zarr_list: configs/holdout_rides.txt
 local_attn_size_schedule: [[0, 21]]
 
 # ---------------------------------------------------------------------------
-# R3GAN — RpGAN + R1 + R2 discriminator on GT vs student latent video.
+# R3GAN — RpGAN + R1 discriminator on GT vs student latent video.
 # Inert unless gan_enabled=true at run time.
 # ---------------------------------------------------------------------------
 gan_enabled: true
@@ -54,7 +54,6 @@ gan_disc_base_channels: 64
 gan_disc_num_blocks: 4
 gan_loss_weight: 0.05         # G-side RpGAN weight (~5% of DMD magnitude)
 gan_r1_gamma: 1.0             # zero-centered grad penalty on real samples
-gan_r2_gamma: 1.0             # zero-centered grad penalty on fake samples
 gan_warmup_steps: 500         # linear ramp 0 → gan_loss_weight on G side
 gan_updates_per_step: 1       # 1:1 D:G ratio
 gan_lr: 2.0e-04
@@ -81,20 +80,6 @@ ladd_cmap_dim: 64                    # inner-product cmap dim (StyleGAN-T)
 ladd_disc_loss_weight: 1.0           # additional G-side multiplier on top of gan_loss_weight ramp
 ladd_r1_gamma: 1.0                   # R1 on chunk_i (real-anchor)
 ladd_r1_every_n_steps: 1             # lazy R1: compute every N disc updates (1=every step)
-# R2 — zero-centered gradient penalty on the FAKE side (R3GAN pairs R1+R2).
-# OFF by default (ladd_r2_gamma=0.0). When enabled, R2 fires on an OFFSET
-# cadence from R1 so the two perturbed-input disc forwards never stack in a
-# single D-update (OOM guard). IMPORTANT: the offset only separates R1 and
-# R2 when BOTH cadences are >= 2 — if either every_n is 1 (fires every step)
-# they co-fire and both perturbed forwards land together. Intended usage:
-#   ladd_r1_every_n_steps=2  ladd_r2_every_n_steps=2  ladd_r2_phase_offset=1
-#   -> R1 on even steps, R2 on odd steps.
-# The trainer logs a loud WARNING at startup if the configured cadences
-# actually collide. every_n / sigma fall back to R1's when unset.
-ladd_r2_gamma: 0.0                   # 0 = OFF; set >0 to enable fake-side R2
-ladd_r2_every_n_steps: 2            # lazy R2 cadence; keep >=2 for the offset guard
-ladd_r2_phase_offset: 1             # step offset between R1 and R2 firing
-# ladd_r2_sigma:                    # FD perturbation sigma (defaults to R1's)
 ladd_diff_aug_policy: "flip,cutout,translation"  # latent-space DiffAugment
 ladd_pair_start_seed_boundary: true  # include (last_seed, first_AR) pair
 ladd_pairs_per_step: 0               # 0 = all pairs; >0 = random subset
@@ -169,3 +154,411 @@ dmd_frozen_teacher_pass_enabled: false
 # Re-enable as a quality-tuning task once the VAE call wraps the
 # input/output in proper fp32↔bf16 casts.
 boundary_vae_roundtrip: false
+
+# ---------------------------------------------------------------------------
+# WP-14B — independent frozen backbone for the LADD disc projection.
+# (docs/GAN_REDESIGN.md section B2; report: docs/WP_14B.md)
+# ---------------------------------------------------------------------------
+# Point 6: tapping ``real_score`` makes the critic read the SAME
+# representation the DMD teacher scores with, so the GAN gradient is
+# largely redundant with the distillation term. This block swaps the
+# tapped network for a STOCK Wan2.1-T2V-14B prefix the student has never
+# been trained against. ``real_score`` / ``real_name`` are NOT touched —
+# DMD keeps its teacher exactly as-is.
+#
+# Only blocks 0..max(ladd_feature_blocks) are constructed and loaded
+# (texture lives in the shallow taps), so the cost is ~6.8 GB in bf16 for
+# taps [0, 2, 4, 8] instead of the full model's ~28 GB.
+#
+# "" (default) = OFF: the disc keeps tapping ``real_score`` and every
+# existing run is byte-identical. Set it to the checkpoint directory to
+# enable, e.g.
+#   ladd_disc_backbone_model_name=/scratch/u6ex/as1748.u6ex/frodobots/Wan2.1-T2V-14B
+ladd_disc_backbone_model_name: ""
+ladd_disc_backbone_dtype: bfloat16   # on-disk fp32 -> bf16 halves it
+ladd_disc_backbone_load_head: true   # head is never executed (max_block
+                                     # early-exit); loaded only so the
+                                     # prefix stays a faithful copy
+#
+# MANDATORY companion override for the 14B arm — pass it on the launch
+# line, NOT here: ``ladd_feature_blocks`` is already defined earlier in
+# this file, and a duplicate key at the end of the file would silently
+# retarget every existing 1.3B run's taps.
+#
+#   ladd_feature_blocks=[0,2,4,8] \
+#   ladd_disc_backbone_model_name=/scratch/u6ex/as1748.u6ex/frodobots/Wan2.1-T2V-14B
+#
+# The trainer REFUSES to build the 14B backbone when the taps were
+# auto-derived: the 40-block auto-default is [8,16,24,32,39], i.e. a full
+# 28 GB load. ``max(taps) < num_layers_loaded`` is asserted in three
+# places (loader, build_ladd_disc, trainer).
+#
+# Expected telemetry shift (A7): |cos(g_GAN, g_DMD)| should FALL versus
+# the v14e-backbone critic — that drop IS the point (an independent
+# critic), not a regression. Stock T2V 14B never saw driving data or
+# action tokens; the disc runs with action_tokens_per_frame=0 here.
+
+# ---------------------------------------------------------------------------
+# WP-PIXGAN (B1) — pixel-space texture PatchGAN.
+# (docs/TEXTURE_GAN_DESIGN.md; report: docs/WP_PIXGAN.md)
+#
+# APPENDED AT THE END, after WP-14B's block, and it edits NO key above.
+# Every key below is read at a literal ``getattr(cfg, "...")`` site in
+# ``trainer/causal_action_forcing_train.py``, so the A18-D3 override guard
+# sources them for real rather than by registration.
+# ---------------------------------------------------------------------------
+
+# MASTER GATE (§5, T3-A). false = byte-identical to every run that came
+# before: no critic, no optimizer, no decode, no dataset read, no RNG
+# draw and not one log key.
+gan_pixel_texture_enabled: false
+
+# §3.1 / A23 — fake source. false (DEFAULT, and the first adversarial
+# arm's setting per WP_PIXGAN §14) = the flash ``flash_dmd_gan_x0`` x0:
+# cheaper, no retained rung graph, no frame-dilution mask. true = the A23
+# finish-grad ladder. A23 is OVERTURNED (§6.0), so this is an
+# EXPERIMENTAL VARIABLE, not a quality gate — both paths stay tested.
+pix_finish_grad_enabled: false
+
+# §5.5 / §12 — GENERATOR-SIDE WEIGHT. DELIBERATELY UNSET.
+#
+# There is NO default: 0.03 was withdrawn (§5.5, measured under a scalar
+# LATENT critic — different domain, reduction, loss form and critic), and
+# the LADD arms' measured 0.65–0.80 / 0.054 (§24) MUST NOT be inherited
+# for the same reason. ``resolve_gan_weight(..., strict=True)`` raises if
+# this key is absent while the arm is on, so the omission is LOUD.
+#
+# Calibrate, do not guess (§12):
+#   1. weight-free probe: launch with ``pix_gan_weight=0.0`` and read
+#      ``train/pix_gan_grad_ratio`` — the UNWEIGHTED ratio, i.e. the share
+#      the term WOULD have at weight 1.0 (at weight 0 the applied term has
+#      no gradient at all, so only this key can answer);
+#   2. solve ``pix_gan_weight = 0.10 / r_probe`` for §5.5's 5–20 % band;
+#   3. bracket ×1/3, ×1, ×3.
+# There is no GAN-side gradient cap to catch an over-large weight
+# (A4 ``gan_grad_target_norm`` was deleted), which is why step 1 is not
+# optional.
+# pix_gan_weight:  <- set on the launch line, per arm.
+
+# §5.2 — critic optimizer (T3-A).
+pix_gan_lr: 1.0e-5
+pix_gan_betas: [0.0, 0.9]
+
+# §3.2 / §6 / A24 — supply geometry (T3-B). Decode cost scales with
+# CROPS only (§9), and the crop rows/cols are clamped to the latent
+# extent, so the DERIVED values are echoed at
+# ``train/pix_cfg_*`` once per run rather than assumed from these.
+pix_crop_lat: [24, 32]
+# 8, not 4 — RESEARCHER EXPOSURE DIRECTIVE (2026-08-24): the pixel critic
+# needs A LOT of exposure to fakes and equivalent reals. 8 is §3.7's own
+# upper bracket. With pix_frames_per_crop=3 and pix_gan_updates_per_step
+# following gan_updates_per_step (5 in the ganfix arms), this is
+# 24 fakes + 24 band-matched reals per D-update = 120/120 per step.
+pix_crops_per_step: 8
+pix_frames_per_crop: 3
+pix_lat_frames_per_crop: 2
+pix_decode_border_trim: 8
+pix_decode_batch: 4
+
+# A24 — COARSE thirds, PINNED. Any other value is rejected at CONFIG
+# RESOLUTION (trainer ``_pix_resolve_cfg``), i.e. at construction and again
+# on entry to BOTH consumers — not inside one of them, after its own early
+# returns, while the other read the key unpinned.
+pix_band_count: 3
+
+# A20 — one INDEPENDENTLY SOURCED real per fake, same A24 band.
+pix_reals_per_fake: 1
+
+# §3.4 / A21 — real-supply pool (the "cache" of §7). The A21 floor is
+# >= 4,096 DISTINCT source frames, measured off
+# ``train/pix_real_support_frames`` and asserted by
+# ``train/pix_a21_support_ok`` — never assumed from the loader.
+#
+# 2048 was the configuration that could NEVER pass. The pool's nominal
+# source-frame ceiling is ``pix_real_pool_windows x
+# pix_lat_frames_per_crop`` = 2048 x 2 = 4096 — EXACTLY the floor, with
+# zero margin — and windows overlap inside a ride (a window at ``s``
+# contributes ``{s, s+1}``, so a window at ``s+1`` adds only one new
+# frame), so the realised ceiling measured 4,069..4,085 across seeds and
+# ``pix_a21_support_ok`` read 0.0 on every logged step of the arm's life.
+#
+# Two things fix it and BOTH are needed. (1) Refresh no longer stops when
+# the pool reaches its cap: admission is the only thing that grows A21
+# support, so the cap now bounds MEMORY only and the FIFO eviction in
+# ``_pix_pool_fill`` finally runs, which is also what keeps the A22
+# holdout check from going stale. Support is therefore UNBOUNDED in time
+# and no longer capped by this number at all. (2) This number is raised so
+# the STEADY-STATE pool carries the floor on its own with real margin:
+# 4096 x 2 = 8,192 nominal source frames = 2.00x the floor, and the low
+# end of A21's own "8-16k preferred" band. fp16 CPU storage:
+# 4096 x 2 x 16 x 24 x 32 ~= 200 MB.
+pix_real_pool_windows: 4096
+# STEADY-STATE admissions per D-update, forever. Must be >= 1: 0 is not a
+# cheaper setting, it is the frozen mini-dataset A21 exists to forbid, and
+# it is rejected at resolution time.
+pix_real_pool_refresh: 8
+# D-updates allowed to bring the pool from cold to its cap. At the steady
+# rate alone this would take 4096/8 = 512 updates, i.e. a 300-step arm
+# would spend its whole life below the floor for the second time; at 64
+# the warm-up rate is ceil(4096/64) = 64 window loads per D-update (the §3
+# budget already contemplated 60/step) and measured support passes 4,096
+# around update ~33 and 8,000 by update ~64. ``pix_a21_support_ok`` may
+# honestly read 0 during warm-up — ``train/pix_a21_warming`` marks it —
+# and an unmet floor AFTER warm-up is a hard failure, not a logged 0.
+pix_real_pool_warm_updates: 64
+# D-updates of drawn source frames the rolling reuse gauge
+# (``train/pix_real_recent_reuse_frac``) looks back over.
+pix_real_reuse_horizon: 32
+pix_real_draw_rank_synced: false
+
+# §5.1 — patchwise loss form: "nsgan" (non-saturating logistic) or
+# "hinge". Non-relativistic, nonlinearity BEFORE any averaging.
+pix_loss_form: nsgan
+
+# §5.3 / §5.4 — R1 ONLY (R2 is deleted and no ``pix_r2_*`` key exists or
+# ever will). R1 differentiates the MEAN patch score per image and fires
+# on EVERY D-update; cost is bounded by subsampling, NEVER by raising
+# every_n (that is the silent-cadence bug class A10/A16).
+# ``train/pix_r1_grad_sq`` is logged PRE-gamma so gamma is recalibrated
+# from measurement; ``train/pix_r1_grad_share`` reports R1's share of the
+# D-side gradient POST-gamma, because too-weak and too-strong R1 have
+# OPPOSITE failure modes that no magnitude can tell apart.
+#
+# ``pix_r1_gamma`` HAS NO DEFAULT, for the same reason ``pix_gan_weight``
+# has none, and it is now gated the same way (trainer
+# ``_pix_resolve_r1_gamma``, which raises). The module default 1.0 is
+# MEASURED INERT on BOTH architectures — R1/d_loss = 3.7e-06..7.6e-06 on
+# the shipped norm-free critic and 4.5e-04..9.6e-04 with the GroupNorm,
+# against ``d_loss = 2 ln 2`` — so pinning 1.0 here launched the arm with
+# R1 switched OFF while ``train/pix_r1_rate`` read a confident 1.00.
+# ``model/pixel_texture_disc.py`` carries the full INERT-GAMMA WARNING.
+# The gamma that puts R1 at 0.1 % of ``d_loss`` is 131..273 at the spec
+# crop (P = 660); calibrate from a measured ``train/pix_r1_grad_sq_mean``
+# and set it on the launch line, exactly like ``pix_gan_weight``. An
+# explicit 0.0 is legal and means R1 deliberately OFF (echoed as
+# ``pix_cfg_pix_r1_disabled``); 1.0 and null are both refused.
+# pix_r1_gamma:  <- set on the launch line, per arm.
+pix_r1_gamma: null
+pix_r1_sigma: 0.01
+pix_r1_every_n: 1
+pix_r1_num_samples: null   # null = all reals; >= 1 subsamples
+
+# §5.2 — D-updates per training step. null = FOLLOW ``gan_updates_per_step``
+# (5 in the ganfix arms) — RESEARCHER EXPOSURE DIRECTIVE (2026-08-24). The
+# previous pinned 1 silently capped the pixel critic at 1/5th of the LADD
+# disc's cadence. A pinned integer here still wins if set; the followed
+# value and its source are echoed at ``train/pix_cfg_pix_gan_updates_
+# per_step_derived`` / ``..._followed``.
+pix_gan_updates_per_step: null
+
+# §8.1 — POSITIVE CONTROL, which is what makes ``pix_d_loss ~ ln 2``
+# decidable at all (undertrained vs design-wrong read identically without
+# it). 0 = OFF (default): no extra decode, no key. The amplitude is
+# DIMENSIONLESS (scaled by the latent's own std) and must be calibrated
+# ONCE offline — ``python -m model.pixel_texture_disc calibrate`` /
+# ``sweep_c1_amplitude`` — before any reading off it is quoted.
+pix_poscontrol_every: 0
+pix_poscontrol_amplitude: 0.5
+pix_poscontrol_boot: 1000
+
+# §5.2 — DDP determinism: the seed for the critic's PRIVATE generators.
+# Every pixel-side draw comes from these, so the global RNG stream is
+# untouched and the gate-off path stays byte-identical.
+pix_seed: 20260823
+
+# ---------------------------------------------------------------------------
+# WP-SURROGATE (B3) — latent surrogate critic. docs/WP_SURROGATE.md.
+#
+# BUILD STEP ONLY this window: these keys reach
+# model/latent_texture_critic.py::build_from_config and construct
+# self.latent_texture_critic / self.latent_critic_optimizer /
+# self.latent_texture_distiller. The per-step distillation + generator
+# consumption (and save/resume) are a separate, not-yet-landed window --
+# turning this gate on builds an untrained critic and trains nothing.
+# Default OFF, byte-identical when off (build_from_config returns
+# (None, None, None) whenever this key is absent or false).
+surrogate_critic_enabled: false
+
+# Architecture (docs/WP_SURROGATE.md §3). Defaults below are what
+# build_from_config falls back to if a key here is ever removed --
+# duplicated for visibility, not because the fallback is untested.
+surrogate_critic_d_model: 512
+surrogate_critic_num_blocks: 4
+surrogate_critic_num_heads: 8
+surrogate_critic_max_frames: 64
+surrogate_critic_lr: 2.0e-4
+
+# Distillation targets (§1: value MSE + Sobolev grad-z MSE).
+# grad_loss_normalize=true is the MAIN-RULED default (2026-08-23,
+# GAN_REDESIGN_TWO): the ancestor's raw-MSE Sobolev term at weight 1.0
+# was measured DECORATIVE (held-out grad cos -0.002, statistically
+# matching value-only's -0.003); normalized reaches +0.986. Do not set
+# this false with weight 1.0 -- that recreates the inert configuration.
+# If a verbatim historical restore is ever wanted deliberately: false
+# AND ~1e4, never false alone.
+surrogate_value_loss_weight: 1.0
+surrogate_grad_loss_weight: 1.0
+surrogate_grad_loss_normalize: true
+
+# NEW cadence knob (delta (b) vs the 835b1df ancestor, which ran the
+# teacher every step). Teacher fwd+grad runs every N steps; the critic
+# serves the generator every step regardless -- that is the entire
+# affordability mechanism. If this key fails to reach the distiller it
+# silently defaults to 1 (teacher every step, run merely slower, every
+# metric stays healthy) -- read train/surrogate_n_teacher_refresh, never
+# a raw teacher/disc forward count, to confirm the cadence took effect
+# (the count is 2x under checkpointing's backward recompute).
+pix_teacher_refresh_every: 4
+
+surrogate_cache_capacity: 8
+surrogate_grad_check_every: 100
+surrogate_teacher_use_checkpoint: true
+
+# --- WP-SURROGATE teacher backbone (researcher directive 2026-08-24) ------
+# "pixel"    = B1's from-scratch PatchGAN (B1's own arm keeps this).
+# "sam2"|"dinov2"|"convnext" = PRETRAINED teachers for the surrogate
+#   branch. All three attach the SAME ADM 2D heads to a frozen backbone
+#   (model/pretrained_pixel_disc.py reuses r3gan_sam2._R3GANDiscHeads
+#   verbatim), so an arm-to-arm difference is attributable to the FEATURE
+#   BASIS and nothing else -- that is the whole point of offering three.
+#     sam2     hierarchical ViT | segmentation (SA-1B) | region/boundary
+#     dinov2   plain ViT        | self-supervised      | semantic/shape
+#              ^ TEXTURE_GAN_DESIGN §4.1's named B5 escalation; ADD used
+#                it for this exact job. Taps = evenly-spaced blocks.
+#     convnext conv             | supervised ImageNet  | TEXTURE
+#              ^ ImageNet CNNs are texture-biased (Geirhos et al. 2019) --
+#                for a texture critic that bias is a feature, and it is
+#                the sharpest contrast to dinov2 (conv-vs-ViT AND
+#                supervised-vs-self-supervised in one swap).
+# Resolutions default per-backbone (dinov2 518, convnext 512) so every
+# tapped feature map clears the shared head's 8x8 minimum -- below that
+# the head's three stride-2 4x4 convs collapse it and raise. Overriding
+# these downward will fail loudly at construction, by design.
+# "sam2"   = frozen SAM2
+#            Hiera-B+ encoder + trainable ADM 2D heads (model/r3gan_sam2.py,
+#            restored verbatim from 835b1df). The surrogate branch must not
+#            use a from-scratch teacher.
+# Heads get an NS-logistic D-update every distillation step (encoder frozen);
+# the latent critic then distils value+Sobolev targets from the just-updated
+# teacher exactly as with the pixel backbone.
+surrogate_teacher_backbone: pixel
+surrogate_sam2_checkpoint_path: sam2_checkpoints/sam2.1_hiera_base_plus.pt
+surrogate_sam2_config_path: configs/sam2.1/sam2.1_hiera_b+.yaml
+surrogate_sam2_resolution: 512
+surrogate_sam2_lr: 2.0e-4
+surrogate_sam2_updates_per_step: 1
+surrogate_sam2_frame_pool: mean
+surrogate_sam2_preserve_aspect: true
+surrogate_sam2_pad_to_square: true
+
+# dinov2 / convnext teacher knobs (all optional -- null/absent = the
+# backbone's own default, which is the tested configuration).
+surrogate_dinov2_variant: null        # default dinov2_vits14
+surrogate_dinov2_resolution: null     # default 518 (37x14)
+surrogate_dinov2_layers: null         # default = evenly-spaced blocks (ADD analog)
+surrogate_dinov2_lr: 2.0e-4
+surrogate_dinov2_pad_to_square: true
+surrogate_convnext_variant: null      # default convnext_tiny.fb_in1k
+surrogate_convnext_resolution: null   # default 512 -> 128/64/32/16
+surrogate_convnext_layers: null       # default = all four FPN stages
+surrogate_convnext_lr: 2.0e-4
+surrogate_convnext_pad_to_square: true
+
+# ---------------------------------------------------------------------------
+# *** SUPERSEDED — 2026-08-24 measurement. DO NOT ARM. ***
+# The e-keyed gate below is retained, still default-off, but its signal was
+# FALSIFIED: across the supervised band e = |x0 - pred_real| was FLAT
+# (~0.18) while align swung +0.094 -> -0.530. e therefore does not predict
+# alignment, and a gate keyed on it gates on NOISE. The replacement is the
+# per-frame fingerprint gate (dmd_fp_* below), which is keyed on DMD's own
+# ability to localise the manifold at each frame. Code kept in the tree so
+# the measurement path and its tests stay live — not deleted, not armed.
+# ---------------------------------------------------------------------------
+# DMD MANIFOLD GATE (docs/DMD_MANIFOLD_GATE.md) — researcher thesis
+# 2026-08-24. DMD's direction is trustworthy only near the data manifold;
+# far from it the one-step teacher is extrapolating outside its training
+# region and the update AMPLIFIES drift instead of correcting it. The
+# rollout compounds drift with depth, so the tail is where DMD does harm
+# — and exactly where the (decoupled, pixel) GAN should work instead.
+#
+# Signal is DMD's OWN error e = |x0 - pred_real|: how far the frozen
+# teacher wants to move the student's own sample. NOT an MAE-vs-GT
+# quantity — e needs no GT (so it works on the drifted tail where GT
+# alignment is weakest) and it measures TEACHER COMPETENCE rather than
+# student badness (a bad student under a competent teacher is exactly
+# where DMD is most useful; gating on student error would switch DMD off
+# precisely when it works).
+#
+# POLARITY: this is the OPPOSITE end of the axis from dmd_mae_gate_*.
+# That gate closes as the student CATCHES the teacher (r->1). This one
+# closes as the sample LEAVES the teacher's competence region. They
+# compose multiplicatively into a band: DMD on in the middle, off at both
+# extremes. Do not confuse them.
+dmd_err_gate_enabled: false
+# NO DEFAULTS, deliberately. These are the measured align-crossover for
+# THIS teacher/data pair, not inheritable constants — enabling the gate
+# with either unset RAISES (same discipline as pix_gan_weight and
+# pix_r1_gamma, both of which were inert-by-default disasters). Get them
+# from: analysis/dmd_gate_crossover.py <trace>.
+dmd_err_gate_e_lo: null   # full DMD at/below this error
+dmd_err_gate_e_hi: null   # DMD fully off at/above this error
+dmd_err_gate_min_weight: 0.0
+dmd_err_gate_ema: 0.9
+# Set to a path to dump one row per DMD call for the crossover fit. The
+# step line only prints every 10th step (~4 points/run) — far too few to
+# locate a sign change. Leave null in production.
+dmd_err_gate_trace_path: null
+
+# ---------------------------------------------------------------------------
+# DMD SELF-FINGERPRINT GATE (docs/DMD_FINGERPRINT_PROBE.md) — the
+# REPLACEMENT for dmd_err_gate_* above. Perturb a sample with a structured
+# (NON-gaussian) displacement, denoise, and ask whether DMD pushes back
+# along it: s(x) = cos(r, -delta). +1 => DMD knows the manifold here;
+# ~0 => it cannot localise it, so its direction is not trustworthy. The
+# score is normalised against two anchors we have BY CONSTRUCTION —
+# s_gt (GT, on-manifold by definition) and s_off (GT + a large corruption,
+# off-manifold by construction) — giving
+#     m = clamp((s - s_off) / (s_gt - s_off), 0, 1)
+# and m is resolved PER FRAME because the measured effect is per frame:
+# alignment was positive at band frames 9-13 and -0.53 by 17, a cliff
+# INSIDE a single band. A scalar gate averages that cliff away.
+#
+# The knobs split into two classes and the split is ENFORCED in code:
+#
+#   CLASS A — MEASUREMENT. Needed to run the probe; safe defaults so the
+#     depth study and the diagnostic path work before any calibration
+#     exists.
+dmd_fp_every: 0                 # 0 = probe off; N = probe every Nth DMD call
+dmd_fp_perturb: hf_scramble     # hf_scramble | patch_shuffle | channel_rot
+dmd_fp_seeds: 2                 # noise draws averaged per fingerprint
+#
+#   CLASS B — CALIBRATION. These define the gate's RESPONSE CURVE and are
+#     MEASURED, per teacher/data pair, by analysis/dmd_fp_depth_study.py.
+#     They are null on purpose. The previous in-code defaults (scale 0.15,
+#     exponent 1.0, min_weight 0.0, and an off-anchor buried as the literal
+#     max(0.6, scale*4)) were GUESSES. Enabling the gate with ANY of them
+#     unset RAISES and names the missing keys — same discipline as
+#     dmd_err_gate_e_lo/e_hi and the pix_gan_weight / pix_r1_gamma
+#     inert-by-default disasters. A guessed default that silently works is
+#     the exact failure mode this block exists to make impossible.
+#
+#     NOTE dmd_fp_scale / dmd_fp_off_scale are also required by the
+#     PROBE ITSELF (dmd_fp_every>0), gate or no gate: switching the probe
+#     on with either unset raises rather than substituting a number. The
+#     scale sweep belongs to the study, not to the trainer.
+dmd_fp_scale: null              # perturbation magnitude (fraction of |x|)
+                                #   <- the scale that actually DISCRIMINATES
+dmd_fp_off_scale: null          # corruption magnitude defining the s_off anchor
+                                #   <- large enough to be provably off-manifold
+dmd_fp_m_lo: null               # m at/below which DMD is NOT trusted -> min_weight
+dmd_fp_m_hi: null               # m at/above which DMD is fully trusted -> 1.0
+                                #   <- read off the m-vs-align cliff
+dmd_fp_gate_exponent: null      # ramp shape between m_lo and m_hi (>0; 1 = linear)
+dmd_fp_gate_min_weight: null    # floor on the weight (0 = DMD can be fully off)
+# Weight mapping, explicit rather than "w = m" (which silently assumed the
+# response is linear in m across all of [0,1]):
+#     u = clamp((m - m_lo) / (m_hi - m_lo), 0, 1)
+#     w = min_weight + (1 - min_weight) * u**exponent
+# The floor is AFFINE, not a clamp: a clamped floor of 0.3 with exponent 2
+# would silently kill the bottom half of the calibrated range.
+dmd_fp_gate_enabled: false      # arm the gate (requires every Class-B value)

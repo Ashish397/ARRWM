@@ -290,6 +290,9 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_42f_clean_self = bool(
             getattr(args, "dmd_42f_clean_self", False)
         )
+        self.dmd_42f_clean_shift_fwd = int(getattr(args, "dmd_42f_clean_shift_fwd", 0) or 0)
+        # DMD self-fingerprint probe (docs/DMD_FINGERPRINT_PROBE.md).
+        self._init_dmd_fp_knobs(args)
         # ``dmd_42f_rand_sup_slot`` (seed_last=false only): instead of
         # always grading the FIRST after-student chunk (the slot right
         # after the GT context), randomly pick WHICH student chunk carries
@@ -1345,6 +1348,28 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_loss_mode = str(
             getattr(args, "forward_noiser_loss_mode", "mse")
         ).lower()
+        # CARN pair-swap test (researcher directive, 2026-08-24):
+        # 'rollout_to_gt' trains F(rollout_chunk, level) ~= GT_chunk at the
+        # SAME ride/abs positions — the forward noiser IS the style
+        # corrector (rollout -> GT), no reverse net / cycle needed (the
+        # reverse noiser is only constructed under the teacher_feat cycle).
+        # 'r1_vs_r2' = legacy rollout1->rollout2 drift pairing (default,
+        # byte-identical).
+        self.fn_pair_mode = str(
+            getattr(args, "fn_pair_mode", "r1_vs_r2")
+        ).lower()
+        if self.fn_pair_mode not in ("r1_vs_r2", "rollout_to_gt"):
+            raise ValueError(
+                "fn_pair_mode must be 'r1_vs_r2' or 'rollout_to_gt'; "
+                f"got {self.fn_pair_mode!r}."
+            )
+        if (self.fn_pair_mode == "rollout_to_gt"
+                and self.forward_noiser_loss_mode != "mse"):
+            raise ValueError(
+                "fn_pair_mode='rollout_to_gt' requires "
+                "forward_noiser_loss_mode='mse'; the teacher_feat path "
+                "builds its pairs elsewhere and is NOT swapped."
+            )
         if self.forward_noiser_loss_mode not in ("mse", "teacher_feat"):
             raise ValueError(
                 "forward_noiser_loss_mode must be 'mse' or 'teacher_feat'; "
@@ -2607,6 +2632,25 @@ class ActionForcingDMD(SelfForcingModel):
         # so w=1 when the student is >= r_full x worse than the teacher,
         # ramping to ``min_weight`` (default 0) as the student reaches
         # teacher parity (r->1) or beats it (r<1). Default OFF.
+        # DMD-error manifold gate (docs/DMD_MANIFOLD_GATE.md). Default
+        # OFF; thresholds deliberately have NO defaults (see the raise in
+        # _dmd_error_gate_weight -- they are measured, not inherited).
+        self.dmd_err_gate_enabled = bool(
+            getattr(args, "dmd_err_gate_enabled", False)
+        )
+        self.dmd_err_gate_e_lo = getattr(args, "dmd_err_gate_e_lo", None)
+        self.dmd_err_gate_e_hi = getattr(args, "dmd_err_gate_e_hi", None)
+        self.dmd_err_gate_min_weight = float(
+            getattr(args, "dmd_err_gate_min_weight", 0.0)
+        )
+        self.dmd_err_gate_ema = float(
+            getattr(args, "dmd_err_gate_ema", 0.9)
+        )
+        self._dmd_err_gate_ema = None
+        # Single line ON PURPOSE: the override guard greps for
+        # getattr(args, "<key>", ...) per line, so a wrapped call reads as
+        # "key never consumed" and raises a false alarm on every launch.
+        self.dmd_err_gate_trace_path = getattr(args, "dmd_err_gate_trace_path", None)
         self.dmd_mae_gate_enabled = bool(
             getattr(args, "dmd_mae_gate_enabled", False)
         )
@@ -5038,6 +5082,877 @@ class ActionForcingDMD(SelfForcingModel):
                 a_m1[:, j:] = a_m1[:, j - 1:j]
         return {"STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos, "M1": a_m1}
 
+    # ------------------------------------------------------------------
+    # DMD SELF-FINGERPRINT (docs/DMD_FINGERPRINT_PROBE.md)
+    # ------------------------------------------------------------------
+    # The ``dmd_fp_*`` knobs split into two classes and the split is
+    # ENFORCED, not merely documented:
+    #
+    #   CLASS A -- MEASUREMENT params. Needed to RUN the probe at all
+    #     (``dmd_fp_every``, ``dmd_fp_perturb``, ``dmd_fp_seeds``). These
+    #     keep working defaults so the depth study and the diagnostic
+    #     path can run without a prior study.
+    #   CLASS B -- CALIBRATION params. These define the gate's RESPONSE
+    #     CURVE (``dmd_fp_scale``, ``dmd_fp_off_scale``, ``dmd_fp_m_lo``,
+    #     ``dmd_fp_m_hi``, ``dmd_fp_gate_exponent``,
+    #     ``dmd_fp_gate_min_weight``). They default to ``None`` and
+    #     enabling the gate without them RAISES. They are measured, per
+    #     teacher/data pair, by ``analysis/dmd_fp_depth_study.py``. The
+    #     previous defaults (scale 0.15, exponent 1.0, min_weight 0.0)
+    #     were GUESSES; a guessed default that silently works is exactly
+    #     the failure mode this campaign keeps rediscovering, so they are
+    #     gone rather than kept "as a starting point".
+    _DMD_FP_CALIB_KEYS = (
+        "dmd_fp_scale",
+        "dmd_fp_off_scale",
+        "dmd_fp_m_lo",
+        "dmd_fp_m_hi",
+        "dmd_fp_gate_exponent",
+        "dmd_fp_gate_min_weight",
+    )
+
+    @staticmethod
+    def _dmd_fp_opt_float(args, key):
+        """``float(args.key)`` or ``None`` -- never a substituted number.
+
+        ``float(getattr(args, k, None))`` would crash on an unset key and
+        ``float(getattr(args, k, 0.15))`` would silently invent one; this
+        is the only shape that preserves "unset" all the way to the
+        consumer, where it becomes a raise.
+        """
+        v = getattr(args, key, None)
+        return None if v is None else float(v)
+
+    def _init_dmd_fp_knobs(self, args) -> None:
+        """Read the ``dmd_fp_*`` knobs off ``args``.
+
+        Split out of ``__init__`` so the config->consumer wiring is
+        testable on CPU without constructing a model: every knob below is
+        driven from a real config object in
+        ``testing/test_dmd_fp_gate.py``.
+        """
+        # --- CLASS A: measurement (defaults OK, the probe must be able
+        # --- to run before any study exists) --------------------------
+        self.dmd_fp_every = int(getattr(args, "dmd_fp_every", 0) or 0)
+        self.dmd_fp_perturb = str(getattr(args, "dmd_fp_perturb", "hf_scramble"))
+        self.dmd_fp_seeds = int(getattr(args, "dmd_fp_seeds", 2) or 2)
+        # --- CLASS B: calibration (None until measured) ---------------
+        for _k in self._DMD_FP_CALIB_KEYS:
+            setattr(self, _k, self._dmd_fp_opt_float(args, _k))
+        self.dmd_fp_gate_enabled = bool(getattr(args, "dmd_fp_gate_enabled", False))
+        self._last_dmd_fp_w_per_frame = None
+        self._last_dmd_fp_m_per_frame = None
+        # Telemetry slots. None (not 0.0) so an unavailable diagnostic is
+        # an ABSENT step-line key rather than a forgeable value inside the
+        # metric's meaningful range -- w=0.0 reads as "DMD fully gated
+        # off", which is a real regime and must not be faked.
+        self._last_dmd_fp_m = None
+        self._last_dmd_fp_gate_w_mean = None
+        self._last_dmd_fp_gate_w_min = None
+        self._last_dmd_fp_gate_w_max = None
+        self._last_dmd_fp_gate_share = None
+        self._last_dmd_fp_calc_idx = None
+
+    def _dmd_fp_missing_calib(self):
+        """The Class-B keys that are still unset, in declaration order."""
+        return [k for k in self._DMD_FP_CALIB_KEYS
+                if getattr(self, k, None) is None]
+
+    def _dmd_fp_require_calib(self, why: str) -> None:
+        """Raise naming EXACTLY which measured values are missing.
+
+        Same discipline as ``dmd_err_gate_e_lo``/``e_hi`` (and the
+        ``pix_gan_weight`` / ``pix_r1_gamma`` inert-by-default disasters
+        before them): a number that was never measured must not be
+        silently inherited. Absence raises; it never falls back.
+        """
+        missing = self._dmd_fp_missing_calib()
+        if missing:
+            raise ValueError(
+                f"{why} but these dmd_fp calibration values are unset: "
+                + ", ".join(missing)
+                + ". They are NOT inheritable defaults -- they are the "
+                "measured response curve for THIS teacher/data pair. "
+                "Get them from analysis/dmd_fp_depth_study.py (see "
+                "docs/DMD_FINGERPRINT_PROBE.md) and set them in the "
+                "config. Refusing to run on invented constants."
+            )
+
+    def _dmd_fp_probe_params(self):
+        """``(mode, scale, off_scale, seeds)`` for a probe call, or raise.
+
+        DELIBERATE CHOICE for probe-only operation (``dmd_fp_every>0``
+        with the gate OFF): the probe REQUIRES explicit ``dmd_fp_scale``
+        and ``dmd_fp_off_scale`` rather than sweeping internally. Two
+        reasons. (1) An internal sweep would make the probe's own output
+        depend on a sweep grid nobody chose, which is the same "silently
+        substituted number" defect one level up. (2) The scale sweep is
+        the depth study's job -- it varies scale ACROSS runs and reads
+        off which one discriminates; a trainer-side sweep would average
+        those together inside one number. So an unset scale is an error,
+        loudly, at the moment the probe is switched on.
+        """
+        missing = [k for k in ("dmd_fp_scale", "dmd_fp_off_scale")
+                   if getattr(self, k, None) is None]
+        if missing:
+            raise ValueError(
+                "dmd_fp_every>0 (fingerprint probe on) but "
+                + ", ".join(missing)
+                + " is unset. The probe does NOT substitute a default "
+                "perturbation magnitude -- the old 0.15 was a guess. "
+                "Sweep it with analysis/dmd_fp_depth_study.py and set "
+                "the value that actually discriminates."
+            )
+        return (
+            str(getattr(self, "dmd_fp_perturb", "hf_scramble")),
+            float(self.dmd_fp_scale),
+            float(self.dmd_fp_off_scale),
+            int(getattr(self, "dmd_fp_seeds", 2) or 2),
+        )
+
+    def _dmd_fp_gate_weight_from_m(self, m):
+        """Map the calibrated score ``m`` -> the DMD per-frame weight.
+
+        ``m`` may be a float or a ``[F]`` tensor; the return matches.
+
+        The mapping is EXPLICIT because the previous code used ``m``
+        directly as the weight, which silently assumes the gate response
+        is linear in ``m`` over the whole of [0, 1]. That is an
+        assumption, not a measurement, and it is exactly the kind of
+        thing that never gets revisited once it works. So:
+
+            m <= m_lo            ->  min_weight   (DMD is not trusted)
+            m >= m_hi            ->  1.0          (DMD is fully trusted)
+            in between           ->  min_weight + (1-min_weight) * u**exp
+                                     with u = (m - m_lo) / (m_hi - m_lo)
+
+        NOTE the floor is applied AFFINELY, not as a ``clamp(min=)`` like
+        the (superseded) ``dmd_err_gate``. With a clamp, a min_weight of
+        0.3 and an exponent of 2 makes every u below 0.55 collapse to the
+        floor -- half the calibrated range dead, silently. The affine
+        form keeps the ramp strictly monotone across the whole
+        [m_lo, m_hi] window and still hits both endpoints exactly.
+        """
+        self._dmd_fp_require_calib("the fingerprint gate response was requested")
+        m_lo = float(self.dmd_fp_m_lo)
+        m_hi = float(self.dmd_fp_m_hi)
+        ex = float(self.dmd_fp_gate_exponent)
+        mw = float(self.dmd_fp_gate_min_weight)
+        if not (m_hi > m_lo):
+            raise ValueError(
+                f"dmd_fp_m_hi ({m_hi}) must exceed dmd_fp_m_lo ({m_lo})."
+            )
+        if not (0.0 <= m_lo and m_hi <= 1.0):
+            # ``m`` is itself clamped to [0, 1] by construction, so a
+            # threshold outside it silently makes one end unreachable.
+            raise ValueError(
+                f"dmd_fp_m_lo/m_hi ({m_lo}, {m_hi}) must lie in [0, 1]: "
+                "m is the clamped (s - s_off)/(s_gt - s_off) fraction."
+            )
+        if not (0.0 <= mw <= 1.0):
+            raise ValueError(
+                f"dmd_fp_gate_min_weight ({mw}) must lie in [0, 1]."
+            )
+        if not (ex > 0.0):
+            raise ValueError(
+                f"dmd_fp_gate_exponent ({ex}) must be > 0."
+            )
+        if torch.is_tensor(m):
+            u = ((m.float() - m_lo) / (m_hi - m_lo)).clamp(0.0, 1.0)
+            if ex != 1.0:
+                u = u ** ex
+            return mw + (1.0 - mw) * u
+        u = min(1.0, max(0.0, (float(m) - m_lo) / (m_hi - m_lo)))
+        if ex != 1.0:
+            u = u ** ex
+        return mw + (1.0 - mw) * u
+
+    def _dmd_loss_with_fp_gate(
+        self,
+        original_latent: torch.Tensor,
+        grad: torch.Tensor,
+        gradient_mask: torch.Tensor,
+        log_dict: Dict[str, Any],
+    ) -> torch.Tensor:
+        """The DMD term, optionally attenuated PER FRAME by the gate.
+
+        docs/DMD_FINGERPRINT_PROBE.md. Weight each frame's DMD term by
+        how well DMD can localise the manifold AT THAT FRAME, measured by
+        DMD itself (perturb -> denoise -> does it restore?). Per-frame
+        because the measured effect is per-frame: alignment was POSITIVE
+        at band frames 9-13 and -0.53 by 17 -- a cliff INSIDE one band. A
+        scalar weight averages that away and gives every frame the same
+        compromise, which is the design this replaces.
+
+        NOTE this supersedes the e-based gate as the intended signal: the
+        same measurement showed e = |x0 - pred_real| FLAT (~0.18) across
+        all frames while alignment swung +0.094 -> -0.530, so ``e`` does
+        not predict alignment and a gate keyed on it gates on noise. That
+        gate stays in the tree, still default-off -- see the doc.
+
+        Split out of :meth:`compute_distribution_matching_loss` so the
+        default-off path can be pinned EXACTLY (not approximately) against
+        the pre-gate ``F.mse_loss`` on CPU. Off must be byte-identical.
+        """
+        _fpw = None
+        if bool(getattr(self, "dmd_fp_gate_enabled", False)):
+            # Order matters: the calibration check first, because
+            # "armed on invented constants" is the worse failure and the
+            # one whose error message must be seen.
+            self._dmd_fp_require_calib("dmd_fp_gate_enabled=true")
+            _fpw = getattr(self, "_last_dmd_fp_w_per_frame", None)
+            if _fpw is None:
+                raise ValueError(
+                    "dmd_fp_gate_enabled=true but no per-frame fingerprint "
+                    "weight has been computed. Set dmd_fp_every>=1 (the "
+                    "probe supplies the weights) and confirm "
+                    "_dmd_fp_denoise_fn is installed. Refusing to run an "
+                    "'attenuated' DMD that is silently un-attenuated."
+                )
+        if _fpw is None:
+            # DEFAULT-OFF PATH -- must stay bit-for-bit what it was
+            # before the gate existed. Do not "unify" this with the
+            # weighted branch using an all-ones weight. MEASURED: the two
+            # reductions do happen to agree bit-for-bit on the cases
+            # tested, but that is an accident of this reduction and not a
+            # guarantee, and the unified form would also emit gate
+            # telemetry on a run with the gate off. Keep them separate.
+            return 0.5 * F.mse_loss(
+                original_latent.double()[gradient_mask],
+                (original_latent.double() - grad.double()).detach()[gradient_mask],
+                reduction="mean",
+            )
+        _w = _fpw.to(original_latent.device, original_latent.dtype)
+        _w = _w.view(1, -1, 1, 1, 1).expand_as(original_latent)
+        _se = (
+            original_latent.double()
+            - (original_latent.double() - grad.double()).detach()
+        ) ** 2
+        _wm = _w.double()[gradient_mask]
+        dmd_loss = 0.5 * (
+            (_se[gradient_mask] * _wm).sum() / _wm.sum().clamp_min(1e-8)
+        )
+        # Telemetry over the weights ACTUALLY APPLIED (mask-selected),
+        # not over every frame in the tensor: the unsupervised frames
+        # contribute nothing to the loss and including them would report
+        # an attenuation that never happened.
+        _mean = float(_wm.mean())
+        log_dict["dmd_fp_gate_w_mean"] = _mean
+        log_dict["dmd_fp_gate_w_min"] = float(_wm.min())
+        log_dict["dmd_fp_gate_w_max"] = float(_wm.max())
+        # SHARE: mean weight as a fraction of the unattenuated 1.0, i.e.
+        # how much of DMD actually SURVIVES the gate. Standing campaign
+        # rule -- a gate that reports only its raw values can be fully
+        # closed or fully open without the step line saying so.
+        log_dict["dmd_fp_gate_share"] = _mean
+        # Staleness: the probe runs once every ``dmd_fp_every`` DMD
+        # calls, so the weights in force are up to that many calls old.
+        # An unexpectedly large age means the probe stopped firing while
+        # the gate kept attenuating on frozen numbers.
+        _idx = int(getattr(self, "_dmd_gate_call_idx", 0))
+        _at = getattr(self, "_last_dmd_fp_calc_idx", None)
+        if _at is not None:
+            log_dict["dmd_fp_gate_w_age"] = float(_idx - int(_at))
+        # Stash for the STEP LINE. dmd_log_dict is wandb-only and never
+        # reaches stderr, so a step-line lookup against it finds nothing,
+        # forever, silently -- the exact bug already caught twice in this
+        # campaign. getattr on the model is the proven path.
+        self._last_dmd_fp_gate_w_mean = _mean
+        self._last_dmd_fp_gate_w_min = float(_wm.min())
+        self._last_dmd_fp_gate_w_max = float(_wm.max())
+        self._last_dmd_fp_gate_share = _mean
+        return dmd_loss
+
+    def _dmd_fp_perturb(
+        self, x: torch.Tensor, mode: str, scale: float, gen: torch.Generator,
+    ) -> torch.Tensor:
+        """A NON-GAUSSIAN, structured displacement of ``x``.
+
+        Non-gaussian is the whole point. Gaussian displacement is the
+        forward process the teacher was TRAINED TO INVERT, so undoing it
+        demonstrates nothing but ordinary competence and would score high
+        everywhere. A structured corruption leaves the data manifold in a
+        way the noise schedule does not model, so restoring it requires
+        the teacher to actually know where that manifold IS -- which is
+        the discriminating case.
+
+        Returns ``delta`` (the displacement), not the displaced sample,
+        because the probe needs ``delta`` to score ``cos(r, -delta)``.
+        """
+        xf = x.float()
+        if mode == "patch_shuffle":
+            # Break local spatial arrangement, preserve marginals.
+            B, F_, C, H, W = xf.shape
+            ph = max(1, H // 4); pw = max(1, W // 4)
+            nh, nw = H // ph, W // pw
+            core = xf[..., :nh * ph, :nw * pw]
+            blocks = core.reshape(B, F_, C, nh, ph, nw, pw)
+            blocks = blocks.permute(0, 1, 2, 3, 5, 4, 6).reshape(
+                B, F_, C, nh * nw, ph, pw)
+            perm = torch.randperm(nh * nw, generator=gen, device=gen.device)
+            shuf = blocks[:, :, :, perm.to(blocks.device)]
+            shuf = shuf.reshape(B, F_, C, nh, nw, ph, pw).permute(
+                0, 1, 2, 3, 5, 4, 6).reshape(B, F_, C, nh * ph, nw * pw)
+            out = xf.clone()
+            out[..., :nh * ph, :nw * pw] = shuf
+            d = out - xf
+        elif mode == "channel_rot":
+            # Latent channels are NOT interchangeable; rolling them breaks
+            # their joint statistics while preserving every marginal.
+            d = torch.roll(xf, shifts=1, dims=2) - xf
+        else:  # "hf_scramble" (default) -- destroy fine texture, keep
+               # low frequencies. Targets exactly the band the texture
+               # measurement found dead (teacher target/GT ~ 0.37).
+            lp = torch.nn.functional.avg_pool2d(
+                xf.flatten(0, 2).unsqueeze(1), kernel_size=2, stride=1,
+                padding=1, count_include_pad=False,
+            ).squeeze(1)[..., :xf.shape[-2], :xf.shape[-1]]
+            lp = lp.reshape(xf.shape)
+            hf = xf - lp                       # the high-frequency band
+            flat = hf.reshape(hf.shape[0], hf.shape[1], hf.shape[2], -1)
+            perm = torch.randperm(flat.shape[-1], generator=gen,
+                                  device=gen.device).to(flat.device)
+            d = flat[..., perm].reshape(hf.shape) - hf
+        n = d.flatten(1).norm(dim=1).clamp_min(1e-8)
+        xn = xf.flatten(1).norm(dim=1)
+        # Scale to a FIXED fraction of the sample's own norm, so the probe
+        # asks the same question of every sample regardless of its scale.
+        return (d / n.view(-1, 1, 1, 1, 1)) * (xn * scale).view(-1, 1, 1, 1, 1)
+
+    @torch.no_grad()
+    def _dmd_fingerprint_per_frame(
+        self, x, denoise_fn, gen, *, mode: str, scale: float, seeds: int,
+    ):
+        """``s`` resolved PER FRAME, returned as ``[F]``.
+
+        Per-frame and not a scalar because that is where the effect
+        actually lives. The 2026-08-24 measurement found DMD's alignment
+        POSITIVE at band frames 9-13 and collapsing to -0.53 by frame 17,
+        with a cliff between 14 and 15 -- inside a SINGLE band, in one
+        forward. A scalar gate would average that cliff away and apply
+        one compromise weight to frames that need opposite treatment:
+        full DMD at the band's head, none at its tail. So the gate has to
+        be a per-frame weight vector, and therefore so does the score
+        that drives it.
+        """
+        acc = None
+        n_ok = 0
+        for _ in range(max(1, int(seeds))):
+            delta = self._dmd_fp_perturb(x, mode, scale, gen)
+            x_p = x.float() + delta
+            x0_hat = denoise_fn(x_p)
+            if x0_hat is None:
+                continue
+            r = (x0_hat.float() - x_p)
+            d = -delta
+            # flatten everything EXCEPT the frame axis (dim 1)
+            rf = r.permute(1, 0, 2, 3, 4).reshape(r.shape[1], -1)
+            df = d.permute(1, 0, 2, 3, 4).reshape(d.shape[1], -1)
+            rn, dn = rf.norm(dim=1), df.norm(dim=1)
+            cs = torch.where(
+                (rn > 1e-8) & (dn > 1e-8),
+                (rf * df).sum(dim=1) / (rn * dn).clamp_min(1e-8),
+                torch.zeros_like(rn),
+            )
+            acc = cs if acc is None else acc + cs
+            n_ok += 1
+        return (acc / n_ok) if n_ok else None
+
+    @torch.no_grad()
+    def _dmd_fingerprint(
+        self,
+        x: torch.Tensor,
+        denoise_fn,
+        gen: torch.Generator,
+        *,
+        mode: str,
+        scale: float,
+        seeds: int,
+    ) -> Optional[float]:
+        """``s(x) = cos(r, -delta)`` averaged over ``seeds`` noise draws.
+
+        HIGHER => the teacher restores the perturbation better, i.e. it
+        localises the manifold better here. LOWER => it does not, so its
+        direction is not trustworthy and the gate must close.
+
+        **``s`` IS ORDINAL ONLY -- it has no absolute meaning and 0 is
+        NOT its floor.** ``r = x0_hat - x_p`` keeps a ``-x_p`` term even
+        for a completely oblivious teacher, and the perturbations REPLACE
+        the sample's own content, so ``-x_p`` anti-correlates with
+        ``-delta`` by construction. An ``x0_hat = 0`` teacher measures
+        ``s ~ -0.68 .. -0.35`` depending on mode and scale (table in
+        docs/DMD_FINGERPRINT_PROBE.md §2); the in-training baseline is
+        ~ -0.4. Read ``s`` ONLY through the two-anchor normalisation
+        ``m = (s - s_off) / (s_gt - s_off)``.
+        """
+        vals = []
+        for _ in range(max(1, int(seeds))):
+            delta = self._dmd_fp_perturb(x, mode, scale, gen)
+            x_p = x.float() + delta
+            x0_hat = denoise_fn(x_p)
+            if x0_hat is None:
+                return None
+            r = (x0_hat.float() - x_p).flatten(1)
+            dneg = (-delta).flatten(1)
+            rn, dn = r.norm(dim=1), dneg.norm(dim=1)
+            ok = (rn > 1e-8) & (dn > 1e-8)
+            if not bool(ok.any()):
+                continue
+            cs = ((r * dneg).sum(dim=1)[ok] / (rn[ok] * dn[ok]))
+            vals.append(float(cs.mean()))
+        return (sum(vals) / len(vals)) if vals else None
+
+    def _install_dmd_fp_denoise_fn(
+        self,
+        timestep: torch.Tensor,
+        conditional_dict: dict,
+        tf_kwargs_real: Dict[str, Any],
+        reference: torch.Tensor,
+    ) -> None:
+        """Install (or clear) the teacher denoiser the probe calls.
+
+        ``s(x) = cos(x0_hat - x_p, -delta)`` is only that quantity when
+        ``x0_hat`` is the teacher's x0 prediction for the GAUSSIAN-NOISED
+        perturbed sample::
+
+            x_t    = scheduler.add_noise(x_p, eps, t)   # forward process
+            x0_hat = real_score(x_t, t, **tf_kwargs_real)[1]
+
+        Noising is the mechanism, not a detail: the probe asks whether
+        the teacher can restore a NON-gaussian displacement after the
+        gaussian corruption it was trained to invert. Without the noise
+        step the teacher is being asked a different question entirely.
+
+        Installed from :meth:`_compute_kl_grad`, at the one place the
+        real-score call is already fully parameterised, because the probe
+        must use THE SAME teacher whose competence it is measuring --
+        that is the entire premise -- and must run it on the SAME
+        ``tf_kwargs_real`` contract as every other real-score call here.
+
+        KNOWN-DEFECT HISTORY (2026-08-24, docs/DMD_FINGERPRINT_PROBE.md
+        §6). The first version of this hook carried four defects at once:
+        it noised nothing (the noising was guarded on ``hasattr(self,
+        "_add_noise_to_x0")`` -- a method that exists NOWHERE in the
+        repo, so the guard was permanently false and ``x_t = x_p``
+        silently); it returned element ``[0]``, the FLOW, not x0; it
+        dropped ``tf_kwargs_real``; and it called ``real_score`` up to
+        three times per invocation. That is the shape of this rewrite:
+        no capability guards, no fallbacks, ONE call, explicit unpack.
+        If the hook cannot be built it is ``None`` and the probe simply
+        does not run -- strictly better than a probe that runs on the
+        wrong quantity and reports a number anyway.
+        """
+        _sched = getattr(self, "scheduler", None)
+        if _sched is None or not hasattr(_sched, "add_noise"):
+            # NEVER fall back to an un-noised passthrough. That was the
+            # original defect and it was silent. No noising => no probe,
+            # and say so on stderr (dmd_log_dict is wandb-only).
+            self._dmd_fp_denoise_fn = None
+            # Once, not once per DMD call -- loud, not spam. stderr
+            # because dmd_log_dict is wandb-only and never reaches it.
+            if not getattr(self, "_dmd_fp_hook_warned", False):
+                self._dmd_fp_hook_warned = True
+                import sys as _sys
+                print(
+                    "[dmd_fp] denoise hook DISABLED: self.scheduler exposes "
+                    "no add_noise, so the perturbed sample cannot be noised. "
+                    "The fingerprint probe will NOT run (dmd_fp_every="
+                    f"{int(getattr(self, 'dmd_fp_every', 0) or 0)}). "
+                    "Refusing an un-noised passthrough.",
+                    file=_sys.stderr, flush=True,
+                )
+            return
+
+        def _fp_denoise(x_p, _t=timestep, _c=conditional_dict,
+                        _kw=dict(tf_kwargs_real), _ref=reference):
+            with torch.no_grad():
+                x = x_p.to(device=_ref.device, dtype=_ref.dtype)
+                eps = torch.randn_like(x)
+                # The canonical noising in this file: x_t = (1-s)*x_p +
+                # s*eps, with the same sigma lookup ``_sigma_at_timestep``
+                # mirrors. Flatten/unflatten as at every other call site.
+                x_t = self.scheduler.add_noise(
+                    x.flatten(0, 1), eps.flatten(0, 1), _t.reshape(-1),
+                ).unflatten(0, x.shape[:2])
+                # ONE call. [0] is the FLOW prediction; x0 is [1].
+                _flow, x0_hat = self.real_score(
+                    noisy_image_or_video=x_t,
+                    conditional_dict=_c,
+                    timestep=_t,
+                    **_kw,
+                )
+                return x0_hat
+
+        self._dmd_fp_denoise_fn = _fp_denoise
+
+    def _dmd_error_gate_weight(
+        self,
+        x0: torch.Tensor,
+        pred_real: torch.Tensor,
+        grad: torch.Tensor,
+        gt_target: Optional[torch.Tensor],
+        gradient_mask: torch.Tensor,
+        log_dict: Dict[str, Any],
+    ) -> float:
+        """Manifold gate keyed on **DMD's OWN error**, not on MAE-vs-GT.
+
+        Thesis and derivation: ``docs/DMD_MANIFOLD_GATE.md``. In short:
+        DMD's direction is trustworthy only near the data manifold; far
+        from it the one-step teacher is extrapolating outside the region
+        it was trained on, its score estimate stops being meaningful, and
+        the DMD update AMPLIFIES the drift instead of correcting it. The
+        rollout compounds drift with depth, so the tail is exactly where
+        DMD does damage -- and exactly where the (now decoupled, pixel)
+        GAN should be doing the work instead.
+
+        **The signal is ``e = |x0 - pred_real|``** -- how far the frozen
+        teacher wants to move the student's own sample. This is DMD's
+        intrinsic error and it is the right quantity for three reasons:
+
+        1. **It needs no GT.** The MAE gate
+           (:meth:`_dmd_mae_gate_weight`) compares both errors against
+           ``gt_target`` and is therefore confined to supervised slots.
+           The drifted tail is precisely where GT alignment is weakest,
+           so a GT-keyed gate is least reliable where it matters most.
+        2. **It measures TEACHER COMPETENCE, not student badness.** A
+           large ``|x0 - pred_real|`` says the teacher strongly disagrees
+           with this sample -- the signature of being outside its
+           training region. Student-vs-GT error can be large simply
+           because the student is bad while the teacher remains perfectly
+           competent, which is the regime where DMD is maximally USEFUL.
+           Gating on that would switch DMD off exactly when it works.
+        3. **It is already computed.** ``p_real`` in
+           :meth:`_compute_kl_grad` is this same quantity; the CausVid
+           normaliser divides by its mean. Nothing new is estimated.
+
+        ``align`` is MEASUREMENT-ONLY and is the thesis's falsifiable
+        core: ``cos(-grad, GT - x0)`` on the supervised slots. ``-grad``
+        is the direction the update actually moves the sample; ``GT-x0``
+        points at the manifold. So ``align > 0`` means DMD pulls toward
+        the manifold and ``align < 0`` means it pushes away. **The gate
+        threshold is the value of ``e`` at which ``align`` changes
+        sign** -- read it off a run, do not guess it. If ``align`` never
+        goes negative the thesis is falsified for this configuration and
+        this gate must NOT be shipped; that is why the measurement is
+        landed before the gate is armed. ``align`` needs GT, but only for
+        the measurement -- the deployed gate does not.
+
+        Returns 1.0 (no gating) whenever the gate is disabled or the
+        thresholds are unset, so this is inert until deliberately armed.
+        """
+        if gradient_mask is None or not gradient_mask.any():
+            return 1.0
+        with torch.no_grad():
+            m = gradient_mask
+            e_t = (x0.float() - pred_real.float())[m].abs().mean()
+            e = float(e_t.item())
+            log_dict["dmd_err_gate_e"] = e
+            self._dmd_gate_call_idx = int(
+                getattr(self, "_dmd_gate_call_idx", 0)) + 1
+            # ALSO stash on self. dmd_log_dict goes to wandb only -- it
+            # never reaches stderr, so a step-line lookup against it finds
+            # nothing, forever, silently. That is the same shape as the
+            # null smokes and the unconsumed grad-check knob. The proven
+            # path in this file is an attribute the trainer reads via
+            # getattr (see _last_dmd_mae_gate_weight), so use that.
+            self._last_dmd_err = e
+            # --- MEASUREMENT: does DMD point toward the manifold here? --
+            if gt_target is not None and gt_target.shape == x0.shape:
+                gtf = gt_target.to(dtype=x0.dtype, device=x0.device).float()
+                upd = (-grad.float())[m]           # the actual update dir
+                tgt = (gtf - x0.float())[m]        # toward the manifold
+                un, tn = upd.norm(), tgt.norm()
+                if float(un) > 1e-12 and float(tn) > 1e-12:
+                    _al = float((upd * tgt).sum() / (un * tn))
+                    log_dict["dmd_align"] = _al
+                    self._last_dmd_align = _al
+                    # Companion: the student's own distance to GT, so the
+                    # crossover can be plotted against EITHER axis.
+                    _gd = float((gtf - x0.float())[m].abs().mean())
+                    log_dict["dmd_gt_dist"] = _gd
+                    self._last_dmd_gt_dist = _gd
+                    # DECISIVE, cosine-free test of "is the teacher even
+                    # the better oracle here?". align < 0 is worse than
+                    # random and no benign hypothesis predicts it
+                    # (mode-seeking gives +0.707, a 2-sigma-wrong teacher
+                    # still gives +0.32), so either the teacher's target
+                    # is FURTHER from GT than the student already is, or
+                    # the cosine is mis-signed. This distinguishes them
+                    # without trusting any direction convention:
+                    #   teacher_gt_dist > gt_dist  =>  moving toward the
+                    #   teacher provably moves AWAY from the manifold.
+                    # ---- TEXTURE vs SPATIAL STRUCTURE -----------------
+                    # Researcher hypothesis: deeper into the rollout DMD
+                    # may find a DEGENERATE solution that DEGRADES TEXTURE
+                    # while PRESERVING SPATIAL PATTERN -- which would make
+                    # ``align`` RECOVER even as the sample gets worse.
+                    # A pure cosine cannot tell "genuinely back on the
+                    # manifold" from "collapsed to a smooth thing that
+                    # happens to be spatially aligned", so measure texture
+                    # SEPARATELY. Total-variation as the texture proxy
+                    # (spatial first differences): cheap, conv-free, and
+                    # exactly the high-frequency content a smoothing
+                    # collapse destroys first.
+                    def _tv(t):
+                        t = t.float()
+                        return float(
+                            ((t[..., 1:, :] - t[..., :-1, :]).abs().mean()
+                             + (t[..., :, 1:] - t[..., :, :-1]).abs().mean())
+                            * 0.5
+                        )
+                    _fsel = m.any(dim=(0, 2, 3, 4)) if m.dim() == 5 else None
+                    try:
+                        if _fsel is not None and bool(_fsel.any()):
+                            _x0f = x0[:, _fsel]
+                            _gtf_f = gtf[:, _fsel]
+                            _prf = pred_real[:, _fsel]
+                        else:
+                            _x0f, _gtf_f, _prf = x0, gtf, pred_real
+                        _tv_x0, _tv_gt, _tv_pr = _tv(_x0f), _tv(_gtf_f), _tv(_prf)
+                        log_dict["dmd_tv_x0"] = _tv_x0
+                        log_dict["dmd_tv_gt"] = _tv_gt
+                        log_dict["dmd_tv_pred_real"] = _tv_pr
+                        # <1 => the student has LOST texture vs GT.
+                        log_dict["dmd_tv_ratio"] = (
+                            _tv_x0 / _tv_gt if _tv_gt > 1e-8 else float("nan"))
+                        # <1 => the TEACHER'S OWN TARGET is texturally
+                        # dead vs GT, i.e. DMD is pulling toward a
+                        # smoothed solution BY CONSTRUCTION.
+                        log_dict["dmd_tv_ratio_teacher"] = (
+                            _tv_pr / _tv_gt if _tv_gt > 1e-8 else float("nan"))
+                    except Exception:
+                        pass
+                            # ---- DMD SELF-FINGERPRINT (the GT-sample-free score)
+                    # docs/DMD_FINGERPRINT_PROBE.md. Measures how well DMD
+                    # can LOCALISE the manifold at this sample, using DMD
+                    # alone -- no external critic, because the question is
+                    # how wrong DMD is and another model would answer about
+                    # itself. Calibrated against two anchors we have BY
+                    # CONSTRUCTION: GT (on-manifold by definition) and
+                    # GT+large corruption (off-manifold by construction).
+                    _fp_every = int(getattr(self, "dmd_fp_every", 0) or 0)
+                    _dfn = getattr(self, "_dmd_fp_denoise_fn", None)
+                    if (_fp_every > 0 and callable(_dfn)
+                            and (int(getattr(self, "_dmd_gate_call_idx", 0))
+                                 % _fp_every) == 0):
+                        # Resolve the (measured) probe magnitudes OUTSIDE
+                        # the try below -- an unset scale is a config
+                        # error and must NOT be swallowed into the
+                        # _dmd_fp_err counter, which is for genuine
+                        # runtime flakes. Silent degradation of a probe
+                        # into "ran with a made-up number" is precisely
+                        # the failure this whole arming exercise removes.
+                        _mode, _sc, _off_sc, _sd = self._dmd_fp_probe_params()
+                        try:
+                            _g = torch.Generator(device=x0.device)
+                            _g.manual_seed(1234 + int(
+                                getattr(self, "_dmd_gate_call_idx", 0)))
+                            # s(x) on the live sample
+                            _s_x = self._dmd_fingerprint(
+                                x0.detach(), _dfn, _g,
+                                mode=_mode, scale=_sc, seeds=_sd)
+                            # ANCHOR HIGH: GT is on-manifold by definition
+                            _s_gt = self._dmd_fingerprint(
+                                gtf, _dfn, _g,
+                                mode=_mode, scale=_sc, seeds=_sd)
+                            # ANCHOR LOW: GT wrecked by a large structured
+                            # corruption is off-manifold by construction.
+                            # ``dmd_fp_off_scale`` IS that corruption
+                            # magnitude -- it defines where the m=0 anchor
+                            # sits and therefore the whole normalisation,
+                            # so it is a measured calibration value, not
+                            # the ``max(0.6, scale*4)`` literal it used to
+                            # be buried as.
+                            _wrecked = gtf + self._dmd_fp_perturb(
+                                gtf, _mode, _off_sc, _g)
+                            _s_off = self._dmd_fingerprint(
+                                _wrecked, _dfn, _g,
+                                mode=_mode, scale=_sc, seeds=_sd)
+                            if None not in (_s_x, _s_gt, _s_off):
+                                log_dict["dmd_fp_s"] = _s_x
+                                log_dict["dmd_fp_s_gt"] = _s_gt
+                                log_dict["dmd_fp_s_off"] = _s_off
+                                _span = _s_gt - _s_off
+                                if abs(_span) > 1e-6:
+                                    # 0 = provably off, 1 = as well-localised
+                                    # as GT itself.
+                                    _mx = (_s_x - _s_off) / _span
+                                    _mx = max(0.0, min(1.0, _mx))
+                                    log_dict["dmd_fp_m"] = _mx
+                                    self._last_dmd_fp_m = _mx
+                                    # PER-FRAME weights -- what the gate
+                                    # actually consumes. Same two anchors,
+                                    # applied frame-wise, so a band whose
+                                    # head is on-manifold and whose tail
+                                    # has drifted gets DMD at the head and
+                                    # not at the tail, instead of one
+                                    # averaged compromise everywhere.
+                                    _spf = self._dmd_fingerprint_per_frame(
+                                        x0.detach(), _dfn, _g,
+                                        mode=_mode, scale=_sc, seeds=_sd)
+                                    if _spf is not None:
+                                        _mpf = ((_spf - _s_off) / _span).clamp(0.0, 1.0)
+                                        # RAW per-frame ``m`` -- the
+                                        # study's observable. Logged
+                                        # BEFORE any response curve is
+                                        # applied, so the measurement is
+                                        # not contaminated by the mapping
+                                        # it is supposed to calibrate.
+                                        self._last_dmd_fp_m_per_frame = _mpf.detach()
+                                        log_dict["dmd_fp_m_frame_first"] = float(_mpf[0])
+                                        log_dict["dmd_fp_m_frame_last"] = float(_mpf[-1])
+                                        log_dict["dmd_fp_m_frame_delta"] = float(
+                                            _mpf[-1] - _mpf[0])
+                                        # WEIGHTS: only once the response
+                                        # curve has actually been measured.
+                                        # Probe-only runs (gate off, calib
+                                        # unset) get the measurement and no
+                                        # weights -- never a weight built
+                                        # from an assumed curve.
+                                        if not self._dmd_fp_missing_calib():
+                                            _wpf = self._dmd_fp_gate_weight_from_m(_mpf)
+                                            self._last_dmd_fp_w_per_frame = _wpf.detach()
+                                            self._last_dmd_fp_calc_idx = int(
+                                                getattr(self, "_dmd_gate_call_idx", 0))
+                                            log_dict["dmd_fp_w_frame_first"] = float(_wpf[0])
+                                            log_dict["dmd_fp_w_frame_last"] = float(_wpf[-1])
+                                            log_dict["dmd_fp_w_frame_delta"] = float(
+                                                _wpf[-1] - _wpf[0])
+                                else:
+                                    # Anchors collapsed => the probe cannot
+                                    # discriminate here. Regime flag, never
+                                    # a forgeable 0.0 (which would read as
+                                    # "fully off-manifold").
+                                    log_dict["dmd_fp_degenerate"] = 1.0
+                                self._last_dmd_fp_s = _s_x
+                        except Exception:
+                            self._dmd_fp_err = int(
+                                getattr(self, "_dmd_fp_err", 0)) + 1
+                    _tgd = float((gtf - pred_real.float())[m].abs().mean())
+                    log_dict["dmd_teacher_gt_dist"] = _tgd
+                    self._last_dmd_teacher_gt_dist = _tgd
+                    # >1 means the teacher is the worse oracle here.
+                    log_dict["dmd_teacher_worse_ratio"] = (
+                        _tgd / _gd if _gd > 1e-8 else float("nan"))
+                    # PER-FRAME breakdown. The bidirectional TF teacher is
+                    # anchored by CLEAN GT CONTEXT on both sides of the
+                    # supervised band (the band's own GT is masked, so this
+                    # is not a leak -- but it IS an anchor). An anchored
+                    # teacher does not lose competence off-distribution,
+                    # which is the exact mechanism the thesis needs, so a
+                    # band-mean align can stay positive even if the effect
+                    # is real. Frames FURTHEST from the clean anchor are
+                    # the closest available proxy for the unanchored (AR /
+                    # inference) regime, so resolve align per frame and let
+                    # the analysis look for a gradient ACROSS the band
+                    # rather than only a global sign change.
+                    try:
+                        _pf = []
+                        _F = int(x0.shape[1])
+                        for _fi in range(_F):
+                            _mf = m[:, _fi]
+                            if not bool(_mf.any()):
+                                _pf.append(None)
+                                continue
+                            _u = (-grad.float())[:, _fi][_mf]
+                            _t = (gtf - x0.float())[:, _fi][_mf]
+                            _un, _tn = _u.norm(), _t.norm()
+                            _pf.append(
+                                float((_u * _t).sum() / (_un * _tn))
+                                if (float(_un) > 1e-12 and float(_tn) > 1e-12)
+                                else None
+                            )
+                        log_dict["dmd_align_per_frame"] = _pf
+                    except Exception:
+                        pass
+            # TRACE DUMP -- the actual instrument for locating the
+            # crossover. The step line prints every 10th step, which over
+            # a 60-step smoke is ~4 points: nowhere near enough to fit a
+            # sign change. One row PER DMD CALL gives ~40-60 samples from
+            # the same run, across the rollout-depth spread the smoke
+            # already randomises (rolling_random_depth 2..6), so drift
+            # varies within a single run rather than needing a sweep.
+            _tp = getattr(self, "dmd_err_gate_trace_path", None)
+            if _tp:
+                try:
+                    import json as _json
+                    with open(str(_tp), "a") as _fh:
+                        _fh.write(_json.dumps({
+                            "e": e,
+                            "align": log_dict.get("dmd_align"),
+                            "gt_dist": log_dict.get("dmd_gt_dist"),
+                            "teacher_gt_dist": log_dict.get(
+                                "dmd_teacher_gt_dist"),
+                            "fp_s": log_dict.get("dmd_fp_s"),
+                            "fp_s_gt": log_dict.get("dmd_fp_s_gt"),
+                            "fp_s_off": log_dict.get("dmd_fp_s_off"),
+                            "fp_m": log_dict.get("dmd_fp_m"),
+                            "teacher_worse_ratio": log_dict.get(
+                                "dmd_teacher_worse_ratio"),
+                            "n_slots": int(m.sum().item()),
+                            # Call index: the trend question ("zigzag, or
+                            # hold-then-rise-then-stagnate?") is about the
+                            # SEQUENCE. Binning by e destroys the ordering,
+                            # so record it explicitly.
+                            "i": int(getattr(self, "_dmd_gate_call_idx", 0)),
+                            "tv_ratio": log_dict.get("dmd_tv_ratio"),
+                            "tv_ratio_teacher": log_dict.get(
+                                "dmd_tv_ratio_teacher"),
+                            "align_per_frame": log_dict.get(
+                                "dmd_align_per_frame"),
+                            # Per-frame DMD error too, so align can be
+                            # plotted against the frame's OWN drift rather
+                            # than the band mean.
+                            "e_per_frame": [
+                                (float((x0.float() - pred_real.float())
+                                       [:, _i][m[:, _i]].abs().mean())
+                                 if bool(m[:, _i].any()) else None)
+                                for _i in range(int(x0.shape[1]))
+                            ],
+                        }) + "\n")
+                except Exception:
+                    # Telemetry must never kill a step; but count it so a
+                    # silently-empty trace is distinguishable from a
+                    # genuinely empty measurement.
+                    self._dmd_trace_err = int(
+                        getattr(self, "_dmd_trace_err", 0)) + 1
+            if not bool(getattr(self, "dmd_err_gate_enabled", False)):
+                return 1.0
+            e_lo = getattr(self, "dmd_err_gate_e_lo", None)
+            e_hi = getattr(self, "dmd_err_gate_e_hi", None)
+            if e_lo is None or e_hi is None:
+                # Same discipline as pix_gan_weight / pix_r1_gamma: a
+                # threshold that was never MEASURED must not be silently
+                # inherited. Absence raises rather than defaulting.
+                raise ValueError(
+                    "dmd_err_gate_enabled=true but dmd_err_gate_e_lo/"
+                    "dmd_err_gate_e_hi are unset. These are NOT "
+                    "inheritable defaults -- they are the measured "
+                    "align-crossover for THIS teacher/data pair (see "
+                    "docs/DMD_MANIFOLD_GATE.md §5). Run the measurement "
+                    "first and set them from dmd_align vs dmd_err_gate_e."
+                )
+            e_lo, e_hi = float(e_lo), float(e_hi)
+            if e_hi <= e_lo:
+                raise ValueError(
+                    f"dmd_err_gate_e_hi ({e_hi}) must exceed e_lo ({e_lo})."
+                )
+            a = float(getattr(self, "dmd_err_gate_ema", 0.9))
+            prev = getattr(self, "_dmd_err_gate_ema", None)
+            e_s = e if (prev is None or a <= 0.0) else a * prev + (1.0 - a) * e
+            self._dmd_err_gate_ema = e_s
+            # Falling ramp: full DMD at/below e_lo, off at/above e_hi.
+            # OPPOSITE sense to the MAE gate by design -- see the doc's
+            # polarity table; that gate cuts DMD at the r->1 end (student
+            # caught the teacher), this one cuts it at the far end.
+            w = (e_hi - e_s) / (e_hi - e_lo)
+            w = max(float(getattr(self, "dmd_err_gate_min_weight", 0.0)),
+                    min(1.0, w))
+            log_dict["dmd_err_gate_e_ema"] = e_s
+            log_dict["dmd_err_gate_weight"] = w
+            self._last_dmd_err_gate_weight = float(w)
+            return float(w)
+
     def _dmd_mae_gate_weight(
         self,
         pred_real: torch.Tensor,
@@ -5403,6 +6318,16 @@ class ActionForcingDMD(SelfForcingModel):
         # connection to anything that reads the stash; overwritten
         # each gen-step DMD pass.
         self._latest_pred_real_image = pred_real_image.detach()
+
+        # Expose a one-shot teacher denoiser for the self-fingerprint
+        # probe (docs/DMD_FINGERPRINT_PROBE.md). Captured HERE, at the one
+        # place the real-score call is already fully parameterised, so the
+        # probe measures THE SAME teacher on THE SAME contract rather than
+        # a subtly different rebuild. Body: _install_dmd_fp_denoise_fn.
+        self._install_dmd_fp_denoise_fn(
+            timestep, conditional_dict, tf_kwargs_real,
+            estimated_clean_image_or_video,
+        )
 
         # Step 3: DMD grad = (fake - real). CF normalizes by
         # |x0 - real|.mean() (eq. 8). Gated by ``normalization`` AND
@@ -6636,10 +7561,8 @@ class ActionForcingDMD(SelfForcingModel):
             self._last_dmd_mae_gate_weight = 1.0
             zero_loss = (original_latent.double() * 0.0).sum()
             return zero_loss, dmd_log_dict
-        dmd_loss = 0.5 * F.mse_loss(
-            original_latent.double()[gradient_mask],
-            (original_latent.double() - grad.double()).detach()[gradient_mask],
-            reduction="mean",
+        dmd_loss = self._dmd_loss_with_fp_gate(
+            original_latent, grad, gradient_mask, dmd_log_dict,
         )
 
         # MAE-based student-vs-teacher gate: scale the DMD loss (hence
@@ -6675,6 +7598,24 @@ class ActionForcingDMD(SelfForcingModel):
                 dmd_log_dict["rung_depth"] = float(
                     self._rung_depth.get(_rung, self.dmd_real_score_rungs)
                 )
+        # Manifold gate on DMD's OWN error. Composes MULTIPLICATIVELY
+        # with the MAE gate above because the two cut opposite ends of
+        # the same axis (docs/DMD_MANIFOLD_GATE.md §3): the MAE gate
+        # closes as the student catches the teacher (r->1), this one
+        # closes as the sample leaves the teacher's competence region.
+        # Together they are the band -- DMD on in the middle, off at both
+        # extremes. Measurement-only until armed.
+        _err_w = self._dmd_error_gate_weight(
+            x0=original_latent.detach(),
+            pred_real=pred_real_image_detached,
+            grad=grad,
+            gt_target=gt_target,
+            gradient_mask=gradient_mask,
+            log_dict=dmd_log_dict,
+        )
+        if _err_w != 1.0:
+            _gate_w = _gate_w * _err_w
+            dmd_log_dict["dmd_gate_w_combined"] = float(_gate_w)
         if _gate_w != 1.0:
             dmd_loss = dmd_loss * _gate_w
         # TF (mean-seeking) head weight. Applied AFTER the MAE gate so the
@@ -8079,11 +9020,25 @@ class ActionForcingDMD(SelfForcingModel):
         """
         if not bool(getattr(self, "reverse_noiser_dedrift_enabled", False)):
             return z
-        if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
-            return z
-        G = getattr(self, "reverse_noiser", None)
-        if G is None:
-            return z
+        # CARN pair-swap test (researcher, 2026-08-24): under
+        # fn_pair_mode='rollout_to_gt' the FORWARD noiser IS the corrector
+        # (F(rollout, lvl) ~= GT), so the de-drift applies F directly — no
+        # cycle / reverse net exists or is needed. Same stepping loop,
+        # same frozen-params discipline; F was trained residual=True, so
+        # residual=False returns the raw increment delta ~= (GT - x) and
+        # cur + alpha*delta is the lambda-blend toward GT.
+        if getattr(self, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt":
+            G = getattr(self, "forward_noiser", None)
+            if G is None:
+                return z
+            self._carntx_dedrift_calls = getattr(
+                self, "_carntx_dedrift_calls", 0) + 1
+        else:
+            if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
+                return z
+            G = getattr(self, "reverse_noiser", None)
+            if G is None:
+                return z
         start_level = int(start_level)
         min_level = int(getattr(self, "reverse_noiser_dedrift_min_level", 1))
         if start_level < min_level:
@@ -8113,6 +9068,16 @@ class ActionForcingDMD(SelfForcingModel):
                 # explicit relaxed (decelerating) Euler step toward the manifold.
                 delta = G_inner(cur.to(dtype=g_dtype), cs, residual=False)
                 cur = cur + alpha * delta.to(dtype=cur.dtype)
+            if (getattr(self, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt"
+                    and getattr(self, "_carntx_dedrift_calls", 0) in (1, 50)):
+                import sys as _sys
+                _rel = float((cur - z).norm() / max(float(z.norm()), 1e-8))
+                print(
+                    f"[CARNTX-DEDRIFT] call={self._carntx_dedrift_calls} "
+                    f"rel|dz|={_rel:.4f} lvl={start_level} "
+                    f"(applied to the tensor passed in — with "
+                    f"apply_to_flash=true that includes the GRADIENT slab)",
+                    file=_sys.stderr, flush=True)
             return cur
         finally:
             for _p, _r in zip(g_params, saved):
@@ -8137,6 +9102,17 @@ class ActionForcingDMD(SelfForcingModel):
         if z_dedrifted is z_raw:
             # de-drift was a no-op (disabled / level<min) -> nothing to pull to.
             return z_raw.new_zeros(())
+        if getattr(self, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt":
+            # Pair-swap test: F is the corrector and no cycle exists, so the
+            # cycle-consistency confidence gate is unavailable — use w=1
+            # (plain pull toward the corrected chunk, target detached).
+            # NB: torch.nn.functional spelled out — this function assigns a
+            # LOCAL ``F`` (the forward noiser) below, which would shadow the
+            # module alias and make ``F.mse_loss`` an UnboundLocalError.
+            # w_int applied EXPLICITLY: the first arm returned the raw mse
+            # (weight silently dropped in this early-return).
+            return w_int * torch.nn.functional.mse_loss(
+                z_raw, z_dedrifted.detach())
         if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
             return z_raw.new_zeros(())
         G = getattr(self, "reverse_noiser", None)
@@ -8187,6 +9163,114 @@ class ActionForcingDMD(SelfForcingModel):
         )
         return pred.sum() * 0.0
 
+    def _compute_fn_loss_rollout_to_gt(
+        self,
+        chunk: torch.Tensor,
+        info: Dict[str, Any],
+        critic_log: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        """CARN pair-swap test (researcher directive, 2026-08-24).
+
+        Pair = (rollout chunk at depth d -> GT chunk, SAME ride, SAME abs
+        frame positions). The forward noiser learns the style RESTORATION
+        map F(rollout, level) ~= GT directly — F is the corrector; no
+        reverse net or cycle machinery involved. Mirrors the legacy
+        pairing's discipline exactly: flash-refined input preference, npb
+        alignment invariant, CARN-level clamp, and the DDP anchor on EVERY
+        data-dependent bail (a skipped forward desyncs the FN grad-bucket
+        all-reduce -> silent hang; see ``_compute_forward_noiser_loss``).
+        The GT side comes from ``streaming_state['ride_latents_window']``
+        (always present in streaming), so anchors should be rare.
+        """
+        npb = int(self.num_frame_per_block)
+        s = self.streaming_state  # caller verified not-None
+        # RAW slab first: with reverse_noiser_dedrift_apply_to_flash=true,
+        # info['flash_dmd_gan_x0'] is F's OWN corrected output — training on
+        # it would be a feedback loop (F learns to correct its corrections).
+        # Same reason the teacher_feat path prefers the _raw key.
+        flash_chunk = info.get("flash_dmd_gan_x0_raw")
+        if flash_chunk is None:
+            flash_chunk = info.get("flash_dmd_gan_x0")
+        fn_input_chunk = (
+            flash_chunk.detach() if flash_chunk is not None
+            else chunk.detach()
+        )
+        ride_window = s.get("ride_latents_window")
+        if ride_window is None:
+            return self._forward_noiser_ddp_anchor(fn_input_chunk, npb)
+        chunk_size_critic = int(fn_input_chunk.shape[1])
+        if chunk_size_critic % npb != 0:
+            return self._forward_noiser_ddp_anchor(fn_input_chunk, npb)
+        n_chunks = chunk_size_critic // npb
+        abs_new_start = int(info.get("abs_frame_start", 0))
+        overlap_critic = int(info.get("overlap", 0))
+        chunk_abs_start = abs_new_start - overlap_critic
+        if chunk_abs_start % npb != 0:
+            raise RuntimeError(
+                f"_compute_fn_loss_rollout_to_gt: chunk_abs_start="
+                f"{chunk_abs_start} not divisible by npb={npb} "
+                f"(abs_frame_start={abs_new_start}, "
+                f"overlap={overlap_critic})."
+            )
+        num_seed_r1 = int(self.dmd_context_clean_frames // npb)
+        gt_total = int(ride_window.shape[1])
+        losses: list = []
+        for c in range(n_chunks):
+            f_start = c * npb
+            f_end = f_start + npb
+            abs_f_start = chunk_abs_start + f_start
+            abs_f_end = chunk_abs_start + f_end
+            if abs_f_start < 0 or abs_f_end > gt_total:
+                continue
+            chunk_abs_idx = abs_f_start // npb
+            carn_lvl = min(
+                max(0, chunk_abs_idx - (num_seed_r1 - 1)),
+                int(self.forward_noiser_max_carn_step),
+            )
+            if carn_lvl <= 0:
+                # Seed region: the rollout IS GT (teacher-forced), so the
+                # pair is (GT, GT) — identity. The critic window should
+                # not reach here (legacy: rolled region only); skip as a
+                # guard rather than train identity at level 0.
+                continue
+            target_gt = ride_window[:, abs_f_start:abs_f_end].to(
+                dtype=fn_input_chunk.dtype,
+                device=fn_input_chunk.device,
+            ).detach()
+            input_roll = fn_input_chunk[:, f_start:f_end].detach()
+            losses.append((input_roll, target_gt, carn_lvl))
+        if not losses:
+            return self._forward_noiser_ddp_anchor(fn_input_chunk, npb)
+        # ONE batched forward for all pairs: DDP-clean (exactly one FN
+        # forward per backward, so the reducer's bucket accounting holds
+        # when this loss gets its own dedicated backward trainer-side).
+        B = fn_input_chunk.shape[0]
+        x_in = torch.cat([t[0] for t in losses], dim=0)
+        x_tg = torch.cat([t[1] for t in losses], dim=0)
+        cs = torch.cat([
+            torch.full((B,), lvl, dtype=torch.long,
+                       device=fn_input_chunk.device)
+            for (_, _, lvl) in losses
+        ], dim=0)
+        predicted = self.forward_noiser(x_in, cs, residual=True)
+        fn_loss = F.mse_loss(predicted, x_tg)
+        critic_log["forward_noiser_loss_raw"] = fn_loss.detach()
+        critic_log["forward_noiser_n_pairs"] = float(len(losses))
+        # One-shot stderr proof the CORRECTOR pairing is live (wandb-only
+        # metrics never reach .err; the tag doubles as the resolved echo
+        # of fn_pair_mode).
+        _fc = getattr(self, "_fn_train_dbg", 0)
+        if _fc < 2:
+            self._fn_train_dbg = _fc + 1
+            import sys as _sys
+            print(
+                f"[FN-TRAIN][fn_pair_mode=rollout_to_gt] corrector ALIVE: "
+                f"n_pairs={len(losses)} "
+                f"loss_raw={float(fn_loss.detach().item()):.5f}",
+                file=_sys.stderr, flush=True,
+            )
+        return fn_loss
+
     def _compute_forward_noiser_loss(
         self,
         chunk: torch.Tensor,
@@ -8220,6 +9304,10 @@ class ActionForcingDMD(SelfForcingModel):
         s = self.streaming_state
         if s is None:
             return self._forward_noiser_ddp_anchor(chunk, npb)
+        # CARN pair-swap test: reroute BEFORE the rollout-2 requirement —
+        # the swapped pairing needs no second rollout at all.
+        if getattr(self, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt":
+            return self._compute_fn_loss_rollout_to_gt(chunk, info, critic_log)
         r2_x0 = s.get("rollout2_x0")
         r2_abs_start = s.get("rollout2_abs_frame_start")
         if r2_x0 is None or r2_abs_start is None:
@@ -9372,6 +10460,18 @@ class ActionForcingDMD(SelfForcingModel):
         # flash_dmd_enabled=False. Surfaced for the rollout viz so videos show
         # deployable output rather than the random exit-rung x0 lottery.
         info_finish_denoised = getattr(pipe, "_clean_chunk", None)
+        # A23 grad twin (pipeline gate ``pix_finish_grad_enabled``).
+        # The LADDER-ENDPOINT x0 WITH a graph back to the generator --
+        # the tensor utils/eval_causal_AR.py commits and renders, i.e.
+        # the inference-parity fake for the pixel critic. The pipeline
+        # publishes this ONLY when it actually carries a graph, so
+        # ``None`` here always means "no A23 fake this iter".
+        info_finish_denoised_grad = getattr(pipe, "_clean_chunk_grad", None)
+        # Frame-level attachment mask for the buffer above, ``[F]``
+        # bool over the chunk's frame axis. Published only together
+        # with the buffer; ``None`` whenever the buffer is ``None``.
+        info_finish_denoised_grad_mask = getattr(
+            pipe, "_clean_chunk_grad_mask", None)
 
         # Snapshot OLD previous_chunk BEFORE we overwrite — clean_x_self
         # assembly on iter k≥2 needs the iter (k-1) chunk.
@@ -9546,6 +10646,36 @@ class ActionForcingDMD(SelfForcingModel):
             "finish_denoised_chunk": (
                 info_finish_denoised.detach()
                 if info_finish_denoised is not None else None
+            ),
+            # A23 inference-parity fake. NOT detached -- this is the
+            # whole point. ``None`` when the pipeline gate is off or
+            # the buffer carried no graph. Frozen interface contract:
+            # ``finish_denoised_chunk`` above is UNCHANGED.
+            #
+            # CONSUMER CONTRACT: this buffer is only PARTIALLY live.
+            # ``requires_grad`` is True as soon as ONE block attaches,
+            # but the trailing block of a multi-block rollout is
+            # deliberately detached (pipeline memory intent), as is any
+            # block whose random exit rung WAS the last rung. A
+            # consumer that reduces its generator loss over the whole
+            # chunk silently averages in frames with no path to the
+            # generator. You MUST select on
+            # ``finish_denoised_chunk_grad_mask`` --
+            # ``fake[:, mask]`` -- rather than assume the whole chunk
+            # is live. The dilution you would otherwise eat is logged
+            # as 1 - pix_finish_grad_frames / pix_finish_grad_frames_total.
+            "finish_denoised_chunk_grad": (
+                info_finish_denoised_grad
+                if (info_finish_denoised_grad is not None
+                    and info_finish_denoised_grad.requires_grad)
+                else None
+            ),
+            # ``[F]`` bool; True = that frame's slice carries a graph.
+            "finish_denoised_chunk_grad_mask": (
+                info_finish_denoised_grad_mask
+                if (info_finish_denoised_grad is not None
+                    and info_finish_denoised_grad.requires_grad)
+                else None
             ),
         }
         # Surface MAE from pipeline.
@@ -10289,6 +11419,27 @@ class ActionForcingDMD(SelfForcingModel):
                         chunk[:, sup_frames:sup_frames + gt_after_frames].detach()
                     )
         noisy_x = torch.cat(parts, dim=1)          # [B, 21, ...]
+        # ``dmd_42f_clean_shift_fwd`` (int frames, default 0): slide the
+        # clean window FORWARD by N frames. Under clean_self_forward the
+        # student-covered span shrinks by N at the leading edge and N
+        # extra frames appear at the trailing edge -- and those trailing
+        # frames lie beyond the student's roll, so they come from GT.
+        # i.e. "clean window shifted forward N, the N new frames are GT".
+        # Existing dmd_42f_clean_drift_* cannot express this: it RAMPS
+        # -npb -> +npb over a step range and lands on multiples of npb,
+        # so a fixed +2 is not reachable through it.
+        _cshift = int(getattr(self, "dmd_42f_clean_shift_fwd", 0) or 0)
+        if _cshift:
+            clean_lo = clean_lo + _cshift
+            if getattr(self, "_cshift_dbg", 0) < 3:
+                self._cshift_dbg = getattr(self, "_cshift_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    f"[42F-CSHIFT] clean window +{_cshift} frames -> "
+                    f"clean_lo={clean_lo} (trailing {_cshift} frames now "
+                    f"beyond the student roll => GT)",
+                    file=_sys.stderr, flush=True,
+                )
         clean_x = ride_lat[:, clean_lo:clean_lo + N].to(
             dtype=chunk.dtype, device=chunk.device,
         ).detach()

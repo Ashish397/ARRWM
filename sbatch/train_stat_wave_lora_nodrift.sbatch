@@ -29,7 +29,8 @@
 #         (pairs_per_step=0) via micro_batch_groups=2 (covers every fake).
 #   R1:   token-NORMALIZED (ladd_r1_normalize_tokens) so gamma is portable
 #         -> gamma=10 on the normalized scale; fires 1-of-5 per step
-#         (ladd_r1_once_per_step); sigma=0.01.
+#         (now implicit: the R1 debt latch consumes the debt on the
+#         first disc-update; flag removed 2026-08-23); sigma=0.01.
 #   GAN volume: gan_loss_weight=1.0.  Disc CAPACITY: proj_dim 256 -> 512.
 #   DMD:  dmd_42f_seed_last=FALSE (per user) — the noisy after-block is the
 #         student's OWN rolled chunks (DETACHED/no-grad), not a GT scaffold,
@@ -71,7 +72,8 @@
 #     >>> NOTE: SMOKE FIRST to read the logged normalised r3gan_r1_grad_sq
 #         and confirm gamma=10 gives a sane penalty (not inert, not
 #         dominant); finalise gamma from that. <<<
-#   * ladd_r1_once_per_step=true: R1 fires on only the FIRST of the 5
+#   * R1-once-per-step (now implicit in the debt latch; the explicit
+#     flag was removed 2026-08-23): R1 fires on only the FIRST of the 5
 #     disc-updates per fire-step (1-of-5), cutting the R1 dose ~5x (it
 #     was firing on all 5).
 #   * gan_loss_weight 1.5 -> 1.0 (per request). NOTE the tension: this
@@ -418,7 +420,6 @@ srun torchrun \
     ladd_r1_sigma=0.01 \
     ladd_r1_every_n_steps=8 \
     ladd_r1_normalize_tokens=true \
-    ladd_r1_once_per_step=true \
     ladd_diff_aug_policy=flip \
     ladd_pairs_per_step=0 \
     ladd_disc_micro_batch_groups=2 \

@@ -1,4 +1,36 @@
 #!/bin/bash
+# #####################################################################
+# ##  NEVER EDIT THIS SCRIPT WHILE A RUN IS EXECUTING IT.            ##
+# #####################################################################
+# bash does not slurp a script into memory. It reads it incrementally
+# and remembers a BYTE OFFSET into the file. Editing the file IN PLACE
+# (`vi`, `sed -i` on some builds, an editor that truncates+rewrites,
+# any tool that keeps the same inode) makes the running shell resume at
+# a stale offset in changed bytes -- it will execute a fragment of a
+# line, skip a command, or silently run the wrong branch. It does not
+# error; it corrupts the tail of the run.
+#
+# HIT FOR REAL on 2026-08-22: this file and `run_ganfix_poolrich.sh`
+# were edited at 10:27 while the 09:47 poolrich run was executing both,
+# putting the chained eval at risk.
+#
+# BEFORE editing, check what is live:
+#     squeue -u $USER
+#     ls logs/.holder_cmd_*.sh logs/.holder_running_*.sh
+#     tail -1 logs/hold-*_<jobid>.out      # "HOLDER command exit=" = idle
+#
+# THE REMEDY -- write a temp file in the SAME directory and rename over
+# the original. rename(2) is atomic and gives the new content a NEW
+# inode, so a running bash keeps reading the old inode to completion:
+#     cp script.sh script.sh.tmp
+#     <edit script.sh.tmp>
+#     mv -f script.sh.tmp script.sh          # atomic, same filesystem
+# In Python: write the temp, then `os.replace(tmp, path)`
+# (plus `shutil.copymode(path, tmp)` to keep the +x bit).
+#
+# If a run IS live and you cannot wait: CLONE the script to a new name
+# and edit the clone. Never touch the one being executed.
+# #####################################################################
 set -euo pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
@@ -52,16 +84,16 @@ case "$MODE" in
     GAN_EXTRA="gan_enabled=false gan_loss_weight=0.0"
     ;;
   wavelet)
-    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=5e-6 gan_updates_per_step=1 gan_disc_start_step=20 gan_critic_warmup_steps=40 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=true ladd_wavelet_hf_augment=true ladd_wavelet_hf_drop_ll=true ladd_wavelet_hf_ll_weight=0.15 ladd_wavelet_hf_adapter_init_gain=0.1 ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=true ladd_gt_transition_xeq_per_channel=false ladd_gt_transition_std_equalize=false ladd_gt_transition_xeq_preserve_delta=true ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ${DISC_T_EXTRA} ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_once_per_step=true ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_r2_gamma=1.0 ladd_r2_every_n_steps=2 ladd_r2_phase_offset=1 ladd_r2_sigma=0.01 ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=true"
+    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=5e-6 gan_updates_per_step=1 gan_disc_start_step=20 gan_critic_warmup_steps=40 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=true ladd_wavelet_hf_augment=true ladd_wavelet_hf_drop_ll=true ladd_wavelet_hf_ll_weight=0.15 ladd_wavelet_hf_adapter_init_gain=0.1 ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=true ladd_gt_transition_xeq_per_channel=false ladd_gt_transition_std_equalize=false ladd_gt_transition_xeq_preserve_delta=true ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ${DISC_T_EXTRA} ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=true"
     ;;
   projected)
-    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=5e-6 gan_updates_per_step=1 gan_disc_start_step=20 gan_critic_warmup_steps=40 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=false ladd_wavelet_hf_augment=false ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=true ladd_gt_transition_xeq_per_channel=false ladd_gt_transition_std_equalize=false ladd_gt_transition_xeq_preserve_delta=true ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ladd_disc_sample_t=true ladd_disc_t_min=20 ladd_disc_t_max=980 ladd_disc_timestep_shift=5.0 ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_once_per_step=true ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_r2_gamma=1.0 ladd_r2_every_n_steps=2 ladd_r2_phase_offset=1 ladd_r2_sigma=0.01 ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=true"
+    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=5e-6 gan_updates_per_step=1 gan_disc_start_step=20 gan_critic_warmup_steps=40 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=false ladd_wavelet_hf_augment=false ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=true ladd_gt_transition_xeq_per_channel=false ladd_gt_transition_std_equalize=false ladd_gt_transition_xeq_preserve_delta=true ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ladd_disc_sample_t=true ladd_disc_t_min=20 ladd_disc_t_max=980 ladd_disc_timestep_shift=5.0 ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=true"
     ;;
   raw)
     # Item 8 cell: the wavelet arm with the WAVELET OFF and nothing else
     # changed, so `raw vs wavelet` and `t0 vs sampled` (DISC_T) form a clean
     # 2x2 against fullcarn_bidir_kl_wave01.
-    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=5e-6 gan_updates_per_step=1 gan_disc_start_step=20 gan_critic_warmup_steps=40 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=false ladd_wavelet_hf_augment=false ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=true ladd_gt_transition_xeq_per_channel=false ladd_gt_transition_std_equalize=false ladd_gt_transition_xeq_preserve_delta=true ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ${DISC_T_EXTRA} ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_once_per_step=true ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_r2_gamma=1.0 ladd_r2_every_n_steps=2 ladd_r2_phase_offset=1 ladd_r2_sigma=0.01 ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=true"
+    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=5e-6 gan_updates_per_step=1 gan_disc_start_step=20 gan_critic_warmup_steps=40 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=false ladd_wavelet_hf_augment=false ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=true ladd_gt_transition_xeq_per_channel=false ladd_gt_transition_std_equalize=false ladd_gt_transition_xeq_preserve_delta=true ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ${DISC_T_EXTRA} ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=true"
     ;;
   strict)
     # STRICT ACTION-CONDITIONED transition critic on the IDENTICAL DMD recipe
@@ -69,10 +101,10 @@ case "$MODE" in
     # the matched arm the Immediate Decision Rule asks for: same route, seed,
     # checkpoint step, inference CARN -- the ONLY delta vs `none` is the GAN.
     # Critic settings = the "full assembly" (cross-ride bank 4096, sampled disc
-    # t shared real/fake, scalar logit, frozen projector mixing, R1+R2 gamma 1,
+    # t shared real/fake, scalar logit, frozen projector mixing, R1 gamma 1,
     # 5 disc updates, lr_D 1e-5, strict action conditioning, no wavelet, no
     # mean equalization).
-    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=1e-5 gan_updates_per_step=5 gan_disc_start_step=20 gan_critic_warmup_steps=20 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=false ladd_wavelet_hf_augment=false ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=false ladd_gt_transition_cross_equalize=false ladd_gt_transition_std_equalize=false ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ladd_disc_sample_t=true ladd_disc_t_min=20 ladd_disc_t_max=980 ladd_disc_timestep_shift=5.0 ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_once_per_step=true ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_r2_gamma=1.0 ladd_r2_every_n_steps=2 ladd_r2_phase_offset=1 ladd_r2_sigma=0.01 ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=false"
+    GAN_EXTRA="gan_enabled=true gan_loss_weight=${GANW} gan_lr=1e-5 gan_updates_per_step=5 gan_disc_start_step=20 gan_critic_warmup_steps=20 gan_warmup_steps=25 gan_warmup_shape=linear ladd_proj_dim=256 ladd_scalar_output=true ladd_freeze_projector_mixing=true ladd_use_csm=true ladd_use_lateral_proj=false ladd_use_prompt_cond=false ladd_cmap_dim=0 ladd_stat_head_enabled=false ladd_wavelet_hf_enabled=false ladd_wavelet_hf_augment=false ladd_gt_transition_enabled=true ladd_gt_transition_match=true ladd_gt_transition_match_k=4 ladd_gt_transition_match_pool=8 ladd_gt_transition_match_max_real=12 ladd_gt_transition_mean_equalize=false ladd_gt_transition_cross_equalize=false ladd_gt_transition_std_equalize=false ladd_gt_transition_gen_detach_former=true ladd_real_pool_cross_ride=4096 ladd_real_pool_push_per_ride=8 ladd_disc_sample_t=true ladd_disc_t_min=20 ladd_disc_t_max=980 ladd_disc_timestep_shift=5.0 ladd_real_match_fake_t=false ladd_r1_gamma=1.0 ladd_r1_every_n_steps=2 ladd_r1_num_samples=6 ladd_r1_normalize_tokens=false ladd_diff_aug_policy=flip ladd_gt_transition_action_blind=false"
     ;;
   *)
     echo "Unknown MODE=$MODE (expected none, wavelet, raw, projected, or strict)" >&2
