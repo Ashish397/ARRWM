@@ -287,8 +287,13 @@ def _ladd_trainer_two_modes(dlogs, glogs):
     t._ladd_diag_n = 99          # silence the [LADD-DIAG] print
     seen = []
 
+    # ``**_extra`` absorbs the divergence-3 kwargs (``fake_sample_t`` /
+    # ``fake_action_frame_lo`` / ``fake_sample_source``) that
+    # ``_compute_ladd_losses`` threads through unconditionally; this
+    # stub is about the R1 / overlay bookkeeping, not the fake-source
+    # plumbing (covered by its own suite).
     def _stub(*, real_src, fake_src_grad, fake_src_detached,
-              pred_image_dtype, pair_mode, current_step, phase):
+              pred_image_dtype, pair_mode, current_step, phase, **_extra):
         seen.append((pair_mode, phase))
         out = dict(dlogs[pair_mode] if phase == "d_only"
                    else glogs[pair_mode])

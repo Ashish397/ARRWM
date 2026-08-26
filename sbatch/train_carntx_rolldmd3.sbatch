@@ -20,6 +20,7 @@
 #SBATCH --exclusive
 #SBATCH --time=03:00:00
 #SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
 # =====================================================================
@@ -255,7 +256,7 @@
 set -e -o pipefail
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 DARM=${DARM:-carntxroll}
-ODE_CKPT=${ODE_CKPT:-/scratch/u6ex/as1748.u6ex/ARRWM/logs/dmd10k_dmd3kl/dmd10k_dmd3kl_j6052054/phase1_step0000200.pt}
+ODE_CKPT=${ODE_CKPT:-/scratch/u6ex/as1748.u6ex/ARRWM/logs/ode14e_pilot/run3_flip2_rollkl10k/action_ode_step0000400.pt}
 MAXSTEPS=${MAXSTEPS:-250}
 DEXTRA=${DEXTRA:-}
 # Space-free teacher-head switches. `sbatch --export=...,DEXTRA="a=1 b=2"`

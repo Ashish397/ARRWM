@@ -52,7 +52,11 @@ gan_enabled: true
 gan_disc_in_channels: 16
 gan_disc_base_channels: 64
 gan_disc_num_blocks: 4
-gan_loss_weight: 0.05         # G-side RpGAN weight (~5% of DMD magnitude)
+gan_loss_weight: 1.0          # CODEBASE DEFAULT set 2026-08-25 from the w1 tuning point
+                              # (measured: ratio median 0.156, FLAT logit-gap trend +1.69->+1.75
+                              #  over 200 steps = the only rung that did not trend toward saturation).
+                              # Was 0.05. Researcher directive: this is the default until/unless
+                              # the SAM2-surrogate or wavelet-HF arms beat it.
 gan_r1_gamma: 1.0             # zero-centered grad penalty on real samples
 gan_warmup_steps: 500         # linear ramp 0 → gan_loss_weight on G side
 gan_updates_per_step: 1       # 1:1 D:G ratio
@@ -78,7 +82,15 @@ ladd_use_lateral_proj: false         # lateral 1x1 in CSM (rarely needed)
 ladd_use_prompt_cond: true           # prompt-conditioning in disc heads
 ladd_cmap_dim: 64                    # inner-product cmap dim (StyleGAN-T)
 ladd_disc_loss_weight: 1.0           # additional G-side multiplier on top of gan_loss_weight ramp
-ladd_r1_gamma: 1.0                   # R1 on chunk_i (real-anchor)
+ladd_r1_gamma: 10.0
+ladd_disc_force_clean: true          # CODEBASE DEFAULT set 2026-08-25 23:20 (researcher:
+                                     # "gantune_w2tclean is much better than the alternative").
+                                     # Pins the disc's input timestep to 0 => alpha_t = 1-sigma = 1.0.
+                                     # Two effects, both wanted: (1) the disc sees CLEAN latents, so
+                                     # texture is not destroyed before it looks; (2) the generator
+                                     # gradient is at full scale. At the dmd band's t=1000 rung
+                                     # alpha_t is exactly 0 and the student's sample is multiplied by
+                                     # zero - measured on 3 of 8 samples in gansig_of. Was False.                  # R1 on chunk_i (real-anchor)
 ladd_r1_every_n_steps: 1             # lazy R1: compute every N disc updates (1=every step)
 ladd_diff_aug_policy: "flip,cutout,translation"  # latent-space DiffAugment
 ladd_pair_start_seed_boundary: true  # include (last_seed, first_AR) pair
@@ -465,6 +477,107 @@ surrogate_convnext_lr: 2.0e-4
 surrogate_convnext_pad_to_square: true
 
 # ---------------------------------------------------------------------------
+# WP-STYLE — unpaired, region-level Gram/AdaIN STYLE loss.
+# model/style_gram_loss.py; trainer ``_compute_style_gram_loss``.
+#
+# WHY IT EXISTS: the objective is style shift to the TRAINING DATASET's
+# appearance distribution, and nothing else in the training path measures
+# style. The LADD disc scores transformer features of LATENTS at a fixed
+# noise level, projected 1536->256 — structurally blind to texture. Every
+# Gram symbol in the repo before this lived in OFFLINE eval
+# (grids/eval/style_shift.py, analysis/style_shift/axis2_local_style.py)
+# with zero imports from trainer/ model/ pipeline/. This is the direct,
+# online, differentiable measure, and unlike the pretrained-teacher
+# surrogates it has NO warm-up: a Gram on a frozen encoder is meaningful
+# at step 0 (the surrogate teachers need ~8 head updates per generator
+# step before they say anything).
+#
+# DEFAULT OFF and byte-identical when off. ``style_gram_loss_weight`` IS
+# the gate — 0.0 means the call site materialises nothing: no encoder
+# build, no VAE decode, no dataset read, no RNG draw, no log key. Every
+# value below equals the code's own getattr default, duplicated here for
+# discoverability, not because the fallback is untested.
+#
+# TWO-SIDED BY CONSTRUCTION (researcher directive: "sharpness can get the
+# thing to go really blocky and pixelated so don't optimise for
+# sharpness"). The loss MATCHES a statistic instead of maximising one, and
+# the normalising denominator is the REAL side only, detached — so nothing
+# in it can be lowered by inflating the student's texture energy. Watch
+# ``train/style_energy_ratio``: >1 means the student is OVERSHOOTING the
+# dataset's texture energy (today's 1.55x tree-crown banding failure) and
+# the loss is pushing it back DOWN.
+style_gram_loss_weight: 0.0
+
+# "gram"  = second moments G = f f^T / (C H W) — channel co-occurrence,
+#           the Gatys style representation, and exactly the normalisation
+#           grids/eval/style_shift.py::VGGStyle uses.
+# "adain" = per-channel mean+std only — the statistic
+#           analysis/style_shift/axis2_local_style.py uses. Cheaper,
+#           weaker (no cross-channel structure).
+style_gram_mode: gram
+
+# "vgg16" (default) is the SAME feature basis as the offline metric, so
+# the training loss and the evaluation metric measure the same thing —
+# which is the point of aligning them. ImageNet CNNs are texture-biased
+# (Geirhos et al. 2019); for a style loss that bias is an asset. It is
+# also the cheapest candidate: features[:16] is 1.74M params (~7 MB) vs
+# ConvNeXt-T 28M / DINOv2 ViT-S 21M / SAM2 Hiera-B+ ~80M, and the weights
+# are already in the node torch-hub cache (vgg16-397923af.pth) so the
+# constructor never touches the network. "convnext" reuses
+# model/pretrained_pixel_disc.py's offline-first loader.
+style_gram_encoder: vgg16
+# null = the encoder's default taps. For vgg16 that is [3, 8, 15] =
+# relu1_2/relu2_2/relu3_3, i.e. axis2_local_style.py's LOCAL-style tap
+# set. relu4_3 (22) is available but dropped by default: it roughly
+# triples encoder FLOPs and activations for a 512x512 Gram that is
+# semantic rather than textural.
+style_gram_layers: null
+
+# --- cost / cadence. Decode is the dominant term and scales with CROPS.
+style_gram_every: 1              # every step — convergence speed is the requirement
+style_gram_crops: 4              # graph-on VAE decode windows per style step
+style_gram_frames_per_crop: 2    # pixel frames kept per decoded window -> 8 images
+style_gram_crop_lat: [24, 32]    # same geometry as the pixel critic (shared pool)
+style_gram_lat_frames_per_crop: 2
+style_gram_decode_border_trim: 8
+style_gram_decode_batch: 2
+
+# A24 COARSE thirds, PINNED — shared with the pixel critic's band-
+# stratified pool. Region-level means "matched inside a band" (sky / mid /
+# road); a single global Gram would be satisfiable by making everything
+# look like sky. Any finer y-matching is forbidden and permanent.
+style_gram_band_count: 3
+
+# Debiased EMA momentum for the REAL-side statistic. The real style
+# distribution is stationary, so averaging it over steps costs nothing and
+# gives the TARGET ~1/(1-m) steps' worth of real frames behind it. That is
+# the single biggest convergence lever here: a low-variance target is a
+# steadier descent. 0.0 = use only this step's reals.
+style_gram_real_ema: 0.9
+
+# The reals come from the SAME A20/A21 pool the pixel critic maintains
+# (cross-ride, A22 holdout-checked, band-stratified, CONTINUOUSLY
+# refreshed). No second loader exists. When the pixel critic is also
+# enabled it owns the pool's cap and these two keys bound only the style
+# path's own refresh. Refresh must be >= 1: freezing the pool would
+# converge the style target onto a handful of windows instead of the
+# dataset.
+style_gram_real_pool_windows: 1024
+style_gram_real_pool_refresh: 4
+
+# "pred" = the student chunk the DMD scores. Always present, always
+#          graph-on, no dependency on any GAN arm being enabled.
+# "pix"  = whatever _pix_select_fake_latents resolves (flash t=60 x0 or
+#          the ladder endpoint) — requires the pixel-critic machinery.
+style_gram_fake_source: pred
+
+style_gram_warmup_steps: 0
+# PRIVATE generator seed. Every style-side draw comes from a rank-local
+# generator built from this, so the global RNG stream is untouched and the
+# gate-off path stays byte-identical.
+style_gram_seed: 20260825
+
+# ---------------------------------------------------------------------------
 # *** SUPERSEDED — 2026-08-24 measurement. DO NOT ARM. ***
 # The e-keyed gate below is retained, still default-off, but its signal was
 # FALSIFIED: across the supervised band e = |x0 - pred_real| was FLAT
@@ -676,6 +789,27 @@ gan_of_enabled: false
 gan_of_g_weight: 0.03
 gan_of_d_weight: 0.03
 
+# EXPERIMENTAL-DESIGN CONTROL, not a paper knob. The arm as first shipped
+# changes TWO things at once: (a) the disc reads features from the
+# TRAINABLE ``fake_score`` critic instead of the frozen ``real_score``
+# teacher, and (b) the ``fake_score`` backbone CO-TRAINS on the adversarial
+# loss. The port's thesis is that (b) is what makes One-Forcing work, but
+# with both moving neither outcome can attribute the result.
+#   true  (default) = the faithful One-Forcing setting, byte-identical to
+#                     the arm as launched: one backward carries the
+#                     denoising AND the adversarial gradient into the
+#                     backbone.
+#   false           = (a) unchanged — the disc still TAPS ``fake_score``,
+#                     and those features still track the student because
+#                     the backbone is still trained every step by its own
+#                     DENOISING loss — but the adversarial gradient reaches
+#                     the head modules ONLY. This is "adversarial gradient
+#                     to heads only", NOT "backbone frozen"; freezing
+#                     fake_score globally would break the DMD critic.
+# Run both; the pair is the A/B. See docs/ONE_FORCING_PORT.md "The
+# confound".
+gan_of_backbone_trainable: true
+
 # Head geometry. ``feature_layers`` are the transformer blocks tapped; one
 # register token + one stack of ``blocks_per_token`` cross-attn blocks is
 # built per tap, paired IN ORDER, so the list must be ascending. Our legacy
@@ -744,3 +878,66 @@ gan_of_real_source: "aligned_gt"
 # fake_score updates log under an ``of_inner_`` prefix so they cannot
 # overwrite the main D step's numbers.
 gan_of_telemetry_every: 25
+
+# ---------------------------------------------------------------------
+# S6 — DISC-FORWARD MEMORY (2026-08-25). Every default below reproduces
+# the pre-S6 forward BYTE-IDENTICALLY; see docs/ONE_FORCING_PORT.md
+# "S6 — disc-forward memory" for the measured footprint these address.
+# ---------------------------------------------------------------------
+# Split the concatenated [fake ; real] disc batch into N contiguous row
+# groups, one forward each, then concatenate the logits back before the
+# loss. The loss is taken over the SAME [2B, ...] logit tensor as the
+# single-batch path, so the VALUE cannot drift (no per-group weighting to
+# get wrong, unlike ladd_disc_micro_batch_groups which backwards each
+# group and must rescale by /N_total). Group count is a pure function of
+# config + tensor shape => rank-uniform => the number of forwards before
+# the shared critic backward matches on every rank.
+# NOTE the batch here is only 2 rows (1 fake + 1 real at B=1), so 2 is
+# the largest value that does anything.
+gan_of_disc_micro_batch_groups: 1
+# Checkpoint the GanAttentionBlock tap stacks. They sit OUTSIDE the DiT's
+# per-block gradient checkpoint and retain ~21.5 KiB/token/row/tap —
+# MEASURED at ~31% of the whole disc forward's resident footprint, the
+# single largest addressable term. Costs one recompute of the tap stack.
+gan_of_checkpoint_taps: false
+# Skip the DiT head + unpatchify on classify-only forwards. Their result
+# is discarded by every OF call site; computing it retains ~13.7 MiB per
+# frame per row. Logits are bit-identical either way.
+gan_of_classify_skip_head: false
+# R1/R2 real-subsample, analogous to ladd_r1_num_samples. <=0 => every
+# row. Inert here twice over: the R1/R2 weights are 0.0 and B is 1.
+gan_of_r1_num_samples: 0
+
+# ---------------------------------------------------------------------
+# D-STEP RESOLUTION (2026-08-25). THE MEASURED DEFECT, and its two
+# independent fixes. Both default to the value that reproduces today's
+# behaviour byte-for-byte.
+#
+# The disc head lives on fake_score.model, so it shares fake_optimizer
+# and fake_lr (4e-7 below). With fake_betas beta1=0.0 an AdamW step is
+# ~lr in magnitude; the bf16 ulp at the head's final-Linear weight scale
+# is 3.05e-5 — 76x LARGER — so round-to-nearest DISCARDS every update.
+# Measured on the GPU: 0.5% of head params ever moved, of_logit_gap
+# pinned at 0, every emitted value an exact multiple of one bf16 ulp
+# (1.953e-3). Reproduced on CPU against the real head modules at our
+# exact param count (36,221,441):
+#     bf16 lr=4e-7 : gap 0.0078 -> 0.00195 over 200 steps, NO TREND
+#     bf16 lr=1e-5 : gap 0.0078 -> 1.289
+#     fp32 lr=1e-5 : gap crosses 1.0 at ~step 70, 7.4 by step 400
+# The reference One-Forcing runs lr_critic=1e-5.
+#
+# Two knobs, not one, because the defect has two causes (the step is too
+# small AND the storage is too coarse) and a combined fix could not say
+# which mattered.
+#
+# > 0 gives the three disc head module groups (_cls_pred_branch,
+# _register_tokens, _gan_ca_blocks) their OWN param group in
+# fake_optimizer at this LR. Every other fake_score parameter stays on
+# fake_lr, so the DMD critic's recipe is untouched — this is NOT a
+# critic LR bump. 0.0 = inherit fake_lr = ONE param group = today.
+gan_of_head_lr: 0.0
+# Build the head modules in float32 while the backbone stays bf16, so
+# the update resolution at the head's weight scale is ~1e-10 instead of
+# 3.05e-5. The tap features are cast at the head boundary in both
+# classify loops. false = build at the trainer dtype = today.
+gan_of_head_fp32: false

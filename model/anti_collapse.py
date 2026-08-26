@@ -333,6 +333,23 @@ def _per_frame_M1(x: torch.Tensor) -> torch.Tensor:
     return (x ** 2).sum(dim=[3, 4])
 
 
+def _per_frame_MEAN(x: torch.Tensor) -> torch.Tensor:
+    """Per-frame, per-channel SPATIAL MEAN ``mean_{H,W} x`` — the FIRST
+    moment. ``x: [B, F, C, H, W]`` -> ``[B, F, C]``.
+
+    NAMING TRAP (2026-08-25). ``_per_frame_M1`` above is NOT this: despite
+    the "M1" name it returns per-channel ``Σ_{H,W} x²`` — a raw SECOND
+    moment (per-channel energy). Until this function existed
+    ``compute_stat_anchor_loss`` carried NO first-moment term at all: every
+    stat in it (STD, M2, TV, SOS, M1) is a spread or an energy. A recipe
+    setting ``stat_anchor_M1_*`` expecting to constrain the MEAN constrains
+    per-channel energy instead. ``stat_anchor_MEAN_*`` is the mean.
+    Signed on purpose — the DC/colour drift the AR walk produces has a
+    sign, and abs() here would hide a bias that flips channel to channel.
+    """
+    return x.mean(dim=[3, 4])
+
+
 def _per_frame_TV(x: torch.Tensor) -> torch.Tensor:
     """Per-frame total-variation (latent space).
 
@@ -499,6 +516,7 @@ def compute_stat_anchor_loss(
     seed_TV_anchor: Optional[torch.Tensor] = None,
     seed_SOS_anchor: Optional[torch.Tensor] = None,
     seed_M1_anchor: Optional[torch.Tensor] = None,
+    seed_MEAN_anchor: Optional[torch.Tensor] = None,
     STD_short_weight: float = 0.1,
     STD_long_weight: float = 0.1,
     M2_short_weight: float = 0.1,
@@ -509,6 +527,10 @@ def compute_stat_anchor_loss(
     SOS_long_weight: float = 0.0,
     M1_short_weight: float = 0.0,
     M1_long_weight: float = 0.0,
+    # First moment (per-channel spatial mean). DEFAULT 0.0 = the term is
+    # never built, so every existing caller is byte-identical.
+    MEAN_short_weight: float = 0.0,
+    MEAN_long_weight: float = 0.0,
     rel_tol_short: float = 0.20,
     rel_tol_long: float = 0.10,
     # Optional long-horizon anchor overrides — scalar tensors. When
@@ -588,6 +610,7 @@ def compute_stat_anchor_loss(
             TV_anchor = _per_frame_TV(seed).mean(dim=1)        # [B]
             SOS_anchor = _per_frame_SOS(seed).mean(dim=1)      # [B]
             M1_anchor = _per_frame_M1(seed).mean(dim=1)        # [B, C]
+            MEAN_anchor = _per_frame_MEAN(seed).mean(dim=1)    # [B, C]
     else:
         if (
             seed_STD_anchor is None
@@ -608,6 +631,9 @@ def compute_stat_anchor_loss(
         )
         M1_anchor = (
             seed_M1_anchor.detach() if seed_M1_anchor is not None else None
+        )
+        MEAN_anchor = (
+            seed_MEAN_anchor.detach() if seed_MEAN_anchor is not None else None
         )
 
     # Per-frame stats on pred (graph-attached).
@@ -736,9 +762,17 @@ def compute_stat_anchor_loss(
     loss_M1_short = loss_M1_long = zero
     floor_M1_short = floor_M1_long = 0.0
     mse_M1_short = mse_M1_long = zero
-    if M1_anchor is not None and (
+    # SILENT NO-OP GUARD (2026-08-25). The term is skipped both when the
+    # WEIGHT is zero (intended: term disabled) and when the ANCHOR is None
+    # (NOT intended: e.g. a precomputed-anchor path that omits the "M1"
+    # key). Those two cases are indistinguishable in the logs otherwise --
+    # both just show ``stat/M1_active_* == 0``. ``stat/M1_term_built``
+    # below separates them: requested-but-not-built is a dropped loss term.
+    M1_requested = (
         float(M1_short_weight) != 0.0 or float(M1_long_weight) != 0.0
-    ):
+    )
+    M1_built = bool(M1_anchor is not None and M1_requested)
+    if M1_built:
         M1_pf = _per_frame_M1(pred_x0)                      # [B, F, C]
         M1_long = _causal_cumulative_mean(M1_pf)            # [B, F, C]
         # M1 anchor: per-batch [B,C] -> [B,1,C], or per-frame [B,F,C] as-is.
@@ -752,6 +786,47 @@ def compute_stat_anchor_loss(
         loss_M1_short = (mse_M1_short - floor_M1_short).clamp(min=0)
         loss_M1_long = (mse_M1_long - floor_M1_long).clamp(min=0)
 
+    # ------------------------------------------------------------------
+    # MEAN (per-channel spatial mean; [B,F,C]) — the FIRST moment, and the
+    # only mean-sensitive term in this function (see ``_per_frame_MEAN``:
+    # "M1" above is per-channel ENERGY, not the mean). Same floor-clamped
+    # MSE machinery. Default weights 0.0 => never built => byte-identical.
+    #
+    # FLOOR DEVIATION, deliberate: every other stat here is NON-NEGATIVE, so
+    # ``anchor.mean()^2`` is a sane "typical magnitude" for the deadband.
+    # The mean is SIGNED and its per-channel values largely cancel (measured
+    # on weunz GT: mean over channels 0.053 vs mean |per-channel| 0.328), so
+    # ``anchor.mean()^2`` would collapse the deadband to ~2.6% of its
+    # intended size and make ``rel_tol`` effectively inoperative. We use
+    # ``anchor.abs().mean()^2`` so ``rel_tol`` keeps meaning "a fraction of
+    # a typical per-channel mean". No effect when rel_tol == 0.
+    # ------------------------------------------------------------------
+    loss_MEAN_short = loss_MEAN_long = zero
+    floor_MEAN_short = floor_MEAN_long = 0.0
+    mse_MEAN_short = mse_MEAN_long = zero
+    # Same silent-no-op guard as M1 above: ``stat/MEAN_term_built``
+    # distinguishes "weight is 0, term intentionally off" from "weight > 0
+    # but MEAN_anchor arrived None, term silently dropped". The MEAN term
+    # is the newest code path here and the one fed by the brand-new
+    # ``_gt_window_stat_anchors["MEAN"]`` key, so it is the most likely to
+    # be silently absent.
+    MEAN_requested = (
+        float(MEAN_short_weight) != 0.0 or float(MEAN_long_weight) != 0.0
+    )
+    MEAN_built = bool(MEAN_anchor is not None and MEAN_requested)
+    if MEAN_built:
+        MEAN_pf = _per_frame_MEAN(pred_x0)                   # [B, F, C]
+        MEAN_long = _causal_cumulative_mean(MEAN_pf)         # [B, F, C]
+        a_MEAN = MEAN_anchor.to(MEAN_pf.dtype)
+        a_MEAN = a_MEAN if a_MEAN.dim() == 3 else a_MEAN.unsqueeze(1)
+        mse_MEAN_short = (MEAN_pf - a_MEAN).pow(2).mean()
+        mse_MEAN_long = (MEAN_long - a_MEAN).pow(2).mean()
+        MEAN_a2 = float(MEAN_anchor.detach().abs().mean().pow(2).item())
+        floor_MEAN_short = rs2 * MEAN_a2
+        floor_MEAN_long = rl2 * MEAN_a2
+        loss_MEAN_short = (mse_MEAN_short - floor_MEAN_short).clamp(min=0)
+        loss_MEAN_long = (mse_MEAN_long - floor_MEAN_long).clamp(min=0)
+
     loss = (
         float(STD_short_weight) * loss_STD_short
         + float(STD_long_weight) * loss_STD_long
@@ -763,6 +838,8 @@ def compute_stat_anchor_loss(
         + float(SOS_long_weight) * loss_SOS_long
         + float(M1_short_weight) * loss_M1_short
         + float(M1_long_weight) * loss_M1_long
+        + float(MEAN_short_weight) * loss_MEAN_short
+        + float(MEAN_long_weight) * loss_MEAN_long
     )
 
     dev = pred_x0.device
@@ -835,6 +912,32 @@ def compute_stat_anchor_loss(
         "stat/SOS_active_long": loss_SOS_long.detach(),
         "stat/M1_active_short": loss_M1_short.detach(),
         "stat/M1_active_long": loss_M1_long.detach(),
+        # 1.0 iff the M1 term was actually BUILT (weight requested AND
+        # anchor present). ``M1_requested=1, M1_term_built=0`` means the
+        # term was silently dropped for want of an anchor.
+        "stat/M1_requested": _t(1.0 if M1_requested else 0.0),
+        "stat/M1_term_built": _t(1.0 if M1_built else 0.0),
+        # MEAN (first moment, per-channel spatial mean). ``_abs`` is the
+        # magnitude telemetry: the signed channel average cancels to near
+        # zero, so a run watching only ``stat/MEAN_anchor`` would see ~0
+        # whether the mean is healthy or has walked off.
+        "stat/MEAN_anchor": (
+            MEAN_anchor.mean().detach() if MEAN_anchor is not None else zero
+        ),
+        "stat/MEAN_anchor_abs": (
+            MEAN_anchor.abs().mean().detach()
+            if MEAN_anchor is not None else zero
+        ),
+        "stat/MEAN_mse_short": mse_MEAN_short.detach(),
+        "stat/MEAN_mse_long": mse_MEAN_long.detach(),
+        "stat/MEAN_floor_short": _t(floor_MEAN_short),
+        "stat/MEAN_floor_long": _t(floor_MEAN_long),
+        "stat/MEAN_active_short": loss_MEAN_short.detach(),
+        "stat/MEAN_active_long": loss_MEAN_long.detach(),
+        # See ``stat/M1_term_built``. ``MEAN_requested=1,
+        # MEAN_term_built=0`` == the mean-training term is silently absent.
+        "stat/MEAN_requested": _t(1.0 if MEAN_requested else 0.0),
+        "stat/MEAN_term_built": _t(1.0 if MEAN_built else 0.0),
     }
     return loss, logs
 

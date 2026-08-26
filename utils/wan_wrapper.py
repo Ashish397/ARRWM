@@ -39,6 +39,54 @@ class ResidualMLPBlock(nn.Module):
         x = self.dropout(x)
         return x + residual  # Residual connection
 
+
+def build_cls_pred_branch(
+    input_dim: int,
+    hidden_dim: int,
+    num_class: int,
+    num_layers: int,
+    dropout: float,
+) -> nn.Sequential:
+    """The One-Forcing / Self-Forcing discriminator MLP head.
+
+    Extracted VERBATIM from ``WanDiffusionWrapper.adding_cls_branch`` (it
+    was inline there) so a second consumer — the LADD ``ladd_readout=
+    "register"`` head in ``model/ladd_disc.py`` — gets the *same* shape,
+    the same layer order and therefore the same parameter-init RNG
+    consumption, instead of a re-typed near-copy that could drift.
+    ``adding_cls_branch`` now calls this and is unchanged in behaviour.
+
+    ``num_layers <= 1`` is the PAPER SHAPE (One-Forcing,
+    ``one_forcing/utils/wan_wrapper.py``:224-229):
+    ``LayerNorm / Linear / SiLU / [Dropout] / Linear`` and nothing else.
+    ``num_layers >= 2`` is the historical (heavier) shape:
+    ``num_layers - 1`` ``ResidualMLPBlock``s plus a trailing
+    ``LayerNorm + Linear``. The two are NOT a continuum — ``2`` is
+    strictly heavier than the paper, not equal to it.
+    """
+    layers = []
+
+    # Initial projection and normalization
+    layers.append(nn.LayerNorm(input_dim))
+    layers.append(nn.Linear(input_dim, hidden_dim))
+    layers.append(nn.SiLU())
+    if dropout > 0.0:
+        layers.append(nn.Dropout(dropout))
+
+    if num_layers <= 1:
+        layers.append(nn.Linear(hidden_dim, num_class))
+    else:
+        # Residual blocks
+        for _ in range(num_layers - 1):  # -1 because we have final layer
+            layers.append(ResidualMLPBlock(hidden_dim, dropout=dropout))
+
+        # Final output layer (no residual connection)
+        layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Linear(hidden_dim, num_class))
+
+    return nn.Sequential(*layers)
+
+
 class WanTextEncoder(torch.nn.Module):
     def __init__(
         self,
@@ -336,6 +384,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         block_ffn_dim=8192,
         block_num_heads=12,
         attach_to_model=False,
+        checkpoint_taps=False,
+        classify_skip_head=False,
     ) -> None:
         """
         Add classification branch with deeper layers, dropout, and residual connections.
@@ -405,41 +455,19 @@ class WanDiffusionWrapper(torch.nn.Module):
         # Input dimension: num_registers * atten_dim
         input_dim = num_registers * atten_dim
 
-        # Build deeper classification head with residual connections
-        layers = []
-
-        # Initial projection and normalization
-        layers.append(nn.LayerNorm(input_dim))
-        layers.append(nn.Linear(input_dim, hidden_dim))
-        layers.append(nn.SiLU())
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
-
-        if num_layers <= 1:
-            # PAPER SHAPE (One-Forcing, ``one_forcing/utils/wan_wrapper.py``
-            # :224-229): LayerNorm / Linear / SiLU / Linear, and nothing
-            # else. This branch exists because ``num_layers=2`` does NOT
-            # produce it — it produces
-            # ``[LayerNorm, Linear, SiLU, ResidualMLPBlock, LayerNorm,
-            # Linear]``, i.e. a residual MLP block and a second LayerNorm
-            # the reference does not have. The docs, the config comment and
-            # this file all claimed otherwise for the OF arm, and
-            # ``validate_of_config`` refused ``num_layers < 2``, so the
-            # shape everything said we were running was UNREACHABLE.
-            # ``num_layers >= 2`` keeps its historical meaning exactly, so
-            # the legacy ``model/dmd2*.py`` callers (default 4) are
-            # byte-identical.
-            layers.append(nn.Linear(hidden_dim, num_class))
-        else:
-            # Residual blocks
-            for _ in range(num_layers - 1):  # -1 because we have final layer
-                layers.append(ResidualMLPBlock(hidden_dim, dropout=dropout))
-
-            # Final output layer (no residual connection)
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.Linear(hidden_dim, num_class))
-
-        cls_pred_branch = nn.Sequential(*layers)
+        # Build deeper classification head with residual connections.
+        # Body lives in the module-level ``build_cls_pred_branch`` so the
+        # LADD ``ladd_readout="register"`` head can build the IDENTICAL
+        # shape from the same code (see model/ladd_disc.py). Extraction is
+        # behaviour-preserving: same layers, same order, so the same
+        # parameter-init RNG draws in the same sequence.
+        cls_pred_branch = build_cls_pred_branch(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_class=num_class,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
         cls_pred_branch.requires_grad_(True)
 
         # Register tokens for each layer we extract from
@@ -471,6 +499,16 @@ class WanDiffusionWrapper(torch.nn.Module):
         # lives on the MODEL in both attach modes because that is the object
         # those loops have as ``self``.
         self._unwrapped_model()._gan_feature_layers = layer_indices
+        # S6 memory knobs, read by the SAME two block loops as the tap
+        # list, so they live on the MODEL for the same reason. Both default
+        # False => the loops take their verbatim historical branch, which
+        # is what keeps a config predating S6 byte-identical.
+        #   _gan_checkpoint_taps    <- gan_of_checkpoint_taps
+        #   _gan_classify_skip_head <- gan_of_classify_skip_head
+        self._unwrapped_model()._gan_checkpoint_taps = bool(checkpoint_taps)
+        self._unwrapped_model()._gan_classify_skip_head = bool(
+            classify_skip_head
+        )
         # self.has_cls_branch = True
 
     def _cls_branch_modules(self):

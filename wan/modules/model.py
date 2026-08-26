@@ -214,7 +214,21 @@ class WanGanCrossAttention(WanSelfAttention):
         vv = self.v(x).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(qq, kk, vv)
+        # ``_attn_impl`` (default ABSENT -> None -> the verbatim historical
+        # ``flash_attention`` call) lets a host swap the attention kernel
+        # for this block only. Needed by the LADD ``ladd_readout=
+        # "register"`` head (model/ladd_disc.py): that discriminator is
+        # built in **fp32** for R1 stability and is exercised on CPU in
+        # tests, while ``flash_attention`` hard-asserts
+        # ``q.device.type == 'cuda'`` and downcasts to bf16. Setting the
+        # attribute is opt-in and per-instance, so every existing user of
+        # this class (the One-Forcing ``classify_mode`` path, ``dmd2*``)
+        # is byte-identical.
+        _attn_impl = getattr(self, "_attn_impl", None)
+        if _attn_impl is None:
+            x = flash_attention(qq, kk, vv)
+        else:
+            x = _attn_impl(qq, kk, vv)
 
         # output
         x = x.flatten(2)
@@ -843,8 +857,40 @@ class WanModel(ModelMixin, ConfigMixin):
                 gan_token = registers[:, gan_idx: gan_idx + 1]
                 # Apply multiple GanAttentionBlocks sequentially for progressive feature refinement
                 token_features = gan_token
-                for block in gan_ca_blocks[gan_idx]:
-                    token_features = block(x, token_features)
+                # S6 MEMORY (parity with model/action_model_patch.py): these
+                # tap blocks sit OUTSIDE the per-block checkpoint above and
+                # retain full-sequence activations. ``_gan_checkpoint_taps``
+                # (<- gan_of_checkpoint_taps) trades a recompute for that
+                # residency. Absent/False => verbatim historical loop.
+                # FP32-HEAD BOUNDARY (``gan_of_head_fp32``). The head
+                # modules may be built in fp32 while this backbone stays
+                # bf16 (the bf16-ulp starvation fix — see
+                # ``docs/ONE_FORCING_PORT.md``). The tap features are the
+                # ONLY backbone tensors the head consumes on this path, so
+                # one cast here covers ``GanAttentionBlock`` /
+                # ``WanGanCrossAttention`` / ``_cls_pred_branch``. Cast
+                # rather than build-in-bf16 so autograd keeps a real cast
+                # node: the G side differentiates the logit back into the
+                # fake tensor, and the cast's backward converts the fp32
+                # head gradient to bf16 at exactly this boundary. When the
+                # head is at the backbone dtype (the default) ``_tap_x is
+                # x`` and the loop is the verbatim historical one.
+                _tap_x = (
+                    x if x.dtype == token_features.dtype
+                    else x.to(token_features.dtype)
+                )
+                if bool(getattr(self, "_gan_checkpoint_taps", False)) \
+                        and torch.is_grad_enabled():
+                    def _tap_fn(_x, _tok, _blocks=gan_ca_blocks[gan_idx]):
+                        for _cab in _blocks:
+                            _tok = _cab(_x, _tok)
+                        return _tok
+                    token_features = torch.utils.checkpoint.checkpoint(
+                        _tap_fn, _tap_x, token_features, use_reentrant=False,
+                    )
+                else:
+                    for block in gan_ca_blocks[gan_idx]:
+                        token_features = block(_tap_x, token_features)
                 final_x.append(token_features)
                 gan_idx += 1
 
@@ -860,7 +906,13 @@ class WanModel(ModelMixin, ConfigMixin):
         if classify_mode:
             final_x = torch.cat(final_x, dim=1)
             if concat_time_embeddings:
-                final_x = cls_pred_branch(torch.cat([final_x, 10 * e[:, None, :]], dim=1).view(final_x.shape[0], -1))
+                # Second (and last) backbone tensor the head consumes —
+                # cast for the same ``gan_of_head_fp32`` reason as the tap
+                # features above. Identity when the dtypes already agree.
+                _e_cat = e[:, None, :]
+                if _e_cat.dtype != final_x.dtype:
+                    _e_cat = _e_cat.to(final_x.dtype)
+                final_x = cls_pred_branch(torch.cat([final_x, 10 * _e_cat], dim=1).view(final_x.shape[0], -1))
             else:
                 final_x = cls_pred_branch(final_x.view(final_x.shape[0], -1))
 
@@ -875,6 +927,30 @@ class WanModel(ModelMixin, ConfigMixin):
             # Hard-coded: 42 = 21 frames * 2 actions
             batch_size = final_x_rgs.shape[0]
             final_x_rgs = final_x_rgs.view(batch_size, num_frames_rgs, num_class_rgs)
+
+        # S6 MEMORY (parity with model/action_model_patch.py): a
+        # classify-only forward DISCARDS the head + unpatchify result, but
+        # computing it retains ~3 full-sequence activations. Skip it when
+        # ``_gan_classify_skip_head`` (<- gan_of_classify_skip_head) is set
+        # and nothing else needs the DiT output, returning a
+        # correctly-shaped zero placeholder so the 2-tuple contract and the
+        # wrapper's unconditional ``pred_x0`` derivation both still hold.
+        # ``final_x`` (the logits) is already fully computed above and is
+        # bit-identical either way. Deliberately NOT taken when
+        # ``regress_mode`` or ``compute_alt_head`` is on — those genuinely
+        # consume the backbone output.
+        if (classify_mode and not regress_mode and not compute_alt_head
+                and bool(getattr(self, "_gan_classify_skip_head", False))):
+            _ps = list(self.patch_size)
+            _ph = [
+                [i * j for i, j in zip(v, _ps)]
+                for v in grid_sizes.tolist()
+            ]
+            return torch.stack([
+                torch.zeros((self.out_dim, *_sh), device=x.device,
+                            dtype=x.dtype)
+                for _sh in _ph
+            ]), final_x
 
         # head (main) + optional alt head sharing backbone features
         x_feat = x

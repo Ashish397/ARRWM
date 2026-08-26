@@ -121,6 +121,7 @@ srun torchrun \
     num_workers=0 \
     sample_fps=16 \
     boundary_vae_roundtrip=true \
+    boundary_vae_roundtrip_keep_graph=true \
     infinity_rope=true \
     seed_prefill_mode=real \
     kv_cache_seed_headroom=true \
@@ -183,7 +184,7 @@ srun torchrun \
     streaming_fake_updates_per_gen=4 \
     rollout_viz_source=finish \
     lr=2e-6 \
-    fake_lr=4e-7 \
+    fake_lr=1e-5 \
     ema_weight=0.99 \
     ema_start_step=0 \
     fake_score_init_from_teacher=true \

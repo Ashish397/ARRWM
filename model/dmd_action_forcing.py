@@ -80,6 +80,7 @@ from torch.utils.checkpoint import checkpoint as _ckpt
 from model.base import SelfForcingModel
 from model.one_forcing_gan import (
     add_noise_bf,
+    disc_micro_batch_bounds,
     duplicate_conditional_dict,
     finite_difference_penalty,
     logit_gap,
@@ -90,6 +91,7 @@ from model.one_forcing_gan import (
     pair_shared_noise,
     resolve_of_config,
     sample_of_timestep,
+    slice_conditional_dict_rows,
     split_logits,
 )
 from pipeline.action_forcing_training import (
@@ -125,6 +127,773 @@ except Exception:
 
 def _is_main() -> bool:
     return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def resolve_ladd_fake_backbone_trainable(
+    args, ladd_feature_source: str,
+) -> bool:
+    """Resolve + validate ``ladd_fake_backbone_trainable``.
+
+    Module-level and pure so the illegal-combination contract is
+    unit-testable without constructing a 1.3B model (the reason the
+    existing ``ladd_feature_source`` checks were only ever exercised on
+    a GPU). Returns the resolved bool; raises ``ValueError`` on every
+    illegal combination, mirroring the neighbouring
+    ``ladd_feature_source`` raises.
+
+    See ``ActionForcingDMD.__init__`` for the full design note (which
+    loss trains the backbone, which optimizer steps it, why the disc
+    update must be deferred)."""
+    enabled = bool(getattr(args, "ladd_fake_backbone_trainable", False))
+    if not enabled:
+        return False
+    if str(ladd_feature_source) != "fake":
+        raise ValueError(
+            "ladd_fake_backbone_trainable=true requires "
+            "ladd_feature_source='fake'; got "
+            f"{ladd_feature_source!r}. The flag releases the "
+            "adversarial-gradient freeze on the FAKE-SCORE feature "
+            "backbone, and there is no such backbone unless the disc "
+            "taps it. On ladd_feature_source='real' the disc's "
+            "features come from the frozen real_score TEACHER — "
+            "training that with the D loss is the exact coupling "
+            "GAN_REDESIGN_TWO.md forbids."
+        )
+    if not bool(getattr(args, "ladd_defer_disc_update", False)):
+        raise ValueError(
+            "ladd_fake_backbone_trainable=true requires "
+            "ladd_defer_disc_update=true. Three reasons, all "
+            "structural: (1) NESTING — the inline disc update runs "
+            "inside the gen-side frozen-fake-score window, so its "
+            "unfrozen window would have to lift and restore an "
+            "enclosing freeze in the middle of the generator's live "
+            "graph; (2) BOOKKEEPING — inline, the adversarial gradient "
+            "is deposited BEFORE the critic backward and is consumed "
+            "by the first streaming_fake_updates_per_gen step rather "
+            "than by the step that also carries the denoising "
+            "gradient; (3) RANK SAFETY — the DDP-bypassed adversarial "
+            "gradient must be manually all-reduced at a straight-line, "
+            "rank-uniform point after every denoising backward, which "
+            "only the deferred site is. Deferring is also the FT_v3 "
+            "memory fix, which this mode needs more than the frozen "
+            "one does."
+        )
+    if not bool(getattr(args, "streaming_mode", True)):
+        raise ValueError(
+            "ladd_fake_backbone_trainable=true requires "
+            "streaming_mode=true: the deferred disc-update site (the "
+            "only place the trainable D-update window is opened) "
+            "exists only on the streaming step. Under "
+            "streaming_mode=false the closure would be stashed and "
+            "never run — the disc would silently stop updating."
+        )
+    return True
+
+
+def resolve_ladd_fake_sample_source(args) -> str:
+    """Resolve + validate ``ladd_fake_sample_source``.
+
+    One-Forcing DIVERGENCE 3 (docs/ONE_FORCING_PORT.md ~:88 — "fake
+    sample: ours = the ``flash_dmd_gan_t=60`` slab, a DIFFERENT
+    sub-graph from DMD; One-Forcing = the SAME ``pred_image`` the DMD
+    scores").
+
+      ``"flash"`` (default): today's behaviour, byte-identical. The
+          LADD disc's fake is ``info["flash_dmd_gan_x0"]`` — the x0
+          estimate of a DEDICATED extra generator forward at
+          ``t=flash_dmd_gan_t``. It shares the generator's weights with
+          the DMD-scored sample but not its sub-graph: the adversarial
+          and distillation gradients reach the generator through two
+          different forwards, at two different noise levels.
+      ``"dmd"``: the fake is ``score_image[:, band]`` — literally the
+          tensor handed to ``compute_distribution_matching_loss``,
+          restricted to the frames its ``gradient_mask`` is True on. One
+          sample, one sub-graph, two objectives.
+
+    Module-level and pure so the illegal-combination contract is
+    unit-testable without constructing a 1.3B model (the same reason
+    ``resolve_ladd_fake_backbone_trainable`` above is). Returns the
+    resolved string; raises ``ValueError`` on every illegal combination.
+    """
+    source = str(getattr(args, "ladd_fake_sample_source", "flash") or "flash")
+    if source not in ("flash", "dmd"):
+        raise ValueError(
+            "ladd_fake_sample_source must be 'flash' or 'dmd'; got "
+            f"{source!r}."
+        )
+    if source == "flash":
+        return source
+    if not bool(getattr(args, "streaming_mode", True)):
+        raise ValueError(
+            "ladd_fake_sample_source='dmd' requires streaming_mode=true. "
+            "The band is published by ``_publish_ladd_dmd_band``, which "
+            "runs inside ``compute_generator_loss_streaming`` — the only "
+            "scope in the process that holds ``score_image``, the tensor "
+            "the DMD gradient is actually applied to. Under "
+            "streaming_mode=false that method never runs and the disc "
+            "would have no fake at all."
+        )
+    if bool(getattr(args, "dmd_only_first_chunk_per_ride", False)):
+        raise ValueError(
+            "ladd_fake_sample_source='dmd' refuses "
+            "dmd_only_first_chunk_per_ride=true: that flag EARLY-RETURNS "
+            "out of compute_generator_loss_streaming on rolls 2..N, "
+            "before the scoring inputs are built, so the band would go "
+            "unpublished on exactly those rolls while the trainer's GAN "
+            "block still runs. ``dmd_supervise_roll_mode`` is the "
+            "supported way to supervise a subset of rolls: it skips the "
+            "SCORER but still builds (and publishes) the band."
+        )
+    return source
+
+
+class _LaddFakeFeatureBackbone:
+    """LADD teacher_feat GAN feature-backbone override: the TRAINABLE
+    fake score instead of the frozen real_score teacher.
+
+    Installed on ``self.real_score`` as the plain attribute
+    ``_ladd_feature_backbone_override`` when
+    ``ladd_feature_source == "fake"`` (One-Forcing style: the disc's
+    feature basis is the fake-score critic, which is trained every step
+    to denoise the current student's samples, so it TRACKS the student
+    distribution instead of staying frozen). A plain object — not an
+    ``nn.Module`` — so it never enters real_score's state_dict, its
+    parameter iteration, or ``.to()`` traversal.
+
+    ``model/ladd_disc.py``'s ``WanFeatureProjector`` consults the
+    attribute at every feature forward. ALL the GAN feature-extraction
+    sites funnel through that single ``__call__`` (the disc D-update's
+    real AND fake sides, the R1/R2 perturbed forwards, the gen-side
+    G-term / guidance forward, the FN teacher_feat projector loss and
+    the aux-teacher projector feature-match), so this one override
+    covers every site with identical timestep/slab/conditioning
+    semantics — only the backbone module swaps.
+
+    Invariants enforced by ``forward``:
+
+    * INPUT gradients flow. The forward is NOT wrapped in
+      ``torch.no_grad()``; parameter-side ``requires_grad=False`` does
+      not sever the input → feature autograd path, which the gen-side
+      G-term needs to reach the student sample.
+    * WEIGHT gradients NEVER accumulate into fake-score params from any
+      GAN loss. Every wrapper param is set ``requires_grad_(False)``
+      for the duration of the forward and restored to its RECORDED
+      per-param prior value (mixed True/False survives — e.g.
+      ``fake_score_lora_enabled`` freezes the base and trains only the
+      LoRA) in a ``finally``. Same snapshot/restore discipline as
+      ``_of_disc_frozen`` below. With the params frozen at graph-record
+      time, autograd records no edges into them, so no ``.grad``
+      buffers are ever created by the GAN backward and the critic's own
+      next optimizer step sees clean state.
+    * CHECKPOINT-REPLAY safety. This forward executes INSIDE
+      ``WanFeatureProjector``'s checkpointed ``_run_teacher`` body
+      (``use_reentrant=False``), so the backward-time replay re-runs
+      this method and the recomputed graph must be identical to the
+      recorded one. Two modes:
+
+      SCOPED (``scope_enter``/``scope_exit``, the production path): the
+      TRAINER freezes every fake-score param for the WHOLE
+      forward+backward window of the consumer loss (FN teacher_feat,
+      the gen-side GAN window, the disc updates). With the flags pinned
+      across the entire window, the fake score's inner per-block
+      ``gradient_checkpointing`` can stay ENABLED: its frames record
+      AND replay under the same frozen flags (no saved-tensor-list
+      shift), and the projector's outer-checkpoint recompute holds only
+      per-block boundary tensors instead of the full 30-block
+      activation set. This is the actual memory parity with the
+      real_score path — real_score runs inner-ckpt-ON
+      (``real_score_gradient_checkpointing=true``) with PERMANENTLY
+      frozen params, which is why it never had the flag-flip hazard.
+      The branch choice (scoped vs legacy) replays consistently because
+      the scope contract requires record and backward inside one
+      window.
+
+      TRAINABLE DISC WINDOW (``ladd_fake_backbone_trainable=true``,
+      opened by ``disc_window_enter``/``disc_window_exit`` around the
+      D-UPDATE consumer only — divergence-1 of
+      docs/ONE_FORCING_PORT.md, where the disc IS the trainable
+      fake-score backbone and the whole 1.3B takes adversarial
+      gradient): params are NOT frozen, so the D loss's backward
+      deposits adversarial gradient straight onto the fake-score
+      parameters. Inner per-block gradient checkpointing must still be
+      ON (same fail-loud guard as the scoped branch — see
+      ``_assert_inner_ckpt``). There is no outer-checkpoint replay on
+      this path: the projector only wraps ``_run_teacher`` in
+      ``torch.utils.checkpoint`` when ``x_noisy.requires_grad`` and the
+      D-update's real/fake/R1 slabs are all DETACHED, so the forward is
+      recorded once and backwarded once inside the window. The
+      gen-side G-term, the FN teacher_feat consumer and the aux-teacher
+      disc losses keep using the FROZEN scoped window even in this
+      mode — see ``disc_window_enter`` for why (G must not train D).
+
+      LEGACY (unscoped, no_grad / detached-input calls only): freeze +
+      restore around this single forward, with inner
+      ``gradient_checkpointing`` temporarily DISABLED: an inner
+      checkpoint frame recorded under frozen flags would replay AFTER
+      the ``finally`` restored the flags, changing the saved-tensor
+      list and raising ``CheckpointError`` (exactly how the first
+      8-rank OF smoke died — see ``_of_disc_frozen``'s docstring).
+      Inner-ckpt-off makes the outer-checkpoint recompute materialize
+      the FULL per-block activations of the whole batch at once
+      (~seq_len-padded 30-block slab), which is what OOM'd the first
+      ``ladd_feature_source=fake`` 8-rank run at 92.7GB pre-step-1
+      (``logs/exp_carntx_fakefeat.err``: FN teacher_feat backward →
+      outer ``recompute_fn`` → this forward → WAN FFN GELU). Grad-on
+      unscoped calls therefore RAISE — see ``forward``.
+    * DDP bypass. The trainer DDP-wraps ``fake_score.model`` and
+      assigns the DDP object back onto the wrapper
+      (``model.fake_score.model = self.fake_score_ddp``). For the
+      duration of this forward the wrapper's ``.model`` is rebound to
+      the underlying ``.module`` and restored in the same ``finally``,
+      so no DDP hooks / bucket logic fire on these auxiliary forwards.
+      Mirrors ``_of_disc_logits(unwrapped=True)``: a DDP forward whose
+      backward produces no param grads is a multi-node hang risk.
+    * LIVE weights, never the EMA. One-Forcing runs its disc on the
+      live critic; ``fake_score`` is resolved from the owner at CALL
+      time and any ``fake_score_ema_weight`` machinery is deliberately
+      not consulted.
+    """
+
+    def __init__(
+        self,
+        owner: "ActionForcingDMD",
+        backbone_trainable: bool = False,
+    ):
+        self._owner = owner
+        # ``ladd_fake_backbone_trainable`` (default False = today's
+        # behaviour, byte-identical). True ONLY inverts the freeze for
+        # the D-update consumer window (``disc_window_enter``); every
+        # other consumer keeps the scoped freeze.
+        self.backbone_trainable = bool(backbone_trainable)
+        # Consumer-scoped freeze state (``scope_enter``/``scope_exit``):
+        # depth-counted so nested windows compose (e.g. the gen-side GAN
+        # window wrapping the inline disc updates). While depth > 0 the
+        # fake-score params stay frozen for the WHOLE forward+backward
+        # window of the consumer loss — the invariant that makes it safe
+        # to leave the fake score's inner per-block gradient
+        # checkpointing ENABLED during the feature forward.
+        self._scope_depth = 0
+        self._scope_params: List[nn.Parameter] = []
+        self._scope_saved: List[bool] = []
+        # ---- trainable D-update window state (see disc_window_enter) --
+        # ``_disc_stack`` records, per open disc window, which flavour it
+        # is so ``disc_window_exit`` unwinds symmetrically:
+        #   "frozen"         -> delegated to scope_enter/scope_exit
+        #   "trainable"      -> no enclosing freeze existed
+        #   "trainable+lift" -> an enclosing frozen scope was LIFTED for
+        #                       the duration and must be re-frozen
+        self._disc_stack: List[str] = []
+        self._trainable_depth = 0
+        self._scope_suspended = False
+        # ---- telemetry (``ladd_fake_backbone_grad_norm``) -------------
+        self._grad_hooks: List[Any] = []
+        self._grad_sq: Optional[torch.Tensor] = None
+        self._grad_hits: int = 0
+        self._telemetry: Dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Trainable D-update window (ladd_fake_backbone_trainable)
+    # ------------------------------------------------------------------
+    def disc_window_enter(self, measure_grad_norm: bool = False) -> None:
+        """Open the GAN **D-update** consumer window.
+
+        ``backbone_trainable=False`` (default): identical to
+        ``scope_enter()`` — the disc update runs with every fake-score
+        param frozen, exactly as before this flag existed.
+
+        ``backbone_trainable=True``: the window is UNFROZEN, so the
+        D loss's backward deposits adversarial gradient onto the
+        fake-score parameters (One-Forcing divergence 1). Three
+        properties are deliberate:
+
+        * **Only the D-update.** The gen-side G-term, the FN
+          teacher_feat consumer and the aux-teacher disc losses keep the
+          frozen ``scope_enter`` window in BOTH modes. Releasing them
+          would let the GENERATOR's backward train the discriminator's
+          feature backbone — G training D, a known silent failure.
+        * **Nesting is resolved by LIFTING.** If a frozen scope is
+          already open (the gen-side GAN window wraps the INLINE disc
+          update), it is temporarily lifted here and re-frozen on exit,
+          so a nested disc update still gets a genuinely unfrozen
+          window instead of silently inheriting the outer freeze. The
+          production wiring never relies on this — the trainable mode
+          REFUSES ``ladd_defer_disc_update=false`` at construction, so
+          the disc window is always the outermost one — but the lift
+          makes the invariant structural rather than positional.
+        * **Fail loud if the mode is not actually live.** If no
+          fake-score parameter requires grad there is nothing for the
+          adversarial gradient to land on; the feature forward raises
+          rather than running a mode that measures nothing.
+
+        ``measure_grad_norm`` installs per-parameter gradient probes for
+        this window (see ``_install_grad_probes``); the trainer decides
+        the cadence.
+        """
+        if not self.backbone_trainable:
+            self.scope_enter()
+            self._disc_stack.append("frozen")
+            return
+        lifted = False
+        if self._scope_depth > 0 and not self._scope_suspended:
+            for p, flag in zip(self._scope_params, self._scope_saved):
+                p.requires_grad_(flag)
+            self._scope_suspended = True
+            lifted = True
+        self._trainable_depth += 1
+        self._disc_stack.append("trainable+lift" if lifted else "trainable")
+        if self._trainable_depth == 1:
+            self._install_grad_probes(
+                measure=bool(measure_grad_norm),
+                scale=float(getattr(
+                    self._owner, "ladd_fake_backbone_grad_scale", 1.0)),
+            )
+
+    def disc_window_exit(self) -> None:
+        """Close one D-update window level (see ``disc_window_enter``).
+
+        On the OUTERMOST trainable level, in this order:
+          1. remove the gradient probes and publish their reading (the
+             window's backwards are all complete by now);
+          2. all-reduce the fake-score gradients across ranks — the
+             feature forward BYPASSES the ``fake_score`` DDP wrapper, so
+             the adversarial gradient it produced is rank-local and
+             would otherwise desynchronise the critic's weights
+             silently (see ``_sync_backbone_grads``);
+          3. re-freeze any enclosing scope that was lifted.
+        Extra calls (empty stack) are no-ops."""
+        if not self._disc_stack:
+            return
+        kind = self._disc_stack.pop()
+        if kind == "frozen":
+            self.scope_exit()
+            return
+        self._trainable_depth -= 1
+        if self._trainable_depth == 0:
+            self._remove_grad_probes()
+            self._sync_backbone_grads()
+        if kind == "trainable+lift":
+            for p in self._scope_params:
+                p.requires_grad_(False)
+            self._scope_suspended = False
+
+    def _trainable_params(self) -> List[nn.Parameter]:
+        """The fake-score params the adversarial gradient can land on.
+
+        Built from ``requires_grad``, which is a pure function of the
+        run config (full-FT vs ``fake_score_lora_enabled``) and is
+        therefore IDENTICAL on every rank — the property
+        ``_sync_backbone_grads`` needs for its collectives to match.
+        Iterates the WRAPPER (a superset of ``fake_score.model``, which
+        is what ``fake_optimizer`` owns) so a wrapper-level trainable
+        param can never be left unsynced."""
+        return [
+            p for p in self._owner.fake_score.parameters() if p.requires_grad
+        ]
+
+    def _install_grad_probes(
+        self, measure: bool = True, scale: float = 1.0,
+    ) -> None:
+        """Per-parameter hooks on the adversarial gradient for the
+        duration of one trainable D-update window.
+
+        ``Tensor.register_hook`` on a leaf fires with the INCOMING
+        contribution, BEFORE ``AccumulateGrad`` folds it into ``.grad``.
+        That is the only place in this design where the adversarial term
+        is separable from the denoising gradient already sitting in
+        ``.grad``, and it costs O(1) memory — a pre/post ``.grad``
+        snapshot would be ~2.6-5.2 GB on a 1.3B critic.
+
+        ``measure``: accumulate the summed squared norm, published as
+        ``ladd_fake_backbone_grad_norm``. A D-update block issues
+        ``gan_updates_per_step`` x ``ladd_disc_micro_batch_groups``
+        backwards and EVERY one of them fires the hooks, so the reading
+        is ``sqrt(sum over all backwards, all params, ||g||^2)`` — the
+        total adversarial energy the backbone received this window.
+        ``ladd_fake_backbone_grad_hits`` publishes the firing count so
+        the two can never be confused (hits / n_params = the number of
+        adversarial backwards that landed).
+
+        ``scale`` (``ladd_fake_backbone_grad_scale``, default 1.0 =
+        inert, no hook installed on that account): multiplies the
+        incoming adversarial gradient only. It exists because the
+        accumulation above is real and would otherwise be SILENT: the
+        backbone receives the SUM of all ``gan_updates_per_step`` x
+        ``ladd_disc_micro_batch_groups`` D backwards while the disc's
+        own optimizer consumes and zeroes each one separately, so the
+        effective adversarial weight on the backbone is
+        ``n_disc_updates`` x its weight on the disc. Setting
+        ``1/gan_updates_per_step`` makes the backbone see the MEAN
+        D-update instead of the sum. Scaling here — rather than at the
+        window close — is what keeps the denoising gradient already in
+        ``.grad`` untouched."""
+        params = self._trainable_params()
+        if not params:
+            return
+        do_scale = float(scale) != 1.0
+        if not (measure or do_scale):
+            return
+        if measure:
+            self._grad_sq = torch.zeros(
+                (), device=params[0].device, dtype=torch.float64
+            )
+            self._grad_hits = 0
+        _s = float(scale)
+
+        def _make_probe():
+            def _probe(g):
+                if g is None:
+                    return None
+                if do_scale:
+                    g = g * _s
+                if self._grad_sq is not None:
+                    self._grad_sq += (
+                        g.detach().float().pow(2).sum().to(torch.float64)
+                    )
+                    self._grad_hits += 1
+                # Returning a tensor REPLACES the gradient; returning
+                # None leaves it untouched. Both branches are explicit so
+                # the inert default can never accidentally rewrite it.
+                return g if do_scale else None
+            return _probe
+
+        self._grad_hooks = [p.register_hook(_make_probe()) for p in params]
+        if do_scale:
+            self._telemetry["ladd_fake_backbone_grad_scale"] = _s
+
+    def _remove_grad_probes(self) -> None:
+        for h in self._grad_hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self._grad_hooks = []
+        if self._grad_sq is not None:
+            self._telemetry["ladd_fake_backbone_grad_norm"] = float(
+                self._grad_sq.sqrt().item()
+            )
+            self._telemetry["ladd_fake_backbone_grad_hits"] = float(
+                self._grad_hits
+            )
+            self._grad_sq = None
+            self._grad_hits = 0
+
+    def _sync_backbone_grads(self) -> None:
+        """All-reduce (MEAN) every trainable fake-score gradient.
+
+        WHY, and why re-reducing the denoising term is safe:
+
+        * The feature forward rebinds ``fake_score.model`` to the raw
+          module for its duration, so the D-update's backward never
+          touches the DDP reducer (a DDP forward whose backward produces
+          no param grads is a multi-node hang risk, which is why the
+          bypass exists). The adversarial gradient it deposits is
+          therefore RANK-LOCAL. Left alone, every rank would apply a
+          different ``fake_optimizer`` step and the critic's weights
+          would silently diverge — the worst available outcome.
+        * Routing this forward THROUGH DDP instead was rejected: the
+          critic already runs 1 + ``streaming_fake_updates_per_gen``
+          DDP forward/backward cycles per step, and interleaving extra
+          reducer-armed forwards (x ``gan_updates_per_step`` x
+          ``ladd_disc_micro_batch_groups`` backwards, several of them
+          under ``no_sync``) is exactly the multi-forward reducer
+          hazard this file already documents elsewhere.
+        * The window runs AFTER the critic's DDP backward(s), so
+          ``.grad`` at this point is ``ddp_mean(denoise) + local(adv)``.
+          DDP's reduction (reduce-scatter + all-gather) leaves every
+          rank bit-identical, so re-averaging the denoise half is a
+          numeric no-op; only the adversarial half actually changes.
+          That is what makes a single blanket all-reduce correct and
+          removes the need for a 5 GB pre/post snapshot.
+
+        The parameter list is rank-uniform by construction
+        (``_trainable_params``), so the collectives match. A missing
+        ``.grad`` is impossible on the supported wiring (the critic's
+        ``find_unused_parameters=False`` backward has already populated
+        every trainable fake param before this window opens) and is
+        raised rather than skipped — skipping it per-rank is precisely
+        how a collective mismatch turns into a hang."""
+        if not (dist.is_available() and dist.is_initialized()):
+            self._telemetry["ladd_fake_backbone_grad_synced"] = 0.0
+            return
+        world = dist.get_world_size()
+        if world <= 1:
+            self._telemetry["ladd_fake_backbone_grad_synced"] = 0.0
+            return
+        params = self._trainable_params()
+        if not params:
+            self._telemetry["ladd_fake_backbone_grad_synced"] = 0.0
+            return
+        n_missing = sum(1 for p in params if p.grad is None)
+        if n_missing:
+            raise RuntimeError(
+                "_LaddFakeFeatureBackbone._sync_backbone_grads: "
+                f"{n_missing}/{len(params)} trainable fake_score params "
+                "have .grad=None at the close of the trainable D-update "
+                "window. The manual all-reduce cannot skip them without "
+                "risking a per-rank collective mismatch (a hang). This "
+                "means the critic's denoising backward did not run "
+                "before the disc window — check that "
+                "ladd_defer_disc_update=true and that "
+                "fake_score_updates_enabled=true."
+            )
+        scale = 1.0 / float(world)
+        for p in params:
+            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
+            p.grad.data.mul_(scale)
+        self._telemetry["ladd_fake_backbone_grad_synced"] = float(len(params))
+
+    def pop_telemetry(self) -> Dict[str, float]:
+        """Drain this window's gauges. Always carries
+        ``ladd_fake_backbone_trainable`` so a trace PROVES which mode
+        ran; the grad norm rides the trainer's cadence."""
+        out: Dict[str, float] = {
+            "ladd_fake_backbone_trainable": (
+                1.0 if self.backbone_trainable else 0.0
+            ),
+        }
+        out.update(self._telemetry)
+        self._telemetry = {}
+        return out
+
+    def scope_enter(self) -> None:
+        """Open (or nest into) a frozen-fake-score consumer window.
+
+        First entry snapshots every fake-score param's ``requires_grad``
+        and sets it False (mixed True/False survives — e.g.
+        ``fake_score_lora_enabled``); nested entries only bump the
+        depth. The trainer MUST keep the window open until the consumer
+        loss's backward has completed — checkpoint frames recorded in
+        this window replay during that backward and must see the same
+        flags."""
+        self._scope_depth += 1
+        if self._scope_depth == 1:
+            wrapper = self._owner.fake_score
+            for p in wrapper.parameters():
+                self._scope_params.append(p)
+                self._scope_saved.append(bool(p.requires_grad))
+                p.requires_grad_(False)
+
+    def scope_exit(self) -> None:
+        """Close one window level; restores the recorded per-param
+        ``requires_grad`` flags when the outermost level closes.
+        Extra calls (depth already 0) are no-ops."""
+        if self._scope_depth <= 0:
+            return
+        self._scope_depth -= 1
+        if self._scope_depth == 0:
+            for p, flag in zip(self._scope_params, self._scope_saved):
+                p.requires_grad_(flag)
+            self._scope_params.clear()
+            self._scope_saved.clear()
+
+    def scope_release_all(self) -> None:
+        """Unwind every open window level (idempotent). The trainer
+        calls this right after the gen backward — the single point by
+        which all gen-graph consumers' replays have completed — and
+        BEFORE the critic's own DDP training forward, which needs the
+        fake params trainable again."""
+        while self._scope_depth > 0:
+            self.scope_exit()
+
+    def module(self) -> nn.Module:
+        """Root module for dtype detection / transformer-block discovery
+        (the projector installs its forward hooks on blocks found under
+        this). Returns the live wrapper; ``modules()`` traverses through
+        a DDP wrap, so block discovery is unaffected by wrapping."""
+        return self._owner.fake_score
+
+    def _assert_inner_ckpt(self, prev_model, is_ddp: bool) -> None:
+        """FAIL-LOUD GUARD: the memory argument for a grad-on feature
+        forward ONLY holds if the fake score's inner per-block
+        ``gradient_checkpointing`` is actually ON. The WAN backbone
+        consults the plain attribute ``gradient_checkpointing`` on the
+        MODEL ROOT (``wan/modules/model.py`` block loop:
+        ``torch.is_grad_enabled() and self.gradient_checkpointing``), set
+        by the trainer from ``fake_score_gradient_checkpointing`` onto
+        ``fake_score.model``.
+
+        With it OFF:
+          * SCOPED (frozen) window — the projector's outer non-reentrant
+            checkpoint backward RECOMPUTES this forward with all 30
+            blocks' activations resident (~25-35GB/row vs ~3GB/row with
+            the inner frames on) and OOMs 95GB GPUs.
+          * TRAINABLE D-update window — worse: the parameters require
+            grad, so ``F.linear`` also saves its INPUT for the weight
+            gradient at every layer, and with no per-block frames the
+            whole 30-block activation set is RETAINED (not merely
+            recomputed) until the D backward.
+
+        The flag is ALSO independently load-bearing for DDP:
+        ``action_model_patch.py`` (crossattn-cache pin, see the
+        ``_TWIN_MIRRORED_FLAGS`` block) documents that the
+        gradient-checkpointing branch of ``_forward_inference`` omits
+        ``crossattn_cache``, which is what keeps every cross-attn k/v
+        param used and ``find_unused_parameters=False`` DDP from
+        hanging. Cheap: one attribute read, no tensor work; only on the
+        grad-on windowed paths — never the legacy no-grad/detached path
+        or the real_score path (different object)."""
+        if not torch.is_grad_enabled():
+            return
+        _gc_model = prev_model.module if is_ddp else prev_model
+        _gc_flag = getattr(_gc_model, "gradient_checkpointing", None)
+        if _gc_flag is not None and not _gc_flag:
+            raise RuntimeError(
+                "_LaddFakeFeatureBackbone.forward: windowed grad-on "
+                "feature forward with the fake score's inner "
+                "per-block gradient checkpointing DISABLED "
+                "(fake_score.model.gradient_checkpointing is "
+                "False). The outer-checkpoint backward recompute "
+                "would then materialize ALL 30 blocks' "
+                "activations (~25-35GB/row instead of ~3GB/row "
+                "with inner frames on) and OOM 95GB GPUs — and with "
+                "ladd_fake_backbone_trainable=true they would be "
+                "RETAINED, not merely recomputed. Set "
+                "fake_score_gradient_checkpointing=true. The "
+                "flag is also independently load-bearing for "
+                "DDP: the gradient-checkpointing branch of "
+                "_forward_inference omits crossattn_cache "
+                "(model/action_model_patch.py), which is what "
+                "keeps find_unused_parameters=False DDP from "
+                "hanging on never-ready cross-attn buckets."
+            )
+
+    def forward(self, **kwargs):
+        """Run the fake-score backbone forward under the freeze guard.
+
+        ``kwargs`` are exactly the kwargs the projector would have
+        passed to ``real_score`` (``noisy_image_or_video``,
+        ``conditional_dict``, ``timestep``, optional ``clean_x`` /
+        ``aug_t`` / ``seq_len``) — real_score and fake_score are the
+        same ``WanDiffusionWrapper`` class, so no signature adaptation
+        is needed. The return value is discarded by the caller; the
+        projector's local hooks capture the per-block features.
+        """
+        wrapper = self._owner.fake_score
+        prev_model = wrapper.model
+        is_ddp = isinstance(
+            prev_model, torch.nn.parallel.DistributedDataParallel
+        )
+        if self._trainable_depth > 0:
+            # TRAINABLE D-update window (ladd_fake_backbone_trainable):
+            # params keep their REAL requires_grad flags, so autograd
+            # records edges into them and the D loss's backward deposits
+            # adversarial gradient on the fake-score weights — One-
+            # Forcing divergence 1 (docs/ONE_FORCING_PORT.md ~:88).
+            #
+            # Checked FIRST so it wins over any enclosing frozen scope.
+            # ``disc_window_enter`` also physically lifts that scope, so
+            # the two can never disagree about the flags; the ordering
+            # here is belt-and-braces for a mis-nested call site.
+            #
+            # No outer-checkpoint replay on this path: the projector
+            # wraps ``_run_teacher`` in ``torch.utils.checkpoint`` only
+            # when ``x_noisy.requires_grad`` (model/ladd_disc.py), and
+            # the D-update's real / fake / R1 slabs are all DETACHED.
+            # The forward is therefore recorded once and backwarded once
+            # INSIDE this window — none of the flag-flip replay hazards
+            # that shape the two branches below apply. The inner
+            # per-block frames still record-and-replay inside the same
+            # window, and must be ON (guard below).
+            if torch.is_grad_enabled():
+                self._assert_inner_ckpt(prev_model, is_ddp)
+                if not any(p.requires_grad for p in wrapper.parameters()):
+                    raise RuntimeError(
+                        "_LaddFakeFeatureBackbone.forward: "
+                        "ladd_fake_backbone_trainable=true but NO "
+                        "fake_score parameter requires grad, so the "
+                        "adversarial gradient has nothing to land on "
+                        "and the arm would measure nothing while "
+                        "logging cheerfully. Check "
+                        "fake_score_updates_enabled and that no outer "
+                        "freeze is still active."
+                    )
+            try:
+                if is_ddp:
+                    wrapper.model = prev_model.module
+                return wrapper(**kwargs)
+            finally:
+                if is_ddp:
+                    wrapper.model = prev_model
+        if self._scope_depth > 0 and not self._scope_suspended:
+            # SCOPED consumer window (trainer-managed): params were
+            # frozen by ``scope_enter`` and stay frozen until AFTER the
+            # consumer's backward, so the inner per-block
+            # ``gradient_checkpointing`` stays ENABLED — its frames
+            # record and replay under the same frozen flags, and the
+            # projector's outer-checkpoint recompute holds per-block
+            # boundaries instead of the full 30-block activation set
+            # (memory parity with the real_score path). This branch
+            # replays identically during the outer non-reentrant
+            # checkpoint backward because the scope is still open there.
+            #
+            # FAIL-LOUD GUARD (``_assert_inner_ckpt``): the memory-parity
+            # argument above ONLY holds if the inner per-block
+            # ``gradient_checkpointing`` is actually ON. Shared verbatim
+            # with the trainable branch above; see that method for the
+            # full rationale and the DDP crossattn-cache coupling.
+            self._assert_inner_ckpt(prev_model, is_ddp)
+            try:
+                if is_ddp:
+                    wrapper.model = prev_model.module
+                return wrapper(**kwargs)
+            finally:
+                if is_ddp:
+                    wrapper.model = prev_model
+        _x_in = kwargs.get("noisy_image_or_video", None)
+        if (
+            torch.is_grad_enabled()
+            and torch.is_tensor(_x_in)
+            and _x_in.requires_grad
+        ):
+            # UNSCOPED grad-on feature forward. The legacy fallback
+            # below records with inner ckpt DISABLED; the projector's
+            # outer-checkpoint replay then rematerializes the FULL
+            # per-block activations of this whole (seq_len-padded)
+            # batch at once — the 92.7GB pre-step-1 OOM of the first
+            # fakefeat 8-rank run (logs/exp_carntx_fakefeat.err). And
+            # if the replay lands inside ANOTHER consumer's open scope
+            # window, the scoped branch above would be taken on replay
+            # -> saved-tensor mismatch -> CheckpointError. Every
+            # grad-on consumer must open a scope spanning its forward
+            # AND backward (trainer ``_ladd_fake_feat_override()``
+            # + ``scope_enter``/``scope_exit``). Fail loud at the call
+            # site instead.
+            raise RuntimeError(
+                "_LaddFakeFeatureBackbone.forward: grad-on feature "
+                "forward outside a frozen-fake-score scope window "
+                "(ladd_feature_source='fake'). Wrap this consumer's "
+                "forward+backward in scope_enter()/scope_exit() — see "
+                "trainer _fn_forward_backward_with_cycle and the "
+                "gen-side GAN window around _compute_r3gan_losses — so "
+                "the fake score's params stay frozen through the "
+                "backward and its inner gradient checkpointing stays "
+                "replay-consistent."
+            )
+        # LEGACY unscoped path (no_grad / detached-input calls):
+        # per-forward freeze + inner-ckpt-off, byte-identical to the
+        # original implementation.
+        params: List[nn.Parameter] = []
+        saved_rg: List[bool] = []
+        gc_mods: List[nn.Module] = []
+        try:
+            if is_ddp:
+                wrapper.model = prev_model.module
+            for p in wrapper.parameters():
+                params.append(p)
+                saved_rg.append(p.requires_grad)
+                p.requires_grad_(False)
+            for m in wrapper.modules():
+                if getattr(m, "gradient_checkpointing", False) is True:
+                    gc_mods.append(m)
+                    m.gradient_checkpointing = False
+            return wrapper(**kwargs)
+        finally:
+            for m in gc_mods:
+                m.gradient_checkpointing = True
+            for p, flag in zip(params, saved_rg):
+                p.requires_grad_(flag)
+            if is_ddp:
+                wrapper.model = prev_model
 
 
 def _slice_baseline_scoring_window(
@@ -515,6 +1284,78 @@ class ActionForcingDMD(SelfForcingModel):
         self.dmd_42f_clean_match_min_improve = float(
             getattr(args, "dmd_42f_clean_match_min_improve", 0.0)
         )
+        # ``dmd_42f_clean_match_forward_only`` (2026-08-24, default False =
+        # byte-identical legacy +-cap search): restrict the clean-match
+        # candidate offsets to m >= 0. Researcher directive: a STALLED
+        # rollout matches best to PAST GT (m < 0), so backward matches
+        # ACCOMMODATE the stall instead of pulling advancement; forward-only
+        # keeps the matched target ahead of (or at) the positional moment.
+        # Only the candidate range changes — m=0 stays a candidate, and the
+        # min_improve acceptance + all window clamping are untouched.
+        self.dmd_42f_clean_match_forward_only = bool(
+            getattr(args, "dmd_42f_clean_match_forward_only", False)
+        )
+        # ``dmd_42f_clean_match_min_shift`` (2026-08-25, default 0 =
+        # byte-identical): minimum FORWARD offset the clean-match search may
+        # select. forward_only alone still allows m=0, i.e. matching to GT at
+        # the student's own moment — a stalled rollout is then rewarded for
+        # standing still. min_shift>=1 removes m=0 from the candidate range so
+        # the matched target is always ahead. Requires forward_only and must be
+        # <= max_drift_frames (the search radius). The min_improve safeguard is
+        # kept but its REFERENCE offset moves from m=0 to the smallest legal
+        # candidate (see compute_clean_match_offset) — falling back to m=0
+        # would reintroduce exactly the stall this flag forbids.
+        self.dmd_42f_clean_match_min_shift = int(
+            getattr(args, "dmd_42f_clean_match_min_shift", 0)
+        )
+        if self.dmd_42f_clean_match_min_shift < 0:
+            raise ValueError(
+                "dmd_42f_clean_match_min_shift must be >= 0, got "
+                f"{self.dmd_42f_clean_match_min_shift}"
+            )
+        if self.dmd_42f_clean_match_min_shift > 0:
+            if not self.dmd_42f_clean_match_forward_only:
+                raise ValueError(
+                    "dmd_42f_clean_match_min_shift="
+                    f"{self.dmd_42f_clean_match_min_shift} requires "
+                    "dmd_42f_clean_match_forward_only=true (a "
+                    "backward-allowed search with a positive minimum forward "
+                    "shift is incoherent)"
+                )
+            if (self.dmd_42f_clean_match_min_shift
+                    > self.dmd_42f_clean_match_max_drift_frames):
+                raise ValueError(
+                    "dmd_42f_clean_match_min_shift="
+                    f"{self.dmd_42f_clean_match_min_shift} must be <= "
+                    "dmd_42f_clean_match_max_drift_frames="
+                    f"{self.dmd_42f_clean_match_max_drift_frames} (a minimum "
+                    "larger than the search radius leaves no candidate)"
+                )
+        # ``dmd_42f_clean_match_ref_clamp`` (2026-08-25, default False =
+        # byte-identical legacy): make the min_improve safeguard's REFERENCE
+        # offset follow the clamped candidate range instead of being pinned at
+        # m=0.
+        #
+        # DEFECT this exists to fix (kept default-off because flipping it is a
+        # training-recipe change): when the in-bounds clamp pushes ``_m_lo``
+        # ABOVE 0 — which happens on the first roll of every ride whenever
+        # ``dmd_42f_clean_drift_enabled`` widens the reserved clean span (e.g.
+        # drift_chunks=3 -> _m_lo=6) — the reference m=0 is never evaluated,
+        # ``_d0`` stays None and the min_improve safeguard is SILENTLY SKIPPED.
+        # The argmin over [_m_lo, _m_hi] is then accepted no matter how
+        # marginal: a student that is a PERFECT positional copy of GT still
+        # gets a +6..+12 frame offset, which shifts clean_x / gt_target / the
+        # gate MAE / the stat-anchor window with it. Note the m=0 COMPARISON is
+        # always computable (only the downstream clean-window slice is OOB), so
+        # there is no numerical reason to skip the check — the existing
+        # ``min_shift`` path already does the right thing by moving the
+        # reference to the smallest legal candidate. With this flag on, the
+        # bounds-clamped path does the same: reference = the smallest legal
+        # candidate, and a rejected match parks there instead of accepting the
+        # unchecked argmin.
+        self.dmd_42f_clean_match_ref_clamp = bool(
+            getattr(args, "dmd_42f_clean_match_ref_clamp", False)
+        )
         # ``dmd_42f_clean_match_forward`` (default False): after the match, place
         # the clean half ONE CHUNK AHEAD of the student band instead of the
         # default npb back-shift — giving the (bidirectional) teacher a FUTURE
@@ -590,6 +1431,12 @@ class ActionForcingDMD(SelfForcingModel):
         # CARN seam affine strength (latent CARN v0). 0 = off.
         self.carn_seam_affine_lambda = float(
             getattr(args, "carn_seam_affine_lambda", 0.0)
+        )
+        # Seam-affine mean half. DEFAULT FALSE = std/scale re-anchor only;
+        # True restores the legacy mean+std blend (see the consumer at
+        # pipeline/action_forcing_training.py `carn_seam_affine_match_mean`).
+        self.carn_seam_affine_match_mean = bool(
+            getattr(args, "carn_seam_affine_match_mean", False)
         )
         # Rolling scorer-ctx source (see generate_next_chunk). Default off.
         self.dmd_rolling_ctx_last_rung = bool(
@@ -1514,6 +2361,61 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_apply_gt_drift_cap = bool(
             getattr(args, "forward_noiser_apply_gt_drift_cap", False)
         )
+        # ``forward_noiser_gt_match_frames`` / ``_forward_only``: consumed by
+        # the trainer's _train_forward_noiser_tf reverse-pair matching (GT
+        # target shift-search over +/-N frames; forward_only restricts to
+        # s >= 0). Previously these were NEVER registered on the model, so
+        # the trainer's getattr(m, ...) always saw the defaults and the
+        # config values were a silent no-op. Defaults (0 / False) preserve
+        # byte-identical legacy behavior.
+        self.forward_noiser_gt_match_frames = int(
+            getattr(args, "forward_noiser_gt_match_frames", 0)
+        )
+        if self.forward_noiser_gt_match_frames < 0:
+            raise ValueError(
+                "forward_noiser_gt_match_frames must be >= 0, got "
+                f"{self.forward_noiser_gt_match_frames}"
+            )
+        self.forward_noiser_gt_match_forward_only = bool(
+            getattr(args, "forward_noiser_gt_match_forward_only", False)
+        )
+        # ``forward_noiser_gt_match_min_shift`` (2026-08-25, default 0 =
+        # byte-identical): the MINIMUM forward shift the reverse-pair GT search
+        # may select. Researcher directive: with the floor at 0 the search may
+        # pick s=0, i.e. a target at the student's OWN position — a stalled
+        # rollout then gets rewarded for standing still. min_shift>=1 drops
+        # s=0 from the candidate set so the target always advances. Only
+        # meaningful with forward_only (a backward-allowed search with a
+        # positive minimum FORWARD shift is incoherent) and must not exceed the
+        # search radius. The trainer's out-of-bounds fallback (documented at
+        # the search site) is a pure function of the window bounds, so the pair
+        # count and the DDP anchor semantics are unchanged.
+        self.forward_noiser_gt_match_min_shift = int(
+            getattr(args, "forward_noiser_gt_match_min_shift", 0)
+        )
+        if self.forward_noiser_gt_match_min_shift < 0:
+            raise ValueError(
+                "forward_noiser_gt_match_min_shift must be >= 0, got "
+                f"{self.forward_noiser_gt_match_min_shift}"
+            )
+        if self.forward_noiser_gt_match_min_shift > 0:
+            if not self.forward_noiser_gt_match_forward_only:
+                raise ValueError(
+                    "forward_noiser_gt_match_min_shift="
+                    f"{self.forward_noiser_gt_match_min_shift} requires "
+                    "forward_noiser_gt_match_forward_only=true (a "
+                    "backward-allowed search with a positive minimum forward "
+                    "shift is incoherent)"
+                )
+            if (self.forward_noiser_gt_match_min_shift
+                    > self.forward_noiser_gt_match_frames):
+                raise ValueError(
+                    "forward_noiser_gt_match_min_shift="
+                    f"{self.forward_noiser_gt_match_min_shift} must be <= "
+                    "forward_noiser_gt_match_frames="
+                    f"{self.forward_noiser_gt_match_frames} (a minimum larger "
+                    "than the search radius leaves no candidate)"
+                )
         # ===== Level-conditioned CHAINED FN scheme (model-based, default) ====
         # ``forward_noiser_chain_levels`` (default TRUE): the unified scheme.
         #   * TRAINING (always, regardless of carn_recurse): conditioned
@@ -1990,6 +2892,116 @@ class ActionForcingDMD(SelfForcingModel):
         # ``_compute_ladd_losses_distilled``. Activated by setting
         # ``gan_backbone=ladd_teacher_feat`` in config; otherwise the
         # legacy 3D-conv path runs unchanged.
+        # ``ladd_feature_source`` (2026-08-24): which network the LADD
+        # teacher_feat GAN taps for its BACKBONE features.
+        #   "real" (default): the frozen real_score teacher — byte-
+        #       identical legacy behaviour (the projector's real_score
+        #       branch runs untouched).
+        #   "fake": the TRAINABLE fake-score critic — One-Forcing style
+        #       (docs/ONE_FORCING_PORT.md): the disc's feature basis is
+        #       already being trained every step to denoise the current
+        #       student's samples, so it tracks the student distribution
+        #       instead of being frozen. Wiring: ``__init__`` installs a
+        #       ``_LaddFakeFeatureBackbone`` handle on ``real_score``
+        #       (see the class docstring for the grad-isolation / DDP /
+        #       checkpoint-replay invariants); ``WanFeatureProjector``
+        #       consults it at every feature forward, so the disc
+        #       D-update (real+fake), R1/R2, the gen-side G-term and
+        #       the FN teacher_feat / aux-teacher projector losses all
+        #       swap backbone together. Timestep/slab/conditioning
+        #       semantics are unchanged — only the backbone swaps.
+        self.ladd_feature_source = str(
+            getattr(args, "ladd_feature_source", "real") or "real"
+        )
+        if self.ladd_feature_source not in ("real", "fake"):
+            raise ValueError(
+                "ladd_feature_source must be 'real' or 'fake'; got "
+                f"{self.ladd_feature_source!r}."
+            )
+        if self.ladd_feature_source == "fake" and str(
+            getattr(args, "ladd_disc_backbone_model_name", "") or ""
+        ):
+            raise ValueError(
+                "ladd_feature_source='fake' is mutually exclusive with "
+                "ladd_disc_backbone_model_name (the WP-14B raw prefix "
+                "backbone): both try to replace the projector's feature "
+                "backbone. Unset one of them."
+            )
+        # ``ladd_fake_backbone_trainable`` (2026-08-25): One-Forcing
+        # DIVERGENCE 1 (docs/ONE_FORCING_PORT.md ~:88 — "trainable
+        # fake_score, whole 1.3B backbone gets adversarial grad").
+        #
+        #   false (default): today's behaviour, byte-identical. The
+        #       feature backbone is the trainable critic but the
+        #       adversarial gradient is fenced out of it by the
+        #       consumer-scoped freeze; only the disc's own CCM/CSM/head
+        #       modules learn from the D loss. Equivalent to the port
+        #       doc's "D-heads" control arm.
+        #   true: the D-UPDATE consumer window runs UNFROZEN, so the
+        #       discriminator loss trains the fake-score backbone. Every
+        #       OTHER consumer (gen-side G-term, FN teacher_feat,
+        #       aux-teacher disc losses) keeps the frozen window — if
+        #       the G-term were released too, the GENERATOR's backward
+        #       would train the DISCRIMINATOR's feature basis, which is
+        #       a known silent failure of this wiring.
+        #
+        # GRADIENT BOOKKEEPING (option (b) — the shared-parameter design
+        # One-Forcing actually uses):
+        #   * The disc's own optimizer (``r3gan_optimizer``) owns ONLY
+        #     the LADD disc modules; ``WanFeatureProjector`` is a plain
+        #     object held as a non-submodule attribute, so no fake-score
+        #     parameter is ever in its param groups, its ``zero_grad``
+        #     or its ``clip_grad_norm_`` list. Nothing about the disc
+        #     step changes.
+        #   * The adversarial gradient lands on ``fake_score`` params,
+        #     which are owned by ``fake_optimizer`` — the same
+        #     parameters and the same optimizer the denoising critic
+        #     loss trains. The two objectives ACCUMULATE into one
+        #     ``.grad`` and ONE ``fake_optimizer.step()`` applies both,
+        #     clipped together at ``fake_max_grad_norm``. That is the
+        #     port doc's "disc shares the backbone with the denoising
+        #     critic loss".
+        #   * Ordering makes the accumulation exact and un-double-
+        #     counted: the D-update window opens AFTER the critic
+        #     backward and after the ``streaming_fake_updates_per_gen``
+        #     inner loop's last step+zero, and closes BEFORE the outer
+        #     loop's single ``fake_optimizer`` clip/step/zero. So the
+        #     adversarial term rides exactly one optimizer step and is
+        #     zeroed with it.
+        # Which is exactly why ``ladd_defer_disc_update`` is REQUIRED
+        # below: with the disc update inline it fires at generator time,
+        # nested inside the gen-side frozen window and BEFORE the critic
+        # backward, so its gradient would instead be consumed by the
+        # first inner fake update, and the rank-sync point (see
+        # ``_LaddFakeFeatureBackbone._sync_backbone_grads``) would have
+        # to move inside a call path with per-rank early exits.
+        self.ladd_fake_backbone_trainable = (
+            resolve_ladd_fake_backbone_trainable(
+                args, self.ladd_feature_source,
+            )
+        )
+        # ``ladd_fake_sample_source`` (2026-08-25): One-Forcing
+        # DIVERGENCE 3 (docs/ONE_FORCING_PORT.md ~:88 — "fake sample").
+        # "flash" (default) = today's flash t=60 slab, byte-identical;
+        # "dmd" = the band of ``score_image`` the DMD gradient is applied
+        # to, so the adversarial and distillation terms act on ONE sample
+        # through ONE sub-graph. See ``resolve_ladd_fake_sample_source``
+        # and ``_publish_ladd_dmd_band``.
+        self.ladd_fake_sample_source = resolve_ladd_fake_sample_source(args)
+        # Per-roll stash written by ``_publish_ladd_dmd_band``; cleared at
+        # the top of every ``compute_generator_loss_streaming`` call so a
+        # stale band (freed graph, wrong ride position) can never be
+        # silently re-consumed. See ``ladd_dmd_band``.
+        self._ladd_dmd_band: Optional[Dict[str, Any]] = None
+        # Multiplier on the ADVERSARIAL gradient only, applied by the
+        # D-update window's hooks (never touches the denoising gradient
+        # already in ``.grad``). 1.0 = inert / no hook. Set
+        # ``1/gan_updates_per_step`` if the backbone should see the MEAN
+        # D-update rather than the SUM of them — see
+        # ``_LaddFakeFeatureBackbone._install_grad_probes``.
+        self.ladd_fake_backbone_grad_scale = float(
+            getattr(args, "ladd_fake_backbone_grad_scale", 1.0) or 1.0
+        )
         self.ladd_feature_blocks = list(
             getattr(args, "ladd_feature_blocks", []) or []
         )
@@ -2163,6 +3175,30 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_match = bool(
             getattr(args, "ladd_gt_transition_match", False)
         )
+        # ``ladd_gt_match_frames`` (2026-08-24, default 0 = off, byte-
+        # identical): FORWARD-ONLY frame shift for the SAME-RIDE POSITIONAL
+        # real anchors of the gt_transition GAN — the former/latter GT
+        # latents read at fixed chunk indices (i, i+1) from the ride window
+        # (NOT the cross-ride content pool of ``ladd_gt_transition_match``
+        # above, which is untouched). When > 0, each real transition pair
+        # may shift s in [0, +N] frames, argmin L1 (fp32, no_grad) against
+        # the fake/student pair it is compared to; s=0 is always a
+        # candidate, visited FIRST, and beaten only by strict-< improvement,
+        # so pair counts / shapes / DDP semantics never change. Former and
+        # latter shift TOGETHER by the same s (the transition structure is
+        # preserved). Forward-only per researcher directive: a stalled
+        # rollout matches best to PAST GT; backward shifts would accommodate
+        # the stall instead of pulling advancement — no backward flag exists
+        # for this site by design. Selection logic lives in
+        # ``ladd_gt_match_pair_shifts``.
+        self.ladd_gt_match_frames = int(
+            getattr(args, "ladd_gt_match_frames", 0)
+        )
+        if self.ladd_gt_match_frames < 0:
+            raise ValueError(
+                "ladd_gt_match_frames must be >= 0 (forward-only shift; "
+                f"got {self.ladd_gt_match_frames})."
+            )
         self.ladd_gt_transition_match_k = int(
             getattr(args, "ladd_gt_transition_match_k", 4)
         )
@@ -2268,9 +3304,18 @@ class ActionForcingDMD(SelfForcingModel):
         # is meant to learn brightness/contrast (wavelet off), noised input
         # swamps that signal — set this True to keep the disc on clean
         # latents without touching flash_dmd_gan_t (which the main DMD path
-        # shares). Default False = legacy behaviour.
+        # shares).
+        # DEFAULT CHANGED False -> True on 2026-08-26 (researcher directive:
+        # "make ladd_disc_force_clean=true the default always"). Evidence:
+        # gantune_w2tclean was visibly better than its w2 parent, and the
+        # scheduler arithmetic makes it strictly preferable — alpha_t = 1-sigma,
+        # so at t=0 the generator gradient is at full scale (1.0) AND the disc
+        # sees texture that noise has not already destroyed. Under the DMD band
+        # the old behaviour could hit t=1000 where alpha_t is exactly 0 and the
+        # student's sample is multiplied by ZERO (measured: 3 of 8 samples in
+        # gansig_of delivered no adversarial gradient at all).
         self.ladd_disc_force_clean = bool(
-            getattr(args, "ladd_disc_force_clean", False)
+            getattr(args, "ladd_disc_force_clean", True)
         )
         # Per-pair, per-channel magnitude normalization of gt_transition
         # pairs (both GT and student) — each pair self-normalizes using
@@ -3226,6 +4271,23 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_M1_long_weight = float(
             getattr(args, "stat_anchor_M1_long_weight", 0.0)
         )
+        # MEAN (per-channel spatial mean) — the FIRST moment, added
+        # 2026-08-25. THIS is the mean-training term. ``stat_anchor_M1_*``
+        # is NOT: ``model.anti_collapse._per_frame_M1`` returns per-channel
+        # ``Σ_{H,W} x²`` (energy), so the long-standing recipe comment
+        # calling M1 "mean" describes a term that does not exist. Default
+        # 0.0 = never built = byte-identical to every prior run.
+        # SCALE (measured on 12 weunz GT rides, C=16 H=60 W=104, npb=3,
+        # k=2 window): |per-channel mean| ~ 0.33, and the MSE a +-12-frame
+        # GT mismatch produces is ~0.023 — vs ~0.41 for M2 and ~0.071 for
+        # TV. The three are NOT on a common scale, so equal weights do not
+        # mean equal pressure; see the arm-script block for the derivation.
+        self.stat_anchor_MEAN_short_weight = float(
+            getattr(args, "stat_anchor_MEAN_short_weight", 0.0)
+        )
+        self.stat_anchor_MEAN_long_weight = float(
+            getattr(args, "stat_anchor_MEAN_long_weight", 0.0)
+        )
         # Tolerance band as a fraction of the anchor. Deviations inside
         # the band produce zero gradient (floor = (rel_tol * anchor)^2).
         # Long horizon uses a tighter tolerance because cumulative
@@ -3318,6 +4380,25 @@ class ActionForcingDMD(SelfForcingModel):
         # +/-k window RADIUS of temporally-adjacent GT around the chunk's own
         # ride position. k=0 -> exactly the aligned GT chunk; k=2 -> mean over
         # a 5-chunk window centred on it.
+        #
+        # ``stat_anchor_use_clean_match_offset`` (default TRUE, 2026-08-25):
+        # when ``dmd_42f_clean_match_enabled`` is on, the rest of the recipe
+        # (the 42f clean half, gt_target, the noisy actions, the going/
+        # collapse gate MAE) does NOT read the POSITIONAL GT — it reads
+        # ``GT@+clean_match_offset``, the +-``dmd_42f_clean_match_max_drift_
+        # frames`` temporally MATCHED window chosen once per step by
+        # ``compute_clean_match_offset``. Reading the positional GT here while
+        # everything else reads the matched one trains the generator toward
+        # the statistics of GT frames its output was explicitly judged NOT to
+        # correspond to (with max_drift_frames=12 and npb=3 the shift is up to
+        # 4 chunks — larger than the k=2 smoothing radius, so the two windows
+        # can be DISJOINT). TRUE = the anchor window slides by the same
+        # ``clean_match_offset``; FALSE = legacy positional behaviour. No-op
+        # when matching is off (offset is always 0) or in the other two modes
+        # (``seed_anchor``/``target_matching`` have no positional base).
+        self.stat_anchor_use_clean_match_offset = bool(
+            getattr(args, "stat_anchor_use_clean_match_offset", True)
+        )
         # Target-matching knobs (consulted only when mode ==
         # ``target_matching``). M2 target / band correspond to the
         # user's externally-named "STD" (Σ σ², typical Wan range 6-9).
@@ -3363,6 +4444,40 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_target_rank_weight = float(
             getattr(args, "stat_anchor_target_rank_weight", 0.1)
         )
+
+        # --- Stat-anchor FAIL-LOUD (2026-08-25) -------------------------
+        # The stat-anchor application sites (``generator_loss`` and its
+        # streaming twin) wrap the whole compute in ``except Exception:
+        # warn-and-continue``. That fail-soft was written when the anchor
+        # was a nice-to-have; it is now a load-bearing training term AND
+        # one of the queued arms is deliberately the no-stat-anchor
+        # ablation. A swallowed exception therefore does not merely lose a
+        # regulariser: it silently converts the treatment arm INTO the
+        # ablation arm, and the write-up reads "the stat anchor makes no
+        # difference" from two runs that were both ablated. See
+        # ``_note_stat_anchor_exception``.
+        #   stat_anchor_fail_loud (default TRUE): when the anchor is
+        #     CONFIGURED ACTIVE (``stat_anchor_loss_weight > 0``) and it
+        #     has thrown ``stat_anchor_fail_loud_after`` times IN A ROW,
+        #     RAISE instead of continuing. A stat anchor that never fires
+        #     is a silently different experiment.
+        #   stat_anchor_fail_loud_after (default 5): consecutive-failure
+        #     budget before the raise. Transients (one bad ride, one odd
+        #     shape) still pass through as warnings.
+        # Set ``stat_anchor_fail_loud=False`` to restore the historical
+        # warn-and-continue-forever behaviour exactly.
+        self.stat_anchor_fail_loud = bool(
+            getattr(args, "stat_anchor_fail_loud", True)
+        )
+        self.stat_anchor_fail_loud_after = int(
+            getattr(args, "stat_anchor_fail_loud_after", 5)
+        )
+        # Failure bookkeeping. ``_total`` is monotone over the run and is
+        # published every step as ``stat/anchor_exception_count`` so a flat
+        # non-zero line in wandb is impossible to miss; ``_consecutive``
+        # resets to 0 on every successful application and drives the raise.
+        self._stat_anchor_exception_count: int = 0
+        self._stat_anchor_consecutive_exceptions: int = 0
 
         # Corridor-mode weights (consulted only when
         # ``anti_collapse_type == "std_corridor"``). Defaults match the
@@ -3511,6 +4626,11 @@ class ActionForcingDMD(SelfForcingModel):
 
         # ----- Load checkpoints -----
         self._load_generator_from_ode_checkpoint(args, device)
+        # AFTER the ODE load on purpose: an explicit
+        # ``action_critic_checkpoint`` must win over whatever (if
+        # anything) the ODE checkpoint carried under the same key.
+        # No-op unless the flag is set.
+        self._load_action_critic_from_checkpoint(args)
         self._load_real_score_with_v14_lora(args, device)
         self._mirror_generator_into_fake_score()
         # v28G_6+: optional LoRA wrap on fake_score. Default OFF
@@ -3519,6 +4639,46 @@ class ActionForcingDMD(SelfForcingModel):
         # would intercept the load path). See ``_apply_fake_score_lora``
         # for the memory-savings rationale and head_alt handling.
         self._apply_fake_score_lora(device)
+        # ===== ladd_feature_source="fake" install (One-Forcing style) =====
+        # Runs AFTER real_score + fake_score exist (and after the
+        # fake_score LoRA wrap, though the handle resolves ``fake_score``
+        # lazily at call time so later trainer-side DDP wrapping of
+        # ``fake_score.model`` is handled too). The handle is a plain
+        # attribute on real_score — the object the trainer hands to
+        # ``build_ladd_disc`` — so ``WanFeatureProjector`` sees it
+        # without any trainer plumbing. Default "real" installs nothing:
+        # byte-identical legacy behaviour.
+        if self.ladd_feature_source == "fake":
+            if getattr(self, "fake_score", None) is None:
+                if bool(getattr(args, "gan_enabled", False)):
+                    raise ValueError(
+                        "ladd_feature_source='fake' with gan_enabled=true "
+                        "requires the fake score network, but "
+                        "self.fake_score is None. The LADD GAN cannot tap "
+                        "a fake-score backbone that was never built — "
+                        "check the fake_score construction path or set "
+                        "ladd_feature_source='real'."
+                    )
+                # gan off + no fake score: nothing to install, nothing
+                # will consume it either.
+            else:
+                # NOTE: live fake_score, never the EMA — One-Forcing runs
+                # its disc on the live critic (fake_score_ema_weight
+                # machinery is deliberately not consulted).
+                self.real_score._ladd_feature_backbone_override = (
+                    _LaddFakeFeatureBackbone(
+                        self,
+                        backbone_trainable=self.ladd_fake_backbone_trainable,
+                    )
+                )
+                if _is_main():
+                    print(
+                        "[LADD-FEAT] backbone=fake_score "
+                        "(One-Forcing style) "
+                        "adversarial_grad_into_backbone="
+                        f"{self.ladd_fake_backbone_trainable}",
+                        flush=True,
+                    )
         # Phased DMD K-LoRA on the student. Default OFF. MUST run
         # AFTER the ODE checkpoint load AND AFTER the fake_score
         # mirror (mirror copies generator.model.state_dict(); a peft
@@ -3681,7 +4841,7 @@ class ActionForcingDMD(SelfForcingModel):
         # ``no_grad`` and moves ONLY the concatenation out, which is what
         # the original comment already claimed the code did.
         self.boundary_vae_roundtrip_keep_graph: bool = bool(
-            getattr(args, "boundary_vae_roundtrip_keep_graph", False)
+            getattr(args, "boundary_vae_roundtrip_keep_graph", True)
         )
         self._boundary_vae_graph_warned: bool = False
         # Deterministic stride for slide-and-train: when > 0, every
@@ -3823,6 +4983,130 @@ class ActionForcingDMD(SelfForcingModel):
                         exc,
                     )
                 self.state_probe = None
+
+    # ------------------------------------------------------------------
+    # Pretrained action_critic loader (flag-gated, default OFF)
+    # ------------------------------------------------------------------
+    def _load_action_critic_from_checkpoint(self, args) -> None:
+        """Load a PRETRAINED ``action_critic`` from an arbitrary ckpt.
+
+        Motivation. ``_load_generator_from_ode_checkpoint`` only picks
+        up ``ckpt["action_critic"]`` when the *ODE init* checkpoint
+        happens to carry one. The Phase-3 DMD arms init from a
+        ``phase1_step*.pt`` produced by this very trainer with the aux
+        heads OFF, so that checkpoint has NO ``action_critic`` key and
+        the head would silently stay at random init — a frozen random
+        critic is pure noise supervision, and an online one throws away
+        the v14e-era pretraining. The pretrained critic actually lives
+        in the *v14e teacher LoRA* checkpoint
+        (``logs/v14e_pca8_raw/causal_lora_step0005000.pt``), which
+        ``_load_real_score_with_v14_lora`` reads ONLY for its ``lora``
+        key. This method closes that gap.
+
+        Default OFF: ``action_critic_checkpoint`` unset -> immediate
+        return, byte-identical to the pre-flag behaviour.
+
+        Action-embedding width adapter. The v14e critic was built with
+        ``action_dim = len(action_critic_dims) = 8`` (it was conditioned
+        on the full 8-D commanded PCA vector). This model builds the
+        critic with ``action_dim = raw_action_dim = 2`` because the
+        Phase-3 rides are pre-sliced to ``action_dims=[0, 1]`` (pca_0 =
+        throttle, pca_1 = steer) and ``raw_action_dim`` is pinned at 2
+        by the ODE checkpoint's ``action_projection`` (in-features 34 =
+        2 dims x Fourier). Only ``action_embed.0.weight`` is affected
+        ([64, 8] vs [64, 2]); taking its FIRST ``action_dim`` columns is
+        exactly equivalent to feeding the pretrained critic
+        ``[a0, a1, 0, 0, 0, 0, 0, 0]``, i.e. the commanded PCA vector
+        with the six uncontrolled scene dims zeroed. Every other tensor
+        (the whole 3D-CNN trunk and the 8-D z head) transfers verbatim.
+
+        Loud on drift. Any key that neither matches nor is covered by
+        the action-embed adapter raises, unless
+        ``action_critic_ckpt_strict=false``. A silently-random critic is
+        precisely the failure mode this method exists to prevent.
+        """
+        ckpt_path = getattr(args, "action_critic_checkpoint", None)
+        if not ckpt_path:
+            return
+        critic = getattr(self, "action_critic", None)
+        if critic is None:
+            raise RuntimeError(
+                "[ActionForcingDMD] action_critic_checkpoint is set but "
+                "model.action_critic is None. Set "
+                "action_critic_aux_enabled=true so the head is "
+                "instantiated before the load."
+            )
+        if not os.path.exists(str(ckpt_path)):
+            raise FileNotFoundError(
+                f"action_critic_checkpoint not found: {ckpt_path}"
+            )
+
+        blob = torch.load(str(ckpt_path), map_location="cpu", mmap=True)
+        if not isinstance(blob, dict) or "action_critic" not in blob:
+            raise KeyError(
+                f"[ActionForcingDMD] action_critic_checkpoint "
+                f"{ckpt_path} has no 'action_critic' key: "
+                f"{list(blob.keys()) if isinstance(blob, dict) else type(blob)}"
+            )
+        src_sd = blob["action_critic"]
+        own_sd = critic.state_dict()
+
+        slice_action_embed = bool(
+            getattr(args, "action_critic_ckpt_slice_action_embed", True)
+        )
+        adapted: Dict[str, torch.Tensor] = {}
+        sliced: List[str] = []
+        bad: List[str] = []
+        for key, val in src_sd.items():
+            tgt = own_sd.get(key)
+            if tgt is None:
+                bad.append(f"{key}(unexpected)")
+                continue
+            if tuple(tgt.shape) == tuple(val.shape):
+                adapted[key] = val
+                continue
+            if (
+                slice_action_embed
+                and key.startswith("action_embed.")
+                and val.dim() == 2
+                and tgt.dim() == 2
+                and val.shape[0] == tgt.shape[0]
+                and val.shape[1] > tgt.shape[1]
+            ):
+                adapted[key] = val[:, : tgt.shape[1]].contiguous().clone()
+                sliced.append(
+                    f"{key}{tuple(val.shape)}->{tuple(tgt.shape)}"
+                )
+                continue
+            bad.append(
+                f"{key}(shape {tuple(val.shape)} vs {tuple(tgt.shape)})"
+            )
+        del blob, src_sd
+
+        missing, unexpected = critic.load_state_dict(adapted, strict=False)
+        # ``missing`` here means "the module has a parameter the adapted
+        # dict did not supply" == still at random init.
+        strict = bool(getattr(args, "action_critic_ckpt_strict", True))
+        if (bad or missing or unexpected) and strict:
+            raise RuntimeError(
+                "[ActionForcingDMD] action_critic_checkpoint load is "
+                "incomplete — the head would be PARTLY RANDOM. "
+                f"unloadable={bad} still_missing={list(missing)} "
+                f"unexpected={list(unexpected)}. Check "
+                "action_critic_base_channels / action_critic_num_blocks "
+                "/ action_critic_z_out_dim against the checkpoint, or "
+                "set action_critic_ckpt_strict=false to accept this."
+            )
+        if _is_main():
+            logging.info(
+                "[ActionForcingDMD] action_critic loaded from %s: "
+                "tensors=%d sliced=%s missing=%d unexpected=%d "
+                "unloadable=%d (critic action_dim=%d, chunk_frames=%d)",
+                ckpt_path, len(adapted), sliced or "[]",
+                len(missing), len(unexpected), len(bad),
+                int(getattr(critic, "action_dim", -1)),
+                int(getattr(critic, "chunk_frames", -1)),
+            )
 
     def _attach_state_probe_to_real_score(self, args) -> None:
         """Mirror ``adding_state_probe_branch`` onto ``self.real_score``
@@ -5034,9 +6318,9 @@ class ActionForcingDMD(SelfForcingModel):
         (``streaming_state['gt_match_latents']``) by MAE on the mean-
         equalized (brightness-removed, texture) rep — the same selection
         the LADD matcher uses, K = ``stat_anchor_match_k`` — and set that
-        chunk's anchor for EVERY stat (STD, M2, TV, SOS, M1) to the mean of
-        those K matched GT chunks. Returns a dict of per-frame anchors
-        ({STD,M2,TV,SOS: [B,F]; M1: [B,F,C]}, fully detached) to feed
+        chunk's anchor for EVERY stat (STD, M2, TV, SOS, M1, MEAN) to the
+        mean of those K matched GT chunks. Returns a dict of per-frame
+        anchors ({STD,M2,TV,SOS: [B,F]; M1,MEAN: [B,F,C]}, fully detached) to feed
         ``compute_stat_anchor_loss``'s precomputed-anchor path — so ALL
         stats flow through the SAME function, no separate loss term.
         Returns None when the pool is unavailable (e.g.
@@ -5058,7 +6342,7 @@ class ActionForcingDMD(SelfForcingModel):
             return None
         from model.anti_collapse import (
             _per_frame_STD, _per_frame_M2, _per_frame_TV,
-            _per_frame_SOS, _per_frame_M1,
+            _per_frame_SOS, _per_frame_M1, _per_frame_MEAN,
         )
         npb = int(self.num_frame_per_block)
         if pred_image.dim() != 5 or int(pred_image.shape[1]) < npb:
@@ -5095,6 +6379,7 @@ class ActionForcingDMD(SelfForcingModel):
             a_tv = pred.new_zeros((B, F_))
             a_sos = pred.new_zeros((B, F_))
             a_m1 = pred.new_zeros((B, F_, C))
+            a_mean = pred.new_zeros((B, F_, C))
             for c in range(n_chunks):
                 fsl = slice(c * npb, (c + 1) * npb)
                 pc_meq = _meq(pred[:, fsl]).reshape(B, 1, -1)
@@ -5116,6 +6401,8 @@ class ActionForcingDMD(SelfForcingModel):
                     B, K, npb).mean(-1).mean(1, keepdim=True)
                 a_m1[:, fsl] = _per_frame_M1(sf).reshape(
                     B, K, npb, C).mean(2).mean(1, keepdim=True)
+                a_mean[:, fsl] = _per_frame_MEAN(sf).reshape(
+                    B, K, npb, C).mean(2).mean(1, keepdim=True)
             rem = F_ - n_chunks * npb
             if rem > 0:  # remainder frames (F not a multiple of npb): repeat last
                 j = n_chunks * npb
@@ -5124,7 +6411,11 @@ class ActionForcingDMD(SelfForcingModel):
                 a_tv[:, j:] = a_tv[:, j - 1:j]
                 a_sos[:, j:] = a_sos[:, j - 1:j]
                 a_m1[:, j:] = a_m1[:, j - 1:j]
-        return {"STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos, "M1": a_m1}
+                a_mean[:, j:] = a_mean[:, j - 1:j]
+        return {
+            "STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos,
+            "M1": a_m1, "MEAN": a_mean,
+        }
 
     def _gt_window_stat_anchors(self, pred_image: torch.Tensor, chunk_lo: int):
         """Per-frame stat anchors from the POSITIONALLY-ALIGNED GT chunk
@@ -5133,21 +6424,42 @@ class ActionForcingDMD(SelfForcingModel):
         Used by ``stat_anchor_mode='gt_window'``. For each rolled chunk ``c``
         in ``pred_image`` (whose GT lives at abs ride frame
         ``chunk_lo + c*npb`` in ``streaming_state['ride_latents_window']``),
-        the anchor for EVERY stat (STD, M2, TV, SOS, M1) is the mean over the
-        GT frames in the window ``[p - k*npb, p + (k+1)*npb)`` clamped to the
+        the anchor for EVERY stat (STD, M2, TV, SOS, M1, MEAN) is the mean
+        over the GT frames in the window ``[p - k*npb, p + (k+1)*npb)`` clamped to the
         ride. This is the actual GT the student should match at that position
         — not a content search (``target_matching``) and not the seed prefix
         (``seed_anchor``) — smoothed over +/- k chunks to suppress per-chunk
-        GT noise. Returns ``{STD,M2,TV,SOS:[B,F]; M1:[B,F,C]}`` detached, or
+        GT noise. Returns ``{STD,M2,TV,SOS:[B,F]; M1,MEAN:[B,F,C]}`` detached, or
         ``None`` if the ride window is unavailable (caller falls back).
+
+        MATCHED OFFSET (``stat_anchor_use_clean_match_offset``, default TRUE).
+        ``chunk_lo`` arrives POSITIONAL (= ``cf + current_length - new_frames
+        - overlap``, the same ``chunk_lo_raw`` ``compute_clean_match_offset``
+        searches from). When ``dmd_42f_clean_match_enabled`` is on, every
+        OTHER GT consumer in the recipe (42f clean half, gt_ctx, gt_target,
+        noisy actions, the gate MAE) reads ``GT@chunk_lo_raw + m`` with
+        ``m = streaming_state['clean_match_offset']``. Unless the flag is
+        turned off we apply the SAME ``m`` here, so the statistics the
+        generator is trained toward come from the GT frames its output was
+        actually matched against. The applied offset is stashed on
+        ``self._stat_anchor_applied_offset`` for logging.
         """
         s = getattr(self, "streaming_state", None)
         ride = s.get("ride_latents_window") if isinstance(s, dict) else None
         if ride is None or pred_image is None:
             return None
+        # Same read as ``_build_42f_scoring_inputs``: the offset is only
+        # meaningful when matching is enabled, and it is stashed (never left
+        # stale) by ``compute_clean_match_offset`` on every roll.
+        match_m = 0
+        if (bool(getattr(self, "stat_anchor_use_clean_match_offset", True))
+                and bool(getattr(self, "dmd_42f_clean_match_enabled", False))):
+            match_m = int(s.get("clean_match_offset", 0) or 0)
+        self._stat_anchor_applied_offset = int(match_m)
+        chunk_lo = int(chunk_lo) + match_m
         from model.anti_collapse import (
             _per_frame_STD, _per_frame_M2, _per_frame_TV,
-            _per_frame_SOS, _per_frame_M1,
+            _per_frame_SOS, _per_frame_M1, _per_frame_MEAN,
         )
         npb = int(self.num_frame_per_block)
         if pred_image.dim() != 5 or int(pred_image.shape[1]) < npb:
@@ -5164,6 +6476,7 @@ class ActionForcingDMD(SelfForcingModel):
         a_tv = pred_image.new_zeros((B, F_))
         a_sos = pred_image.new_zeros((B, F_))
         a_m1 = pred_image.new_zeros((B, F_, C))
+        a_mean = pred_image.new_zeros((B, F_, C))
         with torch.no_grad():
             for c in range(n_chunks):
                 p = int(chunk_lo) + c * npb
@@ -5185,6 +6498,7 @@ class ActionForcingDMD(SelfForcingModel):
                 a_tv[:, fsl] = _per_frame_TV(win).mean(1, keepdim=True)
                 a_sos[:, fsl] = _per_frame_SOS(win).mean(1, keepdim=True)
                 a_m1[:, fsl] = _per_frame_M1(win).mean(1, keepdim=True)
+                a_mean[:, fsl] = _per_frame_MEAN(win).mean(1, keepdim=True)
             rem = F_ - n_chunks * npb
             if rem > 0:  # remainder frames: repeat the last chunk's anchor
                 j = n_chunks * npb
@@ -5193,7 +6507,11 @@ class ActionForcingDMD(SelfForcingModel):
                 a_tv[:, j:] = a_tv[:, j - 1:j]
                 a_sos[:, j:] = a_sos[:, j - 1:j]
                 a_m1[:, j:] = a_m1[:, j - 1:j]
-        return {"STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos, "M1": a_m1}
+                a_mean[:, j:] = a_mean[:, j - 1:j]
+        return {
+            "STD": a_std, "M2": a_m2, "TV": a_tv, "SOS": a_sos,
+            "M1": a_m1, "MEAN": a_mean,
+        }
 
     # ------------------------------------------------------------------
     # DMD SELF-FINGERPRINT (docs/DMD_FINGERPRINT_PROBE.md)
@@ -8934,6 +10252,8 @@ class ActionForcingDMD(SelfForcingModel):
                     SOS_long_weight=self.stat_anchor_SOS_long_weight,
                     M1_short_weight=self.stat_anchor_M1_short_weight,
                     M1_long_weight=self.stat_anchor_M1_long_weight,
+                    MEAN_short_weight=self.stat_anchor_MEAN_short_weight,
+                    MEAN_long_weight=self.stat_anchor_MEAN_long_weight,
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
                     std_one_sided=bool(getattr(
@@ -8953,7 +10273,8 @@ class ActionForcingDMD(SelfForcingModel):
                         seed_M2_anchor=_matched["M2"],
                         seed_TV_anchor=_matched["TV"],
                         seed_SOS_anchor=_matched["SOS"],
-                        seed_M1_anchor=_matched["M1"], **_wk,
+                        seed_M1_anchor=_matched["M1"],
+                        seed_MEAN_anchor=_matched["MEAN"], **_wk,
                     )
                 elif seed_latents is not None:
                     stat_loss, stat_logs = compute_stat_anchor_loss(
@@ -8976,15 +10297,30 @@ class ActionForcingDMD(SelfForcingModel):
                     )
                     for k, v in stat_logs.items():
                         dmd_log_dict[k] = v
-            except Exception as exc:
-                # Fail-soft: log and continue. If the loss is genuinely
-                # broken the operator will see the wandb key go away.
-                if _is_main():
-                    import logging as _logging
-                    _logging.warning(
-                        "[ActionForcingDMD] stat_anchor_loss failed (%s); "
-                        "skipping this iteration.", exc,
+                    self._note_stat_anchor_ok(dmd_log_dict)
+                else:
+                    # No exception, but no anchor either (no matched
+                    # anchors, no seed_latents) -> the anchor contributed
+                    # nothing this step. Publish it explicitly.
+                    dmd_log_dict["stat/anchor_applied"] = 0.0
+                    dmd_log_dict["stat/anchor_exception_count"] = float(
+                        self._stat_anchor_exception_count
                     )
+            except Exception as exc:
+                # NOT fail-soft any more by default. The old behaviour
+                # ("log once and continue; the operator will see the wandb
+                # key go away") is exactly the silent-ablation trap: an
+                # absent key is invisible next to an arm that is SUPPOSED
+                # to have no stat anchor. Count + log every failure +
+                # publish the count + raise after N consecutive when
+                # configured active. ``stat_anchor_fail_loud=False``
+                # restores the historical behaviour.
+                self._note_stat_anchor_exception(
+                    exc,
+                    int(getattr(self, "_last_current_step", 0)),
+                    dmd_log_dict,
+                    path="generator_loss",
+                )
 
         # Surface MAE-extension metrics (may be NaN-marked if
         # gt_latents was None or shorter than the baseline rollout).
@@ -9022,21 +10358,108 @@ class ActionForcingDMD(SelfForcingModel):
     # adversarial gradient into the same backbone. Giving the disc its
     # own optimizer would restore exactly the decoupling this arm exists
     # to remove.
+    #
+    # ``gan_of_backbone_trainable`` (default True = the above, verbatim)
+    # is the ONE supported way to vary that: at False the disc still taps
+    # ``fake_score`` and still rides the same backward, but the
+    # adversarial gradient is restricted to the head modules so the
+    # backbone is moved only by its denoising loss. It is an
+    # experimental-design control for the arm's confound, not a
+    # decoupling — there is still exactly one optimizer and one backward.
+    # See ``_of_head_only_surrogate``.
     # ==================================================================
 
     def _of_disc_cond(self, cond: Dict[str, Any]) -> Dict[str, Any]:
-        """Strip the teacher-forcing (clean-half) streams from a cond dict.
+        """Disc conditioning: clean-half streams STRIPPED and every
+        tensor DETACHED.
 
         ``_build_dmd_context_kwargs`` merges ``_action_modulation_clean`` /
         ``_action_tokens_clean`` into the scoring cond dict for the
         denoising forward. The disc forward runs WITHOUT ``clean_x``, so
         those streams are dead weight there — and leaving them in would
         make it look, to a reader, as though the disc sees a clean half.
+
+        THE DETACH IS THE LOAD-BEARING HALF (added 2026-08-24 after the
+        third 8-rank GPU smoke, ``logs/of_smoke_r3.log``, died on ALL
+        ranks with "Trying to backward through the graph a second time"
+        at the ``streaming_fake_updates_per_gen`` inner
+        ``_extra_loss.backward()``).
+
+        WHAT WENT WRONG. This is the ONE choke point every OF disc
+        forward funnels through — ``_of_publish_streaming_band`` (both
+        source branches), ``compute_of_d_loss`` and ``compute_of_g_loss``
+        all call it. Until now it only filtered keys, so on the
+        ``pred_image`` branch the published band's cond was
+        ``score_cond`` sliced — and ``score_cond`` is
+        ``build_action_conditional``'s output, i.e. the LIVE
+        ``action_projection`` / ``action_token_projection`` subgraph
+        (``model/base.py`` does ``action_projection.requires_grad_(True)``
+        unconditionally). The D term therefore hung its disc forward off
+        the GENERATOR's graph through its conditioning input. Two
+        consequences, one fatal:
+
+          * ``critic_loss.backward()`` (no ``retain_graph``) walked into
+            that shared action-projection subgraph and FREED it. Each of
+            the ``streaming_fake_updates_per_gen`` inner critic updates
+            then built a FRESH disc forward on the SAME now-dangling cond
+            tensors, so the first inner ``.backward()`` re-traversed freed
+            nodes. Rebuilding the D term per inner iteration — which the
+            loop already does — cannot help: the poison is an INPUT, not
+            the term.
+          * even without the crash it pushed DISCRIMINATOR gradient into
+            ``action_projection``, a GENERATOR-owned parameter applied by
+            the GENERATOR's optimizer, wrong-signed and silent. The
+            neighbouring critic paths
+            (``_compute_critic_loss_streaming_gtfix``,
+            ``_compute_aux_teacher_loss_streaming``, ``of_streaming_cond``)
+            all detach their cond dicts for exactly this reason; the OF
+            ``pred_image`` branch was the one that did not.
+
+        Detaching HERE rather than at the call sites is deliberate: a
+        per-call-site detach is one refactor away from being dropped on a
+        new branch, and the ``flash`` branch already detached (via
+        ``of_streaming_cond``) while ``pred_image`` did not — the exact
+        asymmetry that shipped the bug.
+
+        The G side is unaffected in value: ``_of_g_grad`` bounds the
+        adversarial gradient at the fake tensor
+        (``autograd.grad(g_loss, fake_latent)``), so no cond gradient was
+        ever materialised there. Detaching makes that boundary structural
+        instead of incidental, and stops the disc subgraph from sharing
+        saved tensors with the generator's.
         """
         return {
-            k: v for k, v in cond.items()
+            k: (v.detach() if torch.is_tensor(v) else v)
+            for k, v in cond.items()
             if not k.endswith("_clean")
         }
+
+    def _of_assert_cond_detached(
+        self, cond: Dict[str, Any], where: str,
+    ) -> None:
+        """Fail loud if a disc cond dict still carries a graph.
+
+        ``_of_disc_cond`` makes this impossible; the check exists so that
+        deleting the detach fails HERE, at the publish, with the reason
+        written down — instead of four backwards later on 8 ranks with a
+        generic autograd message that says nothing about conditioning.
+        """
+        live = sorted(
+            k for k, v in cond.items()
+            if torch.is_tensor(v) and v.requires_grad
+        )
+        if live:
+            raise RuntimeError(
+                f"One-Forcing: the {where} discriminator conditioning "
+                f"still requires grad ({live}). The disc must be "
+                "conditioned on DETACHED action streams: an undetached "
+                "cond hangs every disc forward off the generator's "
+                "action_projection subgraph, which (a) is freed by "
+                "critic_loss.backward() and crashes the next "
+                "streaming_fake_updates_per_gen inner backward, and (b) "
+                "pushes discriminator gradient into generator-owned "
+                "parameters. See ``_of_disc_cond``."
+            )
 
     def _of_disc_logits(
         self,
@@ -9055,19 +10478,64 @@ class ActionForcingDMD(SelfForcingModel):
         whose backward never fires the reducer's hooks either hangs the
         next collective or raises "Expected to have finished reduction" —
         a multi-node-only failure that a single-node smoke will not show.
+
+        MICRO-BATCHING (``gan_of_disc_micro_batch_groups``, S6). At the
+        default 1 this issues exactly the historical single forward over
+        every row, and the code path below is the verbatim original —
+        byte-identical, not merely numerically close. At N > 1 the rows
+        are split into N contiguous groups (``disc_micro_batch_bounds``)
+        and forwarded one group at a time, and the per-group logits are
+        concatenated back into the same ``[n_rows, num_class]`` tensor the
+        single forward would have produced.
+
+        WHY CONCATENATE LOGITS RATHER THAN ACCUMULATE A WEIGHTED LOSS.
+        ``ladd_disc_micro_batch_groups`` has to re-derive a per-group loss
+        weight (``softplus(...).sum() / N_total``, NOT ``/ N_group``)
+        because that path owns its optimizer and calls ``.backward()``
+        once per group. THIS path must not: the OF D term is returned to
+        the caller and folded into the streaming ``critic_loss`` for a
+        SINGLE backward and a single ``fake_optimizer.step()`` — that
+        shared backward is the arm's entire thesis, and it is also what
+        keeps the three ``head.*`` params gradiented (see
+        ``of_head_touch``). Splitting only the FORWARD and rebuilding the
+        full logit tensor means every downstream mean is taken over
+        exactly the same rows as before, so the loss VALUE cannot drift by
+        construction — there is no weighting to get wrong. The saving is
+        in the forward's transient working set, not in the retained graph.
+
+        RANK UNIFORMITY: the group count is a pure function of config and
+        of ``latent.shape[0]`` (see ``disc_micro_batch_bounds``), so every
+        rank issues the SAME number of forwards before the shared
+        backward. Nothing per-rank is read here.
         """
         wrapper = self.fake_score
         inner = wrapper._unwrapped_model()
         prev_model = wrapper.model
+        n_rows = int(latent.shape[0])
+        groups = int(self.of_cfg.get("gan_of_disc_micro_batch_groups", 1))
         try:
             if unwrapped:
                 wrapper.model = inner
-            _flow, _x0, logits = wrapper(
-                noisy_image_or_video=latent,
-                conditional_dict=cond,
-                timestep=timestep,
-                classify_mode=True,
-            )
+            if groups <= 1 or n_rows <= 1:
+                _flow, _x0, logits = wrapper(
+                    noisy_image_or_video=latent,
+                    conditional_dict=cond,
+                    timestep=timestep,
+                    classify_mode=True,
+                )
+            else:
+                _parts = []
+                for _lo, _hi in disc_micro_batch_bounds(n_rows, groups):
+                    _f, _x, _lg = wrapper(
+                        noisy_image_or_video=latent[_lo:_hi],
+                        conditional_dict=slice_conditional_dict_rows(
+                            cond, _lo, _hi, n_rows,
+                        ),
+                        timestep=timestep[_lo:_hi],
+                        classify_mode=True,
+                    )
+                    _parts.append(_lg)
+                logits = torch.cat(_parts, dim=0)
         finally:
             if unwrapped:
                 wrapper.model = prev_model
@@ -9458,10 +10926,16 @@ class ActionForcingDMD(SelfForcingModel):
             lo, hi = self._of_band_indices(score_grad_mask, n_f)
             fake = score_image[:, lo:hi]
             real = score_gt_target[:, lo:hi].detach()
+            # ``_of_disc_cond`` FIRST, then slice: the detach has to
+            # happen on the way in, because ``score_cond`` is the live
+            # ``build_action_conditional`` output (action_projection
+            # requires grad unconditionally) and a graph-carrying disc
+            # cond is what killed the r3 smoke — see ``_of_disc_cond``.
             cond = _slice_per_frame_streams(
                 self._of_disc_cond(score_cond),
                 frame_start=lo, frame_count=hi - lo,
             )
+            self._of_assert_cond_detached(cond, "pred_image band")
         elif source == "flash":
             # Layer-on knob: the t=flash_dmd_gan_t slab is a DIFFERENT
             # sub-graph from the DMD-scored band by design (it is the
@@ -9485,6 +10959,7 @@ class ActionForcingDMD(SelfForcingModel):
                 self._of_disc_cond(self.of_streaming_cond(info)),
                 frame_start=0, frame_count=n_f,
             )
+            self._of_assert_cond_detached(cond, "flash band")
             lo, hi = 0, n_f
         else:
             raise RuntimeError(f"unknown gan_of_fake_source: {source!r}")
@@ -9553,6 +11028,145 @@ class ActionForcingDMD(SelfForcingModel):
                 "skipped or returned early, the G and D terms have no "
                 "shared fake and must not silently fall back to a "
                 "different tensor."
+            )
+        return band
+
+    # ------------------------------------------------------------------
+    # LADD divergence-3: the DMD-scored sample as the disc's fake.
+    # ------------------------------------------------------------------
+    def _publish_ladd_dmd_band(
+        self,
+        *,
+        score_image: torch.Tensor,
+        score_gt_target: Optional[torch.Tensor],
+        score_grad_mask: Optional[torch.Tensor],
+        world_noisy_lo: Optional[int],
+        denoised_timestep_from: Optional[int],
+        dmd_fired: bool,
+        current_step: int,
+    ) -> None:
+        """Publish the DMD-scored sample for the LADD discriminator.
+
+        ``ladd_fake_sample_source='dmd'`` only — docs/ONE_FORCING_PORT.md
+        divergence 3. Called from ``compute_generator_loss_streaming``
+        immediately after the DMD scorer, beside
+        ``_of_publish_streaming_band`` and for the same reason: this is
+        the ONLY scope in the process that holds ``score_image``, the
+        tensor ``compute_distribution_matching_loss`` was actually
+        handed. Anywhere else the identity has to be re-derived, and the
+        OF port already proved that re-derivation gets it wrong (the
+        trainer's ``train_chunk`` is the ROOT of the scoring graph, not
+        the scored tensor).
+
+        WHAT IS PUBLISHED, and why each piece:
+
+        * ``sample`` = ``score_image[:, lo:hi]`` where ``[lo, hi)`` is the
+          contiguous True span of ``gradient_mask`` — read off the mask
+          via the shared ``_of_band_indices`` rather than re-derived from
+          ``n_ctx`` / ``sup_offset`` / ``sup_span`` (that arithmetic
+          already exists in three builders with three geometries).
+          GRAPH-ON: it is a view of the very tensor the DMD gradient
+          lands on, so the disc's G-term differentiates back into the
+          same sub-graph the distillation term does. That is the whole
+          point of the flag.
+        * ``real`` = ``score_gt_target[:, lo:hi]``, detached.
+          Frame-locked BY CONSTRUCTION: every builder makes its
+          ``gt_target`` the GT counterpart of its own ``noisy_x``,
+          position for position. NOTE this is a DIFFERENT real from the
+          ``flash`` path's ``ride_latents_window[chunk_lo:chunk_hi]``:
+          it follows the scorer's own ``+match_m`` clean-match offset
+          and its own window, which is correct — the disc's real must be
+          the GT counterpart of the disc's fake, and here the fake is
+          the scorer's tensor.
+        * ``abs_lo`` = ``world_noisy_lo + lo``: the band's first frame in
+          RIDE-window coordinates. The trainer slices the disc's
+          per-frame action conditioning from ``ride_actions_window`` at
+          this offset, so the actions the disc is conditioned on are the
+          actions of the frames it is scoring.
+        * ``timestep`` = ``denoised_timestep_from``: the rung the
+          student's x0 estimate was produced FROM. See the trainer's
+          ``_ladd_run_pair_mode`` for why this is the right analogue of
+          ``flash_dmd_gan_t``.
+
+        NOT gated on ``dmd_fired``. The LADD critic trains on every roll
+        as it always has, on whatever sample the flag selects; gating the
+        publication would leave the D-update with no fake on skipped
+        rolls. ``dmd_fired`` is carried as telemetry only.
+
+        Empty / non-contiguous band, missing ``gt_target``, missing
+        ``world_noisy_lo`` and frame-count mismatch all RAISE. A
+        silently-wrong band would pair the disc's real against the wrong
+        GT frames and still log a healthy-looking logit gap — the exact
+        silent-failure mode this file's telemetry rules exist for.
+        """
+        n_f = int(score_image.shape[1])
+        if score_gt_target is None:
+            raise RuntimeError(
+                "ladd_fake_sample_source='dmd': the DMD scoring path "
+                "published no gt_target, so the disc's real side cannot "
+                "be frame-locked to the DMD-scored fake."
+            )
+        if int(score_gt_target.shape[1]) != n_f:
+            raise RuntimeError(
+                f"ladd_fake_sample_source='dmd': gt_target has "
+                f"{int(score_gt_target.shape[1])} frames but the scored "
+                f"tensor has {n_f}; the two must be the same window for "
+                "the band slice to stay aligned."
+            )
+        if world_noisy_lo is None:
+            raise RuntimeError(
+                "ladd_fake_sample_source='dmd': the scoring-input builder "
+                "published no ``world_noisy_lo``, so the band's position "
+                "in the ride window is unknown and the disc's per-frame "
+                "action conditioning cannot be co-located with the frames "
+                "it scores. Add the key to that builder rather than "
+                "falling back to a guess."
+            )
+        lo, hi = self._of_band_indices(score_grad_mask, n_f)
+        sample = score_image[:, lo:hi]
+        real = score_gt_target[:, lo:hi].detach()
+        npb = int(self.num_frame_per_block)
+        if (hi - lo) < npb:
+            raise RuntimeError(
+                f"ladd_fake_sample_source='dmd': the supervised band is "
+                f"{hi - lo} frames but the disc's chunk unit is "
+                f"num_frame_per_block={npb}. There is no whole chunk to "
+                "score; widen the band (e.g. more "
+                "streaming_force_new_frame_chunks) or use "
+                "ladd_fake_sample_source='flash'."
+            )
+        self._ladd_dmd_band = {
+            "sample": sample,
+            "real": real,
+            "band_lo": int(lo),
+            "band_hi": int(hi),
+            "abs_lo": int(world_noisy_lo) + int(lo),
+            "timestep": (
+                None if denoised_timestep_from is None
+                else int(denoised_timestep_from)
+            ),
+            "dmd_fired": bool(dmd_fired),
+            "step": int(current_step),
+            "graph_on": bool(sample.requires_grad),
+        }
+
+    def ladd_dmd_band(self) -> Dict[str, Any]:
+        """The DMD-scored band this roll published (fail-loud).
+
+        Never returns ``None``: a consumer that fell back would degrade
+        to "the disc trained on some other tensor" with nothing in the
+        trace saying so, which is the silent-null-result mode this arm
+        exists to avoid.
+        """
+        band = getattr(self, "_ladd_dmd_band", None)
+        if band is None:
+            raise RuntimeError(
+                "ladd_fake_sample_source='dmd' but no DMD band was "
+                "published this roll. ``_publish_ladd_dmd_band`` runs "
+                "inside ``compute_generator_loss_streaming``; if that "
+                "method was skipped or returned early, the disc has no "
+                "fake and must not silently fall back to the flash slab "
+                "or to the rolled chunk."
             )
         return band
 
@@ -9662,6 +11276,132 @@ class ActionForcingDMD(SelfForcingModel):
             return None
         return acc * 0.0
 
+    def _of_head_parameters(self) -> List[torch.nn.Parameter]:
+        """Every TRAINABLE disc-head parameter, in a stable order.
+
+        The same three module prefixes ``of_head_touch`` scans and the
+        same three the trainer builds / checkpoints
+        (``_OF_HEAD_MODULE_NAMES``), read off the UNWRAPPED module so the
+        objects returned are the very ``nn.Parameter``s DDP owns — not
+        copies, so an autograd edge built on one of these fires that
+        parameter's reducer hook.
+        """
+        inner = self.fake_score._unwrapped_model()
+        out: List[torch.nn.Parameter] = []
+        for _name in _OF_HEAD_MODULE_NAMES:
+            mod = getattr(inner, _name, None)
+            if mod is None:
+                continue
+            for p in mod.parameters():
+                if p.requires_grad:
+                    out.append(p)
+        return out
+
+    def _of_head_only_surrogate(
+        self, total: torch.Tensor,
+    ) -> torch.Tensor:
+        """``gan_of_backbone_trainable=false``: the D term's VALUE, with
+        the adversarial gradient restricted to the disc HEAD.
+
+        WHY THIS EXISTS — the arm as first shipped moves TWO variables at
+        once: (a) the disc reads features from the trainable ``fake_score``
+        critic instead of the frozen ``real_score`` teacher, and (b) the
+        ``fake_score`` backbone CO-TRAINS on the adversarial loss. The
+        thesis of the port is that (b) is what makes One-Forcing work, but
+        with both moving neither a positive nor a negative result can say
+        which one did it. ``gan_of_backbone_trainable=false`` keeps (a) —
+        the disc still taps ``fake_score``, and those features still track
+        the student because the backbone is still trained every step by its
+        own DENOISING loss — and removes (b).
+
+        HOW, and why not the three obvious alternatives:
+
+        * NOT ``torch.no_grad()`` around the disc forward. ``no_grad``
+          severs the INPUT -> feature path, which is the path the G side
+          needs (``_of_g_grad`` differentiates the logit w.r.t. the fake
+          tensor). It would silently zero the generator's adversarial
+          gradient — the ``boundary_vae_roundtrip`` failure mode again.
+        * NOT ``requires_grad_(False)`` on the backbone around the forward.
+          ``fake_score_gradient_checkpointing=true`` replays those blocks at
+          BACKWARD time and asserts the saved-tensor list matches; a flag
+          that differs between record and replay raises ``CheckpointError``
+          or, when the counts happen to agree, produces a SILENTLY WRONG
+          gradient. That exact bug already cost a run — see
+          ``_of_disc_frozen``'s docstring. The rule the codebase settled on
+          is "if flags are cleared, the gradient must be CONSUMED while
+          they are still cleared", which is what ``_of_g_grad`` /
+          ``_of_g_surrogate`` do and what this method does.
+        * NOT a detach at the feature tap. It would work for the DiT block
+          outputs, but it is incomplete: with ``concat_time_embeddings`` the
+          head also consumes ``e``, i.e. the backbone's ``time_embedding``,
+          and a tap-level detach leaves that channel open. Restricting by
+          PARAMETER covers every path into every non-head parameter, present
+          and future, without knowing the head's internal plumbing.
+
+        WHAT IT DOES. ``torch.autograd.grad(total, head_params)`` prunes the
+        backward to the sub-graph that reaches those parameters; the DiT
+        backbone is not on any path to a head parameter, so it is never
+        traversed (and its checkpoint frames are never recomputed — this is
+        also cheaper and lower-peak than the trainable path). The returned
+        scalar is ``sum_i (p_i * g_i).sum()`` shifted to carry ``total``'s
+        VALUE, exactly the ``_of_g_surrogate`` construction: its derivative
+        w.r.t. ``p_i`` is ``g_i`` and it has no other autograd edges at all.
+
+        WHAT IT GUARANTEES: after the caller's backward, the adversarial
+        contribution to ``p.grad`` is EXACTLY ZERO for every ``fake_score``
+        parameter outside the three head modules — including
+        ``time_embedding`` / ``patch_embedding`` / ``text_embedding`` and
+        every DiT block — and is bit-identical to the trainable path for
+        every head parameter (same forward, same graph, same
+        ``autograd.grad``).
+
+        WHAT IT DOES NOT GUARANTEE, recorded so nobody over-reads the arm:
+          * the backbone still MOVES every step, under the denoising critic
+            loss, so the disc's feature basis still tracks the student. The
+            A/B isolates "adversarial co-training", not "frozen features".
+          * the G side is untouched: it already ran inside
+            ``_of_disc_frozen`` and bounded its gradient at the fake tensor,
+            so it never moved a ``fake_score`` weight in either mode.
+          * step 0 head gradients match the trainable arm exactly; later
+            steps diverge because the backbone follows a different
+            trajectory. This is an arm, not a refactor.
+
+        DDP: every trainable head parameter gets an edge (a ``None`` grad
+        is materialised as zeros rather than dropped), so the
+        ``find_unused_parameters=False`` reducer on ``fake_score`` sees the
+        same hook set it saw before — the ``of_head_touch`` contract, kept.
+        The backbone is still gradiented by the denoising loss that shares
+        this backward. ``autograd.grad`` itself does NOT run the
+        ``AccumulateGrad`` nodes (it captures at the input edges), so it
+        does not fire DDP's hooks early and no parameter is marked ready
+        twice; ``TestBackboneTrainableUnderDDP`` proves that on gloo rather
+        than asserting it.
+        """
+        params = self._of_head_parameters()
+        if not params:
+            raise RuntimeError(
+                "gan_of_backbone_trainable=false but no trainable "
+                "discriminator-head parameter was found on fake_score "
+                f"({_OF_HEAD_MODULE_NAMES}). The adversarial gradient has "
+                "nowhere to go, and silently returning the unrestricted "
+                "term would train the backbone adversarially anyway — the "
+                "exact confound this flag exists to remove."
+            )
+        if not total.requires_grad:
+            raise RuntimeError(
+                "gan_of_backbone_trainable=false: the D term carries no "
+                "autograd graph, so the head-only gradient cannot be "
+                "taken. Something upstream detached the disc forward."
+            )
+        grads = torch.autograd.grad(total, params, allow_unused=True)
+        surrogate: Optional[torch.Tensor] = None
+        for p, g in zip(params, grads):
+            gg = torch.zeros_like(p) if g is None else g.detach()
+            term = (p * gg).sum(dtype=torch.float32)
+            surrogate = term if surrogate is None else surrogate + term
+        assert surrogate is not None  # params is non-empty
+        return surrogate - surrogate.detach() + total.detach()
+
     def _of_sample_timestep(
         self, batch_size: int, num_frames: int, device: torch.device,
     ) -> torch.Tensor:
@@ -9729,6 +11469,14 @@ class ActionForcingDMD(SelfForcingModel):
         failure ``of_head_touch`` exists to prevent from the other side.
         (A second, independent reason not to decouple this term.)
 
+        ``gan_of_backbone_trainable=false`` (the de-confounding arm) does
+        NOT change anything above: the same single forward runs, the same
+        term is returned with the same VALUE and the same telemetry. Only
+        the term's autograd edges change — see ``_of_head_only_surrogate``,
+        applied at the very end of this method. In particular the "do not
+        add a freeze/restore around this forward" rule still stands, and
+        that flag deliberately does not break it.
+
         ``telemetry=False`` drops the seven ``.item()`` calls in the log
         dict — seven GPU syncs per D call, and this method runs
         ``1 + streaming_fake_updates_per_gen`` times per step. The weight
@@ -9750,9 +11498,19 @@ class ActionForcingDMD(SelfForcingModel):
         )
         r1_w = self.of_cfg["gan_of_r1_weight"]
         r2_w = self.of_cfg["gan_of_r2_weight"]
+        # Read ONCE, from the resolved config and nothing else, so the
+        # gate cannot become rank-dependent. See _of_head_only_surrogate.
+        head_only = not bool(self.of_cfg.get("gan_of_backbone_trainable", True))
         touch = self.of_head_touch()
         if d_weight <= 0.0 and r1_w <= 0.0 and r2_w <= 0.0:
-            return touch, {"of_d_weight": float(d_weight)}
+            # ``touch`` already edges the head and NOTHING else, so the
+            # inactive path needs no restriction — it is already the
+            # head-only term. The gauge is published anyway so its trace
+            # is dense across a ``disc_start_step`` warmup.
+            zero_logs = {"of_d_weight": float(d_weight)}
+            if head_only:
+                zero_logs["of_backbone_trainable"] = 0.0
+            return touch, zero_logs
         if fake_latent.requires_grad:
             raise RuntimeError(
                 "compute_of_d_loss received a fake sample that still "
@@ -9799,19 +11557,56 @@ class ActionForcingDMD(SelfForcingModel):
         # so they are computed only when their weight is live.
         r1_val = 0.0
         r2_val = 0.0
+        # ``gan_of_r1_num_samples`` (S6), analogous to
+        # ``ladd_r1_num_samples``: cap how many rows the R1/R2 perturbed
+        # forward covers. <=0 or >= B => every row, which is the historical
+        # behaviour and the default. The subsample is drawn from a CPU
+        # generator seeded ONLY by (current_step, B) — no per-rank state —
+        # so every rank penalises the SAME rows and issues the SAME number
+        # of disc forwards before the shared backward. Inert in the shipped
+        # recipe twice over: the R1/R2 weights are 0.0 (the paper's
+        # framewise config has neither), and B is 1.
+        _r1_num = int(self.of_cfg.get("gan_of_r1_num_samples", 0))
+        _r1_rows = None
+        if 0 < _r1_num < B:
+            _g = torch.Generator(device="cpu").manual_seed(
+                int(current_step) * 1000003 + 11 + int(B)
+            )
+            _r1_rows = torch.randperm(B, generator=_g)[:_r1_num].sort(
+            ).values.to(fake_latent.device)
+
+        def _r1_rows_of(t):
+            return t if _r1_rows is None else t.index_select(0, _r1_rows)
+
+        _cond_r1 = cond if _r1_rows is None else {
+            _k: (_v.index_select(0, _r1_rows)
+                 if torch.is_tensor(_v) and _v.dim() > 0
+                 and _v.shape[0] == B else _v)
+            for _k, _v in cond.items()
+        }
         if r1_w > 0.0:
             sigma = self.of_cfg["gan_of_r1_sigma"]
-            pert = noisy_real + sigma * torch.randn_like(noisy_real)
-            pert_logit = self._of_disc_logits(pert, cond, timestep)
-            r1 = finite_difference_penalty(pert_logit, real_logit, sigma, r1_w)
+            _base = _r1_rows_of(noisy_real)
+            pert = _base + sigma * torch.randn_like(_base)
+            pert_logit = self._of_disc_logits(
+                pert, _cond_r1, _r1_rows_of(timestep),
+            )
+            r1 = finite_difference_penalty(
+                pert_logit, _r1_rows_of(real_logit), sigma, r1_w,
+            )
             total = total + 0.5 * r1
             if telemetry:
                 r1_val = float(r1.detach().item())
         if r2_w > 0.0:
             sigma = self.of_cfg["gan_of_r2_sigma"]
-            pert = noisy_fake + sigma * torch.randn_like(noisy_fake)
-            pert_logit = self._of_disc_logits(pert, cond, timestep)
-            r2 = finite_difference_penalty(pert_logit, fake_logit, sigma, r2_w)
+            _base = _r1_rows_of(noisy_fake)
+            pert = _base + sigma * torch.randn_like(_base)
+            pert_logit = self._of_disc_logits(
+                pert, _cond_r1, _r1_rows_of(timestep),
+            )
+            r2 = finite_difference_penalty(
+                pert_logit, _r1_rows_of(fake_logit), sigma, r2_w,
+            )
             total = total + 0.5 * r2
             if telemetry:
                 r2_val = float(r2.detach().item())
@@ -9837,6 +11632,16 @@ class ActionForcingDMD(SelfForcingModel):
                 "of_r1_loss": r1_val,
                 "of_r2_loss": r2_val,
             })
+
+        # ``gan_of_backbone_trainable=false`` — the de-confounding arm.
+        # Applied LAST, after every telemetry value has been read off the
+        # live logits, so the numbers logged are the same numbers the
+        # trainable path logs; only the GRADIENT differs. See
+        # ``_of_head_only_surrogate``. Default True is a no-op, so the
+        # faithful arm is byte-identical.
+        if head_only:
+            total = self._of_head_only_surrogate(total)
+            logs["of_backbone_trainable"] = 0.0
         return total, logs
 
     def _of_g_surrogate(
@@ -12130,12 +13935,23 @@ class ActionForcingDMD(SelfForcingModel):
         pipe.carn_seam_temp = float(getattr(self, "carn_seam_temp", 1.0))
         pipe.carn_seam_affine_lambda = float(
             getattr(self, "carn_seam_affine_lambda", 0.0))
+        pipe.carn_seam_affine_match_mean = bool(
+            getattr(self, "carn_seam_affine_match_mean", False))
         if float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0) > 0.0:
             _seed_sa = s["seed_latents"].float()
             pipe._carn_seam_target = (
                 _seed_sa.mean(dim=(0, 1, 3, 4)),
                 _seed_sa.std(dim=(0, 1, 3, 4)),
             )
+            # STAMP the target with the pipeline's CURRENT ride token.
+            # ``reset_cache_state`` (setup_sequence / reset_streaming_state
+            # / the trainer's sample-video path) bumps that token, so a
+            # target left over from a previous ride can never be applied
+            # silently -- ``_carn_seam_correct`` raises on a stamp
+            # mismatch. Republished every roll, so the stamp is always
+            # current for the streaming path itself.
+            pipe._carn_seam_target_ride = int(
+                getattr(pipe, "_carn_seam_ride_token", 0))
 
         # Two-grad-point rollout (Flash-DMD §3.3): when paper-aligned-
         # adv is on AND we're in a grad-active iter, run an extra
@@ -12177,11 +13993,22 @@ class ActionForcingDMD(SelfForcingModel):
         new_last_rung_chunk = (
             pipe._flash_dmd_gan_output if flash_dmd_enabled else None
         )
-        # Finish-denoised per-chunk pred (refined cache_pred; the content the
-        # KV cache was committed from = inference-parity). None when
-        # flash_dmd_enabled=False. Surfaced for the rollout viz so videos show
-        # deployable output rather than the random exit-rung x0 lottery.
+        # Post-Step-3.3.5 ``cache_pred`` buffer. HONEST DESCRIPTION (the
+        # comment here used to claim "finish-denoised ... what the KV cache
+        # was committed from", which has not been true since the
+        # ladder-endpoint commit fix): with ``flash_dmd_enabled=True`` this
+        # is the t=flash_dmd_gan_t FLASH SLAB, because the pipeline writes
+        # ``clean_chunk`` from ``cache_pred`` AFTER
+        # ``cache_pred = flash_dmd_pred.detach()``. Only with flash OFF is it
+        # the finish-denoised ladder endpoint. Published unchanged under the
+        # legacy key ``finish_denoised_chunk`` (frozen interface) AND under
+        # the honest name ``flash_slab_clean_chunk``.
         info_finish_denoised = getattr(pipe, "_clean_chunk", None)
+        # VIZ-HONESTY: the ACTUAL ladder endpoint -- the pre-flash
+        # finish-denoised x0 that the KV commit is built from and that
+        # inference (utils/eval_causal_AR.py) emits. Detached, whole-chunk,
+        # ungated. Identical object to ``_clean_chunk`` when flash is off.
+        info_ladder_endpoint = getattr(pipe, "_ladder_chunk", None)
         # A23 grad twin (pipeline gate ``pix_finish_grad_enabled``).
         # The LADDER-ENDPOINT x0 WITH a graph back to the generator --
         # the tensor utils/eval_causal_AR.py commits and renders, i.e.
@@ -12343,9 +14170,43 @@ class ActionForcingDMD(SelfForcingModel):
             # (action_critic) consume it
             # as the G-side fake.
             "flash_dmd_gan_chunk": full_last_rung_chunk,
+            # LEGACY KEY, UNCHANGED VALUE. Despite the name this is the
+            # flash t=gan_t slab whenever ``flash_dmd_enabled`` is on
+            # (see ``info_finish_denoised`` above). Every existing
+            # consumer keeps reading exactly what it read before; new
+            # consumers should take ``ladder_endpoint_chunk`` (the
+            # committed tensor) or ``flash_slab_clean_chunk`` (this
+            # tensor, honestly named) and say which one they mean.
             "finish_denoised_chunk": (
                 info_finish_denoised.detach()
                 if info_finish_denoised is not None else None
+            ),
+            # Honest alias of the key above -- SAME tensor, name that
+            # does not lie when flash is on. Requirement (a) of the
+            # viz-honesty fix: the flash slab stays available.
+            "flash_slab_clean_chunk": (
+                info_finish_denoised.detach()
+                if info_finish_denoised is not None else None
+            ),
+            # VIZ-HONESTY: the finish-denoised LADDER ENDPOINT -- the
+            # tensor the KV commit is actually built from (default-ON
+            # ``flash_dmd_commit_ladder_endpoint``) and the one
+            # inference emits, i.e. what the model committed and rolled
+            # on. With ``flash_dmd_enabled=False`` this is the same
+            # object as ``finish_denoised_chunk``.
+            "ladder_endpoint_chunk": (
+                info_ladder_endpoint.detach()
+                if info_ladder_endpoint is not None else None
+            ),
+            # True when ``finish_denoised_chunk`` is the flash slab
+            # rather than the ladder endpoint (i.e. flash is on and the
+            # two genuinely differ). Lets the trainer's viz telemetry
+            # name the tensor it rendered instead of asserting "finish".
+            "finish_denoised_is_flash_slab": bool(
+                flash_dmd_enabled
+                and info_ladder_endpoint is not None
+                and info_finish_denoised is not None
+                and info_ladder_endpoint is not info_finish_denoised
             ),
             # A23 inference-parity fake. NOT detached -- this is the
             # whole point. ``None`` when the pipeline gate is off or
@@ -12552,7 +14413,117 @@ class ActionForcingDMD(SelfForcingModel):
             "gt_target": gt_target,
             "gradient_mask": gradient_mask,
             "rope_offset": rope_offset,
+            # Absolute ride-window frame index of ``noisy_x[:, 0]`` /
+            # ``gt_target[:, 0]``. Additive key (nothing reads it unless
+            # ``ladd_fake_sample_source='dmd'``), so the returned dict is
+            # otherwise unchanged. Consumed by
+            # ``_publish_ladd_dmd_band`` to co-locate the LADD disc's
+            # per-frame ACTION conditioning with the band's own frames —
+            # the same ride coordinates ``ride_actions_window`` uses.
+            "world_noisy_lo": int(chunk_lo),
         }
+
+    def ladd_gt_match_pair_shifts(
+        self,
+        real_src: torch.Tensor,
+        fake_ref: torch.Tensor,
+        pairs: List[Tuple[int, int]],
+        npb: int,
+        current_step: int = -1,
+    ) -> Tuple[List[int], Dict[str, float]]:
+        """Forward-only per-pair frame shifts for the gt_transition GAN's
+        SAME-RIDE positional real anchors (``ladd_gt_match_frames``).
+
+        For each transition pair ``(i, i+1)`` the positional real anchor is
+        ``real_src[:, i*npb : (i+2)*npb]`` — former+latter at the fake's own
+        chunk indices. When ``ladd_gt_match_frames = N > 0`` the anchor may
+        shift FORWARD by ``s in [0, +N]`` frames (never backward: a stalled
+        rollout matches best to PAST GT, and a backward shift would
+        accommodate the stall instead of pulling advancement — no backward
+        variant exists for this site by design), choosing the argmin L1
+        distance (fp32, ``torch.no_grad``) against the fake/student pair the
+        anchor is compared to. ``s=0`` is always a candidate, visited FIRST,
+        and beaten only by STRICT (<) improvement, so the selection is
+        deterministic given the tensors and pair counts / shapes / DDP
+        semantics never change; out-of-bounds candidates are skipped. Former
+        and latter shift TOGETHER by the same ``s`` (transition structure
+        preserved). The cross-ride content pool
+        (``ladd_gt_transition_match``) is a different mechanism and is not
+        touched by this.
+
+        Args:
+            real_src: detached GT latent window ``[B, F, C, H, W]``.
+            fake_ref: detached student source, same layout; only the fixed
+                positional pair slices are read.
+            pairs: chunk-index pairs ``(i, i+1)`` (the trainer's ``pairs``).
+            npb: frames per block/chunk.
+            current_step: for the every-25-steps rank-0 telemetry print
+                (-1 = use an internal call counter).
+
+        Returns ``(shifts, logs)``: ``shifts[k]`` is the chosen forward
+        frame shift for ``pairs[k]`` (0 when the flag is off / no strict
+        improvement exists), and ``logs`` carries
+        ``ladd_gt_match_mean_shift`` (mean |s| over pairs) and
+        ``ladd_gt_match_nonzero_frac``. The same dict is stashed on
+        ``self._ladd_gt_match_logs`` for callers that merge logs later.
+        """
+        n_max = int(getattr(self, "ladd_gt_match_frames", 0))
+        shifts: List[int] = [0] * len(pairs)
+        if n_max <= 0 or not pairs:
+            logs = {
+                "ladd_gt_match_mean_shift": 0.0,
+                "ladd_gt_match_nonzero_frac": 0.0,
+            }
+            self._ladd_gt_match_logs = logs
+            return shifts, logs
+        L_real = int(real_src.shape[1])
+        L_fake = int(fake_ref.shape[1])
+        span = 2 * int(npb)
+        with torch.no_grad():
+            for k, (i, _j) in enumerate(pairs):
+                f_lo = int(i) * int(npb)
+                if f_lo + span > L_fake:
+                    continue  # fake pair OOB — keep positional s=0
+                fk = fake_ref[:, f_lo: f_lo + span].detach().float()
+                best_s, best_d = 0, None
+                # s=0 FIRST, then forward candidates; strict-< only.
+                for s in range(0, n_max + 1):
+                    r_lo = f_lo + s
+                    if r_lo + span > L_real:
+                        break  # further s only more OOB — skip
+                    rc = real_src[:, r_lo: r_lo + span].detach().to(
+                        dtype=torch.float32, device=fk.device
+                    )
+                    d = float((fk - rc).abs().mean().item())
+                    if best_d is None or d < best_d:
+                        best_s, best_d = int(s), d
+                shifts[k] = best_s
+        n_pairs = max(1, len(pairs))
+        mean_shift = float(sum(abs(s) for s in shifts)) / n_pairs
+        nonzero_frac = float(sum(1 for s in shifts if s != 0)) / n_pairs
+        logs = {
+            "ladd_gt_match_mean_shift": mean_shift,
+            "ladd_gt_match_nonzero_frac": nonzero_frac,
+        }
+        self._ladd_gt_match_logs = logs
+        # Rank-0 telemetry every 25 steps/calls.
+        self._ladd_gt_match_ncalls = int(
+            getattr(self, "_ladd_gt_match_ncalls", 0)
+        ) + 1
+        _tick = (
+            int(current_step) if int(current_step) >= 0
+            else self._ladd_gt_match_ncalls
+        )
+        if _is_main() and _tick % 25 == 0:
+            import sys as _sys
+            print(
+                f"[LADD-GTMATCH] step={_tick} "
+                f"mean_shift={mean_shift:.3f} "
+                f"nonzero_frac={nonzero_frac:.3f} "
+                f"(N={n_max}, pairs={len(pairs)})",
+                file=_sys.stderr, flush=True,
+            )
+        return shifts, logs
 
     def compute_clean_match_offset(
         self, chunk: torch.Tensor, info: Dict[str, Any],
@@ -12580,6 +14551,13 @@ class ActionForcingDMD(SelfForcingModel):
         the student can DIVERGE in content (not just time-drift), where the
         best match barely beats positional — the gate keeps matching from
         "agreeing with the error" / masking it.
+
+        MINIMUM FORWARD SHIFT (``dmd_42f_clean_match_min_shift``, default 0 =
+        off, requires ``_forward_only``): floor the candidate range at
+        ``m >= min_shift`` so the matched target can never sit at the student's
+        own moment. The safeguard's reference/fallback offset moves from m=0 to
+        the smallest legal candidate, and an end-of-window range collapses to
+        the largest in-bounds offset (see the inline notes).
         """
         if not bool(getattr(self, "dmd_42f_clean_match_enabled", False)):
             return 0, None
@@ -12711,29 +14689,85 @@ class ActionForcingDMD(SelfForcingModel):
         )
         _m_lo = max(-_cap, -_lo_base)
         _m_hi = min(_cap, _L - _hi_base)
+        # Forward-only matching (dmd_42f_clean_match_forward_only): a stalled
+        # rollout matches best to PAST GT, and m<0 would accommodate the stall
+        # — restrict candidates to m>=0 so the target keeps pulling
+        # advancement. Candidate range ONLY: m=0 stays in range (when not
+        # clamped OOB), and min_improve + all clamping above are untouched.
+        _fwd_only = bool(getattr(self, "dmd_42f_clean_match_forward_only", False))
+        if _fwd_only:
+            _m_lo = max(_m_lo, 0)
+        # ``dmd_42f_clean_match_min_shift`` (default 0 = byte-identical): floor
+        # the candidate range at m >= min_shift so the matched target can never
+        # sit at the student's own moment (m=0 = standing still).
+        #   * FALLBACK (bounds-only, no data dependence): if the clamped bounds
+        #     leave [min_shift, _m_hi] EMPTY (end of the ride window), collapse
+        #     to the single largest in-bounds offset _m_hi — advance as far as
+        #     the window allows. If even that is below the pre-floor lower
+        #     bound (no legal offset at all), leave the range empty and keep the
+        #     legacy m=0 result.
+        #   * min_improve REFERENCE (see below): the safeguard compares the best
+        #     match against the SMALLEST legal candidate (= _m_lo, normally
+        #     min_shift) instead of m=0, and rejects back to that same offset.
+        #     Rejecting to m=0 would reintroduce the stall the floor forbids.
+        _min_shift = int(getattr(self, "dmd_42f_clean_match_min_shift", 0))
+        if _min_shift > 0 and not _fwd_only:
+            raise ValueError(
+                f"dmd_42f_clean_match_min_shift={_min_shift} requires "
+                "dmd_42f_clean_match_forward_only=true (a backward-allowed "
+                "search with a positive minimum forward shift is incoherent)"
+            )
+        if _min_shift > 0:
+            if _min_shift > _cap:
+                raise ValueError(
+                    f"dmd_42f_clean_match_min_shift={_min_shift} must be <= "
+                    f"dmd_42f_clean_match_max_drift_frames={_cap}"
+                )
+            if _m_hi >= _min_shift:
+                _m_lo = max(_m_lo, _min_shift)
+            elif _m_hi >= _m_lo:
+                _m_lo = _m_hi          # bounds fallback: farthest legal shift
+        _ref_m = _m_lo if _min_shift > 0 else 0
+        # ``dmd_42f_clean_match_ref_clamp`` (default False = legacy): when the
+        # in-bounds clamp alone pushes the range above 0, the pinned reference
+        # m=0 is NOT a candidate, so ``_d0`` stays None below and the
+        # min_improve safeguard is silently skipped (the argmin is then
+        # accepted unconditionally — even for a student that already matches
+        # positional GT exactly). Clamping the reference INTO the legal range
+        # restores the check, mirroring what the min_shift path already does.
+        if _min_shift <= 0 and bool(getattr(
+                self, "dmd_42f_clean_match_ref_clamp", False)):
+            _ref_m = min(max(0, _m_lo), _m_hi) if _m_hi >= _m_lo else 0
         match_m = 0
+        _dbg_d0 = _dbg_best = _dbg_argmin = None
         if _m_hi >= _m_lo and (band_off + sup_frames) <= _clen:
             _stu = chunk[:, band_off: band_off + sup_frames].detach().float()
-            _best_m, _best_d, _d0 = 0, None, None
+            _best_m, _best_d, _d0 = _ref_m, None, None
             for _cand in range(_m_lo, _m_hi + 1):
                 _g = ride_lat[
                     :, band_lo + _cand: band_lo + _cand + sup_frames,
                 ].to(dtype=torch.float32, device=_stu.device)
                 _d = float((_stu - _g).abs().mean().item())
-                if _cand == 0:
+                if _cand == _ref_m:
                     _d0 = _d
                 if _best_d is None or _d < _best_d:
                     _best_m, _best_d = int(_cand), _d
-            # Residual-confidence safeguard: require the match to beat
-            # positional by >= min_improve, else stay at m=0 (no masking).
-            # ``_d0`` is None only when m=0 was clamped out of range — which
-            # happens iff the positional (m=0) window is itself OOB, so there is
-            # no valid m=0 to fall back to and skipping the safeguard is correct.
+            # Residual-confidence safeguard: require the match to beat the
+            # REFERENCE offset by >= min_improve, else stay at the reference
+            # (no masking). Reference = m=0 (positional) by default; with
+            # min_shift>0 it is the smallest LEGAL forward offset _m_lo, so a
+            # rejected match parks the target one floor-step ahead instead of
+            # standing still.
+            # ``_d0`` is None only when the reference was clamped out of range —
+            # which happens iff the reference window is itself OOB, so there is
+            # no valid reference to fall back to and skipping the safeguard is
+            # correct.
             _min_improve = float(
                 getattr(self, "dmd_42f_clean_match_min_improve", 0.0))
+            _dbg_d0, _dbg_best, _dbg_argmin = _d0, _best_d, _best_m
             if (_d0 is not None and _best_d is not None
                     and _best_d > _d0 * (1.0 - _min_improve)):
-                _best_m = 0
+                _best_m = _ref_m
             match_m = _best_m
         s["clean_match_offset"] = int(match_m)
         matched_mae = None
@@ -12746,9 +14780,36 @@ class ActionForcingDMD(SelfForcingModel):
         if getattr(self, "_42f_match_dbg", 0) < 8:
             self._42f_match_dbg = getattr(self, "_42f_match_dbg", 0) + 1
             import sys as _sys
+            # Telemetry (no behaviour change): WHY m came out the way it did.
+            #   argmin  = best candidate BEFORE the safeguard
+            #   d0      = MAE at the reference offset (None => reference was
+            #             not a candidate, so min_improve was SKIPPED and the
+            #             argmin was accepted unchecked)
+            #   ratio   = best/d0, must be <= 1-min_improve to be accepted
+            # Without these, "m=0 because the argmin was 0" and "m=0 because
+            # the safeguard rejected a real match" are indistinguishable — the
+            # exact ambiguity that hid a 288/288 no-op.
+            _ratio = (
+                (_dbg_best / _dbg_d0)
+                if (_dbg_d0 not in (None, 0.0) and _dbg_best is not None)
+                else None
+            )
+            if _dbg_best is None:
+                _verdict = "no-search(empty-range/OOB)"
+            elif _dbg_d0 is None:
+                _verdict = "no-ref(safeguard-skipped)"
+            elif _dbg_argmin != match_m:
+                _verdict = "rejected"
+            else:
+                _verdict = "accepted"
             print(
                 f"[42F-MATCH] m={match_m} rolling={_rolling} "
-                f"(cap={_cap}, range=[{_m_lo},{_m_hi}]) matched_mae={matched_mae}",
+                f"(cap={_cap}, range=[{_m_lo},{_m_hi}], "
+                f"min_shift={_min_shift}, ref_m={_ref_m}) "
+                f"argmin={_dbg_argmin} d0={_dbg_d0} best={_dbg_best} "
+                f"ratio={_ratio} need<={1.0 - float(getattr(self, 'dmd_42f_clean_match_min_improve', 0.0)):.3f} "
+                f"{_verdict} "
+                f"matched_mae={matched_mae}",
                 file=_sys.stderr, flush=True,
             )
         return int(match_m), matched_mae
@@ -13470,6 +15531,16 @@ class ActionForcingDMD(SelfForcingModel):
             "gradient_mask": gradient_mask,
             "rope_offset": _rope_offset,
             "ar_head": ar_head,
+            # Absolute ride-window frame index of ``noisy_x[:, 0]``.
+            # ``gt_target`` is ``ride_lat[noisy_lo + match_m : noisy_hi +
+            # match_m]``, so ``gt_target`` frame i == world
+            # ``noisy_lo + match_m + i`` — the SAME +match_m convention
+            # every other GT slice this builder makes uses, including the
+            # action window ``noisy_cond`` is built from. Additive key
+            # (nothing reads it unless ``ladd_fake_sample_source='dmd'``),
+            # consumed by ``_publish_ladd_dmd_band`` to co-locate the LADD
+            # disc's per-frame ACTION conditioning with the band frames.
+            "world_noisy_lo": int(noisy_lo + match_m),
         }
         if _allroll_flag:
             # all-rolling telemetry (flag-on only; keys absent otherwise so
@@ -13604,6 +15675,12 @@ class ActionForcingDMD(SelfForcingModel):
         # graph is by then freed and whose GT window belongs to a
         # different position in the ride).
         self._of_band = None
+        # Same discipline for the LADD divergence-3 band
+        # (``ladd_fake_sample_source='dmd'``): drop last roll's stash
+        # FIRST so the trainer's GAN block hits ``ladd_dmd_band``'s loud
+        # error rather than re-using a freed graph at the wrong ride
+        # position.
+        self._ladd_dmd_band = None
         # Feed the fingerprint RATCHET the ride depth. Before the
         # only_first/only_last early returns on purpose: the ratchet must
         # keep tracking depth across rolls that skip the scorer, and the
@@ -13900,6 +15977,11 @@ class ActionForcingDMD(SelfForcingModel):
             # only the critic term wants it: the AR head block below
             # gates on ``dmd_ar_head_weight``, not on the payload.
             score_ar_head = f42.get("ar_head")
+            # Absolute ride-window index of ``score_image[:, 0]``. Read
+            # only by ``_publish_ladd_dmd_band``; ``None`` on any branch
+            # that does not publish it, which that method turns into a
+            # loud raise rather than a guessed offset.
+            score_world_lo = f42.get("world_noisy_lo")
         elif asymmetric:
             asym = self._build_asymmetric_scoring_inputs(chunk, info)
             score_image = asym["noisy_x"]
@@ -13913,6 +15995,7 @@ class ActionForcingDMD(SelfForcingModel):
             score_aug_t_real = None
             asym_rope_offset = asym["rope_offset"]
             score_ar_head = None      # AR head is 42f-only
+            score_world_lo = asym.get("world_noisy_lo")
         else:
             score_image = chunk
             score_cond = cond_for_scoring
@@ -13925,6 +16008,11 @@ class ActionForcingDMD(SelfForcingModel):
             score_aug_t_real = sc_aug_t_real
             asym_rope_offset = None
             score_ar_head = None      # AR head is 42f-only
+            # Legacy path: ``score_image`` IS the rolled chunk, whose
+            # first frame sits at ride-window position ``chunk_lo``
+            # (``cf + noisy_start_sdn``, computed above) — the same
+            # coordinate the trainer's ``gt_window`` slice uses.
+            score_world_lo = int(chunk_lo)
 
         # ---- authoritative clean_x stash -------------------------------
         # Written HERE, after every branch has resolved, so the logged
@@ -14057,6 +16145,21 @@ class ActionForcingDMD(SelfForcingModel):
                 dmd_fired=(not _skip_scorer),
                 current_step=current_step,
             )
+        # ---- LADD divergence-3: publish the DMD-scored band for the
+        # LADD disc, from the SAME scope and for the same reason as the
+        # OF publish above. Publication only — no loss is built here; the
+        # trainer's existing GAN block consumes the stash so the D-update
+        # / G-term / deferred-update wiring is untouched.
+        if self.ladd_fake_sample_source == "dmd":
+            self._publish_ladd_dmd_band(
+                score_image=score_image,
+                score_gt_target=score_gt_target,
+                score_grad_mask=score_grad_mask,
+                world_noisy_lo=score_world_lo,
+                denoised_timestep_from=info.get("denoised_timestep_from"),
+                dmd_fired=(not _skip_scorer),
+                current_step=current_step,
+            )
         # Graph tripwire for the DMD term itself. ``score_image`` is built
         # out of the rolled chunk; when the rollout arrives detached (the
         # ``boundary_vae_roundtrip`` no_grad-cat defect, a no-grad
@@ -14134,6 +16237,8 @@ class ActionForcingDMD(SelfForcingModel):
                     SOS_long_weight=self.stat_anchor_SOS_long_weight,
                     M1_short_weight=self.stat_anchor_M1_short_weight,
                     M1_long_weight=self.stat_anchor_M1_long_weight,
+                    MEAN_short_weight=self.stat_anchor_MEAN_short_weight,
+                    MEAN_long_weight=self.stat_anchor_MEAN_long_weight,
                     rel_tol_short=self.stat_anchor_rel_tol_short,
                     rel_tol_long=self.stat_anchor_rel_tol_long,
                     std_one_sided=bool(getattr(
@@ -14142,8 +16247,17 @@ class ActionForcingDMD(SelfForcingModel):
                 if _mode == "target_matching":
                     _matched = self._matched_gt_stat_anchors(chunk.float())
                 elif _mode == "gt_window":
+                    # ``chunk_lo`` is POSITIONAL; the helper adds
+                    # ``clean_match_offset`` itself when
+                    # stat_anchor_use_clean_match_offset (default TRUE) and
+                    # dmd_42f_clean_match_enabled are both on, so the anchor
+                    # window is the SAME matched GT the 42f clean half, the
+                    # gt_target and the gate MAE use.
                     _matched = self._gt_window_stat_anchors(
                         chunk.float(), chunk_lo,
+                    )
+                    dmd_log["stat_anchor_match_offset"] = float(
+                        getattr(self, "_stat_anchor_applied_offset", 0)
                     )
                 else:
                     _matched = None
@@ -14154,7 +16268,8 @@ class ActionForcingDMD(SelfForcingModel):
                         seed_M2_anchor=_matched["M2"],
                         seed_TV_anchor=_matched["TV"],
                         seed_SOS_anchor=_matched["SOS"],
-                        seed_M1_anchor=_matched["M1"], **_wk,
+                        seed_M1_anchor=_matched["M1"],
+                        seed_MEAN_anchor=_matched["MEAN"], **_wk,
                     )
                 elif cf_state > 0 and ride_window.shape[1] >= cf_state:
                     seed_latents_stream = ride_window[:, :cf_state].detach()
@@ -14189,14 +16304,23 @@ class ActionForcingDMD(SelfForcingModel):
                     )
                     for k, v in stat_logs.items():
                         dmd_log[k] = v
-            except Exception as exc:
-                if _is_main():
-                    import logging as _logging
-                    _logging.warning(
-                        "[ActionForcingDMD] stat_anchor_loss "
-                        "(streaming) failed (%s); skipping this "
-                        "iteration.", exc,
+                    self._note_stat_anchor_ok(dmd_log)
+                else:
+                    # Not an exception, but still a step with NO stat
+                    # anchor (no matched anchor and no usable seed
+                    # window). Surface it rather than leaving the key
+                    # absent -- absence is exactly what hid this before.
+                    dmd_log["stat/anchor_applied"] = 0.0
+                    dmd_log["stat/anchor_exception_count"] = float(
+                        self._stat_anchor_exception_count
                     )
+            except Exception as exc:
+                # Counts, logs (type + message + step, rate-limited) and
+                # RAISES after N consecutive failures when the anchor is
+                # configured active and ``stat_anchor_fail_loud``.
+                self._note_stat_anchor_exception(
+                    exc, current_step, dmd_log, path="streaming",
+                )
 
         # Flash-DMD: when enabled, the rolling rollout emitted a
         # per-block t=flash_dmd_gan_t grad-on forward. The chunk_size-
@@ -15269,6 +17393,105 @@ class ActionForcingDMD(SelfForcingModel):
         # Linear ramp from full at s=start to floor at s=start+rampdown_steps.
         progress = float(s - start) / float(rampdown_steps)
         return full * (1.0 - progress) + floor * progress
+
+    # ------------------------------------------------------------------
+    # Stat-anchor failure bookkeeping (shared by both application sites)
+    # ------------------------------------------------------------------
+    def _note_stat_anchor_ok(self, log_dict) -> None:
+        """Record a SUCCESSFUL stat-anchor application.
+
+        Resets the consecutive-failure counter and (re)publishes the
+        monotone total so ``stat/anchor_exception_count`` is present on
+        every logged step, not only on the steps that failed. A key that
+        only appears when something is wrong is a key nobody notices.
+        """
+        self._stat_anchor_consecutive_exceptions = 0
+        if isinstance(log_dict, dict):
+            log_dict["stat/anchor_exception_count"] = float(
+                self._stat_anchor_exception_count
+            )
+            log_dict["stat/anchor_applied"] = 1.0
+
+    def _note_stat_anchor_exception(
+        self,
+        exc: BaseException,
+        current_step,
+        log_dict=None,
+        path: str = "",
+    ) -> None:
+        """Record a FAILED stat-anchor application; raise when fail-loud.
+
+        Behaviour (see the ``stat_anchor_fail_loud`` block in ``__init__``):
+          * increments ``_stat_anchor_exception_count`` (monotone) and
+            ``_stat_anchor_consecutive_exceptions``;
+          * logs EVERY failure with the exception TYPE, message and step,
+            rate-limited to the first 3 then every 25th so a persistent
+            failure keeps producing evidence without flooding the log;
+          * publishes ``stat/anchor_exception_count`` (and
+            ``stat/anchor_applied=0``) into ``log_dict`` for wandb;
+          * RAISES ``RuntimeError`` when the anchor is configured active
+            (``stat_anchor_loss_weight > 0``) and it has now failed
+            ``stat_anchor_fail_loud_after`` times consecutively, unless
+            ``stat_anchor_fail_loud`` is False (legacy warn-and-continue).
+
+        NOTE (DDP): the raise is deliberately un-guarded across ranks. A
+        stat-anchor that throws on one rank throws for a structural reason
+        (shape/dtype/None anchor) that will hit the others too; crashing is
+        the intended outcome and is strictly better than finishing a run
+        whose headline claim is unfalsifiable.
+        """
+        self._stat_anchor_exception_count += 1
+        self._stat_anchor_consecutive_exceptions += 1
+        n_tot = int(self._stat_anchor_exception_count)
+        n_run = int(self._stat_anchor_consecutive_exceptions)
+        if isinstance(log_dict, dict):
+            log_dict["stat/anchor_exception_count"] = float(n_tot)
+            log_dict["stat/anchor_applied"] = 0.0
+        configured_active = float(
+            getattr(self, "stat_anchor_loss_weight", 0.0)
+        ) > 0.0
+        # Rate limit: first 3, then every 25th.
+        if n_tot <= 3 or (n_tot % 25) == 0:
+            if _is_main():
+                import logging as _logging
+                _logging.warning(
+                    "[ActionForcingDMD] stat_anchor_loss (%s) FAILED at "
+                    "step %s: %s: %s | failures=%d (consecutive=%d) "
+                    "configured_active=%s fail_loud=%s. The stat anchor "
+                    "contributed NOTHING to this step's loss.",
+                    path or "unknown-path",
+                    str(current_step),
+                    type(exc).__name__,
+                    exc,
+                    n_tot,
+                    n_run,
+                    configured_active,
+                    bool(getattr(self, "stat_anchor_fail_loud", True)),
+                    exc_info=(n_tot <= 3),
+                )
+        if not bool(getattr(self, "stat_anchor_fail_loud", True)):
+            return
+        if not configured_active:
+            return
+        limit = int(getattr(self, "stat_anchor_fail_loud_after", 5))
+        if limit <= 0 or n_run < limit:
+            return
+        raise RuntimeError(
+            "[ActionForcingDMD] stat_anchor_loss (%s) failed %d times IN A "
+            "ROW (%d total) with stat_anchor_loss_weight=%s > 0. A stat "
+            "anchor that never fires is a silently different experiment "
+            "(it turns this arm into the no-stat-anchor ablation), so this "
+            "is a hard failure. Last exception: %s: %s. Set "
+            "stat_anchor_fail_loud=false to restore warn-and-continue."
+            % (
+                path or "unknown-path",
+                n_run,
+                n_tot,
+                float(getattr(self, "stat_anchor_loss_weight", 0.0)),
+                type(exc).__name__,
+                exc,
+            )
+        ) from exc
 
     def _resolved_dmd_loss_weight(self, current_step: int) -> float:
         """Return the effective DMD loss weight at this step.

@@ -192,6 +192,45 @@ def _apply_carn_seam_affine(
     return ((x - mean) / std * blended_std + blended_mean).to(source_dtype)
 
 
+def _resolve_trained_attn_window(base_dit, fallback_frames: int):
+    """Resolve the student's TRAINED local attention window, in FRAMES.
+
+    FIX 2 support (2026-08-25). Prefer what the loaded model/config
+    actually says over a hardcoded constant, so a student trained at a
+    different window is served at ITS window, not at 21.
+
+    Probes, in order:
+      1. ``base_dit.local_attn_size``          (the DiT's own config)
+      2. any sub-module's ``local_attn_size``  (attention blocks)
+      3. ``fallback_frames``                   (TEACHER_ATTN_FRAMES = 21)
+
+    A value of ``-1`` / ``None`` / non-int means "global attention, not
+    configured" and is SKIPPED -- it is not a trained window. Returns
+    ``(frames, source_string)``; the source is printed at eval start so
+    a scored number is never ambiguous about where its span came from.
+    """
+    def _ok(v):
+        if v is None or isinstance(v, (list, tuple, bool)):
+            return None
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        return iv if iv > 0 else None
+
+    v = _ok(getattr(base_dit, "local_attn_size", None))
+    if v is not None:
+        return v, "model.local_attn_size"
+    try:
+        for name, module in base_dit.named_modules():
+            v = _ok(getattr(module, "local_attn_size", None))
+            if v is not None:
+                return v, f"model.{name}.local_attn_size"
+    except Exception:
+        pass
+    return int(fallback_frames), f"fallback:TEACHER_ATTN_FRAMES={fallback_frames}"
+
+
 def _set_attention_window(base_dit, *, local_attn_size_frames: int, max_tokens: int) -> None:
     """Propagate ``local_attn_size`` (frames) and ``max_attention_size``
     (tokens) to every attention block + top-level module."""
@@ -669,15 +708,71 @@ class ODEChainPipeline(ChainPipeline):
         # query-key distances never seen in training and degrade per chunk.
         TEACHER_ATTN_FRAMES = 21
         _cache_frames = (cache_chunks + chunks_per_step) * BASE_CHUNK_FRAMES
-        local_attn_size_frames = int(os.environ.get(
-            "ODE_ATTN_FRAMES", TEACHER_ATTN_FRAMES))
+        # ===============================================================
+        # FIX 2 -- INFERENCE ATTENTION SPAN (researcher-ordered, 2026-08-25)
+        # DEFAULT-BEHAVIOUR CHANGE. ``eval_span_match_training`` DEFAULTS
+        # TO TRUE (aligned); set EVAL_SPAN_MATCH_TRAINING=0 for the legacy
+        # behaviour.
+        #
+        # WHAT WAS WRONG. ``max_tokens`` was ``kv_cache_tokens`` -- the
+        # size of the ALLOCATED KV BUFFER (cache_chunks+chunks_per_step =
+        # 24 frames), not the window the student was TRAINED at (21
+        # frames). Training attends 21
+        # (pipeline/action_forcing_training.py:299-306, local_attn_size *
+        # frame_seq_length) and so does the 14e ODE stage
+        # (pipeline/ode_rollout.py). Eval was the only outlier, and the
+        # comment directly above -- "the span itself must not exceed what
+        # the student was trained at" -- already stated the correct
+        # intent while the code did the opposite. Late chunks therefore
+        # attended across query-key distances never seen in training.
+        #
+        # THE FIX. The cache is STILL ALLOCATED at ``kv_cache_tokens``
+        # (the deeper buffer is what the rolling/eviction bookkeeping
+        # expects); only the ATTENTION SPAN is capped at the trained
+        # window. Teacher parity is preserved: the teacher likewise
+        # allocates 27 frames and hard-caps attention at 21.
+        #
+        # THIS CHANGES PREVIOUSLY-SCORED NUMBERS. Any eval run before
+        # 2026-08-25 attended 24 frames. The effective span and where it
+        # came from are printed once at eval start (below) so no result
+        # is ever ambiguous about which contract produced it.
+        # ===============================================================
+        _win_frames, _win_src = _resolve_trained_attn_window(
+            base_dit, TEACHER_ATTN_FRAMES,
+        )
+        if "ODE_ATTN_FRAMES" in os.environ:
+            local_attn_size_frames = int(os.environ["ODE_ATTN_FRAMES"])
+            _win_src = "env:ODE_ATTN_FRAMES"
+        else:
+            local_attn_size_frames = int(_win_frames)
         kv_cache_tokens = max(_cache_frames, local_attn_size_frames) * frame_seq_length
         required_chunk_tokens = num_frame_per_block * frame_seq_length
         self.wrapper.seq_len = max(int(self.wrapper.seq_len), required_chunk_tokens)
+        _span_match = os.environ.get(
+            "EVAL_SPAN_MATCH_TRAINING", "1",
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        _span_tokens = (
+            local_attn_size_frames * frame_seq_length
+            if _span_match
+            else kv_cache_tokens
+        )
+        # REQUIRED one-shot announcement (see the block comment above):
+        # the effective span AND its provenance, every eval, at start.
+        log.info(
+            "[AR][span] eval_span_match_training=%s | attention span = "
+            "%d frames (%d tokens) from %s | KV buffer allocated at "
+            "%d frames (%d tokens) | frame_seq_length=%d%s",
+            _span_match,
+            _span_tokens // frame_seq_length, _span_tokens, _win_src,
+            kv_cache_tokens // frame_seq_length, kv_cache_tokens,
+            frame_seq_length,
+            "" if _span_match else
+            "  <-- LEGACY: span follows the BUFFER, not the trained window",
+        )
         _set_attention_window(
             base_dit,
             local_attn_size_frames=local_attn_size_frames,
-            max_tokens=kv_cache_tokens,
+            max_tokens=_span_tokens,
         )
         # TEACHER PARITY, and it MUST precede the cache prefill below:
         # the seed/clean-fill forwards write K/V into the cache, so if the

@@ -888,8 +888,47 @@ def _bidir_forward_with_action_tokens(
         if classify_mode and _blk_idx in gan_taps:
             _tap_idx = gan_taps.index(_blk_idx)
             token_features = gan_registers[:, _tap_idx: _tap_idx + 1]
-            for ca_block in gan_ca_blocks[_tap_idx]:
-                token_features = ca_block(x, token_features)
+            # S6 MEMORY. These GanAttentionBlock calls sit OUTSIDE the
+            # per-DiT-block checkpoint above, so unlike the backbone they
+            # retain full-sequence activations for the whole forward:
+            # norm3(x), the k and v projections of x inside
+            # WanGanCrossAttention, and norm_k's fp32 upcast — measured at
+            # ~21.5 KiB per token per row per tap, i.e. ~31% of the entire
+            # disc forward's resident footprint at the shipped 9-frame
+            # band. ``gan_of_checkpoint_taps`` trades one recompute of the
+            # tap stack for that residency. Default False = the verbatim
+            # historical call, byte-identical.
+            #
+            # use_reentrant=False so the replay honours the same
+            # requires_grad flags the original forward saw — the invariant
+            # ``_of_disc_frozen`` documents.
+            # FP32-HEAD BOUNDARY (``gan_of_head_fp32``), parity with
+            # ``wan/modules/model.py``. The head modules may be stored in
+            # fp32 while this backbone stays bf16 (the bf16-ulp starvation
+            # fix — see ``docs/ONE_FORCING_PORT.md``). The tap features are
+            # the ONLY backbone tensors the head consumes on this path
+            # (``concat_time_embeddings`` is refused below), so this one
+            # cast covers the whole head. A cast node, not a rebuild, so
+            # the G side's ``autograd.grad`` back into the fake tensor
+            # converts fp32 head gradients to bf16 right here. Identity
+            # (``_tap_x is x``) when the head is at the backbone dtype,
+            # which is the default.
+            _tap_x = (
+                x if x.dtype == token_features.dtype
+                else x.to(token_features.dtype)
+            )
+            if bool(getattr(self, "_gan_checkpoint_taps", False)) \
+                    and torch.is_grad_enabled():
+                def _tap_fn(_x, _tok, _blocks=gan_ca_blocks[_tap_idx]):
+                    for _cab in _blocks:
+                        _tok = _cab(_x, _tok)
+                    return _tok
+                token_features = torch.utils.checkpoint.checkpoint(
+                    _tap_fn, _tap_x, token_features, use_reentrant=False,
+                )
+            else:
+                for ca_block in gan_ca_blocks[_tap_idx]:
+                    token_features = ca_block(_tap_x, token_features)
             gan_features.append(token_features)
 
     # Teacher-forcing: keep only the noisy half (the second half of the
@@ -912,6 +951,44 @@ def _bidir_forward_with_action_tokens(
     # per-sample x — mis-shaped. Reproduce the causal head math here.
     # The head uses the NOISY half's e (the original ``t``-based one),
     # not the joint e0 — same convention as CausalWanModel (line 1560).
+    #
+    # S6 MEMORY: classify-only forwards DISCARD the DiT output. Every OF
+    # call site reads only the logits (``_of_disc_logits`` unpacks
+    # ``_flow, _x0, logits``), yet the head below retains ~3 full-sequence
+    # [rows, L, dim] activations (the LayerNorm input, the modulated
+    # tensor, the Linear input) — measured 13.72 MiB per frame per row.
+    # When ``gan_of_classify_skip_head`` is set we return a
+    # correctly-shaped ZERO placeholder instead of computing head +
+    # unpatchify.
+    #
+    # WHY A ZERO PLACEHOLDER RATHER THAN None: the wrapper unconditionally
+    # derives ``pred_x0`` from this tensor, and every classify caller
+    # unpacks a 2-tuple. A placeholder keeps both contracts intact with no
+    # downstream signature change. The LOGITS — the only value any
+    # classify caller reads — are bit-identical either way, because they
+    # come from the tap stack above, which this branch does not touch.
+    # GRADIENTS are unaffected too: the head's output is discarded by
+    # every classify caller, so ``head.modulation`` / ``head.head.*`` were
+    # ALREADY ungradiented on a classify-only backward (the exact three
+    # params ``compute_of_d_loss`` documents).
+    if classify_mode and bool(
+            getattr(self, "_gan_classify_skip_head", False)):
+        if concat_time_embeddings:
+            raise RuntimeError(
+                "concat_time_embeddings=True is not supported on the "
+                "action-token classify path (per-frame time embedding is "
+                "[B*F, C], not [B, C]). Leave it False."
+            )
+        _out_shape = [
+            i * j for i, j in zip(grid_sizes[0].tolist(), list(self.patch_size))
+        ]
+        _placeholder = torch.zeros(
+            (x.shape[0], self.out_dim, *_out_shape),
+            device=x.device, dtype=x.dtype,
+        )
+        _gf = torch.cat(gan_features, dim=1)
+        return _placeholder, cls_pred_branch(_gf.view(_gf.shape[0], -1))
+
     head_mod = getattr(self.head, "modulation")
     head_norm = getattr(self.head, "norm")
     head_lin = getattr(self.head, "head")

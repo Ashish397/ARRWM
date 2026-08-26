@@ -47,6 +47,16 @@ OF_DEFAULTS: Dict[str, Any] = {
     "gan_of_enabled": False,
     "gan_of_g_weight": 0.03,
     "gan_of_d_weight": 0.03,
+    # EXPERIMENTAL-DESIGN KNOB, not a paper knob. True = the faithful
+    # One-Forcing setting and the arm as first shipped: the adversarial D
+    # loss rides the same backward as the denoising critic loss, so the
+    # fake_score BACKBONE co-trains on both. False keeps the disc TAPPING
+    # fake_score features (unchanged) but restricts the adversarial
+    # gradient to the three head module groups, so the backbone is moved
+    # only by its own denoising loss. See ``docs/ONE_FORCING_PORT.md``
+    # "The confound" — as shipped the arm moved two variables at once and
+    # neither a positive nor a negative result could tell them apart.
+    "gan_of_backbone_trainable": True,
     "gan_of_feature_layers": [21, 29],
     "gan_of_blocks_per_token": 1,
     "gan_of_block_ffn_dim": 2048,
@@ -71,6 +81,67 @@ OF_DEFAULTS: Dict[str, Any] = {
     "gan_of_fake_source": "pred_image",
     "gan_of_real_source": "aligned_gt",
     "gan_of_telemetry_every": 25,
+    # ---- S6 memory knobs (2026-08-25). All default to the value that
+    # reproduces the pre-S6 forward BYTE-IDENTICALLY. See
+    # ``docs/ONE_FORCING_PORT.md`` section "S6 — disc-forward memory".
+    #
+    # ``gan_of_disc_micro_batch_groups`` splits the concatenated
+    # ``[fake ; real]`` disc batch into N contiguous row groups, one
+    # forward each, and concatenates the logits back before the loss is
+    # taken. The loss is therefore computed on the SAME ``[2B, ...]``
+    # logit tensor as the single-batch path, so the value is unchanged by
+    # construction rather than by a re-derived per-group weighting (which
+    # is what ``ladd_disc_micro_batch_groups`` has to do, because THAT
+    # path owns its optimizer and backwards each group separately).
+    # N is clamped to the row count, so it is a pure function of config
+    # and tensor shape -- never per-rank state.
+    "gan_of_disc_micro_batch_groups": 1,
+    # Checkpoint the un-checkpointed tap blocks. The GanAttentionBlock
+    # calls sit OUTSIDE the DiT's per-block checkpoint and each retains
+    # ~4 full-sequence [rows, L, dim] activations; measured at ~31% of the
+    # whole disc forward's resident footprint. See the doc section.
+    "gan_of_checkpoint_taps": False,
+    # Skip the DiT ``head`` + ``unpatchify`` on a classify-only forward.
+    # Their result is DISCARDED by every OF call site (only the logits are
+    # read), but computing them retains ~3 full-sequence activations.
+    "gan_of_classify_skip_head": False,
+    # R1/R2 real-subsample, analogous to ``ladd_r1_num_samples``.
+    # <=0 => every row (current behaviour). Inert while the R1/R2 weights
+    # are 0.0, which is the paper's framewise recipe and our default.
+    "gan_of_r1_num_samples": 0,
+    # ---- D-STEP RESOLUTION (2026-08-25). The measured defect. ----------
+    #
+    # The disc head shares ``fake_optimizer`` and therefore ``fake_lr``
+    # (4e-7 in the shipped phase-3 recipe). With ``fake_betas`` beta1=0.0
+    # an AdamW step is ~lr in magnitude, and the head's final Linear sits
+    # at a weight scale whose bf16 ulp is 3.05e-5 — 76x LARGER than the
+    # update. Round-to-nearest therefore DISCARDS the step: measured on
+    # the GPU, only 0.5% of head params ever moved and ``of_logit_gap``
+    # was pinned at 0 (every emitted value an exact multiple of one bf16
+    # ulp, 1.953e-3). Reproduced on CPU against the real head modules at
+    # our exact param count (36,221,441):
+    #
+    #     bf16 lr=4e-7 : gap 0.0078 -> 0.00195 over 200 steps, NO TREND
+    #     bf16 lr=1e-5 : gap 0.0078 -> 1.289
+    #     fp32 lr=1e-5 : gap crosses 1.0 at ~step 70, 7.4 by step 400
+    #
+    # Two independent knobs because the defect has two independent
+    # causes — the step is too small AND the storage is too coarse — and
+    # a fix that moves both at once could not say which mattered.
+    #
+    # ``gan_of_head_lr`` > 0 puts the three head module groups in their
+    # OWN param group in ``fake_optimizer`` at that LR, leaving every
+    # other fake_score parameter on ``fake_lr`` so the DMD critic's
+    # recipe is untouched. 0.0 = inherit ``fake_lr`` = byte-identical to
+    # today (ONE param group, built by the verbatim historical call).
+    # One-Forcing's reference uses ``lr_critic=1e-5``.
+    "gan_of_head_lr": 0.0,
+    # ``gan_of_head_fp32`` builds the head modules in float32 while the
+    # backbone stays bf16, so the update resolution at the head's weight
+    # scale is ~1e-10 instead of 3.05e-5. Precedent in this tree: the
+    # r3gan disc and the pixel disc are both built ``.to(float32)`` on a
+    # bf16 model. False = build at the trainer dtype = byte-identical.
+    "gan_of_head_fp32": False,
 }
 
 # Explicit registration for the trainer's override guard. Every key here
@@ -102,6 +173,9 @@ def resolve_of_config(cfg: Any) -> Dict[str, Any]:
         "gan_of_enabled": bool(getattr(cfg, "gan_of_enabled", False)),
         "gan_of_g_weight": float(getattr(cfg, "gan_of_g_weight", 0.03)),
         "gan_of_d_weight": float(getattr(cfg, "gan_of_d_weight", 0.03)),
+        "gan_of_backbone_trainable": bool(
+            getattr(cfg, "gan_of_backbone_trainable", True)
+        ),
         "gan_of_feature_layers": [
             int(v) for v in (getattr(cfg, "gan_of_feature_layers", None) or [21, 29])
         ],
@@ -125,6 +199,20 @@ def resolve_of_config(cfg: Any) -> Dict[str, Any]:
         "gan_of_fake_source": str(getattr(cfg, "gan_of_fake_source", "pred_image")),
         "gan_of_real_source": str(getattr(cfg, "gan_of_real_source", "aligned_gt")),
         "gan_of_telemetry_every": int(getattr(cfg, "gan_of_telemetry_every", 25)),
+        "gan_of_disc_micro_batch_groups": int(
+            getattr(cfg, "gan_of_disc_micro_batch_groups", 1)
+        ),
+        "gan_of_checkpoint_taps": bool(
+            getattr(cfg, "gan_of_checkpoint_taps", False)
+        ),
+        "gan_of_classify_skip_head": bool(
+            getattr(cfg, "gan_of_classify_skip_head", False)
+        ),
+        "gan_of_r1_num_samples": int(
+            getattr(cfg, "gan_of_r1_num_samples", 0)
+        ),
+        "gan_of_head_lr": float(getattr(cfg, "gan_of_head_lr", 0.0)),
+        "gan_of_head_fp32": bool(getattr(cfg, "gan_of_head_fp32", False)),
     }
     validate_of_config(out)
     return out
@@ -185,6 +273,101 @@ def validate_of_config(resolved: Dict[str, Any], *, force: bool = False) -> None
         )
     if resolved["gan_of_blocks_per_token"] < 1:
         raise ValueError("gan_of_blocks_per_token must be >= 1.")
+    if int(resolved.get("gan_of_disc_micro_batch_groups", 1)) < 1:
+        raise ValueError(
+            "gan_of_disc_micro_batch_groups must be >= 1 (1 = the verbatim "
+            "single-batch disc forward). Got "
+            f"{resolved['gan_of_disc_micro_batch_groups']}."
+        )
+    if float(resolved.get("gan_of_head_lr", 0.0)) < 0.0:
+        raise ValueError(
+            "gan_of_head_lr must be >= 0 (0 = inherit fake_lr, the "
+            "byte-identical default). Got "
+            f"{resolved['gan_of_head_lr']}."
+        )
+
+
+# ----------------------------------------------------------------------
+# Optimizer param-group split for the disc head (``gan_of_head_lr``).
+# ----------------------------------------------------------------------
+def split_of_head_param_groups(
+    all_params: List[torch.nn.Parameter],
+    head_params: List[torch.nn.Parameter],
+    *,
+    fake_lr: float,
+    head_lr: float,
+) -> List[Dict[str, Any]]:
+    """Two ``fake_optimizer`` param groups: backbone @ ``fake_lr``, disc
+    head @ ``head_lr``.
+
+    WHY IT IS A FUNCTION AND NOT FOUR LINES INLINE. The split has to be
+    EXACT — every head parameter in the head group, every other
+    parameter in the backbone group, nothing in both, nothing dropped —
+    and each of those three failures is silent: a dropped parameter is
+    simply never stepped (which is the bug this whole change exists to
+    fix, in a new dress), and a duplicated parameter is stepped twice
+    per iteration at two different LRs. Asserted here, once, where a
+    test can drive it without constructing a trainer.
+
+    Matching is by OBJECT IDENTITY, not by name. ``fake_optimizer`` is
+    built from ``fake_score.model.parameters()`` where ``.model`` may
+    already be the DDP wrapper (whose ``named_parameters`` are prefixed
+    ``module.``), so a name-based match would silently produce an EMPTY
+    head group and put the head back on ``fake_lr`` with nothing in the
+    log to say so.
+
+    Only ``requires_grad`` head params are eligible, because
+    ``all_params`` is already filtered that way; a frozen head param
+    that appeared in ``head_params`` but not in ``all_params`` is
+    dropped from the head group rather than smuggled into the
+    optimizer.
+    """
+    head_ids = {id(p) for p in head_params if p.requires_grad}
+    if not head_ids:
+        raise RuntimeError(
+            "gan_of_head_lr > 0 but no trainable discriminator-head "
+            "parameter was found on fake_score. The head would silently "
+            "keep running at fake_lr — the exact bf16-ulp starvation "
+            "this flag exists to remove."
+        )
+    head_group: List[torch.nn.Parameter] = []
+    backbone_group: List[torch.nn.Parameter] = []
+    for p in all_params:
+        (head_group if id(p) in head_ids else backbone_group).append(p)
+    seen_head = {id(p) for p in head_group}
+    if len(seen_head) != len(head_group):
+        raise RuntimeError(
+            "gan_of_head_lr: the head param group contains a duplicate "
+            "parameter; it would be stepped twice per iteration."
+        )
+    if seen_head != head_ids:
+        missing = len(head_ids - seen_head)
+        raise RuntimeError(
+            f"gan_of_head_lr: {missing} of {len(head_ids)} disc-head "
+            "parameters are absent from the fake optimizer's parameter "
+            "list. adding_cls_branch must run with attach_to_model=True "
+            "BEFORE _build_optimizer, or the head is never stepped at "
+            "all."
+        )
+    if not backbone_group:
+        raise RuntimeError(
+            "gan_of_head_lr: the backbone param group is EMPTY — every "
+            "fake_score parameter matched the disc head. That cannot be "
+            "right, and it would move the DMD critic's own recipe onto "
+            "the head LR."
+        )
+    if len(head_group) + len(backbone_group) != len(all_params):
+        raise RuntimeError(
+            "gan_of_head_lr: the split lost or duplicated parameters "
+            f"({len(head_group)} + {len(backbone_group)} != "
+            f"{len(all_params)})."
+        )
+    # Backbone FIRST so ``param_groups[0]`` keeps meaning "the fake_lr
+    # group" for any reader that predates this split.
+    return [
+        {"params": backbone_group, "lr": float(fake_lr)},
+        {"params": head_group, "lr": float(head_lr)},
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -542,6 +725,57 @@ def duplicate_conditional_dict(cond: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in cond.items():
         if torch.is_tensor(v):
             out[k] = torch.cat([v, v], dim=0)
+        else:
+            out[k] = v
+    return out
+
+
+def disc_micro_batch_bounds(n_rows: int, groups: int) -> List[Tuple[int, int]]:
+    """Contiguous ``[lo, hi)`` row bounds for the micro-batched disc forward.
+
+    RANK UNIFORMITY -- the property this whole helper exists to make
+    checkable. The returned list is a pure function of ``(n_rows,
+    groups)``. ``groups`` comes from ``gan_of_disc_micro_batch_groups``,
+    a config value identical on every rank; ``n_rows`` is ``2 * B`` where
+    ``B`` is the per-rank band batch, which is ``1`` in every shipped
+    phase-3 geometry and in any case is fixed by config, not by data. No
+    per-rank quantity (ride length, ``gradient_mask.any()``, a
+    ``.item()``-ed loss) is read here or by any caller. The NUMBER of
+    disc forwards issued before the single ``critic_loss.backward()``
+    is therefore identical on every rank, which is what keeps the
+    DDP-wrapped ``fake_score`` reducer in lockstep. A group count that
+    varied per rank would be a multi-node hang, not a slowdown.
+
+    ``groups`` is clamped to ``[1, n_rows]`` -- asking for more groups
+    than rows yields one row per group rather than empty groups, so the
+    returned list never contains an empty span and the caller never
+    issues a zero-row forward.
+    """
+    if n_rows <= 0:
+        raise ValueError(f"disc_micro_batch_bounds: n_rows must be >0, got {n_rows}")
+    g = max(1, min(int(groups), int(n_rows)))
+    bounds = [((i * n_rows) // g, ((i + 1) * n_rows) // g) for i in range(g)]
+    assert bounds[0][0] == 0 and bounds[-1][1] == n_rows
+    assert all(hi > lo for lo, hi in bounds)
+    return bounds
+
+
+def slice_conditional_dict_rows(
+    cond: Dict[str, Any], lo: int, hi: int, n_rows: int,
+) -> Dict[str, Any]:
+    """Row-slice the batch-dim tensors of an already-duplicated cond dict.
+
+    Only tensors whose dim 0 equals ``n_rows`` are sliced; everything
+    else (scalars, per-frame streams that were never duplicated, plain
+    Python values) passes through untouched. That mirrors
+    ``duplicate_conditional_dict``, which likewise only touches dim-0
+    tensors, so ``slice(duplicate(x))`` reconstructs exactly the rows the
+    single-batch path would have fed the disc for those same indices.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in cond.items():
+        if torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == n_rows:
+            out[k] = v[lo:hi]
         else:
             out[k] = v
     return out

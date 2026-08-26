@@ -576,6 +576,24 @@ class RollingStaircaseDMDTrainer:
         self.action_dims: Optional[List[int]] = list(action_dims) if action_dims is not None else None
         self.max_ride_frames = getattr(cfg, "max_ride_frames", None)
 
+    def _fake_optimizer_params(self) -> List[torch.nn.Parameter]:
+        """Every parameter ``fake_optimizer`` owns, across ALL param groups.
+
+        Was ``fake_optimizer.param_groups[0]["params"]`` at four clip
+        sites. That is correct only while the optimizer has exactly one
+        group; ``gan_of_head_lr`` adds a second (the One-Forcing disc
+        head), and reading group 0 alone would leave the head's gradients
+        UNCLIPPED — silently, because the clip returns a norm over the
+        params it was handed and nothing compares that against the
+        optimizer's contents. With one group this returns exactly
+        ``param_groups[0]["params"]``, in the same order, so the
+        single-group path is byte-identical.
+        """
+        opt = getattr(self, "fake_optimizer", None)
+        if opt is None:
+            return []
+        return [p for g in opt.param_groups for p in g["params"]]
+
     def _build_optimizer(self) -> None:
         cfg = self.config
         lr = float(getattr(cfg, "lr", 1e-5))
@@ -752,13 +770,68 @@ class RollingStaircaseDMDTrainer:
                     "trainable parameters. Did DMD2B2BLAM_Staircase.__init__ "
                     "accidentally freeze them?"
                 )
-            self.fake_optimizer = _AdamW(
-                fake_params,
-                lr=fake_lr,
-                betas=fake_betas,
-                eps=fake_eps,
-                weight_decay=fake_wd,
-            )
+            # ---- One-Forcing disc-head LR split (``gan_of_head_lr``) ----
+            # MEASURED DEFECT, 2026-08-25. The OF discriminator head lives
+            # on ``fake_score.model`` and therefore inherits ``fake_lr``
+            # (4e-7). With ``fake_betas`` beta1=0.0 an AdamW step is ~lr in
+            # magnitude, while the bf16 ulp at the head's final-Linear
+            # weight scale is 3.05e-5 — 76x LARGER. Round-to-nearest
+            # discards the update: only 0.5% of head params ever moved and
+            # ``of_logit_gap`` sat pinned at 0 for the whole run. Giving
+            # the head its own param group at ``gan_of_head_lr`` fixes the
+            # step size while leaving every other fake_score parameter on
+            # ``fake_lr``, so the DMD critic's recipe is untouched — a
+            # single-variable change, not a critic LR bump.
+            #
+            # Default 0.0 takes the verbatim historical single-group call
+            # below, byte-identical (same class, same one group, same
+            # order, same RNG). Works with AdamW8bit as well as torch
+            # AdamW: both accept the standard param-group dict list.
+            _of_head_lr = 0.0
+            if bool(getattr(cfg, "gan_of_enabled", False)):
+                _of_head_lr = float(getattr(cfg, "gan_of_head_lr", 0.0) or 0.0)
+            if _of_head_lr > 0.0:
+                from model.one_forcing_gan import split_of_head_param_groups
+                _fs_inner = self.model.fake_score._unwrapped_model()
+                _of_head_params = [
+                    p
+                    for _mn in ("_cls_pred_branch", "_register_tokens",
+                                "_gan_ca_blocks")
+                    for p in getattr(
+                        _fs_inner, _mn, torch.nn.Module(),
+                    ).parameters()
+                ]
+                _of_groups = split_of_head_param_groups(
+                    fake_params, _of_head_params,
+                    fake_lr=fake_lr, head_lr=_of_head_lr,
+                )
+                self.fake_optimizer = _AdamW(
+                    _of_groups,
+                    lr=fake_lr,
+                    betas=fake_betas,
+                    eps=fake_eps,
+                    weight_decay=fake_wd,
+                )
+                if self.is_main_process:
+                    logging.info(
+                        "[OneForcing] fake_optimizer split into 2 param "
+                        "groups: backbone n=%d lr=%g | disc head n=%d "
+                        "lr=%g (dtype=%s). RESOLVED off the live "
+                        "optimizer, not the config.",
+                        len(self.fake_optimizer.param_groups[0]["params"]),
+                        float(self.fake_optimizer.param_groups[0]["lr"]),
+                        len(self.fake_optimizer.param_groups[1]["params"]),
+                        float(self.fake_optimizer.param_groups[1]["lr"]),
+                        self.fake_optimizer.param_groups[1]["params"][0].dtype,
+                    )
+            else:
+                self.fake_optimizer = _AdamW(
+                    fake_params,
+                    lr=fake_lr,
+                    betas=fake_betas,
+                    eps=fake_eps,
+                    weight_decay=fake_wd,
+                )
             self.fake_max_grad_norm = float(
                 getattr(cfg, "fake_max_grad_norm", self.max_grad_norm)
             )
@@ -2526,7 +2599,7 @@ class RollingStaircaseDMDTrainer:
         if self.fake_optimizer is not None:
             fake_params_with_grad = [
                 p
-                for p in self.fake_optimizer.param_groups[0]["params"]
+                for p in self._fake_optimizer_params()
                 if p.grad is not None
             ]
             if fake_params_with_grad:
@@ -2724,7 +2797,7 @@ class RollingStaircaseDMDTrainer:
         if self.fake_optimizer is not None:
             fake_params_with_grad = [
                 p
-                for p in self.fake_optimizer.param_groups[0]["params"]
+                for p in self._fake_optimizer_params()
                 if p.grad is not None
             ]
             if fake_params_with_grad:

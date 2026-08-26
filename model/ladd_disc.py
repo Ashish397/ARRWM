@@ -24,10 +24,26 @@ References (cloned in ``references/``):
         (chunk_i = real-anchor, chunk_{i+1} = fake / push-target).
 
 Overall flow per gen-step iter:
-    1. Build adjacent-chunk pairs from the gen-side rollout output
-       (``pred_image`` or ``flash_dmd_gan_x0``).
-    2. Re-noise each chunk member at ``flash_dmd_gan_t`` (when
-       flash-DMD is enabled) or at the DMD step's ``t`` (otherwise).
+    1. Build adjacent-chunk pairs from the gen-side rollout output.
+       WHICH tensor that is, is selected by ``ladd_fake_sample_source``
+       (docs/ONE_FORCING_PORT.md divergence 3):
+         "flash" (default) -> ``flash_dmd_gan_x0``, the x0 of a
+             dedicated extra generator forward at ``flash_dmd_gan_t``;
+             falls back to ``pred_image`` (the rolled chunk) when
+             flash-DMD is off. A DIFFERENT sub-graph from the one DMD
+             scores.
+         "dmd" -> ``score_image[:, band]``, i.e. literally the tensor
+             ``compute_distribution_matching_loss`` was handed,
+             restricted to the frames its ``gradient_mask`` is True on,
+             so the adversarial and distillation gradients travel ONE
+             sub-graph into the generator. Published by
+             ``ActionForcingDMD._publish_ladd_dmd_band``.
+    2. Re-noise each chunk member at the FAKE SAMPLE'S OWN generation
+       timestep -- ``flash_dmd_gan_t`` on the flash path, the band's
+       exit rung (``denoised_timestep_from``) on the dmd path -- or at
+       t=0 when neither is defined. ``ladd_disc_force_clean`` /
+       wavelet-HF / ``ladd_disc_sample_t`` override it; the value
+       actually used is logged as ``train/ladd_disc_t``.
     3. ``WanFeatureProjector`` runs a single ``no_grad``-on-teacher
        forward through ``real_score``, capturing intermediate features
        at configurable block indices. The input tensor carries
@@ -59,11 +75,13 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint  # noqa: F401  (explicit: not implied by `import torch`)
 from torch.nn.utils import spectral_norm
 
 
@@ -182,16 +200,26 @@ class WanFeatureProjector:
                 "``blocks``/``transformer_blocks`` ModuleList "
                 f"(type={type(self.backbone).__name__})."
             )
-        for candidate in [self.real_score] + list(
-            self.real_score.modules()
-        ):
+        # ladd_feature_source="fake" (One-Forcing style): the model
+        # installs a backbone-override handle on real_score; when
+        # present, the hooks must be installed on the OVERRIDE's
+        # transformer blocks (the trainable fake score), not the frozen
+        # teacher's. See _LaddFakeFeatureBackbone in
+        # model/dmd_action_forcing.py.
+        _override = getattr(
+            self.real_score, "_ladd_feature_backbone_override", None
+        )
+        _root = (
+            _override.module() if _override is not None else self.real_score
+        )
+        for candidate in [_root] + list(_root.modules()):
             for attr in ("transformer_blocks", "blocks"):
                 b = getattr(candidate, attr, None)
                 if isinstance(b, nn.ModuleList) and len(b) >= 10:
                     return b
         raise AttributeError(
             "WanFeatureProjector: could not find a transformer-block "
-            f"ModuleList anywhere under {type(self.real_score).__name__}. "
+            f"ModuleList anywhere under {type(_root).__name__}. "
             "Expected attribute ``transformer_blocks`` or ``blocks`` on "
             "some submodule with >=10 entries."
         )
@@ -295,8 +323,30 @@ class WanFeatureProjector:
         # the teacher's parameter dtype and cast all float tensors
         # going into the teacher to match. Hook outputs come back in
         # bf16, and CCM's first Linear casts them to fp32 again.
+        # ladd_feature_source="fake" (One-Forcing style): backbone
+        # override handle installed on real_score by ActionForcingDMD.
+        # When present, the feature forward runs through the TRAINABLE
+        # fake score (with the override's own freeze/DDP-bypass guard)
+        # instead of the frozen teacher. Mutually exclusive with the
+        # WP-14B raw ``backbone`` — both replace the feature backbone.
+        feature_override = getattr(
+            self.real_score, "_ladd_feature_backbone_override", None
+        )
+        if feature_override is not None and self.backbone is not None:
+            raise ValueError(
+                "WanFeatureProjector: both a raw disc backbone "
+                "(ladd_disc_backbone_model_name) and a "
+                "_ladd_feature_backbone_override (ladd_feature_source="
+                "'fake') are set. They are mutually exclusive."
+            )
         teacher_module = (
-            self.backbone if self.backbone is not None else self.real_score
+            self.backbone
+            if self.backbone is not None
+            else (
+                feature_override.module()
+                if feature_override is not None
+                else self.real_score
+            )
         )
         teacher_dtype = next(teacher_module.parameters()).dtype
 
@@ -463,7 +513,20 @@ class WanFeatureProjector:
             else:
                 kwargs_local = dict(kwargs)
                 kwargs_local["noisy_image_or_video"] = x
-                _ = self.real_score(**kwargs_local)
+                if feature_override is not None:
+                    # One-Forcing-style fake-score backbone. The
+                    # override freezes every fake-score param (restores
+                    # the recorded prior flags after) and bypasses the
+                    # DDP wrap for THIS forward only. It MUST execute
+                    # here, inside the checkpointed ``_run_teacher``
+                    # body: the use_reentrant=False replay during the
+                    # GAN backward re-runs the freeze, so the
+                    # recomputed graph also carries no edges into the
+                    # fake-score params. Same call signature as the
+                    # real_score branch — only the backbone swaps.
+                    _ = feature_override.forward(**kwargs_local)
+                else:
+                    _ = self.real_score(**kwargs_local)
             return tuple(local_feats[i] for i in block_indices_sorted)
 
         try:
@@ -820,6 +883,314 @@ class LADDStatHead(nn.Module):
 
 
 # ============================================================================
+# Register-token cross-attention readout (One-Forcing divergence 2)
+# ============================================================================
+
+
+def _gan_cross_attention_sdpa(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+) -> torch.Tensor:
+    """SDPA stand-in for ``wan.modules.attention.flash_attention``.
+
+    Same contract: ``[B, L, N, C]`` in and out. This is exactly the
+    fallback branch of ``wan.modules.attention.attention`` minus its
+    unconditional bf16 cast.
+
+    Why it exists rather than calling ``flash_attention`` directly:
+    ``flash_attention`` asserts ``q.device.type == 'cuda'`` and asserts a
+    half dtype, and the LADD discriminator is built **fp32** (for R1
+    stability — see ``trainer/causal_action_forcing_train.py``'s
+    ``disc.to(dtype=torch.float32)``) and is unit-tested on CPU. The
+    register query is a SINGLE token, so this is a [1 x L] attention row
+    per head — the flash kernel buys nothing here anyway.
+    """
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+    )
+    return out.transpose(1, 2).contiguous()
+
+
+class LADDRegisterReadout(nn.Module):
+    """One-Forcing's learned register-token cross-attention pooling.
+
+    ``docs/ONE_FORCING_PORT.md`` divergence 2: ours mean-pools/convolves
+    projected tap features (CCM -> CSM -> SpectralConv heads); theirs
+    pools each tap with a LEARNED register token that cross-attends over
+    that tap's whole token sequence, concatenates the pooled tokens and
+    runs one MLP to a scalar.
+
+    This class is a thin re-host of the machinery that already ships in
+    this tree for the ``classify_mode`` path — ``RegisterTokens`` and
+    ``GanAttentionBlock`` from ``wan/modules/model.py`` and the head
+    builder factored out of ``WanDiffusionWrapper.adding_cls_branch`` —
+    executed on the features the ``WanFeatureProjector`` already
+    captured, in the same order as ``wan/modules/model.py``'s
+    ``classify_mode`` block (tap i <-> register token i, IN ORDER; concat
+    on the token axis; flatten; MLP).
+
+    WHY re-host instead of calling ``classify_mode``: parameter
+    ownership. ``adding_cls_branch`` attaches its modules to a
+    ``WanDiffusionWrapper`` or to that wrapper's ``WanModel``. The LADD
+    disc taps ``real_score`` (frozen, and NOT in any optimizer) or —
+    under ``ladd_feature_source="fake"`` — the ``fake_score`` backbone,
+    whose parameters belong to ``fake_optimizer``. Attaching a
+    discriminator head to either would either never be stepped or be
+    stepped by the WRONG optimizer. As a submodule of
+    ``LADDDiscriminator`` the head lands in ``disc.parameters()``, which
+    is exactly what ``r3gan_optimizer`` is built from and what
+    ``r3gan_disc_ddp`` wraps.
+
+    Output: ``[B, num_class]`` — ONE logit per row at the default
+    ``num_class=1``. That is the same shape ``ladd_scalar_output=True``
+    produces, so the RpGAN/relativistic reductions and the R1
+    finite-difference estimator (which sums over the logit axis) are
+    unchanged in meaning: with a single column, sum == mean.
+    """
+
+    def __init__(
+        self,
+        block_indices: List[int],
+        dim_teacher: int,
+        blocks_per_token: int = 2,
+        block_ffn_dim: int = 8192,
+        block_num_heads: int = 12,
+        head_hidden_dim: int = 3072,
+        head_num_layers: int = 4,
+        head_dropout: float = 0.2,
+        num_class: int = 1,
+        use_checkpoint: Optional[bool] = None,
+    ):
+        super().__init__()
+        # Lazy imports: ``model/ladd_disc.py`` is imported by lightweight
+        # CPU tests, and ``utils.wan_wrapper`` drags in T5/VAE.
+        from wan.modules.model import RegisterTokens, GanAttentionBlock
+        from utils.wan_wrapper import build_cls_pred_branch
+
+        self.block_indices = sorted(set(int(i) for i in block_indices))
+        if not self.block_indices:
+            raise ValueError(
+                "LADDRegisterReadout: block_indices is empty; the register "
+                "head needs at least one tap."
+            )
+        self.dim_teacher = int(dim_teacher)
+        self.blocks_per_token = max(1, int(blocks_per_token))
+        self.block_ffn_dim = int(block_ffn_dim)
+        self.block_num_heads = int(block_num_heads)
+        self.head_hidden_dim = int(head_hidden_dim)
+        self.head_num_layers = int(head_num_layers)
+        self.head_dropout = float(head_dropout)
+        self.num_class = int(num_class)
+        # ------------------------------------------------------------------
+        # ladd_register_checkpoint — activation-checkpoint the per-tap
+        # GanAttentionBlock stacks (torch.utils.checkpoint,
+        # use_reentrant=False). WHY: each block cross-attends a single
+        # register token over the FULL real-token sequence, and this runs
+        # OUTSIDE the projector's checkpointed ``_run_teacher`` body, so
+        # every big [B, L_real, dim] intermediate (fp32 tap cast, norm3
+        # out, k(x), RMSNorm product, kk, vv — ~6 x B*L*dim*4 bytes per
+        # tap per block) is RETAINED until the consumer loss's backward.
+        # At the 6-frame-pair smoke geometry (L_real=9360, dim=1536, 5
+        # taps, ~9-12 rows per disc micro-group) that is ~1.6 GiB/row =
+        # ~15-19 GiB per D-update micro-group — the marginal straw that
+        # OOM'd carntx6all-on at 92.66 GiB. Checkpointing keeps only the
+        # inputs (the bf16 tap features, which are alive anyway as
+        # projector outputs, + the tiny register token) and recomputes
+        # the blocks at backward time (~1 extra readout forward per
+        # group — negligible next to the 1.3B backbone's own inner-ckpt
+        # recompute).
+        #
+        # SAFETY (record/replay invariant — see
+        # model/dmd_action_forcing.py:_LaddFakeFeatureBackbone): the
+        # checkpoint only ARMS when this module's own params require
+        # grad AND grad mode is on (see ``forward``). That is exactly
+        # the D-update window, where the disc's flags are pinned across
+        # each group's forward+backward. The gen-side guidance forward
+        # and the aux-teacher disc forward both run under
+        # ``disc.requires_grad_(False)`` with a ``finally`` that
+        # restores True BEFORE their backward — a flag flip across
+        # record/replay that would change the recompute's saved-tensor
+        # list and raise CheckpointError; the params-require-grad guard
+        # makes those paths take the plain (verbatim) branch instead.
+        # The blocks are RNG-free (no dropout — ``head_dropout`` lives
+        # in ``cls_pred_branch``, OUTSIDE the checkpointed region) and
+        # state-free (no spectral_norm / BN), so the backward-time
+        # replay is bit-identical to the recorded forward and cannot
+        # double-mutate module state.
+        #
+        # Default TRUE (strictly memory-better, gradient-identical —
+        # proven bit-equal outputs/input-grads/param-grads on CPU).
+        # Override per-run without trainer plumbing via env
+        # LADD_REGISTER_CHECKPOINT=0/1; the constructor arg (when not
+        # None) wins over the env var.
+        if use_checkpoint is None:
+            _env = os.environ.get("LADD_REGISTER_CHECKPOINT")
+            if _env is None:
+                use_checkpoint = True
+            else:
+                use_checkpoint = _env.strip().lower() not in (
+                    "0", "false", "no", "off", "")
+        self.use_checkpoint = bool(use_checkpoint)
+        n_reg = len(self.block_indices)
+
+        self.register_tokens = RegisterTokens(
+            num_registers=n_reg, dim=self.dim_teacher,
+        )
+        self.gan_ca_blocks = nn.ModuleList([
+            nn.ModuleList([
+                GanAttentionBlock(
+                    dim=self.dim_teacher,
+                    ffn_dim=self.block_ffn_dim,
+                    num_heads=self.block_num_heads,
+                )
+                for _ in range(self.blocks_per_token)
+            ])
+            for _ in range(n_reg)
+        ])
+        self.cls_pred_branch = build_cls_pred_branch(
+            input_dim=n_reg * self.dim_teacher,
+            hidden_dim=self.head_hidden_dim,
+            num_class=self.num_class,
+            num_layers=self.head_num_layers,
+            dropout=self.head_dropout,
+        )
+        # fp32/CPU-capable attention kernel for THESE blocks only (see
+        # ``_gan_cross_attention_sdpa``). Per-instance attribute: the
+        # ``classify_mode`` blocks built by ``adding_cls_branch`` never
+        # see it and keep calling ``flash_attention``.
+        for _stack in self.gan_ca_blocks:
+            for _blk in _stack:
+                _blk.cross_attn._attn_impl = _gan_cross_attention_sdpa
+
+    # ------------------------------------------------------------------
+    @property
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def describe(self) -> str:
+        return (
+            "taps=%s dim=%d blocks_per_token=%d ffn=%d heads=%d "
+            "head_hidden=%d head_layers=%d dropout=%.3g params=%.2fM "
+            "ckpt=%s" % (
+                self.block_indices, self.dim_teacher, self.blocks_per_token,
+                self.block_ffn_dim, self.block_num_heads,
+                self.head_hidden_dim, self.head_num_layers, self.head_dropout,
+                self.num_params / 1e6, self.use_checkpoint,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    def _tap_forward(
+        self, tap_pos: int, feat: torch.Tensor, token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-tap pipeline: dtype cast + the tap's GanAttentionBlock
+        stack. Exactly the op sequence the pre-checkpoint inline loop
+        ran, factored out so ``forward`` can route it either directly
+        (verbatim behaviour) or through ``torch.utils.checkpoint``.
+
+        The cast lives INSIDE this function on purpose: under
+        checkpointing only the function INPUTS are saved, so the fp32
+        copy of the (bf16) tap features is recomputed at backward time
+        instead of being retained — that copy alone is B*L_real*dim*4
+        bytes per tap. RNG-free and state-free (see the
+        ``use_checkpoint`` note in ``__init__``), so record and replay
+        are bit-identical.
+        """
+        if feat.dtype != token.dtype:
+            # Tap features arrive in the backbone's dtype (bf16); the head
+            # is fp32. Same boundary the ``classify_mode`` loop casts at
+            # (``wan/modules/model.py`` ``_tap_x``) — a real cast node, so
+            # the G-side gradient converts back at exactly this edge.
+            feat = feat.to(token.dtype)
+        for blk in self.gan_ca_blocks[tap_pos]:
+            token = blk(feat, token)
+        return token
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        features: Dict[int, torch.Tensor],
+        real_tokens: Optional[int] = None,
+    ) -> torch.Tensor:
+        """``{block_idx: [B, L, dim_teacher]}`` -> ``[B, num_class]``.
+
+        ``real_tokens`` trims the WAN wrapper's zero padding (the disc
+        forward runs at the wrapper's fixed ``seq_len``, so most of ``L``
+        is padding for a 3- or 9-frame chunk). The LADD readout strips
+        the same region at ``LADDDiscriminator.forward``; letting the
+        register token attend over tens of thousands of zero rows would
+        both cost real time and hand the disc a chunk-length cue.
+        Action tokens are KEPT — unlike the 2D SpectralConv heads, this
+        readout has no patch-grid to fold them into.
+        """
+        missing = [i for i in self.block_indices if i not in features]
+        if missing:
+            raise RuntimeError(
+                "LADDRegisterReadout: no features for block indices "
+                f"{missing}; the projector's taps and the head's taps must "
+                "be the same list."
+            )
+        toks = self.register_tokens()  # [n_reg, dim] (RMS-normed)
+        # Arm the per-tap activation checkpoint ONLY inside a window
+        # where this module's params take gradient (the D-update): there
+        # the flags are pinned across forward+backward, so the
+        # backward-time replay records the SAME saved-tensor list. The
+        # frozen-disc consumers (gen-side guidance, aux-teacher disc)
+        # flip ``requires_grad`` back to True in a ``finally`` BEFORE
+        # their backward runs — checkpointing across that flip would
+        # raise CheckpointError — so they take the verbatim direct path
+        # (byte-identical to the pre-flag code). Evaluated ONCE per
+        # forward so record and (potential) replay cannot disagree.
+        _use_ckpt = (
+            self.use_checkpoint
+            and torch.is_grad_enabled()
+            and any(p.requires_grad for p in self.parameters())
+        )
+        pooled = []
+        B = None
+        for i, idx in enumerate(self.block_indices):
+            feat = features[idx]
+            if feat.dim() != 3:
+                raise ValueError(
+                    "LADDRegisterReadout: expected tap features "
+                    f"[B, L, dim]; got {tuple(feat.shape)} at block {idx}."
+                )
+            if int(feat.shape[2]) != self.dim_teacher:
+                raise ValueError(
+                    "LADDRegisterReadout: tap feature dim "
+                    f"{int(feat.shape[2])} != dim_teacher "
+                    f"{self.dim_teacher} at block {idx}."
+                )
+            B = int(feat.shape[0])
+            if real_tokens is not None:
+                rt = int(real_tokens)
+                if feat.shape[1] < rt:
+                    raise RuntimeError(
+                        "LADDRegisterReadout: captured feature length "
+                        f"{int(feat.shape[1])} < expected real_tokens {rt} "
+                        f"at block {idx}."
+                    )
+                feat = feat[:, :rt]
+            token = toks[i].reshape(1, 1, -1).expand(B, 1, -1)
+            if _use_ckpt:
+                # Non-reentrant: DDP-safe (find_unused_parameters=False)
+                # and composes with the projector's outer checkpoint by
+                # being SEQUENTIAL to it, never nested — the readout
+                # consumes the projector's outputs after its checkpoint
+                # scope has closed. preserve_rng_state=False is sound
+                # because ``_tap_forward`` draws no RNG (no dropout in
+                # the GanAttentionBlock stack).
+                token = torch.utils.checkpoint.checkpoint(
+                    self._tap_forward, i, feat, token,
+                    use_reentrant=False, preserve_rng_state=False,
+                )
+            else:
+                token = self._tap_forward(i, feat, token)
+            pooled.append(token)
+        final = torch.cat(pooled, dim=1)          # [B, n_reg, dim]
+        return self.cls_pred_branch(final.reshape(B, -1))
+
+
+# ============================================================================
 # Full LADD discriminator
 # ============================================================================
 
@@ -878,6 +1249,21 @@ class LADDDiscriminator(nn.Module):
         stat_head_pool_size: spatial pool target P. Default 4 → 16
             elements per spatial-map reduction.
         stat_head_hidden_dim: stat MLP hidden width. Default 256.
+        readout: ``"ladd"`` (default, byte-identical to before) or
+            ``"register"`` — One-Forcing's learned register-token
+            cross-attention pooling per tap
+            (docs/ONE_FORCING_PORT.md divergence 2). ``"register"``
+            REPLACES CCM/CSM/heads/cmapper (they are not built) and
+            emits ``[B, 1]``, i.e. the same shape
+            ``scalar_output=True`` produces.
+        register_blocks_per_token / register_block_ffn_dim /
+        register_block_num_heads / register_head_hidden_dim /
+        register_head_num_layers / register_head_dropout: geometry of
+            the register head. Defaults reproduce the shape
+            ``adding_cls_branch`` builds today (2 blocks/token, ffn
+            8192, 12 heads, hidden 3072, 4-layer residual MLP, dropout
+            0.2). One-Forcing's *framewise* config is
+            ``1 / 2048 / 12 / 1536 / 1 / 0.0``; set the knobs to get it.
     """
 
     def __init__(
@@ -905,6 +1291,14 @@ class LADDDiscriminator(nn.Module):
         stat_head_hidden_dim: int = 256,
         scalar_output: bool = False,
         freeze_projector_mixing: bool = False,
+        readout: str = "ladd",
+        register_blocks_per_token: int = 2,
+        register_block_ffn_dim: int = 8192,
+        register_block_num_heads: int = 12,
+        register_head_hidden_dim: int = 3072,
+        register_head_num_layers: int = 4,
+        register_head_dropout: float = 0.2,
+        register_checkpoint: Optional[bool] = None,
     ):
         super().__init__()
         self.projector = projector  # stored as plain attribute, not nn submodule
@@ -934,39 +1328,94 @@ class LADDDiscriminator(nn.Module):
         else:
             self.wavelet_hf = None
 
-        self.ccm = LADDChannelMixer(
-            block_indices=self.block_indices,
-            dim_teacher=self.dim_teacher,
-            dim_proj=self.dim_proj,
-        )
-        if self.use_csm:
-            self.csm = LADDFeatureFusion(
+        # ------------------------------------------------------------------
+        # Readout (docs/ONE_FORCING_PORT.md divergence 2).
+        #   "ladd"     (default) — CCM -> optional CSM -> per-tap
+        #              SpectralConv heads. Byte-identical to before: the
+        #              block below is the verbatim historical code.
+        #   "register" — One-Forcing's learned register-token cross-attn
+        #              pooling per tap (``LADDRegisterReadout``). It
+        #              REPLACES CCM/CSM/heads/cmapper rather than sitting
+        #              beside them; building them and not using them would
+        #              leave them ungradiented and the disc's
+        #              ``find_unused_parameters=False`` DDP reducer would
+        #              raise "Expected to have finished reduction".
+        # ------------------------------------------------------------------
+        self.readout = str(readout)
+        if self.readout not in ("ladd", "register"):
+            raise ValueError(
+                "LADDDiscriminator: ladd_readout must be 'ladd' or "
+                f"'register'; got {self.readout!r}."
+            )
+        self.register_readout: Optional[LADDRegisterReadout] = None
+        if self.readout == "register":
+            if self.cmap_dim > 0:
+                raise ValueError(
+                    "LADDDiscriminator: ladd_readout='register' does not "
+                    "consume the prompt cmap (the register head has no "
+                    f"per-scale cls conv to modulate); got cmap_dim="
+                    f"{self.cmap_dim}. Pass ladd_cmap_dim=0 / "
+                    "ladd_use_prompt_cond=false rather than have the "
+                    "cmapper built and silently never gradiented."
+                )
+            if self.freeze_projector_mixing:
+                raise ValueError(
+                    "LADDDiscriminator: ladd_freeze_projector_mixing=true "
+                    "with ladd_readout='register' is inert — there is no "
+                    "CCM/CSM to freeze. Refused rather than ignored."
+                )
+            self.ccm = None
+            self.csm = None
+            self.heads = None
+            self.cmapper = None
+            self.register_readout = LADDRegisterReadout(
                 block_indices=self.block_indices,
-                dim_proj=self.dim_proj,
-                use_lateral_proj=bool(use_lateral_proj),
+                dim_teacher=self.dim_teacher,
+                blocks_per_token=int(register_blocks_per_token),
+                block_ffn_dim=int(register_block_ffn_dim),
+                block_num_heads=int(register_block_num_heads),
+                head_hidden_dim=int(register_head_hidden_dim),
+                head_num_layers=int(register_head_num_layers),
+                head_dropout=float(register_head_dropout),
+                num_class=1,
+                # None -> LADDRegisterReadout resolves it (env
+                # LADD_REGISTER_CHECKPOINT, else default True).
+                use_checkpoint=register_checkpoint,
             )
         else:
-            self.csm = None
-        if self.freeze_projector_mixing:
-            self.ccm.requires_grad_(False)
-            if self.csm is not None:
-                self.csm.requires_grad_(False)
-        self.heads = nn.ModuleDict(
-            {str(i): LADDDiscHead(
+            self.ccm = LADDChannelMixer(
+                block_indices=self.block_indices,
+                dim_teacher=self.dim_teacher,
                 dim_proj=self.dim_proj,
-                kernel_size=head_kernel_size,
-                cmap_dim=self.cmap_dim,
-            ) for i in self.block_indices}
-        )
-        if self.cmap_dim > 0:
-            if prompt_embed_dim <= 0:
-                raise ValueError(
-                    "LADDDiscriminator: prompt_embed_dim must be >0 when "
-                    "cmap_dim>0."
+            )
+            if self.use_csm:
+                self.csm = LADDFeatureFusion(
+                    block_indices=self.block_indices,
+                    dim_proj=self.dim_proj,
+                    use_lateral_proj=bool(use_lateral_proj),
                 )
-            self.cmapper = nn.Linear(prompt_embed_dim, self.cmap_dim)
-        else:
-            self.cmapper = None
+            else:
+                self.csm = None
+            if self.freeze_projector_mixing:
+                self.ccm.requires_grad_(False)
+                if self.csm is not None:
+                    self.csm.requires_grad_(False)
+            self.heads = nn.ModuleDict(
+                {str(i): LADDDiscHead(
+                    dim_proj=self.dim_proj,
+                    kernel_size=head_kernel_size,
+                    cmap_dim=self.cmap_dim,
+                ) for i in self.block_indices}
+            )
+            if self.cmap_dim > 0:
+                if prompt_embed_dim <= 0:
+                    raise ValueError(
+                        "LADDDiscriminator: prompt_embed_dim must be >0 when "
+                        "cmap_dim>0."
+                    )
+                self.cmapper = nn.Linear(prompt_embed_dim, self.cmap_dim)
+            else:
+                self.cmapper = None
 
         # Parallel stat head — distribution-match std statistics
         # adversarially. Operates on the RAW input latent, NOT on the
@@ -1066,6 +1515,27 @@ class LADDDiscriminator(nn.Module):
                 f"block indices {missing}. Hook setup is broken — verify "
                 f"that real_score's transformer_blocks indices are valid."
             )
+        if self.register_readout is not None:
+            # One-Forcing readout: register-token cross-attn pooling per
+            # tap -> one scalar logit per row. No CCM/CSM/heads exist in
+            # this mode, so the 2D patch-grid reshape below is skipped
+            # entirely; the only geometry the readout needs is the real
+            # (non-padding) token count, computed with the SAME arithmetic
+            # the LADD branch uses.
+            B, F_in, _C_in, H_in, W_in = x_noisy.shape
+            pt, ph, pw = self.patch_size
+            _real_tokens = (F_in // pt) * (
+                (H_in // ph) * (W_in // pw) + int(self.action_tokens_per_frame)
+            )
+            visual_logits = self.register_readout(
+                feats, real_tokens=_real_tokens,
+            )
+            if self.stat_head is not None:
+                visual_logits = torch.cat(
+                    [visual_logits, self.stat_head(x_noisy_raw)], dim=1,
+                )
+            return visual_logits
+
         proj = self.ccm(feats)
         if self.csm is not None:
             proj = self.csm(proj)
@@ -1350,6 +1820,14 @@ def build_ladd_disc(
     scalar_output: bool = False,
     freeze_projector_mixing: bool = False,
     backbone: Optional[nn.Module] = None,
+    readout: str = "ladd",
+    register_blocks_per_token: int = 2,
+    register_block_ffn_dim: int = 8192,
+    register_block_num_heads: int = 12,
+    register_head_hidden_dim: int = 3072,
+    register_head_num_layers: int = 4,
+    register_head_dropout: float = 0.2,
+    register_checkpoint: Optional[bool] = None,
 ) -> LADDDiscriminator:
     """Build a LADD discriminator wired to the existing teacher.
 
@@ -1454,6 +1932,14 @@ def build_ladd_disc(
         stat_head_hidden_dim=stat_head_hidden_dim,
         scalar_output=scalar_output,
         freeze_projector_mixing=freeze_projector_mixing,
+        readout=readout,
+        register_blocks_per_token=register_blocks_per_token,
+        register_block_ffn_dim=register_block_ffn_dim,
+        register_block_num_heads=register_block_num_heads,
+        register_head_hidden_dim=register_head_hidden_dim,
+        register_head_num_layers=register_head_num_layers,
+        register_head_dropout=register_head_dropout,
+        register_checkpoint=register_checkpoint,
     )
     return disc
 

@@ -96,6 +96,8 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional, Tuple
 
+import os
+
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint as _ckpt
@@ -247,6 +249,10 @@ class ActionForcingTrainingPipeline:
         # gt_latents was None, or extension was disabled).
         self._last_extension_metrics: dict = {}
 
+        # One-shot latch for the ``[COMMIT-SRC]`` proof line (see
+        # ``_log_commit_source``). Per PROCESS, not per step / per call.
+        self._commit_src_logged: bool = False
+
         # -------------------------------------------------------------
         # Seed-prefill contract (14e alignment, 2026-08-17).
         #
@@ -288,6 +294,15 @@ class ActionForcingTrainingPipeline:
 
         self.kv_cache1: Optional[list] = None
         self.crossattn_cache: Optional[list] = None
+
+        # CARN seam-affine target + its ride stamp. The target is
+        # published per ride by the streaming path; the token is bumped
+        # by ``reset_cache_state`` (the per-ride boundary) so a target
+        # that outlives its ride can be DETECTED rather than silently
+        # applied to another ride's commits. See ``_carn_seam_correct``.
+        self._carn_seam_target = None
+        self._carn_seam_target_ride: Optional[int] = None
+        self._carn_seam_ride_token: int = 0
 
         # max_attention_size propagation (2026-08-16): every sibling pipeline
         # (self_forcing_training.py:564, rolling_staircase_training.py:570,
@@ -974,6 +989,359 @@ class ActionForcingTrainingPipeline:
             )
             del cache_commit_input
 
+    # =================================================================
+    # TRAIN/INFER CONTRACT ALIGNMENT (researcher-ordered, 2026-08-25)
+    # -----------------------------------------------------------------
+    # A train-vs-inference contract audit found three places where the
+    # training rollout did something the deployed AR rollout
+    # (``utils/eval_causal_AR.py``) does not. All three are now FIXED,
+    # and -- because 8-node jobs were already QUEUED against this tree
+    # and must pick the fixes up without resubmission -- every fix
+    # DEFAULTS TO THE ALIGNED BEHAVIOUR. Each has a flag that restores
+    # the legacy (pre-2026-08-25) behaviour bit-identically.
+    #
+    #   FIX 1  ``flash_dmd_commit_ladder_endpoint``  default TRUE
+    #          The KV cache is committed from the LADDER ENDPOINT
+    #          (t~208, the post-finish-denoise ``cache_pred``), which is
+    #          what inference commits -- NOT the t=60 flash prediction.
+    #          Legacy: set False.
+    #
+    #   FIX 3  ``carn_seam_affine_apply_to_output``  default TRUE
+    #          The CARN seam correction is applied to the EMITTED
+    #          ``output`` and the ``clean_chunk`` stash as well as to
+    #          the KV commit, matching inference, which corrects
+    #          ``pred_x0`` ONCE and then both emits and commits the
+    #          corrected tensor (utils/eval_causal_AR.py:1327-1340).
+    #          Legacy: set False.
+    #
+    # (FIX 2 -- the inference attention span -- lives in
+    #  ``utils/eval_causal_AR.py``; nothing to do here.)
+    #
+    # HOW THE FLAGS ARE READ. Like every other knob on this class, as a
+    # plain attribute set by the trainer. Nothing plumbs them today, so
+    # an ENVIRONMENT-VARIABLE fallback is provided as the escape hatch
+    # (no edit to model/dmd_action_forcing.py or trainer/... required):
+    #     FLASH_DMD_COMMIT_LADDER_ENDPOINT=0
+    #     CARN_SEAM_AFFINE_APPLY_TO_OUTPUT=0
+    # An explicitly-set attribute always wins over the env var.
+    # =================================================================
+    _FALSEY = ("0", "false", "no", "off", "")
+
+    def _contract_flag(self, attr: str, env: str, default: bool = True) -> bool:
+        """Attribute > env var > ``default`` (which is the ALIGNED value)."""
+        v = getattr(self, attr, None)
+        if v is not None:
+            return bool(v)
+        e = os.environ.get(env)
+        if e is not None:
+            return e.strip().lower() not in self._FALSEY
+        return default
+
+    # -----------------------------------------------------------------
+    # COMMIT-SOURCE PROOF (FIX 1 telemetry, always on, one-shot).
+    #
+    # WHY IT EXISTS. ``flash_dmd_commit_ladder_endpoint`` DEFAULTS TRUE
+    # and changes what every rolled chunk's KV cache -- the AR memory
+    # every subsequent chunk conditions on -- is built from. Until now
+    # NOTHING in a run's log proved which tensor was actually committed:
+    # the only line that mentioned the flag lives inside the CARN seam
+    # affine block (``_carn_seam_correct``), which is gated on
+    # ``carn_seam_affine_lambda > 0.0`` -- and that lambda is 0.0 in
+    # every queued arm, so it never fired. A default-ON training-contract
+    # change with no proof of execution is exactly the silent-failure
+    # class this campaign keeps losing runs to.
+    #
+    # WHAT IT DOES, at BOTH commit twins (``inference_with_trajectory``
+    # and ``generate_chunk_with_cache``):
+    #   * ONE-SHOT (per process, guarded by ``_commit_src_logged``),
+    #     rank-0 ``print`` naming the committed tensor, the resolved
+    #     flag, and whether flash-DMD is on. NOT per step.
+    #   * On that same first commit ONLY, and only when flash is on (so
+    #     the two tensors are genuinely distinct objects), one extra
+    #     ``.item()`` measuring ``mean|ladder_endpoint - flash|``. If
+    #     that number were ~0 the whole fix would be a no-op and nobody
+    #     would know; printing it makes the fix falsifiable from the log.
+    #     Zero cost on every subsequent commit.
+    #   * Per-call, zero-cost numeric keys on ``_last_extension_metrics``
+    #     (the existing channel ``model/dmd_action_forcing.py`` folds
+    #     into the trainer's info dict), so the choice is also visible in
+    #     wandb for the whole run, not just in stdout at step 0.
+    #
+    # Greppable: ``grep '\[COMMIT-SRC\]'``.
+    # -----------------------------------------------------------------
+    def _log_commit_source(
+        self,
+        *,
+        use_ladder: bool,
+        flash_dmd_enabled: bool,
+        ladder_pred: Optional[torch.Tensor],
+        flash_pred: Optional[torch.Tensor],
+        site: str,
+    ) -> None:
+        # ---- always-on, sync-free telemetry (every call) -------------
+        m = getattr(self, "_last_extension_metrics", None)
+        if isinstance(m, dict):
+            m["commit_src_ladder_endpoint"] = 1.0 if use_ladder else 0.0
+            m["commit_src_flash_dmd_enabled"] = (
+                1.0 if flash_dmd_enabled else 0.0
+            )
+        # ---- one-shot proof (first commit of this process only) ------
+        if getattr(self, "_commit_src_logged", False):
+            return
+        # Set BEFORE the work so a raising .item() can never turn this
+        # into a per-step cost.
+        self._commit_src_logged = True
+        diff = None
+        try:
+            if (
+                flash_dmd_enabled
+                and ladder_pred is not None
+                and flash_pred is not None
+                and ladder_pred is not flash_pred
+                and tuple(ladder_pred.shape) == tuple(flash_pred.shape)
+            ):
+                with torch.no_grad():
+                    diff = float(
+                        (
+                            ladder_pred.detach().float()
+                            - flash_pred.detach().float()
+                        ).abs().mean().item()
+                    )
+        except Exception:
+            # Telemetry must never take a training step down.
+            diff = None
+        if isinstance(m, dict) and diff is not None:
+            m["commit_src_first_absdiff"] = diff
+        try:
+            _rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            _rank = 0
+        if _rank != 0:
+            return
+        print(
+            "[COMMIT-SRC] source="
+            f"{'ladder_endpoint' if use_ladder else 'flash'}"
+            f" flash_dmd_enabled={bool(flash_dmd_enabled)}"
+            f" flag={bool(use_ladder)}"
+            f" site={site}"
+            " mean_abs_diff(ladder,flash)="
+            + ("n/a" if diff is None else f"{diff:.6g}"),
+            flush=True,
+        )
+
+    # -----------------------------------------------------------------
+    # CARN seam correction -- SINGLE implementation shared by all commit
+    # sites. Extracted verbatim (op-for-op, same order, same dtypes) from
+    # the two copies that used to live inline in
+    # ``inference_with_trajectory`` and ``generate_chunk_with_cache``, so
+    # the numerics are bit-identical to the pre-extraction code.
+    #
+    # Chain, in order:
+    #   1. carn_seam_temp        (default 1.0 = off) variance re-inflation
+    #   2. carn_seam_drift_lambda(default 0.0 = off) mu-only drift bias
+    #   3. carn_seam_affine_lambda(default 0.0 = off) std (+optional mean)
+    #                             re-anchor toward the ride seed's stats
+    #
+    # ``record=True`` (the KV-commit site only) additionally publishes the
+    # seam telemetry described below.
+    # -----------------------------------------------------------------
+    def _carn_seam_correct(
+        self, x: torch.Tensor, *, record: bool = False,
+    ) -> torch.Tensor:
+        # CARN seam affine (latent CARN v0): gated per-channel mean/std
+        # re-anchor of the committed context toward the ride seed's latent
+        # stats -- counters the AR drift walk (DC/color haze, contraction)
+        # INSIDE the loop; affine correction measured ~80% sufficient in
+        # the contraction-law study. lambda=0 (default) = byte-identical.
+        # Temperature scaling (carn_seam_temp, default 1.0 = off): scale
+        # per-channel deviations by T to counter the per-chunk variance
+        # contraction (k~0.917 for the 4-rung sampler => T ~ 1/k). Pure
+        # re-inflation, no target stats needed; composes with (runs
+        # before) the affine re-anchor below.
+        _tT = float(getattr(self, "carn_seam_temp", 1.0) or 1.0)
+        if abs(_tT - 1.0) > 1e-6:
+            _x = x.float()
+            _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
+            x = (_mu + _tT * (_x - _mu)).to(x.dtype)
+        # Global drift counter-bias (CARN repulsor v1): subtract
+        # lambda_d * d_hat (per-channel-mean drift/roll, fitted from the
+        # frozen-model drift probe -- transition cos +0.53, ride cos
+        # +0.74). mu-only by design (the grep-sign study: the mu-half is
+        # right-signed; the sigma-half is handled by temp/affine instead).
+        _dl = float(getattr(self, "carn_seam_drift_lambda", 0.0) or 0.0)
+        _dv = getattr(self, "_carn_seam_drift_vec", None)
+        if _dl > 0.0 and _dv is not None:
+            x = (
+                x.float()
+                - _dl * _dv.view(1, 1, -1, 1, 1).to(x.device)
+            ).to(x.dtype)
+        _cl = float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0)
+        _ct = getattr(self, "_carn_seam_target", None)
+        # ---- STALE-TARGET GUARD (``carn_seam_target_ride_guard``,
+        # DEFAULT ON) ------------------------------------------------
+        # ``_carn_seam_target`` is published ONLY by the streaming path
+        # (``generate_next_chunk``), from the CURRENT ride's seed
+        # latents, and used to be cleared NOWHERE. The other affine
+        # site, ``inference_with_trajectory``, has no publisher at all,
+        # so every call through it (e.g. the trainer's 7-chunk sample
+        # video, which rolls a DIFFERENT ride) re-anchored its commits
+        # to whatever ride's seed stats were published last -- silent
+        # cross-ride contamination with no log line.
+        #
+        # The fix has two halves. (1) ``reset_cache_state`` -- the
+        # per-ride teardown both ``setup_sequence`` and
+        # ``reset_streaming_state`` go through -- drops the target and
+        # bumps ``_carn_seam_ride_token``. (2) the target is STAMPED
+        # with the token that was current when it was published, and
+        # here we refuse to apply a stamp that does not match: a target
+        # that outlived its ride is a hard error, never a silent
+        # rescale. A MISSING target (lambda>0, nothing published for
+        # this sequence -- the honest state of the non-streaming path)
+        # stays a no-op as before, but warns once so it cannot be
+        # mistaken for "the affine ran". An UNSTAMPED target
+        # (``_carn_seam_target_ride is None``) is applied as before: a
+        # target set directly on the pipeline by hand or by a test has
+        # no ride to be stale relative to, and refusing it would break
+        # callers that never went through the streaming publisher.
+        # No-op for lambda=0 runs: this whole block is unreachable then.
+        if _cl > 0.0 and self._contract_flag(
+            "carn_seam_target_ride_guard", "CARN_SEAM_TARGET_RIDE_GUARD",
+        ):
+            _stamp = getattr(self, "_carn_seam_target_ride", None)
+            if _ct is None:
+                self._warn_once_carn_seam_no_target(_cl)
+            elif (
+                _stamp is not None
+                and _stamp != getattr(self, "_carn_seam_ride_token", 0)
+            ):
+                raise RuntimeError(
+                    "[CARN][seam-affine] STALE TARGET: "
+                    "carn_seam_affine_lambda="
+                    f"{_cl:.4f} but ``_carn_seam_target`` was published "
+                    "for ride token "
+                    f"{getattr(self, '_carn_seam_target_ride', None)!r} "
+                    "and the current ride token is "
+                    f"{getattr(self, '_carn_seam_ride_token', 0)!r}. "
+                    "Applying it would re-anchor this sequence's commits "
+                    "to a DIFFERENT ride's seed statistics. Publish a "
+                    "target for this sequence (see "
+                    "``generate_next_chunk``) or set "
+                    "carn_seam_affine_lambda=0. Set "
+                    "carn_seam_target_ride_guard=False (or "
+                    "CARN_SEAM_TARGET_RIDE_GUARD=0) for the legacy "
+                    "silent behaviour."
+                )
+        if _cl > 0.0 and _ct is not None:
+            # DEFAULT-BEHAVIOUR CHANGE (researcher-ordered, 2026-08-25):
+            # `carn_seam_affine_match_mean` DEFAULTS TO FALSE, so the seam
+            # affine now re-anchors the SCALE (std) only and every
+            # committed chunk KEEPS ITS OWN per-channel mean. Rationale:
+            # forward motion necessarily drifts the per-channel latent
+            # means away from the ride seed, so blending the mean back
+            # toward the seed on every chunk actively opposes the very
+            # signal that represents forward progress. The std/scale half
+            # is unchanged and still blends toward the seed target.
+            # Setting carn_seam_affine_match_mean=True on the pipeline
+            # restores the legacy (bit-identical) mean+std blend.
+            _mm = bool(getattr(self, "carn_seam_affine_match_mean", False))
+            if not getattr(self, "_carn_seam_affine_logged", False):
+                # One-shot, rank-0 only: a run must PROVE which of the two
+                # behaviours it actually executed. Not per-step.
+                self._carn_seam_affine_logged = True
+                if (dist.get_rank() if dist.is_initialized() else 0) == 0:
+                    print(
+                        "[CARN][seam-affine] std_matching=ON "
+                        f"mean_matching={'ON' if _mm else 'OFF'} "
+                        f"(legacy default was ON) lambda={_cl:.4f} "
+                        "apply_to_output="
+                        f"{self._contract_flag('carn_seam_affine_apply_to_output', 'CARN_SEAM_AFFINE_APPLY_TO_OUTPUT')}",
+                        flush=True,
+                    )
+            _tm, _tsd = _ct
+            _x = x.float()
+            _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
+            _sd = _x.std(dim=(0, 1, 3, 4), keepdim=True).clamp_min(1e-4)
+            _tm_ = _tm.view(1, 1, -1, 1, 1).to(_x)
+            _tsd_ = _tsd.view(1, 1, -1, 1, 1).to(_x)
+            _bsd = _cl * _tsd_ + (1.0 - _cl) * _sd
+            _shift = (_cl * _tm_ + (1.0 - _cl) * _mu) if _mm else _mu
+            x = ((_x - _mu) / _sd * _bsd + _shift).to(x.dtype)
+            if record:
+                self._carn_seam_record(_sd, _bsd, _mu, _tm_)
+        return x
+
+    # -----------------------------------------------------------------
+    # Seam telemetry (``carn_seam_telemetry``, DEFAULT ON).
+    #
+    # WHY IT EXISTS. Until 2026-08-25 the seam affine had ZERO telemetry:
+    # a 250-step run applied a silent per-commit rescale that no log line
+    # and no video ever showed. These four scalars ARE the recursion --
+    # ``carn_pred_std`` (s) and ``carn_commit_std`` (S = l*S_seed+(1-l)*s)
+    # together let k (the per-chunk contraction) and the seed ratio be
+    # fitted from one run's logs. Predicted steady-state gain ~1.045;
+    # a value near 2.0 means the student's own std has collapsed and the
+    # corrector is doing all the work.
+    #
+    # They are published on ``_last_extension_metrics`` (the existing
+    # per-call channel that ``model/dmd_action_forcing.py`` already folds
+    # into the trainer's info dict), so no consumer-side change is needed.
+    # Values are the MEAN OVER BLOCKS of the current call.
+    #
+    # Cost: 4 ``.item()`` syncs per committed block, and ONLY when the
+    # affine is actually live (lambda>0 and a target published). Set
+    # ``carn_seam_telemetry=False`` (or CARN_SEAM_TELEMETRY=0) to drop it.
+    # -----------------------------------------------------------------
+    def _warn_once_carn_seam_no_target(self, lam: float) -> None:
+        """One-shot, rank-0: the seam affine is ON but no target was
+        published for the CURRENT sequence, so nothing is being
+        re-anchored. Loud once rather than silent forever -- this is the
+        state ``inference_with_trajectory`` is always in (it has no
+        publisher), and it used to be indistinguishable from a working
+        affine because the stale target from the previous ride was
+        applied instead."""
+        if getattr(self, "_carn_seam_no_target_warned", False):
+            return
+        self._carn_seam_no_target_warned = True
+        if (dist.get_rank() if dist.is_initialized() else 0) != 0:
+            return
+        print(
+            "[CARN][seam-affine] NO TARGET for this sequence "
+            f"(carn_seam_affine_lambda={lam:.4f}) -- the affine "
+            "re-anchor is INERT here. Only the streaming path "
+            "(generate_next_chunk) publishes a target; calls through "
+            "inference_with_trajectory previously reused the last "
+            "ride's stats, which was cross-ride contamination.",
+            flush=True,
+        )
+
+    def _carn_seam_record(self, sd, bsd, mu, tm) -> None:
+        if not self._contract_flag(
+            "carn_seam_telemetry", "CARN_SEAM_TELEMETRY",
+        ):
+            return
+        try:
+            with torch.no_grad():
+                stats = {
+                    # channel-mean applied gain S/s
+                    "carn_seam_gain": float((bsd / sd).mean().item()),
+                    # ||M - m||_2 over channels (mean target vs chunk mean)
+                    "carn_seam_mu_shift": float(
+                        (tm - mu).flatten().norm().item()),
+                    "carn_commit_std": float(bsd.mean().item()),
+                    "carn_pred_std": float(sd.mean().item()),
+                }
+            m = getattr(self, "_last_extension_metrics", None)
+            if m is None:
+                return
+            n = float(m.get("carn_seam_blocks", 0.0)) + 1.0
+            m["carn_seam_blocks"] = n
+            for k, v in stats.items():
+                prev = float(m.get(k, 0.0))
+                m[k] = prev + (v - prev) / n
+        except Exception:
+            # Telemetry must never take a training step down.
+            pass
+
     # -----------------------------------------------------------------
     # Main entry: inference_with_trajectory
     # -----------------------------------------------------------------
@@ -1066,6 +1434,18 @@ class ActionForcingTrainingPipeline:
         # unless the A23 gate is on.)
         self._clean_chunk_grad: Optional[torch.Tensor] = None
         self._clean_chunk_grad_mask: Optional[torch.Tensor] = None
+        # LADDER-ENDPOINT buffer (VIZ-HONESTY fix, 2026-08-25).
+        # ``_clean_chunk`` above is written from ``cache_pred`` AFTER the
+        # flash reassignment, so with ``flash_dmd_enabled=True`` it holds
+        # the t=flash_dmd_gan_t FLASH slab -- NOT the finish-denoised
+        # ladder endpoint, and (since the ladder-endpoint commit fix) not
+        # even what the KV cache was built from. This buffer holds the
+        # tensor the rollout actually COMMITTED and rolled on: the
+        # pre-flash ``ladder_endpoint_pred``, carrying the same CARN seam
+        # correction the emitted ``output`` gets. When
+        # ``flash_dmd_enabled=False`` the two coincide and this is set to
+        # the very same object as ``_clean_chunk`` (no extra allocation).
+        self._ladder_chunk: Optional[torch.Tensor] = None
         # Reset per-call last-block clean pred (= cache_pred at the
         batch_size, num_frames, num_channels, height, width = noise.shape
 
@@ -1225,6 +1605,14 @@ class ActionForcingTrainingPipeline:
             [batch_size, num_output_frames, num_channels, height, width],
             device=noise.device,
             dtype=noise.dtype,
+        )
+        # Ladder-endpoint twin of ``clean_chunk``. Allocated ONLY when
+        # flash is on -- with flash off ``ladder_endpoint_pred is
+        # cache_pred``, so the two buffers would be bit-identical and the
+        # tail aliases ``_ladder_chunk`` to ``_clean_chunk`` instead of
+        # paying a second allocation.
+        ladder_chunk = (
+            torch.zeros_like(clean_chunk) if flash_dmd_enabled else None
         )
         # CF-parity #11: gradient-window gate. CF hardcodes a literal
         # 21 here (``Causal-Forcing/pipeline/self_forcing_training.py:
@@ -1584,6 +1972,25 @@ class ActionForcingTrainingPipeline:
                 if prefer_cache_pred_in_output
                 else denoised_pred
             )
+            # -------- FIX 3 (contract alignment, DEFAULT-ON) ----------
+            # ``carn_seam_affine_apply_to_output`` DEFAULTS TO TRUE.
+            # Inference corrects ``pred_x0`` ONCE and then emits AND
+            # commits the corrected tensor
+            # (utils/eval_causal_AR.py:1327-1340). Training used to
+            # correct ONLY the KV commit, so the AR memory was
+            # systematically rescaled by a factor that no loss and no
+            # rollout video ever saw. Now the emitted ``output`` gets
+            # the same correction. Set the flag False (or
+            # CARN_SEAM_AFFINE_APPLY_TO_OUTPUT=0) for the legacy,
+            # bit-identical behaviour.
+            # NOTE: no-op unless a CARN knob is live (temp!=1, drift>0,
+            # or affine lambda>0 with a published target).
+            _carn_out = self._contract_flag(
+                "carn_seam_affine_apply_to_output",
+                "CARN_SEAM_AFFINE_APPLY_TO_OUTPUT",
+            )
+            if _carn_out:
+                output_pred = self._carn_seam_correct(output_pred)
             output[
                 :,
                 current_start_frame: current_start_frame + current_num_frames,
@@ -1599,6 +2006,14 @@ class ActionForcingTrainingPipeline:
             # forward. We detach when assigning to ``cache_pred`` so the
             # cache K/V commit below doesn't carry the gen's autograd
             # graph into the cache state.
+            # -------- FIX 1 (contract alignment, DEFAULT-ON) ----------
+            # Stash the LADDER ENDPOINT (post-finish-denoise
+            # ``cache_pred``, t~208) BEFORE the flash reassignment
+            # below overwrites ``cache_pred`` with the t=60 flash
+            # prediction. Step 3.4's KV commit uses this by default --
+            # see the commit site for the full rationale.
+            # Identical to ``cache_pred`` when flash is OFF.
+            ladder_endpoint_pred = cache_pred
             if flash_dmd_enabled:
                 if flash_dmd_pred is None:
                     raise RuntimeError(
@@ -1611,6 +2026,8 @@ class ActionForcingTrainingPipeline:
                 ] = flash_dmd_pred
                 # Unification: cache_pred becomes the t=60 refined
                 # output (detached), avoiding the second forward.
+                # UNCHANGED by FIX 1: the GAN / FN consumers keep
+                # reading exactly this tensor.
                 cache_pred = flash_dmd_pred.detach()
 
             # Stash the post-Step-3.3.5 ``cache_pred`` (refined when
@@ -1620,10 +2037,31 @@ class ActionForcingTrainingPipeline:
             # training step; gradient must NOT flow back through this
             # tensor into the student.
             if clean_chunk is not None:
+                # FIX 3: same correction as the emitted ``output``.
+                _cc = cache_pred.detach()
+                if _carn_out:
+                    _cc = self._carn_seam_correct(_cc)
                 clean_chunk[
                     :,
                     current_start_frame: current_start_frame + current_num_frames,
-                ] = cache_pred.detach()
+                ] = _cc
+
+            # VIZ-HONESTY twin of the stash above. Written from the
+            # PRE-FLASH ``ladder_endpoint_pred`` -- the finish-denoised
+            # x0 the KV commit below actually uses (default-ON
+            # ``flash_dmd_commit_ladder_endpoint``) and the tensor
+            # inference emits. Same slice, same detach, same CARN
+            # correction as ``output``/``clean_chunk`` so the buffers are
+            # directly comparable. ``record=False``: the KV-commit site
+            # remains the sole publisher of seam telemetry.
+            if ladder_chunk is not None:
+                _lc = ladder_endpoint_pred.detach()
+                if _carn_out:
+                    _lc = self._carn_seam_correct(_lc)
+                ladder_chunk[
+                    :,
+                    current_start_frame: current_start_frame + current_num_frames,
+                ] = _lc
 
             # Step 3.4: Cache-update forward at t=context_noise. Runs
             # in BOTH modes (flash_dmd_enabled or not):
@@ -1634,58 +2072,57 @@ class ActionForcingTrainingPipeline:
             #     overwrites the grad-attached K/V slots written by
             #     the t=flash_dmd_gan_t grad-on forward with graph-free
             #     K/V at t=context_noise so the next block's exit-rung
-            #     (DMD-grad) forward reads detached K/V. ``cache_pred``
-            #     here is the t=60 refined output (reassigned at the
-            #     ``flash_dmd_enabled`` branch above) — the KV cache
-            #     therefore carries the cleaner t=60 x0 estimate forward.
-            # The input is always detached (cache_pred came from a
-            # no_grad chain anyway, but the explicit detach releases
-            # any autograd nodes early — memory hygiene).
-            commit_input_clean = cache_pred.detach()
-            # CARN seam affine (latent CARN v0): gated per-channel mean/std
-            # re-anchor of the committed context toward the ride seed's latent
-            # stats -- counters the AR drift walk (DC/color haze, contraction)
-            # INSIDE the loop; affine correction measured ~80% sufficient in
-            # the contraction-law study. lambda=0 (default) = byte-identical.
-            # Temperature scaling (carn_seam_temp, default 1.0 = off): scale
-            # per-channel deviations of the committed context by T to counter
-            # the per-chunk variance contraction (k~0.917 for the 4-rung
-            # sampler => T ~ 1/k). Pure re-inflation, no target stats needed;
-            # composes with (runs before) the affine re-anchor below.
-            _tT = float(getattr(self, "carn_seam_temp", 1.0) or 1.0)
-            if abs(_tT - 1.0) > 1e-6:
-                _x = commit_input_clean.float()
-                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
-                commit_input_clean = (
-                    _mu + _tT * (_x - _mu)
-                ).to(commit_input_clean.dtype)
-            # Global drift counter-bias (CARN repulsor v1): subtract
-            # lambda_d * d_hat (per-channel-mean drift/roll, fitted from the
-            # frozen-model drift probe -- transition cos +0.53, ride cos
-            # +0.74) from every committed chunk. mu-only by design (the
-            # grep-sign study: the mu-half is right-signed; sigma-half is
-            # handled by temp/affine instead).
-            _dl = float(getattr(self, "carn_seam_drift_lambda", 0.0) or 0.0)
-            _dv = getattr(self, "_carn_seam_drift_vec", None)
-            if _dl > 0.0 and _dv is not None:
-                commit_input_clean = (
-                    commit_input_clean.float()
-                    - _dl * _dv.view(1, 1, -1, 1, 1).to(
-                        commit_input_clean.device)
-                ).to(commit_input_clean.dtype)
-            _cl = float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0)
-            _ct = getattr(self, "_carn_seam_target", None)
-            if _cl > 0.0 and _ct is not None:
-                _tm, _tsd = _ct
-                _x = commit_input_clean.float()
-                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
-                _sd = _x.std(dim=(0, 1, 3, 4), keepdim=True).clamp_min(1e-4)
-                _tm_ = _tm.view(1, 1, -1, 1, 1).to(_x)
-                _tsd_ = _tsd.view(1, 1, -1, 1, 1).to(_x)
-                commit_input_clean = (
-                    (_x - _mu) / _sd * (_cl * _tsd_ + (1.0 - _cl) * _sd)
-                    + (_cl * _tm_ + (1.0 - _cl) * _mu)
-                ).to(commit_input_clean.dtype)
+            #     (DMD-grad) forward reads detached K/V.
+            #
+            # -------- FIX 1 (contract alignment, DEFAULT-ON) ----------
+            # ``flash_dmd_commit_ladder_endpoint`` DEFAULTS TO TRUE.
+            # WHAT USED TO HAPPEN: ``cache_pred`` had been reassigned to
+            # the t=60 FLASH prediction above, so the KV cache -- the AR
+            # memory every subsequent chunk conditions on -- was built
+            # from the flash tensor. INFERENCE
+            # (utils/eval_causal_AR.py) commits the LADDER ENDPOINT: the
+            # ``pred_x0`` at the end of the denoising ladder (t~208).
+            # Training and deployment therefore rolled on two different
+            # context distributions.
+            # NOW: the commit reads ``ladder_endpoint_pred`` (stashed
+            # just before the flash reassignment). ``flash_dmd_pred``
+            # still flows to ``flash_dmd_gan_output`` and every GAN / FN
+            # consumer exactly as before -- ONLY the KV commit changed.
+            # Set the flag False (or FLASH_DMD_COMMIT_LADDER_ENDPOINT=0)
+            # for the legacy, bit-identical behaviour.
+            # No-op when ``flash_dmd_enabled=False`` (the two tensors
+            # are then the same object).
+            # The input is always detached (it came from a no_grad chain
+            # anyway, but the explicit detach releases any autograd
+            # nodes early — memory hygiene).
+            # Resolve ONCE and reuse for both the selection and the
+            # proof line, so the log can never name a source the commit
+            # did not actually use.
+            _use_ladder = self._contract_flag(
+                "flash_dmd_commit_ladder_endpoint",
+                "FLASH_DMD_COMMIT_LADDER_ENDPOINT",
+            )
+            # One-shot rank-0 [COMMIT-SRC] proof + per-call telemetry
+            # keys. Fires regardless of carn_seam_affine_lambda -- see
+            # ``_log_commit_source``. NOTE ``flash_pred=cache_pred``:
+            # when flash is on, ``cache_pred`` IS the t=60 flash tensor
+            # by this point (reassigned above).
+            self._log_commit_source(
+                use_ladder=_use_ladder,
+                flash_dmd_enabled=bool(flash_dmd_enabled),
+                ladder_pred=ladder_endpoint_pred,
+                flash_pred=cache_pred,
+                site="inference_with_trajectory",
+            )
+            _commit_src = ladder_endpoint_pred if _use_ladder else cache_pred
+            commit_input_clean = _commit_src.detach()
+            # CARN seam correction. Extracted to ``_carn_seam_correct``
+            # (single shared implementation, bit-identical to the code
+            # that used to sit inline here). ``record=True``: this is
+            # the KV-commit site, the one that publishes seam telemetry.
+            commit_input_clean = self._carn_seam_correct(
+                commit_input_clean, record=True,
+            )
             context_timestep = torch.full_like(timestep, self.context_noise)
             if int(self.context_noise) == 0:
                 # See the matching note in generate_chunk_with_cache: the
@@ -1761,6 +2198,10 @@ class ActionForcingTrainingPipeline:
                 clean_chunk = clean_chunk[
                     :, num_input_frames + num_seed_frames:
                 ]
+            if ladder_chunk is not None:
+                ladder_chunk = ladder_chunk[
+                    :, num_input_frames + num_seed_frames:
+                ]
 
         # Stash the Flash-DMD t=flash_dmd_gan_t output on the pipeline
         # instance so the model can read it without a return-tuple
@@ -1773,6 +2214,13 @@ class ActionForcingTrainingPipeline:
         self._flash_dmd_gan_output = flash_dmd_gan_output
         # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
+        # Ladder-endpoint stash. With flash OFF ``ladder_chunk`` was never
+        # allocated because the two tensors are the same object every
+        # block, so alias the clean buffer -- consumers then see an
+        # identical tensor and the whole VIZ-HONESTY change is a no-op.
+        self._ladder_chunk = (
+            ladder_chunk if ladder_chunk is not None else clean_chunk
+        )
 
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
@@ -1869,6 +2317,23 @@ class ActionForcingTrainingPipeline:
         """
         self.kv_cache1 = None
         self.crossattn_cache = None
+        # ---- STALE-TARGET GUARD (``carn_seam_target_ride_guard``) ----
+        # This is the per-ride boundary: ``setup_sequence`` and
+        # ``reset_streaming_state`` both come through here, as does the
+        # trainer's sample-video path immediately before AND after its
+        # ``inference_with_trajectory`` rollout. Drop the CARN seam
+        # target and bump the ride token so any target that survives on
+        # some other reference is detected as stale by
+        # ``_carn_seam_correct`` instead of being applied silently.
+        # Inert for lambda=0 runs (nothing reads the target then).
+        if self._contract_flag(
+            "carn_seam_target_ride_guard", "CARN_SEAM_TARGET_RIDE_GUARD",
+        ):
+            self._carn_seam_target = None
+            self._carn_seam_target_ride = None
+            self._carn_seam_ride_token = (
+                int(getattr(self, "_carn_seam_ride_token", 0)) + 1
+            )
 
     # -----------------------------------------------------------------
     # KV-cache CPU snapshot / restore  (FT_v3 post-build, "option 1").
@@ -1974,6 +2439,13 @@ class ActionForcingTrainingPipeline:
         # Frame-level attachment mask for the buffer above, ``[F]``
         # bool. Published only together with the buffer.
         self._clean_chunk_grad_mask: Optional[torch.Tensor] = None
+        # VIZ-HONESTY: reset per-call DETACHED ladder-endpoint buffer.
+        # Twin of ``_clean_chunk`` but written PRE-flash, so it holds the
+        # finish-denoised x0 the KV commit uses. Unlike
+        # ``_clean_chunk_grad`` this is unconditional (no gate) and
+        # carries no graph -- it exists so videos/telemetry can show the
+        # tensor the model actually committed and rolled on.
+        self._ladder_chunk: Optional[torch.Tensor] = None
         # Per-call A23 telemetry; populated ONLY when the gate is on.
         self._pix_finish_grad_stats: dict = {}
 
@@ -2045,6 +2517,17 @@ class ActionForcingTrainingPipeline:
         # KV cache, so exposing that ``cache_pred`` to downstream
         # consumers is free.
         clean_chunk = torch.zeros_like(noise)
+        # VIZ-HONESTY detached ladder-endpoint twin of ``clean_chunk``.
+        # Allocated ONLY when flash is on; with flash off
+        # ``ladder_endpoint_pred is cache_pred`` so the tail aliases
+        # ``_ladder_chunk`` to ``_clean_chunk`` and nothing extra is
+        # allocated. Distinct from ``clean_chunk_grad`` below: that one
+        # is gated, partial (mask) and graph-carrying for the pixel
+        # critic; this one is ungated, whole-chunk and detached, for
+        # video / telemetry consumers.
+        ladder_chunk = (
+            torch.zeros_like(noise) if flash_dmd_enabled else None
+        )
         # A23 grad twin of ``clean_chunk``. Allocated the same way but
         # ONLY under the gate (the retained one-rung graph is real
         # memory). Written with the GRAD-CARRYING ladder-endpoint
@@ -2488,6 +2971,24 @@ class ActionForcingTrainingPipeline:
                 if prefer_cache_pred_in_output
                 else denoised_pred
             )
+            # -------- FIX 3 (contract alignment, DEFAULT-ON) ----------
+            # ``carn_seam_affine_apply_to_output`` DEFAULTS TO TRUE.
+            # TWIN of the block in ``inference_with_trajectory`` -- see
+            # there for the full rationale. Inference corrects
+            # ``pred_x0`` ONCE and then emits AND commits the corrected
+            # tensor (utils/eval_causal_AR.py:1327-1340); training used
+            # to correct ONLY the KV commit, so the AR memory was
+            # rescaled by a factor no loss and no video ever saw.
+            # Set the flag False (or CARN_SEAM_AFFINE_APPLY_TO_OUTPUT=0)
+            # for the legacy, bit-identical behaviour.
+            # NOTE: no-op unless a CARN knob is live (temp!=1, drift>0,
+            # or affine lambda>0 with a published target).
+            _carn_out = self._contract_flag(
+                "carn_seam_affine_apply_to_output",
+                "CARN_SEAM_AFFINE_APPLY_TO_OUTPUT",
+            )
+            if _carn_out:
+                output_pred = self._carn_seam_correct(output_pred)
             output[
                 :, block_start_in_noise: block_start_in_noise + current_num_frames,
             ] = output_pred
@@ -2496,6 +2997,14 @@ class ActionForcingTrainingPipeline:
             # serves both the GAN adv buffer AND the cache_pred state.
             # No separate no_grad t=60 refinement (one forward saved
             # per block).
+            #
+            # -------- FIX 1 (contract alignment, DEFAULT-ON) ----------
+            # Stash the LADDER ENDPOINT (post-finish-denoise
+            # ``cache_pred``, t~208) BEFORE the flash reassignment
+            # overwrites it. Step 3.4's KV commit uses this by default;
+            # full rationale at the commit site below. Identical to
+            # ``cache_pred`` when flash is OFF.
+            ladder_endpoint_pred = cache_pred
             if flash_dmd_enabled:
                 if flash_dmd_pred is None:
                     raise RuntimeError(
@@ -2505,6 +3014,8 @@ class ActionForcingTrainingPipeline:
                 flash_dmd_gan_output[
                     :, block_start_in_noise: block_start_in_noise + current_num_frames,
                 ] = flash_dmd_pred
+                # UNCHANGED by FIX 1: the GAN / FN consumers keep
+                # reading exactly this tensor.
                 cache_pred = flash_dmd_pred.detach()
 
             # Stash post-Step-3.3.5 ``cache_pred`` into the per-rollout
@@ -2512,10 +3023,29 @@ class ActionForcingTrainingPipeline:
             # ``output`` write above (``block_start_in_noise`` for the
             # streaming path's noise-tensor-relative offset).
             if clean_chunk is not None:
+                # FIX 3: same correction as the emitted ``output``.
+                _cc = cache_pred.detach()
+                if _carn_out:
+                    _cc = self._carn_seam_correct(_cc)
                 clean_chunk[
                     :,
                     block_start_in_noise: block_start_in_noise + current_num_frames,
-                ] = cache_pred.detach()
+                ] = _cc
+
+            # VIZ-HONESTY twin of the stash above (TWIN of the block in
+            # ``inference_with_trajectory``). PRE-FLASH
+            # ``ladder_endpoint_pred``, detached, same slice, same CARN
+            # correction as ``output``. This is the tensor the KV commit
+            # below uses by default and the one inference emits, so it is
+            # what a rollout video must show.
+            if ladder_chunk is not None:
+                _lc = ladder_endpoint_pred.detach()
+                if _carn_out:
+                    _lc = self._carn_seam_correct(_lc)
+                ladder_chunk[
+                    :,
+                    block_start_in_noise: block_start_in_noise + current_num_frames,
+                ] = _lc
 
             # A23 grad twin. Written at the SAME index slice, and ONLY
             # ever with ``finish_grad_pred`` -- the PRE-FLASH ladder
@@ -2584,51 +3114,51 @@ class ActionForcingTrainingPipeline:
             # forward with graph-free K/V so the next block's exit-
             # rung forward doesn't pull DMD's grad through the prior
             # block's Flash-DMD gen forward).
-            commit_input_clean = cache_pred.detach()
-            # CARN seam affine (latent CARN v0): gated per-channel mean/std
-            # re-anchor of the committed context toward the ride seed's latent
-            # stats -- counters the AR drift walk (DC/color haze, contraction)
-            # INSIDE the loop; affine correction measured ~80% sufficient in
-            # the contraction-law study. lambda=0 (default) = byte-identical.
-            # Temperature scaling (carn_seam_temp, default 1.0 = off): scale
-            # per-channel deviations of the committed context by T to counter
-            # the per-chunk variance contraction (k~0.917 for the 4-rung
-            # sampler => T ~ 1/k). Pure re-inflation, no target stats needed;
-            # composes with (runs before) the affine re-anchor below.
-            _tT = float(getattr(self, "carn_seam_temp", 1.0) or 1.0)
-            if abs(_tT - 1.0) > 1e-6:
-                _x = commit_input_clean.float()
-                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
-                commit_input_clean = (
-                    _mu + _tT * (_x - _mu)
-                ).to(commit_input_clean.dtype)
-            # Global drift counter-bias (CARN repulsor v1): subtract
-            # lambda_d * d_hat (per-channel-mean drift/roll, fitted from the
-            # frozen-model drift probe -- transition cos +0.53, ride cos
-            # +0.74) from every committed chunk. mu-only by design (the
-            # grep-sign study: the mu-half is right-signed; sigma-half is
-            # handled by temp/affine instead).
-            _dl = float(getattr(self, "carn_seam_drift_lambda", 0.0) or 0.0)
-            _dv = getattr(self, "_carn_seam_drift_vec", None)
-            if _dl > 0.0 and _dv is not None:
-                commit_input_clean = (
-                    commit_input_clean.float()
-                    - _dl * _dv.view(1, 1, -1, 1, 1).to(
-                        commit_input_clean.device)
-                ).to(commit_input_clean.dtype)
-            _cl = float(getattr(self, "carn_seam_affine_lambda", 0.0) or 0.0)
-            _ct = getattr(self, "_carn_seam_target", None)
-            if _cl > 0.0 and _ct is not None:
-                _tm, _tsd = _ct
-                _x = commit_input_clean.float()
-                _mu = _x.mean(dim=(0, 1, 3, 4), keepdim=True)
-                _sd = _x.std(dim=(0, 1, 3, 4), keepdim=True).clamp_min(1e-4)
-                _tm_ = _tm.view(1, 1, -1, 1, 1).to(_x)
-                _tsd_ = _tsd.view(1, 1, -1, 1, 1).to(_x)
-                commit_input_clean = (
-                    (_x - _mu) / _sd * (_cl * _tsd_ + (1.0 - _cl) * _sd)
-                    + (_cl * _tm_ + (1.0 - _cl) * _mu)
-                ).to(commit_input_clean.dtype)
+            #
+            # -------- FIX 1 (contract alignment, DEFAULT-ON) ----------
+            # ``flash_dmd_commit_ladder_endpoint`` DEFAULTS TO TRUE.
+            # TWIN of the block in ``inference_with_trajectory`` -- see
+            # there for the full rationale. In short: ``cache_pred`` has
+            # by this point been reassigned to the t=60 FLASH
+            # prediction, so the legacy code built the AR memory (the
+            # KV cache every subsequent chunk conditions on) out of the
+            # flash tensor, while INFERENCE (utils/eval_causal_AR.py)
+            # commits the LADDER ENDPOINT ``pred_x0`` at t~208.
+            # NOW: the commit reads ``ladder_endpoint_pred``, stashed
+            # just before the flash reassignment. ``flash_dmd_pred``
+            # still flows to ``flash_dmd_gan_output`` and every GAN / FN
+            # consumer exactly as before -- ONLY the KV commit changed.
+            # Set the flag False (or FLASH_DMD_COMMIT_LADDER_ENDPOINT=0)
+            # for the legacy, bit-identical behaviour.
+            # No-op when ``flash_dmd_enabled=False``.
+            # Resolve ONCE and reuse for both the selection and the
+            # proof line (twin of the block in
+            # ``inference_with_trajectory``).
+            _use_ladder = self._contract_flag(
+                "flash_dmd_commit_ladder_endpoint",
+                "FLASH_DMD_COMMIT_LADDER_ENDPOINT",
+            )
+            # One-shot rank-0 [COMMIT-SRC] proof + per-call telemetry
+            # keys. Fires regardless of carn_seam_affine_lambda -- see
+            # ``_log_commit_source``. ``flash_pred=cache_pred`` because
+            # ``cache_pred`` IS the t=60 flash tensor by this point when
+            # flash is on.
+            self._log_commit_source(
+                use_ladder=_use_ladder,
+                flash_dmd_enabled=bool(flash_dmd_enabled),
+                ladder_pred=ladder_endpoint_pred,
+                flash_pred=cache_pred,
+                site="generate_chunk_with_cache",
+            )
+            _commit_src = ladder_endpoint_pred if _use_ladder else cache_pred
+            commit_input_clean = _commit_src.detach()
+            # CARN seam correction. Extracted to ``_carn_seam_correct``
+            # (single shared implementation, bit-identical to the code
+            # that used to sit inline here). ``record=True``: this is
+            # the KV-commit site, the one that publishes seam telemetry.
+            commit_input_clean = self._carn_seam_correct(
+                commit_input_clean, record=True,
+            )
             context_timestep = torch.full_like(timestep, self.context_noise)
             if int(self.context_noise) == 0:
                 # context_noise=0 did NOT mean "clean". FlowMatchScheduler's
@@ -2709,6 +3239,11 @@ class ActionForcingTrainingPipeline:
         self._flash_dmd_gan_output = flash_dmd_gan_output
         # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
+        # Ladder-endpoint stash (VIZ-HONESTY). Aliases ``_clean_chunk``
+        # when flash is off, where the two tensors are identical.
+        self._ladder_chunk = (
+            ladder_chunk if ladder_chunk is not None else clean_chunk
+        )
         # A23 stash. Published ONLY when the buffer actually carries a
         # graph -- a grad-less buffer here would be silently useless to
         # the pixel critic (its G-loss would have no path to the

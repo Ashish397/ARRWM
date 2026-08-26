@@ -2352,12 +2352,27 @@ def test_planted_second_resolution_point_fires():
     a second ``pix_real_pool_windows`` resolution inside ``_pix_pool_fill``
     -- and prove the scanner reports it. Planted into the REAL trainer
     source, through the same ``pix_resolution_report`` the guard above
-    calls, so the companion cannot pass on source the guard never sees."""
+    calls, so the companion cannot pass on source the guard never sees.
+
+    RE-AIMED 2026-08-25 (WP-STYLE). ``_pix_pool_fill`` gained an optional
+    ``cap`` argument so a non-pixel consumer (the style loss) can supply its
+    OWN bound instead of re-reading ``pix_real_pool_windows`` -- which is
+    the opposite of this defect, not an instance of it: a different knob,
+    resolved at its own single resolution point, PASSED IN. The consolidated
+    read therefore moved from the ``max(...)`` one-liner into the
+    ``if cap is None:`` branch, and the plant follows it there. The default
+    path is unchanged: ``cap=None`` still resolves through
+    ``_pix_resolve_cfg``, which is exactly what the anchor below asserts.
+    """
     src = _trainer_src()
-    good = 'cap = max(int(n_new), int(self._pix_resolve_cfg()["pool_windows"]))'
+    good = 'cap = int(self._pix_resolve_cfg()["pool_windows"])'
     assert src.count(good) == 1, "consolidated pool cap moved; re-aim the plant"
-    bad = ('cap = max(int(n_new), int(getattr(\n'
-           '            self.config, "pix_real_pool_windows", 2048)))')
+    # ...and the resolved value must still be the thing the FIFO uses.
+    assert 'cap = max(int(n_new), int(cap))' in src, (
+        "the pool cap no longer floors at n_new; re-aim the plant"
+    )
+    bad = ('cap = int(getattr(\n'
+           '                self.config, "pix_real_pool_windows", 2048))')
     strays, disagreements = pix_resolution_report(src.replace(good, bad))
     assert any(k == "pix_real_pool_windows" and f == "_pix_pool_fill"
                for (k, f, _ln) in strays), strays

@@ -41,8 +41,10 @@ from model.one_forcing_gan import (  # noqa: E402
     of_generator_loss,
     of_weight_at_step,
     pair_shared_noise,
+    disc_micro_batch_bounds,
     resolve_of_config,
     sample_of_timestep,
+    slice_conditional_dict_rows,
     split_logits,
     validate_of_config,
 )
@@ -947,6 +949,7 @@ def _make_loss_model(ride, source="pred_image", real_source="aligned_gt"):
     m = _OFLossModelStub(ride, of_cfg=cfg, noisy_cond=({"c": 1}, {}))
     for name in ("of_streaming_real", "of_streaming_cond",
                  "_of_fake_sample", "_of_real_sample", "_of_disc_cond",
+                 "_of_assert_cond_detached",
                  "_of_band_indices", "_of_publish_streaming_band",
                  "of_streaming_band"):
         _bind_model_method(m, name)
@@ -1357,6 +1360,32 @@ class TestStreamingCallSites(unittest.TestCase):
         i = self.src.index("_extra_loss = _extra_loss + _of_d_extra")
         i_bwd = self.src.index("_extra_loss.backward()")
         self.assertLess(i, i_bwd)
+
+    def test_the_inner_d_term_is_rebuilt_INSIDE_the_loop(self):
+        """One D tensor reused across the N inner backwards would
+        double-backward a freed disc graph — and would train the disc on
+        one draw while charging it for five updates. The call must sit
+        inside ``for _efi in range(_extra_fake_n)``, not above it."""
+        i_loop = self.src.index("for _efi in range(_extra_fake_n):")
+        i_inner = self.src.index(
+            "_of_d_extra = self._of_streaming_d_term(", i_loop,
+        )
+        i_bwd = self.src.index("_extra_loss.backward()", i_loop)
+        self.assertLess(i_loop, i_inner)
+        self.assertLess(i_inner, i_bwd)
+        # Exactly two D call sites on this path: the main critic update
+        # and the inner one. A third would be an unaccounted disc forward.
+        self.assertEqual(
+            self.src.count("self._of_streaming_d_term("), 2,
+        )
+        # The inner denoising loss is rebuilt in the loop too, so the two
+        # halves of every inner critic update come from the same fresh
+        # forward pass.
+        self.assertLess(
+            i_loop,
+            self.src.index("self.model.compute_critic_loss_streaming(",
+                           i_loop),
+        )
 
     def test_current_step_is_published_on_the_streaming_path(self):
         fn = _method_src(
@@ -2459,6 +2488,7 @@ def _make_band_stub(ride, source="pred_image", dim=8, n_blocks=3):
     stub = _BandGStub(cfg, disc, ride)
     for name in ("compute_of_g_loss", "_of_fake_sample", "_of_real_sample",
                  "_of_sample_timestep", "_of_disc_cond", "_of_disc_frozen",
+                 "_of_assert_cond_detached",
                  "_of_disc_logits", "_of_g_grad", "_of_g_surrogate",
                  "_of_band_indices", "_of_publish_streaming_band",
                  "of_streaming_band", "of_step", "of_streaming_real"):
@@ -2795,10 +2825,1525 @@ class TestBoundaryVAERoundTripGraph(unittest.TestCase):
         self.assertIn("overlap > 0", head)
         self.assertIn("prev_chunk_for_clean is not None", head)
 
-    def test_the_flag_defaults_off_on_a_config_that_predates_it(self):
+    def test_the_flag_now_defaults_ON_after_researcher_sign_off(self):
+        """Default flipped False -> True on 2026-08-25 with explicit sign-off.
+
+        The old default was byte-identical to the MEASURED (broken)
+        behaviour: the boundary VAE round-trip's ``torch.cat`` ran inside
+        ``no_grad``, so every overlapped roll came back graph-free and the
+        streaming DMD generator loss was a CONSTANT past roll 1. Keeping
+        the fix opt-in meant every recipe silently kept the dead gradient.
+        Flipping it is a training-recipe change and was signed off
+        explicitly; this test pins the new default so it cannot regress
+        back to the broken behaviour unnoticed.
+        """
         from model.dmd_action_forcing import ActionForcingDMD
         import inspect
         init = inspect.getsource(ActionForcingDMD.__init__)
         self.assertIn(
+            'getattr(args, "boundary_vae_roundtrip_keep_graph", True)', init,
+        )
+        self.assertNotIn(
             'getattr(args, "boundary_vae_roundtrip_keep_graph", False)', init,
         )
+
+
+# ======================================================================
+# ROOT CAUSE #3 — the D term's CONDITIONING carried the generator graph,
+# so the ``streaming_fake_updates_per_gen`` inner critic backwards
+# re-traversed a subgraph ``critic_loss.backward()`` had already freed.
+#
+# ``logs/of_smoke_r3.log``, 8 ranks / 2 nodes, ALL of them:
+#
+#     File "trainer/causal_action_forcing_train.py", line 15959,
+#       in _streaming_train_one_chunk
+#         _extra_loss.backward()
+#     RuntimeError: Trying to backward through the graph a second time
+#
+# The D term itself was ALREADY rebuilt per inner iteration (a fresh
+# ``_of_streaming_d_term`` -> fresh ``compute_of_d_loss`` -> fresh disc
+# forward), and its fake and real were ALREADY detached. The poison was
+# an INPUT: on the ``pred_image`` branch the published band's cond was
+# ``score_cond`` sliced, and ``score_cond`` is
+# ``build_action_conditional``'s live output — ``model/base.py`` does
+# ``action_projection.requires_grad_(True)`` unconditionally. So every
+# disc forward hung off the GENERATOR's action-projection subgraph;
+# ``critic_loss.backward()`` freed it, and the next inner backward walked
+# into the corpse. (The ``flash`` branch detached via
+# ``of_streaming_cond``; ``pred_image`` did not — the asymmetry IS the
+# bug.) Fixed in ``_of_disc_cond``, the one choke point all four disc
+# call sites funnel through.
+#
+# These tests execute the REAL publisher, the REAL
+# ``_of_streaming_d_term``, the REAL ``compute_of_d_loss`` /
+# ``of_head_touch`` / ``_of_disc_cond`` against a real ``nn.Module``
+# disc, and take 1 + N sequential backwards in the trainer's own order.
+# Source-level reasoning is what shipped this bug three times running.
+# ======================================================================
+class _OFInnerDisc(nn.Module):
+    """``fake_score``'s inner module.
+
+    A denoising ``backbone`` the critic loss reaches, plus the three
+    register-token head modules that ONLY the classify forward reaches —
+    under the real names ``of_head_touch`` scans
+    (``_OF_HEAD_MODULE_NAMES``).
+    """
+
+    def __init__(self, dim=4):
+        super().__init__()
+        self.dim = dim
+        self.backbone = nn.Linear(dim, dim, bias=False)
+        self._register_tokens = nn.Linear(dim, dim, bias=False)
+        self._gan_ca_blocks = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False)]
+        )
+        self._cls_pred_branch = nn.Linear(dim, 1, bias=False)
+        self.gradient_checkpointing = False
+
+    def head_parameters(self):
+        for m in (self._cls_pred_branch, self._register_tokens,
+                  self._gan_ca_blocks):
+            yield from m.parameters()
+
+
+class _OFInnerDiscWrapper(nn.Module):
+    """``WanDiffusionWrapper`` reduced to the classify forward.
+
+    The action-modulation stream is FOLDED INTO THE FEATURES, so if the
+    cond carries a graph the disc output genuinely depends on it — which
+    is what makes the mutation control reproduce the real crash rather
+    than a lookalike.
+    """
+
+    def __init__(self, dim=4):
+        super().__init__()
+        self.model = _OFInnerDisc(dim)
+
+    def _unwrapped_model(self):
+        return self.model
+
+    def forward(self, noisy_image_or_video, conditional_dict, timestep,
+                classify_mode=False):
+        assert classify_mode, "the OF disc forward is always classify_mode"
+        m = self.model
+        x = noisy_image_or_video.reshape(
+            noisy_image_or_video.shape[0], -1, m.dim,
+        )
+        h = m.backbone(x)
+        am = (conditional_dict or {}).get("_action_modulation")
+        if am is not None:
+            h = h + am.reshape(am.shape[0], -1, m.dim).mean(
+                dim=1, keepdim=True,
+            )
+        tok = m._register_tokens(h.mean(dim=1, keepdim=True))
+        for blk in m._gan_ca_blocks:
+            tok = tok + blk(h).mean(dim=1, keepdim=True)
+        return None, None, m._cls_pred_branch(tok).reshape(h.shape[0], 1)
+
+
+class _OFDTermModelStub:
+    """Everything the D path + the band publisher touch, and nothing else."""
+
+    def __init__(self, of_cfg, disc, ride):
+        self.of_cfg = of_cfg
+        self.fake_score = disc
+        self.scheduler = _StubScheduler()
+        self.streaming_state = {"ride_latents_window": ride}
+        self.gan_of_enabled = True
+        self._of_band = None
+        self._of_current_step = 10
+
+    def _surface_flash_gan_slab(self, info):
+        return None
+
+
+def _make_d_term_stub(ride, dim=4):
+    cfg = dict(OF_DEFAULTS)
+    cfg["gan_of_d_weight"] = 0.03
+    stub = _OFDTermModelStub(cfg, _OFInnerDiscWrapper(dim=dim), ride)
+    for name in ("compute_of_d_loss", "of_head_touch", "_of_disc_cond",
+                 "_of_assert_cond_detached", "_of_disc_logits",
+                 "_of_sample_timestep", "_of_real_sample", "_of_fake_sample",
+                 "_of_band_indices", "_of_publish_streaming_band",
+                 "of_streaming_band", "of_step", "of_streaming_real",
+                 "compute_of_g_loss", "_of_disc_frozen", "_of_g_grad",
+                 "_of_g_surrogate"):
+        _bind_model_method(stub, name)
+    return stub
+
+
+def _prefix_strip_only_disc_cond(cond):
+    """The PRE-FIX ``_of_disc_cond``: strips ``*_clean``, detaches nothing.
+
+    Kept verbatim so the mutation control runs the code that actually
+    crashed on the GPU, not an approximation of it.
+    """
+    return {k: v for k, v in cond.items() if not k.endswith("_clean")}
+
+
+class TestEveryCriticBackwardCarriesALiveDTerm(unittest.TestCase):
+    """1 + ``streaming_fake_updates_per_gen`` sequential critic backwards.
+
+    Mirrors ``_streaming_train_one_chunk`` exactly: the main critic loss
+    (denoising + D) backwards first and FREES, then each inner update
+    rebuilds its own (denoising + D) and backwards again.
+    """
+
+    N_INNER = 4          # the smoke's streaming_fake_updates_per_gen=4
+    DIM = 4
+
+    # ---- assembly -----------------------------------------------------
+    def _assemble(self, seed=0):
+        """The 42f scoring geometry in miniature, with a LIVE action
+        projection feeding the cond — the generator-owned module whose
+        subgraph the critic backward frees."""
+        torch.manual_seed(seed)
+        n_ctx, sup, gt_after = 3, 4, 2
+        n_f = n_ctx + sup + gt_after
+        ride = torch.randn(1, 40, self.DIM, 1, 1)
+        gen = _TinyGenerator(c=self.DIM)
+        # ``action_projection`` — generator-owned, requires_grad=True by
+        # construction (model/base.py:101), exactly like the real one.
+        act_proj = nn.Linear(2, self.DIM, bias=False)
+        rolled = gen(torch.randn(1, n_ctx + sup, self.DIM, 1, 1))
+        score_image = torch.cat(
+            [rolled[:, :n_ctx].detach(), rolled[:, n_ctx:],
+             ride[:, :gt_after]], dim=1,
+        )
+        grad_mask = torch.zeros(1, n_f, self.DIM, 1, 1, dtype=torch.bool)
+        grad_mask[:, n_ctx:n_ctx + sup] = True
+        # ``build_action_conditional``'s output: graph-carrying.
+        score_cond = {
+            "_action_modulation": act_proj(torch.randn(1, n_f, 2)),
+            "_action_modulation_clean": act_proj(torch.randn(1, n_f, 2)),
+            "prompt_embeds": torch.zeros(1, 1, 4),
+        }
+        self.assertTrue(
+            score_cond["_action_modulation"].requires_grad,
+            "the harness must reproduce a LIVE cond or it tests nothing",
+        )
+        stub = _make_d_term_stub(ride, dim=self.DIM)
+        tr = _OFTrainerStub(stub, step=10, telemetry_every=1)
+        _bind_trainer_method(tr, "_of_streaming_d_term")
+        _bind_trainer_method(tr, "_of_telemetry_step")
+        return dict(
+            stub=stub, tr=tr, gen=gen, act_proj=act_proj,
+            score_image=score_image, gt_target=ride[:, 5:5 + n_f],
+            grad_mask=grad_mask, score_cond=score_cond,
+        )
+
+    def _publish(self, a):
+        a["stub"]._of_publish_streaming_band(
+            score_image=a["score_image"],
+            score_gt_target=a["gt_target"],
+            score_cond=a["score_cond"],
+            score_grad_mask=a["grad_mask"],
+            chunk=a["score_image"],
+            info={},
+            chunk_lo=0,
+            chunk_hi=int(a["score_image"].shape[1]),
+            dmd_fired=False,      # D fires on EVERY roll, G only when DMD does
+            current_step=10,
+        )
+        return a["stub"].of_streaming_band()
+
+    def _denoise_surrogate(self, a):
+        """Stands in for ``compute_critic_loss_streaming``: a fresh loss
+        on DETACHED inputs that reaches the disc BACKBONE but never the
+        head — the exact shape that makes ``of_head_touch`` load-bearing.
+        """
+        inner = a["stub"].fake_score.model
+        x = a["score_image"].detach().reshape(1, -1, self.DIM)
+        return inner.backbone(x).pow(2).mean()
+
+    def _head_grads(self, a):
+        return [
+            None if p.grad is None else p.grad.detach().clone()
+            for p in a["stub"].fake_score.model.head_parameters()
+        ]
+
+    def _zero_fake_grads(self, a):
+        for p in a["stub"].fake_score.parameters():
+            p.grad = None
+
+    # ---- 1. THE FIX: N+1 sequential backwards all succeed -------------
+    def test_all_inner_critic_backwards_succeed_with_a_live_d_term(self):
+        a = self._assemble()
+        self._publish(a)
+        out = {}
+
+        # --- the MAIN critic update (trainer lines ~15810-15825) -------
+        main = self._denoise_surrogate(a)
+        d_main = a["tr"]._of_streaming_d_term(out=out)
+        self.assertIsNotNone(d_main)
+        self.assertTrue(d_main.requires_grad)
+        (main + d_main).backward()          # <- frees, no retain_graph
+        head_after_main = self._head_grads(a)
+        self.assertTrue(
+            any(g is not None and float(g.abs().sum()) > 0.0
+                for g in head_after_main),
+            "the MAIN critic update produced no disc-head gradient",
+        )
+
+        # --- the N inner updates (trainer lines ~15930-15960) ----------
+        gaps = [out["of_logit_gap"]]
+        for i in range(self.N_INNER):
+            self._zero_fake_grads(a)        # fake_optimizer.zero_grad
+            inner_out = {}
+            extra = self._denoise_surrogate(a)
+            d_extra = a["tr"]._of_streaming_d_term(
+                out=inner_out, log_prefix="of_inner_",
+            )
+            self.assertIsNotNone(d_extra, f"inner {i}: no D term")
+            self.assertTrue(
+                d_extra.requires_grad, f"inner {i}: D term has no graph",
+            )
+            extra = extra + d_extra
+            extra.backward()                # THE LINE THAT CRASHED
+            grads = self._head_grads(a)
+            self.assertTrue(
+                all(g is not None for g in grads),
+                f"inner {i}: a disc-head parameter was left ungradiented — "
+                "the fake_score DDP reducer would raise on the next step",
+            )
+            self.assertGreater(
+                sum(float(g.abs().sum()) for g in grads), 0.0,
+                f"inner {i}: the D term contributed ZERO head gradient, so "
+                "this fake_score update was NOT adversarially trained",
+            )
+            gaps.append(inner_out["of_inner_of_logit_gap"])
+
+        # Each update drew its own (t, eps) and ran its own disc forward:
+        # 5 distinct logit gaps, not one value reused 5 times.
+        self.assertEqual(len(gaps), self.N_INNER + 1)
+        self.assertEqual(
+            len(set(gaps)), len(gaps),
+            "the D term was computed ONCE and reused — every critic "
+            "update must train the disc on a fresh draw",
+        )
+
+    # ---- 2. MUTATION CONTROL: the pre-fix cond reproduces the crash ---
+    def test_an_undetached_cond_reproduces_the_gpu_runtimeerror(self):
+        """Revert ONLY the detach and the r3 failure comes straight back."""
+        a = self._assemble()
+        stub = a["stub"]
+        # The pre-fix ``_of_disc_cond`` (strip-only). Patched on the stub
+        # so the REAL ``compute_of_d_loss`` consumes a live cond, exactly
+        # as it did on the GPU.
+        stub._of_disc_cond = _prefix_strip_only_disc_cond
+        # Hand-build the band the pre-fix publisher would have produced
+        # (the publisher now refuses a live cond -- see test 3).
+        n_f = int(a["score_image"].shape[1])
+        lo, hi = 3, 7
+        stub._of_band = {
+            "fake": a["score_image"][:, lo:hi],
+            "real": a["gt_target"][:, lo:hi].detach(),
+            "cond": _prefix_strip_only_disc_cond(a["score_cond"]),
+            "gt_pool": a["stub"].streaming_state["ride_latents_window"],
+            "score_image": a["score_image"],
+            "band_lo": lo, "band_hi": hi, "source": "pred_image",
+            "dmd_fired": False, "step": 10,
+            "g_loss": None, "g_fake": None, "g_logs": {"of_g_fired": 0.0},
+        }
+        self.assertTrue(stub._of_band["cond"]["_action_modulation"]
+                        .requires_grad)
+        self.assertEqual(n_f, 9)
+
+        out = {}
+        main = self._denoise_surrogate(a)
+        d_main = a["tr"]._of_streaming_d_term(out=out)
+        (main + d_main).backward()
+
+        with self.assertRaises(RuntimeError) as cm:
+            self._zero_fake_grads(a)
+            extra = self._denoise_surrogate(a)
+            extra = extra + a["tr"]._of_streaming_d_term(
+                out={}, log_prefix="of_inner_",
+            )
+            extra.backward()
+        self.assertIn("backward through the graph a second time",
+                      str(cm.exception))
+
+    # ---- 3. the publisher refuses a live cond, loudly -----------------
+    def test_the_publisher_raises_if_the_cond_still_carries_a_graph(self):
+        a = self._assemble()
+        a["stub"]._of_disc_cond = _prefix_strip_only_disc_cond
+        with self.assertRaises(RuntimeError) as cm:
+            self._publish(a)
+        msg = str(cm.exception)
+        self.assertIn("still requires grad", msg)
+        self.assertIn("_action_modulation", msg)
+
+    # ---- 4. the published cond is detached, and clean-stripped --------
+    def test_the_published_cond_is_detached(self):
+        a = self._assemble()
+        band = self._publish(a)
+        for k, v in band["cond"].items():
+            if torch.is_tensor(v):
+                self.assertFalse(
+                    v.requires_grad, f"band cond {k!r} still carries a graph",
+                )
+        self.assertNotIn("_action_modulation_clean", band["cond"])
+        # ...and the VALUES are unchanged: this is a graph edit, not a
+        # numerics edit. The disc sees the same conditioning it always did.
+        torch.testing.assert_close(
+            band["cond"]["_action_modulation"],
+            a["score_cond"]["_action_modulation"].detach()[:, 3:7],
+        )
+
+    # ---- 5. no disc gradient escapes into the generator ---------------
+    def test_the_d_term_moves_no_generator_or_action_projection_param(self):
+        a = self._assemble()
+        self._publish(a)
+        out = {}
+        d = a["tr"]._of_streaming_d_term(out=out)
+        d.backward()
+        for name, p in a["gen"].named_parameters():
+            self.assertIsNone(p.grad, f"D term reached the generator: {name}")
+        self.assertIsNone(
+            a["act_proj"].weight.grad,
+            "D term pushed discriminator gradient into action_projection — "
+            "a generator-owned parameter applied by the generator's "
+            "optimizer, wrong-signed and silent",
+        )
+        # ...while the disc DID get trained.
+        self.assertGreater(
+            sum(float(p.grad.abs().sum())
+                for p in a["stub"].fake_score.model.head_parameters()
+                if p.grad is not None),
+            0.0,
+        )
+
+    # ---- 6. the head is touched even when the D weight is off ---------
+    def test_head_is_reached_on_every_inner_update_with_the_weight_at_zero(
+        self,
+    ):
+        """``gan_of_d_weight=0`` / ``disc_start_step>0``: the D term
+        degrades to ``of_head_touch()``, which must STILL ride every one
+        of the N+1 backwards or the fake_score reducer starves."""
+        a = self._assemble()
+        a["stub"].of_cfg["gan_of_d_weight"] = 0.0
+        a["tr"].gan_of_cfg["gan_of_d_weight"] = 0.0
+        self._publish(a)
+        for i in range(self.N_INNER + 1):
+            self._zero_fake_grads(a)
+            loss = self._denoise_surrogate(a)
+            term = a["tr"]._of_streaming_d_term(out={}, log_prefix="p_")
+            self.assertIsNotNone(term, f"update {i}: no head tie-in")
+            (loss + term).backward()
+            for p in a["stub"].fake_score.model.head_parameters():
+                self.assertIsNotNone(
+                    p.grad, f"update {i}: head parameter ungradiented",
+                )
+                self.assertTrue(torch.equal(p.grad, torch.zeros_like(p.grad)))
+
+
+# ======================================================================
+# #14 — ``gan_of_backbone_trainable``: un-confounding the arm.
+#
+# As first shipped the arm moved TWO variables at once: (a) the disc taps
+# the TRAINABLE ``fake_score`` critic instead of the frozen ``real_score``
+# teacher, and (b) that backbone CO-TRAINS on the adversarial loss. The
+# thesis is that (b) is the active ingredient, but with both moving
+# neither a positive nor a negative result can attribute anything.
+#
+# ``gan_of_backbone_trainable=false`` keeps (a) and removes (b). These
+# tests execute the REAL ``compute_of_d_loss`` / ``_of_head_only_surrogate``
+# / ``of_head_touch`` against a real ``nn.Module`` disc — with the DiT
+# stack CHECKPOINTED, because a ``requires_grad``-toggling implementation
+# of this flag would die exactly there.
+# ======================================================================
+class _BTDisc(nn.Module):
+    """``fake_score``'s inner module, with the parts that matter.
+
+    ``blocks`` + ``time_embedding`` are the BACKBONE; the three
+    ``_OF_HEAD_MODULE_NAMES`` modules are the head. ``time_embedding``
+    is deliberately consumed by the HEAD as well (the
+    ``concat_time_embeddings`` shape): it is the backbone parameter a
+    detach-at-the-feature-tap implementation would leave adversarially
+    trained, so the tests can tell the two implementations apart.
+    """
+
+    def __init__(self, dim=8, n_blocks=3):
+        super().__init__()
+        self.dim = dim
+        self.blocks = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False) for _ in range(n_blocks)]
+        )
+        self.time_embedding = nn.Linear(1, dim, bias=False)
+        self._register_tokens = nn.Linear(dim, dim, bias=False)
+        self._gan_ca_blocks = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+        self._cls_pred_branch = nn.Linear(dim, 1, bias=False)
+        self.gradient_checkpointing = True
+
+    # -- the two names the tests partition every parameter by ----------
+    HEAD_PREFIXES = ("_cls_pred_branch", "_register_tokens", "_gan_ca_blocks")
+
+    def head_parameters(self):
+        for n, p in self.named_parameters():
+            if n.startswith(self.HEAD_PREFIXES):
+                yield n, p
+
+    def backbone_parameters(self):
+        for n, p in self.named_parameters():
+            if not n.startswith(self.HEAD_PREFIXES):
+                yield n, p
+
+    def forward(self, latent, timestep, classify_mode=False):
+        B = latent.shape[0]
+        h = latent.reshape(B, -1, self.dim)
+        for blk in self.blocks:
+            if self.gradient_checkpointing:
+                h = torch.utils.checkpoint.checkpoint(
+                    lambda t, m=blk: m(t).tanh(), h, use_reentrant=False,
+                )
+            else:
+                h = blk(h).tanh()
+        te = self.time_embedding(
+            timestep.float().reshape(B, -1)[:, :1] / 1000.0
+        ).unsqueeze(1)
+        if not classify_mode:
+            # The DENOISING forward: reaches every backbone parameter and
+            # not one head parameter — the real asymmetry.
+            return h + te
+        tok = self._register_tokens(h.mean(dim=1, keepdim=True))
+        for blk in self._gan_ca_blocks:
+            tok = tok + blk(h).mean(dim=1, keepdim=True)
+        tok = tok + te
+        return self._cls_pred_branch(tok).reshape(B, 1)
+
+
+class _BTDiscWrapper(nn.Module):
+    """``WanDiffusionWrapper`` reduced to what the D path uses, DDP-able:
+    the wrapper CALLS ``self.model``, so ``self.model`` can be a DDP
+    object exactly as the trainer leaves it."""
+
+    def __init__(self, dim=8, n_blocks=3):
+        super().__init__()
+        self.dim = dim
+        self.model = _BTDisc(dim, n_blocks)
+        self.forwards = 0
+
+    def _unwrapped_model(self):
+        m = self.model
+        return m.module if hasattr(m, "module") else m
+
+    def forward(self, noisy_image_or_video, conditional_dict, timestep,
+                classify_mode=False):
+        self.forwards += 1
+        out = self.model(
+            noisy_image_or_video, timestep, classify_mode=classify_mode,
+        )
+        return (None, None, out) if classify_mode else (None, out, None)
+
+
+class _BTStub:
+    """Everything ``compute_of_d_loss`` touches, and nothing else."""
+
+    def __init__(self, of_cfg, disc):
+        self.of_cfg = of_cfg
+        self.fake_score = disc
+        self.scheduler = _StubScheduler()
+        self._of_current_step = 10
+
+
+_BT_METHODS = (
+    "compute_of_d_loss", "of_head_touch", "_of_head_parameters",
+    "_of_head_only_surrogate", "_of_disc_cond", "_of_assert_cond_detached",
+    "_of_disc_logits", "_of_sample_timestep", "of_step",
+)
+
+
+def _make_bt_stub(trainable, dim=8, n_blocks=3, ckpt=True, seed=0):
+    """``trainable=None`` builds a config that PREDATES the flag — the
+    byte-identity reference."""
+    torch.manual_seed(seed)
+    cfg = dict(OF_DEFAULTS)
+    cfg["gan_of_d_weight"] = 0.03
+    if trainable is None:
+        cfg.pop("gan_of_backbone_trainable")
+    else:
+        cfg["gan_of_backbone_trainable"] = bool(trainable)
+    disc = _BTDiscWrapper(dim=dim, n_blocks=n_blocks)
+    disc.model.gradient_checkpointing = bool(ckpt)
+    stub = _BTStub(cfg, disc)
+    for name in _BT_METHODS:
+        _bind_model_method(stub, name)
+    return stub
+
+
+def _bt_inputs(dim=8, frames=4, seed=1):
+    torch.manual_seed(seed)
+    fake = torch.randn(1, frames, dim, 1, 1)
+    real = torch.randn(1, frames, dim, 1, 1)
+    return fake, real
+
+
+def _bt_d_term(stub, seed=1, telemetry=True):
+    """One D call with the RNG pinned, so the two arms see the SAME
+    timestep and the SAME epsilon and any difference in the returned
+    value is the flag's doing and nothing else."""
+    fake, real = _bt_inputs(dim=stub.fake_score.dim, seed=seed)
+    torch.manual_seed(seed + 100)
+    return stub.compute_of_d_loss(
+        fake_latent=fake, real_latent=real, cond_for_scoring={},
+        current_step=10, telemetry=telemetry,
+    )
+
+
+def _bt_denoise(stub, seed=7):
+    """The critic's own loss: reaches every BACKBONE parameter, no head
+    parameter. Same shape as ``compute_critic_loss_streaming``'s."""
+    torch.manual_seed(seed)
+    dim = stub.fake_score.dim
+    x = torch.randn(1, 4, dim, 1, 1)
+    t = torch.full((1, 4), 500.0)
+    out = stub.fake_score(x, {}, t, classify_mode=False)[1]
+    return out.pow(2).mean()
+
+
+def _bt_grads(inner):
+    return {
+        n: (None if p.grad is None else p.grad.detach().clone())
+        for n, p in inner.named_parameters()
+    }
+
+
+def _bt_zero(inner):
+    for p in inner.parameters():
+        p.grad = None
+
+
+class TestBackboneTrainableConfig(unittest.TestCase):
+    def test_the_flag_exists_and_defaults_true(self):
+        self.assertIs(OF_DEFAULTS["gan_of_backbone_trainable"], True)
+
+    def test_a_config_predating_the_flag_resolves_to_the_faithful_arm(self):
+        self.assertIs(
+            resolve_of_config(_Cfg())["gan_of_backbone_trainable"], True,
+        )
+
+    def test_the_control_is_reachable_from_config(self):
+        r = resolve_of_config(_Cfg(gan_of_backbone_trainable=False))
+        self.assertIs(r["gan_of_backbone_trainable"], False)
+
+    def test_the_yaml_registers_the_key(self):
+        """The override guard only sees keys the config declares; an
+        unregistered ``gan_of_*`` key is a hard kill under
+        ``strict_override_keys``."""
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "configs", "action_forcing_phase3_dmd.yaml",
+        )
+        with open(path) as fh:
+            text = fh.read()
+        self.assertIn("gan_of_backbone_trainable: true", text)
+
+    def test_the_key_is_in_the_override_guard_registration_list(self):
+        from model.one_forcing_gan import CONFIG_KEYS
+        self.assertIn("gan_of_backbone_trainable", CONFIG_KEYS)
+
+
+class TestBackboneTrainableTrueIsByteIdentical(unittest.TestCase):
+    """Default TRUE must be the arm as launched, to the bit."""
+
+    def _run(self, trainable):
+        stub = _make_bt_stub(trainable)
+        inner = stub.fake_score._unwrapped_model()
+        term, logs = _bt_d_term(stub)
+        (_bt_denoise(stub) + term).backward()
+        return float(term.detach()), logs, _bt_grads(inner), stub
+
+    def test_value_logs_and_every_gradient_match_a_preflag_config(self):
+        v_ref, logs_ref, g_ref, s_ref = self._run(None)    # flag absent
+        v_new, logs_new, g_new, s_new = self._run(True)    # flag present
+        self.assertEqual(v_ref, v_new)
+        self.assertEqual(logs_ref, logs_new)
+        self.assertEqual(set(g_ref), set(g_new))
+        for n in g_ref:
+            self.assertIsNotNone(g_ref[n], f"{n}: reference had no grad")
+            self.assertTrue(
+                torch.equal(g_ref[n], g_new[n]),
+                f"{n}: gradient changed under the default flag",
+            )
+        self.assertEqual(s_ref.fake_score.forwards, s_new.fake_score.forwards)
+
+    def test_no_extra_log_key_appears_on_the_faithful_arm(self):
+        _v, logs, _g, _s = self._run(True)
+        self.assertNotIn("of_backbone_trainable", logs)
+
+    def test_the_faithful_arm_really_does_train_the_backbone(self):
+        """MUTATION CONTROL for every 'zero on the backbone' assertion
+        below: with the flag TRUE the adversarial-only backward MUST move
+        the backbone, or those assertions prove nothing."""
+        stub = _make_bt_stub(True)
+        inner = stub.fake_score._unwrapped_model()
+        term, _logs = _bt_d_term(stub)
+        term.backward()
+        moved = [
+            n for n, p in inner.backbone_parameters()
+            if p.grad is not None and float(p.grad.abs().sum()) > 0.0
+        ]
+        self.assertEqual(
+            len(moved), len(list(inner.backbone_parameters())),
+            f"only {moved} of the backbone was adversarially trained",
+        )
+
+
+class TestBackboneTrainableFalseRestrictsToTheHead(unittest.TestCase):
+    def test_adversarial_backward_deposits_zero_on_the_backbone(self):
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+        term, _logs = _bt_d_term(stub)
+        term.backward()
+        for n, p in inner.backbone_parameters():
+            self.assertTrue(
+                p.grad is None or float(p.grad.abs().sum()) == 0.0,
+                f"{n} received ADVERSARIAL gradient with "
+                "gan_of_backbone_trainable=false",
+            )
+
+    def test_the_time_embedding_is_covered(self):
+        """The head consumes ``time_embedding`` directly (the
+        ``concat_time_embeddings`` shape), so a detach-at-the-tap
+        implementation would still train it. Named separately because it
+        is the one parameter that distinguishes the two designs."""
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+        _bt_d_term(stub)[0].backward()
+        self.assertTrue(
+            inner.time_embedding.weight.grad is None
+            or float(inner.time_embedding.weight.grad.abs().sum()) == 0.0
+        )
+
+    def test_all_three_head_module_groups_are_gradiented(self):
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+        _bt_d_term(stub)[0].backward()
+        for prefix in _BTDisc.HEAD_PREFIXES:
+            tot = sum(
+                float(p.grad.abs().sum())
+                for n, p in inner.head_parameters()
+                if n.startswith(prefix) and p.grad is not None
+            )
+            self.assertGreater(
+                tot, 0.0, f"{prefix} got NO adversarial gradient",
+            )
+        for n, p in inner.head_parameters():
+            self.assertIsNotNone(
+                p.grad,
+                f"{n} has grad=None — the fake_score reducer "
+                "(find_unused_parameters=False) starves on it",
+            )
+
+    def test_the_head_gradient_is_bit_identical_to_the_faithful_arm(self):
+        """Only the BACKBONE edge is removed. If the head's learning
+        signal changed too, the A/B would still be confounded."""
+        g = {}
+        for name, flag in (("true", True), ("false", False)):
+            stub = _make_bt_stub(flag)
+            inner = stub.fake_score._unwrapped_model()
+            _bt_d_term(stub)[0].backward()
+            g[name] = _bt_grads(inner)
+        for n, _p in _make_bt_stub(True).fake_score._unwrapped_model(
+        ).head_parameters():
+            self.assertTrue(
+                torch.equal(g["true"][n], g["false"][n]),
+                f"{n}: head gradient differs between the two arms",
+            )
+
+    def test_the_value_and_the_telemetry_are_unchanged(self):
+        v_t, logs_t = _bt_d_term(_make_bt_stub(True))
+        v_f, logs_f = _bt_d_term(_make_bt_stub(False))
+        self.assertEqual(float(v_t.detach()), float(v_f.detach()))
+        self.assertEqual(logs_f.pop("of_backbone_trainable"), 0.0)
+        self.assertEqual(logs_t, logs_f)
+
+    def test_the_checkpointed_disc_does_not_raise(self):
+        """A ``requires_grad``-toggling implementation dies here with
+        ``CheckpointError``; the surrogate never touches a flag."""
+        stub = _make_bt_stub(False, ckpt=True)
+        self.assertTrue(stub.fake_score.model.gradient_checkpointing)
+        (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+
+    def test_sequential_rebuilt_d_terms_all_backward(self):
+        """``streaming_fake_updates_per_gen``: 1 + N critic backwards,
+        no ``retain_graph``. The surrogate frees its own graph, so this
+        is where an accidental double-traverse would show up."""
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+        for i in range(5):
+            _bt_zero(inner)
+            term, _logs = _bt_d_term(stub, seed=1 + i)
+            (_bt_denoise(stub) + term).backward()
+            for n, p in inner.head_parameters():
+                self.assertIsNotNone(p.grad, f"update {i}: {n} ungradiented")
+
+    def test_it_composes_with_the_micro_batched_disc_forward(self):
+        """The S6 memory knob (``gan_of_disc_micro_batch_groups``) splits
+        the ``[fake ; real]`` batch across N forwards. The restriction is
+        applied to the SUMMED term, so the two are orthogonal — checked
+        here rather than assumed, because they touch the same method."""
+        if "gan_of_disc_micro_batch_groups" not in OF_DEFAULTS:
+            self.skipTest("S6 micro-batching is not in this tree")
+        stub = _make_bt_stub(False)
+        stub.of_cfg["gan_of_disc_micro_batch_groups"] = 2
+        inner = stub.fake_score._unwrapped_model()
+        (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+        for n, p in inner.head_parameters():
+            self.assertIsNotNone(p.grad, n)
+        head = sum(
+            float(p.grad.abs().sum()) for _n, p in inner.head_parameters()
+        )
+        self.assertGreater(head, 0.0)
+        # ...and the backbone still carries the DENOISING gradient only.
+        _bt_zero(inner)
+        _bt_d_term(stub)[0].backward()
+        for n, p in inner.backbone_parameters():
+            self.assertTrue(
+                p.grad is None or float(p.grad.abs().sum()) == 0.0,
+                f"{n} was adversarially trained under micro-batching",
+            )
+
+    def test_the_inactive_weight_path_is_already_head_only(self):
+        """``gan_of_d_weight=0`` / ``disc_start_step>0`` degrade the term
+        to ``of_head_touch()``, which edges the head and nothing else —
+        so the restriction is a no-op there, and the gauge must still be
+        published or its trace goes sparse across the warmup."""
+        stub = _make_bt_stub(False)
+        stub.of_cfg["gan_of_d_weight"] = 0.0
+        inner = stub.fake_score._unwrapped_model()
+        term, logs = _bt_d_term(stub)
+        self.assertIsNotNone(term)
+        self.assertEqual(logs["of_backbone_trainable"], 0.0)
+        term.backward()
+        for n, p in inner.head_parameters():
+            self.assertIsNotNone(p.grad, n)
+            self.assertTrue(torch.equal(p.grad, torch.zeros_like(p.grad)))
+        for n, p in inner.backbone_parameters():
+            self.assertIsNone(p.grad, n)
+
+    def test_no_head_at_all_fails_loud(self):
+        class _Bare(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Linear(4, 4)])
+
+        class _W(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = _Bare()
+
+            def _unwrapped_model(self):
+                return self.model
+
+        stub = _BTStub(dict(OF_DEFAULTS), _W())
+        stub.of_cfg["gan_of_backbone_trainable"] = False
+        for name in _BT_METHODS:
+            _bind_model_method(stub, name)
+        with self.assertRaises(RuntimeError) as cm:
+            stub._of_head_only_surrogate(torch.zeros((), requires_grad=True))
+        self.assertIn("nowhere to go", str(cm.exception))
+
+
+class TestBackboneTrainableFalseKeepsTheCriticAlive(unittest.TestCase):
+    """"Adversarial gradient to heads only", NOT "backbone frozen". A
+    globally frozen ``fake_score`` would break the DMD critic, which is a
+    different variable again."""
+
+    def test_the_denoising_loss_still_gradients_every_backbone_parameter(self):
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+        (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+        for n, p in inner.backbone_parameters():
+            self.assertIsNotNone(p.grad, f"{n} ungradiented — critic broken")
+            self.assertGreater(float(p.grad.abs().sum()), 0.0, n)
+
+    def test_the_backbone_gradient_equals_the_denoising_only_gradient(self):
+        """The exact claim: the adversarial contribution to the backbone
+        is ZERO, so the sum equals the denoising term alone."""
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+
+        _bt_denoise(stub).backward()
+        denoise_only = _bt_grads(inner)
+
+        _bt_zero(inner)
+        (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+        both = _bt_grads(inner)
+
+        for n, _p in inner.backbone_parameters():
+            self.assertTrue(
+                torch.equal(denoise_only[n], both[n]),
+                f"{n}: the D term perturbed a backbone gradient",
+            )
+
+    def test_the_control_shows_the_faithful_arm_does_perturb_it(self):
+        """MUTATION CONTROL for the test above."""
+        stub = _make_bt_stub(True)
+        inner = stub.fake_score._unwrapped_model()
+        _bt_denoise(stub).backward()
+        denoise_only = _bt_grads(inner)
+        _bt_zero(inner)
+        (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+        both = _bt_grads(inner)
+        self.assertTrue(
+            any(
+                not torch.equal(denoise_only[n], both[n])
+                for n, _p in inner.backbone_parameters()
+            ),
+            "the faithful arm left the backbone gradient untouched — the "
+            "harness is not exercising co-training at all",
+        )
+
+    def test_no_fake_score_parameter_requires_grad_flag_was_changed(self):
+        """The flag must not be implemented by toggling ``requires_grad``
+        (checkpoint replay reads those flags at BACKWARD time)."""
+        stub = _make_bt_stub(False)
+        inner = stub.fake_score._unwrapped_model()
+        before = {n: p.requires_grad for n, p in inner.named_parameters()}
+        (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+        after = {n: p.requires_grad for n, p in inner.named_parameters()}
+        self.assertEqual(before, after)
+        self.assertTrue(all(after.values()))
+
+
+class TestBackboneTrainableRankUniformity(unittest.TestCase):
+    def test_the_two_arms_run_the_same_number_of_disc_forwards(self):
+        counts = []
+        for flag in (True, False):
+            stub = _make_bt_stub(flag)
+            (_bt_denoise(stub) + _bt_d_term(stub)[0]).backward()
+            counts.append(stub.fake_score.forwards)
+        self.assertEqual(counts[0], counts[1])
+
+    def test_the_flag_draws_no_rng(self):
+        """If the control consumed a different number of RNG values the
+        ranks would silently desynchronise. Same seed in, same state out."""
+        states = []
+        for flag in (True, False):
+            stub = _make_bt_stub(flag)
+            torch.manual_seed(4242)
+            _bt_d_term(stub)[0].backward()
+            states.append(torch.random.get_rng_state().clone())
+        self.assertTrue(torch.equal(states[0], states[1]))
+
+    def test_the_gate_is_read_only_from_the_resolved_config(self):
+        """No per-rank quantity can reach it: the only reader is
+        ``self.of_cfg``."""
+        import ast
+        import inspect
+        import textwrap
+        from model.dmd_action_forcing import ActionForcingDMD
+        src = textwrap.dedent(
+            inspect.getsource(ActionForcingDMD.compute_of_d_loss)
+        )
+        doc = ast.get_docstring(ast.parse(src).body[0]) or ""
+        prose = {ln.strip() for ln in doc.splitlines()}
+        gate = [
+            ln for ln in src.splitlines()
+            if "gan_of_backbone_trainable" in ln
+            and not ln.strip().startswith("#")
+            and ln.strip() not in prose
+        ]
+        self.assertEqual(len(gate), 1, gate)
+        self.assertIn("self.of_cfg", gate[0])
+
+
+class TestBackboneTrainableUnderDDP(unittest.TestCase):
+    """The reducer must be satisfied in BOTH arms.
+
+    Under ``gan_of_backbone_trainable=false`` the head is gradiented by a
+    surrogate rather than by the classify forward, and the head-only
+    ``torch.autograd.grad`` runs BEFORE the caller's backward. If that call
+    fired DDP's ``AccumulateGrad`` hooks, the head would be marked ready
+    twice and the reducer would raise. It does not — proven here rather
+    than argued.
+    """
+
+    def setUp(self):
+        import tempfile
+        import torch.distributed as dist
+        if not dist.is_available() or not dist.is_gloo_available():
+            self.skipTest("gloo unavailable")
+        self._tmp = tempfile.mkdtemp()
+        if dist.is_initialized():
+            self.skipTest("a process group is already initialised")
+        dist.init_process_group(
+            backend="gloo",
+            store=dist.FileStore(os.path.join(self._tmp, "store"), 1),
+            rank=0, world_size=1,
+        )
+
+    def tearDown(self):
+        import shutil
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _run(self, trainable, iters=3):
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        stub = _make_bt_stub(trainable, ckpt=False)
+        inner = stub.fake_score.model
+        stub.fake_score.model = DDP(inner, find_unused_parameters=False)
+        for i in range(iters):
+            loss = _bt_denoise(stub, seed=7 + i)
+            term, _logs = _bt_d_term(stub, seed=1 + i)
+            (loss + term).backward()
+            for n, p in inner.named_parameters():
+                self.assertIsNotNone(p.grad, f"iter {i}: {n} ungradiented")
+                p.grad = None
+
+    def test_the_faithful_arm_keeps_the_reducer_happy(self):
+        self._run(True)
+
+    def test_the_control_arm_keeps_the_reducer_happy(self):
+        self._run(False)
+
+
+class TestBackboneTrainableLeavesTheGSideAlone(unittest.TestCase):
+    """The G side must NOT be collateral damage. It needs gradient to
+    flow to the INPUT latent — a different path from the backbone
+    PARAMS — and a ``no_grad``/tap-detach implementation would kill it."""
+
+    def _g_stub(self, trainable):
+        cfg = dict(OF_DEFAULTS)
+        cfg["gan_of_g_weight"] = 0.03
+        cfg["gan_of_backbone_trainable"] = bool(trainable)
+        torch.manual_seed(0)
+        disc = _BTDiscWrapper(dim=8, n_blocks=3)
+        disc.model.gradient_checkpointing = True
+        stub = _OFGLossStub(cfg, disc)
+        for name in ("compute_of_g_loss", "_of_fake_sample",
+                     "_of_real_sample", "_of_sample_timestep",
+                     "_of_disc_cond", "_of_disc_frozen", "_of_disc_logits",
+                     "_of_g_grad", "_of_g_surrogate", "_of_head_parameters",
+                     "_of_head_only_surrogate", "of_head_touch"):
+            _bind_model_method(stub, name)
+        return stub
+
+    def _run(self, trainable):
+        stub = self._g_stub(trainable)
+        torch.manual_seed(3)
+        gen = _TinyGenerator(c=8)
+        pred = gen(torch.randn(1, 4, 8, 1, 1))
+        real = torch.randn(1, 4, 8, 1, 1)
+        torch.manual_seed(11)
+        term, fake, logs = stub.compute_of_g_loss(
+            pred_image=pred, real_latent=real, cond_for_scoring={},
+            current_step=10,
+        )
+        return stub, gen, pred, term, fake, logs
+
+    def test_the_adversarial_gradient_still_reaches_the_generator(self):
+        _stub, gen, _pred, term, _fake, _logs = self._run(False)
+        self.assertIsNotNone(term)
+        self.assertTrue(term.requires_grad)
+        g = torch.autograd.grad(term, gen.proj.weight)[0]
+        self.assertIsNotNone(g)
+        self.assertTrue(torch.isfinite(g).all())
+        self.assertGreater(
+            float(g.abs().sum()), 0.0,
+            "gan_of_backbone_trainable=false severed the GEN-side "
+            "adversarial gradient — the exact collateral damage a "
+            "no_grad or tap-detach implementation causes",
+        )
+
+    def test_it_reaches_the_generator_through_the_fake_tensor(self):
+        _stub, _gen, pred, term, _fake, _logs = self._run(False)
+        g = torch.autograd.grad(term, pred, retain_graph=True)[0]
+        self.assertGreater(float(g.abs().sum()), 0.0)
+
+    def test_the_g_side_is_numerically_identical_in_both_arms(self):
+        vals = []
+        for flag in (True, False):
+            _s, gen, _p, term, _f, logs = self._run(flag)
+            vals.append((
+                float(term.detach()),
+                float(torch.autograd.grad(term, gen.proj.weight)[0].sum()),
+                logs.get("of_g_loss"),
+            ))
+        self.assertEqual(vals[0], vals[1])
+
+    def test_the_g_side_still_moves_no_fake_score_weight_in_either_arm(self):
+        for flag in (True, False):
+            stub, gen, _p, term, _f, _l = self._run(flag)
+            term.backward()
+            for n, p in stub.fake_score._unwrapped_model().named_parameters():
+                self.assertTrue(
+                    p.grad is None or float(p.grad.abs().sum()) == 0.0,
+                    f"trainable={flag}: G moved fake_score parameter {n}",
+                )
+
+
+# =====================================================================
+# S6 — DISC-FORWARD MEMORY (2026-08-25)
+# =====================================================================
+# WHAT S6 IS. The D step pushes ``cat([noisy_fake, noisy_real])`` through
+# ONE classify forward on the trainable 1.3B fake_score, and there are
+# ``1 + streaming_fake_updates_per_gen`` = 5 such forward+backwards per
+# active step. The measured resident cost of one of them, at the shipped
+# geometry (band = 9 frames x 1561 tokens, dim 1536, 30 blocks, taps
+# [21, 29], bf16, fake_score_gradient_checkpointing=true):
+#
+#   DiT checkpoint boundaries  30 x [2, 14049, 1536] bf16   ~2.41 GiB
+#   tap blocks (NOT checkpointed, 2 taps)                   ~1.18 GiB
+#   head + unpatchify (result DISCARDED)                    ~0.24 GiB
+#                                                          ---------
+#                                                           ~3.83 GiB
+#
+# The tap and head terms are the addressable ones, and they are what the
+# two model-side flags below remove. Note the DiT backbone does NOT carry
+# a requires_grad-dependent saved-INPUT term: ``use_reentrant=False``
+# checkpointing discards block internals entirely, which
+# ``TestCheckpointHidesSavedInputTerm`` demonstrates directly.
+
+
+class TestDiscMicroBatchBounds(unittest.TestCase):
+    """``disc_micro_batch_bounds`` — the rank-uniformity guarantee.
+
+    The group count decides how many disc forwards run before the SINGLE
+    shared ``critic_loss.backward()``. If two ranks disagreed on that
+    count, the DDP-wrapped ``fake_score`` reducer desynchronises and the
+    job hangs — a multi-node-only failure. These tests pin the property
+    that makes disagreement impossible: the bounds are a pure function of
+    ``(n_rows, groups)`` and read no state at all.
+    """
+
+    def test_default_groups_is_one_whole_batch(self):
+        self.assertEqual(disc_micro_batch_bounds(2, 1), [(0, 2)])
+        self.assertEqual(disc_micro_batch_bounds(8, 1), [(0, 8)])
+
+    def test_partition_is_exact_and_non_empty(self):
+        for n_rows in range(1, 17):
+            for g in range(1, 20):
+                b = disc_micro_batch_bounds(n_rows, g)
+                self.assertEqual(b[0][0], 0)
+                self.assertEqual(b[-1][1], n_rows)
+                for (_, hi), (lo2, _) in zip(b, b[1:]):
+                    self.assertEqual(hi, lo2, "groups must be contiguous")
+                self.assertTrue(all(hi > lo for lo, hi in b),
+                                "no group may be empty")
+                self.assertEqual(sum(hi - lo for lo, hi in b), n_rows)
+
+    def test_groups_clamped_to_row_count(self):
+        """More groups than rows => one row each, never an empty forward."""
+        self.assertEqual(len(disc_micro_batch_bounds(2, 9)), 2)
+        self.assertEqual(disc_micro_batch_bounds(2, 9), [(0, 1), (1, 2)])
+
+    def test_is_a_pure_function(self):
+        """Same inputs => same bounds, always. This is the rank-uniformity
+        argument in executable form: nothing else is read."""
+        for _ in range(5):
+            self.assertEqual(disc_micro_batch_bounds(6, 4),
+                             [(0, 1), (1, 3), (3, 4), (4, 6)])
+
+    def test_rejects_nonpositive_rows(self):
+        with self.assertRaises(ValueError):
+            disc_micro_batch_bounds(0, 2)
+
+
+class TestSliceConditionalDictRows(unittest.TestCase):
+    """Row-slicing the duplicated cond dict must be the exact inverse of
+    the concatenation the single-batch path performs."""
+
+    def test_reassembles_the_duplicated_cond(self):
+        cond = {
+            "prompt_embeds": torch.randn(3, 5, 7),
+            "_action_tokens": torch.randn(3, 4),
+            "scalar": 1.5,
+            "not_batched": torch.randn(9, 2),   # dim0 != n_rows => passthrough
+        }
+        dup = duplicate_conditional_dict(cond)
+        n_rows = 6
+        parts = [slice_conditional_dict_rows(dup, lo, hi, n_rows)
+                 for lo, hi in disc_micro_batch_bounds(n_rows, 3)]
+        for key in ("prompt_embeds", "_action_tokens"):
+            torch.testing.assert_close(
+                torch.cat([p[key] for p in parts], dim=0), dup[key],
+                rtol=0, atol=0,
+            )
+        # Entries whose dim 0 is not ``n_rows`` are passed through
+        # untouched on every group (here: a 9-row tensor duplicated to 18,
+        # which is neither 6 nor a row-aligned slice).
+        for p in parts:
+            self.assertEqual(p["scalar"], 1.5)
+            torch.testing.assert_close(p["not_batched"], dup["not_batched"],
+                                       rtol=0, atol=0)
+
+
+def _micro_stub(groups, dim=8, n_blocks=3):
+    """A ``_of_disc_logits`` host with the micro-batch knob set."""
+    cfg = dict(OF_DEFAULTS)
+    cfg["gan_of_disc_micro_batch_groups"] = int(groups)
+    disc = _StubDiscWrapper(dim=dim, n_blocks=n_blocks)
+    disc.model.gradient_checkpointing = False
+    stub = types.SimpleNamespace(of_cfg=cfg, fake_score=disc)
+    _bind_model_method(stub, "_of_disc_logits")
+    return stub
+
+
+class TestDiscMicroBatchValueEquivalence(unittest.TestCase):
+    """Micro-batching must not move the number.
+
+    This is the property ``ladd_disc_micro_batch_groups`` has to work for
+    (its per-group loss is scaled by ``/N_total``, not ``/N_group``). The
+    OF path gets it for free by concatenating LOGITS and taking the loss
+    once, and these tests are what turn "for free" into a fact.
+    """
+
+    def _run(self, groups, rows=4, seed=0):
+        torch.manual_seed(seed)
+        stub = _micro_stub(groups)
+        torch.manual_seed(seed + 1)
+        latent = torch.randn(rows, 2, 4, 2, 2)
+        cond = {"cond_feat": torch.randn(rows, 4, 8)}
+        t = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
+        return stub._of_disc_logits(latent=latent, cond=cond, timestep=t)
+
+    def test_logits_identical_across_group_counts(self):
+        base = self._run(1)
+        for g in (2, 3, 4, 7):
+            torch.testing.assert_close(
+                self._run(g), base, rtol=0, atol=0,
+                msg=f"groups={g} moved the logits",
+            )
+
+    def test_shape_preserved(self):
+        self.assertEqual(tuple(self._run(1).shape), tuple(self._run(4).shape))
+
+    def test_groups_one_issues_exactly_one_forward(self):
+        """Byte-identity at the default is a code-PATH claim, not just a
+        numeric one: groups=1 must take the verbatim single call."""
+        for groups, expect in ((1, 1), (2, 2), (4, 4)):
+            stub = _micro_stub(groups)
+            calls = []
+            inner = stub.fake_score.forward
+
+            def counting(*a, _inner=inner, **kw):
+                calls.append(kw.get("noisy_image_or_video").shape[0])
+                return _inner(*a, **kw)
+
+            stub.fake_score.forward = counting
+            stub._of_disc_logits(
+                latent=torch.randn(4, 2, 4, 2, 2),
+                cond={"cond_feat": torch.randn(4, 4, 8)},
+                timestep=torch.zeros(4, 2),
+            )
+            self.assertEqual(len(calls), expect,
+                             f"groups={groups} issued {len(calls)} forwards")
+            self.assertEqual(sum(calls), 4, "every row must be forwarded once")
+
+    def test_single_row_batch_never_splits(self):
+        """A 1-row forward (the G side at B=1) must stay a single call even
+        with a large group count — a zero-row forward would be a shape
+        error on some ranks and not others."""
+        stub = _micro_stub(8)
+        calls = []
+        inner = stub.fake_score.forward
+        stub.fake_score.forward = lambda *a, **kw: (
+            calls.append(1) or inner(*a, **kw))
+        stub._of_disc_logits(
+            latent=torch.randn(1, 2, 4, 2, 2),
+            cond={"cond_feat": torch.randn(1, 4, 8)},
+            timestep=torch.zeros(1, 2),
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_mutation_control_unsliced_cond_is_detected(self):
+        """MUTATION CONTROL. Revert ONLY the cond row-slicing (hand every
+        group the full-batch cond) and the equivalence assertion above must
+        FAIL. Without this, a test that never varies the conditioning
+        across rows would pass with the slicing removed entirely, and the
+        disc would silently score every group against row 0's actions."""
+        import model.dmd_action_forcing as dmd
+
+        base = self._run(1)
+        orig = dmd.slice_conditional_dict_rows
+        try:
+            dmd.slice_conditional_dict_rows = (
+                lambda cond, lo, hi, n_rows: cond
+            )
+            with self.assertRaises(Exception):
+                # Either a shape error or a value mismatch — both are the
+                # test noticing. Anything that passes here means the
+                # equivalence test above is vacuous.
+                torch.testing.assert_close(
+                    self._run(2), base, rtol=0, atol=0,
+                )
+        finally:
+            dmd.slice_conditional_dict_rows = orig
+
+
+class TestCheckpointHidesSavedInputTerm(unittest.TestCase):
+    """``use_reentrant=False`` checkpointing removes the
+    requires_grad-dependent saved-INPUT term entirely.
+
+    WHY THIS TEST EXISTS. ``F.linear`` saves its INPUT only when the
+    weight requires grad, so a disc forward on the TRAINABLE fake_score
+    was expected to retain one extra full-sequence activation per linear
+    per block versus the frozen real_score — which, across 30 blocks,
+    would dominate everything else and was the stated reason to fear an
+    OOM. It does not apply to our path, because the OF disc forward runs
+    with ``fake_score_gradient_checkpointing=true`` and a checkpointed
+    region saves NOTHING but its boundary input. This test pins that, so
+    the reasoning behind the S6 sizing cannot silently rot.
+    """
+
+    def _saved_bytes(self, trainable, ckpt, n_blocks=6, L=64, dim=32):
+        seen = {}
+
+        def pack(t):
+            if isinstance(t, torch.Tensor):
+                seen[t.data_ptr()] = t.numel() * t.element_size()
+            return t
+
+        torch.manual_seed(0)
+        blocks = nn.ModuleList([nn.Linear(dim, dim) for _ in range(n_blocks)])
+        for p in blocks.parameters():
+            p.requires_grad_(trainable)
+        x = torch.randn(2, L, dim, requires_grad=True)
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            h = x
+            for b in blocks:
+                h = (torch.utils.checkpoint.checkpoint(
+                    b, h, use_reentrant=False) if ckpt else b(h))
+        return sum(seen.values())
+
+    def test_uncheckpointed_trainable_costs_more_than_frozen(self):
+        """The mechanism is real when nothing is checkpointed."""
+        self.assertGreater(
+            self._saved_bytes(trainable=True, ckpt=False),
+            self._saved_bytes(trainable=False, ckpt=False),
+        )
+
+    def test_checkpointing_erases_the_difference(self):
+        """...and it vanishes under the checkpointing our disc forward
+        actually runs with. This is why S6 does NOT size the backbone term
+        off ``requires_grad``."""
+        self.assertEqual(
+            self._saved_bytes(trainable=True, ckpt=True),
+            self._saved_bytes(trainable=False, ckpt=True),
+        )
+
+
+class TestTapCheckpointEquivalence(unittest.TestCase):
+    """``gan_of_checkpoint_taps`` must be value- and gradient-neutral.
+
+    Runs the REAL ``GanAttentionBlock`` (the module the tap loop calls),
+    with ``flash_attention`` swapped for SDPA because flash has no CPU
+    path. What is under test is the transformation the two tap loops
+    apply — wrapping the per-tap block stack in
+    ``checkpoint(use_reentrant=False)`` — not a re-implementation of it.
+    """
+
+    def _blocks(self, dim=32, n=2):
+        import wan.modules.model as wm
+        torch.manual_seed(0)
+        return nn.ModuleList([
+            wm.GanAttentionBlock(dim=dim, ffn_dim=64, num_heads=4)
+            for _ in range(n)
+        ])
+
+    def _run(self, use_ckpt, dim=32, L=16):
+        import torch.nn.functional as F
+        import wan.modules.model as wm
+
+        def _sdpa(q, k, v, *a, **kw):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            ).transpose(1, 2)
+
+        prev = wm.flash_attention
+        wm.flash_attention = _sdpa
+        try:
+            blocks = self._blocks(dim=dim)
+            torch.manual_seed(1)
+            x = torch.randn(2, L, dim, requires_grad=True)
+            tok = torch.randn(2, 1, dim, requires_grad=True)
+            if use_ckpt:
+                def _tap_fn(_x, _t, _blocks=blocks):
+                    for _c in _blocks:
+                        _t = _c(_x, _t)
+                    return _t
+                out = torch.utils.checkpoint.checkpoint(
+                    _tap_fn, x, tok, use_reentrant=False)
+            else:
+                out = tok
+                for c in blocks:
+                    out = c(x, out)
+            out.sum().backward()
+            return out.detach(), x.grad.clone(), [
+                p.grad.clone() for p in blocks.parameters()
+            ]
+        finally:
+            wm.flash_attention = prev
+
+    def test_output_and_gradients_match(self):
+        o0, gx0, gp0 = self._run(False)
+        o1, gx1, gp1 = self._run(True)
+        torch.testing.assert_close(o1, o0, rtol=0, atol=0)
+        torch.testing.assert_close(gx1, gx0, rtol=1e-6, atol=1e-6)
+        self.assertEqual(len(gp0), len(gp1))
+        for a, b in zip(gp0, gp1):
+            torch.testing.assert_close(b, a, rtol=1e-6, atol=1e-6)
+
+    def test_checkpointed_tap_retains_less(self):
+        """The point of the flag: the tap stack's activations stop being
+        resident for the whole forward."""
+        import torch.nn.functional as F
+        import wan.modules.model as wm
+
+        def _sdpa(q, k, v, *a, **kw):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            ).transpose(1, 2)
+
+        def saved(use_ckpt):
+            seen = {}
+
+            def pack(t):
+                if isinstance(t, torch.Tensor):
+                    seen[t.data_ptr()] = t.numel() * t.element_size()
+                return t
+            prev = wm.flash_attention
+            wm.flash_attention = _sdpa
+            try:
+                blocks = self._blocks()
+                torch.manual_seed(1)
+                x = torch.randn(2, 64, 32, requires_grad=True)
+                tok = torch.randn(2, 1, 32, requires_grad=True)
+                with torch.autograd.graph.saved_tensors_hooks(
+                        pack, lambda t: t):
+                    if use_ckpt:
+                        def _tap_fn(_x, _t, _b=blocks):
+                            for _c in _b:
+                                _t = _c(_x, _t)
+                            return _t
+                        torch.utils.checkpoint.checkpoint(
+                            _tap_fn, x, tok, use_reentrant=False)
+                    else:
+                        out = tok
+                        for c in blocks:
+                            out = c(x, out)
+                return sum(seen.values())
+            finally:
+                wm.flash_attention = prev
+
+        self.assertLess(saved(True), saved(False))
+
+
+class TestClassifySkipHeadShapeContract(unittest.TestCase):
+    """The skipped head's ZERO PLACEHOLDER must have exactly the shape
+    ``head + unpatchify`` would have produced.
+
+    Only the shape can break: the logits come from the tap stack, which
+    the skip branch does not touch, and the head's output is discarded by
+    every classify caller (which is why ``head.modulation`` /
+    ``head.head.*`` were ALREADY ungradiented on a classify-only
+    backward). So this test checks the one contract at risk, against the
+    REAL ``unpatchify``.
+    """
+
+    def _real_unpatchify_shape(self, grid, patch, out_dim):
+        import wan.modules.model as wm
+        stub = types.SimpleNamespace(
+            out_dim=out_dim, patch_size=patch,
+            unpatchify=None,
+        )
+        stub.unpatchify = types.MethodType(wm.WanModel.unpatchify, stub)
+        gs = torch.tensor([list(grid)])
+        n = 1
+        for v in grid:
+            n *= v
+        head_out = torch.zeros(1, n, out_dim * (patch[0] * patch[1] * patch[2]))
+        return tuple(torch.stack(stub.unpatchify(head_out, gs)).shape)
+
+    def _placeholder_shape(self, grid, patch, out_dim):
+        """The expression the shipped skip branch uses."""
+        shape = [i * j for i, j in zip(list(grid), list(patch))]
+        return tuple(torch.zeros((1, out_dim, *shape)).shape)
+
+    def test_placeholder_matches_unpatchify(self):
+        for grid, patch, out_dim in (
+            ((9, 30, 52), (1, 2, 2), 16),     # the shipped OF band
+            ((21, 30, 52), (1, 2, 2), 16),    # full scoring window
+            ((3, 4, 6), (1, 2, 2), 8),        # small
+            ((2, 4, 4), (2, 2, 2), 4),        # non-unit temporal patch
+        ):
+            self.assertEqual(
+                self._placeholder_shape(grid, patch, out_dim),
+                self._real_unpatchify_shape(grid, patch, out_dim),
+                f"placeholder shape diverged for grid={grid} patch={patch}",
+            )
+
+    def test_mutation_control_wrong_patch_is_detected(self):
+        """MUTATION CONTROL: drop the patch-size multiply (the obvious way
+        to write this branch wrong) and the shapes must disagree."""
+        grid, patch, out_dim = (9, 30, 52), (1, 2, 2), 16
+        wrong = tuple(torch.zeros((1, out_dim, *grid)).shape)
+        self.assertNotEqual(
+            wrong, self._real_unpatchify_shape(grid, patch, out_dim))
+
+
+class TestS6FlagsDefaultOffAndPlumbed(unittest.TestCase):
+    """Every S6 knob defaults to the pre-S6 behaviour, and reaches the
+    object that acts on it."""
+
+    def test_defaults_are_inert(self):
+        cfg = resolve_of_config(types.SimpleNamespace())
+        self.assertEqual(cfg["gan_of_disc_micro_batch_groups"], 1)
+        self.assertFalse(cfg["gan_of_checkpoint_taps"])
+        self.assertFalse(cfg["gan_of_classify_skip_head"])
+        self.assertEqual(cfg["gan_of_r1_num_samples"], 0)
+
+    def test_registered_for_the_override_guard(self):
+        from model.one_forcing_gan import CONFIG_KEYS
+        for k in ("gan_of_disc_micro_batch_groups", "gan_of_checkpoint_taps",
+                  "gan_of_classify_skip_head", "gan_of_r1_num_samples"):
+            self.assertIn(k, CONFIG_KEYS)
+
+    def test_shipped_config_declares_them(self):
+        import yaml
+        with open(os.path.join(_ROOT, "configs",
+                               "action_forcing_phase3_dmd.yaml")) as fh:
+            y = yaml.safe_load(fh)
+        self.assertEqual(y["gan_of_disc_micro_batch_groups"], 1)
+        self.assertIs(y["gan_of_checkpoint_taps"], False)
+        self.assertIs(y["gan_of_classify_skip_head"], False)
+        self.assertEqual(y["gan_of_r1_num_samples"], 0)
+
+    def test_invalid_group_count_refused(self):
+        cfg = dict(OF_DEFAULTS)
+        cfg["gan_of_enabled"] = True
+        cfg["gan_of_disc_micro_batch_groups"] = 0
+        with self.assertRaises(ValueError):
+            validate_of_config(cfg)
+
+    def test_adding_cls_branch_writes_the_model_attrs(self):
+        """The two model-side flags must land on the object the tap/head
+        loops see as ``self`` — the inner model, not the wrapper."""
+        for ckpt_taps, skip_head in ((False, False), (True, False),
+                                     (False, True), (True, True)):
+            w, inner = _make_stub_wrapper()
+            w.adding_cls_branch(
+                atten_dim=32, num_class=1, hidden_dim=32, num_layers=1,
+                dropout=0.0, gan_blocks_per_token=1, layer_indices=[1, 3],
+                block_ffn_dim=16, block_num_heads=4, attach_to_model=True,
+                checkpoint_taps=ckpt_taps, classify_skip_head=skip_head,
+            )
+            self.assertIs(inner._gan_checkpoint_taps, ckpt_taps)
+            self.assertIs(inner._gan_classify_skip_head, skip_head)
+
+    def test_adding_cls_branch_defaults_leave_attrs_off(self):
+        """A caller that predates S6 (the legacy dmd2* users) must get the
+        historical behaviour without passing anything."""
+        w, inner = _make_stub_wrapper()
+        w.adding_cls_branch(
+            atten_dim=32, num_class=1, hidden_dim=32, num_layers=1,
+            dropout=0.0, gan_blocks_per_token=1, layer_indices=[1, 3],
+            block_ffn_dim=16, block_num_heads=4, attach_to_model=True,
+        )
+        self.assertFalse(inner._gan_checkpoint_taps)
+        self.assertFalse(inner._gan_classify_skip_head)
