@@ -7797,8 +7797,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 float(n_repeat) / float(max(1, n_req))
             ),
             "train/style_real_pool_windows": float(len(pool)),
+            # THIS STEP's draw only -- bounded above by len(bands), so it
+            # can never exceed the crop count and is NOT a measure of how
+            # wide the target is. It reads 4 with 8 crops simply because
+            # the pool it drew from held 13 windows.
             "train/style_real_unique_rides": float(
                 len({pool[i]["ride"] for i in chosen})
+            ),
+            # THE ACTUAL BREADTH OF THE STYLE TARGET: every distinct ride
+            # ever admitted to the support pool. ``style_real_unique_rides``
+            # was read as "the dataset's style is being estimated from 4
+            # rides", which it does not say; this key does. Sourced from
+            # ``_pix_real_rides``, which ``_pix_pool_fill`` grows one
+            # freshly-drawn ride at a time.
+            "train/style_real_pool_unique_rides": float(
+                len(getattr(self, "_pix_real_rides", None) or ())
             ),
             "train/style_real_cache_refresh_total": float(
                 getattr(self, "_pix_pool_refresh_total", 0)
@@ -8200,14 +8213,54 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out: Dict[str, float],
         *,
         current_step: int,
+        probe_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Publish the style term's UNWEIGHTED grad ratio and its cosine
         against the rest of the generator loss.
 
-        Same anchor, same cadence knob and same helper as the pixel arm's
-        A7 probe (``_pix_standalone_grad_telemetry``), so the calibration
-        read is comparable across features: the target band for the ratio
-        is the same 0.05-0.20 the GAN weight is tuned into.
+        WHERE THIS PROBE MEASURES, AND WHY IT MOVED (2026-08-26)
+        =======================================================
+        It used to differentiate BOTH losses at ``p_last`` -- "the last
+        ``requires_grad`` generator parameter" -- copying the pixel arm's
+        A7 probe (``_pix_standalone_grad_telemetry``).  On the live
+        ``dmd10k_gantune_w2gram`` arm that read
+
+            style_grad_norm_unweighted = 0.0   (EXACTLY, 13/13 samples)
+            style_base_grad_norm_shared = 0.032 .. 0.209  (healthy)
+            style_grad_probe_unavailable  ABSENT
+
+        i.e. ``torch.autograd.grad`` returned a NON-None, ALL-ZERO vector.
+        That combination is only possible when the probed parameter is
+        graph-REACHABLE from the style term but structurally receives
+        nothing from it -- an OFF-PATH parameter, not a severed loss.  The
+        two are indistinguishable at a single site, which is exactly why
+        the old key could not be trusted: a parameter chosen by position
+        in ``named_parameters()`` is chosen by REGISTRATION ORDER, and
+        every auxiliary branch this codebase bolts onto the generator
+        (state tokens / probe readout / cls+rgs heads / register tokens)
+        registers AFTER the DiT and is fed by a loss that never passes
+        through the predicted latent chunk.
+
+        So the authoritative site is now the STUDENT CHUNK ITSELF, which
+        is on-path BY CONSTRUCTION:
+
+          * the style term reaches the generator ONLY through this tensor
+            (``_compute_style_gram_loss`` crops it, decodes it, and Grams
+            the decode -- there is no other route), and
+          * the DMD term is built from the same tensor.
+
+        ``||d(style)/d(chunk)|| / ||d(rest)/d(chunk)||`` is therefore a
+        ratio of two influences on the SAME quantity, and it cannot be
+        zeroed by a probe-selection accident.  It is also strictly cheaper
+        than the parameter site: autograd stops at the chunk instead of
+        traversing the whole DiT backward.
+
+        The parameter site is KEPT, but demoted to a named diagnostic
+        (``style_param_*``) and run only until it has answered once.  Its
+        job now is to REPORT the artefact rather than be the measurement:
+        ``style_param_probe_offpath=1.0`` is published when the parameter
+        reads zero while the chunk reads non-zero, which is the signature
+        above, stated as a fact instead of inferred from a suspicious 0.
 
         The COSINE is the part that matters for this particular loss. A
         sustained strongly negative style/DMD cosine means the style term
@@ -8221,21 +8274,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if tel <= 0 or int(current_step) % tel != 0:
             return
         try:
-            p_last = None
-            for _pn, _pp in self.model.generator.named_parameters():
-                if _pp.requires_grad:
-                    p_last = _pp
-            if p_last is None:
+            # ---- SITE 1 (AUTHORITATIVE): the student chunk ------------
+            # ``probe_tensor`` is the tensor handed to
+            # ``_compute_style_gram_loss``. No fallback to the parameter
+            # site if it is missing: a silent fallback is how the old
+            # reading became untrustworthy in the first place.
+            if not (isinstance(probe_tensor, torch.Tensor)
+                    and probe_tensor.requires_grad):
+                out["train/style_grad_probe_unavailable"] = 1.0
+                out["train/style_grad_probe_reason_no_tensor"] = 1.0
                 return
-            base_vec = grad_at(generator_loss, p_last, retain_graph=True)
-            style_vec = grad_at(style_raw, p_last, retain_graph=True)
+            base_vec = grad_at(generator_loss, probe_tensor, retain_graph=True)
+            style_vec = grad_at(style_raw, probe_tensor, retain_graph=True)
             if base_vec is None or style_vec is None:
                 # NEVER a 0.0 ratio -- that is the forgeable zero this
                 # campaign has been bitten by. A distinct key instead.
                 out["train/style_grad_probe_unavailable"] = 1.0
+                if style_vec is None:
+                    # The loud one: the style term does not reach the
+                    # tensor it was built from = a REAL severing.
+                    out["train/style_grad_severed_from_chunk"] = 1.0
                 return
             b_n = float(base_vec.norm())
             s_n = float(style_vec.norm())
+            # Provenance, in the trace: 1.0 = measured at the student
+            # chunk. A future move of the probe must change this number,
+            # so no reader ever has to guess which site a value came from.
+            out["train/style_grad_probe_site_is_chunk"] = 1.0
             out["train/style_grad_norm_unweighted"] = s_n
             out["train/style_grad_norm_weighted"] = s_n * float(
                 getattr(self, "style_gram_loss_weight", 0.0)
@@ -8251,6 +8316,55 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 out["train/style_dmd_grad_cos"] = float(
                     torch.dot(style_vec, base_vec) / (s_n * b_n)
                 )
+
+            # ---- SITE 2 (DIAGNOSTIC, one-shot): the old parameter probe
+            # Runs until it has produced ONE comparison, then never again:
+            # it costs a full backward through the DiT and its only job is
+            # to name the artefact above. Its keys are prefixed
+            # ``style_param_`` so they can never be mistaken for the
+            # authoritative reading again.
+            if not getattr(self, "_style_param_probe_settled", False):
+                p_last = None
+                p_name = ""
+                for _pn, _pp in self.model.generator.named_parameters():
+                    if _pp.requires_grad:
+                        p_last, p_name = _pp, _pn
+                if p_last is not None:
+                    self._style_param_probe_settled = True
+                    p_style = grad_at(style_raw, p_last, retain_graph=True)
+                    p_base = grad_at(
+                        generator_loss, p_last, retain_graph=True)
+                    ps_n = None if p_style is None else float(p_style.norm())
+                    pb_n = None if p_base is None else float(p_base.norm())
+                    out["train/style_param_probe_ran"] = 1.0
+                    if ps_n is None:
+                        out["train/style_param_grad_unreachable"] = 1.0
+                    else:
+                        out["train/style_param_grad_norm_unweighted"] = ps_n
+                    if pb_n is not None:
+                        out["train/style_param_base_grad_norm"] = pb_n
+                    offpath = (
+                        s_n > 0.0 and (ps_n is None or ps_n == 0.0)
+                    )
+                    out["train/style_param_probe_offpath"] = (
+                        1.0 if offpath else 0.0
+                    )
+                    if self.is_main_process:
+                        logging.warning(
+                            "[StyleGram][PROBE-SITE] step=%d probe param = "
+                            "%r | d(style)/d(param) = %s | "
+                            "d(base)/d(param) = %s | d(style)/d(chunk) = "
+                            "%.6g | d(base)/d(chunk) = %.6g -- %s",
+                            int(current_step), p_name,
+                            "UNREACHABLE" if ps_n is None else f"{ps_n:.6g}",
+                            "UNREACHABLE" if pb_n is None else f"{pb_n:.6g}",
+                            s_n, b_n,
+                            ("PARAM PROBE IS OFF THE STYLE PATH (the old "
+                             "style_grad_norm_* zeros were a measurement "
+                             "artefact, NOT a severed loss)" if offpath
+                             else "param probe agrees with the chunk site"),
+                        )
+
             # ONE-SHOT ACTIONABLE CALIBRATION LINE. The weight this term
             # wants cannot be predicted from first principles -- its
             # gradient runs through the VAE decoder and a VGG, and neither
@@ -8276,7 +8390,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "weight that lands at 0.10 is %.4g. cos(style, base) "
                     "= %+.3f (sustained strongly negative = the style term "
                     "is fighting the reconstruction objective, pull the "
-                    "weight back).",
+                    "weight back). Measured at the STUDENT CHUNK, the one "
+                    "tensor both terms provably share.",
                     int(current_step), r, w, s_n / b_n, verdict,
                     0.10 * b_n / max(s_n, 1e-12),
                     float(torch.dot(style_vec, base_vec) / (s_n * b_n)),
@@ -12935,6 +13050,161 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 [_slice(fake_src_grad, j) for (_, j) in pairs], dim=0,
             )
 
+        # ===== DECOUPLED FN (CARN) application to the POSITIONAL real =====
+        # ``forward_noiser_apply_decoupled`` (bool, default False =>
+        # byte-identical: the whole block is skipped and NOTHING below it
+        # sees a different tensor).
+        #
+        # WHY THIS EXISTS. The historical FN-apply-to-GT site (``[FN-CHAIN-
+        # APP]`` / ``[FN-GT-FORMER]``, further down this method) lives INSIDE
+        # ``_match_select``, i.e. inside the matched-pool branch, and is
+        # additionally gated on ``chunks_per_pair == 2``. It is therefore
+        # reachable ONLY with gt_transition (cpp==2) AND
+        # ``ladd_gt_transition_match=true``. An arm configured
+        # ``ladd_gt_transition_enabled=false`` + ``ladd_gt_vs_fake_enabled=
+        # true`` that sets ``forward_noiser_apply_gt_former=true`` gets a
+        # SILENT NO-OP -- the FN trains but never touches the data.
+        #
+        # This block restores the capability on the POSITIONAL single-chunk
+        # path (cpp==1: gt_vs_fake / adjacent_chunks). ``real_chunks_det``
+        # here is the WHOLE real disc input for this mode and is consumed by
+        # BOTH the D-update (``_add_disc_noise(real_chunks_det)``) and the
+        # gen-side real view (``real_chunks_grad_det = real_chunks_det
+        # .detach()``) -- the same "naive both-sides" placement the matched
+        # gt_transition apply has (see its comment: "the SAME transformed
+        # pair feeds the D-update and the gen-side real view").
+        #
+        # LEVEL SEMANTICS. cpp==1 has no former/latter, so there is no
+        # "latter drift level L" to schedule against. The equivalent is the
+        # ROW'S OWN ROLLOUT POSITION: the student chunk at scored-slice index
+        # ``j`` has drift level >= j+1 (the same convention the matched
+        # Req-1 cap uses -- "fake pair p's former drift = pairs[p][0]"), and
+        # the positional real sits at that same index. So with
+        # ``Lf = j + 1``:
+        #     weak   (default): target = Lf // 2        == (L-1)//2 of the
+        #                       coupled path re-expressed for the chunk that
+        #                       is actually being noised
+        #     strong          : target = max(0, Lf - 1) == max(0, L-2)
+        # Req-1 (the real must be noised strictly LESS than the student it
+        # is discriminated against) is enforced by capping the target at
+        # ``j`` (< j+1 <= student drift). Target 0 => the row keeps its
+        # ORIGINAL clean GT (the FN is undefined at level 0), exactly as the
+        # coupled path does.
+        _fn_decoupled = bool(
+            getattr(self.model, "forward_noiser_apply_decoupled", None)
+            or getattr(self.config, "forward_noiser_apply_decoupled", False)
+        )
+        if (
+            _fn_decoupled
+            and chunks_per_pair == 1
+            and n_pairs > 0
+            and (
+                bool(getattr(
+                    self.model, "forward_noiser_apply_gt_former", False))
+                or bool(getattr(
+                    self.model, "forward_noiser_apply_gt_both", False))
+            )
+            and getattr(self.model, "forward_noiser", None) is not None
+        ):
+            _dmode = str(getattr(
+                self.model, "forward_noiser_former_mode", "weak")).lower()
+            _dchain = bool(getattr(
+                self.model, "forward_noiser_chain_levels", True))
+            _duncond = bool(getattr(
+                self.model, "forward_noiser_step_unconditioned", False))
+            _dfixed = int(getattr(
+                self.model, "forward_noiser_apply_gt_level", 1))
+            _nrow = int(real_chunks_det.shape[0])
+            # Rows are ``cat([_slice(...) for k in range(n_pairs)], dim=0)``
+            # so row r belongs to pair r // B (B = per-rank batch).
+            _Bd = max(1, _nrow // n_pairs)
+            _dtgt = []
+            for _r in range(_nrow):
+                _k = min(n_pairs - 1, _r // _Bd)
+                _j = int(pairs[_k][1])
+                if _dchain:
+                    _Lf = _j + 1
+                    _t = (max(0, _Lf - 1) if _dmode == "strong"
+                          else _Lf // 2)
+                else:
+                    # Legacy fixed-level application, still Req-1 capped.
+                    _t = max(0, _dfixed)
+                _dtgt.append(int(max(0, min(_t, _j))))
+            _dt = torch.tensor(
+                _dtgt, dtype=torch.long, device=real_chunks_det.device)
+            _dmax = int(_dt.max().item()) if _nrow else 0
+            with torch.no_grad():
+                _dx0 = real_chunks_det.detach()
+                _dcur = _dx0.clone()
+                if _duncond:
+                    # Step-UNCONDITIONED FN: it learned one generic "+1
+                    # shift" and is only defined at carn_step=0. The
+                    # schedule then only decides WHICH rows get that one
+                    # shift.
+                    _sel = (_dt > 0).nonzero(as_tuple=False).flatten()
+                    if _sel.numel() > 0:
+                        _sub = _dcur.index_select(0, _sel)
+                        _cs = torch.zeros(
+                            (_sub.shape[0],), dtype=torch.long,
+                            device=_sub.device)
+                        _sub = self.model.forward_noiser(
+                            _sub, _cs, residual=True)
+                        _dcur = _dcur.index_copy(0, _sel, _sub)
+                elif _dchain:
+                    # Same composition rule as the coupled chained apply:
+                    # feed cond=c to the rows whose chain includes c
+                    # (target >= c and SAME parity), c ascending.
+                    for _c in range(1, _dmax + 1):
+                        _sel = ((_dt >= _c)
+                                & ((_dt % 2) == (_c % 2))).nonzero(
+                                    as_tuple=False).flatten()
+                        if _sel.numel() == 0:
+                            continue
+                        _sub = _dcur.index_select(0, _sel)
+                        _cs = torch.full(
+                            (_sub.shape[0],), int(_c),
+                            dtype=torch.long, device=_sub.device)
+                        _sub = self.model.forward_noiser(
+                            _sub, _cs, residual=True)
+                        _dcur = _dcur.index_copy(0, _sel, _sub)
+                elif _dmax > 0:
+                    # Single conditioned call at each row's target level.
+                    _cs = _dt.clamp(min=1)
+                    _dcur = self.model.forward_noiser(
+                        _dx0, _cs, residual=True)
+                # Moment-preserving (texture-only) restore -- identical maths
+                # to the coupled apply: per-channel DC mean + per-sample
+                # mean-magnitude of the ORIGINAL are restored, so only
+                # texture STRUCTURE changes (no brightness/colour shift that
+                # the disc could latch onto).
+                _de = 1e-6
+                _dmci = _dx0.mean(dim=[1, 3, 4], keepdim=True)
+                _dmco = _dcur.mean(dim=[1, 3, 4], keepdim=True)
+                _dcur = _dcur - _dmco + _dmci
+                _dai = _dx0.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                _dao = _dcur.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                _dcur = _dcur * (_dai / (_dao + _de))
+                # target-0 rows keep the ORIGINAL clean chunk.
+                _dkeep = (_dt > 0).view(-1, 1, 1, 1, 1)
+                _dcur = torch.where(_dkeep, _dcur, _dx0)
+            real_chunks_det = _dcur.detach()
+            if (getattr(self, "is_main_process", True)
+                    and getattr(self, "_fn_decoupled_dbg", 0) < 3):
+                self._fn_decoupled_dbg = getattr(
+                    self, "_fn_decoupled_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    "[FN-DECOUPLED-APP] ACTIVE: pair_mode=%s cpp=1 mode=%s "
+                    "chain=%s uncond=%s n=%d levels=%s maxlvl=%d "
+                    "(positional single-chunk real; level from the fake "
+                    "chunk index+1, Req-1 capped at that index; level 0 "
+                    "rows keep clean GT)" % (
+                        pair_mode, _dmode, _dchain, _duncond, _nrow,
+                        _dtgt[:12], _dmax,
+                    ),
+                    file=_sys.stderr, flush=True,
+                )
+
         # ----- Disc timestep -----
         # WAN with action-aware forward expects per-frame timestep
         # ``[B, F]`` so the time_projection output matches the per-frame
@@ -13914,8 +14184,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.model, "forward_noiser_apply_gt_both", False))
                 _gt_former = bool(getattr(
                     self.model, "forward_noiser_apply_gt_former", False))
+                # ``forward_noiser_apply_decoupled`` additionally admits the
+                # SINGLE-CHUNK matched pool (chunks_per_pair == 1, i.e.
+                # ``ladd_gt_vs_fake_match=true`` with gt_transition OFF).
+                # Without this, a matched gt_vs_fake arm would be a SILENT
+                # NO-OP twice over: the positional decoupled apply above
+                # transforms ``real_chunks_det``, which the matched branch
+                # does not consume (it rebuilds ``ru`` from the pool).
                 if ((_gt_both or _gt_former)
-                        and chunks_per_pair == 2
+                        and (chunks_per_pair == 2
+                             or (_fn_decoupled and chunks_per_pair == 1))
                         and getattr(self.model, "forward_noiser", None)
                         is not None):
                   # chain_levels drives the FORMER-only forward scheme; any
@@ -13953,9 +14231,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     _tgt = []
                     for _r in range(_nuq):
                         _u = int(rows_bu[_r][1])
-                        _L = max(0, (_u + 1) - (_seed_r1 - 1))
-                        _t = (max(0, _L - 2) if _mode == "strong"
-                              else max(0, (_L - 1) // 2))
+                        if chunks_per_pair == 2:
+                            _L = max(0, (_u + 1) - (_seed_r1 - 1))
+                            _t = (max(0, _L - 2) if _mode == "strong"
+                                  else max(0, (_L - 1) // 2))
+                        else:
+                            # DECOUPLED single-chunk matched pool: the row IS
+                            # the candidate at pool chunk ``_u`` (no latter),
+                            # so the schedule keys on the NOISED chunk's own
+                            # position level. Identical mapping to cpp==2 --
+                            # there the noised chunk is the FORMER at ``_u``
+                            # whose own level is L-1, and weak=(L-1)//2 ==
+                            # _Lf//2, strong=max(0,L-2) == max(0,_Lf-1).
+                            _Lf = max(0, _u - (_seed_r1 - 1))
+                            _t = (max(0, _Lf - 1) if _mode == "strong"
+                                  else _Lf // 2)
                         # Req-1 cap: _mind = min matched-fake former chunk INDEX
                         # i. The student former's true drift LEVEL is always
                         # >= i+1 (drift = i+1+frontier_offset, offset>=0), so
@@ -14012,7 +14302,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         print(
                             "[FN-CHAIN-APP] mode=%s n=%d former targets=%s "
                             "(cap=served-fake drift-1; single<=2, recurse>2)"
-                            % (_mode, _nuq, _tgt[:12]),
+                            " cpp=%d pair_mode=%s decoupled=%s"
+                            % (_mode, _nuq, _tgt[:12],
+                               chunks_per_pair, pair_mode, _fn_decoupled),
                             file=_sys.stderr, flush=True,
                         )
                   else:
@@ -14040,6 +14332,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         self.model,
                         "forward_noiser_apply_gt_drift_cap", False))
                     _fn_offsets = (0, npb) if _gt_both else (0,)
+                    # DECOUPLED cpp==1: there is exactly ONE half. Restrict
+                    # the half loop so ``ru[:, npb:2*npb]`` (an EMPTY slice
+                    # at cpp==1) is never fed to the FN. Byte-identical at
+                    # cpp==2, where this is literally ``(0, npb)``.
+                    _half_offsets = ((0, npb) if chunks_per_pair == 2
+                                     else (0,))
                     with torch.no_grad():
                         if _drift_cap:
                             _BIGc = 1 << 30
@@ -14071,7 +14369,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                 (ru.shape[0],), _apply_lvl,
                                 dtype=torch.long, device=ru.device)
                         _halves = []
-                        for _h0 in (0, npb):
+                        for _h0 in _half_offsets:
                             _x0 = ru[:, _h0:_h0 + npb]
                             if _h0 not in _fn_offsets:
                                 _halves.append(_x0)
@@ -18962,6 +19260,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self._style_grad_telemetry(
                     generator_loss, _style_raw, out,
                     current_step=int(self.step),
+                    # The probe site. ``train_chunk`` is the ONE tensor
+                    # both terms provably share -- the style term reaches
+                    # the generator only through it, and the DMD term is
+                    # built from it -- so the ratio it yields cannot be
+                    # zeroed by an off-path parameter pick. See the
+                    # helper's docstring for what that accident looked
+                    # like on ``dmd10k_gantune_w2gram``.
+                    probe_tensor=train_chunk,
                 )
                 generator_loss = generator_loss + _style_w
                 # THE PROOF-OF-FIRE PAIR, published HERE because HERE is

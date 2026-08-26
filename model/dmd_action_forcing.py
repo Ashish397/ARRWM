@@ -2341,6 +2341,32 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_apply_gt_former = bool(
             getattr(args, "forward_noiser_apply_gt_former", False)
         )
+        # ``forward_noiser_apply_decoupled`` (2026-08-26, default False =
+        # byte-identical): DECOUPLE the FN (CARN) application to the GT
+        # context from the ``gt_transition`` pair mode.
+        #
+        # Until this flag, the ONLY site that applied the forward noiser to
+        # the real/GT disc input lived inside the MATCHED-POOL branch of
+        # ``_ladd_run_pair_mode`` and was gated by BOTH
+        #   (a) ``_match_active``  -- gt_transition + ladd_gt_transition_match
+        #       (or gt_vs_fake + ladd_gt_vs_fake_match), and
+        #   (b) ``chunks_per_pair == 2`` -- i.e. gt_transition ONLY.
+        # An arm running ``ladd_gt_transition_enabled=false`` +
+        # ``ladd_gt_vs_fake_enabled=true`` could therefore set
+        # ``forward_noiser_apply_gt_former=true`` and the FN would NEVER
+        # touch a single tensor: a SILENT NO-OP (log census: zero
+        # ``[FN-GT-FORMER]`` / ``[FN-CHAIN-APP]`` banners in every such arm).
+        #
+        # With this flag ON, the FN is applied to the POSITIONAL
+        # single-chunk real batch (``chunks_per_pair == 1``: gt_vs_fake /
+        # adjacent_chunks), i.e. reachable with NO gt_transition and NO
+        # matched pool. Requires ``forward_noiser_apply_gt_former`` (or
+        # ``_gt_both``; under a single chunk the two mean the same thing)
+        # and a constructed forward noiser. Emits ``[FN-DECOUPLED-APP]``
+        # with the realized per-row levels so a run can PROVE it fired.
+        self.forward_noiser_apply_decoupled = bool(
+            getattr(args, "forward_noiser_apply_decoupled", False)
+        )
         # ``forward_noiser_apply_gt_level_max`` (h4): when > apply_gt_level
         # (and the FN is step-conditioned), the application level is drawn
         # PER ROW uniformly in [apply_gt_level, level_max] instead of the

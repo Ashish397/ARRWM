@@ -246,8 +246,14 @@ def run_with_block(weight, dtype, block=None):
                     {"train/style_gram_dist_raw": float(raw.detach())})
 
         t._compute_style_gram_loss = types.MethodType(fake_compute, t)
+        # ``**kw`` rather than a fixed signature: the shipped call site
+        # passes the probe SITE (``probe_tensor=train_chunk``) and this
+        # stub must not be the thing that pins the probe's signature --
+        # that is ``test_the_call_site_hands_the_probe_the_student_chunk``'s
+        # job. A rigid lambda here turns any probe change into a spurious
+        # byte-identity failure.
         t._style_grad_telemetry = types.MethodType(
-            lambda self, gl, sr, o, *, current_step: None, t,
+            lambda self, gl, sr, o, *, current_step, **kw: None, t,
         )
         ns = {
             "self": t, "train_chunk": train_chunk, "train_info": {},
@@ -1164,6 +1170,309 @@ class TestEndToEnd(unittest.TestCase):
             "the shipped path; the signal is not usable inside the ~50-step "
             "budget the researcher asked for.",
         )
+
+
+# ===========================================================================
+# 10. THE GRAD PROBE ITSELF  (``_style_grad_telemetry``)
+#
+# Added 2026-08-26 after the live ``dmd10k_gantune_w2gram`` arm reported
+#
+#     style_grad_norm_unweighted  = 0.0  (EXACTLY, 13/13 telemetry samples)
+#     style_base_grad_norm_shared = 0.032 .. 0.209   (healthy)
+#     style_grad_probe_unavailable  ABSENT
+#
+# while every test in section 9 passed. Section 9 asserts the gradient
+# reaches the LATENT TENSOR; nothing asserted anything about the PROBE, so
+# the probe was the one part of the feature with no coverage at all. These
+# tests close that hole and, between them, decide which of the two readings
+# of that zero is the true one:
+#
+#   (a) MEASUREMENT ARTEFACT -- the probed parameter is not on the style
+#       loss's graph, so ``autograd.grad`` legitimately hands back zeros;
+#   (b) REAL SEVERING -- the style term genuinely delivers no gradient.
+#
+# ``test_the_style_term_delivers_gradient_to_an_on_path_parameter`` rules
+# out (b) for the shipped code path. ``test_an_off_path_trailing_param_
+# reproduces_the_live_zero`` reproduces (a)'s EXACT signature -- non-None,
+# exactly zero, no ``_unavailable`` key -- which is the only one of the two
+# that can produce what the live run recorded.
+# ===========================================================================
+class OnPathGen(nn.Module):
+    """A generator stand-in whose LAST registered parameter is on the path
+    that produces the latent chunk."""
+
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Conv3d(16, 16, 1)          # last param = body.bias
+
+    def forward(self, z):
+        return self.body(z.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+
+
+class AuxTailGen(nn.Module):
+    """A generator stand-in shaped like the real one: an auxiliary branch
+    registered AFTER the trunk, fed by its own loss, and connected to the
+    chunk only through a concat-then-slice junction.
+
+    That junction is what every auxiliary TOKEN branch in this codebase
+    does (state tokens, action tokens, register tokens): extra tokens ride
+    the same tensor through the trunk and are sliced off before the head.
+    The parameter is therefore graph-REACHABLE from the chunk -- so
+    ``autograd.grad`` returns a tensor rather than ``None`` -- while its
+    gradient from the chunk is structurally, exactly zero.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Conv3d(16, 16, 1)
+        self.aux = nn.Linear(2, 2)                # registered LAST
+
+    def forward(self, z):
+        b, f, c, h, w = z.shape
+        x = self.body(z.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+        tok = self.aux(torch.ones(1, 2)).reshape(1, 1, 1, 1, 2)
+        tok = tok.expand(b, f, c, h, 2)
+        chunk = torch.cat([x, tok], dim=-1)[..., :w]
+        return chunk, self.aux(torch.ones(1, 2)).sum()
+
+
+class TestStyleGradProbe(unittest.TestCase):
+
+    def _fire(self, gen, *, seed=71):
+        """Run the SHIPPED helper + the SHIPPED probe end to end."""
+        t = make_e2e_trainer(gan_grad_telemetry_every=1)
+        t.model.generator = gen
+        torch.manual_seed(seed)
+        z = torch.randn(1, 4, 16, 12, 16) * 0.5
+        res = gen(z)
+        aux = None
+        chunk = res
+        if isinstance(res, tuple):
+            chunk, aux = res
+        w, raw, logs = t._compute_style_gram_loss(chunk, {}, current_step=0)
+        self.assertIsNotNone(raw, f"the style helper declined: {logs}")
+        generator_loss = (chunk ** 2).mean()
+        if aux is not None:
+            # The aux branch's OWN loss -- the analogue of the z-guidance /
+            # state-probe terms that give the real trailing parameter a
+            # healthy base gradient while contributing nothing to the
+            # predicted latents.
+            generator_loss = generator_loss + 3.0 * aux
+        out = {}
+        t._style_grad_telemetry(
+            generator_loss, raw, out, current_step=0, probe_tensor=chunk,
+        )
+        return t, chunk, raw, out
+
+    # -- (b) is FALSE for the shipped path -----------------------------
+    def test_the_style_term_delivers_gradient_to_an_on_path_parameter(self):
+        """THE VERDICT TEST. Run the real ``_compute_style_gram_loss`` and
+        the real ``grad_at``, and differentiate at a generator PARAMETER
+        (not at the latent tensor section 9 already covers).
+
+        A non-zero result here means the crop -> VAE decode -> frozen
+        encoder -> Gram chain carries gradient all the way into the
+        generator's weights, so a zero read in production cannot be a
+        severed loss -- it can only be a probe pointed at the wrong
+        parameter.
+        """
+        gen = OnPathGen()
+        t, chunk, raw, out = self._fire(gen)
+        g = torch.autograd.grad(
+            raw, [gen.body.bias], retain_graph=True, allow_unused=True,
+        )[0]
+        self.assertIsNotNone(
+            g, "the style term does not even reach an on-path parameter",
+        )
+        self.assertGreater(
+            float(g.norm()), 0.0,
+            "the style term reaches an on-path generator parameter but "
+            "delivers exactly zero gradient -- that WOULD be a real "
+            "severing",
+        )
+        # ... and the probe reports it.
+        self.assertGreater(out["train/style_grad_norm_unweighted"], 0.0)
+        self.assertEqual(out.get("train/style_param_probe_offpath"), 0.0)
+
+    # -- (a) reproduces the live signature EXACTLY ---------------------
+    def test_an_off_path_trailing_param_reproduces_the_live_zero(self):
+        """The observed production signature, reproduced on demand.
+
+        ``style_grad_norm_* == 0.0`` with a healthy base grad and NO
+        ``_unavailable`` key is reachable with the loss fully intact, as
+        long as the probed parameter is the trailing auxiliary one. This
+        is what makes the live reading a MEASUREMENT ARTEFACT rather than
+        evidence about the loss.
+        """
+        gen = AuxTailGen()
+        names = [n for n, p in gen.named_parameters() if p.requires_grad]
+        self.assertEqual(names[-1], "aux.bias", "harness no longer models "
+                         "a trailing auxiliary parameter")
+        t, chunk, raw, out = self._fire(gen)
+
+        # 1. The style term's gradient at the trailing param: present in
+        #    the graph (NOT None) and exactly zero -- the live signature.
+        g_style = torch.autograd.grad(
+            raw, [gen.aux.bias], retain_graph=True, allow_unused=True,
+        )[0]
+        self.assertIsNotNone(
+            g_style, "the harness no longer reproduces the reachable-but-"
+                     "zero junction the live signature requires",
+        )
+        self.assertEqual(float(g_style.norm()), 0.0)
+
+        # 2. The base loss's gradient at the SAME param is healthy, which
+        #    is what made the old pairing look like a severed style term.
+        g_base = torch.autograd.grad(
+            (chunk ** 2).mean() + 3.0 * gen.aux(torch.ones(1, 2)).sum(),
+            [gen.aux.bias], retain_graph=True, allow_unused=True,
+        )[0]
+        self.assertGreater(float(g_base.norm()), 0.0)
+
+        # 3. And the loss is NOT severed: the same style term has a
+        #    non-zero gradient at an on-path parameter.
+        g_on = torch.autograd.grad(
+            raw, [gen.body.bias], retain_graph=True, allow_unused=True,
+        )[0]
+        self.assertGreater(float(g_on.norm()), 0.0)
+
+    def test_the_fixed_probe_reads_nonzero_where_the_old_one_read_zero(self):
+        """The FIX. On the exact configuration that produced the live
+        zeros, the chunk-site probe reports a real number and the demoted
+        parameter probe flags itself off-path."""
+        t, chunk, raw, out = self._fire(AuxTailGen())
+        self.assertEqual(out["train/style_grad_probe_site_is_chunk"], 1.0)
+        self.assertGreater(out["train/style_grad_norm_unweighted"], 0.0)
+        self.assertGreater(out["train/style_base_grad_norm_shared"], 0.0)
+        self.assertGreater(out["train/style_dmd_grad_ratio_unweighted"], 0.0)
+        self.assertIn("train/style_dmd_grad_cos", out)
+        self.assertNotIn("train/style_grad_telemetry_err", out)
+        self.assertNotIn("train/style_grad_probe_unavailable", out)
+        # The diagnostic names the artefact instead of leaving a reader to
+        # infer it from a suspicious zero.
+        self.assertEqual(out["train/style_param_probe_ran"], 1.0)
+        self.assertEqual(out["train/style_param_probe_offpath"], 1.0)
+        self.assertEqual(out["train/style_param_grad_norm_unweighted"], 0.0)
+        self.assertGreater(out["train/style_param_base_grad_norm"], 0.0)
+
+    def test_the_parameter_diagnostic_runs_only_once(self):
+        """It costs a full backward through the generator and its only job
+        is to answer a yes/no question, so it must not recur."""
+        t = make_e2e_trainer(gan_grad_telemetry_every=1)
+        gen = AuxTailGen()
+        t.model.generator = gen
+        for step in range(2):
+            torch.manual_seed(71 + step)
+            z = torch.randn(1, 4, 16, 12, 16) * 0.5
+            chunk, aux = gen(z)
+            w, raw, _ = t._compute_style_gram_loss(
+                chunk, {}, current_step=step,
+            )
+            out = {}
+            t._style_grad_telemetry(
+                (chunk ** 2).mean() + 3.0 * aux, raw, out,
+                current_step=step, probe_tensor=chunk,
+            )
+            if step == 0:
+                self.assertEqual(out["train/style_param_probe_ran"], 1.0)
+            else:
+                self.assertNotIn("train/style_param_probe_ran", out)
+                # ...while the authoritative reading keeps coming.
+                self.assertGreater(
+                    out["train/style_grad_norm_unweighted"], 0.0)
+
+    def test_a_genuinely_severed_style_term_is_reported_loudly(self):
+        """The other side of the fix: if the style term ever really does
+        stop reaching the chunk it was built from, the probe must say so
+        with its own key and never publish a 0.0 norm."""
+        t = make_e2e_trainer(gan_grad_telemetry_every=1)
+        gen = OnPathGen()
+        t.model.generator = gen
+        torch.manual_seed(71)
+        z = torch.randn(1, 4, 16, 12, 16) * 0.5
+        chunk = gen(z)
+        w, raw, _ = t._compute_style_gram_loss(chunk, {}, current_step=0)
+        severed = raw.detach() + 0.0 * torch.zeros(
+            1, requires_grad=True).sum()
+        out = {}
+        t._style_grad_telemetry(
+            (chunk ** 2).mean(), severed, out,
+            current_step=0, probe_tensor=chunk,
+        )
+        self.assertEqual(out["train/style_grad_probe_unavailable"], 1.0)
+        self.assertEqual(out["train/style_grad_severed_from_chunk"], 1.0)
+        self.assertNotIn("train/style_grad_norm_unweighted", out)
+
+    def test_the_probe_respects_its_cadence_knob(self):
+        t = make_e2e_trainer(gan_grad_telemetry_every=0)
+        gen = OnPathGen()
+        t.model.generator = gen
+        torch.manual_seed(71)
+        chunk = gen(torch.randn(1, 4, 16, 12, 16) * 0.5)
+        w, raw, _ = t._compute_style_gram_loss(chunk, {}, current_step=0)
+        out = {}
+        t._style_grad_telemetry(
+            (chunk ** 2).mean(), raw, out, current_step=0,
+            probe_tensor=chunk,
+        )
+        self.assertEqual(out, {})
+
+    def test_the_call_site_hands_the_probe_the_student_chunk(self):
+        """Sourced from the SHIPPED trainer, so the probe cannot be left
+        pointing at the old site by a future edit."""
+        src = inspect.getsource(Trainer)
+        m = re.search(
+            r"self\._style_grad_telemetry\((.*?)\n\s*\)\n", src, re.S,
+        )
+        self.assertIsNotNone(m, "the style grad-telemetry call site moved")
+        self.assertIn("probe_tensor=train_chunk", m.group(1))
+
+
+class TestRealPoolBreadthTelemetry(unittest.TestCase):
+    """``style_real_unique_rides`` reads the RIDES IN THIS STEP'S DRAW and
+    is bounded by the crop count -- it was read as "the style target is
+    estimated from 4 rides", which it does not say. The pool-wide key does.
+    """
+
+    def test_pool_wide_ride_count_is_published_and_is_not_the_draw_count(self):
+        t = make_e2e_trainer()
+        t._pix_real_rides = {f"r{i}" for i in range(17)}
+        torch.manual_seed(71)
+        chunk = (torch.randn(1, 4, 16, 12, 16) * 0.5).requires_grad_(True)
+        _w, _raw, logs = t._compute_style_gram_loss(chunk, {}, current_step=0)
+        self.assertEqual(logs["train/style_real_pool_unique_rides"], 17.0)
+        # The per-step draw is bounded by the number of crops (3 here), so
+        # the two keys measure different things and must not be conflated.
+        self.assertLessEqual(logs["train/style_real_unique_rides"], 3.0)
+
+    def test_pool_refresh_is_the_knob_that_grows_the_pool(self):
+        """``style_gram_real_pool_windows`` is a CAP (memory bound);
+        ``style_gram_real_pool_refresh`` is the admission rate, and
+        admission is the only thing that grows support. Raising the cap
+        while lowering the refresh narrows the target -- the opposite of
+        what a 'wider pool' change intends.
+        """
+        seen = {}
+        for refresh in (1, 8):
+            t = make_e2e_trainer(
+                style_gram_real_pool_refresh=refresh,
+                style_gram_real_pool_windows=4096,
+            )
+            torch.manual_seed(71)
+            chunk = (torch.randn(1, 4, 16, 12, 16) * 0.5).requires_grad_(True)
+            t._compute_style_gram_loss(chunk, {}, current_step=0)
+            # ``_pix_pool_fill`` is recorded, not executed, by the harness:
+            # count the CONTINUOUS-REFRESH admissions (one call per unit of
+            # ``pool_refresh``), ignoring any band top-ups.
+            seen[refresh] = len(t._fill_calls)
+            for kw in t._fill_calls:
+                self.assertEqual(kw["cap"], 4096)
+        self.assertGreater(
+            seen[8], seen[1],
+            "raising style_gram_real_pool_refresh did not increase the "
+            "admission rate -- it is not the breadth knob",
+        )
+        self.assertGreaterEqual(seen[8] - seen[1], 7)
 
 
 if __name__ == "__main__":
