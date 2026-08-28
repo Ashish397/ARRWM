@@ -86,6 +86,15 @@ class _SurStub(StubTrainer):
     _maybe_run_surrogate_distillation = (
         Trainer._maybe_run_surrogate_distillation
     )
+    # Added 2026-08-26 alongside ``_RecDistiller.should_grad_check``.
+    # ``_compute_pixel_texture_g_loss``'s surrogate branch takes its
+    # critic through ``_surrogate_g_snapshot_critic`` (the guard against
+    # the in-place-Adam version-counter hazard); that indirection landed
+    # after this stub was written, so three consumption tests died on
+    # AttributeError before reaching their assertions. Bind the SHIPPED
+    # helper rather than stubbing it out, so the tests keep exercising
+    # the real snapshot logic.
+    _surrogate_g_snapshot_critic = Trainer._surrogate_g_snapshot_critic
 
     def __init__(self, **cfg):
         cfg.setdefault("pix_gan_weight", 0.1)
@@ -107,6 +116,15 @@ class _RecDistiller:
     def step(self, **kw):
         self.calls.append(kw)
         return {"train/surrogate_loss_total": 0.5}
+
+    # Added 2026-08-26. The shipped trainer calls this right after
+    # ``step`` to decide whether to run the periodic direct-vs-surrogate
+    # gradient audit (``surrogate_grad_check_every``). That call site was
+    # wired up after this stub was written, so every test in this file
+    # died on AttributeError before reaching its own assertions -- 9
+    # RED tests that were reporting a stale stub, not a real defect.
+    def should_grad_check(self, current_step):
+        return False
 
 
 class _StubCritic(nn.Module):
@@ -318,6 +336,23 @@ def test_full_path_call_contract():
     assert call["optimizer"] is stub.latent_critic_optimizer
     assert call["current_step"] == 7
     assert callable(call["teacher_value_fn"])
+
+
+def test_direct_field_receives_exact_origin_for_every_crop():
+    stub = _stub_with_distiller()
+    stub.latent_texture_critic.predicts_gradient = True
+    stub.latent_texture_critic.pixel_condition_channels = 0
+    Trainer._maybe_run_surrogate_distillation(
+        stub, _info(requires_grad=True), {}, current_step=7,
+    )
+    (call,) = stub.latent_texture_distiller.calls
+    assert len(call["origin_fake"]) == call["z_fake"].shape[0]
+    assert len(call["origin_real"]) == call["z_real"].shape[0]
+    assert all(len(origin) == 2 for origin in call["origin_fake"])
+    assert all(len(origin) == 2 for origin in call["origin_real"])
+    # Pool x0 is deliberately one in this fixture; the old mean-origin path
+    # overwrote it with zero for every row.
+    assert all(int(origin[1]) == 1 for origin in call["origin_real"])
 
 
 def test_teacher_closure_decodes_trims_and_reshapes():

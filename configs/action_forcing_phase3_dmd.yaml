@@ -60,6 +60,26 @@ gan_loss_weight: 1.0          # CODEBASE DEFAULT set 2026-08-25 from the w1 tuni
 gan_r1_gamma: 1.0             # zero-centered grad penalty on real samples
 gan_warmup_steps: 500         # linear ramp 0 → gan_loss_weight on G side
 gan_updates_per_step: 1       # 1:1 D:G ratio
+
+# --- D-WINS TRIPWIRE (observability only; model/gan_balance.py).
+# Fires when d_loss stays <= gan_dwins_floor for gan_dwins_k consecutive
+# LOGGED steps (the [GAN-HEALTH] cadence, gan_grad_telemetry_every).
+# MEASURED motivation: pixdirect_strong's median over steps>=50 was
+# 0.3632 -- inside the 0.25-0.55 healthy band -- while its last four
+# logged steps were 0.0104/0.0039/0.0024/0.0102. A median cannot tell a
+# recovered transient (pixdirect_onlinelr: 0.1346, 0.0139, then 0.6243)
+# from a terminal collapse; a consecutive-run counter can.
+# k=3 because onlinelr's recovered transient is 2 observations long, so
+# 3 is the smallest K that separates the measured recovery from the
+# measured collapse. floor=0.135 is the w003 D-wins threshold.
+# Read train/gan_dwins_tripped (headline), _max_streak (how close a
+# non-tripping run came) and _trip_step. Exactly-0.0 d_loss rows -- the
+# pre-gan_disc_start_step not-run sentinel -- are rejected, not counted.
+# Defaults ON: it touches no tensor, no optimiser and no RNG, so
+# training is byte-identical, and an alarm that ships off is worthless.
+gan_dwins_tripwire_enabled: true
+gan_dwins_floor: 0.135
+gan_dwins_k: 3
 gan_lr: 2.0e-04
 gan_betas: [0.0, 0.9]
 gan_eps: 1.0e-08
@@ -227,10 +247,18 @@ gan_pixel_texture_enabled: false
 
 # §3.1 / A23 — fake source. false (DEFAULT, and the first adversarial
 # arm's setting per WP_PIXGAN §14) = the flash ``flash_dmd_gan_x0`` x0:
-# cheaper, no retained rung graph, no frame-dilution mask. true = the A23
+# cheaper and no retained finish-rung graph. true = the A23
 # finish-grad ladder. A23 is OVERTURNED (§6.0), so this is an
 # EXPERIMENTAL VARIABLE, not a quality gate — both paths stay tested.
 pix_finish_grad_enabled: false
+
+# Flash-buffer liveness correction (2026-08-27). The producer deliberately
+# makes the trailing block of a multi-block call graph-free, while the
+# assembled CopySlices slab still has requires_grad=True via earlier blocks.
+# false preserves historical newest-frame selection exactly. Corrected
+# calibration arms set true and select the latest contiguous run marked live
+# by ``flash_dmd_gan_grad_mask``; a missing/all-false mask fails loudly.
+pix_flash_grad_select_enabled: false
 
 # §5.5 / §12 — GENERATOR-SIDE WEIGHT. DELIBERATELY UNSET.
 #
@@ -391,6 +419,17 @@ pix_seed: 20260823
 # (None, None, None) whenever this key is absent or false).
 surrogate_critic_enabled: false
 
+# Graph-free decoder-shaped pullback. This is mutually exclusive with the
+# learned ``surrogate_critic_enabled`` modes. It decodes detached current
+# latents, obtains the current pixel-discriminator cotangent, transports it
+# through the frozen 17-stage WAN reverse hierarchy, and serves the resulting
+# field through a linear generator loss. The bundle is required when enabled.
+surrogate_decoder_shaped_enabled: false
+surrogate_decoder_shaped_bundle: ""
+# Optional live exact-VJP audit cadence. 0 is zero-cost; smokes should use 1
+# so the deployed per-sample Q1 is directly visible before a long arm.
+surrogate_decoder_shaped_audit_every: 0
+
 # Architecture (docs/WP_SURROGATE.md §3). Defaults below are what
 # build_from_config falls back to if a key here is ever removed --
 # duplicated for visibility, not because the fallback is untested.
@@ -399,6 +438,43 @@ surrogate_critic_num_blocks: 4
 surrogate_critic_num_heads: 8
 surrogate_critic_max_frames: 64
 surrogate_critic_lr: 2.0e-4
+
+# Student representation. ``potential`` is the historical scalar critic and
+# retains its Sobolev double-backward. ``direct`` predicts the teacher's
+# latent gradient vector and trains it with a first-order synthetic-gradient
+# objective. The latter is an explicit arm, not a silent behaviour change.
+surrogate_gradient_mode: potential
+surrogate_direct_width: 96
+surrogate_direct_num_blocks: 6
+surrogate_direct_head_init_std: 1.0e-3
+surrogate_direct_teacher_rms_beta: 0.95
+# Default-off architecture extensions for the direct vector field. Temporal
+# mixing models the VAE decoder's cross-frame Jacobian; global context gives
+# the local field access to clip-wide moments used by the VGG statistic head.
+surrogate_direct_temporal_mixing: false
+surrogate_direct_temporal_blocks: 2
+surrogate_direct_global_context: false
+# ``mse`` is the historical unit-target regression. ``cosine`` optimises the
+# direction that gradient_for_generator actually consumes. Per-domain weights
+# allow a fake-only synthetic-gradient student without paying/fitting unused
+# real-manifold teacher fields.
+surrogate_direct_loss_mode: mse
+surrogate_direct_real_loss_weight: 1.0
+surrogate_direct_fake_loss_weight: 1.0
+# Optional detached pixel guide for the direct-gradient student. The VAE is
+# decoded under no_grad; RGB max/min extrema are reduced over each exact 4x
+# temporal group and 8x8 spatial footprint back to the latent grid (6
+# channels). A zero-initialised side projection conditions the vector-field
+# predictor without creating a second generator-gradient route.
+surrogate_pixel_condition_enabled: false
+surrogate_pixel_condition_decode_batch: 1
+# Direct-gradient teacher target graph microbatch. 0 preserves historical
+# all-at-once construction. Positive values serialize graph construction and
+# concatenate the identical target batch, reducing peak without losing crops.
+surrogate_teacher_target_microbatch: 0
+# Diagnostic-only matched-norm tangent control for the sparse full-parameter
+# calibration probe. Default false: no third DiT VJP and no RNG consumption.
+surrogate_param_control_enabled: false
 
 # Distillation targets (§1: value MSE + Sobolev grad-z MSE).
 # grad_loss_normalize=true is the MAIN-RULED default (2026-08-23,
@@ -453,12 +529,33 @@ surrogate_teacher_use_checkpoint: true
 # Heads get an NS-logistic D-update every distillation step (encoder frozen);
 # the latent critic then distils value+Sobolev targets from the just-updated
 # teacher exactly as with the pixel backbone.
+# "ladd_pixel" (2026-08-26, researcher directive) = the LADD gt_vs_fake
+#   discriminator itself, running on its PIXEL feature source
+#   (ladd_feature_source=dinov2|pixgan). This is the intended production
+#   route, not a variant: the teacher is then the critic the adversarial
+#   loop is ACTUALLY TRAINING, on the ACTUAL gt_vs_fake pairing, rather
+#   than a parallel copy with its own pairing and its own warm-up. It
+#   needs no surrogate_sam2_* key at all -- no separate optimizer, no
+#   separate heads D-update -- because its heads AND its (trainable)
+#   encoder are updated by the gt_vs_fake D-update at
+#   gan_updates_per_step (5) per step. See
+#   analysis/gan_tuning/PIXEL_FEATURE_SOURCE.md.
 surrogate_teacher_backbone: pixel
 surrogate_sam2_checkpoint_path: sam2_checkpoints/sam2.1_hiera_base_plus.pt
 surrogate_sam2_config_path: configs/sam2.1/sam2.1_hiera_b+.yaml
 surrogate_sam2_resolution: 512
-surrogate_sam2_lr: 2.0e-4
-surrogate_sam2_updates_per_step: 1
+# TEACHER-HEAD CADENCE, CORRECTED 2026-08-26 (researcher directive).
+# Was lr 2.0e-4 / 1 update per step. The distillation runs only every
+# ``pix_teacher_refresh_every`` (4) steps, so 1 update/step is really
+# 1 update per REFRESH -- ~19 head updates in a 115-step arm, after
+# which the SAM2 teacher separated real from fake at ~0.03 and the
+# surrogate was therefore distilling a critic that had not yet learned
+# anything. Any result read off that arm is void. 8 updates at 5e-4
+# gives ~150 updates over the same 115 steps.
+# NOTE this pair is INERT for surrogate_teacher_backbone=ladd_pixel,
+# which has no separate head optimizer (see above).
+surrogate_sam2_lr: 5.0e-4
+surrogate_sam2_updates_per_step: 8
 surrogate_sam2_frame_pool: mean
 surrogate_sam2_preserve_aspect: true
 surrogate_sam2_pad_to_square: true
@@ -941,3 +1038,154 @@ gan_of_head_lr: 0.0
 # 3.05e-5. The tap features are cast at the head boundary in both
 # classify loops. false = build at the trainer dtype = today.
 gan_of_head_fp32: false
+
+# ---------------------------------------------------------------------------
+# LADD PIXEL FEATURE SOURCE (2026-08-26).
+# analysis/gan_tuning/PIXEL_FEATURE_SOURCE.md; model/ladd_pixel_features.py
+#
+# THE GATE IS ``ladd_feature_source``, which already exists above and
+# already defaults to "real". Setting it to "dinov2" or "pixgan" switches
+# the LADD discriminator's feature basis from WAN transformer taps of
+# LATENTS to a conv/ViT encoder run on DECODED PIXELS. Every key below is
+# read ONLY on that path (model/ladd_pixel_features.py::
+# build_pixel_feature_source and trainer ``_ladd_install_pixel_decode``),
+# so with the historical "real"/"fake" values none of them is consulted,
+# nothing is constructed, no decode happens and no log key appears.
+#
+# WHY: analysis/sharpness/TEXTURE_REVIEW.md §0.2 measured the "texture of
+# dots" as a 16 px 2-D lattice -- fold2d P=16 residual peak-to-peak 11.51
+# luma units for ``ofclean`` against 3.30 for the GT half through the SAME
+# decoder, 39 % of the folded variance in the non-separable dot term
+# against 13 % for GT. 16 px = 2 latent cells = ONE WAN TRANSFORMER PATCH.
+# The LADD head emits one logit per patch token, so the generator's
+# adversarial gradient is a field on the patch grid and the decoder prints
+# it. A pixel encoder carries no such grid.
+# ---------------------------------------------------------------------------
+
+# --- geometry. Deliberately the SAME crop as the pixel critic and the
+# style loss (pix_crop_lat / style_gram_crop_lat = [24, 32]) so all three
+# measure texture at one scale. 24x32 latent -> 192x256 px -> 176x240
+# after the border trim.
+ladd_pixel_crop_rows: 24
+ladd_pixel_crop_cols: 32
+# Crops per DISC ROW. Origins are shared by every row in a forward (so
+# real and fake are spatially aligned whatever the batch layout is) and
+# are a deterministic function of the step, so the five D-updates and the
+# two finite-difference R1 forwards all score the same crop. Raising this
+# buys spatial coverage per step at a linear decode cost.
+ladd_pixel_crops_per_row: 1
+ladd_pixel_lat_frames: 2
+ladd_pixel_frames_per_crop: 2
+ladd_pixel_border_trim: 8
+ladd_pixel_decode_batch: 4
+# INERT ON THE ladd_pixel_* ROUTE: nothing in model/ladd_disc.py reads
+# ``decode_batch``, so lowering it is a SILENT NO-OP. The knob that
+# really splits the decode is ladd_pixel_decode_split (below). The
+# surrogate/pixel-critic path's equivalent is a DIFFERENT key,
+# pix_decode_batch.
+#
+# --- SAMPLE-BUDGET knobs. All three DEFAULT OFF, and off is the legacy
+# path byte for byte (same RNG draw order and count, one decode call,
+# full-height uniform y0). Prove each fired from its counter, never from
+# the config echo:
+#   ladd_pix_decode_split_active   1.0 when the split really ran
+#   ladd_pix_crop_band_active      1.0 when the y0 band is restricted
+#   ladd_pix_crop_stratify_active  1.0 when the K origins are stratified
+#
+# ladd_pixel_decode_split: >0 decodes the [B*K, L, C, h, w] crop tensor
+# in row-groups of this many rows instead of one shot, so the VAE
+# decoder's transient is capped and crops_per_row x lat_frames can be
+# raised past what a single-shot decode fits. 0 = off.
+ladd_pixel_decode_split: 0
+# ladd_pixel_crop_y_lo_frac / _hi_frac: restrict the crop ORIGIN band to
+# a vertical slice of the latent frame, as fractions of H. (0.0, 1.0) is
+# off. MEASURED motivation: 39 % of the adversarial crops contain no road
+# or verge at all, on a budget where only 8.2 % of a chunk's latent cells
+# see adversarial gradient per G-update. Lower two thirds is 0.3333; the
+# texture-benchmark band (analysis/sharpness/radial_spec.py CROPS) is
+# 0.35 / 0.97. *** NEEDS RESEARCHER SIGN-OFF before an arm turns it on:
+# it changes what the disc is trained to call "real" and biases it
+# toward road/verge statistics, which is a recipe change. ***
+ladd_pixel_crop_y_lo_frac: 0.0
+ladd_pixel_crop_y_hi_frac: 1.0
+# ladd_pixel_crop_stratify_x: 1 spreads the K crop origins over K equal
+# column bands (one draw per band) instead of K independent uniform
+# draws, so coverage is K*p instead of the union 1-(1-p)^K and two crops
+# cannot land on top of each other. Only does anything at
+# ladd_pixel_crops_per_row > 1.
+ladd_pixel_crop_stratify_x: 0
+# Optional generator-guidance geometry. null = inherit the D geometry via
+# the historical single-route path (default, byte-identical). Setting any
+# value activates an explicit split: D/R1 continue to use ladd_pixel_* above,
+# while generator guidance uses these values (unset members inherit D).
+ladd_pixel_g_crops_per_row: null
+ladd_pixel_g_lat_frames: null
+ladd_pixel_g_frames_per_crop: null
+ladd_pixel_g_decode_split: null
+ladd_pixel_g_crop_stratify_x: null
+# Optional no-grad decode cache. A hit requires the exact retained tensor
+# object, shape/stride/storage offset, mutation version and step epoch.
+# Never key this path by data_ptr: the discriminator builds fresh temporary
+# micro-group tensors and the allocator can reuse a freed address immediately.
+# Those micro-groups have no intended production reuse, so this defaults off.
+# Graph-on decodes are never cached. The enabled/hit/miss telemetry proves the
+# resolved behavior in live runs.
+ladd_pixel_decode_cache: false
+# Memory-only boundary for unusually wide detached pixel-D updates. After a
+# deferred D closure consumes its no-grad decoded RGB cache, discard that
+# cache and return unused CUDA allocator blocks before the next outer loss.
+# False preserves the historical allocator/cache lifetime.
+ladd_pixel_post_d_memory_release: false
+
+# --- ANTI-LATTICE. Both default ON for the pixel path.
+# Phase jitter, in pixels, applied as an offset INSIDE the border trim
+# that is being cropped away anyway -- so it costs nothing and introduces
+# no padding. This is the load-bearing part of the cure: fold2d measures
+# PHASE-LOCKED structure, and an encoder whose grid phase moves every step
+# cannot accumulate a phase-locked artefact. 0 disables it (the control).
+ladd_pixel_grid_jitter: 8
+# Texture-only input contract for decoded-pixel sources. ``dc`` removes the
+# per-frame/per-channel spatial mean before the encoder, making the
+# discriminator invariant to global exposure/colour offsets. ``swt`` keeps
+# that guarantee and adds an undecimated fixed wavelet-detail residual.
+# Default ``none`` is historical byte identity; active experiments must prove
+# the selected path through train/ladd_pix_input_filter_{dc,swt}.
+ladd_pixel_input_filter: none       # none | dc | swt
+ladd_pixel_swt_strength: 1.0        # used only by input_filter=swt
+# pixgan only: blur-pool every stride-2 subsample (Zhang, ICML 2019).
+# model/pixel_texture_disc.py:528-541 is three Conv2d(k4,s2,p1) with NO
+# low-pass anywhere; a shift-VARIANT stride-8 critic asked to judge an
+# 8 px artefact can reinforce it, because its own response is a function
+# of that artefact's phase. false reproduces the un-blurred trunk, and
+# exists so the two can be compared rather than asserted.
+ladd_pixel_blurpool: true
+ladd_pixel_blurpool_filt_size: 4
+ladd_pixel_spectral_norm: true
+ladd_pixel_base_channels: 64
+# pixgan taps are at strides 2/4/8 and the CSM fuses taps by elementwise
+# addition, so they are bilinearly resampled to ONE grid. Bilinear on
+# purpose: nearest would re-impose a hard lattice.
+ladd_pixel_common_stride: 4
+
+# --- dinov2.
+ladd_pixel_dino_variant: dinov2_vits14
+ladd_pixel_dino_layers: null      # null = evenly-spaced blocks (the ADD analog)
+ladd_pixel_dino_n_taps: 4
+
+# --- TRAINABILITY (researcher directive: DINO "ships frozen ... make them
+# trainable"). WHAT TRAINS, stated explicitly:
+#   * CCM + CSM + LADDDiscHead (the adapter/heads) -- ALWAYS, at the full
+#     disc lr. Unchanged from every LADD arm to date.
+#   * the ENCODER -- when this is true, also by the D loss, but at
+#     ``ladd_pixel_encoder_lr_scale`` times the disc lr.
+# false = heads-only, i.e. what model/pretrained_pixel_disc.py ships and
+# what the directive explicitly asked us to move off; kept as the control
+# arm.
+ladd_pixel_encoder_trainable: true
+# null = per-source default: 1.0 for pixgan (from scratch, no prior to
+# protect) and 0.1 for dinov2 (a 21M pretrained ViT under an adversarial
+# loss at gan_lr=2e-5 can discard the pretrained basis inside a 200-step
+# arm while every GAN-health number stays green; the basis is the entire
+# reason to pick DINOv2 over a from-scratch conv). An explicit value
+# always wins, including an explicit 1.0. 0.0 = frozen encoder.
+ladd_pixel_encoder_lr_scale: null

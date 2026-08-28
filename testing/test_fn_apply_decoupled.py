@@ -74,10 +74,15 @@ def _pair_mode_fn_ast():
 
 
 def _decoupled_block_code():
-    """Compile ``_fn_decoupled = ...`` + the ``if`` that consumes it.
+    """Compile the whole decoupled-apply region of the method body.
 
-    Both are direct statements of the method body, so this is the exact
-    shipped code -- no copy, no paraphrase.
+    That is every top-level statement from the ``_fn_decoupled = ...``
+    assignment through the ``if`` that performs the apply.  Since the
+    2026-08-26 gt_vs_fake-clean ruling the region is five statements
+    (``_fn_decoupled``, ``_fn_allow_gtvf``, ``_fn_block_gtvf``,
+    ``_fn_decoupled_would_apply``, the BYPASS-counter ``if``, and the
+    apply ``if``), all direct statements of the method body -- so this is
+    still the exact shipped code, no copy, no paraphrase.
     """
     fn = _pair_mode_fn_ast()
     idx = None
@@ -91,14 +96,30 @@ def _decoupled_block_code():
         "`_fn_decoupled` assignment not found at the top level of "
         "_ladd_run_pair_mode -- the decoupled block moved or was removed."
     )
-    guard = fn.body[idx + 1]
-    assert isinstance(guard, ast.If), (
-        "the statement after the `_fn_decoupled` assignment is no longer "
-        "the guarded apply block."
+    end = None
+    for j in range(idx + 1, len(fn.body)):
+        st = fn.body[j]
+        if not isinstance(st, ast.If):
+            continue
+        names = {n.id for n in ast.walk(st.test) if isinstance(n, ast.Name)}
+        if {"_fn_decoupled_would_apply", "_fn_block_gtvf"} <= names and any(
+                isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not)
+                for n in ast.walk(st.test)):
+            end = j
+            break
+    assert end is not None, (
+        "the `_fn_decoupled_would_apply and not _fn_block_gtvf` apply "
+        "guard was not found -- the gt_vs_fake-clean ruling gate moved."
     )
-    names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+    body = fn.body[idx:end + 1]
+    names = set()
+    for st in body:
+        names |= {n.id for n in ast.walk(st) if isinstance(n, ast.Name)}
     assert "_fn_decoupled" in names, "the apply block is not flag-gated."
-    mod = ast.Module(body=[fn.body[idx], guard], type_ignores=[])
+    assert "_fn_block_gtvf" in names, (
+        "the gt_vs_fake-clean gate is missing from the decoupled region."
+    )
+    mod = ast.Module(body=body, type_ignores=[])
     ast.fix_missing_locations(mod)
     return compile(mod, "<fn_decoupled_block>", "exec")
 
@@ -151,10 +172,23 @@ def make_ctx(
     npb=3,
     have_fn=True,
     seed=1234,
+    allow_gtvf=True,
 ):
-    """Namespace the lifted block executes in."""
+    """Namespace the lifted block executes in.
+
+    ``allow_gtvf`` defaults to **True** here, i.e. the
+    ``forward_noiser_allow_gt_vs_fake`` ESCAPE HATCH is deliberately open,
+    because this file's job is to pin the decoupled FN *mechanism* (levels,
+    chain composition, moment restore, Req-1 cap) which only runs when the
+    apply runs.  The 2026-08-26 ruling itself -- that the PRODUCTION
+    DEFAULT leaves gt_vs_fake positives clean -- is pinned in
+    ``testing/test_fn_gtvf_clean.py`` and by
+    ``test_ruling_default_blocks_gt_vs_fake`` below.  The model's own
+    default is False; nothing here changes that.
+    """
     fn = _RecordingFN() if have_fn else None
     model = SimpleNamespace(
+        forward_noiser_allow_gt_vs_fake=bool(allow_gtvf),
         forward_noiser_apply_decoupled=bool(decoupled),
         forward_noiser_apply_gt_former=bool(gt_former),
         forward_noiser_apply_gt_both=bool(gt_both),
@@ -254,6 +288,69 @@ def test_block_is_inert_without_its_preconditions(kw, why):
         ns["_orig_real"] = ns["real_chunks_det"]
     out = run_block(ns)
     assert out is ns["_orig_real"], f"block should be inert: {why}"
+
+
+# ---------------------------------------------------------------------------
+# 1b. The 2026-08-26 RULING, in this file's own lifted-block harness
+# ---------------------------------------------------------------------------
+def test_ruling_default_blocks_gt_vs_fake():
+    """No flag set at all => gt_vs_fake positives are untouched objects."""
+    ns = make_ctx(decoupled=True, pair_mode="gt_vs_fake", allow_gtvf=False)
+    out = run_block(ns)
+    assert out is ns["_orig_real"], (
+        "RULING VIOLATED: with no flag set the CARN forward noiser still "
+        "transformed the gt_vs_fake real rows"
+    )
+    assert ns["_fn_module"].calls == [], "the FN was called on gt_vs_fake"
+    assert int(getattr(ns["self"], "_fn_gtvf_noise_skipped", 0)) == 1, (
+        "the bypass counter did not increment -- there is no proof-from-a-"
+        "counter for the ruling"
+    )
+    assert int(getattr(ns["self"], "_fn_gtvf_noise_applied", 0)) == 0
+
+
+def test_ruling_default_missing_attribute_entirely_still_blocks():
+    """A model built before the flag existed must still be CLEAN."""
+    ns = make_ctx(decoupled=True, pair_mode="gt_vs_fake", allow_gtvf=False)
+    delattr(ns["self"].model, "forward_noiser_allow_gt_vs_fake")
+    assert run_block(ns) is ns["_orig_real"]
+
+
+def test_ruling_escape_hatch_restores_old_behaviour():
+    ns = make_ctx(decoupled=True, pair_mode="gt_vs_fake", allow_gtvf=True)
+    out = run_block(ns)
+    assert out is not ns["_orig_real"], "escape hatch did not re-open the FN"
+    assert ns["_fn_module"].calls
+    assert int(getattr(ns["self"], "_fn_gtvf_noise_skipped", 0)) == 0
+    assert int(getattr(ns["self"], "_fn_gtvf_noise_applied", 0)) == 1
+
+
+def test_ruling_escape_hatch_also_readable_off_config():
+    ns = make_ctx(decoupled=True, pair_mode="gt_vs_fake", allow_gtvf=False)
+    delattr(ns["self"].model, "forward_noiser_allow_gt_vs_fake")
+    ns["self"].config.forward_noiser_allow_gt_vs_fake = True
+    assert run_block(ns) is not ns["_orig_real"]
+
+
+def test_ruling_does_not_touch_adjacent_chunks():
+    """The ruling names gt_vs_fake only; adjacent_chunks is unchanged."""
+    ns = make_ctx(decoupled=True, pair_mode="adjacent_chunks",
+                  allow_gtvf=False)
+    out = run_block(ns)
+    assert out is not ns["_orig_real"], (
+        "the gate leaked past gt_vs_fake and disabled adjacent_chunks too"
+    )
+
+
+def test_ruling_no_decoupled_app_banner_for_gt_vs_fake(capsys):
+    ns = make_ctx(decoupled=True, pair_mode="gt_vs_fake", allow_gtvf=False)
+    run_block(ns)
+    err = capsys.readouterr().err
+    assert "[FN-DECOUPLED-APP] ACTIVE" not in err, (
+        "the ACTIVE banner printed for gt_vs_fake -- the exact string the "
+        "ruling says must never appear again"
+    )
+    assert "[FN-GTVF-CLEAN] BYPASS" in err, "no positive bypass marker"
 
 
 # ===========================================================================
@@ -412,14 +509,23 @@ def test_positive_non_chain_fixed_level_is_req1_capped():
 # 3. The COUPLED (gt_transition) path is unchanged
 # ===========================================================================
 def _find_matched_apply_guard():
-    """The matched-pool apply guard, lifted from source."""
+    """The matched-pool apply guard expression, lifted from source.
+
+    Since the 2026-08-26 ruling the guard is the RHS of the
+    ``_fn_matched_would_apply = (...)`` assignment (it was split out of the
+    ``if`` so the gt_vs_fake BYPASS could be counted).  The historical
+    predicate is unchanged, which is exactly what the caller asserts.
+    """
     fn = _pair_mode_fn_ast()
     for node in ast.walk(fn):
-        if not isinstance(node, ast.If):
-            continue
-        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
-        if {"_gt_both", "_gt_former", "chunks_per_pair"} <= names:
-            return node.test
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name)
+                        and t.id == "_fn_matched_would_apply"
+                        for t in node.targets)):
+            names = {n.id for n in ast.walk(node.value)
+                     if isinstance(n, ast.Name)}
+            assert {"_gt_both", "_gt_former", "chunks_per_pair"} <= names
+            return node.value
     raise AssertionError("matched-pool FN apply guard not found")
 
 

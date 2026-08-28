@@ -192,6 +192,78 @@ def _apply_carn_seam_affine(
     return ((x - mean) / std * blended_std + blended_mean).to(source_dtype)
 
 
+def _apply_reverse_noiser_dedrift(
+    chunk: torch.Tensor,
+    noiser: torch.nn.Module,
+    level: int,
+    steps: int = 1,
+    alpha0: float = 1.0,
+    alpha_decay: float = 0.5,
+    min_level: int = 1,
+    _telemetry: Optional[dict] = None,
+) -> torch.Tensor:
+    """Eval-time port of ``ActionForcingDMD._dedrift_with_reverse_noiser``.
+
+    De-drift one committed AR chunk toward the GT manifold with a FROZEN
+    reverse-trained ``ForwardNoiser`` (a network trained under
+    ``forward_noiser_reverse=true``, i.e. it maps CARN level n -> n-1).
+
+    Same relaxed multi-step Euler loop as the training-side helper::
+
+        cur <- cur + alpha_k * N(cur, level_k, residual=False)
+        alpha_k = alpha0 * alpha_decay**k,  level_k = level - k
+
+    The network was trained with ``residual=True``, so ``residual=False``
+    returns the raw increment ``delta`` and ``cur + alpha*delta`` is a
+    decelerating (no-overshoot) step toward the cleaner manifold.
+
+    Returns ``chunk`` unchanged when ``level < min_level`` (near the
+    manifold the corrector is ~identity thanks to the zero-init
+    ``out_proj``, so the ~23M-param conv is skipped).
+
+    ``noiser``'s params are temporarily ``requires_grad_(False)`` (saved
+    and restored) purely to mirror the training-side discipline; the whole
+    eval script already runs under ``@torch.no_grad()`` so this is
+    belt-and-braces, not load-bearing.
+    """
+    level = int(level)
+    min_level = int(min_level)
+    if noiser is None or level < min_level:
+        return chunk
+
+    inner = noiser.module if hasattr(noiser, "module") else noiser
+    n_steps = max(1, int(steps))
+    a0 = float(alpha0)
+    decay = float(alpha_decay)
+
+    params = list(inner.parameters())
+    saved = [p.requires_grad for p in params]
+    for p in params:
+        p.requires_grad_(False)
+    try:
+        n_dtype = next(inner.parameters()).dtype
+        cur = chunk
+        for k in range(n_steps):
+            lvl = max(0, level - k)
+            if lvl < min_level:
+                break
+            alpha = a0 * (decay ** k)
+            cs = torch.full(
+                (cur.shape[0],), lvl, dtype=torch.long, device=cur.device,
+            )
+            delta = inner(cur.to(dtype=n_dtype), cs, residual=False)
+            cur = cur + alpha * delta.to(dtype=cur.dtype)
+        if _telemetry is not None:
+            _telemetry["calls"] = int(_telemetry.get("calls", 0)) + 1
+            _telemetry["rel_dz"] = float(
+                (cur - chunk).norm() / max(float(chunk.norm()), 1e-8)
+            )
+        return cur
+    finally:
+        for p, r in zip(params, saved):
+            p.requires_grad_(r)
+
+
 def _resolve_trained_attn_window(base_dit, fallback_frames: int):
     """Resolve the student's TRAINED local attention window, in FRAMES.
 
@@ -568,6 +640,14 @@ class ODEChainPipeline(ChainPipeline):
         ar_cache: bool = True,
         cache_refresh: str = "append",
         carn_seam_affine_lambda: float = 0.0,
+        reverse_noiser: Optional[torch.nn.Module] = None,
+        reverse_noiser_dedrift_level: int = 1,
+        reverse_noiser_dedrift_steps: int = 1,
+        reverse_noiser_dedrift_alpha0: float = 1.0,
+        reverse_noiser_dedrift_alpha_decay: float = 0.5,
+        reverse_noiser_dedrift_min_level: int = 1,
+        reverse_noiser_dedrift_level_auto: bool = False,
+        reverse_noiser_dedrift_level_max: int = 16,
     ) -> torch.Tensor:
         """Streaming AR rollout with a KV cache.
 
@@ -847,6 +927,24 @@ class ODEChainPipeline(ChainPipeline):
                 "[AR] CARN seam affine enabled at commit: lambda=%.3f, "
                 "target=real prefill per-channel mean/std",
                 carn_seam_affine_lambda,
+            )
+
+        # Reverse-noiser de-drift at commit. Off (byte-identical to the
+        # pre-existing path) whenever ``reverse_noiser is None``.
+        dedrift_tel = None
+        if reverse_noiser is not None:
+            dedrift_tel = {"calls": 0, "rel_dz": 0.0}
+            log.info(
+                "[AR] reverse-noiser de-drift enabled at commit: level=%d "
+                "steps=%d alpha0=%.3f decay=%.3f min_level=%d "
+                "level_auto=%s level_max=%d",
+                int(reverse_noiser_dedrift_level),
+                int(reverse_noiser_dedrift_steps),
+                float(reverse_noiser_dedrift_alpha0),
+                float(reverse_noiser_dedrift_alpha_decay),
+                int(reverse_noiser_dedrift_min_level),
+                bool(reverse_noiser_dedrift_level_auto),
+                int(reverse_noiser_dedrift_level_max),
             )
 
         current_start_frame = 0
@@ -1419,6 +1517,48 @@ class ODEChainPipeline(ChainPipeline):
                 pred_x0 = (_out.view(_C, _B, _F, _H, _W)
                            .permute(1, 2, 0, 3, 4).to(pred_x0.dtype))
 
+            # Reverse-noiser de-drift runs BEFORE the seam affine, on the
+            # same tensor that is both emitted and pushed into the KV cache
+            # (this is the AR feedback point). Ordering rationale: the
+            # de-drift is a learned, content-aware correction whose training
+            # inputs were RAW student rollout chunks, so it must see a raw
+            # chunk; the seam affine is a cheap moment re-anchor that is
+            # correct to apply last (it restores the target mean/std no
+            # matter what preceded it). NOTE: stacking both is NOT a
+            # validated combination -- the smoke exercises exactly one at a
+            # time.
+            if reverse_noiser is not None:
+                # Level = the CARN drift level of the tensor being fed IN.
+                # The trainer's reverse pairing conditions on the ROLLOUT2
+                # (= input) level, counting the first generated chunk as 1
+                # (trainer/causal_action_forcing_train.py:11838-11851), so
+                # ``level_auto`` reproduces that indexing here: the k-th
+                # committed chunk is at level k+1, clamped to the FiLM
+                # embedding's range. Default OFF = the fixed level below.
+                if reverse_noiser_dedrift_level_auto:
+                    _dd_level = min(
+                        len(generated) + 1,
+                        int(reverse_noiser_dedrift_level_max),
+                    )
+                else:
+                    _dd_level = int(reverse_noiser_dedrift_level)
+                pred_x0 = _apply_reverse_noiser_dedrift(
+                    pred_x0,
+                    reverse_noiser,
+                    level=_dd_level,
+                    steps=int(reverse_noiser_dedrift_steps),
+                    alpha0=float(reverse_noiser_dedrift_alpha0),
+                    alpha_decay=float(reverse_noiser_dedrift_alpha_decay),
+                    min_level=int(reverse_noiser_dedrift_min_level),
+                    _telemetry=dedrift_tel,
+                )
+                if dedrift_tel is not None:
+                    log.info(
+                        "[AR][DEDRIFT] call=%d level=%d rel|dz|=%.6f",
+                        dedrift_tel["calls"], _dd_level,
+                        dedrift_tel["rel_dz"],
+                    )
+
             if carn_target is not None:
                 pred_x0 = _apply_carn_seam_affine(
                     pred_x0,
@@ -1428,6 +1568,17 @@ class ODEChainPipeline(ChainPipeline):
                 )
 
             generated.append(pred_x0.detach().to(torch.float32))
+
+            # Cheap per-chunk drift telemetry (log only -- no behaviour
+            # change). Contraction of ``std`` over the rollout is the AR
+            # variance-contraction signature we want to compare between the
+            # de-drift-on and de-drift-off arms.
+            _gc = generated[-1]
+            log.info(
+                "[AR][STATS] chunk=%d mean=%.5f std=%.5f absmax=%.4f",
+                len(generated) - 1, float(_gc.mean()), float(_gc.std()),
+                float(_gc.abs().max()),
+            )
 
             if cache_refresh == "append":
                 # Cache-refresh on the clean pred_x0 so the next step sees
@@ -1721,6 +1872,50 @@ def main():
                              "re-anchor to each generated chunk before emission and "
                              "KV-cache commit. The target is measured once from the "
                              "real prefill; 0 disables it and the precedent uses 0.5.")
+    parser.add_argument("--reverse_noiser_checkpoint", type=str, default="",
+                        help="AR mode only: path to a ForwardNoiser state_dict "
+                             "trained with forward_noiser_reverse=true (a "
+                             "de-CARN / de-drift network, e.g. a fn_rev_step*.pt "
+                             "written by the trainer). When set, each generated "
+                             "chunk is de-drifted through the frozen network "
+                             "before emission and KV-cache commit. Empty "
+                             "(default) = disabled, no new code path runs.")
+    parser.add_argument("--reverse_noiser_latent_channels", type=int, default=16,
+                        help="ForwardNoiser latent_channels (Wan2.1 VAE = 16).")
+    parser.add_argument("--reverse_noiser_hidden_dim", type=int, default=512,
+                        help="ForwardNoiser hidden_dim (must match the "
+                             "checkpoint; trainer default 512).")
+    parser.add_argument("--reverse_noiser_num_blocks", type=int, default=4,
+                        help="ForwardNoiser num_blocks (must match the "
+                             "checkpoint; trainer default 4).")
+    parser.add_argument("--reverse_noiser_max_carn_step", type=int, default=16,
+                        help="ForwardNoiser max_carn_step (trainer default 16). "
+                             "Not a parameter shape, but keep it matched.")
+    parser.add_argument("--reverse_noiser_dedrift_level", type=int, default=1,
+                        help="CARN level the committed chunk is assumed to sit "
+                             "at (the level the de-drift starts FROM).")
+    parser.add_argument("--reverse_noiser_dedrift_steps", type=int, default=1,
+                        help="Euler steps of the de-drift loop (level "
+                             "decrements by 1 each step).")
+    parser.add_argument("--reverse_noiser_dedrift_alpha0", type=float, default=1.0,
+                        help="Step size of the first de-drift Euler step.")
+    parser.add_argument("--reverse_noiser_dedrift_alpha_decay", type=float,
+                        default=0.5,
+                        help="Geometric decay of the de-drift step size.")
+    parser.add_argument("--reverse_noiser_dedrift_min_level", type=int, default=1,
+                        help="Skip the de-drift entirely below this level.")
+    parser.add_argument("--reverse_noiser_dedrift_level_auto",
+                        action="store_true",
+                        help="Ignore --reverse_noiser_dedrift_level and use the "
+                             "committed chunk's own AR index instead (k-th "
+                             "generated chunk -> level k+1), which is the "
+                             "indexing the reverse FN was CONDITIONED ON during "
+                             "training (cond = rollout2/input level, first "
+                             "generated chunk = 1). Clamped by "
+                             "--reverse_noiser_dedrift_level_max.")
+    parser.add_argument("--reverse_noiser_dedrift_level_max", type=int, default=16,
+                        help="Upper clamp for --reverse_noiser_dedrift_level_auto "
+                             "(keep <= the checkpoint's max_carn_step).")
     parser.add_argument("--ar_cache_refresh", choices=["append", "full_fifo"],
                         default="append",
                         help="AR mode only: KV cache maintenance strategy. "
@@ -1929,6 +2124,72 @@ def main():
     )
     pipe.set_denoising_steps(args.denoising_steps)
 
+    # ---- Optional auxiliary de-drift network (reverse-trained CARN) ----
+    # Loaded as a STANDALONE module: this eval script has no
+    # ActionForcingDMD instance, so the noiser is not attached to the
+    # student in any way -- it is applied post-hoc to each committed chunk.
+    reverse_noiser = None
+    if getattr(args, "reverse_noiser_checkpoint", ""):
+        if mode != "ar":
+            # Fail loudly rather than silently ignoring the flag: the
+            # de-drift only has a commit point in the AR streaming loop.
+            raise SystemExit(
+                "--reverse_noiser_checkpoint is AR-mode only; got "
+                f"--mode {mode!r}."
+            )
+        from model.forward_noiser import ForwardNoiser
+        rn_path = Path(args.reverse_noiser_checkpoint)
+        if not rn_path.is_file():
+            raise SystemExit(
+                f"[AR] --reverse_noiser_checkpoint not found: {rn_path}"
+            )
+        rn_obj = torch.load(str(rn_path), map_location="cpu", weights_only=False)
+        # Accept either a bare state_dict (what the trainer writes for
+        # fn_rev_step*.pt) or a wrapper dict holding one.
+        rn_sd = rn_obj
+        if isinstance(rn_obj, dict):
+            for key in ("forward_noiser", "reverse_noiser", "state_dict", "model"):
+                if key in rn_obj and isinstance(rn_obj[key], dict):
+                    rn_sd = rn_obj[key]
+                    break
+        if not isinstance(rn_sd, dict) or "out_proj.weight" not in rn_sd:
+            raise SystemExit(
+                f"[AR] {rn_path} does not look like a ForwardNoiser "
+                f"state_dict (no 'out_proj.weight'); keys="
+                f"{list(rn_sd)[:8] if isinstance(rn_sd, dict) else type(rn_sd)}"
+            )
+        reverse_noiser = ForwardNoiser(
+            latent_channels=int(args.reverse_noiser_latent_channels),
+            hidden_dim=int(args.reverse_noiser_hidden_dim),
+            num_blocks=int(args.reverse_noiser_num_blocks),
+            max_carn_step=int(args.reverse_noiser_max_carn_step),
+        )
+        # strict=True: any shape/name mismatch against the constructed
+        # ForwardNoiser raises here, so a hidden_dim/num_blocks mismatch
+        # cannot be silently absorbed. (Dtype is NOT checked by
+        # load_state_dict -- a bf16 checkpoint loads into the fp32 module
+        # by cast, which is what the trainer writes.)
+        reverse_noiser.load_state_dict(rn_sd, strict=True)
+        reverse_noiser = reverse_noiser.to(
+            device=device, dtype=pipe.dtype).eval()
+        reverse_noiser.requires_grad_(False)
+        _w = float(sum(
+            p.detach().float().pow(2).sum() for p in reverse_noiser.parameters()
+        ).sqrt())
+        _op = float(
+            reverse_noiser.out_proj.weight.detach().float().pow(2).sum().sqrt()
+        )
+        log.info(
+            "[AR] reverse-noiser loaded strict from %s | params=%d wnorm=%.4f "
+            "out_proj_wnorm=%.6f dtype=%s device=%s",
+            rn_path, reverse_noiser.num_params(), _w, _op, pipe.dtype, device,
+        )
+        if _op == 0.0:
+            log.warning(
+                "[AR] reverse-noiser out_proj is EXACTLY zero -- this is the "
+                "zero-init identity; the de-drift will be a strict no-op."
+            )
+
     # ---- Label (drives output subdir + on-video title) ----
     if args.label:
         label = args.label
@@ -2011,6 +2272,18 @@ def main():
                 ar_cache=args.ar_cache,
                 cache_refresh=args.ar_cache_refresh,
                 carn_seam_affine_lambda=args.carn_seam_affine_lambda,
+                reverse_noiser=reverse_noiser,
+                reverse_noiser_dedrift_level=args.reverse_noiser_dedrift_level,
+                reverse_noiser_dedrift_steps=args.reverse_noiser_dedrift_steps,
+                reverse_noiser_dedrift_alpha0=args.reverse_noiser_dedrift_alpha0,
+                reverse_noiser_dedrift_alpha_decay=(
+                    args.reverse_noiser_dedrift_alpha_decay),
+                reverse_noiser_dedrift_min_level=(
+                    args.reverse_noiser_dedrift_min_level),
+                reverse_noiser_dedrift_level_auto=(
+                    args.reverse_noiser_dedrift_level_auto),
+                reverse_noiser_dedrift_level_max=(
+                    args.reverse_noiser_dedrift_level_max),
             )
         peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
         reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)

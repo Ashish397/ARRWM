@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import atexit
 import gc
+import json
 import logging
 import math
 import os
@@ -1721,11 +1722,38 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             ),
                             file=sys.stderr, flush=True,
                         )
+                # ===== PIXEL FEATURE SOURCE =======================
+                # ``ladd_feature_source`` in ("pixgan", "dinov2") swaps
+                # the disc's feature basis from WAN transformer taps of
+                # LATENTS to a conv/ViT encoder run on decoded PIXELS.
+                # Design + measurement: analysis/gan_tuning/
+                # PIXEL_FEATURE_SOURCE.md. Default-off: with the
+                # historical "real"/"fake" values this is None and every
+                # line below is byte-identical.
+                _pix_feat_src = None
+                _lfs_cfg = str(getattr(
+                    self.config, "ladd_feature_source", "real") or "real")
+                from model.ladd_pixel_features import (
+                    SUPPORTED_PIXEL_FEATURE_SOURCES as _PIX_SRCS,
+                )
+                if _lfs_cfg in _PIX_SRCS:
+                    from model.ladd_pixel_features import (
+                        build_pixel_feature_source,
+                    )
+                    _pix_feat_src = build_pixel_feature_source(
+                        _lfs_cfg, self.config, device=self.device,
+                    )
+                    print(
+                        "[LADD-PIXFEAT] built feature source: %s"
+                        % _pix_feat_src.describe(),
+                        file=sys.stderr, flush=True,
+                    )
                 disc = build_ladd_disc(
                     real_score=_real_score,
                     backbone=_ladd_backbone,
                     block_indices=ladd_blocks,
                     dim_teacher=_dim_teacher,
+                    pixel_source=_pix_feat_src,
                     dim_proj=int(
                         getattr(self.config, "ladd_proj_dim", 256)
                     ),
@@ -1847,6 +1875,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 disc.to(device=self.device, dtype=torch.float32)
                 disc.train()
                 self.r3gan_disc = disc
+                # Install the VAE decode callback + crop geometry. MUST
+                # happen before the first disc forward; ``forward``
+                # raises rather than falling back to the WAN taps if it
+                # did not (a silent fallback is how a "pixel" arm ends up
+                # being a latent arm).
+                self.ladd_pixel_source = _pix_feat_src
+                if _pix_feat_src is not None:
+                    self._ladd_install_pixel_decode(disc)
                 self.ladd_block_indices = ladd_blocks
                 if self.world_size > 1:
                     # Trainable params = CCM + CSM + heads + cmapper.
@@ -2075,6 +2111,52 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # Derived, never independently read off config — so this flag can
         # never drift from what was actually built (the seam class above).
         self.surrogate_critic_enabled = self.latent_texture_critic is not None
+        # Decoder-shaped stationary pullback (2026-08-28). This is a third,
+        # mutually-exclusive surrogate mode: the current discriminator still
+        # supplies its pixel cotangent, but WAN's expensive decoder backward
+        # is replaced by a frozen graph-free reverse hierarchy. The bundle
+        # contains only the 17 audit-selected local operators; exact RGB,
+        # resampler, public-latent-prefix and mid-low residual VJPs reuse the
+        # live frozen VAE weights.
+        self.decoder_shaped_pullback = None
+        _decoder_pullback_requested = bool(getattr(
+            self.config, "surrogate_decoder_shaped_enabled", False,
+        ))
+        if _decoder_pullback_requested:
+            if self.surrogate_critic_enabled:
+                raise ValueError(
+                    "surrogate_decoder_shaped_enabled and "
+                    "surrogate_critic_enabled are alternatives, not additive"
+                )
+            _bundle = str(getattr(
+                self.config, "surrogate_decoder_shaped_bundle", "",
+            )).strip()
+            if not _bundle:
+                raise ValueError(
+                    "surrogate_decoder_shaped_enabled requires "
+                    "surrogate_decoder_shaped_bundle"
+                )
+            _live_vae = getattr(self.model, "vae", None)
+            if _live_vae is None:
+                raise RuntimeError(
+                    "decoder-shaped pullback requires self.model.vae"
+                )
+            from model.decoder_shaped_pullback import DecoderShapedPullback
+            self.decoder_shaped_pullback = DecoderShapedPullback.from_bundle(
+                _live_vae, _bundle, map_location="cpu",
+            ).to(self.device).eval().requires_grad_(False)
+        self.decoder_shaped_pullback_enabled = (
+            self.decoder_shaped_pullback is not None
+        )
+        if self.decoder_shaped_pullback_enabled and self.is_main_process:
+            logging.warning(
+                "[ActionForcing] Decoder-shaped pullback built: bundle=%s "
+                "exact_residual_stages=%s graph_free=true",
+                str(getattr(
+                    self.config, "surrogate_decoder_shaped_bundle", "",
+                )),
+                list(self.decoder_shaped_pullback.exact_residual_stages),
+            )
         if self.surrogate_critic_enabled and self.is_main_process:
             logging.info(
                 "[ActionForcing] Latent surrogate critic built: "
@@ -2558,6 +2640,48 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             logging.warning(_eelr_msg)
             print(_eelr_msg, file=sys.stderr, flush=True)
 
+        # ------------------------------------------------------------------
+        # CARN IN-PLACE COMMIT DE-DRIFT — MODEL->PIPELINE BACK-REFERENCE.
+        #
+        # ``ActionForcingTrainingPipeline._reverse_noiser_dedrift_commit``
+        # applies the learned reverse-noiser correction to the chunk that
+        # goes into the KV cache. The operator itself
+        # (``_dedrift_with_reverse_noiser``) and its knobs live on the
+        # ActionForcingDMD model, and the pipeline holds NO model reference
+        # of its own (its convention is plain attributes pushed onto it, see
+        # the A23 seam above). So the model is installed here, once, on the
+        # object whose class performs the read.
+        #
+        # DELIBERATELY NOT a copy of the flag: the gate is read through this
+        # reference off the model, so there is exactly ONE
+        # ``reverse_noiser_dedrift_apply_to_commit`` in the process and the
+        # split-brain half-enabled failure this codebase keeps hitting is
+        # structurally impossible here.
+        #
+        # Set UNCONDITIONALLY: with the flag off the pipeline's read is a
+        # passthrough, so this is byte-identical, but an installed reference
+        # is DISTINGUISHABLE from "nobody ever wired it".
+        # ------------------------------------------------------------------
+        self.pipeline._carn_commit_dedrift_owner = self.model
+        if self.is_main_process and bool(getattr(
+            self.model, "reverse_noiser_dedrift_apply_to_commit", False,
+        )):
+            _ccd_msg = (
+                "[ActionForcing] CARN commit de-drift ARMED on %s: "
+                "reverse_noiser_dedrift_apply_to_commit=True "
+                "dedrift_enabled=%s level=%s -- the KV-committed chunk "
+                "(the AR memory) is corrected IN PLACE by the reverse "
+                "noiser. Look for [CARN][commit-dedrift] to confirm it "
+                "actually fired." % (
+                    type(self.pipeline).__name__,
+                    getattr(self.model, "reverse_noiser_dedrift_enabled",
+                            None),
+                    getattr(self.model, "reverse_noiser_dedrift_level", None),
+                )
+            )
+            logging.warning(_ccd_msg)
+            print(_ccd_msg, file=sys.stderr, flush=True)
+
         if self.is_main_process:
             logging.info(
                 "[ActionForcing] Pipeline: num_frame_per_block=%d "
@@ -2945,8 +3069,59 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "r3gan_disc has no trainable parameters; check the "
                     "constructor."
                 )
+            # ---- PIXEL-SOURCE ENCODER: its own param group ------------
+            # The researcher's directive is "make them trainable", and
+            # the encoder's parameters are in ``disc_params`` above, so
+            # they ARE trained by the D loss with no further work. What
+            # this block adds is a SEPARATE LEARNING RATE for them.
+            #
+            # Rationale (stated because the directive asked which of
+            # encoder / adapter / heads trains, and why):
+            #   * heads + CCM/CSM (the "adapter") ALWAYS train, at the
+            #     full disc lr. Unchanged from every LADD arm.
+            #   * the ENCODER also trains -- that is the directive --
+            #     but a pretrained DINOv2 is chosen precisely FOR its
+            #     feature basis, and a 21M ViT under an adversarial loss
+            #     can discard that basis inside a 200-step arm while
+            #     every GAN-health number stays green. 0.1x is the
+            #     default for ``dinov2``; 1.0x for ``pixgan``, which is
+            #     from scratch and has no prior to protect.
+            #   * ``ladd_pixel_encoder_lr_scale=0.0`` is legal and means
+            #     "frozen encoder, heads only" -- the control arm.
+            _disc_param_groups = disc_params
+            _pix_src_opt = getattr(self, "ladd_pixel_source", None)
+            if _pix_src_opt is not None:
+                from model.ladd_pixel_features import (
+                    default_encoder_lr_scale,
+                )
+                _enc_scale = default_encoder_lr_scale(
+                    _pix_src_opt.source, self.config)
+                _enc_ids = {
+                    id(p) for p in _pix_src_opt.encoder.parameters()
+                }
+                _enc_params = [p for p in disc_params if id(p) in _enc_ids]
+                _rest_params = [
+                    p for p in disc_params if id(p) not in _enc_ids
+                ]
+                if _enc_params and _enc_scale != 1.0:
+                    _disc_param_groups = [
+                        {"params": _rest_params, "lr": disc_lr},
+                        {"params": _enc_params,
+                         "lr": disc_lr * float(_enc_scale)},
+                    ]
+                print(
+                    "[LADD-PIXFEAT] encoder param group: n_encoder=%d "
+                    "n_head_adapter=%d lr_scale=%.4g encoder_lr=%.3g "
+                    "head_lr=%.3g (0 encoder params => the encoder is "
+                    "FROZEN, which contradicts "
+                    "ladd_pixel_encoder_trainable)" % (
+                        len(_enc_params), len(_rest_params), _enc_scale,
+                        disc_lr * float(_enc_scale), disc_lr,
+                    ),
+                    file=sys.stderr, flush=True,
+                )
             self.r3gan_optimizer = torch.optim.AdamW(
-                disc_params,
+                _disc_param_groups,
                 lr=disc_lr,
                 betas=disc_betas,
                 eps=disc_eps,
@@ -3853,6 +4028,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "train/critic_value_loss")
                 if _c_vloss is not None:
                     msg_parts.append(f"c_vloss={float(_c_vloss):.4g}")
+                _decoder_weight = generator_log_dict.get(
+                    "train/surrogate_g_weight")
+                if _decoder_weight is not None:
+                    msg_parts.append(
+                        f"decoder_w={float(_decoder_weight):.6g}")
+                _decoder_param_share = generator_log_dict.get(
+                    "train/surrogate_param_grad_ratio")
+                if _decoder_param_share is not None:
+                    msg_parts.append(
+                        f"decoder_param_share="
+                        f"{float(_decoder_param_share):.4g}"
+                    )
                 # MANIFOLD GATE measurement (docs/DMD_MANIFOLD_GATE.md).
                 # These two ARE the experiment: dmd_err is DMD's own
                 # error |x0 - pred_real| (teacher competence here), and
@@ -3982,6 +4169,45 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                 ))
                 except Exception as _gh_exc:
                     logging.warning("[GAN-HEALTH] render failed: %s", _gh_exc)
+                # ---- D-WINS TRIPWIRE (observability only; the measured
+                # motivation is in model/gan_balance.py's docstring).
+                # Runs on the [ActionForcing]/wandb-log cadence (the
+                # enclosing ``_wandb_log_due`` block), which is at least
+                # as frequent as [GAN-HEALTH]'s debt cadence -- so "K
+                # consecutive logged steps" means the rows a reader
+                # actually sees. It touches no tensor, no optimiser and
+                # no RNG, so training is byte-identical with it on --
+                # which is why it defaults ON. An alarm that ships
+                # default-off reproduces the failure it exists to catch.
+                try:
+                    if bool(getattr(
+                            self.config, "gan_dwins_tripwire_enabled", True)):
+                        _tw = getattr(self, "_gan_dwins_tripwire", None)
+                        if _tw is None:
+                            from model.gan_balance import (
+                                DEFAULT_DWINS_FLOOR, DEFAULT_DWINS_K,
+                                DWinsTripwire,
+                            )
+                            _tw = DWinsTripwire(
+                                floor=float(getattr(
+                                    self.config, "gan_dwins_floor",
+                                    DEFAULT_DWINS_FLOOR)),
+                                k_consecutive=int(getattr(
+                                    self.config, "gan_dwins_k",
+                                    DEFAULT_DWINS_K)),
+                                min_step=int(getattr(
+                                    self, "gan_disc_start_step", 0)),
+                            )
+                            self._gan_dwins_tripwire = _tw
+                        if _tw.observe(
+                            int(self.step),
+                            gan_log_lookup(generator_log_dict, "d_loss"),
+                        ):
+                            logging.warning(_tw.message())
+                        generator_log_dict.update(_tw.logs())
+                except Exception as _tw_exc:
+                    logging.warning(
+                        "[GAN-BALANCE] tripwire failed: %s", _tw_exc)
                 if (
                     _HAS_WANDB
                     and getattr(self, "wandb_enabled", False)
@@ -4093,6 +4319,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # latest slice once rides run deep). cap_frames=False —
                 # the whole rollout is the point.
                 _acc = getattr(self, "_rollout_video_acc", None)
+                # PROOF, not inference (2026-08-26). ``pred_image_rollout``
+                # needs BOTH a sample event AND >21 accumulated latent
+                # frames, and when it is missing there was previously no
+                # way to tell which condition failed -- the video was
+                # simply absent. The accumulator grows by
+                # ``info["new_frames"]`` (~9) per roll and RESETS at each
+                # ride setup, so with max_rolls_per_ride=4 it passes 21
+                # only at roll 3 of 4; a sample event landing on roll 1
+                # or 2 legitimately emits no rollout. That is exactly why
+                # the reference arm shows 10 rollouts against 14
+                # pred_image samples, and it is not a defect.
+                self._rollout_acc_depth_last = (
+                    0 if _acc is None else int(_acc.shape[1]))
+                self._rollout_acc_emitted = int(
+                    getattr(self, "_rollout_acc_emitted", 0))
+                self._rollout_acc_gated = int(
+                    getattr(self, "_rollout_acc_gated", 0))
+                if _acc is not None and int(_acc.shape[1]) > 21:
+                    self._rollout_acc_emitted += 1
+                else:
+                    self._rollout_acc_gated += 1
                 if _acc is not None and int(_acc.shape[1]) > 21:
                     try:
                         self._log_pred_image_video(
@@ -6150,6 +6397,94 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 latent.detach().to(torch.float32), seed_first=True,
             )
 
+    def _surrogate_pixel_condition(
+        self,
+        latent: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Decode a detached RGB extrema guide onto ``latent``'s grid.
+
+        This is conditioning, not a second generator-gradient path.  The
+        input is detached before the VAE call, the decode is under
+        ``no_grad``, and :class:`LatentGradientPredictor` independently
+        rejects any condition tensor that carries autograd history.
+
+        Wan expands one temporal latent into four pixel frames and one
+        spatial cell into an approximately 8x8 output footprint.  The pure
+        pooling helper validates the temporal grouping and reduces RGB max
+        plus RGB min over each group/footprint, retaining dark as well as
+        bright local texture in six channels.
+        """
+        if not bool(getattr(
+            self.config, "surrogate_pixel_condition_enabled", False,
+        )):
+            raise RuntimeError(
+                "_surrogate_pixel_condition called while its config gate is off"
+            )
+        from model.latent_gradient_surrogate import (
+            pool_decoded_pixels_to_latents,
+        )
+
+        if latent.dim() != 5:
+            raise ValueError(
+                "surrogate pixel conditioning expects [B,F,C,H,W], got "
+                f"{tuple(latent.shape)}"
+            )
+        decode_batch = max(1, int(getattr(
+            self.config, "surrogate_pixel_condition_decode_batch", 1,
+        )))
+        chunks = []
+        pixel_shape = None
+        with torch.no_grad():
+            for start in range(0, int(latent.shape[0]), decode_batch):
+                pixels = self._vae_decode_nograd(
+                    latent[start:start + decode_batch].detach()
+                )
+                pixel_shape = tuple(pixels.shape)
+                chunks.append(pool_decoded_pixels_to_latents(
+                    pixels,
+                    latent_frames=int(latent.shape[1]),
+                    latent_height=int(latent.shape[-2]),
+                    latent_width=int(latent.shape[-1]),
+                ))
+        condition = torch.cat(chunks, dim=0).to(
+            device=latent.device, dtype=torch.float32,
+        ).detach()
+        if condition.requires_grad:
+            raise RuntimeError(
+                "surrogate pixel condition unexpectedly retained a graph"
+            )
+        self._surrogate_pixel_condition_decode_calls = int(getattr(
+            self, "_surrogate_pixel_condition_decode_calls", 0,
+        )) + len(chunks)
+        pixel_frames = int(pixel_shape[1]) if pixel_shape is not None else 0
+        pixel_h = int(pixel_shape[-2]) if pixel_shape is not None else 0
+        pixel_w = int(pixel_shape[-1]) if pixel_shape is not None else 0
+        return condition, {
+            "train/surrogate_pixel_condition_active": 1.0,
+            "train/surrogate_pixel_condition_detached": 1.0,
+            "train/surrogate_pixel_condition_channels": float(
+                condition.shape[2]
+            ),
+            "train/surrogate_pixel_condition_temporal_scale": float(
+                pixel_frames // int(latent.shape[1])
+            ),
+            "train/surrogate_pixel_condition_spatial_scale_h": float(
+                pixel_h / int(latent.shape[-2])
+            ),
+            "train/surrogate_pixel_condition_spatial_scale_w": float(
+                pixel_w / int(latent.shape[-1])
+            ),
+            "train/surrogate_pixel_condition_decode_calls": float(
+                self._surrogate_pixel_condition_decode_calls
+            ),
+            "train/surrogate_pixel_condition_samples": float(
+                condition.shape[0]
+            ),
+            "train/surrogate_pixel_condition_rms": float(
+                condition.float().pow(2).mean().sqrt()
+            ),
+        }
+
     def _maybe_texture_tripwire(
         self,
         pred_latents: torch.Tensor,
@@ -6856,6 +7191,477 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         )
         return px.to(self.device, torch.float32)
 
+    # ==================================================================
+    # LADD PIXEL FEATURE SOURCE -- decode callback, per-step epoch,
+    # telemetry.  analysis/gan_tuning/PIXEL_FEATURE_SOURCE.md
+    # ==================================================================
+    def _ladd_install_pixel_decode(self, disc) -> None:
+        """Give the LADD disc a VAE decode callback + its crop geometry.
+
+        The disc owns the CROP PLAN (it must, because real and fake rows
+        have to be cropped identically inside one forward and only the
+        disc sees both) and the trainer owns the DECODE (it must,
+        because only the trainer knows ``self.model.vae``, the derived
+        VAE dtype and the checkpointed ``_vae_decode_grad``). The
+        callback is the seam.
+
+        NO-GRAD DECODE CACHE. The cache holds only NO-GRAD decodes:
+          * a graph-on decode is never cached, because reusing one
+            autograd graph across two backwards raises;
+          * a hit requires the exact same live tensor OBJECT, geometry,
+            mutation version and epoch. The source tensor is retained in
+            the entry, so allocator address reuse by temporary crop stacks
+            cannot serve unrelated pixels;
+          * the finite-difference R1 forward evaluates ``real + sigma*eps``
+            -- a new tensor -- so it misses and is decoded for real,
+            which is required for the estimator to mean anything;
+          * ``epoch`` is in the key so a new step can never serve a
+            previous step's crop geometry.
+
+        Production VGG arms keep this cache off. Their split micro-groups
+        create fresh temporary crop tensors, so object-safe reuse is normally
+        zero; the old ``data_ptr`` key appeared fast only because freed
+        allocator addresses collided and returned stale pixels.
+        Hits and misses are both logged, so "the cache silently served
+        the wrong pixels" is a checkable claim rather than a hope.
+        """
+        cfg = self.config
+        disc.pixel_cfg = {
+            "crop_rows": int(getattr(cfg, "ladd_pixel_crop_rows", 24)),
+            "crop_cols": int(getattr(cfg, "ladd_pixel_crop_cols", 32)),
+            "crops_per_row": int(getattr(cfg, "ladd_pixel_crops_per_row", 1)),
+            "lat_frames": int(getattr(cfg, "ladd_pixel_lat_frames", 2)),
+            "frames_per_crop": int(
+                getattr(cfg, "ladd_pixel_frames_per_crop", 2)),
+            "border": int(getattr(cfg, "ladd_pixel_border_trim", 8)),
+            # INERT ON THIS ROUTE -- nothing in model/ladd_disc.py reads
+            # it. Kept for dict-shape continuity; the working knob is
+            # ``ladd_pixel_decode_split`` below.
+            "decode_batch": int(getattr(cfg, "ladd_pixel_decode_batch", 4)),
+            # ---- SAMPLE-BUDGET knobs (2026-08-26). All three DEFAULT
+            # OFF and the off path in ``_pixel_features`` is the legacy
+            # one byte for byte (same RNG draw order, one decode call,
+            # full-height uniform y0).
+            "decode_split": int(
+                getattr(cfg, "ladd_pixel_decode_split", 0)),
+            "crop_y_lo_frac": float(
+                getattr(cfg, "ladd_pixel_crop_y_lo_frac", 0.0)),
+            "crop_y_hi_frac": float(
+                getattr(cfg, "ladd_pixel_crop_y_hi_frac", 1.0)),
+            "crop_stratify_x": int(
+                getattr(cfg, "ladd_pixel_crop_stratify_x", 0)),
+        }
+        # Optional D/G geometry split.  All keys default to null, so
+        # ``pixel_g_cfg`` stays None and every existing arm takes the exact
+        # historical single-geometry path.  If any key is set, unspecified
+        # G keys inherit the D geometry explicitly.
+        _g_keys = {
+            "crops_per_row": "ladd_pixel_g_crops_per_row",
+            "lat_frames": "ladd_pixel_g_lat_frames",
+            "frames_per_crop": "ladd_pixel_g_frames_per_crop",
+            "decode_split": "ladd_pixel_g_decode_split",
+            "crop_stratify_x": "ladd_pixel_g_crop_stratify_x",
+        }
+        _g_raw = {k: getattr(cfg, ck, None) for k, ck in _g_keys.items()}
+        if any(v is not None for v in _g_raw.values()):
+            disc.pixel_g_cfg = dict(disc.pixel_cfg)
+            for _k, _v in _g_raw.items():
+                if _v is not None:
+                    disc.pixel_g_cfg[_k] = int(_v)
+        else:
+            disc.pixel_g_cfg = None
+        disc.pixel_use_g_cfg = False
+        self._ladd_pix_decode_cache = {}
+        self._ladd_pix_cache_stats = {"hit": 0.0, "miss": 0.0}
+        _cache_on = bool(getattr(cfg, "ladd_pixel_decode_cache", False))
+        # Persist the resolved value for W&B proof. Zero hits alone is
+        # ambiguous (disabled cache versus enabled cache with no reuse).
+        self._ladd_pix_decode_cache_enabled = _cache_on
+        from model.ladd_decode_cache import lookup_decode, store_decode
+
+        def _decode(latents: torch.Tensor, want_grad: bool) -> torch.Tensor:
+            if torch.cuda.is_available():
+                # Same precedent as ``_pix_decode_crops_grad``: the
+                # decoder wants a large contiguous workspace and the
+                # rollout's live activations leave only fragmented gaps.
+                torch.cuda.empty_cache()
+            vdt = self._pix_vae_dtype()
+            if want_grad:
+                return self._vae_decode_grad(latents.to(vdt))
+            key = None
+            if _cache_on:
+                key = int(getattr(disc, "pixel_epoch", 0))
+                hit = lookup_decode(
+                    self._ladd_pix_decode_cache, latents, key,
+                )
+                if hit is not None:
+                    self._ladd_pix_cache_stats["hit"] += 1.0
+                    return hit
+            with torch.no_grad():
+                out = self._vae_decode_grad(latents.detach().to(vdt))
+            if key is not None:
+                # Bounded: one step's D-update touches a handful of distinct
+                # tensors. Cleared every step by ``_ladd_set_pixel_epoch``.
+                store_decode(
+                    self._ladd_pix_decode_cache, latents, key, out,
+                )
+                self._ladd_pix_cache_stats["miss"] += 1.0
+            return out
+
+        disc.pixel_decode_fn = _decode
+
+        # Exact-boundary dataset capture for the GAN-aligned discriminator
+        # benchmark.  Empty path (the default) installs nothing and leaves
+        # every production forward unchanged.  Each rank writes its own
+        # records: data parallel ranks see different ride shards, and that
+        # diversity is precisely what the old single-ride U-test lacked.
+        _capture_dir_raw = str(getattr(
+            cfg, "ladd_discrimination_capture_dir", "") or ""
+        ).strip()
+        if _capture_dir_raw:
+            _capture_dir = Path(_capture_dir_raw)
+            _capture_dir.mkdir(parents=True, exist_ok=True)
+            _capture_every = max(1, int(getattr(
+                cfg, "ladd_discrimination_capture_every", 1
+            ) or 1))
+            _capture_max = max(0, int(getattr(
+                cfg, "ladd_discrimination_capture_max_records_per_rank", 0
+            ) or 0))
+            _capture_rank = (
+                int(dist.get_rank()) if dist.is_available()
+                and dist.is_initialized() else 0
+            )
+            _capture_seen = set()
+
+            def _capture_pixels(imgs: torch.Tensor, meta: Dict[str, Any]):
+                # Tensor-valued private payload: never place this in JSON.
+                # ``dict`` makes the removal local even if a diagnostic
+                # caller retains its input metadata object.
+                meta = dict(meta)
+                latent_crops = meta.pop("_latent_crops", None)
+                step = int(meta.get("step", -1))
+                pair_rows = int(meta.get("pair_rows", 0))
+                if step < 0 or pair_rows <= 0 or step % _capture_every:
+                    return
+                key = (
+                    step, str(meta.get("pair_mode", "")),
+                    int(meta.get("update_idx", 0)),
+                )
+                if key in _capture_seen:
+                    return
+                if _capture_max > 0 and len(_capture_seen) >= _capture_max:
+                    return
+                rows_total = int(meta["rows_total"])
+                k = int(meta["crops_per_row"])
+                f = int(meta["frames_per_crop"])
+                expected = rows_total * k * f
+                if int(imgs.shape[0]) != expected:
+                    raise RuntimeError(
+                        "capture image fold mismatch: "
+                        f"got {int(imgs.shape[0])}, expected {expected} "
+                        f"from rows={rows_total}, K={k}, F={f}"
+                    )
+                if rows_total < 2 * pair_rows:
+                    raise RuntimeError(
+                        "capture real/fake split exceeds row count: "
+                        f"rows={rows_total}, pair_rows={pair_rows}"
+                    )
+                x = imgs.reshape(
+                    rows_total, k, f, *imgs.shape[1:]
+                )
+                # [-1,1] float NCHW -> uint8 NHWC.  The first pair_rows are
+                # real and the next pair_rows fake in the positional D call;
+                # any trailing rows are finite-difference R1 reals and are
+                # intentionally excluded.
+                def _u8(t: torch.Tensor) -> np.ndarray:
+                    a = ((t.float().clamp(-1.0, 1.0) + 1.0) * 127.5)
+                    return a.round().to(torch.uint8).permute(
+                        0, 1, 2, 4, 5, 3
+                    ).contiguous().cpu().numpy()
+
+                real = _u8(x[:pair_rows])
+                fake = _u8(x[pair_rows:2 * pair_rows])
+                real_latent = fake_latent = None
+                if latent_crops is not None:
+                    if latent_crops.dim() != 5:
+                        raise RuntimeError(
+                            "capture latent fold expects [rows*K,L,C,H,W], "
+                            f"got {tuple(latent_crops.shape)}"
+                        )
+                    if int(latent_crops.shape[0]) != rows_total * k:
+                        raise RuntimeError(
+                            "capture latent row/crop mismatch: got "
+                            f"{int(latent_crops.shape[0])}, expected "
+                            f"{rows_total * k}"
+                        )
+                    z = latent_crops.reshape(
+                        rows_total, k, *latent_crops.shape[1:]
+                    )
+                    # Preserve the realised latent exactly in float32.  The
+                    # live tensor is bf16 on this arm, so this widening is
+                    # lossless and lets the offline graph-on VAE decode be
+                    # checked byte-for-byte against the captured uint8 RGB.
+                    real_latent = (
+                        z[:pair_rows].float().contiguous().cpu().numpy()
+                    )
+                    fake_latent = (
+                        z[pair_rows:2 * pair_rows].float().contiguous()
+                        .cpu().numpy()
+                    )
+                state = getattr(self.model, "streaming_state", None)
+                ride = ""
+                state_meta = {}
+                if isinstance(state, dict):
+                    ride = str(state.get("zarr_path", "") or "")
+                    for name in (
+                        "current_length", "cf", "roll_idx", "roll_index",
+                        "ride_offset_s", "motion_chunk_offset",
+                    ):
+                        value = state.get(name)
+                        if isinstance(value, (bool, int, float, str)):
+                            state_meta[name] = value
+                payload_meta = {
+                    **meta,
+                    "rank": int(_capture_rank),
+                    "ride": ride,
+                    "streaming_state": state_meta,
+                    "real_shape": list(real.shape),
+                    "fake_shape": list(fake.shape),
+                    "latent_serialization": (
+                        "float32_lossless_from_bf16"
+                        if real_latent is not None else "absent"
+                    ),
+                    "pixel_range": "uint8_[0,255]",
+                    "class_order": "real_then_fake; trailing_r1_excluded",
+                    "capture_boundary": (
+                        "post_diffaug_crop_vae_border_phase_frame_select; "
+                        "pre_feature_source"
+                    ),
+                }
+                mode = str(meta.get("pair_mode", "unknown")).replace("/", "-")
+                out = _capture_dir / (
+                    f"step{step:06d}_rank{_capture_rank:02d}_{mode}_"
+                    f"u{int(meta.get('update_idx', 0)):02d}.npz"
+                )
+                tmp = out.with_suffix(out.suffix + ".tmp")
+                with open(tmp, "wb") as fh:
+                    arrays = {
+                        "real": real,
+                        "fake": fake,
+                        "metadata": np.asarray(json.dumps(payload_meta)),
+                    }
+                    if real_latent is not None:
+                        arrays.update(
+                            real_latent=real_latent,
+                            fake_latent=fake_latent,
+                        )
+                    np.savez(fh, **arrays)
+                os.replace(tmp, out)
+                _capture_seen.add(key)
+                logging.info(
+                    "[LADD-DISCRIM-CAPTURE] wrote %s real=%s fake=%s ride=%s",
+                    out, real.shape, fake.shape, ride,
+                )
+
+            disc.pixel_capture_fn = _capture_pixels
+            logging.info(
+                "[LADD-DISCRIM-CAPTURE] exact pixel boundary enabled: "
+                "dir=%s every=%d max_records_per_rank=%d rank=%d",
+                _capture_dir, _capture_every, _capture_max, _capture_rank,
+            )
+        _sd = getattr(self, "streaming_chunk_size", None)
+        print(
+            "[LADD-PIXFEAT] decode callback INSTALLED: crop=%dx%d lat "
+            "(=%dx%d px) crops_per_row=%d lat_frames=%d frames_per_crop=%d "
+            "border=%d decode_batch=%d(INERT) cache=%s chunk=%s "
+            "decode_split=%d crop_y_band=[%.4g,%.4g] stratify_x=%d" % (
+                disc.pixel_cfg["crop_rows"], disc.pixel_cfg["crop_cols"],
+                disc.pixel_cfg["crop_rows"] * 8,
+                disc.pixel_cfg["crop_cols"] * 8,
+                disc.pixel_cfg["crops_per_row"],
+                disc.pixel_cfg["lat_frames"],
+                disc.pixel_cfg["frames_per_crop"],
+                disc.pixel_cfg["border"], disc.pixel_cfg["decode_batch"],
+                _cache_on, _sd,
+                disc.pixel_cfg["decode_split"],
+                disc.pixel_cfg["crop_y_lo_frac"],
+                disc.pixel_cfg["crop_y_hi_frac"],
+                disc.pixel_cfg["crop_stratify_x"],
+            ),
+            file=sys.stderr, flush=True,
+        )
+        if disc.pixel_g_cfg is not None:
+            print(
+                "[LADD-PIXFEAT] split geometry ACTIVE: "
+                "D=K%d/L%d/F%d/split%d/strat%d "
+                "G=K%d/L%d/F%d/split%d/strat%d" % (
+                    disc.pixel_cfg["crops_per_row"],
+                    disc.pixel_cfg["lat_frames"],
+                    disc.pixel_cfg["frames_per_crop"],
+                    disc.pixel_cfg["decode_split"],
+                    disc.pixel_cfg["crop_stratify_x"],
+                    disc.pixel_g_cfg["crops_per_row"],
+                    disc.pixel_g_cfg["lat_frames"],
+                    disc.pixel_g_cfg["frames_per_crop"],
+                    disc.pixel_g_cfg["decode_split"],
+                    disc.pixel_g_cfg["crop_stratify_x"],
+                ), file=sys.stderr, flush=True,
+            )
+
+    def _ladd_set_pixel_epoch(self, current_step: int) -> None:
+        """Publish the per-STEP crop/jitter epoch and drop the decode
+        cache. Idempotent: safe to call from every entry point that has
+        a step number, and it MUST be, because the LADD loss and the
+        surrogate distillation both need the epoch set and neither can
+        assume the other ran first."""
+        disc = getattr(self, "r3gan_disc", None)
+        if disc is None or getattr(disc, "pixel_source", None) is None:
+            return
+        if int(getattr(disc, "pixel_epoch", -1)) != int(current_step):
+            disc.pixel_epoch = int(current_step)
+            self._ladd_pix_decode_cache = {}
+
+    def _ladd_pixel_logs(self) -> Dict[str, float]:
+        """CONNECTION PROOF keys. Emitted only on a pixel arm, so the
+        default-off log dict is byte-identical.
+
+        Every one of these answers a question that has been answered
+        WRONGLY-by-silence somewhere in this campaign:
+          ``built``                  did the encoder get constructed
+          ``src_forwards``           did the ENCODER run (its own counter,
+                                     inside model/ladd_pixel_features.py)
+          ``disc_pixel_forwards``    did the DISC take the pixel branch
+          ``wan_projector_calls``    MUST BE 0 -- non-zero means some call
+                                     site is still reading the WAN taps
+          ``images``                 how many pixel images were scored
+          ``decode_grad``/``_nograd`` which decode mode fired, and how often
+          ``teacher_calls``          did ``score_pixels`` serve the surrogate
+          ``encoder_trainable``      did the researcher's "make them
+                                     trainable" actually take
+        """
+        disc = getattr(self, "r3gan_disc", None)
+        src = getattr(disc, "pixel_source", None) if disc is not None else None
+        if src is None:
+            return {}
+        st = getattr(disc, "pixel_stats", {})
+        gh, gw = src.grid
+        out = {
+            "train/ladd_pix_built": 1.0,
+            "train/ladd_pix_src_forwards": float(src.n_forward),
+            "train/ladd_pix_disc_forwards": float(st.get("fwd", 0.0)),
+            "train/ladd_pix_wan_projector_calls": float(
+                st.get("wan_projector_calls", 0.0)),
+            "train/ladd_pix_images": float(st.get("images", 0.0)),
+            "train/ladd_pix_decode_grad": float(st.get("decode_grad", 0.0)),
+            "train/ladd_pix_decode_nograd": float(
+                st.get("decode_nograd", 0.0)),
+            "train/ladd_pix_teacher_calls": float(
+                st.get("teacher_calls", 0.0)),
+            "train/ladd_pix_grid_h": float(gh),
+            "train/ladd_pix_grid_w": float(gw),
+            "train/ladd_pix_encoder_trainable": (
+                1.0 if src.encoder_trainable else 0.0),
+            "train/ladd_pix_encoder_trainable_params": float(
+                src.n_trainable_encoder_params),
+            # DDP BLOCKER FIX (2026-08-26) -- PROOF-OF-FIRE keys. The
+            # online arm died every rank at the first D-update with
+            # "did not receive grad for rank 0: 2" (= DINOv2's
+            # ``mask_token``, measured). ``LaddPixelFeatureSource.
+            # _freeze_ddp_unreachable`` discovers those params from a
+            # real backward and freezes them out of the reducer. This
+            # counter is the ONLY way to tell a fix that fired from a
+            # fix that went inert: it must read 1.0 on a trainable-
+            # encoder dinov2 arm, and 0.0 on the frozen arm (which skips
+            # the probe entirely -- nothing can enter the reducer there).
+            "train/ladd_pix_encoder_unreachable_frozen": float(
+                len(getattr(src, "frozen_unreachable_params", []) or [])),
+            "train/ladd_pix_encoder_blocks_kept": float(
+                getattr(src, "n_encoder_blocks", 0)),
+            "train/ladd_pix_encoder_blocks_dropped": float(
+                getattr(src, "n_encoder_blocks_dropped", 0)),
+            "train/ladd_pix_decode_cache_hit": float(
+                getattr(self, "_ladd_pix_cache_stats", {}).get("hit", 0.0)),
+            "train/ladd_pix_decode_cache_miss": float(
+                getattr(self, "_ladd_pix_cache_stats", {}).get("miss", 0.0)),
+            "train/ladd_pix_decode_cache_enabled": (
+                1.0 if getattr(
+                    self, "_ladd_pix_decode_cache_enabled", False
+                ) else 0.0
+            ),
+            # ===== ORDERLESS READOUT PROOF (ladd_feature_source=vgg) ====
+            # ``pooled_readout``   1.0 iff the [mu, sigma, Cov] head is
+            #                      installed (0.0 on dinov2/pixgan/WAN).
+            # ``pooled_calls``     how many times it RAN. 0.0 with
+            #                      ``pooled_readout``=1.0 means the path
+            #                      is built but inert -- the exact
+            #                      failure mode this campaign keeps
+            #                      hitting.
+            # ``dense_head_calls`` the negative control: MUST be 0.0 on a
+            #                      pooled arm. Non-zero means the dense
+            #                      per-token ``LADDDiscHead`` stack ran.
+            # ``logits_per_sample`` the SHAPE the readout emitted. On the
+            #                      pooled arm it must equal
+            #                      crops_per_row*frames_per_crop (=2). If
+            #                      it ever reads the token count (1768 on
+            #                      the DINOv2 geometry) the readout is
+            #                      dense and the experiment is VOID.
+            # ``stat_dim``         total pooled statistic width.
+            # ``vgg_pretrained``   0.0 means a RANDOM VGG = null
+            #                      experiment; must read 1.0.
+            "train/ladd_pix_pooled_readout": (
+                1.0 if getattr(src, "pooled_readout", None) is not None
+                else 0.0),
+            "train/ladd_pix_pooled_calls": float(
+                st.get("pooled_calls", 0.0)),
+            "train/ladd_pix_dense_head_calls": float(
+                st.get("dense_head_calls", 0.0)),
+            "train/ladd_pix_logits_per_sample": float(
+                st.get("logits_per_sample", 0.0)),
+            "train/ladd_pix_stat_dim": float(getattr(
+                getattr(src, "pooled_readout", None), "total_stat_dim", 0)),
+            "train/ladd_pix_stat_head_forwards": float(getattr(
+                getattr(src, "pooled_readout", None), "n_forward", 0)),
+            "train/ladd_pix_vgg_pretrained": (
+                1.0 if getattr(src, "encoder_pretrained", True) else 0.0),
+            "train/ladd_pix_n_taps": float(len(src.tap_indices)),
+            # INPUT FILTER PROOF.  ``dc`` is the brightness-invariant view;
+            # ``swt`` includes the same DC rejection plus fixed stationary-
+            # wavelet detail emphasis.  These keys distinguish an arm that
+            # merely requested a filter from one whose built source carries
+            # it into both the D and current-teacher G forwards.
+            "train/ladd_pix_input_filter_dc": float(
+                getattr(src, "input_filter", "none") == "dc"),
+            "train/ladd_pix_input_filter_swt": float(
+                getattr(src, "input_filter", "none") == "swt"),
+            "train/ladd_pix_swt_strength": float(
+                getattr(src, "swt_strength", 0.0)),
+        }
+        _dy, _dx = src.jitter_for(int(getattr(disc, "pixel_epoch", 0)))
+        out["train/ladd_pix_jitter_y"] = float(_dy)
+        out["train/ladd_pix_jitter_x"] = float(_dx)
+        # ---- GENERIC PASSTHROUGH of the disc's crop-plan counters.
+        # ``setdefault`` so every explicitly-named key above wins and
+        # nothing already reported changes value or name. This exists so
+        # a counter added in ``model/ladd_disc.py`` cannot be invisible
+        # in wandb because someone forgot to extend the list above --
+        # which is how ``lat_frames`` ended up with no telemetry at all
+        # while being SILENTLY CLAMPED (``L = min(lat_frames, F_lat)``).
+        # The realised crop plan is now provable end to end:
+        # ``ladd_pix_lat_frames_used`` / ``_avail`` / ``_clamped``,
+        # ``ladd_pix_frames_per_crop_used`` / ``ladd_pix_frames_avail`` /
+        # ``_clamped``, ``ladd_pix_crops_per_row_used``,
+        # ``ladd_pix_crop_rows_used`` / ``_cols_used``,
+        # ``ladd_pix_crop_y0_min`` / ``_max`` / ``_sum`` /
+        # ``ladd_pix_crop_draws``, ``ladd_pix_crop_band_active``,
+        # ``ladd_pix_crop_stratify_active``, ``ladd_pix_decode_calls``,
+        # ``ladd_pix_decode_split_active`` / ``_cfg``.
+        for _k, _v in st.items():
+            try:
+                out.setdefault("train/ladd_pix_%s" % _k, float(_v))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     # ------------------------------------------------------------------
     # §3.1 / A23 -- the FAKE, mask-selected.
     # ------------------------------------------------------------------
@@ -6919,6 +7725,67 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "endpoint. Refusing to substitute another tensor."
                 )
             n_lat = int(z.shape[1])
+            # Historical behaviour takes the newest frames blindly. That
+            # is not safe when ``generate_chunk_with_cache`` groups several
+            # blocks: its trailing block deliberately runs under no_grad,
+            # while the assembled CopySlices buffer still advertises
+            # ``requires_grad=True`` because earlier blocks are live. The
+            # 2026-08-27 calibration caught the resulting false-live route:
+            # 825/825 parameters were graph-reachable but both a learned
+            # field and a matched independent tangent produced exactly zero
+            # parameter gradient. Gate the corrected selector so historical
+            # arms stay byte-identical; corrected arms must require and use
+            # the producer's frame-level liveness mask.
+            use_flash_mask = bool(getattr(
+                self.config, "pix_flash_grad_select_enabled", False,
+            ))
+            if use_flash_mask:
+                mask = info.get("flash_dmd_gan_grad_mask")
+                if mask is None:
+                    raise RuntimeError(
+                        "pix_flash_grad_select_enabled=true but "
+                        "info['flash_dmd_gan_grad_mask'] is absent. "
+                        "Refusing to infer frame liveness from a "
+                        "CopySlices buffer's requires_grad flag."
+                    )
+                m = torch.as_tensor(mask).reshape(-1).to(torch.bool)
+                if int(m.numel()) != n_lat:
+                    raise RuntimeError(
+                        "flash_dmd_gan_grad_mask has "
+                        f"{int(m.numel())} entries but the flash slab has "
+                        f"{n_lat} latent frames."
+                    )
+                n_valid = int(m.sum().item())
+                logs["train/pix_flash_grad_frames"] = float(n_valid)
+                logs["train/pix_flash_grad_frames_total"] = float(n_lat)
+                logs["train/pix_flash_grad_frac"] = (
+                    float(n_valid) / float(max(1, n_lat))
+                )
+                if n_valid == 0:
+                    raise RuntimeError(
+                        "flash_dmd_gan_grad_mask is ALL-FALSE: the selected "
+                        "flash fake cannot deliver a generator gradient."
+                    )
+                runs: List[Tuple[int, int]] = []
+                lo = None
+                for i in range(n_lat + 1):
+                    on = i < n_lat and bool(m[i].item())
+                    if on and lo is None:
+                        lo = i
+                    elif not on and lo is not None:
+                        runs.append((lo, i - lo))
+                        lo = None
+                long_enough = [r for r in runs if r[1] >= want_l]
+                if long_enough:
+                    best_lo, best_len = long_enough[-1]
+                else:
+                    best_lo, best_len = max(runs, key=lambda r: r[1])
+                l = min(want_l, best_len)
+                start = best_lo + best_len - l
+                logs["train/pix_fake_lat_frames"] = float(l)
+                logs["train/pix_fake_lat_run"] = float(best_len)
+                logs["train/pix_flash_grad_select_active"] = 1.0
+                return z[:, start:start + l], logs
             l = min(want_l, n_lat)
             start = n_lat - l
             # FORGEABLE-ZERO RULE: pix_finish_grad_frames /
@@ -8671,6 +9538,306 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         else:
             out["train/pix_gan_grad_cos_undefined"] = 1.0
 
+    def _param_grad_ratio(
+        self,
+        term_raw: torch.Tensor,
+        generator_loss: torch.Tensor,
+        out: Dict[str, float],
+        *,
+        prefix: str = "surrogate_param",
+        current_step: Optional[int] = None,
+        control_term: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Calibration ratio measured over ALL trainable generator params.
+
+        WHY A SECOND PROBE EXISTS AT ALL
+        ================================
+        The student-chunk probe is the right instrument for "is the term
+        SEVERED", and it is immune to the off-path-parameter artefact
+        that made the positional probe unfalsifiable. But on the arms we
+        actually launch it cannot produce a RATIO, and the reason is
+        structural rather than a bug:
+
+        ``_pix_select_fake_latents`` resolves the surrogate's fake to
+        ``flash_dmd_gan_x0`` (``pix_finish_grad_enabled=false``,
+        confirmed by ``train/pix_fake_source_ladder = 0``) -- the x0 of
+        the SEPARATE ``flash_dmd_gan_t=60`` generator forward. That is a
+        DIFFERENT SUB-GRAPH from the tensor ``compute_distribution_
+        matching_loss`` scores, exactly as the arm's own header
+        describes (One-Forcing divergence 3: "the adversarial and
+        distillation gradients reach the generator by two different
+        routes"). So ``d(generator_loss)/d(fake_lat)`` is legitimately
+        None -- there is no path -- and the same-quantity ratio the chunk
+        probe was designed to give is undefined on this arm. It is not
+        recoverable by moving the anchor to any single tensor, because no
+        single tensor is on both routes.
+
+        The quantity that actually governs the term's influence is where
+        the two gradients genuinely add: THE PARAMETERS. This probe
+        measures ``||grad_theta(surrogate)|| / ||grad_theta(rest)||`` over
+        EVERY trainable generator parameter.
+
+        It is immune to BOTH known failure modes:
+          * off-path parameter selection -- there is no selection; the
+            norm is over the whole set, so a term that reaches ANY
+            parameter is visible;
+          * disjoint sub-graphs -- both routes terminate at the
+            parameters, so both norms are well defined.
+
+        COST: two full backwards through the DiT, plus one optional
+        matched-norm tangent control. This runs at
+        ``gan_grad_telemetry_every`` cadence only (set 1 for a
+        calibration smoke, 25 for a production arm), and never inside the
+        step's real backward.
+        """
+        if current_step is not None:
+            tel = int(getattr(self.config, "gan_grad_telemetry_every", 25) or 0)
+            if tel <= 0 or int(current_step) % tel != 0:
+                return
+        K = f"train/{prefix}"
+        try:
+            params = [p for p in self.model.generator.parameters()
+                      if p.requires_grad]
+            if not params:
+                out[f"{K}_probe_no_params"] = 1.0
+                return
+            # SEQUENTIAL, and each gradient tuple is reduced to a scalar
+            # and FREED before the next is taken. Holding both at once
+            # would put two full parameter-sized gradient sets on the
+            # card simultaneously on top of a 63 GB step peak, purely for
+            # telemetry. The norms are all we keep.
+            def _norm_and_count(loss):
+                gs = torch.autograd.grad(
+                    loss, params, retain_graph=True, allow_unused=True,
+                )
+                sq = None
+                n_hit = 0
+                for v in gs:
+                    if v is None:
+                        continue
+                    n_hit += 1
+                    s = v.detach().float().pow(2).sum()
+                    sq = s if sq is None else sq + s
+                del gs
+                return (None if sq is None else float(sq.sqrt())), n_hit
+
+            s_n, n_sur = _norm_and_count(term_raw)
+            b_n, n_base = _norm_and_count(generator_loss)
+            c_n, n_control = (
+                _norm_and_count(control_term)
+                if isinstance(control_term, torch.Tensor)
+                and control_term.requires_grad
+                else (None, 0)
+            )
+            out[f"{K}_probe_ran"] = 1.0
+            out[f"{K}_n_params"] = float(len(params))
+            out[f"{K}_n_reached_term"] = float(n_sur)
+            out[f"{K}_n_reached_base"] = float(n_base)
+            if isinstance(control_term, torch.Tensor):
+                out[f"{K}_control_n_reached"] = float(n_control)
+                if c_n is None:
+                    out[f"{K}_control_grad_severed"] = 1.0
+                else:
+                    out[f"{K}_control_grad_norm"] = c_n
+            if s_n is None:
+                # The surrogate term reaches NO generator parameter. This
+                # is the real severing, and at the parameter site it
+                # cannot be confused with an off-path anchor.
+                out[f"{K}_grad_severed"] = 1.0
+                return
+            out[f"{K}_grad_norm_unweighted"] = s_n
+            if c_n is not None and c_n > 0.0:
+                # Both fields have the SAME norm at the flash latent. This
+                # ratio therefore asks whether the learned teacher field is
+                # unusually annihilated by the generator Jacobian. A live
+                # random control with a zero teacher field means "Jacobian
+                # nullspace/cancellation", not "the flash graph is cut".
+                out[f"{K}_vs_control_ratio"] = s_n / c_n
+            if b_n is not None and b_n > 0.0:
+                out[f"{K}_base_grad_norm"] = b_n
+                # THE CALIBRATION READ on these arms. Solve
+                # pix_gan_weight = 0.10 / this for the 5-20 % band.
+                out[f"{K}_grad_ratio_unweighted"] = s_n / b_n
+                out[f"{K}_grad_ratio"] = (
+                    s_n * float(out.get("train/pix_g_weight", 0.0)) / b_n
+                )
+        except Exception as e:
+            out[f"{K}_probe_err"] = 1.0
+            if not getattr(self, "_sur_param_probe_warned", False):
+                self._sur_param_probe_warned = True
+                print(f"[SURROGATE-PARAM-PROBE] {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+
+    def _surrogate_tangent_control(
+        self,
+        probe: torch.Tensor,
+        surrogate_grad: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """A deterministic random-like field matched to ``surrogate_grad``.
+
+        The control shares the exact fake tensor and therefore the exact
+        flash-generator graph with the surrogate. Its gradient at ``probe``
+        has the same L2 norm as the learned field but alternating signs. It
+        is diagnostic only and default-off: no RNG is consumed and the term
+        is never added to the training objective.
+        """
+        if not bool(getattr(
+                self.config, "surrogate_param_control_enabled", False)):
+            return None
+        if surrogate_grad is None or surrogate_grad.numel() == 0:
+            return None
+        with torch.no_grad():
+            flat = torch.arange(
+                probe.numel(), device=probe.device, dtype=torch.int64,
+            )
+            direction = (flat.bitwise_and(1).float() * 2.0 - 1.0).reshape(
+                probe.shape
+            )
+            direction.mul_(
+                surrogate_grad.detach().float().norm()
+                / max(1.0, float(probe.numel()) ** 0.5)
+            )
+        return (probe.float() * direction).sum()
+
+    def _pix_surrogate_grad_telemetry(
+        self,
+        generator_loss: torch.Tensor,
+        pix_raw: torch.Tensor,
+        out: Dict[str, float],
+        *,
+        current_step: int,
+    ) -> None:
+        """Does the surrogate term's gradient ACTUALLY reach the
+        generator, and how big is it next to DMD's?
+
+        WHY THIS EXISTS SEPARATELY FROM
+        ``_pix_standalone_grad_telemetry``
+        ==================================================
+        That probe differentiates at ``p_last`` -- "the last
+        ``requires_grad`` generator parameter". On the live
+        ``dmd10k_gantune_w2gram`` arm the identically-shaped style probe
+        read ``0.0`` EXACTLY, 13/13 samples, while the shared base
+        gradient at the same site read a healthy 0.032-0.209 and no
+        "unavailable" flag was raised. ``torch.autograd.grad`` had
+        returned a NON-None, ALL-ZERO vector: the probed parameter was
+        graph-REACHABLE but structurally received nothing -- an OFF-PATH
+        parameter, not a severed loss. A parameter picked by position in
+        ``named_parameters()`` is picked by REGISTRATION ORDER, and every
+        auxiliary branch bolted onto this generator (state tokens, probe
+        readout, cls+rgs heads, register tokens) registers AFTER the DiT
+        and is fed by a loss that never passes through the predicted
+        latent chunk. A zero there is unfalsifiable.
+
+        So this probe anchors on the STUDENT CHUNK
+        (``self._pix_g_probe_tensor``, stashed by
+        ``_compute_pixel_texture_g_loss``'s surrogate branch), which is
+        on-path by construction:
+
+          * the surrogate term reaches the generator ONLY through that
+            tensor -- ``generator_surrogate_loss(critic, fake_lat)`` has
+            no other route;
+          * the DMD term is built from the same tensor.
+
+        ``||d(surrogate)/d(chunk)|| / ||d(rest)/d(chunk)||`` is therefore
+        a ratio of two influences on the SAME quantity and cannot be
+        zeroed by a probe-selection accident. It is also strictly cheaper
+        than the parameter site (autograd stops at the chunk instead of
+        traversing the whole DiT).
+
+        NO FORGEABLE ZEROS: a missing tensor or a None gradient publishes
+        a distinct REASON key. It never publishes 0.0, because 0.0 is
+        also what a genuinely tiny-but-live term reads.
+        """
+        tel = int(getattr(self.config, "gan_grad_telemetry_every", 25) or 0)
+        if tel <= 0 or int(current_step) % tel != 0:
+            return
+        try:
+            probe = getattr(self, "_pix_g_probe_tensor", None)
+            if not (isinstance(probe, torch.Tensor) and probe.requires_grad):
+                out["train/surrogate_grad_probe_unavailable"] = 1.0
+                out["train/surrogate_grad_probe_reason_no_tensor"] = 1.0
+                return
+            base_vec = grad_at(generator_loss, probe, retain_graph=True)
+            sur_vec = grad_at(pix_raw, probe, retain_graph=True)
+            if base_vec is None or sur_vec is None:
+                # EVERY exit publishes a DISTINCT reason. The first pixel
+                # smoke published ``surrogate_grad_probe_unavailable=1``
+                # with NO reason key at all, because this branch set the
+                # reason only in the ``sur_vec is None`` case -- so the
+                # base-unreachable case (which is what actually happened)
+                # was indistinguishable from a real severing. That is the
+                # forgeable-zero failure wearing a different hat: an
+                # alarm that cannot say what tripped it.
+                out["train/surrogate_grad_probe_unavailable"] = 1.0
+                if sur_vec is None:
+                    # The loud one: the surrogate term does not reach the
+                    # tensor it was built from = a REAL severing. This is
+                    # the failure the whole distilled-critic route would
+                    # otherwise hide, because every distillation metric
+                    # stays healthy while the generator receives nothing.
+                    out["train/surrogate_grad_severed_from_chunk"] = 1.0
+                if base_vec is None:
+                    # NOT a defect in the surrogate path. It means the
+                    # REST of the generator loss does not reach the
+                    # student chunk at this moment -- normal during the
+                    # GAN/DMD warmup window, when the other terms are
+                    # zero-weighted and ``generator_loss`` carries no
+                    # dependence on the chunk. The ratio is undefined
+                    # (no denominator), but the surrogate's OWN norm is
+                    # still meaningful, so publish it rather than
+                    # returning empty-handed.
+                    out["train/surrogate_grad_probe_reason_base_unreachable"] = 1.0
+                    if sur_vec is not None:
+                        out["train/surrogate_grad_norm_unweighted"] = float(
+                            sur_vec.norm())
+                        out["train/surrogate_grad_probe_site_is_chunk"] = 1.0
+                    # FALL THROUGH to the parameter-space probe below,
+                    # which is the ONLY route to a calibration ratio on
+                    # this arm -- see ``_param_grad_ratio``.
+                    self._param_grad_ratio(
+                        pix_raw, generator_loss, out,
+                        control_term=self._surrogate_tangent_control(
+                            probe, sur_vec,
+                        ),
+                    )
+                return
+            b_n = float(base_vec.norm())
+            s_n = float(sur_vec.norm())
+            # Provenance in the trace: 1.0 = measured at the student
+            # chunk. Any future move of this probe must change the key.
+            out["train/surrogate_grad_probe_site_is_chunk"] = 1.0
+            out["train/surrogate_grad_norm_unweighted"] = s_n
+            out["train/surrogate_base_grad_norm_shared"] = b_n
+            _w = float(out.get("train/pix_g_weight", 0.0))
+            out["train/surrogate_grad_norm_weighted"] = s_n * _w
+            if b_n > 0.0:
+                # THE CALIBRATION READ. ``pix_gan_weight`` has no default
+                # by design; the documented procedure is to launch at
+                # 0.0, read the UNWEIGHTED ratio (the share the term
+                # WOULD have at weight 1.0 -- at weight 0 the applied
+                # term has no gradient at all, so only this key can
+                # answer) and solve weight = 0.10 / r for the 5-20 %
+                # band.
+                out["train/surrogate_grad_ratio_unweighted"] = s_n / b_n
+                out["train/surrogate_grad_ratio"] = s_n * _w / b_n
+            if b_n > 0.0 and s_n > 0.0:
+                out["train/surrogate_dmd_grad_cos"] = float(
+                    torch.dot(sur_vec, base_vec) / (s_n * b_n)
+                )
+            # Also take the parameter-space reading when the chunk probe
+            # DID succeed, so the two anchors can be compared on the arms
+            # where both exist rather than only where one does.
+            self._param_grad_ratio(
+                pix_raw, generator_loss, out,
+                control_term=self._surrogate_tangent_control(probe, sur_vec),
+            )
+        except Exception as e:  # telemetry must never take a run down
+            out["train/surrogate_grad_probe_err"] = 1.0
+            if not getattr(self, "_sur_probe_warned", False):
+                self._sur_probe_warned = True
+                print(f"[SURROGATE-PROBE] {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+
     def _pix_standalone_grad_telemetry(
         self,
         generator_loss: torch.Tensor,
@@ -9009,11 +10176,45 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # The regime flag was doing its job; nobody read it. Hence the
         # explicit assertion under it.
         backbone = str(getattr(self, "surrogate_teacher_backbone", "pixel"))
-        teacher_disc = (
-            getattr(self, "sam2_teacher_disc", None)
-            if backbone in ("sam2", "dinov2", "convnext")
-            else getattr(self, "pixel_texture_disc", None)
-        )
+        # ``ladd_pixel`` (researcher directive 2026-08-26): the teacher
+        # IS the LADD gt_vs_fake discriminator running on its pixel
+        # feature source. Distilling THAT is the point -- the critic the
+        # surrogate regresses must be the critic the adversarial loop is
+        # actually training, not a parallel copy of it with its own
+        # pairing, its own optimizer and its own warm-up.
+        #
+        # It needs no ``sam2_teacher_optimizer`` and no separate
+        # heads D-update below, because its heads and its encoder are
+        # updated by the ``gt_vs_fake`` D-update at
+        # ``gan_updates_per_step`` per step -- which is also the fix for
+        # the cadence defect the directive names (at 1 update/step the
+        # SAM2 teacher got ~19 updates in 115 steps and never separated).
+        if backbone == "ladd_pixel":
+            # The pixel crop origin / phase jitter is a function of this
+            # value, and the LADD loss may or may not have run first.
+            # Scoped to this backbone: it is the only one whose teacher
+            # has a crop epoch at all.
+            self._ladd_set_pixel_epoch(int(current_step))
+            teacher_disc = getattr(self, "r3gan_disc", None)
+            if teacher_disc is None or getattr(
+                    teacher_disc, "pixel_source", None) is None:
+                raise RuntimeError(
+                    "surrogate_teacher_backbone='ladd_pixel' requires the "
+                    "LADD disc to be built with a pixel feature source "
+                    "(ladd_feature_source in ('pixgan','dinov2') and "
+                    "gan_backbone=ladd_teacher_feat). Got disc="
+                    f"{type(teacher_disc).__name__}, pixel_source="
+                    f"{getattr(teacher_disc, 'pixel_source', None)!r}. "
+                    "Refused rather than silently distilling from the "
+                    "latent-domain critic, which is the exact feature "
+                    "basis this arm exists to replace."
+                )
+        else:
+            teacher_disc = (
+                getattr(self, "sam2_teacher_disc", None)
+                if backbone in ("sam2", "dinov2", "convnext")
+                else getattr(self, "pixel_texture_disc", None)
+            )
         if teacher_disc is None:
             # No teacher: nothing to distill from. Regime flag, never
             # silence (forgeable-zero rule).
@@ -9041,11 +10242,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # the normalized loss an all-zero target is numerically loud, not
         # ignorable). Then DETACHED: the distiller owns its own graph.
         fake_lat, _fake_logs = self._pix_select_fake_latents(info)
-        crops_f, ys_f, _xs_f, _bands_f = self._pix_take_crops_with_origins(
+        crops_f, ys_f, xs_f, _bands_f = self._pix_take_crops_with_origins(
             fake_lat.detach(),
             n_crops=n_crops, crop_rows=crop_rows, crop_cols=crop_cols,
             n_bands=n_bands, gen=gen,
         )
+        _is_direct_field = bool(getattr(critic, "predicts_gradient", False))
+        _real_target_weight = float(
+            getattr(distiller, "loss_weights", {}).get("real", 1.0)
+        )
+        _need_real_target = not _is_direct_field or _real_target_weight > 0.0
+        # Standalone pretrained heads still require real images for their own
+        # D update even when the latent field student is fake-only. The LADD
+        # pixel head is already trained by the main real-vs-fake GAN loop and
+        # needs no duplicate surrogate-pool supply in that regime.
+        _need_real_supply = _need_real_target or backbone in (
+            "sam2", "dinov2", "convnext",
+        )
+        out["train/surrogate_real_targets_enabled"] = float(_need_real_target)
 
         # Real crops: read-only pool draw (see docstring) -- EXCEPT in
         # surrogate-only SAM2 mode, where the pixel D-loop (the pool's
@@ -9057,7 +10271,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # ``_pix_pool_fill`` primitive the D-loop uses (A21 semantics
         # preserved: cross-ride, band-stratified, FIFO-refreshed), sized
         # to 2x the per-step draw with one fresh admission per step.
-        if backbone in ("sam2", "dinov2", "convnext"):
+        #
+        # ``ladd_pixel`` BELONGS IN THIS SET (2026-08-26). It is in the
+        # identical situation and for the identical reason: that arm runs
+        # with ``gan_pixel_texture_enabled=false``, so the pixel D-loop --
+        # the pool's ONLY producer -- never executes, the pool stays
+        # empty forever, ``z_real`` stays None, and the distiller fits a
+        # FAKE-ONLY value field while ``surrogate_distill_ran`` reads 1
+        # and every loss curve looks healthy. Omitting it here would have
+        # been the exact looks-active-is-inert failure this comment was
+        # written about, reproduced one backbone later.
+        if (
+            _need_real_supply
+            and backbone in ("sam2", "dinov2", "convnext", "ladd_pixel")
+        ):
+            self._surrogate_pool_fill_calls = int(
+                getattr(self, "_surrogate_pool_fill_calls", 0)) + 1
             _pool_now = len(getattr(self, "_pix_real_pool", None) or ())
             _want = max(1, 2 * int(n_crops) - _pool_now)
             self._pix_pool_fill(
@@ -9065,10 +10294,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 n_bands=n_bands, lat_frames=int(rc["lat_frames"]),
                 step=int(current_step),
             )
-        pool = getattr(self, "_pix_real_pool", None) or []
+        pool = (
+            (getattr(self, "_pix_real_pool", None) or [])
+            if _need_real_supply else []
+        )
+        # ---- POOL OBSERVABILITY (2026-08-26) --------------------------
+        # ``train/pix_real_pool_windows`` already exists (:7680) but is
+        # emitted by ``_maybe_run_pixel_texture_d_updates``, which NEVER
+        # RUNS on a surrogate-only arm (gan_pixel_texture_enabled=false).
+        # So on exactly the configuration that depends on the pool most,
+        # the pool's size was invisible -- and an empty pool means the
+        # distiller fits a FAKE-ONLY value field while every curve stays
+        # healthy. Emitted here so the claim "the pool filled" is a
+        # reading rather than a patch review.
+        out["train/surrogate_pool_size"] = float(len(pool))
+        out["train/surrogate_pool_backbone_fills"] = float(
+            getattr(self, "_surrogate_pool_fill_calls", 0))
+        if not pool and _need_real_supply:
+            # Regime flag, never a silent zero: a fake-only distillation
+            # is the failure this key exists to make impossible to miss.
+            out["train/surrogate_pool_EMPTY"] = 1.0
         z_real = None
         origin_real: Optional[List[int]] = None
-        if pool:
+        origin_real_exact = None
+        if pool and _need_real_supply:
             n_draw = min(int(n_crops), len(pool))
             perm = torch.randperm(
                 len(pool), generator=gen, device=gen.device,
@@ -9078,29 +10327,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 e["lat"].to(crops_f.device, crops_f.dtype)
                 for e in entries
             ]).detach()
-            # LatentTextureCritic.forward's ``latent_origin`` is ONE
-            # (y0, x0) pair applied to the WHOLE batch in a single call
-            # (model/latent_texture_critic.py:403-410) -- it is not a
-            # per-crop list. Found on review: a first draft passed the
-            # raw per-crop y-list here, which ``step()`` -> ``compute_
-            # teacher_targets`` reads as ``(origin[0], origin[1])``
-            # (:693) -- i.e. crop 0's y as y0 and crop 1's y MISREAD as
-            # x0, with every other crop's origin silently dropped. Fixed
-            # to a single representative: mean y across the batch (x is
-            # 0 by construction -- A24 does not band-match horizontal
-            # position, TEXTURE_GAN_DESIGN.md §3.6, so there is no
-            # meaningful x to average). This is the batch-shared-origin
-            # approximation the module's own docs call "a positional
-            # prior, not an index" -- correct as far as it goes, but a
-            # coarser one than per-crop origins would give; see
-            # WP_SURROGATE.md §4.3 for the open item to do this properly
-            # if it turns out to matter.
+            # The historical scalar-potential student accepts one shared
+            # origin and therefore retains its mean-origin approximation.
+            # The direct vector student accepts one exact origin per batch
+            # row; retaining both forms here keeps old arms byte-identical
+            # while removing conditioning-label noise from the selected arm.
             origin_real = [
                 int(round(sum(int(e["y0"]) for e in entries) / len(entries))),
                 0,
             ]
-        else:
+            origin_real_exact = [
+                (int(e["y0"]), int(e["x0"])) for e in entries
+            ]
+        elif _need_real_supply:
             out["train/surrogate_distill_no_reals"] = 1.0
+        else:
+            out["train/surrogate_real_targets_disabled"] = 1.0
 
         # ---- SAM2 backbone: heads D-update BEFORE distillation --------
         # The pretrained-teacher branch (researcher directive 2026-08-24).
@@ -9162,6 +10404,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             px = self._vae_decode_grad(z_crop.to(self._pix_vae_dtype()))
             if border > 0:
                 px = px[..., border:-border, border:-border]
+            if backbone == "ladd_pixel":
+                # [n, F, 3, H, W] -> flatten frames -> score_pixels -> [n*F]
+                # -> mean over frames -> [n]. The frame mean (not a max, not
+                # a single frame) matches ``score_pixels``'s own token mean
+                # and keeps the target a smooth function of the crop, which
+                # is what the Sobolev half of the distillation is regressing.
+                # ``compute_teacher_targets`` asserts the leading dim equals
+                # the crop count, so the reduction is not optional.
+                _n, _f = int(px.shape[0]), int(px.shape[1])
+                _v = teacher_disc.score_pixels(
+                    px.flatten(0, 1).to(torch.float32))
+                return _v.reshape(_n, _f).mean(dim=1)
             if backbone in ("sam2", "dinov2", "convnext"):
                 # Pretrained disc consumes [N, F, 3, H, W] whole and returns [N]
                 # per-sample logits (frame-pooled inside);
@@ -9177,22 +10431,60 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 px.flatten(0, 1).to(torch.float32))
             return logits.reshape(n, f, *logits.shape[1:])
 
+        condition_real = None
+        condition_fake = None
+        _pixel_condition_on = (
+            int(getattr(critic, "pixel_condition_channels", 0)) > 0
+        )
+        # Cached teacher targets replay their own matching condition. Decode
+        # only on refresh steps; doing it on replay would pay VAE compute for
+        # a tensor that the distiller correctly ignores.
+        if _pixel_condition_on and distiller.should_refresh(int(current_step)):
+            if z_real is not None:
+                condition_real, _pc_logs = self._surrogate_pixel_condition(
+                    z_real
+                )
+                out.update(_pc_logs)
+                out["train/surrogate_pixel_condition_real_samples"] = float(
+                    condition_real.shape[0]
+                )
+            condition_fake, _pc_logs = self._surrogate_pixel_condition(crops_f)
+            out.update(_pc_logs)
+            out["train/surrogate_pixel_condition_fake_samples"] = float(
+                condition_fake.shape[0]
+            )
+
+        _condition_kwargs = {}
+        if _is_direct_field:
+            _condition_kwargs = {
+                "condition_real": condition_real,
+                "condition_fake": condition_fake,
+            }
         logs = distiller.step(
             z_real=z_real,
             z_fake=crops_f,
             teacher_value_fn=_teacher,
             current_step=int(current_step),
             optimizer=getattr(self, "latent_critic_optimizer", None),
-            origin_real=origin_real,
-            # Same batch-shared-origin fix as ``origin_real`` above.
-            origin_fake=[int(round(sum(ys_f) / len(ys_f))), 0] if ys_f else None,
+            origin_real=(origin_real_exact if _is_direct_field else origin_real),
+            origin_fake=(
+                list(zip((int(y) for y in ys_f), (int(x) for x in xs_f)))
+                if _is_direct_field and ys_f else
+                ([int(round(sum(ys_f) / len(ys_f))), 0] if ys_f else None)
+            ),
+            **_condition_kwargs,
         )
         out.update(logs)
         out["train/surrogate_distill_ran"] = 1.0
         out["train/surrogate_teacher_is_pretrained"] = (
             1.0 if backbone in ("sam2", "dinov2", "convnext") else 0.0
         )
-        # Periodic direct-vs-surrogate gradient audit -- the honest readout
+        # Periodic direct-vs-surrogate gradient audit.  The old implementation
+        # re-used ``crops_f`` immediately after fitting it, making the named
+        # "held-out" gate an in-sample resubstitution score. Draw an
+        # independent crop plan which is never inserted into the cache.  The
+        # offline feature-field bank remains the stronger ride-disjoint test;
+        # this live number now at least measures unseen crop rows/columns.
         # for the whole package (docs/WP_SURROGATE.md §2c): cosine between
         # the gradient the generator WOULD get from the true teacher and
         # the one the surrogate actually serves, on this step's fake crops.
@@ -9203,16 +10495,63 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # site. Costs one extra teacher fwd+grad, hence the cadence gate.
         if distiller.should_grad_check(int(current_step)):
             try:
+                fitted_origins = set(zip(
+                    (int(y) for y in ys_f), (int(x) for x in xs_f),
+                ))
+                audit_attempt = 0
+                while True:
+                    audit_gen = self._pix_sync_generator(
+                        int(current_step), 0, salt=17 + audit_attempt,
+                    )
+                    audit_crops, audit_ys, audit_xs, _audit_bands = (
+                        self._pix_take_crops_with_origins(
+                            fake_lat.detach(),
+                            n_crops=n_crops,
+                            crop_rows=crop_rows,
+                            crop_cols=crop_cols,
+                            n_bands=n_bands,
+                            gen=audit_gen,
+                        )
+                    )
+                    audit_origins = set(zip(
+                        (int(y) for y in audit_ys),
+                        (int(x) for x in audit_xs),
+                    ))
+                    if not (fitted_origins & audit_origins) or audit_attempt >= 7:
+                        break
+                    audit_attempt += 1
+                audit_condition = None
+                if _pixel_condition_on:
+                    audit_condition, _pc_logs = self._surrogate_pixel_condition(
+                        audit_crops
+                    )
+                    out.update(_pc_logs)
+                _audit_kwargs = {}
+                if _is_direct_field:
+                    _audit_kwargs["pixel_condition"] = audit_condition
                 chk = distiller.surrogate_grad_check(
-                    crops_f,
+                    audit_crops,
                     _teacher,
                     origin=(
-                        [int(round(sum(ys_f) / len(ys_f))), 0]
-                        if ys_f else None
+                        list(zip(
+                            (int(y) for y in audit_ys),
+                            (int(x) for x in audit_xs),
+                        ))
+                        if _is_direct_field and audit_ys else
+                        ([int(round(sum(audit_ys) / len(audit_ys))), 0]
+                         if audit_ys else None)
                     ),
                     current_step=int(current_step),
+                    **_audit_kwargs,
                 )
                 out.update(chk)
+                out["train/surrogate_check_reuses_fit_batch"] = 0.0
+                out["train/surrogate_check_distinct_crop_stream"] = 1.0
+                out["train/surrogate_check_origin_overlap_frac"] = (
+                    float(len(fitted_origins & audit_origins))
+                    / max(1.0, float(len(audit_origins)))
+                )
+                out["train/surrogate_check_crop_redraws"] = float(audit_attempt)
             except Exception as exc:
                 # The audit is telemetry: it must never kill a step. But
                 # never silently either (forgeable-zero rule).
@@ -9276,6 +10615,186 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         snap.eval()
         return snap
 
+    def _decoder_shaped_teacher_cotangent(
+        self,
+        pixels: torch.Tensor,
+        *,
+        border: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        """Current pixel-teacher score and detached ``d score / d pixels``."""
+        if not pixels.requires_grad:
+            raise ValueError("decoder-shaped teacher pixels must require grad")
+        view = (
+            pixels[..., border:-border, border:-border]
+            if int(border) > 0 else pixels
+        )
+        backbone = str(getattr(
+            self, "surrogate_teacher_backbone", "ladd_pixel",
+        ))
+        if backbone == "ladd_pixel":
+            teacher = getattr(self, "r3gan_disc", None)
+            if teacher is None or getattr(teacher, "pixel_source", None) is None:
+                raise RuntimeError(
+                    "decoder-shaped ladd_pixel teacher requires the live "
+                    "r3gan_disc pixel source"
+                )
+
+            def score_fn():
+                batch, frames = int(view.shape[0]), int(view.shape[1])
+                return teacher.score_pixels(
+                    view.flatten(0, 1).float()
+                ).reshape(batch, frames).mean(dim=1)
+        elif backbone == "pixel":
+            teacher = getattr(self, "pixel_texture_disc", None)
+            if teacher is None:
+                raise RuntimeError(
+                    "decoder-shaped pixel teacher requires pixel_texture_disc"
+                )
+
+            def score_fn():
+                batch, frames = int(view.shape[0]), int(view.shape[1])
+                logits = teacher(view.flatten(0, 1).float())
+                return logits.reshape(batch, frames, -1).mean(dim=(1, 2))
+        elif backbone in ("sam2", "dinov2", "convnext"):
+            teacher = getattr(self, "sam2_teacher_disc", None)
+            if teacher is None:
+                raise RuntimeError(
+                    f"decoder-shaped {backbone} teacher is not built"
+                )
+
+            def score_fn():
+                return teacher(view.float()).reshape(
+                    int(view.shape[0]), -1,
+                ).mean(dim=1)
+        else:
+            raise ValueError(
+                "decoder-shaped pullback does not support teacher "
+                f"backbone {backbone!r}"
+            )
+
+        parameters = list(teacher.parameters())
+        flags = [parameter.requires_grad for parameter in parameters]
+        try:
+            for parameter in parameters:
+                parameter.requires_grad_(False)
+            score = score_fn()
+            cotangent = torch.autograd.grad(score.sum(), pixels)[0].detach()
+        finally:
+            for parameter, flag in zip(parameters, flags):
+                parameter.requires_grad_(flag)
+        return cotangent, score.detach(), backbone
+
+    def _decoder_shaped_generator_loss(
+        self,
+        fake_lat: torch.Tensor,
+        *,
+        border: int,
+        current_step: int,
+        weight: float,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Dict[str, float]]:
+        """Serve the current discriminator through the graph-free WAN VJP."""
+        operator = getattr(self, "decoder_shaped_pullback", None)
+        if operator is None:
+            raise RuntimeError(
+                "decoder_shaped_pullback_enabled but operator is missing"
+            )
+        captured = operator.capture(fake_lat.detach())
+        pixels = captured.pixels.detach().requires_grad_(True)
+        pixel_cotangent, teacher_score, backbone = (
+            self._decoder_shaped_teacher_cotangent(
+                pixels, border=int(border),
+            )
+        )
+        field = operator.pullback(captured, pixel_cotangent)
+        # Release the detached 17-boundary state bank promptly.  Even after
+        # this release, the optional exact audit below cannot fit beside the
+        # full DMD generator graph on a 95-GiB rank; production launchers keep
+        # it disabled and gate this bundle on the strict offline operator
+        # banks.  The branch remains useful only in reduced-memory harnesses.
+        del captured, pixels
+        from model.decoder_shaped_pullback import (
+            generator_decoder_pullback_loss,
+        )
+        raw, logs = generator_decoder_pullback_loss(
+            fake_lat, field, weight=1.0,
+        )
+        logs.update({
+            "train/surrogate_decoder_teacher_score": float(
+                teacher_score.mean()
+            ),
+            "train/surrogate_decoder_pixel_cotangent_rms": float(
+                pixel_cotangent.float().square().mean().sqrt()
+            ),
+            # A global exposure request is spatial DC in the pixel
+            # cotangent.  The input ``dc``/``swt`` filter should drive this
+            # to numerical zero; logging it makes the protection directly
+            # testable instead of inferred from a video.  Ratio is RMS(DC)
+            # over RMS(all), so it is scale independent.
+            "train/surrogate_decoder_pixel_cotangent_dc_rms": float(
+                pixel_cotangent.float().mean(
+                    dim=(-2, -1), keepdim=True,
+                ).square().mean().sqrt()
+            ),
+            "train/surrogate_decoder_pixel_cotangent_dc_ratio": float(
+                pixel_cotangent.float().mean(
+                    dim=(-2, -1), keepdim=True,
+                ).square().mean().sqrt()
+                / pixel_cotangent.float().square().mean().sqrt().clamp_min(
+                    1.0e-20
+                )
+            ),
+            "train/surrogate_decoder_state_detached": 1.0,
+            "train/surrogate_decoder_current_teacher": 1.0,
+            "train/surrogate_decoder_teacher_ladd_pixel": float(
+                backbone == "ladd_pixel"
+            ),
+            "train/surrogate_g_weight": float(weight),
+            "train/surrogate_g_weighted": (
+                float(weight) * float(logs["train/surrogate_g_main"])
+            ),
+            "train/surrogate_consumed": 1.0,
+            "train/surrogate_staleness_steps": 0.0,
+            "train/pix_g_weight": float(weight),
+            "train/surrogate_exact_residual_stage_count": float(
+                len(operator.exact_residual_stages)
+            ),
+            "train/surrogate_exact_all_residual": float(
+                tuple(operator.exact_residual_stages)
+                == (1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15)
+            ),
+        })
+
+        audit_every = int(getattr(
+            self.config, "surrogate_decoder_shaped_audit_every", 0,
+        ) or 0)
+        if audit_every > 0 and int(current_step) % audit_every == 0:
+            z_exact = fake_lat.detach().float().requires_grad_(True)
+            exact_pixels = self.model.vae.decode_to_pixel(
+                z_exact, seed_first=True,
+            ).float()
+            exact = torch.autograd.grad(
+                exact_pixels, z_exact,
+                grad_outputs=pixel_cotangent.to(exact_pixels),
+            )[0].detach()
+            sample_cos = torch.nn.functional.cosine_similarity(
+                field.float().flatten(1), exact.float().flatten(1), dim=1,
+            )
+            logs.update({
+                "train/surrogate_check_cos_sample_q1": float(
+                    torch.quantile(sample_cos, 0.25)
+                ),
+                "train/surrogate_check_cos_sample_median": float(
+                    sample_cos.median()
+                ),
+                "train/surrogate_check_cos_sample_min": float(
+                    sample_cos.min()
+                ),
+                "train/surrogate_decoder_exact_audit": 1.0,
+            })
+        self._pix_g_probe_tensor = fake_lat
+        weighted = raw * float(weight) if weight != 0.0 else None
+        return weighted, raw, logs
+
     def _compute_pixel_texture_g_loss(
         self,
         info: Dict[str, Any],
@@ -9302,7 +10821,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         the D crops, and a GRAPH-ON decode (``_pix_decode_crops_grad``),
         which is the whole point of the term.
         """
-        _sur_on = bool(getattr(self, "surrogate_critic_enabled", False))
+        _sur_on = (
+            bool(getattr(self, "surrogate_critic_enabled", False))
+            or bool(getattr(self, "decoder_shaped_pullback_enabled", False))
+        )
         if not (bool(getattr(self, "gan_pixel_texture_enabled", False))
                 or _sur_on):
             return None, None, {}
@@ -9346,6 +10868,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             logs["train/pix_g_fake_no_grad"] = 1.0
             return None, None, logs
 
+        if bool(getattr(self, "decoder_shaped_pullback_enabled", False)):
+            weighted, raw, decoder_logs = self._decoder_shaped_generator_loss(
+                fake_lat, border=border, current_step=int(current_step),
+                weight=float(weight),
+            )
+            # Preserve the common fake-selector proof keys.  Returning the
+            # decoder logs directly used to discard (among others)
+            # pix_fake_source_ladder and pix_fake_lat_frames, making the
+            # active route impossible to audit even though it was selected
+            # correctly.
+            logs.update(decoder_logs)
+            return weighted, raw, logs
+
         # ------------------------------------------------------------------
         # WP-SURROGATE (B3) consumption branch -- MAIN, researcher-ordered
         # (docs/TASK_SURROGATE_CONSUMPTION.md). When the surrogate critic is
@@ -9379,8 +10914,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     "not run or was resumed without its keys. Refusing to "
                     "fall back to the direct pixel path silently."
                 )
+            pixel_condition = None
+            if int(getattr(critic, "pixel_condition_channels", 0)) > 0:
+                pixel_condition, _pc_logs = self._surrogate_pixel_condition(
+                    fake_lat
+                )
+                logs.update(_pc_logs)
+                logs["train/surrogate_pixel_condition_generator_samples"] = (
+                    float(pixel_condition.shape[0])
+                )
             raw_sur, sur_logs = generator_surrogate_loss(
                 critic, fake_lat, weight=1.0,
+                pixel_condition=pixel_condition,
             )
             logs.update(sur_logs)
             # The module computed at weight=1.0 (that call IS the raw /
@@ -9394,6 +10939,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             logs["train/surrogate_consumed"] = 1.0
             logs["train/surrogate_staleness_steps"] = 1.0
             logs["train/pix_g_weight"] = float(weight)
+            # ON-PATH PROBE ANCHOR. ``fake_lat`` is the student chunk the
+            # surrogate term is built from and the ONLY route by which
+            # that term reaches the generator, so it is on-path BY
+            # CONSTRUCTION. Stashed here rather than re-derived at the
+            # probe site so the probe can never end up differentiating a
+            # different tensor than the loss was built from. See
+            # ``_pix_surrogate_grad_telemetry``.
+            self._pix_g_probe_tensor = fake_lat
             weighted_sur = (
                 (raw_sur * float(weight)) if weight != 0.0 else None
             )
@@ -10832,12 +12385,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # the training pairs / creates a feedback loop since G inverts F). The
         # _raw key is the pre-de-drift slab; when de-drift/apply_to_flash is OFF
         # it IS flash_dmd_gan_x0 (byte-identical fallback).
-        flash = info.get("flash_dmd_gan_x0_raw")
-        if flash is None:
-            flash = info.get("flash_dmd_gan_x0")
-        r1 = flash.detach() if flash is not None else rollout1_chunk
+        _fn_source = str(getattr(
+            m, "forward_noiser_train_source", "flash",
+        )).lower()
+        flash = None
+        if _fn_source == "flash":
+            flash = info.get("flash_dmd_gan_x0_raw")
+            if flash is None:
+                flash = info.get("flash_dmd_gan_x0")
+            r1 = flash.detach() if flash is not None else rollout1_chunk
+        elif _fn_source == "ladder_endpoint":
+            r1 = info.get("ladder_endpoint_chunk")
+            if r1 is None:
+                return _anchor("no_ladder_endpoint_r1")
+            r1 = r1.detach()
+        else:
+            r1 = rollout1_chunk
         if r1 is None or int(r1.shape[1]) % npb != 0:
             return _anchor("bad_r1")
+        if (getattr(self, "is_main_process", True)
+                and getattr(self, "_fn_r1_source_dbg", 0) < 2):
+            self._fn_r1_source_dbg = getattr(
+                self, "_fn_r1_source_dbg", 0,
+            ) + 1
+            import sys as _sys
+            print(
+                f"[FN-R1-SOURCE] source={_fn_source} "
+                f"flash_dmd_enabled={bool(getattr(m, 'flash_dmd_enabled', False))}",
+                file=_sys.stderr, flush=True,
+            )
         n_chunks = int(r1.shape[1]) // npb
         abs_new_start = int(info.get("abs_frame_start", 0))
         overlap = int(info.get("overlap", 0))
@@ -11113,6 +12689,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/fn_tf_skipped": 0.0,
                 "train/fn_tf_reverse": 1.0 if _reverse else 0.0,
                 "train/fn_tf_chain_levels": 1.0 if _chain_levels else 0.0,
+                "train/fn_tf_r1_ladder_endpoint": (
+                    1.0 if _fn_source == "ladder_endpoint" else 0.0
+                ),
+                "train/fn_tf_r2_ladder_endpoint": (
+                    1.0 if str(getattr(
+                        m, "forward_noiser_rollout2_source", "legacy",
+                    )).lower() == "ladder_endpoint" else 0.0
+                ),
             },
         )
 
@@ -11137,6 +12721,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         zero = torch.zeros((), device=device, dtype=torch.float32)
         if not self.gan_enabled or self.r3gan_disc is None:
             return zero, {}
+        # Pixel-source crop origin + phase jitter epoch. Set ONCE per
+        # step and BEFORE any disc forward, so the five D-updates and
+        # the two finite-difference R1 forwards all score the same crop
+        # at the same phase. No-op on every non-pixel arm.
+        self._ladd_set_pixel_epoch(int(current_step))
 
         # Source latent for the FAKE side (gradient-bearing for the gen).
         # Precedence: the divergence-3 override (the DMD-scored band, when
@@ -11404,6 +12993,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         ]
         if r1_loss_keys:
             logs["train/r3gan_r1"] = sum(logs[k] for k in r1_loss_keys) / len(r1_loss_keys)
+        # CONNECTION PROOFS for the pixel feature source. Empty dict on
+        # every non-pixel arm, so the log payload is byte-identical when
+        # the feature is off.
+        logs.update(self._ladd_pixel_logs())
         return gen_loss_total, logs
 
     # ------------------------------------------------------------------
@@ -11518,6 +13111,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/r3gan_disc_updates_total": float(n),
             "train/r3gan_r1_fired_total": float(r1),
             "train/r3gan_r1_fire_rate": float(r1) / n if n else 0.0,
+            # The ``gan_updates_per_step`` INNER iterations. ``_total``
+            # divided by ``r3gan_disc_updates_total`` recovers the
+            # realised updates-per-phase, so a change to the D-side
+            # counterweight is provable from telemetry instead of from
+            # the config echo. ``_last`` is 0 before gan_disc_start_step.
+            "train/r3gan_disc_inner_updates_total": float(
+                getattr(self, "_ladd_disc_inner_updates_total", 0)),
+            "train/r3gan_disc_inner_updates_last": float(
+                getattr(self, "_ladd_disc_inner_updates_last", 0)),
         }
         if pair_mode is None:
             return out
@@ -12498,7 +14100,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         npb = int(getattr(self.model, "num_frame_per_block", 3))
         F_total = int(fake_src_grad.shape[1])
         if F_total < npb:
-            return zero, {"train/ladd_n_pairs": 0.0}
+            # F3: carry the ruling counters through the early
+            # returns too, so an ABSENT key can never be read
+            # as "counter broken". Nothing was skipped here.
+            return zero, {
+                "train/ladd_n_pairs": 0.0,
+                "train/fn_gtvf_noise_skipped": float(
+                    getattr(self, "_fn_gtvf_noise_skipped", 0)),
+                "train/fn_gtvf_noise_applied": float(
+                    getattr(self, "_fn_gtvf_noise_applied", 0)),
+            }
         n_chunks = F_total // npb
 
         # Per-mode pair index lists. Each pair = (real_idx, fake_idx)
@@ -12511,7 +14122,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             all_pairs = [(i, i) for i in range(n_chunks)]
         elif pair_mode == "adjacent_chunks":
             if n_chunks < 2:
-                return zero, {"train/ladd_n_pairs": 0.0}
+                # F3: carry the ruling counters through the early
+                # returns too, so an ABSENT key can never be read
+                # as "counter broken". Nothing was skipped here.
+                return zero, {
+                    "train/ladd_n_pairs": 0.0,
+                    "train/fn_gtvf_noise_skipped": float(
+                        getattr(self, "_fn_gtvf_noise_skipped", 0)),
+                    "train/fn_gtvf_noise_applied": float(
+                        getattr(self, "_fn_gtvf_noise_applied", 0)),
+                }
             all_pairs = [(i, i + 1) for i in range(n_chunks - 1)]
         elif pair_mode == "gt_transition":
             # Action-conditioned GT-supervised adjacent-chunk matching.
@@ -12522,7 +14142,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # so the action-token slicing below can use the same lo_r /
             # lo_f layout (and we cover both chunks per pair).
             if n_chunks < 2:
-                return zero, {"train/ladd_n_pairs": 0.0}
+                # F3: carry the ruling counters through the early
+                # returns too, so an ABSENT key can never be read
+                # as "counter broken". Nothing was skipped here.
+                return zero, {
+                    "train/ladd_n_pairs": 0.0,
+                    "train/fn_gtvf_noise_skipped": float(
+                        getattr(self, "_fn_gtvf_noise_skipped", 0)),
+                    "train/fn_gtvf_noise_applied": float(
+                        getattr(self, "_fn_gtvf_noise_applied", 0)),
+                }
             all_pairs = [(i, i + 1) for i in range(n_chunks - 1)]
             chunks_per_pair = 2
         else:
@@ -12730,11 +14359,59 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # anchor becomes [cartoon-shifted GT former -> clean GT latter] = a
         # self-correcting (de-cartoon) transition the student must match.
         # Latent-space (no wavelet); requires the FN to be present.
-        _carn_former_on = (
-            pair_mode == "gt_transition"
-            and _carn_knob
-            and getattr(self.model, "forward_noiser", None) is not None
+        _carn_former_on = pair_mode == "gt_transition" and _carn_knob
+        _carn_latter_knob = bool(
+            getattr(
+                self.model, "ladd_gt_transition_carn_latter_reverse", None,
+            )
+            or getattr(
+                self.config, "ladd_gt_transition_carn_latter_reverse", False,
+            )
         )
+        _carn_latter_on = (
+            pair_mode == "gt_transition" and _carn_latter_knob
+        )
+
+        # A single legacy FN can learn EITHER R1->R2 (former +drift) OR
+        # R2->R1 (latter -drift), never both.  ``tx_both`` therefore uses the
+        # cycle build: its forward_noiser is F(+drift) and its dedicated
+        # reverse_noiser is G(-drift).  Keep the old single-reverse route for
+        # tx_minus_latter, and fail loudly if a requested sign has no correctly
+        # trained network instead of silently turning the run into an A/A arm.
+        _fn_reverse = bool(getattr(
+            self.model, "forward_noiser_reverse", False,
+        ))
+        _cycle_on = bool(getattr(
+            self.model, "forward_noiser_cycle_enabled", False,
+        ))
+        _forward_carn = getattr(self.model, "forward_noiser", None)
+        _reverse_carn = None
+        _reverse_carn_source = ""
+        if _fn_reverse:
+            _reverse_carn = _forward_carn
+            _reverse_carn_source = "single_reverse_forward_noiser"
+        elif _cycle_on:
+            _reverse_carn = getattr(self.model, "reverse_noiser", None)
+            _reverse_carn_source = "cycle_reverse_noiser"
+
+        if _carn_former_on and (_forward_carn is None or _fn_reverse):
+            raise ValueError(
+                "ladd_gt_transition_carn_former=true requires an R1->R2 "
+                "forward_noiser. The configured single FN is absent or was "
+                "flipped with forward_noiser_reverse=true."
+            )
+        if _carn_latter_on and _reverse_carn is None:
+            raise ValueError(
+                "ladd_gt_transition_carn_latter_reverse=true requires either "
+                "forward_noiser_reverse=true (single R2->R1 FN) or "
+                "forward_noiser_cycle_enabled=true with a dedicated reverse "
+                "noiser."
+            )
+        if _carn_former_on and _carn_latter_on and not _cycle_on:
+            raise ValueError(
+                "tx_both requires forward_noiser_cycle_enabled=true so the "
+                "former uses F(R1->R2) and the latter uses G(R2->R1)."
+            )
         if _carn_former_on and getattr(self, "_carn_former_dbg", 0) < 2:
             self._carn_former_dbg = getattr(self, "_carn_former_dbg", 0) + 1
             import sys as _sys
@@ -12743,15 +14420,35 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "cartoon step by the learned ForwardNoiser.",
                 file=_sys.stderr, flush=True,
             )
+        if _carn_latter_on and getattr(self, "_carn_latter_dbg", 0) < 2:
+            self._carn_latter_dbg = getattr(self, "_carn_latter_dbg", 0) + 1
+            import sys as _sys
+            print(
+                "[CARN-LATTER-REVERSE] ON: gt_transition GT latter chunk "
+                "pushed -1 drift step by the R2->R1 noiser "
+                f"source={_reverse_carn_source}.",
+                file=_sys.stderr, flush=True,
+            )
+        if (
+            _carn_former_on and _carn_latter_on
+            and getattr(self, "_carn_both_dbg", 0) < 2
+        ):
+            self._carn_both_dbg = getattr(self, "_carn_both_dbg", 0) + 1
+            import sys as _sys
+            print(
+                "[CARN-TX-BOTH] ON: real transition pair uses "
+                "F(+1, former) and G(-1, latter); source=cycle_forward+reverse.",
+                file=_sys.stderr, flush=True,
+            )
 
-        def _carn_former(x):
+        def _carn_transform(x, noiser, *, route, random_level=False):
             n_steps = int(getattr(self.model, "ladd_gt_transition_carn_steps", 1))
             # FIX B (random real-former CARN level): draw the level per PAIR
             # uniformly in [0, max_level] (0 = clean former). The disc then
             # sees real formers at every degradation level (incl. clean), so
             # it can't pull the student toward a single fixed CARN level —
             # it must key on the transition (clean latter | any former).
-            if bool(getattr(
+            if random_level and bool(getattr(
                 self.model, "ladd_gt_transition_carn_random_level", False)):
                 _maxlvl = int(getattr(
                     self.model, "ladd_gt_transition_carn_max_level", n_steps))
@@ -12774,14 +14471,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         (x.shape[0],), int(max(1, n_steps)),
                         dtype=torch.long, device=x.device,
                     )
-                    x = self.model.forward_noiser(x0, cs, residual=True)
+                    x = noiser(x0, cs, residual=True)
                 else:
                     for _s in range(max(1, n_steps)):
                         cs = torch.full(
                             (x.shape[0],), 0 if _uncond else _s,
                             dtype=torch.long, device=x.device,
                         )
-                        x = self.model.forward_noiser(x, cs, residual=True)
+                        x = noiser(x, cs, residual=True)
                 # MOMENT-PRESERVING carn (texture only, NO stats — see the
                 # "CARN = texture, not stats" directive). The FN trains on
                 # un-normalized rollout1->rollout2, where rollout2 runs hot
@@ -12804,11 +14501,28 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 a_in = x0.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
                 a_out = x.abs().mean(dim=[1, 2, 3, 4], keepdim=True)
                 x = x * (a_in / (a_out + eps))
+            _ctr = f"_carn_{route}_rows_applied_total"
+            setattr(self, _ctr, int(getattr(self, _ctr, 0)) + int(x.shape[0]))
             return x.detach()
 
+        def _carn_former(x):
+            return _carn_transform(
+                x, _forward_carn, route="former", random_level=True,
+            )
+
+        def _carn_latter_reverse(x):
+            return _carn_transform(
+                x, _reverse_carn, route="latter_reverse", random_level=False,
+            )
+
         def _slice_pair_carn(t, i, j):
-            former = _carn_former(_slice(t, i))
-            return torch.cat([former, _slice(t, j)], dim=1)
+            former = _slice(t, i)
+            latter = _slice(t, j)
+            if _carn_former_on:
+                former = _carn_former(former)
+            if _carn_latter_on:
+                latter = _carn_latter_reverse(latter)
+            return torch.cat([former, latter], dim=1)
 
         # gt_match telemetry logs (empty dict => no keys emitted when the
         # ladd_gt_match_frames flag is off / cpp != 2). Merged into BOTH
@@ -12820,7 +14534,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # (i, i+1). Real uses GT (real_src=gt_detached), fake uses
             # student (fake_src_*). Same i,j indices on both sides — the
             # disc compares "GT's chunk pair" vs "student's chunk pair".
-            _real_pair_fn = _slice_pair_carn if _carn_former_on else _slice_pair
+            _real_pair_fn = (
+                _slice_pair_carn
+                if (_carn_former_on or _carn_latter_on)
+                else _slice_pair
+            )
             # ladd_gt_match_frames: forward-only per-pair frame matching of
             # the SAME-RIDE positional real anchors. The helper L1-matches
             # each real pair slice against the SAME fake chunk-pair the disc
@@ -12837,10 +14555,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         current_step=current_step,
                     )
                 )
-                _gtm_logs = {
+                _gtm_logs.update({
                     "train/" + _k: float(_v)
                     for _k, _v in _gtm_logs_raw.items()
-                }
+                })
 
                 def _slice_shifted(t, i, s):
                     # _slice with the pair's forward frame shift applied.
@@ -12856,12 +14574,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
 
                 def _slice_pair_carn_shifted(t, i, j, s):
                     # _slice_pair_carn, former+latter shifted TOGETHER by s.
-                    former = _carn_former(_slice_shifted(t, i, s))
-                    return torch.cat(
-                        [former, _slice_shifted(t, j, s)], dim=1)
+                    former = _slice_shifted(t, i, s)
+                    latter = _slice_shifted(t, j, s)
+                    if _carn_former_on:
+                        former = _carn_former(former)
+                    if _carn_latter_on:
+                        latter = _carn_latter_reverse(latter)
+                    return torch.cat([former, latter], dim=1)
 
                 _real_pair_shift_fn = (
-                    _slice_pair_carn_shifted if _carn_former_on
+                    _slice_pair_carn_shifted
+                    if (_carn_former_on or _carn_latter_on)
                     else _slice_pair_shifted
                 )
                 real_chunks_det = torch.cat(
@@ -12879,6 +14602,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 [_slice_pair(fake_src_detached, i, j) for (i, j) in pairs],
                 dim=0,
             )
+            # Positive runtime proof for every transition-CARN route.  The
+            # cumulative row counters prove the transforms actually executed;
+            # config presence or a one-shot boot line is not sufficient.
+            _gtm_logs.update({
+                "train/ladd_carn_former_applied": float(_carn_former_on),
+                "train/ladd_carn_latter_reverse_applied": float(_carn_latter_on),
+                "train/ladd_carn_tx_both_applied": float(
+                    _carn_former_on and _carn_latter_on
+                ),
+                "train/ladd_carn_former_rows_total": float(getattr(
+                    self, "_carn_former_rows_applied_total", 0,
+                )),
+                "train/ladd_carn_latter_reverse_rows_total": float(getattr(
+                    self, "_carn_latter_reverse_rows_applied_total", 0,
+                )),
+                "train/ladd_carn_latter_cycle_source": float(
+                    _carn_latter_on and _reverse_carn_source == "cycle_reverse_noiser"
+                ),
+            })
             _gen_detach_former = bool(getattr(
                 self.model, "ladd_gt_transition_gen_detach_former", False))
 
@@ -13094,7 +14836,25 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             getattr(self.model, "forward_noiser_apply_decoupled", None)
             or getattr(self.config, "forward_noiser_apply_decoupled", False)
         )
-        if (
+        # RULING 2026-08-26 (researcher, binding): the gt_vs_fake
+        # disc's REAL/POSITIVE rows are clean GT, ALWAYS, BY DEFAULT --
+        # "the transition side of things goes to the CARN model and the gt
+        # vs fake is yours ... for gt vs fake we should never be noising".
+        # CALL-SITE GATE ONLY: the forward noiser (CARN) is simply not
+        # CALLED for this pair mode; nothing about the noiser changes.
+        # gt_transition (cpp==2) is untouched -- _fn_block_gtvf can only be
+        # True when pair_mode == 'gt_vs_fake'. adjacent_chunks is untouched
+        # (its "real" is the source latent, not GT).
+        # ``forward_noiser_allow_gt_vs_fake`` (default False) = deliberate-
+        # ablation escape hatch; the clean behaviour needs NO flag.
+        _fn_allow_gtvf = bool(
+            getattr(self.model, "forward_noiser_allow_gt_vs_fake", None)
+            or getattr(self.config, "forward_noiser_allow_gt_vs_fake", False)
+        )
+        _fn_block_gtvf = (pair_mode == "gt_vs_fake") and not _fn_allow_gtvf
+        # Split the historical condition out so the BYPASS can be COUNTED
+        # (proof from a counter, never from the patch).
+        _fn_decoupled_would_apply = (
             _fn_decoupled
             and chunks_per_pair == 1
             and n_pairs > 0
@@ -13105,7 +14865,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self.model, "forward_noiser_apply_gt_both", False))
             )
             and getattr(self.model, "forward_noiser", None) is not None
-        ):
+        )
+        if _fn_decoupled_would_apply and _fn_block_gtvf:
+            self._fn_gtvf_noise_skipped = int(
+                getattr(self, "_fn_gtvf_noise_skipped", 0)) + 1
+            if (getattr(self, "is_main_process", True)
+                    and getattr(self, "_fn_gtvf_clean_dbg", 0) < 3):
+                self._fn_gtvf_clean_dbg = getattr(
+                    self, "_fn_gtvf_clean_dbg", 0) + 1
+                import sys as _sys
+                print(
+                    "[FN-GTVF-CLEAN] BYPASS site=decoupled "
+                    "pair_mode=gt_vs_fake cpp=1 n=%d -- the forward noiser "
+                    "(CARN) was NOT applied to the real/positive rows "
+                    "(researcher ruling: gt_vs_fake positives are clean "
+                    "GT). Set forward_noiser_allow_gt_vs_fake=true to "
+                    "restore the pre-2026-08-26 behaviour for a deliberate "
+                    "ablation." % (int(real_chunks_det.shape[0]),),
+                    file=_sys.stderr, flush=True,
+                )
+        if _fn_decoupled_would_apply and not _fn_block_gtvf:
+            if pair_mode == "gt_vs_fake":
+                self._fn_gtvf_noise_applied = int(
+                    getattr(self, "_fn_gtvf_noise_applied", 0)) + 1
             _dmode = str(getattr(
                 self.model, "forward_noiser_former_mode", "weak")).lower()
             _dchain = bool(getattr(
@@ -13650,6 +15432,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         n_disc_updates = (
             0 if (disc_skipped or skip_d) else int(self.gan_updates_per_step)
         )
+        # D-SIDE DOSE, counted. ``r3gan_disc_updates_total`` counts D
+        # PHASES (one per step per pair mode -- it read 170 on a 200-step
+        # arm), NOT the ``gan_updates_per_step`` inner iterations, so
+        # until now nothing in telemetry proved that knob's realised
+        # value. It is the sanctioned counterweight to any coverage
+        # increase (``gan_loss_weight`` is forbidden: it scales only the
+        # G side and converts over-driven-G into D-wins), so it needs a
+        # counter of its own. Both ``for _it in range(n_disc_updates)``
+        # loops below iterate this bound unconditionally.
+        self._ladd_disc_inner_updates_last = int(n_disc_updates)
+        self._ladd_disc_inner_updates_total = int(
+            getattr(self, "_ladd_disc_inner_updates_total", 0)
+        ) + int(n_disc_updates)
         last_d_loss = 0.0
         last_d_real = 0.0
         last_d_fake = 0.0
@@ -14191,11 +15986,36 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # NO-OP twice over: the positional decoupled apply above
                 # transforms ``real_chunks_det``, which the matched branch
                 # does not consume (it rebuilds ``ru`` from the pool).
-                if ((_gt_both or _gt_former)
-                        and (chunks_per_pair == 2
-                             or (_fn_decoupled and chunks_per_pair == 1))
-                        and getattr(self.model, "forward_noiser", None)
-                        is not None):
+                # RULING 2026-08-26: the cpp==1 admission here is ALWAYS
+                # gt_vs_fake, so ``_fn_block_gtvf`` (enclosing scope) skips
+                # the CALL by default. cpp==2 gt_transition is unchanged.
+                _fn_matched_would_apply = (
+                    (_gt_both or _gt_former)
+                    and (chunks_per_pair == 2
+                         or (_fn_decoupled and chunks_per_pair == 1))
+                    and getattr(self.model, "forward_noiser", None)
+                    is not None
+                )
+                if _fn_matched_would_apply and _fn_block_gtvf:
+                    self._fn_gtvf_noise_skipped = int(
+                        getattr(self, "_fn_gtvf_noise_skipped", 0)) + 1
+                    if (getattr(self, "is_main_process", True)
+                            and getattr(self, "_fn_gtvf_clean_m_dbg", 0) < 3):
+                        self._fn_gtvf_clean_m_dbg = getattr(
+                            self, "_fn_gtvf_clean_m_dbg", 0) + 1
+                        import sys as _sys
+                        print(
+                            "[FN-GTVF-CLEAN] BYPASS site=matched_pool "
+                            "pair_mode=gt_vs_fake cpp=%d n=%d -- the forward "
+                            "noiser (CARN) was NOT applied to the matched "
+                            "real/positive rows (researcher ruling)."
+                            % (chunks_per_pair, int(ru.shape[0])),
+                            file=_sys.stderr, flush=True,
+                        )
+                if _fn_matched_would_apply and not _fn_block_gtvf:
+                  if pair_mode == "gt_vs_fake":
+                      self._fn_gtvf_noise_applied = int(
+                          getattr(self, "_fn_gtvf_noise_applied", 0)) + 1
                   # chain_levels drives the FORMER-only forward scheme; any
                   # gt_both (reverse de-CARN) config falls to legacy below.
                   _chain_app = bool(getattr(
@@ -15073,6 +16893,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     disc_for_guidance.requires_grad_(False)
                 _disc_was_training = disc_for_guidance.training
                 disc_for_guidance.eval()
+                _pixel_g_route_prev = bool(getattr(
+                    disc_for_guidance, "pixel_use_g_cfg", False))
+                disc_for_guidance.pixel_use_g_cfg = True
                 try:
                     (real_m, real_m_rat, real_m_ram, real_m_rpe,
                      group_flat) = _match_select(7919)
@@ -15112,6 +16935,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self._ladd_last_gen_gan_stat_value = float(
                         gen_gan_stat_value)
                 finally:
+                    disc_for_guidance.pixel_use_g_cfg = _pixel_g_route_prev
                     if not _gsr_m:
                         disc_for_guidance.requires_grad_(True)
                     if _disc_was_training:
@@ -15177,6 +17001,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "train/r3gan_g_loss_raw_stat": gen_gan_stat_value,
                 "train/r3gan_stat_loss_weight": float(
                     getattr(self.model, "ladd_stat_head_loss_weight", 1.0)),
+                # RULING 2026-08-26 monotone counters: skipped MUST rise on a
+                # default gt_vs_fake+CARN arm, applied MUST stay 0.0.
+                "train/fn_gtvf_noise_skipped": float(
+                    getattr(self, "_fn_gtvf_noise_skipped", 0)),
+                "train/fn_gtvf_noise_applied": float(
+                    getattr(self, "_fn_gtvf_noise_applied", 0)),
                 # gt_match telemetry (empty when ladd_gt_match_frames off).
                 **_gtm_logs,
             }
@@ -15336,6 +17166,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 # depends on the real rows, so the gradient w.r.t. fake
                 # rows is identically zero.
                 B_pair_d = real_chunks_det_noisy.shape[0]
+                # The pixel-source callback sees the exact post-decode image
+                # batch but cannot infer its semantic row split on its own.
+                # Publish that split only for this positional D update.  The
+                # callback ignores trailing finite-difference R1 rows.
+                if callable(getattr(
+                    self.r3gan_disc, "pixel_capture_fn", None
+                )):
+                    self.r3gan_disc.pixel_capture_context = {
+                        "step": int(current_step),
+                        "pair_mode": f"{pair_mode}/positional",
+                        "update_idx": int(_pos_it),
+                        "pair_rows": int(B_pair_d),
+                        "disc_t": int(disc_t_int),
+                        "diff_aug_policy": str(diff_aug_policy or ""),
+                    }
                 # ---- flag-gated INPUT DUMP (positional branch) ----
                 # Same contract as the matched-real stash above: what the
                 # disc D-update scores, pre-wavelet. Main-rank only,
@@ -15684,6 +17529,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         self.gan_max_grad_norm,
                     )
                 self.r3gan_optimizer.step()
+                self.r3gan_disc.pixel_capture_context = None
                 last_d_loss = float(d_rp.detach().item())
                 last_d_real = float(d_real_logits.detach().mean().item())
                 last_d_fake = float(d_fake_logits.detach().mean().item())
@@ -15742,6 +17588,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 disc_for_guidance.requires_grad_(False)
             disc_was_training = disc_for_guidance.training
             disc_for_guidance.eval()
+            _pixel_g_route_prev = bool(getattr(
+                disc_for_guidance, "pixel_use_g_cfg", False))
+            disc_for_guidance.pixel_use_g_cfg = True
             try:
                 real_chunks_grad_det = real_chunks_det.detach()
                 fake_chunks_grad = fake_chunks_grad_tensor
@@ -15892,6 +17741,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 self._ladd_last_gen_gan_weight_mode = pair_mode
                 self._ladd_last_gen_gan_stat_value = float(gen_gan_stat_value)
             finally:
+                disc_for_guidance.pixel_use_g_cfg = _pixel_g_route_prev
                 if not _gsr_p:
                     disc_for_guidance.requires_grad_(True)
                 if disc_was_training:
@@ -16010,6 +17860,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # A6: positional-path real-diversity telemetry (empty dict =>
             # no keys emitted when gan_real_diversity_log is off).
             **_div_pos,
+            # RULING 2026-08-26 monotone counters: skipped MUST rise on a
+            # default gt_vs_fake+CARN arm, applied MUST stay 0.0.
+            "train/fn_gtvf_noise_skipped": float(
+                getattr(self, "_fn_gtvf_noise_skipped", 0)),
+            "train/fn_gtvf_noise_applied": float(
+                getattr(self, "_fn_gtvf_noise_applied", 0)),
             # gt_match telemetry (empty when ladd_gt_match_frames off).
             **_gtm_logs,
             # FIX-2 action-origin alignment (empty when its flags are off).
@@ -18645,10 +20501,33 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # loop). Only the SCORING path (DMD/GAN/critic) sees the de-drift. When
         # de-drift is OFF the helper returns the SAME object => byte-identical.
         _raw_train_chunk = train_chunk
-        train_chunk = self.model._dedrift_with_reverse_noiser(
-            train_chunk,
-            int(getattr(self.model, "reverse_noiser_dedrift_level", 1)),
+        _need_dedrift_target = (
+            bool(getattr(
+                self.model, "reverse_noiser_dedrift_enabled", False,
+            ))
+            and (
+                bool(getattr(
+                    self.model,
+                    "reverse_noiser_dedrift_apply_to_train_score", True,
+                ))
+                or float(getattr(
+                    self.model, "reverse_noiser_internalize_weight", 0.0,
+                )) > 0.0
+            )
         )
+        _dedrifted_train_chunk = _raw_train_chunk
+        if _need_dedrift_target:
+            _dedrifted_train_chunk = (
+                self.model._dedrift_streaming_slab_with_reverse_noiser(
+                    _raw_train_chunk, train_info,
+                )
+            )
+        if bool(getattr(
+            self.model, "reverse_noiser_dedrift_apply_to_train_score", True,
+        )):
+            train_chunk = _dedrifted_train_chunk
+        else:
+            train_chunk = _raw_train_chunk
         # CARN pair-swap test (researcher, 2026-08-24): DEDICATED corrector
         # training backward. The legacy mse-fold rides the FAKE-SCORE inner
         # backward, which is 0 in this arm (streaming_fake_updates_per_gen=0
@@ -18758,7 +20637,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # (byte-identical) when reverse_noiser_internalize_weight=0.
         if float(getattr(self.model, "reverse_noiser_internalize_weight", 0.0)) > 0.0:
             _l_int = self.model._reverse_noiser_internalize_loss(
-                _raw_train_chunk, train_chunk,
+                _raw_train_chunk, _dedrifted_train_chunk,
+                mask=train_info.get("gradient_mask"),
             )
             generator_loss = generator_loss + _l_int
             out["reverse_noiser_internalize_loss"] = float(_l_int.detach().item())
@@ -18809,12 +20689,69 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # aligned is off or this iter didn't emit it. Gated by
             # ``gen_aux_losses_use_paper_aligned_x0`` (default True).
             ac_pred_x0 = train_chunk
-            if bool(getattr(
-                self.config, "gen_aux_losses_use_paper_aligned_x0", True,
-            )):
-                _pa_x0 = train_info.get("flash_dmd_gan_x0")
-                if _pa_x0 is not None:
+            _ac_x0_source = str(getattr(
+                self.config, "gen_aux_losses_x0_source", "auto",
+            )).lower()
+            if _ac_x0_source == "ladder_endpoint":
+                _pa_x0 = train_info.get("finish_denoised_chunk_grad")
+                _pa_mask = train_info.get("finish_denoised_chunk_grad_mask")
+                if (_pa_x0 is not None and _pa_x0.requires_grad
+                        and _pa_mask is not None
+                        and bool(torch.as_tensor(_pa_mask).any().item())):
                     ac_pred_x0 = _pa_x0
+                    out["train/action_critic_x0_ladder_finish_rung"] = 1.0
+                    out["train/action_critic_x0_ladder_exit_rung"] = 0.0
+                elif (
+                    train_info.get("denoised_timestep_to", None) is not None
+                    and int(train_info["denoised_timestep_to"]) == 0
+                ):
+                    # The random exit itself was the final ladder rung. Its
+                    # graph-bearing ``train_chunk`` is numerically the t0 x0;
+                    # reuse it rather than demand a nonexistent post-exit rung.
+                    ac_pred_x0 = train_chunk
+                    out["train/action_critic_x0_ladder_finish_rung"] = 0.0
+                    out["train/action_critic_x0_ladder_exit_rung"] = 1.0
+                else:
+                    raise RuntimeError(
+                        "gen_aux_losses_x0_source=ladder_endpoint requires "
+                        "pix_finish_grad_enabled=true and a graph-bearing "
+                        "finish_denoised_chunk_grad with at least one live "
+                        "frame, unless the random exit is already the final "
+                        "ladder rung."
+                    )
+            elif _ac_x0_source == "flash":
+                _pa_x0 = train_info.get("flash_dmd_gan_x0")
+                if _pa_x0 is None:
+                    raise RuntimeError(
+                        "gen_aux_losses_x0_source=flash requested an absent "
+                        "Flash-DMD surface."
+                    )
+                ac_pred_x0 = _pa_x0
+            elif _ac_x0_source == "train_chunk":
+                pass
+            elif _ac_x0_source == "auto":
+                if bool(getattr(
+                    self.config, "gen_aux_losses_use_paper_aligned_x0", True,
+                )):
+                    _pa_x0 = train_info.get("flash_dmd_gan_x0")
+                    if _pa_x0 is not None:
+                        ac_pred_x0 = _pa_x0
+            else:
+                raise ValueError(
+                    "gen_aux_losses_x0_source must be 'auto', 'flash', "
+                    "'ladder_endpoint', or 'train_chunk'; got "
+                    f"{_ac_x0_source!r}."
+                )
+            out["train/action_critic_x0_ladder_endpoint"] = (
+                1.0 if _ac_x0_source == "ladder_endpoint" else 0.0
+            )
+            out["train/action_critic_x0_flash"] = (
+                1.0 if (
+                    _ac_x0_source == "flash"
+                    or (_ac_x0_source == "auto"
+                        and ac_pred_x0 is not train_chunk)
+                ) else 0.0
+            )
             gen_action_loss, critic_logs, teacher_z_8d = (
                 self._compute_action_critic_losses(
                     pred_x0=ac_pred_x0,
@@ -18912,12 +20849,20 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         _pix_g_w = None
         _pix_g_raw = None
         _pix_g_folded = False
+        # Objective against which the pixel/surrogate term is calibrated.
+        # This must never contain the pixel term itself.  The GAN-active path
+        # refreshes it below after constructing the ordinary transition-GAN
+        # term but before folding in `_pix_g_w`.
+        _pix_probe_base_loss = generator_loss
         # Surrogate-only mode (surrogate on, pixel gate off -- the SAM2-
         # teacher branch) also enters: the helper's surrogate branch
         # serves the G-term from the latent critic and returns before any
         # pixel-disc code. Gate-off (both false) is unchanged.
         if (bool(getattr(self, "gan_pixel_texture_enabled", False))
-                or bool(getattr(self, "surrogate_critic_enabled", False))):
+                or bool(getattr(self, "surrogate_critic_enabled", False))
+                or bool(getattr(
+                    self, "decoder_shaped_pullback_enabled", False,
+                ))):
             _pix_g_w, _pix_g_raw, _pix_g_logs = (
                 self._compute_pixel_texture_g_loss(
                     train_info, current_step=int(self.step),
@@ -19031,6 +20976,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 fake_action_frame_lo=_fake_act_lo,
                 fake_sample_source=_fake_src_name,
             )
+            _pix_probe_base_loss = generator_loss + gen_gan_loss
             # (A4 gan_grad_target_norm cap REMOVED 2026-08-23 — it used to
             # rescale gen_gan_loss here, immediately before the telemetry
             # below. ``train/gan_grad_norm`` therefore now reports the
@@ -19137,6 +21083,26 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         ))
                 except Exception as _te:
                     out["train/gan_grad_telemetry_err"] = 1.0
+            # ---- DIRECT-ROUTE PROOF (2026-08-26) ----------------------
+            # The parameter-space probe, run on the LADD G-term BEFORE it
+            # is added to ``generator_loss``. This is the SAME instrument
+            # that caught the surrogate route delivering exactly zero
+            # gradient -- 825/825 parameters graph-reachable, total norm
+            # 0.0 -- so the direct route is held to that standard rather
+            # than to a plausible loss curve. A norm of exactly 0 here
+            # means the decode gradient is severed and the arm must not
+            # be believed.
+            #
+            # Cadence-gated inside the helper, and a no-op unless a PIXEL
+            # feature source is installed: the latent-domain LADD arms
+            # already have ``gan_dmd_grad_ratio`` and stay byte-identical.
+            if (getattr(self, "ladd_pixel_source", None) is not None
+                    and isinstance(gen_gan_loss, torch.Tensor)
+                    and gen_gan_loss.requires_grad):
+                self._param_grad_ratio(
+                    gen_gan_loss, generator_loss, out,
+                    prefix="ladd_g", current_step=int(self.step),
+                )
             generator_loss = generator_loss + gen_gan_loss
             out.update(gan_logs)
             self._mem_step_snapshot("4_after_gan_pre_backward")
@@ -19194,6 +21160,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["train/pix_g_applied"] = (
                 1.0 if _pix_g_w is not None else 0.0
             )
+            # ON-PATH PROBE, both branches. Runs BEFORE the term is added
+            # to ``generator_loss`` so the "base" half is the rest of the
+            # objective, exactly as the style probe does it. Publishes
+            # nothing when the surrogate branch did not run (the stash is
+            # absent), so the non-surrogate pixel arm is unaffected.
+            if getattr(self, "_pix_g_probe_tensor", None) is not None:
+                self._pix_surrogate_grad_telemetry(
+                    _pix_probe_base_loss, _pix_g_raw, out,
+                    current_step=int(self.step),
+                )
+                self._pix_g_probe_tensor = None
             if not gan_active:
                 # Telemetry FIRST, against ``generator_loss`` as it stands
                 # BEFORE the pixel term is added -- exactly the quantity the
@@ -19768,6 +21745,103 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             )
             self._ladd_pending_disc = []
             self._mem_step_snapshot("6a_after_deferred_disc")
+            # ---- UNCONDITIONAL deferred-flush proof (2026-08-26) -------
+            # Every other deferred-update key on this path lives inside
+            # ``if _ov_proof is not None:`` -- i.e. it is published ONLY
+            # when the fake-score feature-backbone override is installed.
+            # On ``ladd_feature_source`` in ("pixgan", "dinov2") that
+            # override is NEVER installed (the disc does not tap the
+            # fake-score backbone at all, and
+            # ``ladd_fake_backbone_trainable`` is refused), so
+            # ``_ov_proof`` is always None and EVERY key that could show
+            # the deferred D-update ran was suppressed. Combined with the
+            # ordering fix below, the first pixel smoke had no observable
+            # evidence of its D-update in either direction -- it could
+            # not be shown to have run OR to have failed.
+            #
+            # These two keys are outside that gate on purpose. They are
+            # the answer to "did the deferred closure actually flush".
+            self._ladd_disc_flush_events = int(
+                getattr(self, "_ladd_disc_flush_events", 0)) + 1
+            self._ladd_disc_flush_closures = int(
+                getattr(self, "_ladd_disc_flush_closures", 0)
+            ) + len(_pending_disc)
+        # Published on EVERY step (0 is meaningful here: it means no
+        # deferred closure was pending, which is itself the thing to
+        # know), and NOT gated on the override.
+        out["ladd_disc_deferred_flush_events"] = float(
+            getattr(self, "_ladd_disc_flush_events", 0))
+        out["ladd_disc_deferred_flush_closures"] = float(
+            getattr(self, "_ladd_disc_flush_closures", 0))
+        # ---- PIXEL-SOURCE COUNTERS, RE-PUBLISHED AFTER THE FLUSH ------
+        # THE ORDERING DEFECT, and why it made a working build look dead.
+        # ``_ladd_pixel_logs()`` is also called at the end of
+        # ``_compute_ladd_losses`` (trainer:11819), which runs at ~:19437
+        # -- roughly 670 lines and one deferred-dispatch BEFORE this
+        # flush site. With ``ladd_defer_disc_update=true`` the D-update
+        # closure is STASHED there and executed HERE, so on a pixel arm
+        # whose ONLY disc forward is the D-update (the LADD G-term is off
+        # via ladd_disc_loss_weight=0.0), the counters were always read
+        # one logged GAN step before the work they count.
+        #
+        # The 25-step probe's last logged step was 21 and
+        # gan_disc_start_step is 20, so there was at most ONE logged GAN
+        # step after the disc switched on -- and its counters had been
+        # read before that step's own flush. Every ladd_pix_* counter
+        # therefore read 0 whether or not the encoder ran.
+        #
+        # Re-publishing here overwrites the stale values with the
+        # post-flush ones (same keys, later write wins). The provenance
+        # key says which publish a reader is looking at, so this can
+        # never silently regress to the early one again.
+        _pix_after = self._ladd_pixel_logs()
+        if _pix_after:
+            out.update(_pix_after)
+            out["train/ladd_pix_logs_after_flush"] = 1.0
+        # Optional allocator-pressure boundary for high-evidence pixel-D
+        # arms.  A detached D decode may leave its cached RGB tensor and
+        # allocator blocks resident after the deferred closure flush.  The
+        # ordinary action-critic backward runs before the next pixel epoch
+        # clears that cache, so on the tight holder run D5x/G1x could complete
+        # its GAN work and then OOM there.  This changes neither an objective
+        # nor an update: discard only the no-grad decode cache after its last
+        # consumer, then release unused allocator blocks.  Default false
+        # preserves every historical arm byte-for-byte.
+        _post_d_release_enabled = bool(getattr(
+            self.config, "ladd_pixel_post_d_memory_release", False))
+        _post_d_release = bool(
+            _pending_disc
+            and _post_d_release_enabled
+            and getattr(getattr(self, "r3gan_disc", None),
+                        "pixel_source", None) is not None
+        )
+        if _post_d_release:
+            # The closures have executed and self._ladd_pending_disc was
+            # already reset above.  Drop this local list as well: each closure
+            # captures its detached inputs/conditioning, and empty_cache()
+            # cannot reclaim their allocator blocks while these references
+            # remain live.
+            _pending_disc.clear()
+            self._ladd_pix_decode_cache = {}
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self._ladd_pix_post_d_release_events = int(getattr(
+                self, "_ladd_pix_post_d_release_events", 0)) + 1
+        if _post_d_release_enabled:
+            out["train/ladd_pix_post_d_release_events"] = float(getattr(
+                self, "_ladd_pix_post_d_release_events", 0))
+        # ---- VIDEO OBSERVABILITY (2026-08-26) -------------------------
+        # ``pred_image_rollout`` requires a sample event AND a rollout
+        # accumulator deeper than 21 latent frames. When it is absent
+        # these say WHICH condition failed, instead of leaving a missing
+        # video to be explained by guesswork.
+        if hasattr(self, "_rollout_acc_depth_last"):
+            out["train/rollout_acc_depth"] = float(
+                self._rollout_acc_depth_last)
+            out["train/rollout_acc_emitted"] = float(
+                getattr(self, "_rollout_acc_emitted", 0))
+            out["train/rollout_acc_gated_shallow"] = float(
+                getattr(self, "_rollout_acc_gated", 0))
         if _ov_proof is not None:
             # Refresh AFTER the block so the cumulative gauge includes this
             # step's updates (published unconditionally above so the key is
@@ -20476,6 +22550,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # schedule at step 0. Idempotent and gated.
         if self.gan_of_enabled:
             self.model._of_current_step = int(self.step)
+        # Publish before ANY rollout/setup commit in this iteration.  The
+        # pipeline's commit-only CARN ramp reads this through its model owner;
+        # keeping it here avoids a one-step lag and also covers rollout-2
+        # prebuild commits performed during sequence setup.
+        self.model._carn_commit_current_step = int(self.step)
         if train_generator:
             return self._streaming_step(
                 rollout_frames=rollout_frames,

@@ -9,6 +9,46 @@ set -euo pipefail
 PORTOFF=${PORTOFF:-0}
 SRC=sbatch/${SMOKE}.sbatch; [ -f "$SRC" ] || SRC=sbatch/smk_${SMOKE}.sbatch
 test -f "$SRC" || { echo "no such smoke: $SRC"; exit 2; }
+# ===================== COLLISION GUARD (2026-08-26) =====================
+# REFUSE to launch into a holder that already has a live job step.
+#
+# WHY THIS EXISTS. The holder loop runs ONE command at a time: it moves
+# logs/.holder_cmd_<jobid>.sh to logs/.holder_running_<jobid>.sh and runs
+# it. Writing a NEW .holder_cmd_ while a command is executing does NOT
+# queue safely -- the loop fires it as soon as the file appears on a poll
+# where the previous job is still alive on the nodes, two torchruns then
+# contend for the same allocation, and BOTH die on
+# RendezvousConnectionError. Measured 2026-08-26: this destroyed a matched
+# baseline arm (carncommit_off on 6144623) which logged ZERO training
+# steps, while its treatment partner survived -- leaving a paired smoke
+# that was no longer an experiment. The surviving half looked healthy.
+#
+# NOTE the guard canNOT test for .holder_running_<jobid>.sh: by the time
+# this script runs, the loop has ALREADY created that file for US. It must
+# ask slurm what STEPS are live instead. The holder itself is the .batch
+# (and .extern) step; anything else is somebody's running job.
+#
+# HOLDER_FORCE=1 overrides, for the case where you have positively
+# confirmed the other step is dead. Do not set it habitually.
+# The `|| true` is LOAD-BEARING, do not remove it. This script runs under
+# `set -euo pipefail`. On a CLEAN holder every line is .batch/.extern, so
+# `grep -v` matches nothing and exits 1; pipefail propagates that as the
+# pipeline status even though `wc -l` succeeded, and `set -e` then aborts
+# the whole script. Without `|| true` this guard fails CLOSED on an idle
+# holder -- it kills every launch it is supposed to permit, silently, with
+# exit 1 and no output. Measured: it blocked the carncommit_off relaunch at
+# 17:59:02 and would have blocked every smoke on every holder.
+_LIVE=$(squeue -j "$HOLDER" -h -s -o "%i" 2>/dev/null | grep -vE '\.(batch|extern)$' | wc -l) || true
+if [ "${_LIVE:-0}" -gt 0 ] && [ "${HOLDER_FORCE:-0}" != "1" ]; then
+  echo "[HOLDERSMOKE] REFUSING to launch: holder $HOLDER already has ${_LIVE} live job step(s)." >&2
+  squeue -j "$HOLDER" -s -o "%.18i %.30j %.10M %N" >&2
+  echo "[HOLDERSMOKE] Another job is on these nodes. Launching now would kill BOTH" >&2
+  echo "[HOLDERSMOKE] via RendezvousConnectionError (see the comment in this script)." >&2
+  echo "[HOLDERSMOKE] Wait for it to finish, or pick a genuinely free holder." >&2
+  echo "[HOLDERSMOKE] Override with HOLDER_FORCE=1 ONLY if you have confirmed it is dead." >&2
+  exit 3
+fi
+# =======================================================================
 NODES=$(scontrol show hostnames "$(squeue -j "$HOLDER" -h -o %N)")
 NNODE=$(echo "$NODES" | wc -l); NODELIST=$(echo "$NODES" | paste -sd,)
 MASTER_ADDR=$(echo "$NODES" | head -1)

@@ -565,15 +565,33 @@ class LADDChannelMixer(nn.Module):
     def __init__(
         self,
         block_indices: List[int],
-        dim_teacher: int,
+        dim_teacher,
         dim_proj: int,
     ):
         super().__init__()
         self.block_indices = sorted(set(int(i) for i in block_indices))
-        self.dim_teacher = int(dim_teacher)
+        # ``dim_teacher`` is EITHER an int -- every WAN tap shares dim
+        # 1536, the historical case, byte-identical -- OR a per-tap
+        # ``{block_idx: channels}`` mapping. The mapping exists for the
+        # PIXEL feature sources (``ladd_feature_source=pixgan``), whose
+        # conv taps are 64 / 128 / 256 rather than one shared width. A
+        # plain ViT source (``dinov2``) is uniform and still passes an
+        # int, so the DINO arm does not depend on this branch either.
+        if isinstance(dim_teacher, dict):
+            self.dim_teacher_map = {
+                int(i): int(dim_teacher[i]) for i in self.block_indices
+            }
+            self.dim_teacher = int(
+                self.dim_teacher_map[self.block_indices[0]]
+            )
+        else:
+            self.dim_teacher = int(dim_teacher)
+            self.dim_teacher_map = {
+                int(i): self.dim_teacher for i in self.block_indices
+            }
         self.dim_proj = int(dim_proj)
         self.proj = nn.ModuleDict(
-            {str(i): nn.Linear(self.dim_teacher, self.dim_proj)
+            {str(i): nn.Linear(self.dim_teacher_map[i], self.dim_proj)
              for i in self.block_indices}
         )
 
@@ -1299,11 +1317,93 @@ class LADDDiscriminator(nn.Module):
         register_head_num_layers: int = 4,
         register_head_dropout: float = 0.2,
         register_checkpoint: Optional[bool] = None,
+        pixel_source=None,
     ):
         super().__init__()
         self.projector = projector  # stored as plain attribute, not nn submodule
+        # ===== PIXEL FEATURE SOURCE (analysis/gan_tuning/PIXEL_FEATURE_
+        # SOURCE.md) =====================================================
+        # When present, this REPLACES the WAN projector as the disc's
+        # feature basis: ``forward`` decodes its latent input to pixels,
+        # runs them through this encoder, and hands the resulting token
+        # features to the SAME CCM / CSM / ``LADDDiscHead`` stack. It is
+        # a real ``nn.Module`` submodule (unlike ``projector``) because
+        # its parameters ARE the disc's -- they belong in
+        # ``disc.parameters()``, in ``r3gan_optimizer``, in the disc's
+        # state_dict and inside the DDP reducer.
+        #
+        # ``block_indices`` and ``dim_teacher`` are then taken FROM the
+        # source rather than from ``ladd_feature_blocks`` /
+        # ``dim_teacher``: a pixel encoder's taps are its own, and
+        # silently reusing WAN's [0,2,4,8,29] would index blocks that do
+        # not exist. The override is logged, not silent.
+        self.pixel_source = pixel_source
+        if pixel_source is not None:
+            if readout != "ladd":
+                raise ValueError(
+                    "LADDDiscriminator: a pixel feature source requires "
+                    f"ladd_readout='ladd'; got {readout!r}. The register "
+                    "readout consumes the RAW WAN token sequence "
+                    "(padding arithmetic, action tokens, "
+                    "``real_tokens``) and none of that exists on a "
+                    "pixel encoder's feature grid."
+                )
+            if wavelet_hf_enabled:
+                raise ValueError(
+                    "LADDDiscriminator: ladd_wavelet_hf_enabled=true is "
+                    "incompatible with a pixel feature source. The "
+                    "wavelet stage rewrites the LATENT before the "
+                    "projector; here the latent is VAE-DECODED, and a "
+                    "wavelet-HF latent does not decode to a picture. "
+                    "(It is also measured to kill the gt_transition "
+                    "GAN outright.) Set it false."
+                )
+            _blk = list(pixel_source.tap_indices)
+            if _blk != sorted(set(int(i) for i in block_indices)):
+                logging.info(
+                    "[LADD-PIXFEAT] block_indices OVERRIDDEN by the pixel "
+                    "source: requested %s (ladd_feature_blocks, WAN "
+                    "transformer blocks) -> using %s (the encoder's own "
+                    "taps). ladd_feature_blocks is INERT on this arm.",
+                    sorted(set(int(i) for i in block_indices)), _blk,
+                )
+            block_indices = _blk
+            dim_teacher = pixel_source.tap_dims
+        # ===== ORDERLESS POOLED READOUT (ladd_feature_source=vgg) =====
+        # ``pooled_readout`` is ``None`` for EVERY historical source
+        # (WAN 'real'/'fake', 'pixgan', 'dinov2'), so every branch guarded
+        # on it below is dead on those arms and their behaviour is
+        # byte-identical.
+        #
+        # When it is present the disc's readout is the pixel source's own
+        # ``LaddPixelStatHead``: [mu, sigma, Cov] pooled over ALL spatial
+        # positions, then a tiny MLP -> ONE logit per image. The CCM /
+        # CSM / ``LADDDiscHead`` stack is NOT BUILT AT ALL in that mode --
+        # not merely unused. That matters for two reasons: (a) an unused
+        # trainable submodule is a parameter that receives no gradient,
+        # which aborts the DDP reducer, and this campaign has already
+        # lost an arm to exactly that (``_freeze_ddp_unreachable``);
+        # (b) a dense head that still exists is a dense head somebody can
+        # accidentally re-enter. The register readout at ``readout=
+        # 'register'`` sets the same four attributes to ``None``, so
+        # every downstream consumer already tolerates it.
+        # ``pooled_readout`` is a read-only PROPERTY on this class (see
+        # below) that reads through to ``pixel_source``: assigning the
+        # head here would register it a SECOND time as a direct submodule
+        # and duplicate every one of its tensors in ``state_dict()``.
         self.block_indices = sorted(set(int(i) for i in block_indices))
-        self.dim_teacher = int(dim_teacher)
+        if isinstance(dim_teacher, dict):
+            self.dim_teacher_map = {
+                int(i): int(dim_teacher[i]) for i in self.block_indices
+            }
+            self.dim_teacher = int(
+                self.dim_teacher_map[self.block_indices[0]]
+            )
+        else:
+            self.dim_teacher = int(dim_teacher)
+            self.dim_teacher_map = {
+                int(i): self.dim_teacher for i in self.block_indices
+            }
         self.dim_proj = int(dim_proj)
         self.use_csm = bool(use_csm)
         self.cmap_dim = int(cmap_dim)
@@ -1348,7 +1448,19 @@ class LADDDiscriminator(nn.Module):
                 f"'register'; got {self.readout!r}."
             )
         self.register_readout: Optional[LADDRegisterReadout] = None
-        if self.readout == "register":
+        if self.pooled_readout is not None:
+            # ORDERLESS READOUT. The dense CCM / CSM / LADDDiscHead stack
+            # is NOT BUILT -- not merely unused -- for exactly the reason
+            # the ``register`` branch below does the same: an unused
+            # trainable submodule is a parameter that receives no
+            # gradient, and this disc's DDP reducer raises "Expected to
+            # have finished reduction" on one. It also means a dense
+            # head cannot be accidentally re-entered later.
+            self.ccm = None
+            self.csm = None
+            self.heads = None
+            self.cmapper = None
+        elif self.readout == "register":
             if self.cmap_dim > 0:
                 raise ValueError(
                     "LADDDiscriminator: ladd_readout='register' does not "
@@ -1385,7 +1497,13 @@ class LADDDiscriminator(nn.Module):
         else:
             self.ccm = LADDChannelMixer(
                 block_indices=self.block_indices,
-                dim_teacher=self.dim_teacher,
+                # Per-tap dims when a pixel source is installed (its
+                # conv taps may differ in width); the historical scalar
+                # otherwise, which builds the identical ModuleDict.
+                dim_teacher=(
+                    self.dim_teacher_map if self.pixel_source is not None
+                    else self.dim_teacher
+                ),
                 dim_proj=self.dim_proj,
             )
             if self.use_csm:
@@ -1432,6 +1550,135 @@ class LADDDiscriminator(nn.Module):
         else:
             self.stat_head = None
 
+        # ---- pixel-source RUNTIME state (all plain attributes) --------
+        # ``pixel_decode_fn`` is supplied by the trainer, which owns the
+        # VAE; keeping it a callback rather than a VAE handle means this
+        # module never learns about ``self.model.vae``,
+        # ``_pix_vae_dtype`` or checkpointed decoding.
+        #   signature: fn(latents[n, F, C, h, w], want_grad: bool)
+        #                 -> pixels[n, F_pix, 3, h*8, w*8]  in [-1, 1]
+        # ``pixel_epoch`` is set ONCE PER TRAINING STEP by the trainer
+        # and is what makes the crop origin and the phase jitter
+        # identical across the five D-updates and across the two
+        # finite-difference R1 forwards -- see
+        # ``LaddPixelFeatureSource.jitter_for``.
+        self.pixel_decode_fn = None
+        self.pixel_epoch = 0
+        # Optional benchmark-only observer installed by the trainer.  It is
+        # deliberately a plain callable (not an nn.Module) and defaults to
+        # None, so production forwards have no state-dict/DDP surface and no
+        # behaviour change.  The callback receives the *actual* pixel tensor
+        # handed to the feature source, after shared real/fake crop geometry,
+        # VAE decode, border/phase jitter and frame selection.  A trainer-side
+        # context identifies the real/fake row split for the current D update.
+        self.pixel_capture_fn = None
+        self.pixel_capture_context = None
+        # ``decode_batch`` IS INERT ON THIS ROUTE -- it is read by nothing
+        # here and is kept only so the dict the trainer writes keeps its
+        # historical shape (lowering it is a silent no-op, which is
+        # exactly the failure class this campaign keeps hitting). The
+        # knob that really splits the decode is ``decode_split`` below.
+        self.pixel_cfg: Dict[str, int] = {
+            "crop_rows": 24, "crop_cols": 32, "crops_per_row": 1,
+            "lat_frames": 2, "frames_per_crop": 2, "border": 8,
+            "decode_batch": 4,
+            # ---- SAMPLE-BUDGET knobs. ALL DEFAULT OFF, and every off
+            # path is the byte-identical legacy one: same RNG draw order
+            # and count, same single decode call, same full-height range.
+            #
+            # ``decode_split``: >0 decodes ``crops_t`` in row-groups of
+            #   this many rows instead of one shot, capping the decode
+            #   transient so ``crops_per_row``/``lat_frames`` can be
+            #   raised past what a single-shot decode fits. 0 = off.
+            #   This is the real knob ``decode_batch`` was never wired to.
+            # ``crop_y_lo_frac`` / ``crop_y_hi_frac``: restrict the crop
+            #   ORIGIN band to a vertical slice of the latent frame, as
+            #   fractions of H. (0.0, 1.0) = off = the historical
+            #   full-height uniform draw. Motivation is measured: 39% of
+            #   the adversarial crops contain no road or verge at all
+            #   (COMMENTS_FOR_USER.md, sign-off open). A lower-2/3 band
+            #   is ``crop_y_lo_frac=0.3333``. It stays a deterministic
+            #   function of ``pixel_epoch``, so the five D-updates and
+            #   both R1 forwards still see one identical crop.
+            # ``crop_stratify_x``: 1 => the K crop origins are spread
+            #   over K equal-width column bands (one draw per band)
+            #   instead of K independent uniform draws, so coverage is
+            #   K*p rather than 1-(1-p)^K and two crops cannot collide.
+            "decode_split": 0,
+            "crop_y_lo_frac": 0.0, "crop_y_hi_frac": 1.0,
+            "crop_stratify_x": 0,
+        }
+        # Optional generator-guidance geometry.  ``None`` is the shipped
+        # default and preserves the historical single-geometry path exactly.
+        # The trainer sets ``pixel_use_g_cfg`` only around the two gen-side
+        # discriminator forwards; D updates (including finite-difference R1)
+        # always use ``pixel_cfg``.  This lets a detached D pass score more
+        # evidence without forcing the same graph-on VAE budget through the
+        # generator backward.
+        self.pixel_g_cfg: Optional[Dict[str, int]] = None
+        self.pixel_use_g_cfg = False
+        self._pixel_last_route = ""
+        # CONNECTION PROOF counters. Never reset; drained by the trainer
+        # into ``train/ladd_pix_*``. A pixel arm whose ``fwd`` counter is
+        # 0 did not run, whatever the config echo says.
+        #
+        # CROP-PLAN counters (added 2026-08-26). ``lat_frames`` and
+        # ``frames_per_crop`` are both SILENTLY CLAMPED against the
+        # tensor they get (``L = min(lat_frames, F_lat)``,
+        # ``kf = min(frames_per_crop, F_pix)``) and until now neither had
+        # a counter of any kind -- the only evidence a raise took was the
+        # boot echo, which prints the CONFIG and not the realised value.
+        # A silent clamp with no counter is precisely the mechanism
+        # behind several entries in the silent-failure taxonomy, so every
+        # element of the realised crop plan now has a key. The ``_used``
+        # keys are LAST-VALUE (overwritten each forward); ``_clamped``
+        # keys are CUMULATIVE counts of forwards where the clamp bit.
+        self.pixel_stats: Dict[str, float] = {
+            "fwd": 0.0, "decode_grad": 0.0, "decode_nograd": 0.0,
+            "images": 0.0, "wan_projector_calls": 0.0,
+            "lat_frames_cfg": 0.0, "lat_frames_used": 0.0,
+            "lat_frames_avail": 0.0, "lat_frames_clamped": 0.0,
+            "frames_per_crop_cfg": 0.0, "frames_per_crop_used": 0.0,
+            "frames_avail": 0.0, "frames_per_crop_clamped": 0.0,
+            "crops_per_row_used": 0.0,
+            "crop_rows_used": 0.0, "crop_cols_used": 0.0,
+            # -1 = NEVER DRAWN. 0 is a legal y0, so a zero sentinel here
+            # would be a forgeable zero.
+            "crop_y0_min": -1.0, "crop_y0_max": -1.0,
+            "crop_y0_sum": 0.0, "crop_draws": 0.0,
+            "crop_band_active": 0.0, "crop_stratify_active": 0.0,
+            "decode_calls": 0.0, "decode_split_active": 0.0,
+            "decode_split_cfg": 0.0,
+            # ORDERLESS-READOUT PROOF. ``pooled_calls`` counts pooled
+            # readout forwards (0 => the VGG stat head never ran, i.e.
+            # a silently-inert path). ``logits_per_sample`` is the
+            # SHAPE the readout actually emitted, recorded every forward
+            # -- if it ever equals the token count (1768 on the DINOv2
+            # geometry) a dense head has been reintroduced and the
+            # experiment is void. On the pooled path it must read
+            # ``crops_per_row * frames_per_crop`` (= 2 as shipped).
+            "pooled_calls": 0.0, "logits_per_sample": 0.0,
+            "dense_head_calls": 0.0,
+        }
+
+    # ------------------------------------------------------------------
+    @property
+    def pooled_readout(self):
+        """The pixel source's ORDERLESS ``LaddPixelStatHead``, or ``None``.
+
+        ``None`` for every historical feature source (WAN 'real'/'fake',
+        'pixgan', 'dinov2'), so every branch guarded on it is dead on
+        those arms and their behaviour is byte-identical. Non-``None``
+        only for ``ladd_feature_source=vgg``.
+
+        A PROPERTY and not an attribute on purpose: assigning the head to
+        ``self`` would register it a second time as a direct submodule
+        and duplicate every one of its tensors in ``state_dict()``.
+        """
+        src = getattr(self, "pixel_source", None)
+        return getattr(src, "pooled_readout", None) if src is not None \
+            else None
+
     # ------------------------------------------------------------------
     @property
     def num_params(self) -> int:
@@ -1450,6 +1697,360 @@ class LADDDiscriminator(nn.Module):
         ``ladd_stat_head_loss_weight``.
         """
         return 1 if self.stat_head is not None else 0
+
+    # ------------------------------------------------------------------
+    def score_pixels(self, pixels: torch.Tensor) -> torch.Tensor:
+        """``[N, 3, H, W]`` pixels -> ``[N]`` scalar critic value.
+
+        The SURROGATE TEACHER entry point (researcher directive
+        2026-08-26: "give it the pixel outputs and then map those into
+        generator but using the surrogate gradients method"). It is the
+        SAME encoder and the SAME CCM/CSM/head stack the ``gt_vs_fake``
+        D-update just trained -- deliberately, because the whole premise
+        of distillation is that the student is regressing the critic
+        that is actually being trained, not a parallel copy of it.
+
+        Two differences from ``forward``, both necessary:
+
+        * it takes PIXELS, so the surrogate's crop plan (which owns its
+          own decode, its own A20/A21 real pool and its own
+          ``pix_teacher_refresh_every`` cadence) is not double-cropped
+          by ``_pixel_features``;
+        * it returns ONE value per image, because
+          ``compute_teacher_targets`` differentiates ``value.sum()``
+          w.r.t. the latent crop and asserts ``value.shape[0] ==
+          z.shape[0]``.
+
+        The mean over the token axis is the same reduction
+        ``ladd_scalar_output`` applies inside ``forward``, so the
+        surrogate is fit to the critic's own scalar, not to some other
+        pooling of it.
+        """
+        if self.pixel_source is None:
+            raise RuntimeError(
+                "LADDDiscriminator.score_pixels requires a pixel feature "
+                "source; this disc scores WAN features of latents and has "
+                "no pixel entry point."
+            )
+        if self.readout != "ladd":
+            raise RuntimeError(
+                "LADDDiscriminator.score_pixels requires ladd_readout="
+                f"'ladd'; got {self.readout!r}."
+            )
+        feats = self.pixel_source(pixels, epoch=int(self.pixel_epoch))
+        if self.pooled_readout is not None:
+            # Already one value per image by construction, so there is
+            # no token-axis mean to take here.
+            self.pixel_stats["pooled_calls"] += 1.0
+            self.pixel_stats["teacher_calls"] = (
+                self.pixel_stats.get("teacher_calls", 0.0) + 1.0
+            )
+            return self.pooled_readout(feats).reshape(-1)
+        gh, gw = self.pixel_source.grid
+        proj = self.ccm(feats)
+        if self.csm is not None:
+            proj = self.csm(proj)
+        vals = []
+        for idx in self.block_indices:
+            f = proj[idx]
+            f = f.transpose(1, 2).reshape(
+                int(f.shape[0]), self.dim_proj, gh, gw).contiguous()
+            # cmap is not consulted here: the surrogate teacher must be a
+            # function of the PICTURE alone. A prompt-modulated value
+            # would make the distillation target depend on a conditioning
+            # signal the latent critic never sees.
+            l = self.heads[str(idx)](f, cmap=None) if self.cmap_dim <= 0 \
+                else self.heads[str(idx)].cls(
+                    self.heads[str(idx)].res_block(
+                        self.heads[str(idx)].in_block(f))).mean(
+                            1, keepdim=True)
+            vals.append(l.reshape(int(f.shape[0]), -1).mean(dim=1))
+        self.pixel_stats["teacher_calls"] = (
+            self.pixel_stats.get("teacher_calls", 0.0) + 1.0
+        )
+        return torch.stack(vals, dim=0).mean(dim=0)
+
+    # ------------------------------------------------------------------
+    def _pixel_features(
+        self, x_noisy: torch.Tensor,
+    ) -> Tuple[Dict[int, torch.Tensor], int, Tuple[int, int]]:
+        """Latents -> crops -> PIXELS -> encoder tokens.
+
+        Returns ``(features, n_images_per_row, (gh, gw))``.
+
+        GEOMETRY, and why every choice is what it is
+        --------------------------------------------
+        * **Crops, not full frames.** A ride window is 60x104 latent =
+          480x832 px; a graph-on decode of that, five D-updates deep,
+          does not fit. ``pix_crop_lat = [24, 32]`` -> 192x256 px is the
+          geometry the pixel critic and the style loss already use, so
+          the three read the same texture scale.
+        * **Crop origins are shared by EVERY ROW in the batch, and are a
+          deterministic function of ``pixel_epoch``.** Both halves
+          matter and neither is an optimisation:
+            - shared across rows makes the real rows and the fake rows
+              spatially ALIGNED whatever the batch layout is (positional
+              ``cat([real, fake])``, the micro-batched slice, the
+              matched ``segs`` list, the G-term's ``cat([real_g,
+              fake_g])``). If the two sides were cropped independently
+              the disc could separate them on CONTENT POSITION, which is
+              a real, silent, and catastrophic tell.
+            - deterministic-per-step makes ``D(x)`` and ``D(x + sigma*eps)``
+              -- the two forwards the finite-difference R1 estimator
+              subtracts -- see the SAME crop and the same phase jitter.
+              With a per-call RNG draw the difference would be dominated
+              by the geometry change and R1 would measure noise.
+          It also consumes no global RNG, so it cannot desynchronise
+          DDP ranks or perturb any other path's byte-identity.
+        * **The newest ``lat_frames`` latent frames.** Same choice, same
+          reason, as ``_compute_style_gram_loss``: those are the frames
+          inference actually commits.
+        * **Phase jitter** is applied as an OFFSET INSIDE the border
+          trim that is being cropped away anyway, so it costs nothing
+          and introduces no padding. See the module docstring of
+          ``model/ladd_pixel_features.py`` for why a randomised lattice
+          phase is the load-bearing part of the cure.
+        """
+        if self.pixel_decode_fn is None:
+            raise RuntimeError(
+                "LADDDiscriminator: a pixel feature source is installed "
+                "but ``pixel_decode_fn`` was never set. The trainer must "
+                "install the VAE decode callback before the first disc "
+                "forward; without it the disc has no way to reach "
+                "pixels. Refused rather than silently falling back to "
+                "the WAN taps -- a silent fallback is exactly how a "
+                "'pixel' arm ends up being a latent arm."
+            )
+        if x_noisy.dim() != 5:
+            raise ValueError(
+                "LADDDiscriminator pixel path expects [B, F, C, H, W] "
+                f"latents; got {tuple(x_noisy.shape)}."
+            )
+        _split_geometry = self.pixel_g_cfg is not None
+        _use_g_geometry = bool(self.pixel_use_g_cfg) and _split_geometry
+        cfg = self.pixel_g_cfg if _use_g_geometry else self.pixel_cfg
+        # Empty when split geometry is disabled: no extra stats are touched,
+        # which keeps the default path's state and telemetry byte-identical.
+        _route = "g_" if _use_g_geometry else ("d_" if _split_geometry else "")
+        self._pixel_last_route = _route
+
+        def _route_add(key: str, value: float) -> None:
+            if _route:
+                rk = _route + key
+                self.pixel_stats[rk] = self.pixel_stats.get(rk, 0.0) + value
+
+        def _route_set(key: str, value: float) -> None:
+            if _route:
+                self.pixel_stats[_route + key] = value
+
+        B, F_lat, _C, H, W = x_noisy.shape
+        cr = min(int(cfg["crop_rows"]), H)
+        cc = min(int(cfg["crop_cols"]), W)
+        K = max(1, int(cfg["crops_per_row"]))
+        L = max(1, min(int(cfg["lat_frames"]), F_lat))
+        lat = x_noisy[:, F_lat - L:]
+
+        # ---- CROP-ORIGIN BAND (default OFF) --------------------------
+        # ``y_lo``/``y_hi_excl`` are the [low, high) bounds handed to
+        # ``randint``. With the shipped fractions (0.0, 1.0) they are
+        # EXACTLY ``0`` and ``max(1, H - cr + 1)``, i.e. the historical
+        # draw, and the branch below takes the legacy expression
+        # verbatim so byte-identity is structural rather than argued.
+        _ylo_f = float(cfg.get("crop_y_lo_frac", 0.0) or 0.0)
+        _yhi_f = float(cfg.get("crop_y_hi_frac", 1.0) or 1.0)
+        _band_on = (_ylo_f > 0.0) or (_yhi_f < 1.0)
+        _strat_on = bool(int(cfg.get("crop_stratify_x", 0) or 0))
+        y_span = max(1, H - cr + 1)
+        x_span = max(1, W - cc + 1)
+        if _band_on:
+            # Crop must lie inside [round(lo*H), round(hi*H)).
+            y_lo = max(0, min(y_span - 1, int(round(_ylo_f * H))))
+            y_hi_excl = max(y_lo + 1,
+                            min(y_span, int(round(_yhi_f * H)) - cr + 1))
+        else:
+            y_lo, y_hi_excl = 0, y_span
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed((int(self.pixel_epoch) * 7919 + 104729) & 0x7FFF_FFFF)
+        crops = []
+        crop_origins = []
+        for _k in range(K):
+            if _band_on:
+                y0 = int(torch.randint(y_lo, y_hi_excl, (1,),
+                                       generator=g).item())
+            else:
+                y0 = (int(torch.randint(0, max(1, H - cr + 1), (1,),
+                                        generator=g).item()))
+            if _strat_on and K > 1:
+                # One draw per equal-width column band: the K origins
+                # cannot collide, so coverage is K*p instead of the
+                # union 1-(1-p)^K. Same number of RNG draws as the
+                # independent path, so the schedule stays reproducible.
+                _b_lo = (_k * x_span) // K
+                _b_hi = max(_b_lo + 1, ((_k + 1) * x_span) // K)
+                x0 = int(torch.randint(_b_lo, _b_hi, (1,),
+                                       generator=g).item())
+            else:
+                x0 = (int(torch.randint(0, max(1, W - cc + 1), (1,),
+                                        generator=g).item()))
+            crops.append(lat[:, :, :, y0:y0 + cr, x0:x0 + cc])
+            crop_origins.append((int(y0), int(x0)))
+            _ps = self.pixel_stats
+            _ps["crop_y0_sum"] += float(y0)
+            _ps["crop_draws"] += 1.0
+            _ps["crop_y0_min"] = (
+                float(y0) if _ps["crop_y0_min"] < 0.0
+                else min(_ps["crop_y0_min"], float(y0)))
+            _ps["crop_y0_max"] = max(_ps["crop_y0_max"], float(y0))
+        # ROW-MAJOR stacking: row b occupies slots [b*K, (b+1)*K). The
+        # per-row logit fold at the bottom of ``forward`` is a plain
+        # ``reshape(B, -1)`` and is only correct under this ordering.
+        crops_t = torch.stack(crops, dim=1).reshape(B * K, L, _C, cr, cc)
+
+        want_grad = bool(x_noisy.requires_grad) and torch.is_grad_enabled()
+        # ---- DECODE, optionally SPLIT (default OFF) ------------------
+        # ``decode_split`` is the knob ``decode_batch`` was never wired
+        # to. Off (0) => ONE call with the whole tensor, which is the
+        # historical behaviour byte for byte. On => ceil(n/split) calls
+        # concatenated, which caps the VAE decoder's transient at
+        # ``split`` rows and is what makes a larger ``crops_per_row`` x
+        # ``lat_frames`` affordable.
+        _split = int(cfg.get("decode_split", 0) or 0)
+        if _split > 0 and int(crops_t.shape[0]) > _split:
+            _parts = [
+                self.pixel_decode_fn(crops_t[i:i + _split], want_grad)
+                for i in range(0, int(crops_t.shape[0]), _split)
+            ]
+            self.pixel_stats["decode_calls"] += float(len(_parts))
+            self.pixel_stats["decode_split_active"] = 1.0
+            _route_add("decode_calls", float(len(_parts)))
+            _route_set("decode_split_active", 1.0)
+            pix = torch.cat(_parts, dim=0)
+        else:
+            pix = self.pixel_decode_fn(crops_t, want_grad)
+            self.pixel_stats["decode_calls"] += 1.0
+            _route_add("decode_calls", 1.0)
+            _route_set("decode_split_active", 0.0)
+        if pix.dim() != 5:
+            raise ValueError(
+                "pixel_decode_fn must return [n, F_pix, 3, H, W]; got "
+                f"{tuple(pix.shape)}."
+            )
+
+        b = int(cfg["border"])
+        dy, dx = self.pixel_source.jitter_for(int(self.pixel_epoch))
+        Hp, Wp = int(pix.shape[-2]), int(pix.shape[-1])
+        if b > 0 and Hp > 2 * b and Wp > 2 * b:
+            dy = max(-b, min(b, int(dy)))
+            dx = max(-b, min(b, int(dx)))
+            pix = pix[..., b + dy:Hp - b + dy, b + dx:Wp - b + dx]
+
+        F_pix = int(pix.shape[1])
+        kf = max(1, min(int(cfg["frames_per_crop"]), F_pix))
+        # EVENLY SPACED, not random: a random subset would differ
+        # between the two R1 forwards for the same reason the crop would.
+        sel = [int(round(i * (F_pix - 1) / max(1, kf - 1))) if kf > 1 else 0
+               for i in range(kf)]
+        imgs = pix[:, sel].reshape(-1, *pix.shape[2:]).to(torch.float32)
+
+        # GAN-aligned discrimination benchmark capture.  Keep this outside
+        # the feature-source call so every candidate basis is later evaluated
+        # on byte-identical pixels.  Best-effort is intentional: diagnostics
+        # must never be able to abort training, while the callback itself
+        # writes a loud error marker on failure.
+        _capture = getattr(self, "pixel_capture_fn", None)
+        _capture_ctx = getattr(self, "pixel_capture_context", None)
+        if callable(_capture) and isinstance(_capture_ctx, dict):
+            try:
+                _capture(
+                    imgs.detach(),
+                    {
+                        **_capture_ctx,
+                        "rows_total": int(B),
+                        "crops_per_row": int(K),
+                        "latent_frames_used": int(L),
+                        "frames_per_crop": int(kf),
+                        "crop_rows": int(cr),
+                        "crop_cols": int(cc),
+                        "pixel_height": int(imgs.shape[-2]),
+                        "pixel_width": int(imgs.shape[-1]),
+                        "frame_indices": list(sel),
+                        "phase_jitter_y": int(dy),
+                        "phase_jitter_x": int(dx),
+                        "route": str(_route or "shared"),
+                        # Private tensor payload for the aligned surrogate
+                        # benchmark.  It is consumed and removed by the
+                        # trainer callback before JSON metadata is written.
+                        # Keeping it beside the exact post-decode pixels
+                        # guarantees the latent and RGB banks use identical
+                        # rows, frames, crop origins and augmentation draws.
+                        "_latent_crops": crops_t.detach(),
+                        "crop_origins_yx": [list(v) for v in crop_origins],
+                    },
+                )
+            except Exception as _capture_exc:
+                # The callback records its own marker where possible.  The
+                # discriminator remains usable even if benchmark I/O fails.
+                logging.exception(
+                    "[LADD-DISCRIM-CAPTURE] callback failed: %s",
+                    _capture_exc,
+                )
+
+        feats = self.pixel_source(imgs, epoch=int(self.pixel_epoch))
+        self.pixel_stats["fwd"] += 1.0
+        self.pixel_stats["images"] += float(imgs.shape[0])
+        self.pixel_stats["decode_grad" if want_grad else "decode_nograd"] += 1.0
+        _route_add("fwd", 1.0)
+        _route_add("images", float(imgs.shape[0]))
+        _route_add("decode_grad" if want_grad else "decode_nograd", 1.0)
+        # ---- REALISED CROP PLAN. Every one of these is the value the
+        # code USED, not the value the config asked for, and the two
+        # ``_clamped`` counters are the difference. Before this existed,
+        # ``lat_frames`` and ``frames_per_crop`` were silently clamped
+        # (``min(cfg, F)``) with NO counter of any kind: the only
+        # evidence a raise had taken was the boot echo, which prints the
+        # request. ``lat_frames_clamped > 0`` means the disc's input had
+        # fewer latent frames than the arm asked for and the arm is NOT
+        # running the recipe it thinks it is.
+        _ps = self.pixel_stats
+        _ps["lat_frames_cfg"] = float(int(cfg["lat_frames"]))
+        _ps["lat_frames_used"] = float(L)
+        _ps["lat_frames_avail"] = float(F_lat)
+        if L < int(cfg["lat_frames"]):
+            _ps["lat_frames_clamped"] += 1.0
+        _ps["frames_per_crop_cfg"] = float(int(cfg["frames_per_crop"]))
+        _ps["frames_per_crop_used"] = float(kf)
+        _ps["frames_avail"] = float(F_pix)
+        if kf < int(cfg["frames_per_crop"]):
+            _ps["frames_per_crop_clamped"] += 1.0
+        _ps["crops_per_row_used"] = float(K)
+        _ps["crop_rows_used"] = float(cr)
+        _ps["crop_cols_used"] = float(cc)
+        _ps["crop_band_active"] = 1.0 if _band_on else 0.0
+        _ps["crop_stratify_active"] = 1.0 if (_strat_on and K > 1) else 0.0
+        _ps["decode_split_cfg"] = float(_split)
+        _route_set("lat_frames_cfg", float(int(cfg["lat_frames"])))
+        _route_set("lat_frames_used", float(L))
+        _route_set("lat_frames_avail", float(F_lat))
+        if L < int(cfg["lat_frames"]):
+            _route_add("lat_frames_clamped", 1.0)
+        elif _route:
+            _ps.setdefault(_route + "lat_frames_clamped", 0.0)
+        _route_set("frames_per_crop_cfg", float(int(cfg["frames_per_crop"])))
+        _route_set("frames_per_crop_used", float(kf))
+        _route_set("frames_avail", float(F_pix))
+        if kf < int(cfg["frames_per_crop"]):
+            _route_add("frames_per_crop_clamped", 1.0)
+        elif _route:
+            _ps.setdefault(_route + "frames_per_crop_clamped", 0.0)
+        _route_set("crops_per_row_used", float(K))
+        _route_set("crop_rows_used", float(cr))
+        _route_set("crop_cols_used", float(cc))
+        _route_set("crop_band_active", 1.0 if _band_on else 0.0)
+        _route_set(
+            "crop_stratify_active", 1.0 if (_strat_on and K > 1) else 0.0)
+        _route_set("decode_split_cfg", float(_split))
+        return feats, K * kf, self.pixel_source.grid
 
     # ------------------------------------------------------------------
     def forward(
@@ -1498,15 +2099,29 @@ class LADDDiscriminator(nn.Module):
                 if getattr(self, "wavelet_hf_augment", False)
                 else _wave
             )
-        feats = self.projector(
-            x_noisy=x_noisy,
-            timestep=timestep,
-            prompt_embeds=prompt_embeds,
-            clean_x=clean_x,
-            aug_t=aug_t,
-            seq_len=seq_len,
-            conditional_extra=conditional_extra,
-        )
+        # ===== FEATURE BASIS ==========================================
+        # Exactly one of these two runs, and the counters say which. The
+        # pixel branch never calls ``self.projector``, so the WAN taps
+        # (and, with ladd_feature_source='fake', the fake-score
+        # backbone) are genuinely OUT of the disc's graph on a pixel arm
+        # -- that is the point, and ``ladd_pix_wan_projector_calls``
+        # staying at 0 is the proof.
+        _pix_nimg = 0
+        _pix_grid = (0, 0)
+        B_pool = int(x_noisy.shape[0])
+        if self.pixel_source is not None:
+            feats, _pix_nimg, _pix_grid = self._pixel_features(x_noisy)
+        else:
+            self.pixel_stats["wan_projector_calls"] += 1.0
+            feats = self.projector(
+                x_noisy=x_noisy,
+                timestep=timestep,
+                prompt_embeds=prompt_embeds,
+                clean_x=clean_x,
+                aug_t=aug_t,
+                seq_len=seq_len,
+                conditional_extra=conditional_extra,
+            )
         # Sanity: projector must have returned all expected blocks.
         missing = [i for i in self.block_indices if i not in feats]
         if missing:
@@ -1515,6 +2130,37 @@ class LADDDiscriminator(nn.Module):
                 f"block indices {missing}. Hook setup is broken — verify "
                 f"that real_score's transformer_blocks indices are valid."
             )
+        if self.pooled_readout is not None:
+            # ===== ORDERLESS READOUT =====================================
+            # ``feats`` are the encoder's RAW per-tap maps
+            # ``{tap: [N, C_l, H_l, W_l]}`` at their native resolutions.
+            # The head pools each to [mu, sigma, Cov] over ALL spatial
+            # positions and emits [N, 1]. N is
+            # ``B * crops_per_row * frames_per_crop`` ROW-MAJOR (see
+            # ``_pixel_features``), so the fold to [B, -1] gives
+            # ``crops_per_row * frames_per_crop`` logits per row -- one
+            # per FRAME, which is the coarsest readout the RpGAN
+            # reduction can be given without averaging two independent
+            # pictures together.
+            _pool_logits = self.pooled_readout(feats)
+            visual_logits = _pool_logits.reshape(B_pool, -1)
+            self.pixel_stats["pooled_calls"] += 1.0
+            self.pixel_stats["logits_per_sample"] = float(
+                visual_logits.shape[1])
+            if self._pixel_last_route:
+                _rk = self._pixel_last_route + "pooled_calls"
+                self.pixel_stats[_rk] = self.pixel_stats.get(_rk, 0.0) + 1.0
+                self.pixel_stats[
+                    self._pixel_last_route + "logits_per_sample"
+                ] = float(visual_logits.shape[1])
+            if self.scalar_output:
+                visual_logits = visual_logits.mean(dim=1, keepdim=True)
+            if self.stat_head is not None:
+                visual_logits = torch.cat(
+                    [visual_logits, self.stat_head(x_noisy_raw)], dim=1,
+                )
+            return visual_logits
+
         if self.register_readout is not None:
             # One-Forcing readout: register-token cross-attn pooling per
             # tap -> one scalar logit per row. No CCM/CSM/heads exist in
@@ -1559,44 +2205,74 @@ class LADDDiscriminator(nn.Module):
         # the sequence is zero-padded to ``seq_len``. We slice off
         # the padding AND the per-frame action tokens before the
         # 2D reshape.
-        B, F_in, _C_in, H_in, W_in = x_noisy.shape
-        pt, ph, pw = self.patch_size
-        T_prime = F_in // pt
-        H_prime = H_in // ph
-        W_prime = W_in // pw
-        a_per_f = int(self.action_tokens_per_frame)
-        frame_seqlen = H_prime * W_prime + a_per_f
-        real_tokens = T_prime * frame_seqlen
-
+        B = int(x_noisy.shape[0])
         proj_2d: Dict[int, torch.Tensor] = {}
-        for idx in self.block_indices:
-            feat = proj[idx]  # [B, seq_len, dim_proj]
-            if feat.shape[1] < real_tokens:
-                raise RuntimeError(
-                    "LADDDiscriminator: captured feature length "
-                    f"{feat.shape[1]} < expected real_tokens "
-                    f"{real_tokens} (T'={T_prime}, H'={H_prime}, "
-                    f"W'={W_prime}, a_per_f={a_per_f})."
+        if self.pixel_source is not None:
+            # PIXEL PATH. The token sequence is already exactly the
+            # encoder's own (gh x gw) feature grid -- no padding, no
+            # action tokens, no patch arithmetic -- so the fold is a
+            # straight transpose+reshape. Leading axis is
+            # ``B * crops_per_row * frames_per_crop``, ROW-MAJOR (see
+            # ``_pixel_features``), which is what makes the
+            # ``reshape(B, -1)`` below correct.
+            gh, gw = int(_pix_grid[0]), int(_pix_grid[1])
+            for idx in self.block_indices:
+                feat = proj[idx]                       # [N, gh*gw, dim_proj]
+                if int(feat.shape[1]) != gh * gw:
+                    raise RuntimeError(
+                        "LADDDiscriminator pixel path: tap "
+                        f"{idx} has {feat.shape[1]} tokens but the "
+                        f"encoder grid is {gh}x{gw}={gh * gw}. The taps "
+                        "must share one grid (the CSM fuses them by "
+                        "elementwise addition)."
+                    )
+                proj_2d[idx] = (
+                    feat.transpose(1, 2)
+                    .reshape(int(feat.shape[0]), self.dim_proj, gh, gw)
+                    .contiguous()
                 )
-            # Strip zero-padding past the real-content region.
-            feat = feat[:, :real_tokens]
-            # Per-frame split + strip action tokens.
-            feat = feat.reshape(B, T_prime, frame_seqlen, self.dim_proj)
-            if a_per_f > 0:
-                feat = feat[:, :, :H_prime * W_prime]
-            # [B, T', H', W', dim_proj] -> [B*T', dim_proj, H', W']
-            feat = feat.reshape(B, T_prime, H_prime, W_prime, self.dim_proj)
-            feat = feat.permute(0, 1, 4, 2, 3).contiguous()
-            feat = feat.reshape(B * T_prime, self.dim_proj, H_prime, W_prime)
-            proj_2d[idx] = feat
+        else:
+            F_in, _C_in, H_in, W_in = x_noisy.shape[1:]
+            pt, ph, pw = self.patch_size
+            T_prime = F_in // pt
+            H_prime = H_in // ph
+            W_prime = W_in // pw
+            a_per_f = int(self.action_tokens_per_frame)
+            frame_seqlen = H_prime * W_prime + a_per_f
+            real_tokens = T_prime * frame_seqlen
+
+            for idx in self.block_indices:
+                feat = proj[idx]  # [B, seq_len, dim_proj]
+                if feat.shape[1] < real_tokens:
+                    raise RuntimeError(
+                        "LADDDiscriminator: captured feature length "
+                        f"{feat.shape[1]} < expected real_tokens "
+                        f"{real_tokens} (T'={T_prime}, H'={H_prime}, "
+                        f"W'={W_prime}, a_per_f={a_per_f})."
+                    )
+                # Strip zero-padding past the real-content region.
+                feat = feat[:, :real_tokens]
+                # Per-frame split + strip action tokens.
+                feat = feat.reshape(B, T_prime, frame_seqlen, self.dim_proj)
+                if a_per_f > 0:
+                    feat = feat[:, :, :H_prime * W_prime]
+                # [B, T', H', W', dim_proj] -> [B*T', dim_proj, H', W']
+                feat = feat.reshape(
+                    B, T_prime, H_prime, W_prime, self.dim_proj)
+                feat = feat.permute(0, 1, 4, 2, 3).contiguous()
+                feat = feat.reshape(
+                    B * T_prime, self.dim_proj, H_prime, W_prime)
+                proj_2d[idx] = feat
 
         logits_per_scale = []
+        self.pixel_stats["dense_head_calls"] += 1.0
         for idx in self.block_indices:
             l = self.heads[str(idx)](proj_2d[idx], cmap=cmap)
             # l: [B*T', cmap_dim_or_1, H', W'] -> per-sample flat.
             l = l.reshape(B, -1)
             logits_per_scale.append(l)
         visual_logits = torch.cat(logits_per_scale, dim=1)
+        self.pixel_stats["logits_per_sample"] = float(visual_logits.shape[1])
         if self.scalar_output:
             # One invariant critic value per sample. This reduction is part of
             # D itself, so D/G losses and R1 all differentiate the exact
@@ -1828,6 +2504,7 @@ def build_ladd_disc(
     register_head_num_layers: int = 4,
     register_head_dropout: float = 0.2,
     register_checkpoint: Optional[bool] = None,
+    pixel_source=None,
 ) -> LADDDiscriminator:
     """Build a LADD discriminator wired to the existing teacher.
 
@@ -1940,6 +2617,12 @@ def build_ladd_disc(
         register_head_num_layers=register_head_num_layers,
         register_head_dropout=register_head_dropout,
         register_checkpoint=register_checkpoint,
+        # PIXEL FEATURE SOURCE. When non-None the projector above is
+        # still constructed (so the object graph is unchanged and the
+        # aux-teacher ``feat_w`` path keeps its handle) but it is NEVER
+        # CALLED -- ``LADDDiscriminator.forward`` takes the pixel branch
+        # and ``ladd_pix_wan_projector_calls`` stays at 0.
+        pixel_source=pixel_source,
     )
     return disc
 

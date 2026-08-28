@@ -433,3 +433,82 @@ action critic) with two changes:
 2. `train_carntx_6tchain_on` — the production-lineage counterpart.
 3. `gansig_wide` — never launched all day; lowest value (needs `all_pairs`, which
    disables the memory guards, and corrects the action origin on the real side only).
+
+---
+
+# ABLATING THE TRANSITION GAN — is it feeding us or hurting us? (2026-08-26)
+
+The question: `gt_transition` is the pair mode every pre-`gansig` arm ran, and the whole
+`w2-*` series ran it EXCLUSIVELY. Is it contributing, or is it dead weight that also drags
+the CARN along with it?
+
+## What we know already
+
+**1. It is the wrong question for TEXTURE, and that is now measured.**
+`gt_transition`'s "real" side is a 2-chunk **transition** — it asks *"does this clip join to
+itself plausibly across a seam?"*, a question about temporal continuity. `gt_vs_fake` asks
+*"does this look like real footage?"*. The entire w2-* series (w2, w2pix, w2sam, w2wav2,
+w2gram, w2tclean) ran transition-ONLY, so **not one of them contained a disc that was ever
+asked the appearance question** — the series was underdefined by construction. The
+researcher's observation that `ofclean` is the only arm with semi-realistic texture is
+consistent: it is the only one of that set with `gt_vs_fake` enabled.
+
+**2. It is load-bearing for the CARN — structurally, not by design intent.**
+The CARN's apply site sits behind TWO guards: `_match_active`, and `chunks_per_pair == 2`
+which **only `gt_transition` sets** (`:12412`; every other mode leaves it 1). Log census over
+8,707 files: `[FN-GT-FORMER]` fired **0 times in all 24 arms** with `match=false`, and 2+
+times only where true. **21 arms trained and checkpointed a noiser that never touched a
+single tensor.** That coupling is now broken by `forward_noiser_apply_decoupled`, but the
+decoupled path is a WEAKER variant (see D1-D3 in `THINGS_TO_DO.md`).
+
+**3. Removing it removes an anchor, and the sign may flip.**
+Coupled application noises the FORMER half of a transition and leaves the LATTER clean — a
+degraded→clean anchor the disc can key on. At `cpp==1` that is *structurally impossible*:
+one chunk carries no transition, so there is no quality gradient. What replaces it is
+real-side instance noise (real class = ⅓ clean, ⅔ level-1 CARN'd). The shipped generator
+term is RpGAN `E[softplus(d_real − d_fake)]` with `d_real` detached
+(`model/r3gan.py:238-246`); its gradient w.r.t. the fake logit is `−σ(d_real − d_fake)`, so
+**lowering `d_real` monotonically SHRINKS the adversarial gradient** — i.e. noising the real
+side teaches the disc to *tolerate* drift, not punish it. Site B (`[CARN-MATCH-POOL]`)
+shields against exactly this with a gen-side `carn=True`-on-D-update-only rule; the
+decoupled path does not.
+
+## The ablation set (minimum 4 arms, 2 pairs)
+
+All on the `gansig_gtvf_*` base (clean disc, dmd source, frozen critic). **Pair the arms on
+the same nodes and run ≥3 seeds** — `d_loss` has a 17% noise floor and the ratio 50%.
+
+| # | arm | `gt_transition_enabled` | `gt_vs_fake_enabled` | answers |
+|---|---|---|---|---|
+| A1 | `gtvf_only` | **false** | true | already run (`gansig_gtvf_dmd`, 200 steps) |
+| A2 | `both_modes` | **true** | true | already run (`gansig_ofclean`, 200 steps) |
+| A3 | `xn_only` | true | **false** | **MISSING** — the transition-only control at matched settings |
+| A4 | `neither` | false | false | **MISSING** — GAN-off floor; bounds how much either mode buys |
+
+A1 vs A2 answers *"does transition ADD anything once gt_vs_fake is present?"* — the
+researcher's live hypothesis. A3 vs A1 answers *"is transition WORSE than gt_vs_fake?"*.
+A4 bounds both. **A3 and A4 do not exist yet and are the gap.**
+
+Caveat on A1 vs A2 as currently run: they also differ in the action critic, backbone scale
+(0.2 vs 0.1 — mode-neutral in both, so not a treatment) and the code-fix telemetry flags.
+Only the critic is a real second treatment; strip it for a clean read.
+
+## Judge on texture, not disc health
+
+Per `analysis/sharpness/TEXTURE_REVIEW.md`, the certified composite ranks `of` BEST and
+`ofclean` WORST — the exact inverse of the researcher's eye — because it is blind to the
+phase-locked fold. Use instead, on **textured crops** (tree crown, road; NOT sky), each arm
+paired against its own `clean_x_real`:
+* `fold2d` P=16 **dotfrac** and residual peak-to-peak (GT: 0.13 / 3.30)
+* mod-8 row fold A8y (GT: 1.42)
+* two-sided distance-to-dataset — overshoot is as bad as undershoot
+* reject any arm whose fold improves while HF drops BELOW the dataset (the `of` degeneracy)
+
+## Standing warning
+
+`of`'s "better texture" is the GAN being switched OFF 25% of the time: `disc_t` is drawn
+uniformly from {1000, 250, 100, 50} and at 1000 `alpha_t = 1−sigma = 0` **exactly**, so the
+adversarial gradient is multiplied by zero and the disc trains on two independent N(0,1)
+draws. `ofclean` is `of` with that one line changed and reaches A8y **1.75 vs 4.26** at FULL
+gradient. Any future arm that "improves texture" should be checked against this failure mode
+before being believed.

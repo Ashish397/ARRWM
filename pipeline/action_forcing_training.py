@@ -1343,6 +1343,167 @@ class ActionForcingTrainingPipeline:
             pass
 
     # -----------------------------------------------------------------
+    # CARN IN-PLACE COMMIT DE-DRIFT (``docs/CARN_FINAL_PLAN.md``).
+    #
+    # WHAT. Applies the LEARNED reverse-noiser correction
+    # (``ActionForcingDMD._dedrift_with_reverse_noiser`` -- the same
+    # relaxed multi-step Euler operator already used at the flash and
+    # DMD-target sites) to the chunk that is about to be written into
+    # the KV cache. This is the one site nothing had ever touched: every
+    # other CARN application corrects a loss-computation COPY, never the
+    # AR memory the model actually conditions on going forward.
+    #
+    # WHERE IT FIRES. Both commit twins -- ``inference_with_trajectory``
+    # and ``generate_chunk_with_cache`` -- immediately before their
+    # ``_carn_seam_correct`` call, i.e. on the ``commit_input_clean``
+    # tensor that feeds the Step-3.4 context-noise commit forward.
+    #
+    # ORDER vs ``_carn_seam_correct`` (Risk 5 of the plan, DECIDED):
+    # learned de-drift FIRST, crude mean/std affine SECOND. Rationale:
+    # (a) they are independent knobs and no live arm has the affine on
+    #     (``carn_seam_affine_lambda`` defaults to 0.0 everywhere), so
+    #     the composition is inert today and this only fixes the order
+    #     for whoever turns both on later;
+    # (b) the affine is a STATISTICAL re-anchor toward the ride seed --
+    #     if it runs last it re-anchors whatever the learned operator
+    #     produced, which is the sane reading ("correct, then clamp the
+    #     scale"); running it first would let the learned operator undo
+    #     the clamp;
+    # (c) ``_carn_seam_correct(record=True)`` stays the sole publisher
+    #     of seam telemetry AND now measures the tensor that is really
+    #     committed.
+    # Neither operator is removed or altered by this change.
+    #
+    # GATE. Single source of truth: the flag lives on the owning
+    # ``ActionForcingDMD`` (registered in its ``__init__`` next to the
+    # other ``reverse_noiser_dedrift_*`` knobs) and is read from here
+    # THROUGH the owner reference, so there is no second copy of the
+    # flag on the pipeline that could silently disagree with the model's.
+    # The owner reference is installed by the trainer at the same seam
+    # that installs ``pix_finish_grad_enabled`` (see the CONFIG->PIPELINE
+    # SEAM block in ``trainer/causal_action_forcing_train.py``). No
+    # owner => passthrough (a bare pipeline built by a test or by the
+    # eval harness must keep working, byte-identically).
+    #
+    # DOUBLE GATE. ``_dedrift_with_reverse_noiser`` is itself a
+    # passthrough unless ``reverse_noiser_dedrift_enabled`` is on and a
+    # corrector network exists, so a half-enabled config is a no-op, not
+    # a partial.
+    #
+    # GRADIENT. ``commit_input_clean`` is ``_commit_src.detach()`` and
+    # the commit forward runs under ``torch.no_grad()`` -- the commit
+    # path was ALREADY graph-free before this change, so inserting the
+    # operator here cannot sever a generator gradient (there is none to
+    # sever) and must not START a graph either (it would keep a ~30M
+    # param forward alive for nothing). Pinned by
+    # ``testing/test_reverse_noiser_dedrift_commit.py``.
+    # -----------------------------------------------------------------
+    def _reverse_noiser_dedrift_commit(
+        self, x: torch.Tensor,
+    ) -> torch.Tensor:
+        owner = getattr(self, "_carn_commit_dedrift_owner", None)
+        if not bool(getattr(
+            owner, "reverse_noiser_dedrift_apply_to_commit", False,
+        )):
+            return x
+        # The corrector is learned online by aux-minus.  Applying its first
+        # non-zero update at full strength to recurrent memory closes a moving
+        # feedback loop: the corrector immediately changes the distribution it
+        # is still learning from.  A commit-only warmup and ramp let aux-minus
+        # establish the direction first, while leaving its own pseudo-target
+        # and weight untouched.
+        step = int(getattr(owner, "_carn_commit_current_step", 0))
+        start = int(getattr(owner, "reverse_noiser_commit_start_step", 0))
+        ramp = int(getattr(owner, "reverse_noiser_commit_ramp_steps", 0))
+        target_alpha = float(getattr(
+            owner, "reverse_noiser_commit_alpha", 1.0,
+        ))
+        if step < start:
+            m = getattr(self, "_last_extension_metrics", None)
+            if isinstance(m, dict):
+                m["carn_commit_dedrift_warmup_skip"] = (
+                    float(m.get("carn_commit_dedrift_warmup_skip", 0.0)) + 1.0
+                )
+                m["carn_commit_dedrift_alpha"] = 0.0
+            return x
+        ramp_frac = (
+            min(1.0, max(0.0, float(step - start) / float(ramp)))
+            if ramp > 0 else 1.0
+        )
+        commit_alpha = target_alpha * ramp_frac
+        if commit_alpha <= 0.0:
+            m = getattr(self, "_last_extension_metrics", None)
+            if isinstance(m, dict):
+                m["carn_commit_dedrift_ramp_skip"] = (
+                    float(m.get("carn_commit_dedrift_ramp_skip", 0.0)) + 1.0
+                )
+                m["carn_commit_dedrift_alpha"] = 0.0
+            return x
+        fn = getattr(owner, "_dedrift_with_reverse_noiser", None)
+        if fn is None:
+            return x
+        lvl = int(getattr(owner, "reverse_noiser_dedrift_level", 1))
+        out = fn(x, lvl)
+        if out is x:
+            # The helper's own gate declined (disabled / no network /
+            # level < min_level). Record the DECLINE so a config that
+            # believes it is correcting can be falsified from the log.
+            m = getattr(self, "_last_extension_metrics", None)
+            if isinstance(m, dict):
+                m["carn_commit_dedrift_noop"] = (
+                    float(m.get("carn_commit_dedrift_noop", 0.0)) + 1.0
+                )
+            return x
+        if commit_alpha != 1.0:
+            out = x + commit_alpha * (out - x)
+        n = float(getattr(self, "_carn_commit_dedrift_calls", 0.0)) + 1.0
+        self._carn_commit_dedrift_calls = n
+        m = getattr(self, "_last_extension_metrics", None)
+        if isinstance(m, dict):
+            # Per-call, sync-free: PROVE THE FLAG FIRED FROM A COUNTER.
+            m["carn_commit_dedrift_applied"] = (
+                float(m.get("carn_commit_dedrift_applied", 0.0)) + 1.0
+            )
+            m["carn_commit_dedrift_alpha"] = float(commit_alpha)
+            m["carn_commit_dedrift_step"] = float(step)
+        # MILESTONE rank-0 proof line with the relative displacement.
+        #
+        # NOT one-shot, deliberately. The corrector is zero-init
+        # (``out_proj`` zeroed => R(x, l) == x exactly), so the FIRST
+        # call ALWAYS reports rel|dz|=0 no matter how well the mechanism
+        # works. A single line at call 1 therefore proves the operator
+        # RAN but can never show it started MOVING anything -- and the
+        # whole bootstrapping question (Risk 1/3 of the plan: does the
+        # correction grow, converge, or stay dead?) lives in how rel|dz|
+        # evolves. Log at a geometric ladder of call counts instead, so
+        # a run's stdout carries the trajectory. Same milestone-print
+        # discipline (and cost) as ``_dedrift_with_reverse_noiser``'s own
+        # ``_carntx_dedrift_calls in (1, 50)`` line: a handful of
+        # ``.item()`` syncs over an entire run, never per step.
+        if n in (1.0, 10.0, 50.0, 200.0, 1000.0, 5000.0, 20000.0):
+            self._carn_commit_dedrift_logged = True
+            try:
+                with torch.no_grad():
+                    rel = float(
+                        (out.detach().float() - x.detach().float()).norm()
+                        / max(float(x.detach().float().norm()), 1e-8)
+                    )
+                if (dist.get_rank() if dist.is_initialized() else 0) == 0:
+                    print(
+                        "[CARN][commit-dedrift] ACTIVE at the KV commit: "
+                        f"call={int(n)} step={step} level={lvl} "
+                        f"alpha={commit_alpha:.6g} rel|dz|={rel:.6g} "
+                        "(the COMMITTED chunk is corrected in place; the "
+                        "emitted/scored chunk is not. rel|dz|=0 at call=1 "
+                        "is EXPECTED -- R is zero-init; watch it GROW)",
+                        flush=True,
+                    )
+            except Exception:
+                # Telemetry must never take a training step down.
+                pass
+        return out
+
+    # -----------------------------------------------------------------
     # Main entry: inference_with_trajectory
     # -----------------------------------------------------------------
     def inference_with_trajectory(
@@ -1417,6 +1578,12 @@ class ActionForcingTrainingPipeline:
         # so callers can fail-fast if they expect it but the rollout
         # wasn't run with Flash DMD active.
         self._flash_dmd_gan_output: Optional[torch.Tensor] = None
+        # Frame-level liveness twin of ``_flash_dmd_gan_output``.  The
+        # output buffer is assembled with CopySlices, so buffer-level
+        # ``requires_grad`` is true when *any* block is live even though
+        # the deliberately skipped trailing block is graph-free.  Consumers
+        # must use this mask rather than infer liveness from the buffer.
+        self._flash_dmd_gan_grad_mask: Optional[torch.Tensor] = None
         # Per-block CLEAN PRED buffer for the aux teacher's clean_x.
         # Populated post-Step-3.3.5 (= refined cache_pred when flash
         # is enabled; post-rung cache_pred otherwise). Detached,
@@ -1585,8 +1752,12 @@ class ActionForcingTrainingPipeline:
                 device=noise.device,
                 dtype=noise.dtype,
             )
+            flash_dmd_gan_grad_mask = torch.zeros(
+                num_output_frames, device=noise.device, dtype=torch.bool,
+            )
         else:
             flash_dmd_gan_output = None
+            flash_dmd_gan_grad_mask = None
         # Aux-teacher clean_x buffer: per-block post-Step-3.3.5
         # cache_pred. Detached, no autograd graph. Sized to
         # num_output_frames so block writes use absolute
@@ -2024,6 +2195,9 @@ class ActionForcingTrainingPipeline:
                     :,
                     current_start_frame: current_start_frame + current_num_frames,
                 ] = flash_dmd_pred
+                flash_dmd_gan_grad_mask[
+                    current_start_frame: current_start_frame + current_num_frames
+                ] = bool(flash_grad_active)
                 # Unification: cache_pred becomes the t=60 refined
                 # output (detached), avoiding the second forward.
                 # UNCHANGED by FIX 1: the GAN / FN consumers keep
@@ -2116,6 +2290,15 @@ class ActionForcingTrainingPipeline:
             )
             _commit_src = ladder_endpoint_pred if _use_ladder else cache_pred
             commit_input_clean = _commit_src.detach()
+            # CARN IN-PLACE COMMIT DE-DRIFT (docs/CARN_FINAL_PLAN.md).
+            # Learned reverse-noiser correction FIRST, crude affine
+            # SECOND -- see ``_reverse_noiser_dedrift_commit`` for the
+            # decided ordering and its rationale. Passthrough (same
+            # object) unless ``reverse_noiser_dedrift_apply_to_commit``
+            # AND ``reverse_noiser_dedrift_enabled`` are both on.
+            commit_input_clean = self._reverse_noiser_dedrift_commit(
+                commit_input_clean,
+            )
             # CARN seam correction. Extracted to ``_carn_seam_correct``
             # (single shared implementation, bit-identical to the code
             # that used to sit inline here). ``record=True``: this is
@@ -2194,6 +2377,9 @@ class ActionForcingTrainingPipeline:
                 flash_dmd_gan_output = flash_dmd_gan_output[
                     :, num_input_frames + num_seed_frames:
                 ]
+                flash_dmd_gan_grad_mask = flash_dmd_gan_grad_mask[
+                    num_input_frames + num_seed_frames:
+                ]
             if clean_chunk is not None:
                 clean_chunk = clean_chunk[
                     :, num_input_frames + num_seed_frames:
@@ -2212,6 +2398,7 @@ class ActionForcingTrainingPipeline:
         # the Step 3.4 context-noise commit). ``None`` when
         # ``flash_dmd_enabled=False``.
         self._flash_dmd_gan_output = flash_dmd_gan_output
+        self._flash_dmd_gan_grad_mask = flash_dmd_gan_grad_mask
         # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
         # Ladder-endpoint stash. With flash OFF ``ladder_chunk`` was never
@@ -2424,6 +2611,8 @@ class ActionForcingTrainingPipeline:
         self._last_extension_metrics = {}
         # Reset per-call Flash-DMD t=flash_dmd_gan_t output.
         self._flash_dmd_gan_output: Optional[torch.Tensor] = None
+        # Frame-level graph-liveness mask for that CopySlices buffer.
+        self._flash_dmd_gan_grad_mask: Optional[torch.Tensor] = None
         # Reset per-call clean_chunk buffer (per-block post-Step-3.3.5
         # cache_pred, detached). See ``__init__`` docstring for
         # consumer details.
@@ -2509,6 +2698,10 @@ class ActionForcingTrainingPipeline:
         # ``inference_with_trajectory`` for full rationale.
         flash_dmd_gan_output = (
             torch.zeros_like(noise) if flash_dmd_enabled else None
+        )
+        flash_dmd_gan_grad_mask = (
+            torch.zeros(num_frames, device=noise.device, dtype=torch.bool)
+            if flash_dmd_enabled else None
         )
         # Aux-teacher clean_x buffer (per-block post-Step-3.3.5
         # cache_pred, detached). Allocated UNCONDITIONALLY — see
@@ -3014,6 +3207,9 @@ class ActionForcingTrainingPipeline:
                 flash_dmd_gan_output[
                     :, block_start_in_noise: block_start_in_noise + current_num_frames,
                 ] = flash_dmd_pred
+                flash_dmd_gan_grad_mask[
+                    block_start_in_noise: block_start_in_noise + current_num_frames
+                ] = bool(flash_grad_active)
                 # UNCHANGED by FIX 1: the GAN / FN consumers keep
                 # reading exactly this tensor.
                 cache_pred = flash_dmd_pred.detach()
@@ -3152,6 +3348,16 @@ class ActionForcingTrainingPipeline:
             )
             _commit_src = ladder_endpoint_pred if _use_ladder else cache_pred
             commit_input_clean = _commit_src.detach()
+            # CARN IN-PLACE COMMIT DE-DRIFT (docs/CARN_FINAL_PLAN.md).
+            # TWIN of the block in ``inference_with_trajectory``. This
+            # is the copy that makes the correction propagate into the
+            # forward/reverse noiser's OWN training pairs: rollout2 is
+            # built by ``_prebuild_rollout2_for_v24`` through repeated
+            # ``generate_chunk_with_cache`` calls, so every rollout2
+            # chunk after the first conditions on CORRECTED context.
+            commit_input_clean = self._reverse_noiser_dedrift_commit(
+                commit_input_clean,
+            )
             # CARN seam correction. Extracted to ``_carn_seam_correct``
             # (single shared implementation, bit-identical to the code
             # that used to sit inline here). ``record=True``: this is
@@ -3237,6 +3443,7 @@ class ActionForcingTrainingPipeline:
         # Stash the unified t=60 flash output (None when
         # ``flash_dmd_enabled=False``) for downstream consumers.
         self._flash_dmd_gan_output = flash_dmd_gan_output
+        self._flash_dmd_gan_grad_mask = flash_dmd_gan_grad_mask
         # Same stash for the aux-teacher clean_chunk buffer.
         self._clean_chunk = clean_chunk
         # Ladder-endpoint stash (VIZ-HONESTY). Aliases ``_clean_chunk``

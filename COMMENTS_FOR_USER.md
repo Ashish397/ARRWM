@@ -1,8 +1,369 @@
+# LOGGING DEFECT: the encoder param-group line always cries wolf (2026-08-26)
+
+`trainer/causal_action_forcing_train.py:3020-3029` prints, UNCONDITIONALLY:
+
+    [LADD-PIXFEAT] encoder param group: n_encoder=%d n_head_adapter=%d
+    lr_scale=%.4g encoder_lr=%.3g head_lr=%.3g (0 encoder params => the
+    encoder is FROZEN, which contradicts ladd_pixel_encoder_trainable)
+
+The parenthetical is part of the FORMAT STRING, not a conditional branch. So a
+perfectly healthy trainable-encoder arm logs, verbatim (holder 6143212,
+pixdirect_onlinelr, live):
+
+    n_encoder=174 n_head_adapter=56 lr_scale=0.4 encoder_lr=8e-06
+    head_lr=2e-05 (0 encoder params => the encoder is FROZEN, which
+    contradicts ladd_pixel_encoder_trainable)
+
+n_encoder=174, trainable_encoder_params=22.06M, lr_scale=0.4 -- everything is
+CORRECT, and the line still says the encoder is frozen and contradicts its own
+flag. This is the forgeable-zero failure wearing a different hat: an alarm that
+fires in every state cannot report any state. It is exactly the kind of line
+that produces a false conclusion when someone greps a log at 2am.
+
+NOT FIXED YET, DELIBERATELY. It is a pure print and changes no result, but the
+arms record `srcmd5` over the trainer sources in their [ARRWM-PROVENANCE] line.
+Editing it now would make the arms of the CURRENTLY RUNNING comparison
+(pixdirect_onlinelr / _strong / _gtclean / pixdino_frozen) hash differently from
+one another for no scientific reason. Proposed fix at the next natural break:
+
+    if not _enc_params:
+        print("... WARNING: 0 encoder params => encoder is FROZEN, which "
+              "contradicts ladd_pixel_encoder_trainable=true")
+    else:
+        print("... n_encoder=%d ...")
+
+i.e. emit the diagnosis ONLY in the state it diagnoses. Sign-off wanted on
+whether to fix now (breaking srcmd5 continuity mid-campaign) or at the break.
+
 # COMMENTS FOR USER
 
 Live questions and things you need to know. Anything proposed → signed off →
-implemented → **finished** is moved to `RESOLVED_TODOs.md` (7 items there so far).
+implemented → **finished** is moved to `RESOLVED_TODOs.md`.
 Newest first.
+
+---
+
+# GAN SAMPLE BUDGET: the observability landed, the CAPACITY did NOT (2026-08-26)
+
+Code: `model/ladd_disc.py` (`__init__`, `_pixel_features`),
+`model/gan_balance.py` (new), `trainer/causal_action_forcing_train.py`
+(`_ladd_install_pixel_decode`, `_ladd_pixel_logs`, `_ladd_penalty_fire_logs`,
+`_ladd_run_pair_mode`, `train`), `configs/action_forcing_phase3_dmd.yaml`.
+Tests: `testing/test_ladd_pixel_crop_budget.py` (26 passed; 21 of them FAIL on
+the pre-change tree), `testing/test_gan_dwins_tripwire.py` (20 passed; the
+whole file fails pre-change). Every capacity knob is flag-gated and OFF, and
+the off path is the legacy one byte for byte.
+
+**The headline, and it reverses the brief I was given.** I was asked to raise
+the disc's sample budget as far as memory allows. Re-derived from live logs,
+**memory was never the binding constraint** — even K=4/L=3/kf=8 lands ~76 GB
+of 95 on the worst rank. The binding constraint is the G/D balance, and the
+`pixdirect_strong` arm proves it: **d_loss 0.0104 / 0.0039 / 0.0024 / 0.0102
+at steps 161/171/181/191**, four consecutive below the 0.135 D-wins floor,
+still falling at run end, while its **median over steps>=50 reads 0.3632** —
+inside the healthy band. `pixdirect_onlinelr`, same encoder lr, coverage NOT
+raised, dips twice and recovers (0.1346, 0.0139, then 0.6243), median 0.4560.
+
+## SIGN-OFF 1 — the crop-sampler bias you were asked about is BUILT, default OFF
+
+`ladd_pixel_crop_y_lo_frac` / `_hi_frac`, fractions of the latent height that
+the crop ORIGIN may be drawn from. `(0.0, 1.0)` ships and is the historical
+full-height uniform draw, asserted byte-identical against a longhand replay of
+the old schedule at 5 epochs. Lower two-thirds is `crop_y_lo_frac=0.3333`; the
+texture benchmark's own band (`analysis/sharpness/radial_spec.py` CROPS) is
+`0.35 / 0.97`. It stays a deterministic function of `pixel_epoch`, so the five
+D-updates and both R1 forwards still see one identical crop — tested.
+Your three objections all still stand and I have NOT turned it on. Proof of
+fire is `train/ladd_pix_crop_band_active` = 1.0, with
+`ladd_pix_crop_y0_min` >= the band floor (20 on the 60-row latent).
+
+## SIGN-OFF 2 — do NOT raise the capacity knobs yet, except one
+
+Ranked, with the D-side counterweight each one needs. The D's information per
+step goes as (images per disc forward) x (`gan_updates_per_step`): the healthy
+arm ran 4.88 x 5 = 24.4, the collapsed arm 9.76 x 5 = 48.8. **n = 2 arms, one
+of each, so the exchange rate is INCONCLUSIVE** — what is measured is that 2x
+at `gan_updates_per_step=5` collapsed and 1x did not.
+
+| change | images/fwd | latent cells/G-update | rank-0 peak | counterweight |
+|---|---|---|---|---|
+| **`ladd_pixel_lat_frames` 2 -> 3** | **4.88 (UNCHANGED)** | 8.2 % -> 12.3 % | 57.5 -> ~58.9 GB | **NONE NEEDED** |
+| `ladd_pixel_crops_per_row` 1 -> 2 | 9.76 (2x) | -> 23.1 % | ~63.2 GB (measured) | `gan_updates_per_step` 5 -> 2 |
+| `ladd_pixel_frames_per_crop` 2 -> 6 | 14.6 (3x) | unchanged | ~60.0 GB | `gan_updates_per_step` 5 -> 2 |
+
+`lat_frames=3` is the one I would ship now. It is the ONLY coverage increase
+that adds **no** samples to the discriminator — it changes which latent cells
+receive gradient, not how many pictures D scores — and it closes the measured
+hole where the oldest latent frame of every chunk is never adversarially
+supervised in any step, ever. Asserted as a test.
+
+`frames_per_crop` is the cheapest capacity in the system and nobody has used
+it: the VAE returns `4 x lat_frames` pixel frames and the disc keeps **2**, so
+at L=3 **ten of twelve decoded frames are thrown away** after the expensive
+half is already paid. Raising it costs the ViT batch only (~76 MB/image). But
+it still feeds D more pictures, so it is gated behind the balance question.
+
+## The tripwire that would have caught this at step 181, not step 200
+
+`train/gan_dwins_tripped` / `_max_streak` / `_trip_step`, plus a loud
+`[GAN-BALANCE]` warning. Fires when d_loss stays <= `gan_dwins_floor` (0.135)
+for `gan_dwins_k` (3) consecutive logged steps. k=3 because onlinelr's
+RECOVERED transient is 2 observations long, so 3 is the smallest k that
+separates the measured recovery from the measured collapse — both replayed
+verbatim as regression tests. Exactly-0.0 d_loss rows (the pre-disc-start
+sentinel) are rejected, not counted, or it would fire on every run at step 21.
+It defaults **ON**: it touches no tensor, optimiser or RNG, so training is
+byte-identical, and an alarm that ships off is the failure it exists to catch.
+
+## Three defects fixed unconditionally, because they are how false conclusions get made
+
+1. **`lat_frames` was silently clamped with no counter at all**
+   (`L = min(lat_frames, F_lat)`). The only evidence a raise took was the boot
+   echo, which prints the REQUEST. Now `ladd_pix_lat_frames_cfg` / `_used` /
+   `_avail` / `_clamped`, and the same for `frames_per_crop`, `crops_per_row`,
+   `crop_rows`, `crop_cols`.
+2. **`ladd_pixel_decode_batch` is INERT** — the trainer writes it into
+   `disc.pixel_cfg` and the boot echo prints it, but nothing reads it, so
+   lowering it is a silent no-op. Left inert (the surrogate path's key is a
+   different one, `pix_decode_batch`); the boot echo now says `(INERT)` and the
+   working knob is the new `ladd_pixel_decode_split`.
+3. **`gan_updates_per_step` had no counter either.**
+   `r3gan_disc_updates_total` counts D PHASES (170 on a 200-step arm), not the
+   five inner iterations — so the one lever sanctioned as the D-side
+   counterweight could not be proven to have taken. Now
+   `train/r3gan_disc_inner_updates_total` / `_last`.
+
+## What I would run, in order
+
+1. A **balance arm** at zero coverage change: `pixdirect_onlinelr` exactly,
+   `gan_updates_per_step` 5 -> 2, nothing else. It calibrates the counterweight
+   before any capacity is spent on it. Expect d_loss median 0.45-0.60,
+   `gan_dwins_tripped=0`, `r3gan_disc_inner_updates_total/`
+   `r3gan_disc_updates_total` = 2.0.
+2. `ladd_pixel_lat_frames=3` alone (no counterweight). Expect
+   `ladd_pix_lat_frames_used=3`, `ladd_pix_lat_frames_clamped=0`,
+   `ladd_pix_images/ladd_pix_disc_forwards` STILL 4.88, and d_loss in
+   onlinelr's band.
+3. Only then the coverage arms, each paired with the counterweight step 1
+   calibrated. **I have built no sbatch and submitted nothing.**
+
+---
+
+# SIGN-OFF NEEDED — should the GAN crop sampler be biased toward textured rows? (2026-08-26)
+
+**This is a recipe change, so it is not being made without your word.**
+
+Full context in `analysis/gan_tuning/PIXDIRECT_200_RESULTS.md` §3.3. Short
+version: the adversarial dose is spatially tiny, and a measurable fraction of
+it lands on nothing worth discriminating.
+
+**What was measured** on the completed `pixdirect_frozen` 200-step arms. The
+crop RNG is `manual_seed(step*7919 + 104729)` (`model/ladd_disc.py:1685-1710`),
+so the crop schedule is exactly reproducible and could be replayed and
+content-scored offline:
+
+| | n crops | crops containing NO road/verge at all |
+|---|---|---|
+| G-update crops (the ones that actually reach the generator) | 36 | **14 (38.9 %)** |
+| all D-update crops | 180 | **71 (39.4 %)** |
+
+Per-crop content coverage over the same draws:
+
+| class | mean | median |
+|---|---|---|
+| road / verge | 0.336 | 0.304 |
+| sky | 0.182 | **0.000** |
+
+**It is NOT the sky problem** — the median sky coverage is exactly zero, so
+`ONBOARDING_PIXDIRECT.md` §7's "don't measure texture on sky" hazard is not
+what is biting here. The defect is **texture-free draws**: crops that contain
+neither road nor verge nor sky in quantity, i.e. flat content with nothing for
+a texture discriminator to separate on.
+
+This compounds with the rest of the dose accounting: only **36 of 201**
+iterations (17.9 %) carry a live G-term at all, a `24x32` crop is 12.3 % of a
+60x104 latent frame at **one** location shared by all rows, and `lat_frames=2`
+of `num_frame_per_block=3` means the oldest latent frame of every chunk is
+never adversarially supervised — **8.2 % of the chunk's latent cells per
+G-update**. Losing ~39 % of those draws to texture-free content is a large
+fraction of a small budget.
+
+**Proposed fix (NOT implemented):** sample `y0` from the **lower 2/3** of the
+latent instead of uniformly over the full height. Minimal, one line, and it
+preserves the reproducible-seed property.
+
+**Why it needs your sign-off rather than just being done:**
+
+1. It changes what the discriminator is trained to call "real", which is a
+   training-recipe change, not a telemetry change.
+2. It biases the disc toward road/verge statistics specifically. If the goal
+   is dataset **style** broadly (your stated objective), a road-weighted disc
+   may shift style toward road texture rather than toward the dataset.
+3. It is not free of confound with the `pixdirect_gtclean` test already built
+   (`sbatch/pixdirect_gtclean.sbatch`, not submitted) — if both land at once,
+   neither is single-variable.
+
+**Options, in the order I would rank them:** (a) leave it, and treat the 39 %
+as part of the measured dose; (b) lower-2/3 `y0` as a flag-gated,
+default-off single-variable arm; (c) content-aware rejection sampling, which
+is more work and adds a per-step content pass.
+
+No arm has been built for any of these.
+
+---
+
+# SURROGATE ROUTE FIXED — two arms ready, NOT submitted (2026-08-26)
+
+`analysis/gan_tuning/PIXEL_FEATURE_SOURCE.md` §7c "RESOLVED" has the full
+measurement. Short version: the surrogate delivered zero gradient because
+**the latent critic got 14 gradient steps in a 90-step run**, not because
+of anything structural. The distillation runs only on generator
+iterations (`dfake_gen_update_ratio=5`) and only above
+`gan_disc_start_step=20`, so 90 steps → 14 calls → 7 teacher refreshes,
+which is exactly the `surrogate_n_teacher_refresh = 7` that run reported.
+Held-out gradient cosine vs critic steps (CPU, n=1 per point):
+
+| critic steps | 7 | 14 | 30 | 60 | 120 | 250 | 500 |
+|---|---|---|---|---|---|---|---|
+| realistic teacher | 0.380 | 0.572 | 0.676 | 0.758 | 0.803 | 0.826 | 0.841 |
+| worst-case teacher | 0.003 | −0.003 | −0.001 | 0.020 | 0.034 | 0.312 | 0.707 |
+
+Production's 0.0097 is simply what 14 steps looks like.
+
+**Fix (both default-off, byte-identical when off):**
+`surrogate_distill_substeps=12` — 12 critic steps per call, replaying the
+CACHED teacher targets, so `pix_teacher_refresh_every` and the expensive
+decode+DINO half are untouched. At `MAXSTEPS=200` that is 36 calls × 12 =
+432 critic steps. Plus `surrogate_critic_head_init_std=0.02`, which
+removes an exactly-zero trunk gradient at the shipped zero-init head —
+mechanism-motivated; its effect on the end metric is **within noise at
+n=1**, so it is honest to call it insurance, not a measured win.
+
+`gan_loss_weight` stays 1.0. `surrogate_critic_lr` stays 2.0e-4.
+`real_guidance_scale=0.0`. Nothing else in either arm changed.
+
+Tests: `testing/test_surrogate_gradient_field.py`, 8 passed. It fails on
+the pre-fix behaviour — verified by making the flag inert, which collapses
+the arm pair to `shipped=0.2567 fixed=0.2567`.
+
+## NEEDS YOUR SIGN-OFF — I have NOT run this
+
+`PIXW`: §7c said to calibrate it from `surrogate_grad_ratio_unweighted` on
+a `PIXW=0.0` probe. That reading was taken against a dead critic, so it is
+void and must be retaken. Proposed sequence, on a FREE holder only:
+
+```bash
+# STEP 1 — PIXW=0.0 calibration probe (does not apply the term)
+cat > logs/.holder_cmd_<FREE_HOLDER>.sh <<'EOF'
+#!/bin/bash
+cd /scratch/u6ex/as1748.u6ex/ARRWM
+export PIXW=0.0
+HOLDER=<FREE_HOLDER> SMOKE=pixdino_frozen PORTOFF=<unique> bash sbatch/run_smoke_on_holder.sh
+EOF
+chmod +x logs/.holder_cmd_<FREE_HOLDER>.sh
+```
+
+Read from `wandb/wandb/<run>/files/wandb-summary.json` (these are
+wandb-only keys, the log grep reports false FAILs):
+
+* `train/surrogate_substeps_achieved` — **must read ~12.0, not 1.0.** If
+  it reads 1.0 the flag did not fire and the run proves nothing.
+* `train/surrogate_check_cos_sim` — was 0.0097. Should be well clear of
+  0.3 by step ~150.
+* `train/surrogate_grad_norm_unweighted` — must be > 0. **If cos > 0.6 and
+  this is STILL exactly 0, there is a second, plumbing defect** — stop
+  there, do not read texture off that run.
+* then `train/surrogate_grad_ratio_unweighted` → `PIXW = 0.10 / r`.
+
+STEP 2 is the two real arms at that PIXW (`SMOKE=pixdino_frozen` and
+`SMOKE=pixdino_online`, separate holders, unique `PORTOFF` each).
+
+Questions for you: (a) do you want STEP 1 at all, or launch straight at a
+guessed PIXW to save a holder? (b) `surrogate_distill_substeps=12` is my
+pick from the table — happy to go 24 if you would rather over-train the
+critic, it is cheap. (c) keep `head_init_std=0.02` or set it 0.0 to keep
+the arm strictly single-variable against the shipped critic?
+
+# FIXING THE CARN — bare-minimum experiment set (2026-08-26)
+
+Source review: `analysis/gan_tuning/CARN_TRANSITION_REVIEW.md`. Everything below is
+config-only unless marked CODE.
+
+## What is actually broken (three defects, in order of severity)
+
+**D1 — the noiser is queried OUT OF DOMAIN.** With `forward_noiser_reverse=true` the net is
+trained as a **de-CARN denoiser**: `fn_inputs = drifted, fn_targets = cleaner`
+(`trainer:11045-11050`). But the branch our decoupled arms land in (`_chain_app`,
+`:14201-14203`) is documented as a **forward** FN and its level schedule is derived for an
+increment that *adds* drift. Design intent pairs `reverse=true` with `apply_gt_both`, NOT
+`apply_gt_former`. So we feed clean GT to a network that has only ever seen drifted input.
+**Every CARN arm in this campaign has this.** Fix: `forward_noiser_reverse=false` when using
+`apply_gt_former`.
+
+**D2 — realized strength is ~half of the coupled path.** Decoupled levels come from the
+*band* index (`_Lf = j+1`, `t = _Lf//2`, cap `j`); with 3 band chunks that yields
+`levels=[0,1,1]`, **max 1**, and one of three rows left clean. The coupled path drew from
+the *ride-absolute* pool position and sat AT the Req-1 cap: `levels=[0,0,1,2,1]`, max 2.
+The formulas are algebraically identical; the realized distributions are not.
+
+**D3 — `carn_recurse=false` is inert** in every decoupled arm. Unread by the decoupled
+block (it branches on `chain_levels`), and the training guard at `:10871` is false under
+`chain_levels=true`. We are training/applying the chained scheme, not a cumulative jumper.
+
+## The ablation we have been running is NOT deconfounded
+
+`carnpure` vs `gansig_gtvf_dmd` differ by more than the CARN:
+* **C1 (GAN-fatal): different discriminator initial weights.** `ForwardNoiser` (23.12M
+  params) is constructed at `dmd_action_forcing.py:2758`, BEFORE the LADD disc heads are
+  built. ~23M `kaiming_uniform_` draws land between the per-rank seed and the disc init.
+* **C2:** an entire extra no-grad rollout per ride setup (`_need_rollout2`, true iff
+  FN+`teacher_feat`+`chain_levels`), drawing CUDA RNG.
+* **C3:** per-step sliced-Wasserstein `randn` + `randperm` on the default CUDA generator.
+* **C4:** extra DDP module + 8-bit optimizer.
+
+**The correct control is `carnpure` with `forward_noiser_apply_gt_former=false`** — same
+module, same RNG, same rollout, differing ONLY in whether the transform is applied.
+`gansig_gtvf_dmd` is the wrong control and is retired from this comparison.
+
+**Also void:** `gansig_gtvf_carn_slide12` ≡ `carnpure`. Its only differing line,
+`forward_noiser_gt_match_frames=12`, is read only inside the `not carn_recurse and not
+chain_levels` branch — **inert** under `chain_levels=true`. The two "slide12" runs were
+**A/A replicates**; the difference observed between them was noise, not matching.
+
+## BARE MINIMUM experiment set (3 arms + control)
+
+| # | arm | change vs `carnpure` | answers | status |
+|---|---|---|---|---|
+| 1 | `gansig_carn_ctrl` | `apply_gt_former=false` | matched control (C1-C4 all held) | **RUNNING** 6135660 |
+| 2 | `carnpure` | — (as-is) | does applying do anything? | done, 191 steps |
+| 3 | `gansig_carn_fwd` | `forward_noiser_reverse=false` | **D1 direction fix** — without this, 1-vs-2 measures an OOD transform | **RUNNING** 6135661 |
+| 4 | `carn_strong` | `former_mode=strong` (+ #3) | D2 level-ceiling; run only if 1-vs-3 is null | not built |
+
+**Protocol, non-negotiable given the variance study:** ≥3 seeds per arm, **pin the nodelist
+so paired arms share nodes** (cheapest single variance fix), run past step 130, read medians
+past step 50, and report the bit-stable structural telemetry (`ride_chunk`, `reset`,
+`tf_pairs`, `r1_rate`, `hold_step`, `peak_gb`) as proof the arm ran what it claims.
+
+## Credibility bars (from the n=2 variance study)
+
+Identical configs on different nodes diverge at step 0 and amplify ×250 over 90 steps (no
+determinism enforcement, TF32 on, different NCCL reduction order). Noise floors:
+
+| metric | floor | usable at n=1? |
+|---|---|---|
+| `roll_mae` / `dmd_err` / `gt_dist` | 3.5–5.3% | only if Δ > 15% |
+| `gen_loss` / `d_loss` | 14–17% | only if Δ > 45% |
+| `gan_dmd_grad_ratio` | **50%** | **no** |
+| `r1` | **76%** | **no** |
+| `d_real` / `gan_cos` | **95–119%** | **no** |
+
+## CODE items (described, not implemented — need sign-off)
+
+1. **Direction guard**: mirror the existing `reverse`/`cycle_enabled` mutual exclusion
+   (`dmd_action_forcing.py:2737-2748`) to reject `reverse=true` + `apply_gt_former=true`.
+2. **Fail-fast on inert `carn_recurse`** under `chain_levels=true`.
+3. **Port site B's Req-2 gen-side shield** (`carn=True` on the D-update only) into the
+   decoupled path, which currently copies site C's naive both-sides placement.
 
 ---
 

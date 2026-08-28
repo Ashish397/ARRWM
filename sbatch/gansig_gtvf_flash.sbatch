@@ -134,7 +134,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 echo "[ARRWM-PROVENANCE] HEAD=$(git rev-parse HEAD) tree=$(git stash create 2>/dev/null || echo CLEAN) srcmd5=$(cat model/dmd_action_forcing.py model/anti_collapse.py model/ladd_disc.py pipeline/action_forcing_training.py trainer/causal_action_forcing_train.py | md5sum | cut -d' ' -f1)"
 git status --porcelain | head -20
 echo "GANSIG arm=$DARM ckpt=$ODE_CKPT steps=$MAXSTEPS nodes=$SLURM_NNODES $(date)"
-echo "[GANSIG-KNOBS] arm=gansig_gtvf_flash force_clean=true gtvf_only=true critic=frozen src=flash gan_loss_weight=1.0 gan_lr=2e-5 gan_updates_per_step=5 gan_warmup_steps=25 ladd_r1_gamma=10.0 ladd_r1_every_n_steps=1 ladd_r1_num_samples=3 ladd_fake_backbone_grad_scale=0.1 ladd_gt_transition_enabled=true ladd_gt_vs_fake_enabled=TRUE ladd_gt_vs_fake_all_pairs=false ladd_gt_vs_fake_wide_real=false ladd_adjacent_chunks_enabled=false ladd_fake_sample_source=DMD ladd_readout=ladd(default) ladd_disc_micro_batch_groups=8"
+echo "[GANSIG-KNOBS] arm=gansig_gtvf_flash force_clean=true gtvf_only=true critic=frozen src=flash gan_loss_weight=1.0 gan_lr=2e-5 gan_updates_per_step=5 gan_warmup_steps=25 ladd_r1_gamma=10.0 ladd_r1_every_n_steps=1 ladd_r1_num_samples=3 ladd_fake_backbone_grad_scale=0.1 ladd_gt_transition_enabled=false ladd_gt_vs_fake_enabled=TRUE ladd_gt_vs_fake_all_pairs=false ladd_gt_vs_fake_wide_real=false ladd_adjacent_chunks_enabled=false ladd_fake_sample_source=DMD ladd_readout=ladd(default) ladd_disc_micro_batch_groups=8"
 
 srun torchrun \
   --nnodes=$SLURM_NNODES \

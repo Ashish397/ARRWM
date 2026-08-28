@@ -431,10 +431,14 @@ def test_warning_silent_off_main_process():
 #    critic without the pixel gate, which IS in the chain already), but
 #    defense in depth should not depend on that invariant holding forever.
 # ---------------------------------------------------------------------------
+# ANCHOR MAINTENANCE, 2026-08-26. ``self._of_verify_disc_resume()`` was
+# inserted between ``super()._maybe_resume()`` and the ``if not (``,
+# which silently took this anchor's count to 0 and turned four tests RED
+# on a tree where the gate itself was fine. Anchor on the two lines that
+# actually bracket the condition, and tolerate statements in between.
 _RESUME_GATE_START = (
     "    def _maybe_resume(self) -> None:\n"
     "        super()._maybe_resume()\n"
-    "        if not (\n"
 )
 # ``_slice`` returns everything up to but NOT INCLUDING the start of the
 # END marker match -- so the marker must be the statement AFTER the
@@ -466,11 +470,25 @@ def _resume_gate_source():
     tests below re-indent it themselves when wrapping it in ``_f``)."""
     full = _slice(_af_source(), _RESUME_GATE_START, _RESUME_GATE_END)
     # ``_slice`` dedents; re-derive the condition-only text by dropping
-    # the two prefix lines the anchor needed for uniqueness.
+    # the prefix lines the anchor needed for uniqueness.
+    #
+    # 2026-08-26: this used to drop EXACTLY TWO lines (``def`` +
+    # ``super()``). ``self._of_verify_disc_resume()`` was then inserted
+    # between them and the ``if``, so line 2 became a method call the
+    # exec'd stub has no attribute for -- two RED tests reporting a
+    # method insertion, not a gate defect. Drop everything up to the
+    # ``if not (`` instead, which is what the caller actually wants and
+    # is stable under further insertions.
     lines = full.splitlines(keepends=True)
     assert lines[0].strip().startswith("def _maybe_resume")
     assert "super()._maybe_resume()" in lines[1]
-    return "".join(lines[2:])
+    for i, ln in enumerate(lines):
+        if ln.strip() == "if not (":
+            return "".join(lines[i:])
+    raise AssertionError(
+        "``if not (`` not found in the sliced _maybe_resume body; the "
+        "resume gate has changed shape and this helper needs revisiting."
+    )
 
 
 def test_resume_gate_contains_surrogate_flag():
@@ -603,7 +621,11 @@ class _PixStub:
             self.latent_critic_optimizer = None
             self.latent_texture_distiller = None
         self._pix_real_pool = [
-            {"lat": torch.randn(*CROP_SHAPE[1:]), "y0": 8 * i}
+            # Production _pix_pool_fill records both crop coordinates. The
+            # direct-field path now preserves the exact (y0, x0) per row;
+            # omitting x0 here made this stale fixture fail before exercising
+            # the scalar-potential origin assertion below.
+            {"lat": torch.randn(*CROP_SHAPE[1:]), "y0": 8 * i, "x0": 0}
             for i in range(3)
         ]
         self._select_fake_calls = []
@@ -763,6 +785,35 @@ def test_gterm_surrogate_only_mode_serves_the_term(caplog=None):
     w, raw, logs = fn(stub, {}, current_step=0)
     assert raw is not None, "surrogate-only mode produced no G-term"
     assert logs.get("train/surrogate_consumed") == 1.0
+
+
+def test_decoder_shaped_gterm_preserves_common_fake_selector_logs():
+    """The decoder branch must not erase the proof of which fake it used."""
+    src = _slice(_af_source(), _GLOSS_START, _GLOSS_END)
+    start = src.index(
+        'if bool(getattr(self, "decoder_shaped_pullback_enabled", False)):'
+    )
+    branch = src[start:src.index("# WP-SURROGATE", start)]
+    assert "logs.update(fake_logs)" not in branch  # happens before the branch
+    assert "logs.update(decoder_logs)" in branch
+    assert "return weighted, raw, logs" in branch
+
+
+def test_surrogate_probe_base_excludes_folded_pixel_term():
+    """Active telemetry must not compare the surrogate gradient to itself."""
+    src = _af_source()
+    start = src.index("        _pix_g_w = None")
+    end = src.index("        # Pixel-space perceptual losses", start)
+    block = src[start:end]
+    i_base = block.index(
+        "_pix_probe_base_loss = generator_loss + gen_gan_loss"
+    )
+    i_fold = block.index("gen_gan_loss = gen_gan_loss + _pix_g_w")
+    i_probe = block.index(
+        "self._pix_surrogate_grad_telemetry(\n"
+        "                    _pix_probe_base_loss, _pix_g_raw, out,"
+    )
+    assert i_base < i_fold < i_probe
 
 
 def test_gterm_missing_critic_raises_never_falls_back_to_direct():

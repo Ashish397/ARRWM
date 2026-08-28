@@ -276,6 +276,25 @@ def test_multi_block_call_attaches_every_block_EXCEPT_the_trailing_one():
     )
 
 
+def test_flash_buffer_publishes_the_same_partial_liveness_mask():
+    pipe, gen = _build()
+    _run(pipe, frames=9, flash=True)
+    buf = pipe._flash_dmd_gan_output
+    mask = pipe._flash_dmd_gan_grad_mask
+    assert buf is not None and buf.requires_grad
+    assert mask.tolist() == [True] * 6 + [False] * 3
+
+    def _live(sl):
+        g = torch.autograd.grad(
+            buf[:, sl].sum(), gen.w,
+            allow_unused=True, retain_graph=True,
+        )[0]
+        return g is not None and bool(torch.count_nonzero(g) > 0)
+
+    assert _live(slice(0, 6))
+    assert not _live(slice(6, 9))
+
+
 def test_telemetry_counts_attached_blocks_excluding_trailing_block():
     """``pix_finish_grad_blocks`` counts blocks that actually attached
     a grad rung, which on a multi-block call is n_blocks - 1."""

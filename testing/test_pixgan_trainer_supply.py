@@ -849,6 +849,31 @@ def test_default_fake_source_is_the_flash_tensor():
     assert torch.equal(z, info["flash_dmd_gan_x0"][:, -2:])
 
 
+def test_corrected_flash_source_selects_latest_contiguous_live_frames():
+    t = StubTrainer(pix_flash_grad_select_enabled=True)
+    info = _info_flash(n_lat=9)
+    # Three 3-frame groups: the producer deliberately detached the newest
+    # group, while CopySlices keeps the whole slab's requires_grad true.
+    info["flash_dmd_gan_grad_mask"] = torch.tensor(
+        [True] * 6 + [False] * 3,
+    )
+    z, logs = t._pix_select_fake_latents(info)
+    assert torch.equal(z, info["flash_dmd_gan_x0"][:, 4:6])
+    assert logs["train/pix_flash_grad_frames"] == 6.0
+    assert logs["train/pix_flash_grad_frames_total"] == 9.0
+    assert logs["train/pix_flash_grad_select_active"] == 1.0
+
+
+def test_corrected_flash_source_refuses_missing_or_dead_mask():
+    t = StubTrainer(pix_flash_grad_select_enabled=True)
+    info = _info_flash(n_lat=9)
+    with pytest.raises(RuntimeError, match="flash_dmd_gan_grad_mask.*absent"):
+        t._pix_select_fake_latents(info)
+    info["flash_dmd_gan_grad_mask"] = torch.zeros(9, dtype=torch.bool)
+    with pytest.raises(RuntimeError, match="ALL-FALSE"):
+        t._pix_select_fake_latents(info)
+
+
 def test_ladder_fake_selects_only_mask_valid_frames():
     t = StubTrainer(pix_finish_grad_enabled=True)
     info = _info_ladder(n_lat=7, mask=[True] * 6 + [False])

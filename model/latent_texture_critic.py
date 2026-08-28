@@ -294,6 +294,11 @@ class LatentTextureCritic(nn.Module):
         frame_pool: ``mean | max | topk_mean`` — retained from the
             ancestor for :meth:`pool` symmetry with the disc contract.
         frame_pool_topk: only consulted when ``frame_pool='topk_mean'``.
+        head_init_std: std of the readout init. ``0.0`` (default) is the
+            shipped zero-init, byte for byte. Any value > 0 breaks the
+            Sobolev saddle described at the init site: at a zero head the
+            input gradient AND the trunk's gradient from the
+            gradient-matching term are both EXACTLY zero.
     """
 
     def __init__(
@@ -310,6 +315,7 @@ class LatentTextureCritic(nn.Module):
         max_token_w: int = 32,
         frame_pool: str = "mean",
         frame_pool_topk: int = 4,
+        head_init_std: float = 0.0,
     ) -> None:
         super().__init__()
         if frame_pool not in ("mean", "max", "topk_mean"):
@@ -383,7 +389,45 @@ class LatentTextureCritic(nn.Module):
         # value field (matches the disc convention; the two-stage warmup
         # plus value distillation train it up from zero, and a zero field
         # means a zero generator gradient if anything mis-fires early).
-        nn.init.zeros_(self.head.weight)
+        #
+        # ZERO-INIT IS A SADDLE FOR THE TRUNK UNDER THE SOBOLEV TERM.
+        # ``value(z) = w . h(z) + b`` with ``h`` the mean-pooled token
+        # feature, so the input gradient the generator consumes,
+        # ``cg = d(value)/dz = J_h(z)^T w``, is EXACTLY LINEAR in ``w``.
+        # At ``w = 0`` therefore ``cg == 0``, and ``dL_grad/d(trunk)``,
+        # which carries a factor ``dcg/d(trunk) ~ w``, is EXACTLY zero --
+        # measured 0.000e+00 on CPU, rising linearly with |w| (2.36e-2 at
+        # head std 1e-4, 2.36e-1 at 1e-3, 2.30 at 1e-2). The trunk is the
+        # only part of the critic that can rotate its Jacobian toward the
+        # teacher's field, and with a fixed trunk the reachable gradient
+        # subspace is only ``d_model``-dimensional: the closed-form
+        # least-squares ceiling measures cos = 0.140, against the
+        # random-subspace value sqrt(d_model/n_z) = 0.144. So a zero head
+        # does not merely start small, it withholds the Sobolev signal
+        # from the only parameters that can beat that ceiling.
+        #
+        # ``head_init_std > 0`` breaks the saddle. Default 0.0 reproduces
+        # the shipped zero-init byte for byte. NOTE the one place in this
+        # repo where the Sobolev term is PROVEN to work --
+        # ``testing/test_latent_texture_critic.py::_fit`` -- silently does
+        # ``nn.init.normal_(critic.head.weight, std=0.02)`` right after
+        # construction, i.e. the passing test has never exercised the
+        # shipped initialisation.
+        self.head_init_std = float(head_init_std)
+        if self.head_init_std > 0.0:
+            # a/b are ABSOLUTE bounds in torch's trunc_normal_, not
+            # multiples of std, so they are passed explicitly. Without
+            # them the default (-2, 2) never truncates at these scales and
+            # a tail outlier in the head weight scales straight through to
+            # the generator's gradient.
+            nn.init.trunc_normal_(
+                self.head.weight, std=self.head_init_std,
+                a=-2.0 * self.head_init_std, b=2.0 * self.head_init_std,
+            )
+            self.head_init_applied = True
+        else:
+            nn.init.zeros_(self.head.weight)
+            self.head_init_applied = False
         nn.init.zeros_(self.head.bias)
 
     @property
@@ -542,17 +586,26 @@ class TeacherTargets:
         value: ``[N]`` per-sample mean patch logit.
         grad: ``[N, F, C, h, w]`` teacher gradient, or ``None`` in
             value-only mode.
-        origin: ``(y0, x0)`` latent-space crop origin, or ``None``.
+        origin: one ``(y0, x0)`` latent-space crop origin shared by the
+            batch, a tuple of one origin per batch row, or ``None``.  The
+            per-row form is used by the direct-gradient student so crops at
+            different positions are not silently labelled with their mean
+            origin.
         step: training step the teacher was run at (for the age metric).
         tag: ``"real"`` / ``"fake"``, for logging only.
+        condition: optional detached tensor paired with ``z`` for a
+            conditioned direct-gradient student. It is cached/replayed with
+            the target so a rendered guide is never mismatched to a different
+            latent.
     """
 
     z: torch.Tensor
     value: torch.Tensor
     grad: Optional[torch.Tensor]
-    origin: Optional[Tuple[int, int]]
+    origin: Any
     step: int
     tag: str = ""
+    condition: Optional[torch.Tensor] = None
 
     def to(self, device: torch.device) -> "TeacherTargets":
         return TeacherTargets(
@@ -562,6 +615,10 @@ class TeacherTargets:
             origin=self.origin,
             step=self.step,
             tag=self.tag,
+            condition=(
+                None if self.condition is None
+                else self.condition.to(device, non_blocking=True)
+            ),
         )
 
 
@@ -700,11 +757,27 @@ def compute_teacher_targets(
         )[0].detach()
     else:
         grad = None
+    if origin is None:
+        stored_origin = None
+    elif (
+        len(origin) == 2
+        and not isinstance(origin[0], (list, tuple, torch.Tensor))
+    ):
+        stored_origin = (int(origin[0]), int(origin[1]))
+    else:
+        if len(origin) != int(z_in.shape[0]):
+            raise ValueError(
+                "per-sample latent origins must match the target batch: "
+                f"got {len(origin)} origins for batch {int(z_in.shape[0])}"
+            )
+        stored_origin = tuple(
+            (int(item[0]), int(item[1])) for item in origin
+        )
     return TeacherTargets(
         z=z_in.detach(),
         value=value.detach().float(),
         grad=grad,
-        origin=None if origin is None else (int(origin[0]), int(origin[1])),
+        origin=stored_origin,
         step=int(current_step),
         tag=tag,
     )
@@ -783,6 +856,7 @@ class LatentSurrogateDistiller:
         max_grad_norm: Optional[float] = None,
         teacher_use_checkpoint: bool = False,
         sync_grads: bool = True,
+        distill_substeps: int = 1,
     ) -> None:
         self.critic = critic
         self.value_loss_weight = float(value_loss_weight)
@@ -794,6 +868,10 @@ class LatentSurrogateDistiller:
         self.max_grad_norm = max_grad_norm
         self.teacher_use_checkpoint = bool(teacher_use_checkpoint)
         self.sync_grads = bool(sync_grads)
+        # Critic gradient steps per call to :meth:`step`. 1 = shipped.
+        # See the SUB-STEPS block in :meth:`step` for the cadence
+        # arithmetic that makes this the load-bearing knob.
+        self.distill_substeps = max(1, int(distill_substeps))
         self.cache = TeacherTargetCache(
             capacity=cache_capacity, store_on_cpu=cache_on_cpu,
         )
@@ -802,6 +880,12 @@ class LatentSurrogateDistiller:
         self.n_teacher_refresh = 0
         self.n_replay = 0
         self.n_grad_check = 0
+        # PROOF-OF-FIRE for ``distill_substeps``. Monotone count of critic
+        # gradient steps actually taken. At the default it equals
+        # ``n_teacher_refresh + n_replay``; above it, the flag fired. This
+        # is the counter to read -- never the config echo, and never the
+        # patch (21 arms once trained a noiser that never touched data).
+        self.n_distill_substeps = 0
 
     # -- cadence ----------------------------------------------------------
     def should_refresh(self, current_step: int) -> bool:
@@ -907,101 +991,157 @@ class LatentSurrogateDistiller:
         # ``create_graph=True`` on the input-grad is what makes
         # ``L_grad.backward()`` a genuine second-order backward through
         # the critic — the reason the attention is hand-rolled.
-        crit_vals: List[torch.Tensor] = []
-        teach_vals: List[torch.Tensor] = []
-        crit_grads: List[torch.Tensor] = []
-        teach_grads: List[torch.Tensor] = []
-        dense_terms: List[torch.Tensor] = []
-        for tgt in pairs:
-            z_in = tgt.z.detach().clone().requires_grad_(want_grad)
-            dense = self.critic(z_in, latent_origin=tgt.origin)
-            val = dense.flatten(1).mean(dim=1)
-            crit_vals.append(val)
-            teach_vals.append(tgt.value.to(val.dtype))
-            if want_grad and tgt.grad is not None:
-                g = torch.autograd.grad(
-                    val.sum(), z_in, create_graph=True, retain_graph=True,
-                )[0]
-                crit_grads.append(g)
-                teach_grads.append(tgt.grad.to(g.dtype))
-            if self.dense_value_weight > 0 and teacher_patch_fn is not None:
-                dense_terms.append(
-                    self._dense_value_term(dense, tgt, teacher_patch_fn)
-                )
+        # --- SUB-STEPS (surrogate_distill_substeps) ---------------------
+        # THE CADENCE DEFECT, measured. This method is called from
+        # ``_streaming_train_one_chunk``, which runs only on GENERATOR
+        # iterations (``self.step % dfake_gen_update_ratio == 0``, and
+        # ``dfake_gen_update_ratio=5`` on every phase-3 arm), and the
+        # trainer skips it below ``gan_disc_start_step``. A 90-step run
+        # therefore calls it on steps 20,25,...,85 -- 14 calls -- of which
+        # ``should_refresh`` (step % 2) fires on 7. That is EXACTLY the
+        # ``surrogate_n_teacher_refresh = 7`` the live 90-step probe
+        # reported, and it means the critic got FOURTEEN gradient steps in
+        # the whole run. At MAXSTEPS=200 it gets 36.
+        #
+        # Measured on CPU against the realistic local-conv teacher, the
+        # held-out gradient cosine needs O(100) critic steps to rise: it is
+        # ~0.01 at 14 steps -- which is production's 0.0097 -- and ~0.8 by
+        # 120. So the surrogate was never broken so much as never trained.
+        #
+        # ``n`` sub-steps replay the SAME cached teacher targets, so the
+        # teacher (a graph-on decode + DINO forward + input-gradient, the
+        # only expensive part) still fires exactly on the
+        # ``pix_teacher_refresh_every`` cadence and the arm's teacher cost
+        # is unchanged. Sub-steps after the first re-draw from the cache
+        # rather than re-using one batch, which is the anti-forgetting
+        # measure ``TeacherTargetCache.sample`` already exists for.
+        #
+        # Default 1 == the shipped behaviour, byte for byte: the loop body
+        # runs exactly once, the re-draw branch is unreachable, and no
+        # extra RNG value is consumed.
+        #
+        # DDP / RNG note, because this repo has been bitten by rank-
+        # asymmetric RNG before. The re-draw calls ``cache.sample``, which
+        # draws from the GLOBAL torch RNG -- but so does the existing
+        # replay path, so this is not a new class of consumption. What
+        # matters is that the number of draws is RANK-SYMMETRIC, and it
+        # is: ``n_sub`` is a config constant, ``should_refresh`` is a pure
+        # function of ``current_step``, and every rank pushes to its cache
+        # on the same steps, so ``len(bucket)`` -- and hence whether
+        # ``sample`` short-circuits without drawing -- matches across
+        # ranks. The tensors drawn differ per rank, which is the intended
+        # data parallelism (see ``TeacherTargetCache.sample``); the RNG
+        # STREAM POSITION does not diverge.
+        _sub_device = pairs[0].z.device
+        n_sub = self.distill_substeps
+        for _sub in range(n_sub):
+            if _sub > 0:
+                redrawn: List[TeacherTargets] = []
+                for tag in ("real", "fake"):
+                    tgt = self.cache.sample(tag)
+                    if tgt is not None:
+                        redrawn.append(tgt)
+                if not redrawn:
+                    break
+                pairs = redrawn
+                if self.cache.store_on_cpu:
+                    pairs = [p.to(_sub_device) for p in pairs]
+            self.n_distill_substeps += 1
+            crit_vals: List[torch.Tensor] = []
+            teach_vals: List[torch.Tensor] = []
+            crit_grads: List[torch.Tensor] = []
+            teach_grads: List[torch.Tensor] = []
+            dense_terms: List[torch.Tensor] = []
+            for tgt in pairs:
+                z_in = tgt.z.detach().clone().requires_grad_(want_grad)
+                dense = self.critic(z_in, latent_origin=tgt.origin)
+                val = dense.flatten(1).mean(dim=1)
+                crit_vals.append(val)
+                teach_vals.append(tgt.value.to(val.dtype))
+                if want_grad and tgt.grad is not None:
+                    g = torch.autograd.grad(
+                        val.sum(), z_in, create_graph=True, retain_graph=True,
+                    )[0]
+                    crit_grads.append(g)
+                    teach_grads.append(tgt.grad.to(g.dtype))
+                if self.dense_value_weight > 0 and teacher_patch_fn is not None:
+                    dense_terms.append(
+                        self._dense_value_term(dense, tgt, teacher_patch_fn)
+                    )
 
-        critic_val = torch.cat(crit_vals, dim=0)
-        teacher_val = torch.cat(teach_vals, dim=0)
-        L_value = ((critic_val - teacher_val.detach()) ** 2).mean()
-        if crit_grads:
-            terms = []
-            n_degenerate = 0
-            for cg, tg in zip(crit_grads, teach_grads):
-                tg = tg.detach()
-                # DEGENERATE-TARGET GUARD. An all-(or near-)zero teacher
-                # gradient is a real regime, not a hypothetical: every
-                # pretrained-backbone teacher in this campaign ships a
-                # ZERO-INIT final linear head, so d(logit)/d(input) is
-                # EXACTLY 0 until that head takes its first D-step
-                # (measured: `input-grad norm=0` in the dinov2/convnext/
-                # sam2 preflights). Under normalization that would divide
-                # by the 1e-12 floor and hand the critic a ~1e12 loss --
-                # not "numerically loud" as the docstring once put it, but
-                # an instant NaN. The live ordering (teacher D-update
-                # BEFORE distillation) prevents it today; this guard means
-                # a future reordering degrades to "term skipped, counted"
-                # instead of "run dies at step 0".
-                if tg.pow(2).mean() <= 1e-10:
-                    n_degenerate += 1
-                    continue
-                num = ((cg - tg) ** 2).mean()
-                if self.grad_loss_normalize:
-                    # Relative gradient error: "what fraction of the
-                    # teacher's gradient POWER are we failing to
-                    # reproduce". 1.0 when the critic's field is zero,
-                    # 0.0 on an exact match. See the note on
-                    # ``grad_loss_normalize`` in the constructor for why
-                    # the unnormalized form cannot be weighted sanely.
-                    num = num / (tg.pow(2).mean() + 1e-12)
-                terms.append(num)
-            # Regime flag, never a forgeable zero: if EVERY pair was
-            # degenerate there is no Sobolev signal this step, and the
-            # loss key is omitted below rather than reported as 0.0 (which
-            # reads as "perfect gradient match").
-            logs["train/surrogate_grad_degenerate_pairs"] = float(n_degenerate)
-            if terms:
-                L_grad = torch.stack(terms).mean()
+            critic_val = torch.cat(crit_vals, dim=0)
+            teacher_val = torch.cat(teach_vals, dim=0)
+            L_value = ((critic_val - teacher_val.detach()) ** 2).mean()
+            if crit_grads:
+                terms = []
+                n_degenerate = 0
+                for cg, tg in zip(crit_grads, teach_grads):
+                    tg = tg.detach()
+                    # DEGENERATE-TARGET GUARD. An all-(or near-)zero teacher
+                    # gradient is a real regime, not a hypothetical: every
+                    # pretrained-backbone teacher in this campaign ships a
+                    # ZERO-INIT final linear head, so d(logit)/d(input) is
+                    # EXACTLY 0 until that head takes its first D-step
+                    # (measured: `input-grad norm=0` in the dinov2/convnext/
+                    # sam2 preflights). Under normalization that would divide
+                    # by the 1e-12 floor and hand the critic a ~1e12 loss --
+                    # not "numerically loud" as the docstring once put it, but
+                    # an instant NaN. The live ordering (teacher D-update
+                    # BEFORE distillation) prevents it today; this guard means
+                    # a future reordering degrades to "term skipped, counted"
+                    # instead of "run dies at step 0".
+                    if tg.pow(2).mean() <= 1e-10:
+                        n_degenerate += 1
+                        continue
+                    num = ((cg - tg) ** 2).mean()
+                    if self.grad_loss_normalize:
+                        # Relative gradient error: "what fraction of the
+                        # teacher's gradient POWER are we failing to
+                        # reproduce". 1.0 when the critic's field is zero,
+                        # 0.0 on an exact match. See the note on
+                        # ``grad_loss_normalize`` in the constructor for why
+                        # the unnormalized form cannot be weighted sanely.
+                        num = num / (tg.pow(2).mean() + 1e-12)
+                    terms.append(num)
+                # Regime flag, never a forgeable zero: if EVERY pair was
+                # degenerate there is no Sobolev signal this step, and the
+                # loss key is omitted below rather than reported as 0.0 (which
+                # reads as "perfect gradient match").
+                logs["train/surrogate_grad_degenerate_pairs"] = float(n_degenerate)
+                if terms:
+                    L_grad = torch.stack(terms).mean()
+                else:
+                    L_grad = None
             else:
-                L_grad = None
-        else:
-            L_grad = torch.zeros((), device=critic_val.device)
-        if dense_terms:
-            L_dense = torch.stack(dense_terms).mean()
-        else:
-            L_dense = torch.zeros((), device=critic_val.device)
-        L_critic = (
-            self.value_loss_weight * L_value
-            + self.dense_value_weight * L_dense
-        )
-        if L_grad is not None:
-            L_critic = L_critic + self.grad_loss_weight * L_grad
+                L_grad = torch.zeros((), device=critic_val.device)
+            if dense_terms:
+                L_dense = torch.stack(dense_terms).mean()
+            else:
+                L_dense = torch.zeros((), device=critic_val.device)
+            L_critic = (
+                self.value_loss_weight * L_value
+                + self.dense_value_weight * L_dense
+            )
+            if L_grad is not None:
+                L_critic = L_critic + self.grad_loss_weight * L_grad
 
-        # --- Optimizer -------------------------------------------------
-        grad_norm = 0.0
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-            L_critic.backward()
-            if self.sync_grads:
-                self._all_reduce_grads()
-            params = [p for p in self.critic.parameters() if p.grad is not None]
-            if self.max_grad_norm is not None and self.max_grad_norm > 0:
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(
-                    params, self.max_grad_norm,
-                ))
-            elif params:
-                grad_norm = float(torch.nn.utils.get_total_norm(
-                    [p.grad for p in params]
-                ))
-            optimizer.step()
+            # --- Optimizer -------------------------------------------------
+            grad_norm = 0.0
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+                L_critic.backward()
+                if self.sync_grads:
+                    self._all_reduce_grads()
+                params = [p for p in self.critic.parameters() if p.grad is not None]
+                if self.max_grad_norm is not None and self.max_grad_norm > 0:
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                        params, self.max_grad_norm,
+                    ))
+                elif params:
+                    grad_norm = float(torch.nn.utils.get_total_norm(
+                        [p.grad for p in params]
+                    ))
+                optimizer.step()
 
         # --- Diagnostics (kept verbatim from the ancestor) --------------
         with torch.no_grad():
@@ -1046,6 +1186,19 @@ class LatentSurrogateDistiller:
             logs["train/critic_grad_cos_sim"] = critic_grad_cos_sim
             logs["train/surrogate_grad_mag_ratio"] = grad_mag_ratio
         logs["train/surrogate_critic_grad_norm"] = grad_norm
+        # Sub-step proof-of-fire. ``surrogate_n_distill_substeps`` is the
+        # count that matters: divided by (n_teacher_refresh + n_replay) it
+        # is the ACHIEVED sub-step factor, which is what distinguishes "the
+        # flag is in the config" from "the critic took the extra steps".
+        # At the default both keys read 1.0 and their ratio is 1.0.
+        logs["train/surrogate_distill_substeps"] = float(self.distill_substeps)
+        logs["train/surrogate_n_distill_substeps"] = float(
+            self.n_distill_substeps
+        )
+        _calls = self.n_teacher_refresh + self.n_replay
+        logs["train/surrogate_substeps_achieved"] = (
+            float(self.n_distill_substeps) / float(_calls) if _calls else 0.0
+        )
         return logs
 
     def _dense_value_term(
@@ -1159,6 +1312,7 @@ def generator_surrogate_loss(
     *,
     latent_origin: Optional[Sequence[int]] = None,
     weight: float = 1.0,
+    pixel_condition: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """``weight * (-critic(z).mean())``, with the critic's parameters
     frozen for the duration of the forward.
@@ -1179,6 +1333,25 @@ def generator_surrogate_loss(
     gradient we want flows through ``z_fake_grad`` into the generator's
     own DDP backward.
     """
+    # The direct synthetic-gradient student predicts the vector field rather
+    # than differentiating a scalar potential.  Keep this dispatch here so
+    # the trainer has one consumption seam and the historical potential mode
+    # remains byte-identical when selected (the default).
+    if bool(getattr(critic, "predicts_gradient", False)):
+        from model.latent_gradient_surrogate import (
+            generator_direct_gradient_loss,
+        )
+        return generator_direct_gradient_loss(
+            critic, z_fake_grad,
+            latent_origin=latent_origin,
+            weight=weight,
+            pixel_condition=pixel_condition,
+        )
+    if pixel_condition is not None:
+        raise ValueError(
+            "pixel_condition is supported only by the direct-gradient "
+            "surrogate"
+        )
     critic.requires_grad_(False)
     try:
         dense = critic(z_fake_grad, latent_origin=latent_origin)
@@ -1371,12 +1544,97 @@ def build_from_config(
     """
     if not bool(getattr(cfg, "surrogate_critic_enabled", False)):
         return None, None, None
+    gradient_mode = str(
+        getattr(cfg, "surrogate_gradient_mode", "potential")
+    ).strip().lower()
+    if gradient_mode not in ("potential", "direct"):
+        raise ValueError(
+            "surrogate_gradient_mode must be 'potential' or 'direct'; "
+            f"got {gradient_mode!r}"
+        )
+    pixel_condition_enabled = bool(getattr(
+        cfg, "surrogate_pixel_condition_enabled", False,
+    ))
+    if pixel_condition_enabled and gradient_mode != "direct":
+        raise ValueError(
+            "surrogate_pixel_condition_enabled requires "
+            "surrogate_gradient_mode='direct'"
+        )
+    if gradient_mode == "direct":
+        from model.latent_gradient_surrogate import (
+            DirectGradientDistiller,
+            LatentGradientPredictor,
+        )
+
+        critic = LatentGradientPredictor(
+            in_channels=16,
+            width=int(getattr(cfg, "surrogate_direct_width", 96)),
+            num_blocks=int(getattr(cfg, "surrogate_direct_num_blocks", 6)),
+            head_init_std=float(
+                getattr(cfg, "surrogate_direct_head_init_std", 1.0e-3)
+            ),
+            teacher_rms_beta=float(
+                getattr(cfg, "surrogate_direct_teacher_rms_beta", 0.95)
+            ),
+            pixel_condition_channels=(6 if pixel_condition_enabled else 0),
+            temporal_mixing=bool(getattr(
+                cfg, "surrogate_direct_temporal_mixing", False,
+            )),
+            temporal_blocks=int(getattr(
+                cfg, "surrogate_direct_temporal_blocks", 2,
+            )),
+            global_context=bool(getattr(
+                cfg, "surrogate_direct_global_context", False,
+            )),
+        )
+        if device is not None:
+            critic = critic.to(device=device, dtype=dtype)
+        optimizer = torch.optim.Adam(
+            critic.parameters(),
+            lr=float(getattr(cfg, "surrogate_critic_lr", 2e-4)),
+            betas=(0.0, 0.9),
+        )
+        distiller = DirectGradientDistiller(
+            critic,
+            pix_teacher_refresh_every=int(
+                getattr(cfg, "pix_teacher_refresh_every", 4)
+            ),
+            cache_capacity=int(getattr(cfg, "surrogate_cache_capacity", 8)),
+            grad_check_every=int(
+                getattr(cfg, "surrogate_grad_check_every", 100)
+            ),
+            teacher_use_checkpoint=bool(
+                getattr(cfg, "surrogate_teacher_use_checkpoint", True)
+            ),
+            distill_substeps=int(
+                getattr(cfg, "surrogate_distill_substeps", 1)
+            ),
+            teacher_target_microbatch=int(
+                getattr(cfg, "surrogate_teacher_target_microbatch", 0)
+            ),
+            loss_mode=str(getattr(
+                cfg, "surrogate_direct_loss_mode", "mse",
+            )),
+            real_loss_weight=float(getattr(
+                cfg, "surrogate_direct_real_loss_weight", 1.0,
+            )),
+            fake_loss_weight=float(getattr(
+                cfg, "surrogate_direct_fake_loss_weight", 1.0,
+            )),
+        )
+        return critic, optimizer, distiller
     critic = LatentTextureCritic(
         in_channels=16,
         d_model=int(getattr(cfg, "surrogate_critic_d_model", 512)),
         num_blocks=int(getattr(cfg, "surrogate_critic_num_blocks", 4)),
         num_heads=int(getattr(cfg, "surrogate_critic_num_heads", 8)),
         max_frames=int(getattr(cfg, "surrogate_critic_max_frames", 64)),
+        # 0.0 = the shipped zero-init, byte for byte. > 0 breaks the
+        # trunk's Sobolev saddle (measured |dL_grad/d(trunk)| = 0.000e+00
+        # at exactly zero). See the note at the head init above.
+        head_init_std=float(
+            getattr(cfg, "surrogate_critic_head_init_std", 0.0)
+        ),
     )
     if device is not None:
         critic = critic.to(device=device, dtype=dtype)
@@ -1405,6 +1663,14 @@ def build_from_config(
         ),
         teacher_use_checkpoint=bool(
             getattr(cfg, "surrogate_teacher_use_checkpoint", True)
+        ),
+        # Critic gradient steps per distillation call. 1 = shipped. The
+        # trainer calls the distillation only on generator iterations
+        # (dfake_gen_update_ratio=5) and only above gan_disc_start_step,
+        # so at the default a 200-step arm gives the critic 36 gradient
+        # steps against the O(100) the CPU measurement says it needs.
+        distill_substeps=int(
+            getattr(cfg, "surrogate_distill_substeps", 1)
         ),
     )
     return critic, optimizer, distiller

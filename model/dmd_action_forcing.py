@@ -2208,6 +2208,16 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_carn_former = bool(
             getattr(args, "ladd_gt_transition_carn_former", False)
         )
+        # Equivalent negative-direction transition construction using a
+        # directly-trained reverse FN: keep the real former clean and apply
+        # one learned R2->R1 (-drift) step to the real latter.  This is kept
+        # separate from ``_carn_former`` so the two sign constructions can be
+        # compared independently. They may also be stacked deliberately when
+        # cycle mode supplies distinct forward (+drift) and reverse (-drift)
+        # networks; the trainer fails loudly if both signs resolve to one net.
+        self.ladd_gt_transition_carn_latter_reverse = bool(
+            getattr(args, "ladd_gt_transition_carn_latter_reverse", False)
+        )
         self.ladd_gt_transition_carn_steps = int(
             getattr(args, "ladd_gt_transition_carn_steps", 1)
         )
@@ -2314,6 +2324,36 @@ class ActionForcingDMD(SelfForcingModel):
         self.forward_noiser_reverse = bool(
             getattr(args, "forward_noiser_reverse", False)
         )
+        # Which rollout-1 tensor supplies teacher-feature FN pairs. ``flash``
+        # preserves the historical t=flash_dmd_gan_t source; ``rollout`` uses
+        # the raw generator output handed to the trainer; ``ladder_endpoint``
+        # uses the detached, fully-denoised x0 that inference emits and the KV
+        # cache commits. A reverse FN must be trained in its consumer domain.
+        self.forward_noiser_train_source = str(
+            getattr(args, "forward_noiser_train_source", "flash")
+        ).lower()
+        if self.forward_noiser_train_source not in (
+            "flash", "rollout", "ladder_endpoint",
+        ):
+            raise ValueError(
+                "forward_noiser_train_source must be 'flash', 'rollout', "
+                "or 'ladder_endpoint'; "
+                f"got {self.forward_noiser_train_source!r}."
+            )
+        # Rollout-2 target surface for R1<->R2 CARN pairs. ``legacy`` keeps
+        # the historical flash-if-present / random-exit fallback exactly.
+        # The explicit ladder endpoint is the no-Flash t=0-x0 campaign route.
+        self.forward_noiser_rollout2_source = str(getattr(
+            args, "forward_noiser_rollout2_source", "legacy",
+        )).lower()
+        if self.forward_noiser_rollout2_source not in (
+            "legacy", "flash", "rollout", "ladder_endpoint",
+        ):
+            raise ValueError(
+                "forward_noiser_rollout2_source must be 'legacy', 'flash', "
+                "'rollout', or 'ladder_endpoint'; got "
+                f"{self.forward_noiser_rollout2_source!r}."
+            )
         # ``forward_noiser_apply_gt_both`` (h1): apply the FN ONCE to BOTH
         # GT latents (former + latter) of each matched real transition pair
         # (texture-only, moment-preserving). With forward_noiser_reverse it
@@ -2366,6 +2406,24 @@ class ActionForcingDMD(SelfForcingModel):
         # with the realized per-row levels so a run can PROVE it fired.
         self.forward_noiser_apply_decoupled = bool(
             getattr(args, "forward_noiser_apply_decoupled", False)
+        )
+        # ``forward_noiser_allow_gt_vs_fake`` (2026-08-26, default False):
+        # escape hatch for the researcher's ruling that the ``gt_vs_fake``
+        # disc's real/positive rows are clean GT, always. Default False =>
+        # the trainer does not CALL the forward noiser on those rows at
+        # either apply site; the noiser itself is unchanged, and
+        # ``gt_transition`` is unaffected. Set True only for a deliberate
+        # ablation that wants the pre-2026-08-26 behaviour back.
+        # Proof keys, AS EMITTED: train/fn_gtvf_noise_skipped_gt (must
+        # rise), train/fn_gtvf_noise_applied_gt (must stay 0.0).
+        # The ``_gt`` suffix is NOT optional and NOT a typo:
+        # ``_compute_ladd_losses`` suffixes every per-mode key with the
+        # pair mode (trainer:11986, _gt / _gtxn / _adj), so the bare
+        # name NEVER appears in wandb. Grepping the bare name returns
+        # ABSENT -- the 'absent key reads as zero' hazard this counter
+        # exists to prevent. Same convention as r3gan_d_loss_gt.
+        self.forward_noiser_allow_gt_vs_fake = bool(
+            getattr(args, "forward_noiser_allow_gt_vs_fake", False)
         )
         # ``forward_noiser_apply_gt_level_max`` (h4): when > apply_gt_level
         # (and the FN is step-conditioned), the application level is drawn
@@ -2667,6 +2725,15 @@ class ActionForcingDMD(SelfForcingModel):
         self.reverse_noiser_dedrift_enabled = bool(
             getattr(args, "reverse_noiser_dedrift_enabled", False)
         )
+        # Historically the master gate above unconditionally replaced the
+        # DMD/GAN scoring tensor.  Keep that as the default, but allow an
+        # aux-only arm to construct a -drift pseudo-target without also
+        # receiving the direct de-drift-then-score treatment.
+        self.reverse_noiser_dedrift_apply_to_train_score = bool(
+            getattr(
+                args, "reverse_noiser_dedrift_apply_to_train_score", True,
+            )
+        )
         self.reverse_noiser_dedrift_level = int(
             getattr(args, "reverse_noiser_dedrift_level", 1)
         )
@@ -2685,6 +2752,66 @@ class ActionForcingDMD(SelfForcingModel):
         self.reverse_noiser_dedrift_apply_to_flash = bool(
             getattr(args, "reverse_noiser_dedrift_apply_to_flash", False)
         )
+        # De-drift the DMD *real* target (2026-08-26). ``pred_real_image`` is
+        # the teacher's one-step (or trajectory-refined) x0 estimate computed
+        # from the SAME noisy tensor the student's fake_score denoises — it is
+        # NOT clean GT, so it inherits part of the student rollout's drift
+        # signature. With this flag the same de-drift operator applied to the
+        # flash slab is applied to that target, so ``grad = pred_fake -
+        # pred_real`` is a difference against a de-drifted teacher estimate.
+        # Requires ``reverse_noiser_dedrift_enabled`` too (the helper is a
+        # passthrough otherwise), so default-off is byte-identical.
+        self.reverse_noiser_dedrift_apply_to_real_target = bool(
+            getattr(args, "reverse_noiser_dedrift_apply_to_real_target", False)
+        )
+        # IN-PLACE COMMIT DE-DRIFT (docs/CARN_FINAL_PLAN.md, 2026-08-26).
+        # Every other de-drift site corrects a loss-computation COPY. This
+        # one corrects the chunk that is written into the KV cache, i.e.
+        # the AR memory every subsequent chunk conditions on -- so the
+        # CORRECTED chunk, not the raw one, is what the model remembers.
+        # Read by ``ActionForcingTrainingPipeline._reverse_noiser_dedrift_
+        # commit`` THROUGH the ``_carn_commit_dedrift_owner`` back-
+        # reference the trainer installs on the pipeline (single source of
+        # truth: the flag exists only here). Fires at BOTH commit twins
+        # (``inference_with_trajectory`` and ``generate_chunk_with_cache``),
+        # which is also what makes the corrected dynamics show up in the
+        # forward/reverse noiser's own rollout1/rollout2 training pairs --
+        # ``_prebuild_rollout2_for_v24`` builds rollout2 through
+        # ``generate_chunk_with_cache``. Requires
+        # ``reverse_noiser_dedrift_enabled`` too (the helper is a
+        # passthrough otherwise), so default-off is byte-identical.
+        self.reverse_noiser_dedrift_apply_to_commit = bool(
+            getattr(args, "reverse_noiser_dedrift_apply_to_commit", False)
+        )
+        # Commit-only dose/schedule.  Aux internalisation intentionally keeps
+        # using ``reverse_noiser_dedrift_alpha0`` at full strength; these knobs
+        # attenuate only the graph-free correction written into recurrent KV
+        # memory.  Defaults reproduce the historical full-strength, immediate
+        # commit path exactly.
+        self.reverse_noiser_commit_alpha = float(
+            getattr(args, "reverse_noiser_commit_alpha", 1.0)
+        )
+        self.reverse_noiser_commit_start_step = int(
+            getattr(args, "reverse_noiser_commit_start_step", 0)
+        )
+        self.reverse_noiser_commit_ramp_steps = int(
+            getattr(args, "reverse_noiser_commit_ramp_steps", 0)
+        )
+        if not 0.0 <= self.reverse_noiser_commit_alpha <= 1.0:
+            raise ValueError(
+                "reverse_noiser_commit_alpha must be in [0, 1]; got "
+                f"{self.reverse_noiser_commit_alpha}."
+            )
+        if self.reverse_noiser_commit_start_step < 0:
+            raise ValueError(
+                "reverse_noiser_commit_start_step must be >= 0; got "
+                f"{self.reverse_noiser_commit_start_step}."
+            )
+        if self.reverse_noiser_commit_ramp_steps < 0:
+            raise ValueError(
+                "reverse_noiser_commit_ramp_steps must be >= 0; got "
+                f"{self.reverse_noiser_commit_ramp_steps}."
+            )
         # v2-B: self-rollout paired drift loss for F — ground F as the actual
         # causal-drift emulator (F(z_l)~=z_{l+1}) via an L1 to the student's OWN
         # next rollout state (NOT GT: pure system-identification of the
@@ -2939,16 +3066,76 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_feature_source = str(
             getattr(args, "ladd_feature_source", "real") or "real"
         )
-        if self.ladd_feature_source not in ("real", "fake"):
+        #   "pixgan" / "dinov2" (2026-08-26): PIXEL-DOMAIN feature
+        #       bases. The disc no longer taps WAN at all — its input
+        #       latents are VAE-DECODED and a conv/ViT encoder is run on
+        #       the pictures; those features feed the SAME CCM/CSM/head
+        #       stack. Motivation is measured, not aesthetic:
+        #       ``analysis/sharpness/TEXTURE_REVIEW.md`` §0.2 shows the
+        #       "texture of dots" is a 16 px lattice = ONE WAN PATCH
+        #       (fold2d P=16 residual ptp 11.51 vs 3.30 for GT through
+        #       the same decoder) — the disc's own token grid, printed
+        #       into the picture by the decoder. A pixel encoder has no
+        #       such grid. See ``model/ladd_pixel_features.py`` and
+        #       ``analysis/gan_tuning/PIXEL_FEATURE_SOURCE.md``.
+        from model.ladd_pixel_features import (
+            SUPPORTED_PIXEL_FEATURE_SOURCES as _PIXEL_SOURCES,
+        )
+        if self.ladd_feature_source not in ("real", "fake") + _PIXEL_SOURCES:
             raise ValueError(
-                "ladd_feature_source must be 'real' or 'fake'; got "
+                "ladd_feature_source must be one of "
+                f"{('real', 'fake') + _PIXEL_SOURCES}; got "
                 f"{self.ladd_feature_source!r}."
             )
-        if self.ladd_feature_source == "fake" and str(
+        self.ladd_pixel_feature_source = (
+            self.ladd_feature_source
+            if self.ladd_feature_source in _PIXEL_SOURCES else ""
+        )
+        if self.ladd_pixel_feature_source:
+            # ---- HARD PRECONDITIONS. Each of these would otherwise be a
+            # SILENT wrong-result rather than a crash, which is the only
+            # reason they raise instead of being documented.
+            if not bool(getattr(args, "ladd_disc_force_clean", False)):
+                raise ValueError(
+                    f"ladd_feature_source={self.ladd_feature_source!r} "
+                    "requires ladd_disc_force_clean=true. The pixel path "
+                    "VAE-DECODES the disc's input; a latent re-noised at "
+                    "disc_t decodes to noise, so the critic would be "
+                    "scoring the noise draw and not the picture. "
+                    "(force_clean is independently the measured-better "
+                    "setting — TEXTURE_REVIEW §2.2, two single-variable "
+                    "pairs.)"
+                )
+            if str(getattr(args, "ladd_r1_mode", "fd")) != "fd":
+                raise ValueError(
+                    f"ladd_feature_source={self.ladd_feature_source!r} "
+                    "requires ladd_r1_mode='fd'. The autograd estimator "
+                    "differentiates the disc output w.r.t. the LATENT "
+                    "input with create_graph=True, which on this path "
+                    "means holding a second-order graph through the VAE "
+                    "decoder AND the pixel encoder."
+                )
+            if bool(getattr(args, "ladd_wavelet_hf_enabled", False)):
+                raise ValueError(
+                    f"ladd_feature_source={self.ladd_feature_source!r} is "
+                    "incompatible with ladd_wavelet_hf_enabled=true: the "
+                    "wavelet stage rewrites the latent before the disc "
+                    "sees it, and a wavelet-HF latent does not decode to "
+                    "a picture."
+                )
+            if str(getattr(args, "ladd_readout", "ladd")) != "ladd":
+                raise ValueError(
+                    f"ladd_feature_source={self.ladd_feature_source!r} "
+                    "requires ladd_readout='ladd' (the register readout "
+                    "consumes WAN's raw padded token sequence, which a "
+                    "pixel encoder does not produce)."
+                )
+        if self.ladd_feature_source != "real" and str(
             getattr(args, "ladd_disc_backbone_model_name", "") or ""
         ):
             raise ValueError(
-                "ladd_feature_source='fake' is mutually exclusive with "
+                f"ladd_feature_source={self.ladd_feature_source!r} is "
+                "mutually exclusive with "
                 "ladd_disc_backbone_model_name (the WP-14B raw prefix "
                 "backbone): both try to replace the projector's feature "
                 "backbone. Unset one of them."
@@ -4230,6 +4417,13 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.anti_collapse_apply_to_flash_rung = bool(
             getattr(args, "anti_collapse_apply_to_flash_rung", True)
+        )
+        # Optional inference-parity replacement for the Flash-rung anchor.
+        # Reads the graph-bearing final ladder x0 published by A23. Default
+        # off preserves every historical config; the no-Flash t0 campaign
+        # enables it while disabling the Flash-rung call site above.
+        self.anti_collapse_apply_to_ladder_endpoint = bool(
+            getattr(args, "anti_collapse_apply_to_ladder_endpoint", False)
         )
 
         # v28E_12+: multi-horizon stat-anchor hinge loss config. Pins
@@ -8148,12 +8342,49 @@ class ActionForcingDMD(SelfForcingModel):
                     pred_real_image = _x0
                 self._last_traj_steps = max(0, len(_nodes) - 1)
 
+        # ---- de-drift the REAL target (reverse_noiser_dedrift_apply_to_
+        # real_target, 2026-08-26) ------------------------------------------
+        # Placed AFTER the dmd_real_traj refinement (which reassigns
+        # pred_real_image) and BEFORE the stash, so exactly one tensor — the
+        # one the gradient is actually formed from — exists downstream.
+        # Level: the SAME flat config knob the flash call site uses
+        # (``reverse_noiser_dedrift_level``); there is no per-sample rollout
+        # position available here and inventing one would make the two sites
+        # incomparable. If a future arm needs them decoupled, add a second
+        # knob rather than deriving a level here.
+        # no_grad: this whole method already runs inside the caller's
+        # ``torch.no_grad()`` (compute_distribution_matching_loss:9366-9390),
+        # so pred_real_image is a CONSTANT target with no autograd
+        # connection. The explicit guard pins that invariant locally: it
+        # keeps the ~30M-param G forward from ever building a graph on the
+        # target side if this method is later called under grad. The
+        # generator's gradient path is untouched — it runs through
+        # ``original_latent`` in the caller, and ``grad`` is consumed
+        # detached by ``_dmd_loss_with_fp_gate``.
+        # No-op unless BOTH this flag and ``reverse_noiser_dedrift_enabled``
+        # are set (the helper returns ``z`` itself when its own gate is off).
+        if bool(getattr(
+                self, "reverse_noiser_dedrift_apply_to_real_target", False)):
+            with torch.no_grad():
+                pred_real_image = self._dedrift_with_reverse_noiser(
+                    pred_real_image,
+                    int(getattr(self, "reverse_noiser_dedrift_level", 1)),
+                )
+
         # Unconditionally stash pred_real_image for downstream
         # consumers (alt-head plumbing). The CFG-extrapolated
         # EMA-swapped teacher x0 prediction (or just cond when
         # real_guidance_scale == 0). Detached so no autograd
         # connection to anything that reads the stash; overwritten
         # each gen-step DMD pass.
+        # SEMANTICS (2026-08-26): with
+        # ``reverse_noiser_dedrift_apply_to_real_target`` on, this stash — and
+        # the ``pred_real_image_detached`` returned to the caller, which feeds
+        # the MAE gate / manifold gate / real_score_mae_vs_gt telemetry — hold
+        # the DE-DRIFTED target, i.e. the value the DMD gradient is actually
+        # formed from. Deliberate: a diagnostic of a value nothing uses would
+        # be worse than one that tracks the real gradient. Off by default, so
+        # every existing arm's telemetry is unchanged.
         self._latest_pred_real_image = pred_real_image.detach()
 
         # Expose a one-shot teacher denoiser for the self-fingerprint
@@ -12471,17 +12702,41 @@ class ActionForcingDMD(SelfForcingModel):
             G = getattr(self, "forward_noiser", None)
             if G is None:
                 return z
+            _source = "rollout_to_gt_forward_noiser"
             self._carntx_dedrift_calls = getattr(
                 self, "_carntx_dedrift_calls", 0) + 1
+        elif bool(getattr(self, "forward_noiser_reverse", False)):
+            # Direct reverse mode trains this single FN on observed
+            # rollout2 -> rollout1 pairs.  Previously every de-drift consumer
+            # ignored it because only the mutually-exclusive cycle network
+            # was selected, turning the requested arm into a silent identity.
+            G = getattr(self, "forward_noiser", None)
+            if G is None:
+                return z
+            _source = "forward_noiser_reverse"
         else:
             if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
                 return z
             G = getattr(self, "reverse_noiser", None)
             if G is None:
                 return z
-        start_level = int(start_level)
+            _source = "cycle_reverse_noiser"
         min_level = int(getattr(self, "reverse_noiser_dedrift_min_level", 1))
-        if start_level < min_level:
+        if torch.is_tensor(start_level):
+            levels = start_level.to(device=z.device, dtype=torch.long).reshape(-1)
+            if int(levels.numel()) == 1:
+                levels = levels.expand(int(z.shape[0]))
+            if int(levels.numel()) != int(z.shape[0]):
+                raise ValueError(
+                    "start_level tensor must have one value per batch row; "
+                    f"got {int(levels.numel())} for batch {int(z.shape[0])}."
+                )
+        else:
+            levels = torch.full(
+                (int(z.shape[0]),), int(start_level), dtype=torch.long,
+                device=z.device,
+            )
+        if not bool((levels >= min_level).any()):
             # R ~= I near the manifold (zero-init out_proj => F(x,0)~=x): skip
             # the ~30M-param conv and keep the low-drift path byte-identical.
             return z
@@ -12497,33 +12752,84 @@ class ActionForcingDMD(SelfForcingModel):
             g_dtype = next(G_inner.parameters()).dtype
             cur = z
             for k in range(n_steps):
-                lvl = max(0, start_level - k)
-                if lvl < min_level:
+                lvl = levels - int(k)
+                active = lvl >= min_level
+                if not bool(active.any()):
                     break
                 alpha = a0 * (decay ** k)
-                cs = torch.full(
-                    (cur.shape[0],), lvl, dtype=torch.long, device=cur.device,
-                )
+                cs = lvl.clamp_min(0)
                 # residual=False -> raw increment delta; cur + alpha*delta is an
                 # explicit relaxed (decelerating) Euler step toward the manifold.
                 delta = G_inner(cur.to(dtype=g_dtype), cs, residual=False)
-                cur = cur + alpha * delta.to(dtype=cur.dtype)
-            if (getattr(self, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt"
-                    and getattr(self, "_carntx_dedrift_calls", 0) in (1, 50)):
+                active_view = active.view(
+                    -1, *([1] * (delta.dim() - 1))
+                ).to(dtype=delta.dtype)
+                cur = cur + alpha * (delta * active_view).to(dtype=cur.dtype)
+            self._carn_dedrift_calls = int(getattr(
+                self, "_carn_dedrift_calls", 0)) + 1
+            if self._carn_dedrift_calls in (1, 10, 50, 200):
                 import sys as _sys
-                _rel = float((cur - z).norm() / max(float(z.norm()), 1e-8))
+                _rel = float(
+                    (cur.detach() - z.detach()).norm()
+                    / max(float(z.detach().norm()), 1e-8)
+                )
                 print(
-                    f"[CARNTX-DEDRIFT] call={self._carntx_dedrift_calls} "
-                    f"rel|dz|={_rel:.4f} lvl={start_level} "
-                    f"(applied to the tensor passed in — with "
-                    f"apply_to_flash=true that includes the GRADIENT slab)",
+                    f"[CARN-DEDRIFT] source={_source} "
+                    f"call={self._carn_dedrift_calls} rel|dz|={_rel:.6f} "
+                    f"levels={int(levels.min())}..{int(levels.max())} "
+                    f"active={int((levels >= min_level).sum())}/"
+                    f"{int(levels.numel())}",
                     file=_sys.stderr, flush=True)
             return cur
         finally:
             for _p, _r in zip(g_params, saved):
                 _p.requires_grad_(_r)
 
-    def _reverse_noiser_internalize_loss(self, z_raw, z_dedrifted):
+    def _dedrift_streaming_slab_with_reverse_noiser(self, z, info):
+        """Apply the learned -drift step to each chunk at its own CARN level."""
+        if not bool(getattr(self, "reverse_noiser_dedrift_enabled", False)):
+            return z
+        npb = int(self.num_frame_per_block)
+        if int(z.shape[1]) % npb != 0:
+            raise ValueError(
+                "CARN slab de-drift requires F divisible by "
+                f"num_frame_per_block={npb}; got F={int(z.shape[1])}."
+            )
+        abs_start = int(info.get("abs_frame_start", 0)) - int(
+            info.get("overlap", 0)
+        )
+        if abs_start % npb != 0:
+            raise ValueError(
+                f"CARN slab start {abs_start} is not npb={npb} aligned."
+            )
+        batch = int(z.shape[0])
+        n_chunks = int(z.shape[1]) // npb
+        num_seed = int(self.dmd_context_clean_frames // npb)
+        max_level = int(self.forward_noiser_max_carn_step)
+        per_chunk = torch.tensor([
+            min(
+                max(0, ((abs_start + c * npb) // npb) - (num_seed - 1)),
+                max_level,
+            )
+            for c in range(n_chunks)
+        ], dtype=torch.long, device=z.device)
+        levels = per_chunk.unsqueeze(0).expand(batch, n_chunks).reshape(-1)
+        min_level = int(getattr(self, "reverse_noiser_dedrift_min_level", 1))
+        if not bool((levels >= min_level).any()):
+            return z
+        chunks = z.reshape(
+            batch, n_chunks, npb, *z.shape[2:]
+        ).reshape(batch * n_chunks, npb, *z.shape[2:])
+        corrected = self._dedrift_with_reverse_noiser(chunks, levels)
+        self._carn_slab_level_min = int(per_chunk.min())
+        self._carn_slab_level_max = int(per_chunk.max())
+        return corrected.reshape(
+            batch, n_chunks, npb, *z.shape[2:]
+        ).reshape_as(z)
+
+    def _reverse_noiser_internalize_loss(
+        self, z_raw, z_dedrifted, mask=None,
+    ):
         """v2-E: confidence-gated INTERNALIZATION. Pull the RAW student output
         ``z_raw`` toward its de-drifted version ``z_dedrifted`` (used as a
         stop-grad pseudo-target) so the STUDENT ALONE becomes drift-free, not
@@ -12542,6 +12848,22 @@ class ActionForcingDMD(SelfForcingModel):
         if z_dedrifted is z_raw:
             # de-drift was a no-op (disabled / level<min) -> nothing to pull to.
             return z_raw.new_zeros(())
+        def _reduce(values):
+            if mask is None:
+                return values.mean()
+            m = mask.to(device=values.device, dtype=torch.bool)
+            if m.shape != values.shape:
+                try:
+                    m = m.expand_as(values)
+                except RuntimeError as exc:
+                    raise ValueError(
+                        "CARN internalization mask must broadcast to the "
+                        f"latent: mask={tuple(m.shape)} values="
+                        f"{tuple(values.shape)}"
+                    ) from exc
+            if not bool(m.any()):
+                return values.sum() * 0.0
+            return values[m].mean()
         if getattr(self, "fn_pair_mode", "r1_vs_r2") == "rollout_to_gt":
             # Pair-swap test: F is the corrector and no cycle exists, so the
             # cycle-consistency confidence gate is unavailable — use w=1
@@ -12551,8 +12873,15 @@ class ActionForcingDMD(SelfForcingModel):
             # module alias and make ``F.mse_loss`` an UnboundLocalError.
             # w_int applied EXPLICITLY: the first arm returned the raw mse
             # (weight silently dropped in this early-return).
-            return w_int * torch.nn.functional.mse_loss(
-                z_raw, z_dedrifted.detach())
+            return w_int * _reduce((z_raw - z_dedrifted.detach()).pow(2))
+        if (
+            bool(getattr(self, "forward_noiser_reverse", False))
+            and getattr(self, "forward_noiser", None) is not None
+        ):
+            # Literal aux direction target for a directly-trained R2->R1 FN.
+            self._internalize_resid_mean = None
+            self._internalize_gate_mean = 1.0
+            return w_int * _reduce((z_raw - z_dedrifted.detach()).abs())
         if not bool(getattr(self, "forward_noiser_cycle_enabled", False)):
             return z_raw.new_zeros(())
         G = getattr(self, "reverse_noiser", None)
@@ -12577,7 +12906,7 @@ class ActionForcingDMD(SelfForcingModel):
             self._internalize_resid_mean = float(resid.mean().item())
             self._internalize_gate_mean = float(w.mean().item())
         l1 = (z_raw - z_dedrifted.detach()).abs()                     # grad via z_raw
-        return w_int * (w * l1).mean()
+        return w_int * _reduce(w * l1)
 
     def _forward_noiser_ddp_anchor(
         self, src: torch.Tensor, npb: int,
@@ -12624,17 +12953,25 @@ class ActionForcingDMD(SelfForcingModel):
         """
         npb = int(self.num_frame_per_block)
         s = self.streaming_state  # caller verified not-None
-        # RAW slab first: with reverse_noiser_dedrift_apply_to_flash=true,
-        # info['flash_dmd_gan_x0'] is F's OWN corrected output — training on
-        # it would be a feedback loop (F learns to correct its corrections).
-        # Same reason the teacher_feat path prefers the _raw key.
-        flash_chunk = info.get("flash_dmd_gan_x0_raw")
-        if flash_chunk is None:
-            flash_chunk = info.get("flash_dmd_gan_x0")
-        fn_input_chunk = (
-            flash_chunk.detach() if flash_chunk is not None
-            else chunk.detach()
-        )
+        # Honour the same explicit R1 surface contract as the teacher-feature
+        # path. The no-Flash t0 campaign must never fall back to a random rung.
+        _fn_source = str(getattr(
+            self, "forward_noiser_train_source", "flash",
+        )).lower()
+        if _fn_source == "ladder_endpoint":
+            _fn_surface = info.get("ladder_endpoint_chunk")
+            if _fn_surface is None:
+                return self._forward_noiser_ddp_anchor(chunk, npb)
+        elif _fn_source == "rollout":
+            _fn_surface = chunk
+        else:
+            # RAW Flash slab avoids training F on its own corrected output.
+            _fn_surface = info.get("flash_dmd_gan_x0_raw")
+            if _fn_surface is None:
+                _fn_surface = info.get("flash_dmd_gan_x0")
+            if _fn_surface is None:
+                _fn_surface = chunk
+        fn_input_chunk = _fn_surface.detach()
         ride_window = s.get("ride_latents_window")
         if ride_window is None:
             return self._forward_noiser_ddp_anchor(fn_input_chunk, npb)
@@ -12755,14 +13092,22 @@ class ActionForcingDMD(SelfForcingModel):
         r2_abs_start = int(r2_abs_start)
         r2_total = int(r2_x0.shape[1])
 
-        # Prefer the t=60 refined chunk for FN's rollout1 input when
-        # available (flash_dmd_enabled). Rollout2's r2_x0 was already
-        # built from the t=60 stash in the prebuild path. Falls back to
-        # the random-rung chunk when flash_dmd is off (legacy parity).
-        flash_chunk = info.get("flash_dmd_gan_x0")
-        fn_input_chunk = (
-            flash_chunk.detach() if flash_chunk is not None else chunk
-        )
+        _fn_source = str(getattr(
+            self, "forward_noiser_train_source", "flash",
+        )).lower()
+        if _fn_source == "ladder_endpoint":
+            fn_input_chunk = info.get("ladder_endpoint_chunk")
+            if fn_input_chunk is None:
+                return self._forward_noiser_ddp_anchor(chunk, npb)
+            fn_input_chunk = fn_input_chunk.detach()
+        elif _fn_source == "rollout":
+            fn_input_chunk = chunk
+        else:
+            # Legacy Flash preference with its historical rollout fallback.
+            flash_chunk = info.get("flash_dmd_gan_x0")
+            fn_input_chunk = (
+                flash_chunk.detach() if flash_chunk is not None else chunk
+            )
 
         chunk_size_critic = int(fn_input_chunk.shape[1])
         if chunk_size_critic % npb != 0:
@@ -13099,6 +13444,9 @@ class ActionForcingDMD(SelfForcingModel):
         self.streaming_force_new_frame_chunks = 0
 
         rollout2_chunks: list = []
+        r2_source = str(getattr(
+            self, "forward_noiser_rollout2_source", "legacy",
+        )).lower()
         try:
             with torch.no_grad():
                 # 1) Reset + (re-)init caches for rollout 2.
@@ -13162,6 +13510,26 @@ class ActionForcingDMD(SelfForcingModel):
                     **anchor_full_cond,
                 )
                 del anchor_full_cond
+                if r2_source == "ladder_endpoint":
+                    anchor_surface = getattr(pipe, "_ladder_chunk", None)
+                    if anchor_surface is None:
+                        raise RuntimeError(
+                            "forward_noiser_rollout2_source=ladder_endpoint "
+                            "but the rollout-2 anchor did not publish the "
+                            "ladder endpoint."
+                        )
+                    anchor_chunk = anchor_surface[:, -npb:]
+                elif r2_source == "flash":
+                    anchor_surface = getattr(
+                        pipe, "_flash_dmd_gan_output", None,
+                    )
+                    if anchor_surface is None:
+                        raise RuntimeError(
+                            "forward_noiser_rollout2_source=flash but the "
+                            "rollout-2 anchor did not publish a Flash-DMD "
+                            "surface."
+                        )
+                    anchor_chunk = anchor_surface[:, -npb:]
                 # ``anchor_chunk`` is now the cleanest x0 estimate
                 # the rollout produced (t=60 refined when flash on,
                 # t=~178.6 finish-denoised when flash off). No need
@@ -13194,24 +13562,34 @@ class ActionForcingDMD(SelfForcingModel):
                 }
 
                 # 5) Streaming loop: each iter yields chunk_size frames.
-                # Snapshot the t=60 refined tail (info["flash_dmd_gan_x0"])
-                # when flash_dmd_enabled; fall back to the random-rung
-                # chunk tail otherwise.
+                # ``legacy`` preserves flash-if-present/random-exit fallback.
+                # Explicit sources never silently fall through: the no-Flash
+                # campaign requests the fully-denoised ladder-endpoint x0.
                 while self.can_generate_more():
                     full_chunk, info = self.generate_next_chunk(
                         requires_grad=False,
                         compute_baseline_mae=False,
                     )
                     new_frames_count = int(info.get("new_frames", npb))
-                    flash_slab = info.get("flash_dmd_gan_x0")
-                    if flash_slab is not None:
-                        rollout2_chunks.append(
-                            flash_slab[:, -new_frames_count:].detach()
-                        )
+                    if r2_source == "ladder_endpoint":
+                        r2_surface = info.get("ladder_endpoint_chunk")
+                    elif r2_source == "rollout":
+                        r2_surface = full_chunk
+                    elif r2_source == "flash":
+                        r2_surface = info.get("flash_dmd_gan_x0")
                     else:
-                        rollout2_chunks.append(
-                            full_chunk[:, -new_frames_count:].detach()
+                        r2_surface = info.get("flash_dmd_gan_x0")
+                        if r2_surface is None:
+                            r2_surface = full_chunk
+                    if r2_surface is None:
+                        raise RuntimeError(
+                            "forward_noiser_rollout2_source="
+                            f"{r2_source} did not publish its requested "
+                            "rollout-2 surface."
                         )
+                    rollout2_chunks.append(
+                        r2_surface[:, -new_frames_count:].detach()
+                    )
         finally:
             # Leave pipeline caches clean for the caller's rollout-1
             # prefill. Restore the prior streaming_state (typically None
@@ -13228,6 +13606,14 @@ class ActionForcingDMD(SelfForcingModel):
                 torch.cuda.empty_cache()
 
         rollout2_x0 = torch.cat(rollout2_chunks, dim=1)
+        if getattr(self, "is_main_process", True):
+            import sys as _sys
+            print(
+                "[FN-R2-SOURCE] "
+                f"source={r2_source} flash_dmd_enabled="
+                f"{bool(self.flash_dmd_enabled)} rows={rollout2_x0.shape[1]}",
+                file=_sys.stderr, flush=True,
+            )
         # Park on CPU; critic step ships a per-iter slice back to GPU
         # via the abs-position lookup. Saves ~5 MB/sample * batch_size
         # of permanent GPU residency for the duration of the ride.
@@ -14019,6 +14405,9 @@ class ActionForcingDMD(SelfForcingModel):
         new_last_rung_chunk = (
             pipe._flash_dmd_gan_output if flash_dmd_enabled else None
         )
+        new_last_rung_grad_mask = (
+            pipe._flash_dmd_gan_grad_mask if flash_dmd_enabled else None
+        )
         # Post-Step-3.3.5 ``cache_pred`` buffer. HONEST DESCRIPTION (the
         # comment here used to claim "finish-denoised ... what the KV cache
         # was committed from", which has not been true since the
@@ -14088,7 +14477,22 @@ class ActionForcingDMD(SelfForcingModel):
         # the ``full_chunk = new_chunk`` shortcut: overlap=0, so the
         # whole slab is the new last-rung chunk.
         full_last_rung_chunk = None
+        full_last_rung_grad_mask = None
         if new_last_rung_chunk is not None:
+            if new_last_rung_grad_mask is None:
+                raise RuntimeError(
+                    "flash-DMD published a slab without its frame-level "
+                    "gradient-liveness mask"
+                )
+            new_last_rung_grad_mask = torch.as_tensor(
+                new_last_rung_grad_mask, device=new_last_rung_chunk.device,
+            ).reshape(-1).to(torch.bool)
+            if int(new_last_rung_grad_mask.numel()) != int(new_frames):
+                raise RuntimeError(
+                    "flash-DMD gradient mask has "
+                    f"{int(new_last_rung_grad_mask.numel())} frames but "
+                    f"the newly generated slab has {int(new_frames)}"
+                )
             if overlap > 0:
                 prev_last_rung = s.get("previous_last_rung_chunk")
                 if prev_last_rung is None:
@@ -14106,8 +14510,16 @@ class ActionForcingDMD(SelfForcingModel):
                 full_last_rung_chunk = torch.cat(
                     [overlap_slab.detach(), new_last_rung_chunk], dim=1,
                 )
+                full_last_rung_grad_mask = torch.cat([
+                    torch.zeros(
+                        overlap, device=new_last_rung_chunk.device,
+                        dtype=torch.bool,
+                    ),
+                    new_last_rung_grad_mask,
+                ])
             else:
                 full_last_rung_chunk = new_last_rung_chunk
+                full_last_rung_grad_mask = new_last_rung_grad_mask
 
         # gradient_mask: True only on new frames within the full_chunk.
         gradient_mask = torch.zeros_like(full_chunk, dtype=torch.bool)
@@ -14196,6 +14608,13 @@ class ActionForcingDMD(SelfForcingModel):
             # (action_critic) consume it
             # as the G-side fake.
             "flash_dmd_gan_chunk": full_last_rung_chunk,
+            # ``[F]`` bool aligned with the slab above. A CopySlices buffer
+            # is graph-bearing when any block is live, even if the newest
+            # frames came from the deliberately no-grad trailing block.
+            # Consumers that need a generator gradient must select frames
+            # through this mask; buffer-level ``requires_grad`` is not a
+            # liveness test.
+            "flash_dmd_gan_grad_mask": full_last_rung_grad_mask,
             # LEGACY KEY, UNCHANGED VALUE. Despite the name this is the
             # flash t=gan_t slab whenever ``flash_dmd_enabled`` is on
             # (see ``info_finish_denoised`` above). Every existing
@@ -15667,9 +16086,8 @@ class ActionForcingDMD(SelfForcingModel):
             )
         info["flash_dmd_gan_x0_raw"] = last_rung_chunk
         if bool(getattr(self, "reverse_noiser_dedrift_apply_to_flash", False)):
-            last_rung_chunk = self._dedrift_with_reverse_noiser(
-                last_rung_chunk,
-                int(getattr(self, "reverse_noiser_dedrift_level", 1)),
+            last_rung_chunk = self._dedrift_streaming_slab_with_reverse_noiser(
+                last_rung_chunk, info,
             )
         info["flash_dmd_gan_x0"] = last_rung_chunk
 
@@ -16386,6 +16804,35 @@ class ActionForcingDMD(SelfForcingModel):
                 )
                 if flash_anti_collapse_total is not None:
                     dmd_loss = dmd_loss + flash_anti_collapse_total
+
+        # No-Flash t0 replacement: anchor the graph-bearing inference-parity
+        # ladder endpoint instead of the historical t=60 surface. When the
+        # random exit is already the final rung, ``chunk`` is that same x0 and
+        # the ordinary DMD-rung anti-collapse call above has already covered
+        # it; do not double count. Otherwise A23 must publish a live endpoint.
+        if self.anti_collapse_apply_to_ladder_endpoint:
+            ladder_x0 = info.get("finish_denoised_chunk_grad")
+            if ladder_x0 is None:
+                _ladder_to = info.get("denoised_timestep_to", None)
+                if _ladder_to is None or int(_ladder_to) != 0:
+                    raise RuntimeError(
+                        "anti_collapse_apply_to_ladder_endpoint=true "
+                        "requires pix_finish_grad_enabled=true and a live "
+                        "finish_denoised_chunk_grad unless the DMD exit was "
+                        "already the final rung."
+                    )
+                dmd_log["ladder_anti_collapse_reused_dmd_rung"] = 1.0
+            else:
+                ladder_anti_collapse_total = self._compute_anti_collapse_term(
+                    original_latent=ladder_x0,
+                    gt_target=gt_target,
+                    log_dict=dmd_log,
+                    log_prefix="ladder_",
+                    ref_dtype=dmd_loss.dtype,
+                )
+                if ladder_anti_collapse_total is not None:
+                    dmd_loss = dmd_loss + ladder_anti_collapse_total
+                dmd_log["ladder_anti_collapse_applied"] = 1.0
 
         # Auxiliary online-teacher pass (option 3 of the dual-teacher
         # design). When ``real_teacher_train_online`` is True we run a
