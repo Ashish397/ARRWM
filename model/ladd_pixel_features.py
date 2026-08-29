@@ -95,7 +95,9 @@ __all__ = [
 # ``model/dmd_action_forcing.py`` so the validator and the builder can
 # never drift apart.
 SUPPORTED_PIXEL_FEATURE_SOURCES = ("pixgan", "dinov2", "vgg", "rn50")
-SUPPORTED_PIXEL_INPUT_FILTERS = ("none", "dc", "swt")
+SUPPORTED_PIXEL_INPUT_FILTERS = (
+    "none", "dc", "swt", "dc_grad_hp", "raw_grad_hp",
+)
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -636,8 +638,15 @@ class LaddPixelStatHead(nn.Module):
             [feats[k] for k in sorted(feats)]
         return [self.pool(m, t) for t, m in enumerate(maps)]
 
-    def forward(self, feats) -> torch.Tensor:
-        """``{tap: [N, C, H, W]}`` or a list -> ``[N, 1]``."""
+    def forward(self, feats, *, return_hidden: bool = False):
+        """Pool feature maps and emit one orderless logit per image.
+
+        ``return_hidden`` exposes the final pooled statistic embedding for a
+        projection-style conditional discriminator.  It does not expose (or
+        recreate) a spatial lattice: the returned vector is computed only
+        after every tap's spatial axis has been destroyed by :meth:`pool`.
+        The default return value and state-dict layout remain unchanged.
+        """
         s = self.stats(feats)
         if len(s) != len(self.tap_channels):
             raise ValueError(
@@ -645,7 +654,12 @@ class LaddPixelStatHead(nn.Module):
                 f"{len(self.tap_channels)}."
             )
         e = [emb(v) for emb, v in zip(self.embeds, s)]
-        out = self.mlp(torch.cat(e, dim=1))
+        joined = torch.cat(e, dim=1)
+        # Keep ``self.mlp`` structurally unchanged for checkpoint
+        # compatibility while exposing the representation immediately before
+        # its final scalar layer.
+        hidden = self.mlp[1](self.mlp[0](joined))
+        out = self.mlp[2](hidden)
         self.n_forward += 1
         if int(out.shape[1]) != 1:  # pragma: no cover - structural
             raise RuntimeError(
@@ -655,7 +669,7 @@ class LaddPixelStatHead(nn.Module):
                 "means a dense head has been reintroduced and the "
                 "experiment is void."
             )
-        return out
+        return (out, hidden) if return_hidden else out
 
 
 # ===========================================================================
@@ -1286,16 +1300,41 @@ class LaddPixelFeatureSource(nn.Module):
         undecimated wavelet-detail emphasis.  The latter is deliberately a
         residual view rather than the old latent HH-only route: it preserves
         an image-like input for the pretrained VGG and has no sampling phase.
+
+        ``dc_grad_hp`` has the *same forward value* as ``dc`` so the frozen
+        ImageNet VGG never sees an out-of-distribution pure-detail image.  Its
+        backward Jacobian is instead the fixed stationary-wavelet high-pass
+        ``I - lowpass``.  This is the texture-only generator contract: D may
+        identify a broad exposure patch, but it cannot transmit that coarse
+        request through the pixel cotangent.  The detach identity below is
+        intentional gradient shaping, not a straight-through approximation:
+        forward(y) == forward(x), while dy/dx == I - lowpass.
+
+        ``raw_grad_hp`` applies the same backward-only projection without the
+        forward DC centring.  It is the matched ablation for asking whether D
+        benefits from seeing exposure while the generator is still forbidden
+        from following exposure/low-frequency brightness cues.
         """
         if self.input_filter == "none":
             return x
-        x = x - x.mean(dim=(-2, -1), keepdim=True) + float(midpoint)
-        if self.input_filter == "swt" and self.swt_strength > 0.0:
+        if self.input_filter != "raw_grad_hp":
+            x = x - x.mean(dim=(-2, -1), keepdim=True) + float(midpoint)
+        if self.input_filter in ("swt", "dc_grad_hp", "raw_grad_hp"):
             kernel = self._swt_lowpass.to(device=x.device, dtype=x.dtype)
             kernel = kernel.expand(int(x.shape[1]), 1, 5, 5)
             low = F.conv2d(F.pad(x, (2, 2, 2, 2), mode="reflect"),
                            kernel, groups=int(x.shape[1]))
-            x = x + self.swt_strength * (x - low)
+            detail = x - low
+            if self.input_filter == "swt" and self.swt_strength > 0.0:
+                x = x + self.swt_strength * detail
+            elif self.input_filter in ("dc_grad_hp", "raw_grad_hp"):
+                # The extra projection makes the global-DC guarantee exact
+                # even with reflect-padding boundary weights: the backward
+                # signal of this branch has zero spatial sum by construction.
+                texture_detail = detail - detail.mean(
+                    dim=(-2, -1), keepdim=True,
+                )
+                x = texture_detail + (x - texture_detail).detach()
         return x
 
     # -- forward --------------------------------------------------------

@@ -2218,6 +2218,12 @@ class ActionForcingDMD(SelfForcingModel):
         self.ladd_gt_transition_carn_latter_reverse = bool(
             getattr(args, "ladd_gt_transition_carn_latter_reverse", False)
         )
+        # In-domain one-step bridge: F(former) -> G(F(latter)). This keeps G
+        # on the drifted domain it was trained to invert and avoids the legacy
+        # two-step F(clean)->G(clean) target.
+        self.ladd_gt_transition_carn_bridge = bool(
+            getattr(args, "ladd_gt_transition_carn_bridge", False)
+        )
         self.ladd_gt_transition_carn_steps = int(
             getattr(args, "ladd_gt_transition_carn_steps", 1)
         )
@@ -2687,6 +2693,18 @@ class ActionForcingDMD(SelfForcingModel):
         self.cycle_rev_feat_weight = float(
             getattr(args, "cycle_rev_feat_weight", 0.0)
         )
+        # ``forward_output`` is the historical CycleGAN-style inverse target
+        # G(F(r1))->r1. ``paired_target`` additionally grounds G on the
+        # observed aligned rollout2 domain: G(r2)->r1. The latter is required
+        # when aux/commit consume G on actual rollout states.
+        self.cycle_rev_input_mode = str(
+            getattr(args, "cycle_rev_input_mode", "forward_output")
+        ).lower()
+        if self.cycle_rev_input_mode not in ("forward_output", "paired_target"):
+            raise ValueError(
+                "cycle_rev_input_mode must be forward_output|paired_target; "
+                f"got {self.cycle_rev_input_mode!r}."
+            )
         # Paired-recon norm for L_rev / L_cyc. "l1" (default, CycleGAN
         # convention) or "l2". (Validated only when the cycle is enabled —
         # see the guard block below — so an inert misconfig while off does
@@ -2796,6 +2814,12 @@ class ActionForcingDMD(SelfForcingModel):
         )
         self.reverse_noiser_commit_ramp_steps = int(
             getattr(args, "reverse_noiser_commit_ramp_steps", 0)
+        )
+        self.reverse_noiser_preserve_moments = bool(
+            getattr(args, "reverse_noiser_preserve_moments", False)
+        )
+        self.reverse_noiser_commit_use_absolute_level = bool(
+            getattr(args, "reverse_noiser_commit_use_absolute_level", False)
         )
         if not 0.0 <= self.reverse_noiser_commit_alpha <= 1.0:
             raise ValueError(
@@ -3230,6 +3254,23 @@ class ActionForcingDMD(SelfForcingModel):
             getattr(args, "ladd_use_prompt_cond", True)
         )
         self.ladd_cmap_dim = int(getattr(args, "ladd_cmap_dim", 64))
+        # Pixel-GAN action conditioning (default off).  The historical
+        # action tensors reached the WAN projector path but the VGG pixel
+        # branch never consumed them, so a stronger GAN optimized the
+        # marginal real-image texture distribution irrespective of control.
+        # When enabled, the projection readout consumes the aligned per-frame
+        # action tokens (the VGG arm projects its orderless pooled statistic);
+        # the trainer can additionally contrast a real image window against a
+        # deliberately wrong action sequence.
+        self.ladd_use_action_cond = bool(
+            getattr(args, "ladd_use_action_cond", False)
+        )
+        self.ladd_action_cmap_dim = int(
+            getattr(args, "ladd_action_cmap_dim", self.ladd_cmap_dim)
+        )
+        self.ladd_action_mismatch_weight = float(
+            getattr(args, "ladd_action_mismatch_weight", 0.0)
+        )
         self.ladd_disc_loss_weight = float(
             getattr(args, "ladd_disc_loss_weight", 1.0)
         )
@@ -12765,6 +12806,25 @@ class ActionForcingDMD(SelfForcingModel):
                     -1, *([1] * (delta.dim() - 1))
                 ).to(dtype=delta.dtype)
                 cur = cur + alpha * (delta * active_view).to(dtype=cur.dtype)
+            if bool(getattr(self, "reverse_noiser_preserve_moments", False)):
+                # Shared texture-only contract for aux, commit and scoring:
+                # exact per-channel DC plus centred mean-absolute contrast.
+                _dims = [1, 3, 4]
+                _mu_in = z.mean(dim=_dims, keepdim=True)
+                _mu_out = cur.mean(dim=_dims, keepdim=True)
+                _dev_in = z - _mu_in
+                _dev_out = cur - _mu_out
+                _a_in = _dev_in.abs().mean(
+                    dim=[1, 2, 3, 4], keepdim=True,
+                )
+                _a_out = _dev_out.abs().mean(
+                    dim=[1, 2, 3, 4], keepdim=True,
+                )
+                cur = _dev_out * (_a_in / (_a_out + 1.0e-6)) + _mu_in
+                self._carn_preserve_mean_delta = float(
+                    (cur.mean(dim=_dims) - z.mean(dim=_dims))
+                    .abs().max().detach().item()
+                )
             self._carn_dedrift_calls = int(getattr(
                 self, "_carn_dedrift_calls", 0)) + 1
             if self._carn_dedrift_calls in (1, 10, 50, 200):

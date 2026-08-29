@@ -1,5 +1,9 @@
 # ONBOARDING PROMPT — switch decoder pullback experiments from Q1 0.6 to Q1 0.99
 
+> **New definitive Phase 3 handoff:** incoming Sol agents should now start at
+> `docs/ONBOARDING_SOL_PHASE3_DEFINITIVE_2808.md`. This document remains the
+> detailed decoder-pullback/live-GAN history and must still be read.
+
 Copy everything between the lines to the agent currently working on the older
 Q1~0.6 decoder-shaped surrogate.
 
@@ -24,13 +28,99 @@ false hits and stale real/fake/R1 pixels. Do not use `3rlvysdv` to authorize
 as parameter-selection evidence.
 
 All new runs must resolve `ladd_pixel_decode_cache=false` and log
-`ladd_pix_decode_cache_enabled=0` while decode calls rise. Four corrected
-weight-zero calibrations are running on holders `6168503/6168505`: DC
-reference R1=10 `br6ivuzw`, DC reference R1=1 `zoud58dc`, raw reference R1=10
-`ob5gqkvo`, and DC aux-minus R1=10 `xlf99yu7`. Inspect those before choosing
-any nonzero weight. The safe optional cache now requires
+`ladd_pix_decode_cache_enabled=0` while decode calls rise. The first four
+cache-off controls on holders `6168503/6168505` finished: DC reference R1=10
+`br6ivuzw`, DC reference R1=1 `zoud58dc`, raw reference R1=10 `ob5gqkvo`, and
+DC aux-minus R1=10 `xlf99yu7`. They proved the cache and transport fixes, but
+an ordering audit found that their Q1 field was queried before a deferred D
+update. Do not use them to choose a weight. The safe optional cache now requires
 exact retained tensor identity and mutation version, but production keeps it
 off because the current micro-group geometry has no legitimate reuse.
+
+The definitive launcher must additionally resolve:
+
+```text
+surrogate_decoder_fresh_disc_order=true
+ladd_defer_disc_update=false
+```
+
+This is a real call-order change, not a label: D trains inline on the current
+batch, the trainer proves the inline-update counter increased, and only then
+does the updated head supply the pixel cotangent for the Q1 pullback. Require
+`surrogate_decoder_disc_updates_before_field>0` and
+`surrogate_decoder_disc_updated_before_field=1` on the first active field.
+Four fresh-order repeats completed on child steps `6168503.8/.9` and
+`6168505.9/.8`: DC/R1=10 `83wlndxr`, DC/R1=1 `y9ry8jhr`, raw/R1=10
+`bbj4flwh`, and DC+aux-minus/R1=10 `bfvw2wik`. Every active field proved the
+inline D update occurred before the field. Median unweighted full-parameter
+ratios were `.882/2.404/.946/.777`.
+
+The first nonzero wave normalized to approximately 3% median share and remained
+finite through about step 66. Its child steps were stopped to promote the same
+holder time to 300 steps. The live 300-step wave is calibrated DC/R1=10 `.035`
+`wkq1l6p2`, calibrated DC/R1=1 `.0125` `7o96m8uh`, plus a matched strong-stable
+DC/R1=1 `.0175` reference/aux-minus pair `htfhu37j/acmv0qur`. The last pair
+keeps the GAN fixed and changes the complete CARN policy from the reference
+cycle to the tested R2-to-R1 aux-minus `.25` internalisation contract. Both
+holder allocations must remain alive.
+
+### Action-awareness correction under calibration
+
+Do not mistake the frozen Flash action critic for an action-conditional VGG
+GAN. The four current 300-step controls all resolve an action-blind VGG head;
+the strong `.0175` pair has visibly left the commanded trajectory while the
+lower-share controls remain on it. The initial dense-head implementation was
+incompatible with the winning arm: `ladd_feature_source=vgg` deliberately uses
+an orderless `[mu,sigma,Cov]` pooled readout and does not build dense LADD
+heads. The corrected default-off path applies a projection-discriminator
+compatibility term to that pooled statistic embedding. Matched and wrong
+actions reuse the same decode, frozen VGG maps and pooled evidence, so no
+decoder/VGG pass or spatial lattice is added. It reports
+`ladd_action_cond_active`, `ladd_action_mismatch_token_rms`,
+`r3gan_d_wrong_action` and `r3gan_d_loss_action_mismatch`.
+
+The corrected implementation also passes the aligned selected-Flash action
+window into `score_pixels`, so the current post-D teacher cotangent used by
+the Q1~0.99 pullback is action-conditioned rather than silently querying only
+the unconditional image term. The mechanism and runtime wiring passed, but
+the 60-step calibrations were a negative scientific result. Mismatch `1.0`
+[`lmeubie7`] and `.25` [`uhb3i1lc`] both finished with nonzero shuffled-action
+RMS, yet their mismatch loss remained at `log(2)` and median correct-minus-
+wrong margins were `-1.80e-4/-1.48e-4`. In contrast, final real-minus-fake
+margins were `2.48/2.89`. The pooled, orderless VGG statistic learned texture
+discrimination while ignoring action compatibility. Do not promote either
+conditional head or inherit a nonzero `PIXW` from them.
+
+The requested fallback now keeps the proven action-blind `htfhu37j` GAN fixed
+and changes only the separate action critic. Two 300-step repeats are live on
+holder `6170182`: frozen pretrained critic with guidance doubled `.3 -> .6`
+[`ea2g8x49`], and genuinely online critic [`pstbyie5`] with guidance `.3`,
+`action_teacher_mode=all`, two critic updates/step, z-loss weight `.5`, LR
+`3e-4`, and the exact `pca_raw` teacher space used by commanded actions. The
+online startup proved a 59.3M-parameter AdamW critic optimizer, local
+CoTracker, and PCA teacher self-check error `5.96e-8`. Both retain DC/R1=1,
+stat anchor 1, Flash t=60, `.0175` Q1~0.99 GAN weight, cache off and fresh
+D-before-field. The VGG action-conditioning experiment is disabled on both.
+
+## Promoted CARN candidate: staged aux-minus -> commit
+
+The best CARN candidate is no longer immediate `CARNMODE=commit_aux`. Use the
+guarded `CARNMODE=commit_aux_staged`: aux-minus stays at `.25`, while recurrent
+commit is zero through step 100, `.125` at step 150 and `.25` from step 200.
+The mode pins rollout/legacy R2-to-R1 training, no score/Flash mutation,
+Flash-t=60 GAN and auxiliary sources, DC/no-SWT, stat anchor `1.0`, raw
+transition matching off, stat-anchor offset matching `K=2`, frozen action
+critic guidance `.3`, cache off, fresh D-before-field, `LR=1e-3`, U1 and
+R1=1. It uses the all-residual Q1~0.99 bundle.
+
+`PIXW=.0125` is provisional only. Run
+`sbatch/run_carn_q1p99_commit_aux_staged_calibration_node.sh` at weight zero
+through step 225, inspect the aux/commit/HF/stat/GAN-share/runtime gates, then
+set `CARN_STAGED_CALIBRATION_APPROVED=YES` and its W&B ID in
+`CARN_STAGED_CALIBRATION_RUN` before any active launch. The guarded launcher
+refuses an active staged run without those proofs. Preserve `commit_aux` only
+as historical evidence; its immediate full-strength commit is not the final
+candidate.
 
 ## Read first
 
@@ -132,21 +222,29 @@ enabled while the GAN still consumes the old DMD/finish surface.
 
 The guarded launcher pins this contract in
 `sbatch/run_carn_decoder_surrogate_node.sh`. It keeps
-`gan_updates_per_step=1` while the cache-correct campaign is rebuilt. The
-structurally protected candidate under retest is:
+`gan_updates_per_step=1`. The promoted brightness default is:
 
 ```text
-PIXEL_FILTER=dc
+PIXEL_FILTER=raw_grad_hp
 STAT_ANCHOR=1.0
 ```
 
-Spatial DC rejection still has an analytic zero-brightness-cotangent
-guarantee, so it is a reasonable protected candidate rather than a measured
-winner. The former `fzuybrrm`/raw/SWT/no-anchor comparison is invalidated by
-the stale decode cache and must not select a production recipe. Do not enable
-the raw-image nearest matcher; it reinstates the exposure cue that DC removes.
-The historical measurements and invalidation are documented in
+`raw_grad_hp` is deliberately DC-off in the discriminator forward pass: D
+sees raw RGB and can follow an evolving mean. Its backward-only fixed B3
+high-pass plus exact zero-mean projection prevents the GAN cotangent itself
+from directly imposing a global or broad exposure patch. Keep the stat anchor
+on; it owns the desired mean trajectory. Do not confuse this input policy with
+the raw-image nearest matcher, which remains disabled. The historical
+measurements and invalidation are documented in
 `analysis/gan_tuning/FLASH_BRIGHTNESS_WAVELET_2808.md`.
+
+The matched active screen (`ne3hjgsd` DC-on versus `v7k43yrb` DC-off) was
+visually accepted for brightness control. The remaining milkiness begins only
+after the seed chunk exits the rolling context, following a temporary motion
+stall. Treat that timing as an attention/curriculum issue, not a failure of
+the brightness filter. The proposed next curriculum is 200 stationary steps
+over the first seven autoregressive chunks, followed by rolling training; it
+has not yet been implemented or validated.
 
 At runtime require all of these proofs:
 

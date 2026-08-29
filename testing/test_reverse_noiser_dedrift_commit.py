@@ -72,6 +72,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import inspect
+import math
 import os
 import sys
 import textwrap
@@ -609,6 +610,43 @@ def test_level_comes_from_the_shared_flat_knob(method):
     )
 
 
+def test_absolute_commit_level_matches_streaming_slab_position_rule():
+    net = _noiser()
+    owner = _armed_owner(
+        net,
+        reverse_noiser_commit_use_absolute_level=True,
+        num_frame_per_block=NPB,
+        dmd_context_clean_frames=3 * NPB,
+        forward_noiser_max_carn_step=4,
+    )
+    pipe, _ = _build(**{OWNER_ATTR: owner})
+    x = torch.randn(1, NPB, LAT_C, LAT_H, LAT_W)
+    # With three clean seed chunks, frame 15 is chunk index 5 and therefore
+    # CARN level 5-(3-1)=3, exactly the streaming-slab convention.
+    with torch.no_grad():
+        got = pipe._reverse_noiser_dedrift_commit(x, frame_start=5 * NPB)
+        expect = owner._dedrift_with_reverse_noiser(x, 3)
+        wrong = owner._dedrift_with_reverse_noiser(x, 1)
+    assert torch.equal(got, expect)
+    assert not torch.equal(got, wrong)
+    assert pipe._last_extension_metrics["carn_commit_dedrift_level"] == 3.0
+
+
+def test_absolute_commit_level_requires_an_explicit_aligned_position():
+    owner = _armed_owner(
+        reverse_noiser_commit_use_absolute_level=True,
+        num_frame_per_block=NPB,
+        dmd_context_clean_frames=3 * NPB,
+        forward_noiser_max_carn_step=4,
+    )
+    pipe, _ = _build(**{OWNER_ATTR: owner})
+    x = torch.randn(1, NPB, LAT_C, LAT_H, LAT_W)
+    with pytest.raises(RuntimeError, match="requires frame_start"):
+        pipe._reverse_noiser_dedrift_commit(x)
+    with pytest.raises(RuntimeError, match="npb-aligned"):
+        pipe._reverse_noiser_dedrift_commit(x, frame_start=NPB + 1)
+
+
 @pytest.mark.parametrize("method", sorted(RUNNERS))
 def test_the_correction_is_commit_only_the_emitted_chunk_is_unchanged(method):
     """DOCUMENTED SEMANTICS, not an accident. Only the AR memory is
@@ -698,6 +736,23 @@ def test_commit_warmup_and_ramp_are_step_resolved():
     x = _commit_call(gen_off)["in"]
     full = owner._dedrift_with_reverse_noiser(x, 1)
     assert torch.allclose(_commit_call(gen2)["in"], x + 0.125 * (full - x))
+    assert pipe2._last_extension_metrics["carn_commit_dedrift_alpha"] == 0.125
+
+    owner._carn_commit_current_step = 200
+    pipe3, gen3 = _build(**{OWNER_ATTR: owner})
+    _run_gcwc(pipe3)
+    assert torch.allclose(_commit_call(gen3)["in"], x + 0.25 * (full - x))
+    assert pipe3._last_extension_metrics["carn_commit_dedrift_alpha"] == 0.25
+
+
+def test_commit_displacement_is_published_only_on_existing_sync_milestones():
+    owner = _armed_owner(reverse_noiser_commit_alpha=0.25)
+    pipe, _ = _build(**{OWNER_ATTR: owner})
+    _run_gcwc(pipe)
+    metrics = pipe._last_extension_metrics
+    assert metrics["carn_commit_dedrift_rel_step"] == 0.0
+    assert math.isfinite(metrics["carn_commit_dedrift_rel"])
+    assert metrics["carn_commit_dedrift_rel"] >= 0.0
 
 
 # ===========================================================================

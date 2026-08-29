@@ -215,9 +215,141 @@ temporary discriminator micro-groups and supplied stale decoded pixels.
 Accordingly `.10`, the four 100-step rankings, the stopped transition/R1
 wave, and the brightness-screen ranking are withdrawn pending cache-off
 repetition. This does not change section 7's standalone aux-minus result,
-which did not depend on this VGG decode cache. Corrected weight-zero
-calibrations are running on all four nodes of holders `6168503/6168505`; only
-their child steps may be stopped, never the holders.
+which did not depend on this VGG decode cache. The first cache-off weight-zero
+controls finished but revealed that the surrogate field was still queried
+before a deferred discriminator update. They prove the Q1 route, not a field
+from a discriminator freshly trained on the current batch. True
+`dfresh_DthenG` repeats are running on all four nodes of holders
+`6168503/6168505`; only their child steps may be stopped, never the holders.
+
+The new ordering is fail-closed: `surrogate_decoder_fresh_disc_order=true`
+requires `ladd_defer_disc_update=false`, runs the current-batch D optimizer
+first, verifies its inline-update counter increased, then constructs and folds
+the Q1 field. The first active field must log
+`surrogate_decoder_disc_updates_before_field>0` and
+`surrogate_decoder_disc_updated_before_field=1`. The calibration repeats
+`83wlndxr/y9ry8jhr/bbj4flwh/bfvw2wik` (DC R1=10, DC R1=1, raw R1=10,
+DC+aux-minus R1=10) completed and passed that proof on every active field.
+Their median unweighted shares are `.882/2.404/.946/.777`. The first nonzero
+wave normalized these to about 3% using `.035/.0125/.032/.040`: W&B
+`qa0uuodt/cupkuznr/cedh3jod/ybfvxoeh`. It was valid under both the cache and
+ordering corrections and remained finite through about step 66; only its child
+steps were stopped so the same holder time could be promoted to 300-step runs.
+
+The definitive 300-step wave is now live with videos every 15 steps. Holder
+`6168503` carries the calibrated DC reference pair: R1=10, `PIXW=.035`
+(`wkq1l6p2`) and R1=1, `PIXW=.0125` (`7o96m8uh`). Holder `6168505` carries a
+matched strong-stable CARN comparison at R1=1 and `PIXW=.0175`: reference
+(`htfhu37j`) versus aux-minus weight `.25` (`acmv0qur`). The latter pair is
+identical in every GAN, Flash, stat-anchor and pullback setting; its sole
+intended treatment axis is the complete tested CARN policy (reference cycle
+versus the R2-to-R1 aux-minus internalisation contract). This directly tests
+whether the preferred standalone CARN aux-minus consumer also helps the new
+Q1~0.99 GAN dynamics.
+
+The first active field passed on both strong arms. Runtime/W&B telemetry shows
+one inline D update before each field, current teacher `1`, detached state `1`,
+staleness `0`, all-residual exactness `1`, generator reach `825/825`, Flash
+selection `15/18` frames, decode cache `0`, and 30 genuine decode calls. At
+step 26 the reference D was `real=+.214,fake=+.110,loss=.643`; aux-minus was
+`real=+.405,fake=+.311,loss=.648`. Both are correctly ordered and finite. Both
+runs uploaded `pred_image`, seven-chunk and full-rollout videos by step 16.
+
+## 7.2 Best CARN candidate so far: staged aux-minus -> commit (28 August)
+
+**Researcher ruling.** The final candidate is the staged aux-minus-to-commit
+recipe below. It preserves the useful CARN behavior seen in `309hsl7v`, but
+none of that run's invalid GAN plumbing is carried forward. The current live
+aux-minus-only arm remains useful evidence; it is not the final combined
+recipe.
+
+The CARN contract is:
+
+```text
+forward_noiser_enabled=true
+forward_noiser_train_source=rollout
+forward_noiser_rollout2_source=legacy
+forward_noiser_reverse=true
+forward_noiser_cycle_enabled=false
+forward_noiser_apply_decoupled=false
+forward_noiser_apply_gt_former=false
+forward_noiser_apply_gt_both=false
+forward_noiser_apply_in_aux=false
+
+reverse_noiser_dedrift_enabled=true
+reverse_noiser_dedrift_level=1
+reverse_noiser_dedrift_min_level=1
+reverse_noiser_dedrift_steps=1
+reverse_noiser_dedrift_alpha0=1.0
+reverse_noiser_internalize_weight=0.25
+reverse_noiser_dedrift_apply_to_train_score=false
+reverse_noiser_dedrift_apply_to_flash=false
+
+reverse_noiser_dedrift_apply_to_commit=true
+reverse_noiser_commit_alpha=0.25
+reverse_noiser_commit_start_step=100
+reverse_noiser_commit_ramp_steps=100
+```
+
+Aux-minus remains at `.25` throughout. Only recurrent-memory commit is
+scheduled:
+
+| training step | effective commit alpha |
+|---:|---:|
+| 0--99 | 0 |
+| 100 | 0 |
+| 150 | .125 |
+| >=200 | .25 |
+
+The corrected GAN and auxiliary contract is Flash t=60 on both D and G,
+spatial-DC input rejection, stat anchor `1.0`, cache off, and a fresh inline D
+update before the Q1 field:
+
+```text
+flash_dmd_enabled=true
+flash_dmd_gan_t=60
+gen_aux_losses_x0_source=flash
+ladd_fake_sample_source=flash
+pix_flash_grad_select_enabled=true
+pix_finish_grad_enabled=false
+ladd_pixel_input_filter=dc
+ladd_pixel_swt_strength=0.0
+stat_anchor_loss_weight=1.0
+ladd_pixel_decode_cache=false
+ladd_defer_disc_update=false
+surrogate_decoder_fresh_disc_order=true
+gan_updates_per_step=1
+gan_lr=1e-3
+ladd_r1_gamma=1
+ladd_gt_transition_match=false
+stat_anchor_use_clean_match_offset=true
+stat_anchor_match_k=2
+action_critic_aux_enabled=true
+action_critic_freeze=true
+generator_action_z_guidance_weight=0.3
+```
+
+It uses the hash-pinned all-residual Q1~0.99 bundle. `PIXW=.0125` is only a
+safe provisional active scalar; the combined staged recipe must first receive
+its own weight-zero production-geometry calibration. The guarded launcher now
+exposes `CARNMODE=commit_aux_staged`, refuses incompatible raw/SWT, R1=10,
+non-U1 or old-order settings, and refuses an active staged run without a
+separate staged calibration ID and approval. The ready calibration wrapper is
+`sbatch/run_carn_q1p99_commit_aux_staged_calibration_node.sh`; it runs 225
+steps so all three commit schedule landmarks are observed.
+
+Promotion requires: aux internalisation active before step 100; commit alpha
+`0/.125/.25` at steps `100/150/200`; milestone committed-state relative
+displacement below about 1%; no sustained HF-power or stat-anchor increase
+after step 200; median applied GAN share near 3% with excursions below 10%;
+and every cache-off, fresh-D, Flash-selection, Q1 exact-stage/current-teacher,
+detached-state, zero-staleness and generator-reach proof. The displacement is
+now published as `carn_commit_dedrift_rel` on the existing geometric logging
+milestones without adding a per-commit GPU synchronization.
+
+Do not promote the older `CARNMODE=commit_aux`: it applies immediate
+full-strength commit and recreates the unstable good/bad identical-repeat
+configuration. It remains available only as a historical ablation.
 
 The GAN consumer used for the eventual CARN reflow is no longer the learned
 Q1~0.60 exact-6+7 transport.  New runs use the hash-pinned all-residual WAN
@@ -225,12 +357,12 @@ pullback measured at paired Q1 `.990999` and strict Cartesian Q1 `.992351`.
 All 12 residual VJPs are analytic/tied and consume the current Flash-t=60
 pixel cotangent with detached state and zero staleness; no surrogate fitting
 or reconvergence occurs in training.  The definitive launcher retains only
-the CARN reference/commit/aux-minus/commit+aux/former-plus/latter-minus
+the CARN reference/commit/aux-minus/staged-commit+aux/former-plus/latter-minus
 surface and explicitly disables the older pixel-texture, OF and latent-
-surrogate GAN paths.  Weight-zero production calibration selected
-`LR=1e-3,U1` and a conservative first live `PIXW=.10`; the active smoke is
-W&B `mpt1nx4y`.  This changes the GAN transport used to evaluate CARN, not the
-section-7 ruling that aux-minus is the preferred CARN consumer.
+surrogate GAN paths. Weight-zero production calibration selected `LR=1e-3,U1`
+and treatment-specific weights above; no obsolete `.10` scalar is reused.
+This changes the GAN transport used to evaluate CARN, not the section-7 ruling
+that aux-minus is the preferred standalone CARN consumer.
 
 The invalidated first matched Q1~0.99 wave completed as reference `4vo4kwys`, commit
 `ududui2a`, aux-minus `1wyle11y`, and commit+aux `u3i9p6ya`.  All four pass

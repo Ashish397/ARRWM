@@ -1399,7 +1399,7 @@ class ActionForcingTrainingPipeline:
     # ``testing/test_reverse_noiser_dedrift_commit.py``.
     # -----------------------------------------------------------------
     def _reverse_noiser_dedrift_commit(
-        self, x: torch.Tensor,
+        self, x: torch.Tensor, *, frame_start: Optional[int] = None,
     ) -> torch.Tensor:
         owner = getattr(self, "_carn_commit_dedrift_owner", None)
         if not bool(getattr(
@@ -1443,6 +1443,32 @@ class ActionForcingTrainingPipeline:
         if fn is None:
             return x
         lvl = int(getattr(owner, "reverse_noiser_dedrift_level", 1))
+        if bool(getattr(
+            owner, "reverse_noiser_commit_use_absolute_level", False,
+        )):
+            if frame_start is None:
+                raise RuntimeError(
+                    "absolute-level CARN commit requires frame_start"
+                )
+            npb = int(getattr(owner, "num_frame_per_block", 0))
+            if npb <= 0 or int(frame_start) % npb != 0:
+                raise RuntimeError(
+                    "absolute-level CARN commit requires an npb-aligned "
+                    f"frame_start; got frame_start={frame_start}, npb={npb}."
+                )
+            num_seed = int(
+                getattr(owner, "dmd_context_clean_frames", 0) // npb
+            )
+            max_level = int(getattr(
+                owner, "forward_noiser_max_carn_step", lvl,
+            ))
+            # Same absolute-position convention as
+            # _dedrift_streaming_slab_with_reverse_noiser: the final clean
+            # seed chunk is level 0 and the first generated chunk is level 1.
+            lvl = min(
+                max(0, (int(frame_start) // npb) - (num_seed - 1)),
+                max_level,
+            )
         out = fn(x, lvl)
         if out is x:
             # The helper's own gate declined (disabled / no network /
@@ -1466,6 +1492,7 @@ class ActionForcingTrainingPipeline:
             )
             m["carn_commit_dedrift_alpha"] = float(commit_alpha)
             m["carn_commit_dedrift_step"] = float(step)
+            m["carn_commit_dedrift_level"] = float(lvl)
         # MILESTONE rank-0 proof line with the relative displacement.
         #
         # NOT one-shot, deliberately. The corrector is zero-init
@@ -1488,6 +1515,13 @@ class ActionForcingTrainingPipeline:
                         (out.detach().float() - x.detach().float()).norm()
                         / max(float(x.detach().float().norm()), 1e-8)
                     )
+                # Reuse the milestone sync above to make the displacement
+                # promotion gate queryable in W&B without adding a per-commit
+                # synchronization. Between milestones the key is absent, not
+                # silently repeated from an older cotangent/state.
+                if isinstance(m, dict):
+                    m["carn_commit_dedrift_rel"] = float(rel)
+                    m["carn_commit_dedrift_rel_step"] = float(step)
                 if (dist.get_rank() if dist.is_initialized() else 0) == 0:
                     print(
                         "[CARN][commit-dedrift] ACTIVE at the KV commit: "
@@ -2297,7 +2331,7 @@ class ActionForcingTrainingPipeline:
             # object) unless ``reverse_noiser_dedrift_apply_to_commit``
             # AND ``reverse_noiser_dedrift_enabled`` are both on.
             commit_input_clean = self._reverse_noiser_dedrift_commit(
-                commit_input_clean,
+                commit_input_clean, frame_start=current_start_frame,
             )
             # CARN seam correction. Extracted to ``_carn_seam_correct``
             # (single shared implementation, bit-identical to the code
@@ -3356,7 +3390,7 @@ class ActionForcingTrainingPipeline:
             # ``generate_chunk_with_cache`` calls, so every rollout2
             # chunk after the first conditions on CORRECTED context.
             commit_input_clean = self._reverse_noiser_dedrift_commit(
-                commit_input_clean,
+                commit_input_clean, frame_start=current_start_frame,
             )
             # CARN seam correction. Extracted to ``_carn_seam_correct``
             # (single shared implementation, bit-identical to the code

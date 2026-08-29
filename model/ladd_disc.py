@@ -745,7 +745,8 @@ class LADDDiscHead(nn.Module):
         self,
         feat: torch.Tensor,
         cmap: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        mismatch_cmap: Optional[torch.Tensor] = None,
+    ):
         # feat: [B*T', dim_proj, H', W']
         x = self.in_block(feat)
         x = self.res_block(x)
@@ -762,15 +763,86 @@ class LADDDiscHead(nn.Module):
             # the [B*T', cmap_dim, ...] activation. Recover T' from
             # the activation's batch axis: B_eff = first_dim, T' =
             # B_eff // cmap.shape[0].
-            B_eff = out.shape[0]
-            B_cmap = cmap.shape[0]
-            t_frames = max(1, B_eff // B_cmap)
-            cmap_expanded = cmap.repeat_interleave(t_frames, dim=0)
-            cmap_b = cmap_expanded.unsqueeze(-1).unsqueeze(-1)  # [B*T', cmap_dim, 1, 1]
-            out = (out * cmap_b).sum(1, keepdim=True) * (
-                1.0 / math.sqrt(self.cmap_dim)
+            def _project(this_cmap: torch.Tensor) -> torch.Tensor:
+                B_eff = out.shape[0]
+                B_cmap = this_cmap.shape[0]
+                if B_cmap <= 0 or B_eff % B_cmap != 0:
+                    raise ValueError(
+                        "LADD cmap batch must divide the folded feature "
+                        f"batch; got B_eff={B_eff}, B_cmap={B_cmap}."
+                    )
+                t_frames = B_eff // B_cmap
+                cmap_expanded = this_cmap.repeat_interleave(t_frames, dim=0)
+                cmap_b = cmap_expanded.unsqueeze(-1).unsqueeze(-1)
+                return (out * cmap_b).sum(1, keepdim=True) * (
+                    1.0 / math.sqrt(self.cmap_dim)
+                )
+
+            projected = _project(cmap)
+            if mismatch_cmap is not None:
+                # One SpectralConv/head forward, two cheap projections.  This
+                # keeps both conditions on the identical activation and avoids
+                # a second train-mode spectral-normalization buffer mutation.
+                return projected, _project(mismatch_cmap)
+            return projected
+        if mismatch_cmap is not None:
+            raise ValueError(
+                "mismatch_cmap requires a projection head with cmap_dim>0."
             )
         return out
+
+
+class LADDActionConditioner(nn.Module):
+    """Map a per-frame action-token sequence to one projection cmap.
+
+    The pixel discriminator scores a short video window as one row.  A plain
+    temporal mean would make opposite action schedules indistinguishable, so
+    the summary retains the mean, scale, endpoints and signed endpoint delta.
+    The input is conditioning-only (the trainer detaches action tokens); this
+    module belongs to, and is optimized with, the discriminator.
+    """
+
+    def __init__(self, action_embed_dim: int, cmap_dim: int):
+        super().__init__()
+        self.action_embed_dim = int(action_embed_dim)
+        self.cmap_dim = int(cmap_dim)
+        if self.action_embed_dim <= 0 or self.cmap_dim <= 0:
+            raise ValueError(
+                "LADDActionConditioner dimensions must be positive; got "
+                f"action_embed_dim={self.action_embed_dim}, "
+                f"cmap_dim={self.cmap_dim}."
+            )
+        self.norm = nn.LayerNorm(self.action_embed_dim)
+        self.frame_proj = nn.Linear(self.action_embed_dim, self.cmap_dim)
+        self.summary = nn.Sequential(
+            nn.Linear(5 * self.cmap_dim, 2 * self.cmap_dim),
+            nn.SiLU(),
+            nn.Linear(2 * self.cmap_dim, self.cmap_dim),
+        )
+
+    def forward(self, action_tokens: torch.Tensor) -> torch.Tensor:
+        if action_tokens.dim() != 3:
+            raise ValueError(
+                "LADD action conditioning expects action tokens with shape "
+                f"[B,F,D]; got {tuple(action_tokens.shape)}."
+            )
+        if int(action_tokens.shape[-1]) != self.action_embed_dim:
+            raise ValueError(
+                "LADD action-token width does not match the built action "
+                f"conditioner: got {int(action_tokens.shape[-1])}, expected "
+                f"{self.action_embed_dim}."
+            )
+        if int(action_tokens.shape[1]) < 1:
+            raise ValueError("LADD action conditioning received zero frames.")
+        ref = self.frame_proj.weight
+        x = action_tokens.to(device=ref.device, dtype=ref.dtype)
+        x = self.frame_proj(self.norm(x))
+        mean = x.mean(dim=1)
+        scale = torch.sqrt(x.var(dim=1, unbiased=False) + 1.0e-6)
+        first = x[:, 0]
+        last = x[:, -1]
+        delta = last - first
+        return self.summary(torch.cat([mean, scale, first, last, delta], dim=-1))
 
 
 # ============================================================================
@@ -1295,6 +1367,7 @@ class LADDDiscriminator(nn.Module):
         head_kernel_size: int = 3,
         cmap_dim: int = 0,
         prompt_embed_dim: int = 0,
+        action_embed_dim: int = 0,
         wavelet_hf_enabled: bool = False,
         wavelet_hf_in_channels: int = 16,
         wavelet_hf_drop_ll: bool = False,
@@ -1407,6 +1480,7 @@ class LADDDiscriminator(nn.Module):
         self.dim_proj = int(dim_proj)
         self.use_csm = bool(use_csm)
         self.cmap_dim = int(cmap_dim)
+        self.action_embed_dim = int(action_embed_dim)
         self.wavelet_hf_enabled = bool(wavelet_hf_enabled)
         self.scalar_output = bool(scalar_output)
         self.freeze_projector_mixing = bool(freeze_projector_mixing)
@@ -1460,6 +1534,26 @@ class LADDDiscriminator(nn.Module):
             self.csm = None
             self.heads = None
             self.cmapper = None
+            self.pooled_action_proj = None
+            if self.action_embed_dim > 0:
+                if self.cmap_dim <= 0:
+                    raise ValueError(
+                        "Pooled LADD action conditioning requires cmap_dim>0."
+                    )
+                # Projection discriminator on the ORDERLESS statistic
+                # embedding.  This keeps the winning VGG [mu,sigma,Cov]
+                # evidence and adds only <h(image), c(action)>; it does not
+                # replace it with the dense spatial LADD heads.
+                self.action_cmapper = LADDActionConditioner(
+                    self.action_embed_dim, self.cmap_dim,
+                )
+                self.pooled_action_proj = nn.Linear(
+                    int(self.pooled_readout.hidden_dim),
+                    self.cmap_dim,
+                    bias=False,
+                )
+            else:
+                self.action_cmapper = None
         elif self.readout == "register":
             if self.cmap_dim > 0:
                 raise ValueError(
@@ -1480,6 +1574,8 @@ class LADDDiscriminator(nn.Module):
             self.csm = None
             self.heads = None
             self.cmapper = None
+            self.action_cmapper = None
+            self.pooled_action_proj = None
             self.register_readout = LADDRegisterReadout(
                 block_indices=self.block_indices,
                 dim_teacher=self.dim_teacher,
@@ -1495,6 +1591,7 @@ class LADDDiscriminator(nn.Module):
                 use_checkpoint=register_checkpoint,
             )
         else:
+            self.pooled_action_proj = None
             self.ccm = LADDChannelMixer(
                 block_indices=self.block_indices,
                 # Per-tap dims when a pixel source is installed (its
@@ -1526,14 +1623,28 @@ class LADDDiscriminator(nn.Module):
                 ) for i in self.block_indices}
             )
             if self.cmap_dim > 0:
-                if prompt_embed_dim <= 0:
+                if prompt_embed_dim <= 0 and self.action_embed_dim <= 0:
                     raise ValueError(
-                        "LADDDiscriminator: prompt_embed_dim must be >0 when "
-                        "cmap_dim>0."
+                        "LADDDiscriminator: cmap_dim>0 requires prompt or "
+                        "action conditioning."
                     )
-                self.cmapper = nn.Linear(prompt_embed_dim, self.cmap_dim)
+                self.cmapper = (
+                    nn.Linear(prompt_embed_dim, self.cmap_dim)
+                    if prompt_embed_dim > 0 else None
+                )
+                self.action_cmapper = (
+                    LADDActionConditioner(
+                        self.action_embed_dim, self.cmap_dim,
+                    )
+                    if self.action_embed_dim > 0 else None
+                )
             else:
                 self.cmapper = None
+                self.action_cmapper = None
+                if self.action_embed_dim > 0:
+                    raise ValueError(
+                        "LADD action conditioning requires cmap_dim>0."
+                    )
 
         # Parallel stat head — distribution-match std statistics
         # adversarially. Operates on the RAW input latent, NOT on the
@@ -1684,6 +1795,58 @@ class LADDDiscriminator(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def _pooled_conditioned_logits(
+        self,
+        feats,
+        *,
+        action_tokens: Optional[torch.Tensor] = None,
+        mismatch_action_tokens: Optional[torch.Tensor] = None,
+    ):
+        """Score a pooled VGG/RN50 evidence bank under one/two actions."""
+        if self.pooled_readout is None:
+            raise RuntimeError("pooled conditioning requires a pooled readout")
+        action_proj = getattr(self, "pooled_action_proj", None)
+        if action_proj is None:
+            # The trainer must still build/pass action tensors for the WAN
+            # discriminator geometry even when this pooled pixel readout is
+            # deliberately action-blind.  Preserve the historical blind arm
+            # by ignoring the matched tokens here.  A mismatch objective is
+            # different: it requires an action projection and must fail loud.
+            if mismatch_action_tokens is not None:
+                raise ValueError(
+                    "Wrong-action logits require an action-conditioned "
+                    "pooled LADD discriminator."
+                )
+            return self.pooled_readout(feats), None
+
+        if action_tokens is None:
+            raise ValueError(
+                "Pooled LADD action conditioner is active but matched action "
+                "tokens were not provided."
+            )
+        base, hidden = self.pooled_readout(feats, return_hidden=True)
+        image_cmap = action_proj(hidden)
+
+        def _compat(tokens: torch.Tensor) -> torch.Tensor:
+            cmap = self.action_cmapper(tokens)
+            n_img, n_rows = int(image_cmap.shape[0]), int(cmap.shape[0])
+            if n_rows <= 0 or n_img % n_rows != 0:
+                raise ValueError(
+                    "Pooled LADD action batch must divide the image batch; "
+                    f"got images={n_img}, action_rows={n_rows}."
+                )
+            cmap = cmap.repeat_interleave(n_img // n_rows, dim=0)
+            return (image_cmap * cmap).sum(dim=1, keepdim=True) * (
+                1.0 / math.sqrt(float(self.cmap_dim))
+            )
+
+        matched = base + _compat(action_tokens)
+        mismatched = (
+            base + _compat(mismatch_action_tokens)
+            if mismatch_action_tokens is not None else None
+        )
+        return matched, mismatched
+
     @property
     def stat_logit_count(self) -> int:
         """Number of stat-head logits appended at the END of ``forward``'s
@@ -1699,7 +1862,12 @@ class LADDDiscriminator(nn.Module):
         return 1 if self.stat_head is not None else 0
 
     # ------------------------------------------------------------------
-    def score_pixels(self, pixels: torch.Tensor) -> torch.Tensor:
+    def score_pixels(
+        self,
+        pixels: torch.Tensor,
+        *,
+        action_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """``[N, 3, H, W]`` pixels -> ``[N]`` scalar critic value.
 
         The SURROGATE TEACHER entry point (researcher directive
@@ -1745,7 +1913,15 @@ class LADDDiscriminator(nn.Module):
             self.pixel_stats["teacher_calls"] = (
                 self.pixel_stats.get("teacher_calls", 0.0) + 1.0
             )
-            return self.pooled_readout(feats).reshape(-1)
+            logits, _ = self._pooled_conditioned_logits(
+                feats, action_tokens=action_tokens,
+            )
+            return logits.reshape(-1)
+        if self.action_cmapper is not None:
+            raise RuntimeError(
+                "score_pixels action conditioning is currently implemented "
+                "for the orderless pooled VGG/RN50 readout only."
+            )
         gh, gw = self.pixel_source.grid
         proj = self.ccm(feats)
         if self.csm is not None:
@@ -2142,8 +2318,26 @@ class LADDDiscriminator(nn.Module):
             # per FRAME, which is the coarsest readout the RpGAN
             # reduction can be given without averaging two independent
             # pictures together.
-            _pool_logits = self.pooled_readout(feats)
+            _matched_actions = (
+                conditional_extra.get("_action_tokens")
+                if conditional_extra is not None else None
+            )
+            _mismatch_actions = (
+                conditional_extra.get("_ladd_action_tokens_mismatch")
+                if conditional_extra is not None else None
+            )
+            _pool_logits, _pool_mismatch_logits = (
+                self._pooled_conditioned_logits(
+                    feats,
+                    action_tokens=_matched_actions,
+                    mismatch_action_tokens=_mismatch_actions,
+                )
+            )
             visual_logits = _pool_logits.reshape(B_pool, -1)
+            mismatch_visual_logits = (
+                _pool_mismatch_logits.reshape(B_pool, -1)
+                if _pool_mismatch_logits is not None else None
+            )
             self.pixel_stats["pooled_calls"] += 1.0
             self.pixel_stats["logits_per_sample"] = float(
                 visual_logits.shape[1])
@@ -2155,10 +2349,16 @@ class LADDDiscriminator(nn.Module):
                 ] = float(visual_logits.shape[1])
             if self.scalar_output:
                 visual_logits = visual_logits.mean(dim=1, keepdim=True)
+                if mismatch_visual_logits is not None:
+                    mismatch_visual_logits = mismatch_visual_logits.mean(
+                        dim=1, keepdim=True,
+                    )
             if self.stat_head is not None:
                 visual_logits = torch.cat(
                     [visual_logits, self.stat_head(x_noisy_raw)], dim=1,
                 )
+            if mismatch_visual_logits is not None:
+                return visual_logits, mismatch_visual_logits
             return visual_logits
 
         if self.register_readout is not None:
@@ -2185,14 +2385,53 @@ class LADDDiscriminator(nn.Module):
         proj = self.ccm(feats)
         if self.csm is not None:
             proj = self.csm(proj)
-        cmap = None
-        if self.cmap_dim > 0:
-            if pooled_prompt is None:
-                raise ValueError(
-                    "LADDDiscriminator built with cmap_dim>0 but "
-                    "pooled_prompt not provided."
+        def _condition_cmap(action_key: str = "_action_tokens"):
+            if self.cmap_dim <= 0:
+                return None
+            parts = []
+            if self.cmapper is not None:
+                if pooled_prompt is None:
+                    raise ValueError(
+                        "LADD prompt conditioner is active but pooled_prompt "
+                        "was not provided."
+                    )
+                parts.append(self.cmapper(pooled_prompt.float()))
+            if self.action_cmapper is not None:
+                action_tokens = (
+                    conditional_extra.get(action_key)
+                    if conditional_extra is not None else None
                 )
-            cmap = self.cmapper(pooled_prompt.float())
+                if action_tokens is None:
+                    raise ValueError(
+                        "LADD action conditioner is active but "
+                        f"conditional_extra[{action_key!r}] was not provided."
+                    )
+                parts.append(self.action_cmapper(action_tokens))
+            if not parts:
+                raise RuntimeError(
+                    "LADD cmap heads were built without an active condition."
+                )
+            out = parts[0]
+            for part in parts[1:]:
+                out = out + part
+            if len(parts) > 1:
+                out = out * (1.0 / math.sqrt(float(len(parts))))
+            return out
+
+        cmap = _condition_cmap()
+        mismatch_requested = bool(
+            conditional_extra is not None
+            and "_ladd_action_tokens_mismatch" in conditional_extra
+        )
+        if mismatch_requested and self.action_cmapper is None:
+            raise ValueError(
+                "A LADD wrong-action condition was supplied, but action "
+                "conditioning is not built."
+            )
+        mismatch_cmap = (
+            _condition_cmap("_ladd_action_tokens_mismatch")
+            if mismatch_requested else None
+        )
 
         # Reshape each tap's token sequence to a 2D patch grid so the
         # heads can run 2D SpectralConvs (matches LADD's per-tap 2D
@@ -2265,19 +2504,36 @@ class LADDDiscriminator(nn.Module):
                 proj_2d[idx] = feat
 
         logits_per_scale = []
+        mismatch_logits_per_scale = []
         self.pixel_stats["dense_head_calls"] += 1.0
         for idx in self.block_indices:
-            l = self.heads[str(idx)](proj_2d[idx], cmap=cmap)
+            head_out = self.heads[str(idx)](
+                proj_2d[idx], cmap=cmap, mismatch_cmap=mismatch_cmap,
+            )
+            if mismatch_cmap is not None:
+                l, lm = head_out
+            else:
+                l, lm = head_out, None
             # l: [B*T', cmap_dim_or_1, H', W'] -> per-sample flat.
             l = l.reshape(B, -1)
             logits_per_scale.append(l)
+            if lm is not None:
+                mismatch_logits_per_scale.append(lm.reshape(B, -1))
         visual_logits = torch.cat(logits_per_scale, dim=1)
+        mismatch_visual_logits = (
+            torch.cat(mismatch_logits_per_scale, dim=1)
+            if mismatch_logits_per_scale else None
+        )
         self.pixel_stats["logits_per_sample"] = float(visual_logits.shape[1])
         if self.scalar_output:
             # One invariant critic value per sample. This reduction is part of
             # D itself, so D/G losses and R1 all differentiate the exact
             # same scalar instead of summing a resolution-dependent token map.
             visual_logits = visual_logits.mean(dim=1, keepdim=True)
+            if mismatch_visual_logits is not None:
+                mismatch_visual_logits = mismatch_visual_logits.mean(
+                    dim=1, keepdim=True,
+                )
 
         # Append the parallel stat-head logit. The stat head
         # discriminates std distribution on the RAW input latent
@@ -2291,6 +2547,8 @@ class LADDDiscriminator(nn.Module):
         if self.stat_head is not None:
             stat_logit = self.stat_head(x_noisy_raw)
             visual_logits = torch.cat([visual_logits, stat_logit], dim=1)
+        if mismatch_visual_logits is not None:
+            return visual_logits, mismatch_visual_logits
         return visual_logits
 
 
@@ -2481,6 +2739,7 @@ def build_ladd_disc(
     head_kernel_size: int = 3,
     cmap_dim: int = 0,
     prompt_embed_dim: int = 0,
+    action_embed_dim: int = 0,
     wavelet_hf_enabled: bool = False,
     wavelet_hf_in_channels: int = 16,
     wavelet_hf_drop_ll: bool = False,
@@ -2595,6 +2854,7 @@ def build_ladd_disc(
         head_kernel_size=head_kernel_size,
         cmap_dim=cmap_dim,
         prompt_embed_dim=prompt_embed_dim,
+        action_embed_dim=action_embed_dim,
         wavelet_hf_enabled=wavelet_hf_enabled,
         wavelet_hf_in_channels=wavelet_hf_in_channels,
         wavelet_hf_drop_ll=wavelet_hf_drop_ll,

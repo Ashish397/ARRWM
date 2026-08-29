@@ -1610,6 +1610,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     _prompt_embed_dim = int(
                         getattr(self.config, "text_embed_dim", 4096)
                     )
+                _ladd_action_cond = bool(getattr(
+                    self.config, "ladd_use_action_cond", False,
+                ))
+                if _ladd_action_cond and _ladd_readout != "ladd":
+                    raise ValueError(
+                        "ladd_use_action_cond=true requires "
+                        "ladd_readout='ladd'; the register readout has no "
+                        "projection cmap."
+                    )
                 _wavelet_hf_enabled = bool(
                     getattr(self.config, "ladd_wavelet_hf_enabled", False)
                 )
@@ -1771,11 +1780,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     # never gradiented (a DDP
                     # find_unused_parameters=False raise). Forced to 0 and
                     # echoed in the build-time telemetry below.
-                    cmap_dim=int(
-                        getattr(self.config, "ladd_cmap_dim", 64)
-                    ) if (_prompt_embed_dim > 0
-                          and _ladd_readout != "register") else 0,
+                    cmap_dim=(
+                        int(getattr(
+                            self.config,
+                            "ladd_action_cmap_dim" if _ladd_action_cond
+                            else "ladd_cmap_dim",
+                            64,
+                        ))
+                        if ((_prompt_embed_dim > 0 or _ladd_action_cond)
+                            and _ladd_readout != "register") else 0
+                    ),
                     prompt_embed_dim=_prompt_embed_dim,
+                    # ActionTokenProjection emits WAN-width tokens even when
+                    # a pixel encoder replaces the feature projector.  Pass
+                    # the original WAN width, not the VGG tap-width map that
+                    # LADDDiscriminator installs internally.
+                    action_embed_dim=(
+                        int(_dim_teacher) if _ladd_action_cond else 0
+                    ),
                     wavelet_hf_enabled=_wavelet_hf_enabled,
                     wavelet_hf_in_channels=_wavelet_in_channels,
                     wavelet_hf_drop_ll=bool(
@@ -1911,15 +1933,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     print(
                         "[ActionForcing] LADD discriminator built: "
                         "blocks=%s dim_teacher=%d dim_proj=%d "
-                        "use_csm=%s cmap_dim=%d wavelet_hf=%s scalar=%s "
+                        "use_csm=%s cmap_dim=%d action_cond=%s "
+                        "action_mismatch_weight=%.3f wavelet_hf=%s scalar=%s "
                         "freeze_mixing=%s "
                         "params_total=%.2fM params_trainable=%.2fM "
                         "(DDP=%s)" % (
                             ladd_blocks, _dim_teacher,
                             int(getattr(self.config, "ladd_proj_dim", 256)),
                             bool(getattr(self.config, "ladd_use_csm", True)),
-                            int(getattr(self.config, "ladd_cmap_dim", 64))
-                            if _prompt_embed_dim > 0 else 0,
+                            int(getattr(
+                                disc, "cmap_dim", 0,
+                            )),
+                            bool(getattr(
+                                disc, "action_cmapper", None,
+                            ) is not None),
+                            float(getattr(
+                                self.config,
+                                "ladd_action_mismatch_weight", 0.0,
+                            )),
                             bool(_wavelet_hf_enabled),
                             bool(getattr(
                                 self.config, "ladd_scalar_output", False)),
@@ -2148,14 +2179,48 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self.decoder_shaped_pullback_enabled = (
             self.decoder_shaped_pullback is not None
         )
+        _fresh_decoder_disc_requested = bool(getattr(
+            self.config, "surrogate_decoder_fresh_disc_order", False,
+        ))
+        if _fresh_decoder_disc_requested:
+            _fresh_errors = []
+            if not self.decoder_shaped_pullback_enabled:
+                _fresh_errors.append(
+                    "surrogate_decoder_shaped_enabled must be true")
+            if not self.gan_enabled:
+                _fresh_errors.append("gan_enabled must be true")
+            if str(getattr(
+                self.config, "surrogate_teacher_backbone", "",
+            )) != "ladd_pixel":
+                _fresh_errors.append(
+                    "surrogate_teacher_backbone must be ladd_pixel")
+            if self.ladd_fake_backbone_trainable:
+                _fresh_errors.append(
+                    "ladd_fake_backbone_trainable must be false")
+            if self.ladd_defer_disc_update:
+                _fresh_errors.append(
+                    "ladd_defer_disc_update must be false")
+            if float(getattr(
+                self.model, "ladd_disc_loss_weight", 1.0,
+            )) != 0.0:
+                _fresh_errors.append(
+                    "ladd_disc_loss_weight must be 0 for the replacement-"
+                    "GAN-only experiment")
+            if _fresh_errors:
+                raise ValueError(
+                    "surrogate_decoder_fresh_disc_order invalid: "
+                    + "; ".join(_fresh_errors)
+                )
         if self.decoder_shaped_pullback_enabled and self.is_main_process:
             logging.warning(
                 "[ActionForcing] Decoder-shaped pullback built: bundle=%s "
-                "exact_residual_stages=%s graph_free=true",
+                "exact_residual_stages=%s graph_free=true "
+                "fresh_disc_order=%s",
                 str(getattr(
                     self.config, "surrogate_decoder_shaped_bundle", "",
                 )),
                 list(self.decoder_shaped_pullback.exact_residual_stages),
+                _fresh_decoder_disc_requested,
             )
         if self.surrogate_critic_enabled and self.is_main_process:
             logging.info(
@@ -7626,13 +7691,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/ladd_pix_n_taps": float(len(src.tap_indices)),
             # INPUT FILTER PROOF.  ``dc`` is the brightness-invariant view;
             # ``swt`` includes the same DC rejection plus fixed stationary-
-            # wavelet detail emphasis.  These keys distinguish an arm that
+            # wavelet detail emphasis. ``dc_grad_hp`` preserves the DC
+            # forward view but high-pass projects the generator cotangent.
+            # These keys distinguish an arm that
             # merely requested a filter from one whose built source carries
             # it into both the D and current-teacher G forwards.
             "train/ladd_pix_input_filter_dc": float(
                 getattr(src, "input_filter", "none") == "dc"),
             "train/ladd_pix_input_filter_swt": float(
                 getattr(src, "input_filter", "none") == "swt"),
+            "train/ladd_pix_input_filter_dc_grad_hp": float(
+                getattr(src, "input_filter", "none") == "dc_grad_hp"),
+            "train/ladd_pix_input_filter_raw_grad_hp": float(
+                getattr(src, "input_filter", "none") == "raw_grad_hp"),
             "train/ladd_pix_swt_strength": float(
                 getattr(src, "swt_strength", 0.0)),
         }
@@ -7784,6 +7855,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 start = best_lo + best_len - l
                 logs["train/pix_fake_lat_frames"] = float(l)
                 logs["train/pix_fake_lat_run"] = float(best_len)
+                logs["train/pix_fake_lat_start"] = float(start)
                 logs["train/pix_flash_grad_select_active"] = 1.0
                 return z[:, start:start + l], logs
             l = min(want_l, n_lat)
@@ -7797,6 +7869,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # They are OMITTED; ``pix_fake_source_ladder`` = 0.0 is the
             # regime flag that says why they are absent.
             logs["train/pix_fake_lat_frames"] = float(l)
+            logs["train/pix_fake_lat_start"] = float(start)
             return z[:, start:start + l], logs
 
         z = info.get("finish_denoised_chunk_grad")
@@ -7865,6 +7938,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         start = best_lo + best_len - l
         logs["train/pix_fake_lat_frames"] = float(l)
         logs["train/pix_fake_lat_run"] = float(best_len)
+        logs["train/pix_fake_lat_start"] = float(start)
         return z[:, start:start + l], logs
 
     # ------------------------------------------------------------------
@@ -10615,11 +10689,67 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         snap.eval()
         return snap
 
+    def _pix_action_tokens_for_fake(
+        self,
+        fake_lat: torch.Tensor,
+        *,
+        relative_start: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        """Build the action condition aligned to a selected Flash slab.
+
+        ``fake_lat`` is a contiguous sub-window of the current rollout slab;
+        ``relative_start`` is the selected slab index published by
+        :meth:`_pix_select_fake_latents`.  The absolute ride action origin is
+        therefore the current chunk origin plus that index.
+        """
+        if not bool(getattr(self.config, "ladd_use_action_cond", False)):
+            return None, {"train/pix_g_action_conditioned": 0.0}
+        state = getattr(self.model, "streaming_state", None)
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                "Action-aware pixel GAN requires model.streaming_state."
+            )
+        actions = state.get("ride_actions_window")
+        chunk_lo = state.get("last_chunk_lo_in_ride_window")
+        projection = getattr(self.model, "action_token_projection", None)
+        if actions is None or chunk_lo is None or projection is None:
+            raise RuntimeError(
+                "Action-aware pixel GAN cannot build the generator condition: "
+                "ride_actions_window, last_chunk_lo_in_ride_window and "
+                "action_token_projection are all required."
+            )
+        lo = int(chunk_lo) + int(relative_start)
+        hi = lo + int(fake_lat.shape[1])
+        if lo < 0 or hi > int(actions.shape[1]):
+            raise RuntimeError(
+                "Action-aware pixel GAN selected an action window outside the "
+                f"ride: [{lo},{hi}) of {int(actions.shape[1])}."
+            )
+        raw = actions[:, lo:hi]
+        if int(raw.shape[0]) != int(fake_lat.shape[0]):
+            raise RuntimeError(
+                "Action-aware pixel GAN batch mismatch between selected fake "
+                f"({int(fake_lat.shape[0])}) and actions ({int(raw.shape[0])})."
+            )
+        prompt = state.get("prompt_embeds")
+        dtype = prompt.dtype if torch.is_tensor(prompt) else fake_lat.dtype
+        with torch.no_grad():
+            tokens = projection(
+                raw.to(device=fake_lat.device, dtype=dtype)
+            ).detach()
+        return tokens, {
+            "train/pix_g_action_conditioned": 1.0,
+            "train/pix_g_action_abs_lo": float(lo),
+            "train/pix_g_action_frames": float(hi - lo),
+            "train/pix_g_action_latent_frames": float(fake_lat.shape[1]),
+        }
+
     def _decoder_shaped_teacher_cotangent(
         self,
         pixels: torch.Tensor,
         *,
         border: int,
+        action_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """Current pixel-teacher score and detached ``d score / d pixels``."""
         if not pixels.requires_grad:
@@ -10642,7 +10772,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             def score_fn():
                 batch, frames = int(view.shape[0]), int(view.shape[1])
                 return teacher.score_pixels(
-                    view.flatten(0, 1).float()
+                    view.flatten(0, 1).float(),
+                    action_tokens=action_tokens,
                 ).reshape(batch, frames).mean(dim=1)
         elif backbone == "pixel":
             teacher = getattr(self, "pixel_texture_disc", None)
@@ -10691,6 +10822,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         border: int,
         current_step: int,
         weight: float,
+        action_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Dict[str, float]]:
         """Serve the current discriminator through the graph-free WAN VJP."""
         operator = getattr(self, "decoder_shaped_pullback", None)
@@ -10702,7 +10834,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         pixels = captured.pixels.detach().requires_grad_(True)
         pixel_cotangent, teacher_score, backbone = (
             self._decoder_shaped_teacher_cotangent(
-                pixels, border=int(border),
+                pixels, border=int(border), action_tokens=action_tokens,
             )
         )
         field = operator.pullback(captured, pixel_cotangent)
@@ -10718,6 +10850,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         raw, logs = generator_decoder_pullback_loss(
             fake_lat, field, weight=1.0,
         )
+        _cot = pixel_cotangent.float().flatten(0, 1)
+        _b3 = _cot.new_tensor([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+        _b3 = (_b3[:, None] * _b3[None, :]).view(1, 1, 5, 5)
+        _b3 = _b3.expand(int(_cot.shape[1]), 1, 5, 5)
+        _cot_coarse = F.conv2d(
+            F.pad(_cot, (2, 2, 2, 2), mode="reflect"),
+            _b3, groups=int(_cot.shape[1]),
+        )
+        _cot_rms = _cot.square().mean().sqrt().clamp_min(1.0e-20)
         logs.update({
             "train/surrogate_decoder_teacher_score": float(
                 teacher_score.mean()
@@ -10743,8 +10884,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     1.0e-20
                 )
             ),
+            # Broad-patch diagnostic. Unlike spatial DC, this remains
+            # sensitive to a localized exposure blob. The fixed B3 low-pass
+            # is the complement of the dc_grad_hp/raw_grad_hp Jacobian, so a
+            # protected run should carry much less coarse energy than the
+            # historical DC-only field while retaining fine texture energy.
+            "train/surrogate_decoder_pixel_cotangent_coarse_rms": float(
+                _cot_coarse.square().mean().sqrt()
+            ),
+            "train/surrogate_decoder_pixel_cotangent_coarse_ratio": float(
+                _cot_coarse.square().mean().sqrt() / _cot_rms
+            ),
             "train/surrogate_decoder_state_detached": 1.0,
             "train/surrogate_decoder_current_teacher": 1.0,
+            "train/surrogate_decoder_action_conditioned": float(
+                action_tokens is not None
+            ),
             "train/surrogate_decoder_teacher_ladd_pixel": float(
                 backbone == "ladd_pixel"
             ),
@@ -10869,9 +11024,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             return None, None, logs
 
         if bool(getattr(self, "decoder_shaped_pullback_enabled", False)):
+            action_tokens, action_logs = self._pix_action_tokens_for_fake(
+                fake_lat,
+                relative_start=int(fake_logs.get(
+                    "train/pix_fake_lat_start", 0.0,
+                )),
+            )
+            logs.update(action_logs)
             weighted, raw, decoder_logs = self._decoder_shaped_generator_loss(
                 fake_lat, border=border, current_step=int(current_step),
                 weight=float(weight),
+                action_tokens=action_tokens,
             )
             # Preserve the common fake-selector proof keys.  Returning the
             # decoder logs directly used to discard (among others)
@@ -11922,7 +12085,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         cz = torch.zeros((1,), dtype=torch.long, device=x0.device)
         (G(x0, cz, residual=True).sum() * 0.0).backward()
 
-    def _fn_cycle_terms(self, fn_out, fn_in, carn, proj):
+    def _fn_cycle_terms(self, fn_out, fn_in, carn, proj, fn_target=None):
         """CARN-cycle reverse + cycle losses for one (fn_in -> fn_out=F(fn_in))
         batch, where ``carn`` is the per-row rung label ℓ (the SHARED upper-
         endpoint level used to condition BOTH F and G) and ``fn_in`` is
@@ -11964,13 +12127,27 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         G_inner = G.module if hasattr(G, "module") else G
         fn_in_det = fn_in.detach()
         # ---- L_rev: the ONLY DDP forward of G this step ----
-        # G recovers x1 from F's OWN (detached) output -> trains+syncs θ_G.
+        # Historical mode recovers x1 from F's detached output. Harmony mode
+        # instead uses the OBSERVED paired rollout2 target, grounding G on the
+        # same real R2 domain consumed by aux and commit.
         # CRITICAL DDP INVARIANT: G is forwarded through its DDP wrapper
         # EXACTLY ONCE per step. Forwarding a DDP module twice before a
         # single backward corrupts the reducer (only the last forward's
         # prepare_for_backward survives), so the L_cyc term below must NOT
         # go through the DDP wrapper.
-        g_rev = G(fn_out.detach(), carn, residual=True)
+        _rev_mode = str(getattr(
+            m, "cycle_rev_input_mode", "forward_output",
+        )).lower()
+        if _rev_mode == "paired_target":
+            if fn_target is None:
+                raise RuntimeError(
+                    "cycle_rev_input_mode=paired_target requires the aligned "
+                    "rollout2 target."
+                )
+            g_rev_input = fn_target.detach()
+        else:
+            g_rev_input = fn_out.detach()
+        g_rev = G(g_rev_input, carn, residual=True)
         L_rev = self._fn_recon_loss(g_rev, fn_in_det)
         if float(getattr(m, "cycle_rev_feat_weight", 0.0)) > 0.0:
             L_rev = L_rev + float(m.cycle_rev_feat_weight) * (
@@ -12193,7 +12370,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         if _w_pair > 0.0:
             L_pair = (fn_out - fn_tg.detach()).abs().mean()
             L_fwd = L_fwd + _w_pair * L_pair
-        L_rev, L_cyc = self._fn_cycle_terms(fn_out, fn_in, carn, proj)
+        L_rev, L_cyc = self._fn_cycle_terms(
+            fn_out, fn_in, carn, proj, fn_target=fn_tg,
+        )
         logs = dict(base_logs)
         logs["train/fn_fwd_loss"] = float(L_fwd.detach().item())
         if L_pair is not None:
@@ -12213,6 +12392,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # (1.0 >= w_cyc default 0.5).
             total = L_fwd + w_rev * L_rev + w_cyc_eff * L_cyc
             logs["train/fn_rev_loss"] = float(L_rev.detach().item())
+            logs["train/fn_rev_paired_target"] = float(
+                str(getattr(m, "cycle_rev_input_mode", "forward_output"))
+                == "paired_target"
+            )
             logs["train/fn_cyc_loss"] = float(L_cyc.detach().item())
             logs["train/fn_cyc_weight_eff"] = float(w_cyc_eff)
             # Movement diagnostics: ‖F(x1)-x1‖ vs ‖x2-x1‖ (identity-collapse
@@ -13204,6 +13387,37 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         }
         return act_lo0, align
 
+    @staticmethod
+    def _ladd_wrong_action_tokens(action_tokens: torch.Tensor):
+        """Deterministically pair every row with another row's actions.
+
+        A conditional discriminator can minimize ordinary real/fake loss by
+        ignoring its condition.  The wrong-action real negative prevents that
+        shortcut.  We deliberately use another *valid* sequence from the same
+        D batch rather than negating an embedding (which need not correspond to
+        any realizable throttle/steer stream).
+        """
+        if action_tokens is None or action_tokens.dim() != 3:
+            raise ValueError(
+                "wrong-action construction requires [B,F,D] action tokens."
+            )
+        rows = int(action_tokens.shape[0])
+        if rows < 2:
+            raise RuntimeError(
+                "ladd_action_mismatch_weight>0 needs at least two pair rows "
+                "per rank so each real window can receive another real "
+                "window's valid action sequence."
+            )
+        # Half-rotation is a derangement for every B>1 and separates adjacent
+        # temporal windows more than a one-row roll in the common ordered-pair
+        # layout.
+        shift = max(1, rows // 2)
+        wrong = torch.roll(action_tokens, shifts=shift, dims=0)
+        delta_rms = torch.sqrt(
+            (wrong.float() - action_tokens.float()).pow(2).mean()
+        )
+        return wrong, float(delta_rms.detach().item())
+
     # ------------------------------------------------------------------
     # FIX-2 telemetry (2026-08-25). Emitted when EITHER
     # ``ladd_action_origin_log`` or ``ladd_action_origin_track_slice`` is
@@ -13792,6 +14006,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         disc_for_update, _disc_no_sync, _K_stat, _W_stat,
         _do_r1, _r1_sigma, _r1_gamma, _r1_tok_norm, _r1_num_samples,
         current_step, _micro_groups,
+        real_action_tokens_mismatch=None, action_mismatch_weight=0.0,
     ):
         """A18 (2026-08-25): memory-guarded POSITIONAL D-update.
 
@@ -13886,6 +14101,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         cnt_d_f_s = 0
         d_loss_acc = 0.0
         d_loss_stat_acc = 0.0
+        d_loss_action_mismatch_acc = 0.0
+        sum_d_wrong = torch.zeros((), device=device, dtype=torch.float64)
+        cnt_d_wrong = 0
         r1_acc = 0.0
         r1_gsq_acc = 0.0
 
@@ -13913,6 +14131,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _ams = ([real_action_modulation[lo:hi],
                      fake_action_modulation[lo:hi]]
                     if real_action_modulation is not None else None)
+            _ats_wrong = None
+            if real_action_tokens_mismatch is not None:
+                _ats_wrong = [
+                    real_action_tokens_mismatch[lo:hi],
+                    fake_action_tokens[lo:hi],
+                ]
             if sel_r1 is not None:
                 _xs.append(real_part.index_select(0, sel_r1)
                            + eps_full.index_select(0, sel_r1))
@@ -13924,13 +14148,21 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     _ats.append(_sel(real_action_tokens, sel_r1))
                 if _ams is not None:
                     _ams.append(_sel(real_action_modulation, sel_r1))
+                if _ats_wrong is not None:
+                    # Mismatch logits on the R1 rows are unused; keep the key's
+                    # batch shape aligned using the matched real condition.
+                    _ats_wrong.append(_sel(real_action_tokens, sel_r1))
             _ce = None
             if _ats is not None:
                 _ce = {"_action_tokens": torch.cat(_ats, dim=0)}
                 if _ams is not None:
                     _ce["_action_modulation"] = torch.cat(_ams, dim=0)
+                if _ats_wrong is not None:
+                    _ce["_ladd_action_tokens_mismatch"] = torch.cat(
+                        _ats_wrong, dim=0,
+                    )
 
-            logits = disc_for_update(
+            logits_out = disc_for_update(
                 x_noisy=torch.cat(_xs, dim=0),
                 timestep=torch.cat(_ts, dim=0),
                 prompt_embeds=torch.cat(_pes, dim=0),
@@ -13938,6 +14170,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                                if _pps is not None else None),
                 conditional_extra=_ce,
             )
+            if real_action_tokens_mismatch is not None:
+                if not isinstance(logits_out, tuple) or len(logits_out) != 2:
+                    raise RuntimeError(
+                        "Action-aware LADD D forward must return "
+                        "(matched_logits, wrong_action_logits)."
+                    )
+                logits, mismatch_logits = logits_out
+                d_wrong_g = mismatch_logits[:n_g]
+            else:
+                logits = logits_out
+                d_wrong_g = None
             d_r_g = logits[:n_g]
             d_f_g = logits[n_g:2 * n_g]
 
@@ -13959,6 +14202,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _tot = float(d_r_g.numel()) / float(n_g) * B
                 d_rp_g = torch.nn.functional.softplus(
                     d_f_g - d_r_g).sum() / _tot
+                rv = d_r_g
+                _tot_v = _tot
+            if d_wrong_g is not None:
+                if tuple(d_wrong_g.shape) != tuple(rv.shape):
+                    raise RuntimeError(
+                        "Wrong-action logits must match the visual real-logit "
+                        f"shape; got {tuple(d_wrong_g.shape)} vs "
+                        f"{tuple(rv.shape)}."
+                    )
+                mismatch_p = torch.nn.functional.softplus(
+                    d_wrong_g - rv,
+                ).sum() / _tot_v
+                d_rp_g = d_rp_g + float(action_mismatch_weight) * mismatch_p
+                d_loss_action_mismatch_acc += float(
+                    mismatch_p.detach().item()
+                )
+                sum_d_wrong += d_wrong_g.detach().double().sum()
+                cnt_d_wrong += int(d_wrong_g.numel())
             d_loss_acc += float(d_rp_g.detach().item())
 
             # ---- FD-R1 partial (sum of owned squared FDs / M_r1) ----
@@ -14005,8 +14266,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         return {
             "d_loss": d_loss_acc,
             "d_loss_stat": d_loss_stat_acc,
+            "d_loss_action_mismatch": d_loss_action_mismatch_acc,
             "d_real": float((sum_d_r / max(1, cnt_d_r)).item()),
             "d_fake": float((sum_d_f / max(1, cnt_d_f)).item()),
+            "d_wrong_action": (
+                float((sum_d_wrong / cnt_d_wrong).item())
+                if cnt_d_wrong else 0.0
+            ),
             "d_real_stat": (float((sum_d_r_s / cnt_d_r_s).item())
                             if cnt_d_r_s > 0 else 0.0),
             "d_fake_stat": (float((sum_d_f_s / cnt_d_f_s).item())
@@ -14359,7 +14625,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # anchor becomes [cartoon-shifted GT former -> clean GT latter] = a
         # self-correcting (de-cartoon) transition the student must match.
         # Latent-space (no wavelet); requires the FN to be present.
-        _carn_former_on = pair_mode == "gt_transition" and _carn_knob
+        _carn_bridge_knob = bool(
+            getattr(self.model, "ladd_gt_transition_carn_bridge", False)
+            or getattr(self.config, "ladd_gt_transition_carn_bridge", False)
+        )
+        _carn_bridge_on = (
+            pair_mode == "gt_transition" and _carn_bridge_knob
+        )
+        _carn_former_on = (
+            pair_mode == "gt_transition" and (_carn_knob or _carn_bridge_on)
+        )
         _carn_latter_knob = bool(
             getattr(
                 self.model, "ladd_gt_transition_carn_latter_reverse", None,
@@ -14412,6 +14687,16 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 "tx_both requires forward_noiser_cycle_enabled=true so the "
                 "former uses F(R1->R2) and the latter uses G(R2->R1)."
             )
+        if _carn_bridge_on and not _cycle_on:
+            raise ValueError(
+                "ladd_gt_transition_carn_bridge=true requires "
+                "forward_noiser_cycle_enabled=true with distinct F and G."
+            )
+        if _carn_bridge_on and _carn_latter_on:
+            raise ValueError(
+                "The in-domain CARN bridge replaces literal G(clean latter); "
+                "disable ladd_gt_transition_carn_latter_reverse."
+            )
         if _carn_former_on and getattr(self, "_carn_former_dbg", 0) < 2:
             self._carn_former_dbg = getattr(self, "_carn_former_dbg", 0) + 1
             import sys as _sys
@@ -14438,6 +14723,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             print(
                 "[CARN-TX-BOTH] ON: real transition pair uses "
                 "F(+1, former) and G(-1, latter); source=cycle_forward+reverse.",
+                file=_sys.stderr, flush=True,
+            )
+        if _carn_bridge_on and getattr(self, "_carn_bridge_dbg", 0) < 2:
+            self._carn_bridge_dbg = getattr(self, "_carn_bridge_dbg", 0) + 1
+            import sys as _sys
+            print(
+                "[CARN-TX-BRIDGE] ON: real transition spans one correction "
+                "step F(former) -> G(F(latter)); G never consumes clean GT.",
                 file=_sys.stderr, flush=True,
             )
 
@@ -14515,12 +14808,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 x, _reverse_carn, route="latter_reverse", random_level=False,
             )
 
+        def _carn_bridge_latter(x):
+            drifted = _carn_transform(
+                x, _forward_carn, route="bridge_latter_forward",
+                random_level=False,
+            )
+            return _carn_transform(
+                drifted, _reverse_carn, route="bridge_latter_reverse",
+                random_level=False,
+            )
+
         def _slice_pair_carn(t, i, j):
             former = _slice(t, i)
             latter = _slice(t, j)
             if _carn_former_on:
                 former = _carn_former(former)
-            if _carn_latter_on:
+            if _carn_bridge_on:
+                latter = _carn_bridge_latter(latter)
+            elif _carn_latter_on:
                 latter = _carn_latter_reverse(latter)
             return torch.cat([former, latter], dim=1)
 
@@ -14536,7 +14841,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             # disc compares "GT's chunk pair" vs "student's chunk pair".
             _real_pair_fn = (
                 _slice_pair_carn
-                if (_carn_former_on or _carn_latter_on)
+                if (_carn_former_on or _carn_latter_on or _carn_bridge_on)
                 else _slice_pair
             )
             # ladd_gt_match_frames: forward-only per-pair frame matching of
@@ -14578,13 +14883,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     latter = _slice_shifted(t, j, s)
                     if _carn_former_on:
                         former = _carn_former(former)
-                    if _carn_latter_on:
+                    if _carn_bridge_on:
+                        latter = _carn_bridge_latter(latter)
+                    elif _carn_latter_on:
                         latter = _carn_latter_reverse(latter)
                     return torch.cat([former, latter], dim=1)
 
                 _real_pair_shift_fn = (
                     _slice_pair_carn_shifted
-                    if (_carn_former_on or _carn_latter_on)
+                    if (_carn_former_on or _carn_latter_on or _carn_bridge_on)
                     else _slice_pair_shifted
                 )
                 real_chunks_det = torch.cat(
@@ -15448,6 +15755,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         last_d_loss = 0.0
         last_d_real = 0.0
         last_d_fake = 0.0
+        last_d_loss_action_mismatch = 0.0
+        last_d_wrong_action = 0.0
+        last_action_mismatch_token_rms = 0.0
         last_r1 = 0.0
         # Stat-head diagnostic accumulators — non-zero only when
         # ``stat_head_enabled``. Separate D-side stat loss + per-sample
@@ -15532,6 +15842,30 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # like the mismatched branch's prompt tiling. Mutually exclusive
         # with all_pairs / mismatched n_real.
         _match = _match_active  # bound to the precompute-guard condition above
+        _action_mismatch_weight = float(getattr(
+            self.config, "ladd_action_mismatch_weight",
+            getattr(self.model, "ladd_action_mismatch_weight", 0.0),
+        ))
+        _action_cond_active = bool(
+            getattr(self.r3gan_disc, "action_cmapper", None) is not None
+        )
+        if _action_cond_active and real_action_tokens is None:
+            raise RuntimeError(
+                "ladd_use_action_cond=true but the aligned action-token "
+                "builder produced no action tokens."
+            )
+        if _action_mismatch_weight < 0.0:
+            raise ValueError("ladd_action_mismatch_weight must be >= 0.")
+        if _action_mismatch_weight > 0.0 and not _action_cond_active:
+            raise ValueError(
+                "ladd_action_mismatch_weight>0 requires "
+                "ladd_use_action_cond=true."
+            )
+        if _action_mismatch_weight > 0.0 and _match:
+            raise ValueError(
+                "The initial action-mismatch objective is certified only "
+                "for positional gt-vs-fake pairing; disable GT matching."
+            )
         # Mutually exclusive with the all_pairs matrix and the mismatched
         # n_real sampler — the match branch is physically first and returns,
         # so a co-set config would SILENTLY ignore those. Fail loud instead.
@@ -17108,6 +17442,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             and not _all_pairs_mode
             and _pos_r1_mode_cfg == "fd"
         )
+        if _action_mismatch_weight > 0.0 and not _pos_guard_on:
+            raise ValueError(
+                "ladd_action_mismatch_weight>0 currently requires the "
+                "positional micro-batched FD path: set all_pairs=false, "
+                "ladd_r1_mode='fd', and ladd_disc_micro_batch_groups>1."
+            )
+        real_action_tokens_mismatch = None
+        if _action_mismatch_weight > 0.0:
+            (
+                real_action_tokens_mismatch,
+                last_action_mismatch_token_rms,
+            ) = self._ladd_wrong_action_tokens(real_action_tokens)
         if ((_pos_micro_groups > 1 or _pos_r1_num_samples > 0)
                 and not _pos_guard_on
                 and not getattr(self, "_ladd_pos_guard_warned", False)):
@@ -17155,6 +17501,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         def _run_pos_disc_updates():
             nonlocal last_d_loss, last_d_real, last_d_fake, last_r1
             nonlocal last_d_loss_stat, last_d_real_stat, last_d_fake_stat
+            nonlocal last_d_loss_action_mismatch, last_d_wrong_action
             nonlocal last_r1_grad_sq, last_r1_fired
             nonlocal _K_stat, _W_stat, _r1_every_n, _r1_gamma, _r1_sigma
             for _pos_it in range(n_disc_updates):
@@ -17346,6 +17693,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         _r1_num_samples=_pos_r1_num_samples,
                         current_step=current_step,
                         _micro_groups=_pos_micro_groups,
+                        real_action_tokens_mismatch=(
+                            real_action_tokens_mismatch
+                        ),
+                        action_mismatch_weight=_action_mismatch_weight,
                     )
                     last_d_loss = _plog["d_loss"]
                     last_d_loss_stat = _plog["d_loss_stat"]
@@ -17353,6 +17704,10 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     last_d_fake = _plog["d_fake"]
                     last_d_real_stat = _plog["d_real_stat"]
                     last_d_fake_stat = _plog["d_fake_stat"]
+                    last_d_loss_action_mismatch = _plog[
+                        "d_loss_action_mismatch"
+                    ]
+                    last_d_wrong_action = _plog["d_wrong_action"]
                     last_r1 = _plog["r1"]
                     if _plog["r1_fired"] > 0.0:
                         last_r1_grad_sq = _plog["r1_grad_sq"]
@@ -17809,6 +18164,19 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             "train/r3gan_d_loss": last_d_loss,
             "train/r3gan_d_real": last_d_real,
             "train/r3gan_d_fake_detached": last_d_fake,
+            "train/r3gan_d_loss_action_mismatch": (
+                last_d_loss_action_mismatch
+            ),
+            "train/r3gan_d_wrong_action": last_d_wrong_action,
+            "train/ladd_action_cond_active": (
+                1.0 if _action_cond_active else 0.0
+            ),
+            "train/ladd_action_mismatch_weight": float(
+                _action_mismatch_weight
+            ),
+            "train/ladd_action_mismatch_token_rms": float(
+                last_action_mismatch_token_rms
+            ),
             # γ-weighted R1 penalty actually added to d_total. NOTE: on
             # lazy-skipped iters this is 0.0 (the graph-connected zero);
             # the trace will look almost-flat with γ=0.001. Use the
@@ -20827,14 +21195,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # ------------------------------------------------------------------
         # WP-PIXGAN T3-C -- the pixel G-term, computed at the OUTER level.
         #
-        # It is computed HERE, before the ``gan_active`` branch, because the
-        # pixel arm is specced to run with the transition GAN OFF (T3-A's own
-        # stub sets ``gan_enabled=False``), and ``gen_gan_loss`` exists only
-        # inside that branch. Folding the term in there and nowhere else
-        # would give an arm that trains its critic every step and applies
-        # ZERO gradient from it to the generator -- compiles, runs, logs
-        # cheerfully, measures nothing (docs/WP_PIXGAN.md §16/§22, and the
-        # reason §21 names "both endpoints, not the path between").
+        # Normally it is computed HERE, before the ``gan_active`` branch,
+        # because the pixel arm is specced to run with the transition GAN OFF
+        # too. The explicit decoder-pullback fresh-disc mode is the exception:
+        # it skips this call, runs the current-batch inline D update inside
+        # ``_compute_r3gan_losses``, then constructs the pixel cotangent
+        # immediately afterward. Merely setting ``ladd_defer_disc_update``
+        # false is not sufficient: without this call move the pullback still
+        # sees the pre-update head.
         #
         # So there are two application paths and the trace SAYS WHICH ONE
         # ran (``train/pix_g_in_gen_gan_loss``):
@@ -20849,6 +21217,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         _pix_g_w = None
         _pix_g_raw = None
         _pix_g_folded = False
+        _pix_route_enabled = (
+            bool(getattr(self, "gan_pixel_texture_enabled", False))
+            or bool(getattr(self, "surrogate_critic_enabled", False))
+            or bool(getattr(
+                self, "decoder_shaped_pullback_enabled", False,
+            ))
+        )
+        _pix_fresh_disc_requested = bool(getattr(
+            self.config, "surrogate_decoder_fresh_disc_order", False,
+        ))
+        if _pix_fresh_disc_requested and not gan_active:
+            raise RuntimeError(
+                "surrogate_decoder_fresh_disc_order=true but the current "
+                "streaming step has no live discriminator/optimizer"
+            )
+        _pix_fresh_disc_order = _pix_fresh_disc_requested
+        if _pix_fresh_disc_order and bool(
+            getattr(self, "ladd_defer_disc_update", False)
+        ):
+            raise RuntimeError(
+                "surrogate_decoder_fresh_disc_order=true requires "
+                "ladd_defer_disc_update=false; a deferred D update occurs "
+                "after the generator backward and cannot refresh the "
+                "current pixel cotangent"
+            )
+        if getattr(self, "decoder_shaped_pullback_enabled", False):
+            out["train/surrogate_decoder_fresh_disc_order"] = (
+                1.0 if _pix_fresh_disc_order else 0.0
+            )
+            out["train/surrogate_decoder_fresh_disc_order_requested"] = (
+                1.0 if _pix_fresh_disc_requested else 0.0
+            )
+            out["train/surrogate_decoder_disc_updates_before_field"] = 0.0
+            out["train/surrogate_decoder_disc_updated_before_field"] = 0.0
         # Objective against which the pixel/surrogate term is calibrated.
         # This must never contain the pixel term itself.  The GAN-active path
         # refreshes it below after constructing the ordinary transition-GAN
@@ -20858,11 +21260,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # teacher branch) also enters: the helper's surrogate branch
         # serves the G-term from the latent critic and returns before any
         # pixel-disc code. Gate-off (both false) is unchanged.
-        if (bool(getattr(self, "gan_pixel_texture_enabled", False))
-                or bool(getattr(self, "surrogate_critic_enabled", False))
-                or bool(getattr(
-                    self, "decoder_shaped_pullback_enabled", False,
-                ))):
+        if _pix_route_enabled and not _pix_fresh_disc_order:
             _pix_g_w, _pix_g_raw, _pix_g_logs = (
                 self._compute_pixel_texture_g_loss(
                     train_info, current_step=int(self.step),
@@ -20966,6 +21364,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             _ov_gan = self._ladd_fake_feat_override()
             if _ov_gan is not None:
                 _ov_gan.scope_enter()
+            _inline_disc_before = int(getattr(
+                self, "_ladd_disc_inline_updates", 0,
+            ))
             gen_gan_loss, gan_logs = self._compute_r3gan_losses(
                 pred_image=train_chunk,
                 gt_latents_window=_gt_window_eff,
@@ -20976,7 +21377,38 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 fake_action_frame_lo=_fake_act_lo,
                 fake_sample_source=_fake_src_name,
             )
+            _inline_disc_after = int(getattr(
+                self, "_ladd_disc_inline_updates", 0,
+            ))
             _pix_probe_base_loss = generator_loss + gen_gan_loss
+            if _pix_fresh_disc_order:
+                _n_fresh_updates = _inline_disc_after - _inline_disc_before
+                if (
+                    int(self.step) >= int(getattr(
+                        self, "gan_disc_start_step", 0,
+                    ))
+                    and _n_fresh_updates <= 0
+                ):
+                    raise RuntimeError(
+                        "fresh decoder-pullback field requested, but no "
+                        "current-batch inline discriminator update completed"
+                    )
+                # The only fresh-order call site. The D optimizer step above
+                # has completed on this exact step's detached real/fake rows;
+                # now query that updated head and transport its pixel
+                # cotangent through the Q1~0.99 decoder pullback.
+                _pix_g_w, _pix_g_raw, _pix_g_logs = (
+                    self._compute_pixel_texture_g_loss(
+                        train_info, current_step=int(self.step),
+                    )
+                )
+                out.update(_pix_g_logs)
+                out[
+                    "train/surrogate_decoder_disc_updates_before_field"
+                ] = float(_n_fresh_updates)
+                out[
+                    "train/surrogate_decoder_disc_updated_before_field"
+                ] = 1.0 if _n_fresh_updates > 0 else 0.0
             # (A4 gan_grad_target_norm cap REMOVED 2026-08-23 — it used to
             # rescale gen_gan_loss here, immediately before the telemetry
             # below. ``train/gan_grad_norm`` therefore now reports the

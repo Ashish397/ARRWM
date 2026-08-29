@@ -101,6 +101,15 @@ ladd_use_csm: true                   # cross-scale FPN-style fusion
 ladd_use_lateral_proj: false         # lateral 1x1 in CSM (rarely needed)
 ladd_use_prompt_cond: true           # prompt-conditioning in disc heads
 ladd_cmap_dim: 64                    # inner-product cmap dim (StyleGAN-T)
+# Default-off action-aware pixel GAN.  Unlike the frozen action critic (a
+# separate generator loss), this conditions the discriminator score itself on
+# the aligned per-frame action tokens.  The mismatch term teaches the disc not
+# to ignore the condition by scoring real pixels under another window's action
+# sequence as a negative.  On VGG/RN50 this is a projection term on the
+# orderless pooled-statistic embedding, not a dense spatial LADD head.
+ladd_use_action_cond: false
+ladd_action_cmap_dim: 64
+ladd_action_mismatch_weight: 0.0
 ladd_disc_loss_weight: 1.0           # additional G-side multiplier on top of gan_loss_weight ramp
 ladd_r1_gamma: 10.0
 ladd_disc_force_clean: true          # CODEBASE DEFAULT set 2026-08-25 23:20 (researcher:
@@ -429,6 +438,10 @@ surrogate_decoder_shaped_bundle: ""
 # Optional live exact-VJP audit cadence. 0 is zero-cost; smokes should use 1
 # so the deployed per-sample Q1 is directly visible before a long arm.
 surrogate_decoder_shaped_audit_every: 0
+# Default off for compatibility. When enabled, the streaming trainer requires
+# an inline LADD D update and constructs the decoder-pullback pixel cotangent
+# only after that current-batch discriminator step has completed.
+surrogate_decoder_fresh_disc_order: false
 
 # Architecture (docs/WP_SURROGATE.md §3). Defaults below are what
 # build_from_config falls back to if a key here is ever removed --
@@ -1148,9 +1161,13 @@ ladd_pixel_grid_jitter: 8
 # per-frame/per-channel spatial mean before the encoder, making the
 # discriminator invariant to global exposure/colour offsets. ``swt`` keeps
 # that guarantee and adds an undecimated fixed wavelet-detail residual.
-# Default ``none`` is historical byte identity; active experiments must prove
-# the selected path through train/ladd_pix_input_filter_{dc,swt}.
-ladd_pixel_input_filter: none       # none | dc | swt
+# ``dc_grad_hp`` keeps the exact DC forward view but high-pass projects the
+# backward pixel cotangent so the GAN cannot impose broad exposure patches;
+# ``raw_grad_hp`` keeps the raw forward view with that same backward contract.
+# ``raw_grad_hp`` is the production default: D sees the raw, evolving mean,
+# while the generator-side pixel cotangent cannot directly impose a global or
+# broad exposure shift. ``none`` remains the historical unprotected ablation.
+ladd_pixel_input_filter: raw_grad_hp # none | dc | swt | dc_grad_hp | raw_grad_hp
 ladd_pixel_swt_strength: 1.0        # used only by input_filter=swt
 # pixgan only: blur-pool every stride-2 subsample (Zhang, ICML 2019).
 # model/pixel_texture_disc.py:528-541 is three Conv2d(k4,s2,p1) with NO

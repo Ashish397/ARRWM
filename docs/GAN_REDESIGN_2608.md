@@ -1419,11 +1419,36 @@ wave, and the `fzuybrrm` screen cannot rank GAN or CARN settings. Preserve
 them as bug-history artifacts, not controls.
 
 The corrected launcher disables decode caching and reports an explicit
-enabled flag. Four new weight-zero calibrations occupy the replacement nodes:
-DC reference at R1=10 and R1=1, raw reference at R1=10, and DC aux-minus at
-R1=10. Active weight remains blocked until `cache_enabled=0`, rising decode
-calls, current-teacher/detached/stale-0, all-exact stages and fresh field
-magnitudes have been verified.
+enabled flag. The first four cache-off calibrations
+(`br6ivuzw/zoud58dc/ob5gqkvo/xlf99yu7`) finished with rising decode calls,
+current-teacher/detached/stale-0, all 12 exact residual stages and complete
+parameter reach. They exposed a second independent issue: the pullback field
+was constructed before `_compute_r3gan_losses`, while D itself was deferred
+until after generator backward. Thus these are clean transport controls but
+not fresh-head weight authorities.
+
+The definitive mode now resolves
+`surrogate_decoder_fresh_disc_order=true` and
+`ladd_defer_disc_update=false`. It skips the early field, performs the inline
+current-batch D update, requires its monotone counter to increase, constructs
+the Q1~0.99 pullback from that updated head, and folds the result exactly once.
+Telemetry must show `disc_updates_before_field>0` and
+`disc_updated_before_field=1` on every active field. Four matched repeats
+completed as DC/R1=10 `83wlndxr`, DC/R1=1 `y9ry8jhr`, raw/R1=10 `bbj4flwh`
+and DC+aux-minus/R1=10 `bfvw2wik`. Every field passed the fresh-order,
+cache-off, exact-stage, current/detached/stale-0, `825/825` and Flash proofs.
+Median unweighted ratios are `.882/2.404/.946/.777`.
+
+The first valid active wave normalized to about 3% median share: DC/R1=10
+`.035` (`qa0uuodt`), DC/R1=1 `.0125` (`cupkuznr`), raw/R1=10 `.032`
+(`cedh3jod`), and DC+aux/R1=10 `.040` (`ybfvxoeh`). It remained finite through
+about step 66 and its child steps alone were stopped to promote the comparison
+to 300 steps. The 300-step wave is live as calibrated DC/R1=10 `.035`
+`wkq1l6p2`, calibrated DC/R1=1 `.0125` `7o96m8uh`, and a matched strong-stable
+DC/R1=1 `.0175` reference/aux-minus pair `htfhu37j/acmv0qur`. The matched pair
+keeps the GAN fixed and changes only the intended CARN policy from reference
+cycle to the tested R2-to-R1 aux-minus `.25` contract; both holders remain
+alive.
 
 A18's Q1~0.60 exact-6+7 transport is retired as the active experimental base;
 its outputs remain historical controls.  New work is pinned by artifact hash
@@ -1498,3 +1523,100 @@ without cancelling either replacement holder: former-plus `ir2yhn2f`,
 latter-minus `jrcll5m8`, R1-gamma-1 reference `sf4skqwf`, and U2 reference
 `14anf43a`.  The latter pair isolates R1 strength and update cadence while
 holding Flash, CARN reference, `.10` weight and Q1~0.99 transport fixed.
+
+## A20. ACTION-CONDITIONAL CORRECTION (2026-08-28)
+
+The 300-step visual comparison exposed a control failure before completion:
+the strong R1=1 `.0175` reference (`htfhu37j`) and aux-minus (`acmv0qur`)
+arms leave the commanded trajectory, while the calibrated R1=1 `.0125`
+(`7o96m8uh`) and R1=10 `.035` (`wkq1l6p2`) arms remain on it. This is
+consistent with increased GAN leverage but is not an action-critic
+configuration difference. All four runs have the same frozen Flash action
+critic and guidance weight `.3`, while all four VGG discriminators resolve
+`ladd_use_prompt_cond=false` and `ladd_cmap_dim=0`. The aligned action token
+and modulation tensors are built by the trainer, but the VGG pixel branch
+does not consume the WAN `conditional_extra`; its score is therefore the
+marginal real-image texture/style score, independent of throttle and steer.
+
+Through W&B step 161 the applied-share medians are `.0177/.0139` for the
+aux/reference strong pair versus `.0136/.0149` for the R1=10/R1=1 calibrated
+pair, so typical realized share does not cleanly separate good from bad. The
+peak excursions do: `.197/.228` versus `.126/.114`. The separate action loss
+rises late on both visually good and bad arms, so increasing its scalar alone
+is not a clean causal repair. The mechanistic failure is that a stronger
+action-blind image prior can prefer a plausible-looking trajectory that is
+incompatible with the supplied control while the independent action critic
+only competes with it after gradients are combined.
+
+A default-off action-aware path is now implemented. The first attempt targeted
+the dense LADD projection heads and failed before W&B registration because the
+winning VGG GAN deliberately does not build those heads: its discriminator is
+the orderless `[mu,sigma,Cov] -> MLP -> scalar` pooled readout. The corrected
+path retains that readout and adds a standard projection-discriminator term
+between its final pooled statistic embedding and a learned action cmap. The
+temporal conditioner retains mean, scale, first, last and signed endpoint delta
+rather than globally averaging away action order.
+
+Each D update also scores the *same pooled VGG evidence* under a different
+valid action sequence from another row and adds a wrong-action negative loss.
+This prevents the conditional-GAN shortcut in which D simply ignores its
+condition. The alternate score reuses the exact decoded pixels, frozen VGG
+maps and pooled hidden vector, so it adds no VAE decode or VGG forward and
+does not recreate a dense spatial lattice. The Q1~0.99 generator query now
+receives the action window aligned to the selected contiguous Flash latent
+slab; the post-current-D pixel cotangent is therefore conditioned on the same
+actions instead of silently querying an unconditional teacher.
+
+Initial scope is deliberately fail-closed: pooled VGG `ladd` readout,
+positional GT-vs-fake, FD R1 and the existing micro-batched D path. New knobs are
+`ladd_use_action_cond`, `ladd_action_cmap_dim` and
+`ladd_action_mismatch_weight`; all default off/zero. Runtime telemetry is
+`ladd_action_cond_active`, `ladd_action_mismatch_weight`,
+`ladd_action_mismatch_token_rms`, `r3gan_d_wrong_action` and
+`r3gan_d_loss_action_mismatch`. CPU contracts prove temporal sensitivity,
+single-feature-pass reuse, fail-loud missing conditions, a valid row
+derangement, pooled-readout projection, conditioned `score_pixels`, and
+inclusion of the mismatch loss in D backward (eight focused contracts pass).
+
+Do not retrofit or relabel the four running 300-step controls. The next
+holder experiment is a weight-zero, DC/R1=1, fresh-D, cache-off Q1~0.99
+calibration with `GAN_ACTION_COND=true` and action cmap 64. Two corrected
+pooled-VGG calibrations are live on holder `6170182`: mismatch weight 1.0 is
+W&B `lmeubie7`, and mismatch weight .25 is `uhb3i1lc`. They must prove nonzero
+condition RMS, aligned generator-side conditioning and a learned matched-real
+versus wrong-action margin before deriving a nonzero `PIXW`; `.0125` or
+`.0175` must not be inherited blindly because the discriminator head changed.
+
+First active-field proof (W&B step 21) is clean on both arms. The mismatch
+token RMS is nonzero (~`.01024`); the action-aware generator query selects
+three action rows at absolute ride frames `[24,27)` for its three selected
+Flash latents; D-updates-before-field and updated-before-field are both one;
+Flash selection is `15/18`; decode cache is zero while decode calls are 30;
+current-teacher/state-detached/staleness-zero/all-exact-residual flags all pass.
+The wrong-action loss starts at `log(2)=.69315` and wrong/real logits are still
+equal on the first optimizer update, which is the correct untrained baseline,
+not yet evidence of a learned margin. Initial unweighted parameter-gradient
+ratios are `.927` (mismatch 1) and `.842` (mismatch .25), while DC ratios remain
+`5.36e-9/4.77e-9`. Selection must use the 60-step median and margin trajectory,
+not this single first field.
+
+Both 60-step action-conditioned calibrations subsequently finished and reject
+this pooled-head formulation. For mismatch weights `1/.25`, median
+correct-real minus wrong-action margins are `-1.80e-4/-1.48e-4`, while the
+mismatch losses remain `.69324/.69324`. The shuffled action tensors are
+nonidentical, all generator/Flash/Q1 wiring proofs pass, and final real-minus-
+fake margins reach `2.48/2.89`. Thus this is not a dead input or stale-field
+bug: the orderless pooled VGG statistic has enough information for texture
+real/fake discrimination but not action-to-motion compatibility. Do not run a
+nonzero pooled action-conditional arm.
+
+The fallback comparison reuses `htfhu37j` unchanged (`PIXW=.0175`, DC,
+R1=1, stat anchor 1, Flash t=60, U1, fresh D-before-field, Q1~.99 transport)
+and strengthens the independent action apparatus instead. Holder `6170182`
+runs frozen guidance `.6` as W&B `ea2g8x49` and an online action critic as
+`pstbyie5`. The online treatment retains generator guidance `.3`, trains the
+59.3M-parameter critic at LR `3e-4` for two updates/step against
+`action_teacher_mode=all`/`teacher_action_encoder=pca_raw`, and weights its
+teacher regression `.5`. Its PCA-space self-check is `5.96e-8`; the action GAN
+projection and mismatch loss are off in both arms. Judge action retention from
+the matched 15-step videos and action/critic telemetry through step 300.

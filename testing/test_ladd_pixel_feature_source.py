@@ -471,7 +471,7 @@ def test_blurpool_flag_off_reproduces_the_strided_conv_trunk():
 # ===========================================================================
 # 8. BRIGHTNESS-INVARIANT / STATIONARY-WAVELET INPUT
 # ===========================================================================
-@pytest.mark.parametrize("mode", ["dc", "swt"])
+@pytest.mark.parametrize("mode", ["dc", "swt", "dc_grad_hp"])
 def test_texture_input_filter_is_invariant_to_global_channel_offsets(mode):
     src = LaddPixelFeatureSource(
         "pixgan", pixgan_base_channels=8, input_filter=mode,
@@ -484,7 +484,9 @@ def test_texture_input_filter_is_invariant_to_global_channel_offsets(mode):
     assert torch.allclose(a, b, atol=2e-6, rtol=2e-6)
 
 
-@pytest.mark.parametrize("mode", ["dc", "swt"])
+@pytest.mark.parametrize(
+    "mode", ["dc", "swt", "dc_grad_hp", "raw_grad_hp"],
+)
 def test_texture_input_filter_annihilates_spatial_dc_cotangent(mode):
     src = LaddPixelFeatureSource(
         "pixgan", pixgan_base_channels=8, input_filter=mode,
@@ -506,6 +508,90 @@ def test_stationary_wavelet_filter_preserves_shape_and_uses_no_parameters():
     assert y.shape == x.shape
     assert "_swt_lowpass" not in dict(src.named_parameters())
     assert "input_filter=swt" in src.describe()
+
+
+def test_dc_grad_hp_preserves_dc_forward_view_but_rejects_coarse_gradients():
+    dc = LaddPixelFeatureSource(
+        "pixgan", pixgan_base_channels=8, input_filter="dc",
+    )
+    texture = LaddPixelFeatureSource(
+        "pixgan", pixgan_base_channels=8, input_filter="dc_grad_hp",
+    )
+    x = torch.randn(1, 3, 64, 64, requires_grad=True)
+    y_dc = dc._filter_input(x, midpoint=0.5)
+    y_texture = texture._filter_input(x, midpoint=0.5)
+    assert torch.allclose(y_texture, y_dc, atol=2e-7, rtol=2e-7)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, 64),
+        torch.linspace(-1.0, 1.0, 64),
+        indexing="ij",
+    )
+    broad_patch = torch.exp(-(xx.square() + yy.square()) / 0.45)
+    broad_patch = broad_patch.view(1, 1, 64, 64).expand_as(x)
+    checker = ((torch.arange(64).view(-1, 1)
+                + torch.arange(64).view(1, -1)) % 2).float()
+    checker = (checker * 2.0 - 1.0).view(1, 1, 64, 64).expand_as(x)
+
+    coarse_dc = torch.autograd.grad(
+        (y_dc * broad_patch).sum(), x, retain_graph=True,
+    )[0]
+    coarse_texture = torch.autograd.grad(
+        (y_texture * broad_patch).sum(), x, retain_graph=True,
+    )[0]
+    fine_dc = torch.autograd.grad(
+        (y_dc * checker).sum(), x, retain_graph=True,
+    )[0]
+    fine_texture = torch.autograd.grad(
+        (y_texture * checker).sum(), x,
+    )[0]
+
+    # Reflect padding leaves a small boundary response; the fixed projection
+    # still rejects more than 89% of this deliberately broad field.
+    assert float(coarse_texture.norm() / coarse_dc.norm()) < 0.11
+    assert float(fine_texture.norm() / fine_dc.norm()) > 0.90
+
+
+def test_raw_grad_hp_preserves_raw_forward_view_but_rejects_coarse_gradients():
+    raw = LaddPixelFeatureSource(
+        "pixgan", pixgan_base_channels=8, input_filter="none",
+    )
+    texture = LaddPixelFeatureSource(
+        "pixgan", pixgan_base_channels=8, input_filter="raw_grad_hp",
+    )
+    x = torch.randn(1, 3, 64, 64, requires_grad=True)
+    y_raw = raw._filter_input(x, midpoint=0.5)
+    y_texture = texture._filter_input(x, midpoint=0.5)
+    # The detach identity is numerically (not bitwise) equal because it forms
+    # ``detail + (x-detail)`` in floating point to replace only the Jacobian.
+    assert torch.allclose(y_texture, y_raw, atol=2e-7, rtol=2e-7)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, 64),
+        torch.linspace(-1.0, 1.0, 64),
+        indexing="ij",
+    )
+    broad_patch = torch.exp(-(xx.square() + yy.square()) / 0.45)
+    broad_patch = broad_patch.view(1, 1, 64, 64).expand_as(x)
+    checker = ((torch.arange(64).view(-1, 1)
+                + torch.arange(64).view(1, -1)) % 2).float()
+    checker = (checker * 2.0 - 1.0).view(1, 1, 64, 64).expand_as(x)
+
+    coarse_raw = torch.autograd.grad(
+        (y_raw * broad_patch).sum(), x, retain_graph=True,
+    )[0]
+    coarse_texture = torch.autograd.grad(
+        (y_texture * broad_patch).sum(), x, retain_graph=True,
+    )[0]
+    fine_raw = torch.autograd.grad(
+        (y_raw * checker).sum(), x, retain_graph=True,
+    )[0]
+    fine_texture = torch.autograd.grad(
+        (y_texture * checker).sum(), x,
+    )[0]
+
+    assert float(coarse_texture.norm() / coarse_raw.norm()) < 0.11
+    assert float(fine_texture.norm() / fine_raw.norm()) > 0.90
 
 
 # ===========================================================================
