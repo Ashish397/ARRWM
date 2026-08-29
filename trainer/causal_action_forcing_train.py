@@ -79,6 +79,34 @@ from pipeline.action_forcing_training import ActionForcingTrainingPipeline
 from utils.infinity_rope import install as _install_infinity_rope
 
 
+def _rolling_window_curriculum_max(
+    step: int,
+    *,
+    start_step: int,
+    stage_steps: int = 100,
+    first_max: int = 10,
+    increment: int = 3,
+    cap: int = 37,
+) -> int:
+    """Return the inclusive random-context upper bound for rolling.
+
+    ``step`` is the trainer's absolute checkpoint step. ``start_step`` is
+    the first step of the rolling phase, so a stationary->rolling resume can
+    keep its global counter while the curriculum still starts at local step
+    zero. The stages are [0,100), [100,200), ...; the result saturates at
+    ``cap``.
+    """
+    if stage_steps <= 0:
+        raise ValueError("rolling curriculum stage_steps must be > 0")
+    if increment < 0:
+        raise ValueError("rolling curriculum increment must be >= 0")
+    if first_max <= 0 or cap <= 0:
+        raise ValueError("rolling curriculum bounds must be > 0")
+    phase_step = max(0, int(step) - int(start_step))
+    stage = phase_step // int(stage_steps)
+    return min(int(cap), int(first_max) + int(increment) * stage)
+
+
 def resolve_rollout_viz_source(
     info: Dict[str, Any],
     *,
@@ -4022,7 +4050,22 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 )
                 if "dmdtrain_gradient_norm" in generator_log_dict:
                     msg_parts.append(
-                        f"dmd_grad={generator_log_dict['dmdtrain_gradient_norm']:.4f}"
+                        f"dmd_grad={float(generator_log_dict['dmdtrain_gradient_norm']):.6g}"
+                    )
+                if "dmd_loss_weight_resolved" in generator_log_dict:
+                    msg_parts.append(
+                        "dmd_w="
+                        f"{float(generator_log_dict['dmd_loss_weight_resolved']):.4g}"
+                    )
+                if "dmd_sup_band_graph_on" in generator_log_dict:
+                    msg_parts.append(
+                        "dmd_graph="
+                        f"{int(float(generator_log_dict['dmd_sup_band_graph_on']))}"
+                    )
+                if "streaming_context_depth_chunks" in generator_log_dict:
+                    msg_parts.append(
+                        "ctx_depth="
+                        f"{int(float(generator_log_dict['streaming_context_depth_chunks']))}"
                     )
                 # Streaming mode: the standalone critic iter is a no-op
                 # (its dict has no critic_loss) — the REAL diffusion loss
@@ -19882,6 +19925,14 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         outer ``optim.step()`` runs after this returns.
         """
         cfg = self.config
+        # Reference-style random terminal-window training. Each outer step
+        # opens a fresh ride, samples a context depth, rolls that many student
+        # chunks under no_grad, then generates ONE fresh seven-chunk terminal
+        # window and trains it. Historical persistent one-chunk-per-step rides
+        # remain the default when this flag is false.
+        _window_per_step = bool(getattr(
+            cfg, "rolling_window_per_step_enabled", False,
+        ))
         max_rolls = int(getattr(cfg, "max_rolls_per_ride", 60))
         # ---- FT_v3 post-build master flag (default OFF = byte-identical) --
         # When OFF, NONE of the new roll-until-going + post-build branches
@@ -19960,6 +20011,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     self._iqa_agree_threshold,
                 )
         if _tp_on:
+            if _window_per_step:
+                raise ValueError(
+                    "rolling_window_per_step_enabled is incompatible with "
+                    "rolling_toothpaste_enabled"
+                )
             max_rolls = int(self._tp_depth)
         else:
             # Legacy step-count schedule (only LOWERS the cap): cap rolls at
@@ -19977,21 +20033,48 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     _sched_base
                     + max(0, _cur_step - _sched_start) // _sched_every,
                 )
+        _window_curriculum_upper = int(max_rolls)
+        if _window_per_step:
+            _window_curriculum_upper = _rolling_window_curriculum_max(
+                int(getattr(self, "step", 0)),
+                start_step=int(getattr(
+                    cfg, "rolling_window_curriculum_start_step", 0,
+                )),
+                stage_steps=int(getattr(
+                    cfg, "rolling_window_curriculum_stage_steps", 100,
+                )),
+                first_max=int(getattr(
+                    cfg, "rolling_window_curriculum_first_max", 10,
+                )),
+                increment=int(getattr(
+                    cfg, "rolling_window_curriculum_increment", 3,
+                )),
+                cap=int(getattr(
+                    cfg, "rolling_window_curriculum_cap", 37,
+                )),
+            )
+            max_rolls = min(int(max_rolls), _window_curriculum_upper)
         # ``rolling_random_depth_enabled`` (2026-08-20, reference parity):
         # Causal-Forcing/long_video draws a RANDOM number of blocks to roll per
         # optimizer step and broadcasts it from rank 0, then supervises the
         # frontier window. A fixed depth ladder over-weights shallow rolls
         # (whose context is near-GT) relative to inference, which runs deep.
-        # Drawn ONCE per ride and held for that ride's rolls; broadcast so
-        # every rank holds the identical cap (mandatory -- the cap drives the
-        # only-last skip, and a rank-divergent skip hangs NCCL on the scorer's
-        # collectives).
+        # Legacy mode draws ONCE per ride and holds the cap. The opt-in
+        # terminal-window mode draws ONCE per optimizer step, because each
+        # step owns a complete no_grad context rollout plus one trained
+        # terminal window. Broadcast keeps every rank's call count identical.
         if bool(getattr(cfg, "rolling_random_depth_enabled", False)):
             _new_ride = self.model.streaming_state is None
-            if _new_ride or not hasattr(self, "_ride_random_depth"):
+            if (
+                _window_per_step
+                or _new_ride
+                or not hasattr(self, "_ride_random_depth")
+            ):
                 _dmin = int(getattr(cfg, "rolling_random_depth_min", 2))
                 _dmax = int(getattr(cfg, "rolling_random_depth_max",
                                     int(max_rolls)))
+                if _window_per_step:
+                    _dmax = min(_dmax, int(max_rolls))
                 _dmax = max(_dmin, _dmax)
                 if dist.is_initialized() and dist.get_world_size() > 1:
                     if self.is_main_process:
@@ -20004,12 +20087,24 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             1, dtype=torch.long, device=self.device,
                         )
                     dist.broadcast(_d, src=0)
-                    self._ride_random_depth = int(_d.item())
+                    _drawn_depth = int(_d.item())
                 else:
-                    self._ride_random_depth = int(
+                    _drawn_depth = int(
                         torch.randint(_dmin, _dmax + 1, (1,)).item()
                     )
-            max_rolls = int(self._ride_random_depth)
+                if _window_per_step:
+                    self._window_random_depth = int(_drawn_depth)
+                else:
+                    self._ride_random_depth = int(_drawn_depth)
+            if _window_per_step:
+                max_rolls = int(self._window_random_depth)
+            else:
+                max_rolls = int(self._ride_random_depth)
+        elif _window_per_step:
+            raise ValueError(
+                "rolling_window_per_step_enabled requires "
+                "rolling_random_depth_enabled=true"
+            )
         # ``dmd_supervise_roll_mode="random"`` (2026-08-22): draw the ONE
         # roll index that receives the generator DMD gradient this ride.
         # Same once-per-ride trigger, same rank-0 draw + broadcast pattern
@@ -20028,6 +20123,11 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             str(getattr(cfg, "dmd_supervise_roll_mode", "all") or "all")
             .strip().lower() == "random"
         ):
+            if _window_per_step:
+                raise ValueError(
+                    "terminal-window rolling already has exactly one trained "
+                    "window; set dmd_supervise_roll_mode=all"
+                )
             _new_ride_sup = self.model.streaming_state is None
             if _new_ride_sup or not hasattr(self, "_ride_supervise_roll"):
                 _tmax = max(1, int(max_rolls))
@@ -20183,6 +20283,90 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # backward with the next ride's disk I/O). Idempotent.
         self._kick_ride_prefetch_if_idle(rollout_frames + cf_dmdctx)
 
+        _window_warmup_ms = 0.0
+        _window_saved_force: Optional[int] = None
+        if _window_per_step:
+            # One optimizer step == one independently sampled rolling
+            # context plus one terminal seven-chunk train window. The anchor
+            # generated by setup_sequence is context chunk 1; generate the
+            # remaining D-1 context chunks one-at-a-time under no_grad so an
+            # arbitrary inclusive D in [4, curriculum_max] is representable.
+            state_w = self.model.streaming_state
+            if not needs_setup or state_w is None:
+                raise RuntimeError(
+                    "terminal-window rolling must start every optimizer step "
+                    "from a fresh sequence"
+                )
+            npb_w = int(self.model.num_frame_per_block)
+            terminal_frames = int(self.model.num_training_frames)
+            if terminal_frames != 7 * npb_w:
+                raise RuntimeError(
+                    "terminal-window rolling requires exactly seven chunks "
+                    f"(got num_training_frames={terminal_frames}, npb={npb_w})"
+                )
+            if int(state_w["chunk_size"]) != npb_w:
+                raise RuntimeError(
+                    "terminal-window warmup requires streaming_chunk_size="
+                    f"num_frame_per_block={npb_w}; got "
+                    f"{int(state_w['chunk_size'])}"
+                )
+            if int(state_w["current_length"]) != npb_w:
+                raise RuntimeError(
+                    "terminal-window setup anchor must be exactly one chunk"
+                )
+            required = (int(max_rolls) + 7) * npb_w
+            if int(state_w["max_length"]) < required:
+                raise RuntimeError(
+                    "terminal-window ride capacity is too short: "
+                    f"need {required} post-seed frames for context_depth="
+                    f"{int(max_rolls)} + 7 terminal chunks; have "
+                    f"{int(state_w['max_length'])}"
+                )
+
+            _prefix_parts: List[torch.Tensor] = []
+            if self.is_main_process:
+                _prefix_parts.append(state_w["anchor_chunk"].detach().cpu())
+            _window_saved_force = int(
+                self.model.streaming_force_new_frame_chunks
+            )
+            self.model.streaming_force_new_frame_chunks = 1
+            _warm_t0 = time.monotonic()
+            with torch.no_grad():
+                for _ in range(int(max_rolls) - 1):
+                    _ctx_chunk, _ctx_info = self.model.generate_next_chunk(
+                        requires_grad=False,
+                        compute_baseline_mae=False,
+                    )
+                    if self.is_main_process:
+                        _ctx_src, _ = resolve_rollout_viz_source(
+                            _ctx_info,
+                            mode=str(getattr(
+                                cfg, "rollout_viz_source", "finish",
+                            )).lower(),
+                            finish_is_ladder=bool(getattr(
+                                cfg, "rollout_viz_finish_is_ladder", True,
+                            )),
+                        )
+                        if _ctx_src is None:
+                            _ctx_src = _ctx_chunk
+                        _prefix_parts.append(
+                            _ctx_src[:, -npb_w:].detach().float().cpu()
+                        )
+            _window_warmup_ms = (
+                time.monotonic() - _warm_t0
+            ) * 1000.0
+            if self.is_main_process:
+                self._window_rollout_prefix = torch.cat(
+                    _prefix_parts, dim=1,
+                )
+
+            # The trained window is wholly fresh student content: generate
+            # seven new chunks in this call (zero overlap). The pipeline's
+            # skip-last rule keeps S7 detached; the 42f builder masks S7 and
+            # supervises S1..S6.
+            state_w["chunk_size"] = terminal_frames
+            self.model.streaming_force_new_frame_chunks = 7
+
         state = self.model.streaming_state
         chunk_size = int(state["chunk_size"])
         cf_state = int(state["cf"])
@@ -20228,6 +20412,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             compute_baseline_mae=False,
             force_exit_step=forced_exit_step,
         )
+        if _window_saved_force is not None:
+            self.model.streaming_force_new_frame_chunks = _window_saved_force
         self._chunks_in_current_ride = (
             getattr(self, "_chunks_in_current_ride", 0) + 1
         )
@@ -20293,7 +20479,13 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 _src_acc if _src_acc is not None else chunk
             )[:, -_nf_acc:].detach().float().cpu()
             if needs_setup or getattr(self, "_rollout_video_acc", None) is None:
-                self._rollout_video_acc = _new_acc
+                _prefix = getattr(self, "_window_rollout_prefix", None)
+                if _window_per_step and _prefix is not None:
+                    self._rollout_video_acc = torch.cat(
+                        [_prefix, _new_acc], dim=1,
+                    )
+                else:
+                    self._rollout_video_acc = _new_acc
             else:
                 self._rollout_video_acc = torch.cat(
                     [self._rollout_video_acc, _new_acc], dim=1)
@@ -20360,6 +20552,17 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         out["streaming_window_avg_mae"] = float(avg_mae)
         out["streaming_did_setup_this_step"] = 1.0 if needs_setup else 0.0
         out["streaming_window_start_chunk"] = float(self._chunks_in_current_ride)
+        if _window_per_step:
+            _phase_start = int(getattr(
+                cfg, "rolling_window_curriculum_start_step", 0,
+            ))
+            out["streaming_context_depth_chunks"] = float(max_rolls)
+            out["streaming_context_depth_upper"] = float(
+                _window_curriculum_upper
+            )
+            out["streaming_rolling_phase_step"] = float(max(
+                0, int(getattr(self, "step", 0)) - _phase_start,
+            ))
 
         # ---- Toothpaste GONE gate -----------------------------------
         # If this window's frontier MAE has blown past the off-manifold bar
@@ -20486,7 +20689,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # rank-uniform (MAX-reduced above), so it agrees across ranks; the
         # final MAX-reduce keeps it lockstep with the other reasons.
         local_should_reset = (
-            local_hit_cap or local_exhausted or local_mae_collapse
+            _window_per_step or local_hit_cap or local_exhausted or local_mae_collapse
             or _tp_gone_hit or _ftv3_going_hit
         )
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -20704,6 +20907,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         #     ride pulls too expensive). Revisit prefetch design.
         out["streaming_step_setup_ms"] = float(t_setup_ms)
         out["streaming_prefetch_wait_ms"] = float(prefetch_wait_ms)
+        out["streaming_context_warmup_ms"] = float(_window_warmup_ms)
         out["streaming_step_rollout_ms"] = float(t_rollout_ms)
         out["streaming_step_train_ms"] = float(t_train_ms)
         out["streaming_step_wallclock_ms"] = float(
