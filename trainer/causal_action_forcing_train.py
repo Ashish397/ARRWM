@@ -2710,6 +2710,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             logging.warning(_a23_msg)
             print(_a23_msg, file=sys.stderr, flush=True)
 
+        # Seven-chunk Phase-3 geometry normally keeps the trailing block
+        # graph-free because the 42f DMD teacher has no clean counterpart for
+        # that position.  Non-DMD objectives do not share that restriction:
+        # CARN internalisation and the Flash gt-vs-fake generator objective can
+        # legitimately train all seven generated chunks.  This explicit seam
+        # lets those objectives retain the trailing exit/Flash graphs while
+        # the independent DMD mask continues to decide whether S7 is scored.
+        # Default False preserves every historical run byte-for-byte.
+        self.pipeline.aux_train_trailing_chunk = bool(
+            getattr(self.config, "aux_train_trailing_chunk", False)
+        )
+        if self.is_main_process:
+            _s7aux_msg = (
+                "[ActionForcing] S7 auxiliary graph gate propagated to %s: "
+                "aux_train_trailing_chunk=%s (DMD S7 is controlled "
+                "independently by dmd_42f_supervise_last)." % (
+                    type(self.pipeline).__name__,
+                    self.pipeline.aux_train_trailing_chunk,
+                )
+            )
+            logging.warning(_s7aux_msg)
+            print(_s7aux_msg, file=sys.stderr, flush=True)
+
         # ------------------------------------------------------------------
         # exit_exclude_last_rung (MAIN 14:1x, RESEARCHER-APPROVED for the KV
         # recompute-order probe): excludes the last denoising rung from the
@@ -7779,6 +7802,80 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # ------------------------------------------------------------------
     # §3.1 / A23 -- the FAKE, mask-selected.
     # ------------------------------------------------------------------
+    def _prepare_gan_carn_commit_fake(
+        self,
+        info: Dict[str, Any],
+        *,
+        current_step: int,
+    ) -> Dict[str, float]:
+        """Make every GAN consumer see the literal recurrent commit.
+
+        The pipeline records the exact post-CARN tensor used for its KV
+        write.  This method attaches that forward value to the matching
+        graph-bearing ladder endpoint.  Its backward is either identity-ST or
+        the input Jacobian of a replayed parameter-frozen CARN commit.  Both
+        the action critic and LADD generator field then optimize the state
+        future chunks actually condition on.
+
+        The production seven-chunk recipe promises every frame has a live
+        ladder-endpoint graph (``exit_exclude_last_rung`` plus
+        ``aux_train_trailing_chunk``).  Fail loudly if that contract drifts;
+        silently feeding detached frames would undo the rehabilitation.
+        """
+        if str(getattr(
+            self.model, "ladd_fake_sample_source", "flash",
+        )) != "commit":
+            return {}
+
+        graph = info.get("finish_denoised_chunk_grad")
+        mask = info.get("finish_denoised_chunk_grad_mask")
+        committed = info.get("committed_ladder_endpoint_chunk")
+        if graph is None or not graph.requires_grad:
+            raise RuntimeError(
+                "ladd_fake_sample_source='commit' requires a graph-bearing "
+                "finish_denoised_chunk_grad."
+            )
+        if committed is None:
+            raise RuntimeError(
+                "ladd_fake_sample_source='commit' requires the exact "
+                "committed_ladder_endpoint_chunk published by the pipeline."
+            )
+        if mask is None:
+            raise RuntimeError(
+                "ladd_fake_sample_source='commit' requires "
+                "finish_denoised_chunk_grad_mask; frame liveness may not be "
+                "inferred from a CopySlices buffer."
+            )
+        live = torch.as_tensor(mask, device=graph.device).reshape(-1).bool()
+        if int(live.numel()) != int(graph.shape[1]):
+            raise RuntimeError(
+                "GAN/CARN commit mask has "
+                f"{int(live.numel())} entries for {int(graph.shape[1])} "
+                "latent frames."
+            )
+        if not bool(live.all().item()):
+            raise RuntimeError(
+                "GAN/CARN commit alignment requires all generated frames to "
+                "be graph-live, but only "
+                f"{int(live.sum().item())}/{int(live.numel())} are live. "
+                "Keep exit_exclude_last_rung=true and "
+                "aux_train_trailing_chunk=true."
+            )
+
+        aligned, logs = self.model._gan_carn_commit_aligned_slab(
+            graph, info, current_step=int(current_step),
+        )
+        # Preserve the producer tensor for audits, then replace the canonical
+        # finish-grad key so all existing pixel/surrogate selectors inherit
+        # the aligned value without a second routing implementation.
+        info["finish_denoised_chunk_grad_raw"] = graph
+        info["finish_denoised_chunk_grad"] = aligned
+        info["gan_carn_commit_aligned_x0"] = aligned
+        info["gan_carn_commit_aligned_mask"] = live
+        logs["train/gan_carn_commit_live_frames"] = float(live.sum().item())
+        logs["train/gan_carn_commit_frames_total"] = float(live.numel())
+        return logs
+
     def _pix_select_fake_latents(
         self, info: Dict[str, Any],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -15486,7 +15583,8 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # A run must PROVE which fake it trained on; "the flag was in the
         # config" is not proof (docs/ONE_FORCING_PORT.md's whole §6 exists
         # because a source-level claim was confidently wrong).
-        #   ladd_fake_sample_source : 0 = flash slab, 1 = DMD-scored band
+        #   ladd_fake_sample_source : 0 = flash slab, 1 = DMD-scored band,
+        #                             2 = exact recurrent commit
         #   ladd_fake_sample_t      : the sample's OWN generation timestep
         #                             (flash_dmd_gan_t, or the band's exit
         #                             rung); -1 = undefined (flash off).
@@ -15498,7 +15596,12 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         #                             band) is visible in the trace.
         _fake_src_logs = {
             "train/ladd_fake_sample_source": (
-                1.0 if str(fake_sample_source) == "dmd" else 0.0
+                2.0 if str(fake_sample_source) == "commit" else (
+                    1.0 if str(fake_sample_source) == "dmd" else 0.0
+                )
+            ),
+            "train/ladd_fake_sample_source_commit": (
+                1.0 if str(fake_sample_source) == "commit" else 0.0
             ),
             "train/ladd_fake_sample_t": (
                 float(_fake_t) if _fake_t is not None else -1.0
@@ -19925,6 +20028,15 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         outer ``optim.step()`` runs after this returns.
         """
         cfg = self.config
+        if bool(getattr(
+            self.model, "reverse_noiser_commit_cycle_probe_enabled", False,
+        )) or bool(getattr(
+            self.model, "reverse_noiser_commit_cycle_gate_enabled", False,
+        )):
+            # Reset before setup_sequence so the aggregate includes the
+            # generated anchor's recurrent commit, not merely the terminal
+            # call's last block.
+            self.model._carn_commit_cycle_step_stats = {}
         # Reference-style random terminal-window training. Each outer step
         # opens a fresh ride, samples a context depth, rolls that many student
         # chunks under no_grad, then generates ONE fresh seven-chunk terminal
@@ -20331,27 +20443,49 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             self.model.streaming_force_new_frame_chunks = 1
             _warm_t0 = time.monotonic()
-            with torch.no_grad():
-                for _ in range(int(max_rolls) - 1):
-                    _ctx_chunk, _ctx_info = self.model.generate_next_chunk(
-                        requires_grad=False,
-                        compute_baseline_mae=False,
+            # Diagnostic-only counterfactual for isolating recurrent CARN
+            # commit drift from the terminal loss geometry.  Default false,
+            # so production is byte-for-byte unchanged.  The terminal window
+            # still receives the normal commit and all normal losses; only
+            # the no-grad context that precedes it bypasses commit de-drift.
+            _warmup_no_commit = bool(getattr(
+                cfg, "rolling_window_warmup_disable_carn_commit", False,
+            ))
+            _saved_commit_on = bool(getattr(
+                self.model, "reverse_noiser_dedrift_apply_to_commit", False,
+            ))
+            if _warmup_no_commit:
+                self.model.reverse_noiser_dedrift_apply_to_commit = False
+            try:
+                with torch.no_grad():
+                    for _ in range(int(max_rolls) - 1):
+                        _ctx_chunk, _ctx_info = self.model.generate_next_chunk(
+                            requires_grad=False,
+                            compute_baseline_mae=False,
+                        )
+                        if self.is_main_process:
+                            _ctx_src, _ = resolve_rollout_viz_source(
+                                _ctx_info,
+                                mode=str(getattr(
+                                    cfg, "rollout_viz_source", "finish",
+                                )).lower(),
+                                finish_is_ladder=bool(getattr(
+                                    cfg, "rollout_viz_finish_is_ladder", True,
+                                )),
+                            )
+                            if _ctx_src is None:
+                                _ctx_src = _ctx_chunk
+                            _prefix_parts.append(
+                                _ctx_src[:, -npb_w:].detach().float().cpu()
+                            )
+            finally:
+                if _warmup_no_commit:
+                    self.model.reverse_noiser_dedrift_apply_to_commit = (
+                        _saved_commit_on
                     )
-                    if self.is_main_process:
-                        _ctx_src, _ = resolve_rollout_viz_source(
-                            _ctx_info,
-                            mode=str(getattr(
-                                cfg, "rollout_viz_source", "finish",
-                            )).lower(),
-                            finish_is_ladder=bool(getattr(
-                                cfg, "rollout_viz_finish_is_ladder", True,
-                            )),
-                        )
-                        if _ctx_src is None:
-                            _ctx_src = _ctx_chunk
-                        _prefix_parts.append(
-                            _ctx_src[:, -npb_w:].detach().float().cpu()
-                        )
+            out["train/rolling_warmup_carn_commit_enabled"] = (
+                0.0 if _warmup_no_commit else float(_saved_commit_on)
+            )
             _window_warmup_ms = (
                 time.monotonic() - _warm_t0
             ) * 1000.0
@@ -20417,6 +20551,45 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         self._chunks_in_current_ride = (
             getattr(self, "_chunks_in_current_ride", 0) + 1
         )
+        _cy = getattr(self.model, "_carn_commit_cycle_step_stats", None)
+        if isinstance(_cy, dict) and _cy.get("rel"):
+            _cy_rel = torch.cat(_cy["rel"]).float()
+            _cy_correction_rel = torch.cat(_cy["correction_rel"]).float()
+            _cy_ratio = torch.cat(_cy["ratio"]).float()
+            _cy_cos = torch.cat(_cy["cos"]).float()
+            _cy_reliability = torch.cat(_cy["reliability"]).float()
+            _cn = float(_cy_rel.numel())
+            out.update({
+                "train/carn_commit_cycle_calls": _cn,
+                "train/carn_commit_cycle_rel_mean": float(_cy_rel.mean()),
+                "train/carn_commit_cycle_rel_max": float(_cy_rel.max()),
+                "train/carn_commit_correction_rel_mean": float(
+                    _cy_correction_rel.mean()
+                ),
+                "train/carn_commit_cycle_ratio_mean": float(_cy_ratio.mean()),
+                "train/carn_commit_cycle_ratio_max": float(_cy_ratio.max()),
+                "train/carn_commit_cycle_inverse_cos_mean": float(
+                    _cy_cos.mean()
+                ),
+                "train/carn_commit_cycle_inverse_cos_min": float(
+                    _cy_cos.min()
+                ),
+                "train/carn_commit_cycle_reliability_mean": float(
+                    _cy_reliability.mean()
+                ),
+                "train/carn_commit_cycle_reliability_min": float(
+                    _cy_reliability.min()
+                ),
+                "train/carn_commit_anchor_cycle_rel": float(_cy_rel[0]),
+                "train/carn_commit_anchor_correction_rel": float(
+                    _cy_correction_rel[0]
+                ),
+                "train/carn_commit_anchor_cycle_ratio": float(_cy_ratio[0]),
+                "train/carn_commit_anchor_inverse_cos": float(_cy_cos[0]),
+                "train/carn_commit_anchor_reliability": float(
+                    _cy_reliability[0]
+                ),
+            })
 
         # ---- Stage 3: per-rank MAE on the chunk_size-frame trained window.
         noisy_start_sdn = int(
@@ -21236,6 +21409,34 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         chunk_lo = cf_state + noisy_start_sdn
         chunk_hi = chunk_lo + chunk_size
 
+        # Resolve the single recurrent-state surface before ANY generator
+        # auxiliary consumes x0.  This intentionally precedes the frozen
+        # action critic below as well as the GAN/pullback block: action,
+        # texture and recurrence must not optimize three nearby but distinct
+        # latent states.
+        if str(getattr(
+            self.model, "ladd_fake_sample_source", "flash",
+        )) == "commit":
+            out.update(self._prepare_gan_carn_commit_fake(
+                train_info, current_step=int(self.step),
+            ))
+
+        # Holder-only interaction audit.  These references are populated
+        # below without changing the applied objective.  The counterfactual
+        # action forward is cadence-gated and uses the frozen deterministic
+        # critic, so it neither updates a module nor consumes RNG.
+        _interaction_tel_n = int(getattr(
+            self.config, "interaction_grad_telemetry_every", 0,
+        ) or 0)
+        _interaction_due = (
+            _interaction_tel_n > 0
+            and int(self.step) % _interaction_tel_n == 0
+        )
+        _interaction_action_loss = None
+        _interaction_action_raw_loss = None
+        _interaction_surface = None
+        _interaction_raw_surface = None
+
         if aux_active:
             actions_chunk = state["ride_actions_window"][:, chunk_lo:chunk_hi]
             actions_for_critic = self._slice_actions_for_critic(
@@ -21299,6 +21500,18 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                         "Flash-DMD surface."
                     )
                 ac_pred_x0 = _pa_x0
+            elif _ac_x0_source == "commit":
+                _pa_x0 = train_info.get("gan_carn_commit_aligned_x0")
+                _pa_mask = train_info.get("gan_carn_commit_aligned_mask")
+                if (_pa_x0 is None or not _pa_x0.requires_grad
+                        or _pa_mask is None
+                        or not bool(torch.as_tensor(_pa_mask).all().item())):
+                    raise RuntimeError(
+                        "gen_aux_losses_x0_source=commit requires the exact "
+                        "all-live GAN/CARN recurrent-state proxy."
+                    )
+                ac_pred_x0 = _pa_x0
+                out["train/action_critic_x0_commit_aligned"] = 1.0
             elif _ac_x0_source == "train_chunk":
                 pass
             elif _ac_x0_source == "auto":
@@ -21311,7 +21524,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             else:
                 raise ValueError(
                     "gen_aux_losses_x0_source must be 'auto', 'flash', "
-                    "'ladder_endpoint', or 'train_chunk'; got "
+                    "'commit', 'ladder_endpoint', or 'train_chunk'; got "
                     f"{_ac_x0_source!r}."
                 )
             out["train/action_critic_x0_ladder_endpoint"] = (
@@ -21334,6 +21547,40 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             )
             generator_loss = generator_loss + gen_action_loss
             out.update(critic_logs)
+            if _interaction_due:
+                _interaction_action_loss = gen_action_loss
+                _interaction_surface = ac_pred_x0
+                _interaction_raw_surface = train_info.get(
+                    "finish_denoised_chunk_grad_raw"
+                )
+                if (
+                    _ac_x0_source == "commit"
+                    and bool(getattr(self, "action_critic_freeze", False))
+                    and isinstance(_interaction_raw_surface, torch.Tensor)
+                    and _interaction_raw_surface.requires_grad
+                ):
+                    _interaction_action_raw_loss, _, _ = (
+                        self._compute_action_critic_losses(
+                            pred_x0=_interaction_raw_surface,
+                            target_action_z=actions_for_critic,
+                            chunk_t=chunk_t,
+                            current_step=int(self.step),
+                        )
+                    )
+                    out["train/interaction_action_loss_commit"] = float(
+                        gen_action_loss.detach().item()
+                    )
+                    out["train/interaction_action_loss_raw"] = float(
+                        _interaction_action_raw_loss.detach().item()
+                    )
+                    out["train/interaction_action_loss_commit_minus_raw"] = (
+                        float(
+                            (gen_action_loss - _interaction_action_raw_loss)
+                            .detach().item()
+                        )
+                    )
+                else:
+                    out["train/interaction_action_raw_unavailable"] = 1.0
             self._mem_step_snapshot("2_after_action_critic")
 
             # LoRA-side action losses (action_critic z-guidance on the
@@ -21531,6 +21778,23 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                     1.0 if _band["graph_on"] else 0.0)
                 out["train/ladd_dmd_band_dmd_fired"] = (
                     1.0 if _band["dmd_fired"] else 0.0)
+            elif str(getattr(
+                self.model, "ladd_fake_sample_source", "flash",
+            )) == "commit":
+                _fake_override = train_info.get(
+                    "gan_carn_commit_aligned_x0"
+                )
+                if _fake_override is None:
+                    raise RuntimeError(
+                        "commit-aligned LADD source was selected but the "
+                        "aligned recurrent tensor was not prepared."
+                    )
+                # The committed ladder endpoint is a clean x0. Keep the real
+                # and action window unchanged: it spans the same generated
+                # frames, only their fake value is now recurrence-exact.
+                _fake_sample_t = 0
+                _fake_act_lo = int(chunk_lo)
+                _fake_src_name = "commit"
             # Reset the deferred-disc queue before the GAN compute. When
             # ladd_defer_disc_update is on, _compute_r3gan_losses stashes the
             # disc-update closures here instead of running them inline; we run
@@ -21626,6 +21890,89 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 gen_gan_loss = gen_gan_loss + _pix_g_w
                 _pix_g_folded = True
 
+            # Directly inspect the cotangents where action guidance and GAN
+            # meet the exact post-CARN recurrent value.  Measuring at this
+            # shared latent surface avoids the historical off-path parameter
+            # problem and isolates whether the two auxiliaries reinforce or
+            # fight one another.  A second action-only cotangent at the raw
+            # pre-commit endpoint measures CARN's local conditioning effect.
+            if _interaction_due:
+                try:
+                    if not (
+                        isinstance(_interaction_surface, torch.Tensor)
+                        and isinstance(_interaction_action_loss, torch.Tensor)
+                    ):
+                        raise RuntimeError(
+                            "interaction telemetry has no live action surface"
+                        )
+                    _iga = grad_at(
+                        _interaction_action_loss,
+                        _interaction_surface,
+                        retain_graph=True,
+                    )
+                    _igg = grad_at(
+                        gen_gan_loss,
+                        _interaction_surface,
+                        retain_graph=True,
+                    )
+                    if _iga is None or _igg is None:
+                        raise RuntimeError(
+                            "action or GAN does not reach the shared commit surface"
+                        )
+                    _na = float(_iga.norm())
+                    _ng = float(_igg.norm())
+                    _joint = _iga + _igg
+                    _nj = float(_joint.norm())
+                    out["train/interaction_surface_action_grad_norm"] = _na
+                    out["train/interaction_surface_gan_grad_norm"] = _ng
+                    out["train/interaction_surface_joint_grad_norm"] = _nj
+                    if _na > 0.0 and _ng > 0.0:
+                        out["train/interaction_surface_action_gan_cos"] = float(
+                            torch.dot(_iga, _igg) / (_na * _ng)
+                        )
+                        out["train/interaction_surface_gan_action_ratio"] = (
+                            _ng / _na
+                        )
+                        out["train/interaction_surface_joint_over_sum_norms"] = (
+                            _nj / (_na + _ng)
+                        )
+                    else:
+                        out[
+                            "train/interaction_surface_cos_undefined"
+                        ] = 1.0
+
+                    if (
+                        isinstance(_interaction_action_raw_loss, torch.Tensor)
+                        and isinstance(_interaction_raw_surface, torch.Tensor)
+                    ):
+                        _igar = grad_at(
+                            _interaction_action_raw_loss,
+                            _interaction_raw_surface,
+                            retain_graph=True,
+                        )
+                        if _igar is None:
+                            raise RuntimeError(
+                                "raw action loss does not reach raw surface"
+                            )
+                        _nar = float(_igar.norm())
+                        out[
+                            "train/interaction_action_raw_surface_grad_norm"
+                        ] = _nar
+                        if _na > 0.0 and _nar > 0.0:
+                            out[
+                                "train/interaction_action_commit_raw_grad_cos"
+                            ] = float(torch.dot(_iga, _igar) / (_na * _nar))
+                            out[
+                                "train/interaction_action_commit_raw_grad_norm_ratio"
+                            ] = _na / _nar
+                except Exception as _interaction_exc:
+                    out["train/interaction_grad_telemetry_err"] = 1.0
+                    if self.is_main_process:
+                        logging.warning(
+                            "[INTERACTION-AUDIT] telemetry failed at step=%d: %s",
+                            int(self.step), _interaction_exc,
+                        )
+
             # A3 GRAD TELEMETRY (diagnostic-only, plan 22/8 v2): per-loss
             # gradients at the LAST requires-grad generator parameter.
             # ||g_GAN||/||g_rest|| separates weak-vs-destructive; the cosine
@@ -21672,6 +22019,58 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                             out["train/gan_dmd_grad_cos"] = float(
                                 torch.dot(_gg, _gr)
                                 / max(_ng * _nr, 1e-12))
+                            if (
+                                _interaction_due
+                                and isinstance(
+                                    _interaction_action_loss, torch.Tensor,
+                                )
+                            ):
+                                _ga = grad_at(
+                                    _interaction_action_loss,
+                                    _p_last,
+                                    retain_graph=True,
+                                )
+                                if _ga is None:
+                                    out[
+                                        "train/interaction_param_action_unavailable"
+                                    ] = 1.0
+                                else:
+                                    # `_gr` is the pre-GAN objective and
+                                    # already contains action guidance.  By
+                                    # gradient linearity, subtraction gives
+                                    # the exact same-parameter remainder
+                                    # without another full DMD replay.
+                                    _gb = _gr - _ga
+                                    _nba = float(_gb.norm())
+                                    _naa = float(_ga.norm())
+                                    _ngg = float(_gg.norm())
+                                    out[
+                                        "train/interaction_param_base_grad_norm"
+                                    ] = _nba
+                                    out[
+                                        "train/interaction_param_action_grad_norm"
+                                    ] = _naa
+                                    if _nba > 0.0 and _naa > 0.0:
+                                        out[
+                                            "train/interaction_param_action_base_cos"
+                                        ] = float(
+                                            torch.dot(_ga, _gb) / (_naa * _nba)
+                                        )
+                                        out[
+                                            "train/interaction_param_action_base_ratio"
+                                        ] = _naa / _nba
+                                    if _naa > 0.0 and _ngg > 0.0:
+                                        out[
+                                            "train/interaction_param_action_gan_cos"
+                                        ] = float(
+                                            torch.dot(_ga, _gg) / (_naa * _ngg)
+                                        )
+                                    _joint3 = _gb + _ga + _gg
+                                    _den3 = _nba + _naa + _ngg
+                                    if _den3 > 0.0:
+                                        out[
+                                            "train/interaction_param_joint_over_sum_norms"
+                                        ] = float(_joint3.norm()) / _den3
                         # ---- T3-C: the UNWEIGHTED pixel ratio (§12 step 1).
                         # Deliberately OUTSIDE the block above, not nested in
                         # it: that block needs ``_gg`` (the grad of the whole

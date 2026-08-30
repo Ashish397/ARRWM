@@ -295,6 +295,43 @@ def test_flash_buffer_publishes_the_same_partial_liveness_mask():
     assert not _live(slice(6, 9))
 
 
+def test_s7_aux_gate_keeps_trailing_exit_and_flash_blocks_graph_live():
+    """Phase-3 S7 experiment: auxiliaries may train the trailing block
+    without changing the independent DMD mask.  Prove both graph sources,
+    rather than trusting the boolean or whole-buffer ``requires_grad``."""
+    pipe, gen = _build()
+    pipe.aux_train_trailing_chunk = True
+    out = _run(pipe, frames=9, flash=True)
+    flash = pipe._flash_dmd_gan_output
+    mask = pipe._flash_dmd_gan_grad_mask
+    assert flash is not None and flash.requires_grad
+    assert mask.tolist() == [True] * 9
+
+    exit_g = torch.autograd.grad(
+        out[:, 6:9].sum(), gen.w,
+        allow_unused=True, retain_graph=True,
+    )[0]
+    flash_g = torch.autograd.grad(
+        flash[:, 6:9].sum(), gen.w,
+        allow_unused=True, retain_graph=True,
+    )[0]
+    assert exit_g is not None and torch.count_nonzero(exit_g) > 0
+    assert flash_g is not None and torch.count_nonzero(flash_g) > 0
+
+
+def test_s7_aux_gate_extends_optional_finish_graph_to_trailing_block():
+    pipe, gen = _build(pix_finish_grad_enabled=True)
+    pipe.aux_train_trailing_chunk = True
+    _run(pipe, frames=9)
+    buf = pipe._clean_chunk_grad
+    assert buf is not None and buf.requires_grad
+    g = torch.autograd.grad(
+        buf[:, 6:9].sum(), gen.w, allow_unused=True,
+    )[0]
+    assert g is not None and torch.count_nonzero(g) > 0
+    assert pipe._clean_chunk_grad_mask.tolist() == [True] * 9
+
+
 def test_telemetry_counts_attached_blocks_excluding_trailing_block():
     """``pix_finish_grad_blocks`` counts blocks that actually attached
     a grad rung, which on a multi-block call is n_blocks - 1."""

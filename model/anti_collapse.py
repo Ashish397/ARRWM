@@ -29,6 +29,55 @@ import torch
 import torch.nn.functional as F
 
 
+def attenuate_stat_anchor_tail(
+    loss: torch.Tensor,
+    threshold: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bound an exceptional stat-anchor tail without dropping the sample.
+
+    The transform is exactly the identity through ``threshold`` and uses the
+    continuous rational tail
+
+    ``f(L) = 2T - T^2 / L`` for ``L > T``.
+
+    Consequently ``f(T)=T`` and ``f'(T)=1`` (no kink in value or gradient),
+    while the tail gradient is attenuated by ``(T/L)^2`` and the reported
+    effective loss remains bounded below ``2T``. Unlike a hard clamp, every
+    finite outlier retains a non-zero corrective gradient; unlike rejecting a
+    window, DMD/GAN/CARN/action all continue to train on the same perturbation.
+
+    ``threshold <= 0`` is the byte-for-byte legacy path. The returned tuple
+    is ``(effective_loss, detached_gradient_scale, detached_active_bit)`` so
+    the intervention is explicit in telemetry.
+    """
+    threshold = float(threshold)
+    if threshold <= 0.0:
+        one = loss.detach().new_ones(())
+        zero = loss.detach().new_zeros(())
+        return loss, one, zero
+    if loss.numel() != 1:
+        raise ValueError(
+            "attenuate_stat_anchor_tail expects a scalar loss; got "
+            f"shape={tuple(loss.shape)}"
+        )
+
+    t = loss.new_tensor(threshold)
+    # Stat-anchor is a weighted sum of non-negative losses. Clamp only the
+    # denominator for numerical safety; the normal branch returns ``loss``
+    # itself and therefore preserves its exact graph and value.
+    safe_loss = loss.clamp_min(torch.finfo(loss.dtype).tiny)
+    tail = 2.0 * t - t.square() / safe_loss
+    active = loss > t
+    effective = torch.where(active, tail, loss)
+    with torch.no_grad():
+        scale = torch.where(
+            active,
+            (t / safe_loss.detach()).square(),
+            torch.ones_like(loss.detach()),
+        )
+    return effective, scale.detach(), active.detach().to(loss.dtype)
+
+
 def latent_moment_corridor_loss(
     pred_x0: torch.Tensor,
     gt_target: torch.Tensor,

@@ -78,6 +78,10 @@ from torch.utils import swap_tensors as _swap_tensors
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from model.base import SelfForcingModel
+from model.carn_commit import (
+    resolved_commit_alpha,
+    straight_through_value,
+)
 from model.one_forcing_gan import (
     add_noise_bf,
     disc_micro_batch_bounds,
@@ -209,6 +213,11 @@ def resolve_ladd_fake_sample_source(args) -> str:
           tensor handed to ``compute_distribution_matching_loss``,
           restricted to the frames its ``gradient_mask`` is True on. One
           sample, one sub-graph, two objectives.
+      ``"commit"``: the trainer publishes a graph-bearing straight-through
+          proxy whose forward value is the exact CARN-corrected ladder
+          endpoint written into recurrent memory.  GAN and recurrence then
+          optimize/consume one state, while the generator gradient bypasses
+          the online CARN corrector's Jacobian.
 
     Module-level and pure so the illegal-combination contract is
     unit-testable without constructing a 1.3B model (the same reason
@@ -216,12 +225,31 @@ def resolve_ladd_fake_sample_source(args) -> str:
     resolved string; raises ``ValueError`` on every illegal combination.
     """
     source = str(getattr(args, "ladd_fake_sample_source", "flash") or "flash")
-    if source not in ("flash", "dmd"):
+    if source not in ("flash", "dmd", "commit"):
         raise ValueError(
-            "ladd_fake_sample_source must be 'flash' or 'dmd'; got "
+            "ladd_fake_sample_source must be 'flash', 'dmd' or 'commit'; got "
             f"{source!r}."
         )
     if source == "flash":
+        return source
+    if source == "commit":
+        if not bool(getattr(args, "streaming_mode", True)):
+            raise ValueError(
+                "ladd_fake_sample_source='commit' requires "
+                "streaming_mode=true because the exact recurrent commit has "
+                "no non-streaming analogue."
+            )
+        if not bool(getattr(args, "pix_finish_grad_enabled", False)):
+            raise ValueError(
+                "ladd_fake_sample_source='commit' requires "
+                "pix_finish_grad_enabled=true so the inference-parity ladder "
+                "endpoint has a generator graph."
+            )
+        if not bool(getattr(args, "gan_carn_commit_align_enabled", False)):
+            raise ValueError(
+                "ladd_fake_sample_source='commit' requires "
+                "gan_carn_commit_align_enabled=true."
+            )
         return source
     if not bool(getattr(args, "streaming_mode", True)):
         raise ValueError(
@@ -1076,6 +1104,15 @@ class ActionForcingDMD(SelfForcingModel):
         # 1); 3 = supervise 2 reliable chunks (denser DMD signal). Overrides
         # ``dmd_42f_2chunk`` when > 0.
         self.dmd_42f_num_chunks = int(getattr(args, "dmd_42f_num_chunks", 0))
+        # Experimental S7 arm: the canonical 42f layout masks the newest
+        # student chunk because it has no clean-half counterpart.  When true,
+        # retain the same 21+21 teacher shape but deliberately supervise that
+        # final noisy slot as well.  This is independent of
+        # ``aux_train_trailing_chunk``: the latter opens the generator graph;
+        # this flag extends only the DMD scoring mask/layout to S7.
+        self.dmd_42f_supervise_last = bool(
+            getattr(args, "dmd_42f_supervise_last", False)
+        )
         # ``dmd_42f_seed_last``: replace the masked (newest) STUDENT
         # chunk(s) in the noisy half with GT, so the supervised student
         # chunk is scaffolded by clean GT on BOTH temporal sides (GT
@@ -2821,6 +2858,41 @@ class ActionForcingDMD(SelfForcingModel):
         self.reverse_noiser_commit_use_absolute_level = bool(
             getattr(args, "reverse_noiser_commit_use_absolute_level", False)
         )
+        # GAN/commit rehabilitation.  The GAN consumes a straight-through
+        # proxy whose FORWARD value is the same corrected ladder endpoint as
+        # the recurrent commit.  The trust region is shared with the actual
+        # commit path so the two cannot silently realize different doses.
+        self.gan_carn_commit_align_enabled = bool(
+            getattr(args, "gan_carn_commit_align_enabled", False)
+        )
+        self.gan_carn_commit_straight_through = bool(
+            getattr(args, "gan_carn_commit_straight_through", True)
+        )
+        self.reverse_noiser_commit_max_relative_shift = float(
+            getattr(args, "reverse_noiser_commit_max_relative_shift", 0.0)
+        )
+        # Recurrent-commit reliability audit/gate.  The reverse corrector G
+        # is only trustworthy at x when the learned forward map closes the
+        # local cycle, F(G(x), level) ~= x, and its displacement opposes G's.
+        # ``probe`` measures that contract without changing values.  ``gate``
+        # continuously attenuates the commit by the measured reliability.
+        # Both default off so existing recipes are byte-identical.
+        self.reverse_noiser_commit_cycle_probe_enabled = bool(getattr(
+            args, "reverse_noiser_commit_cycle_probe_enabled", False,
+        ))
+        self.reverse_noiser_commit_cycle_gate_enabled = bool(getattr(
+            args, "reverse_noiser_commit_cycle_gate_enabled", False,
+        ))
+        self.reverse_noiser_commit_cycle_gate_tau = float(getattr(
+            args, "reverse_noiser_commit_cycle_gate_tau", 0.02,
+        ))
+        self.reverse_noiser_commit_cycle_gate_mode = str(getattr(
+            args, "reverse_noiser_commit_cycle_gate_mode",
+            "relative_closure",
+        )).strip().lower()
+        self.reverse_noiser_commit_cycle_gate_min_cosine = float(getattr(
+            args, "reverse_noiser_commit_cycle_gate_min_cosine", 0.0,
+        ))
         if not 0.0 <= self.reverse_noiser_commit_alpha <= 1.0:
             raise ValueError(
                 "reverse_noiser_commit_alpha must be in [0, 1]; got "
@@ -2835,6 +2907,30 @@ class ActionForcingDMD(SelfForcingModel):
             raise ValueError(
                 "reverse_noiser_commit_ramp_steps must be >= 0; got "
                 f"{self.reverse_noiser_commit_ramp_steps}."
+            )
+        if self.reverse_noiser_commit_max_relative_shift < 0.0:
+            raise ValueError(
+                "reverse_noiser_commit_max_relative_shift must be >= 0; got "
+                f"{self.reverse_noiser_commit_max_relative_shift}."
+            )
+        if self.reverse_noiser_commit_cycle_gate_tau <= 0.0:
+            raise ValueError(
+                "reverse_noiser_commit_cycle_gate_tau must be > 0; got "
+                f"{self.reverse_noiser_commit_cycle_gate_tau}."
+            )
+        if self.reverse_noiser_commit_cycle_gate_mode not in (
+            "relative_closure", "gaussian",
+        ):
+            raise ValueError(
+                "reverse_noiser_commit_cycle_gate_mode must be "
+                "'relative_closure' or 'gaussian'; got "
+                f"{self.reverse_noiser_commit_cycle_gate_mode!r}."
+            )
+        if not -1.0 <= self.reverse_noiser_commit_cycle_gate_min_cosine < 1.0:
+            raise ValueError(
+                "reverse_noiser_commit_cycle_gate_min_cosine must be in "
+                "[-1, 1); got "
+                f"{self.reverse_noiser_commit_cycle_gate_min_cosine}."
             )
         # v2-B: self-rollout paired drift loss for F — ground F as the actual
         # causal-drift emulator (F(z_l)~=z_{l+1}) via an L1 to the student's OWN
@@ -4480,6 +4576,20 @@ class ActionForcingDMD(SelfForcingModel):
         self.stat_anchor_loss_weight = float(
             getattr(args, "stat_anchor_loss_weight", 0.0)
         )
+        # Main-run-only emergency robustifier for the raw quadratic stat
+        # anchor. A positive value T leaves L<=T exactly unchanged and uses
+        # ``2T-T^2/L`` above T (see ``attenuate_stat_anchor_tail``). Default
+        # zero is the historical objective. This is deliberately independent
+        # of the stat-anchor weight/ramp so the threshold is calibrated in the
+        # same *weighted-loss units* that ``stat_anchor_total`` logs.
+        self.stat_anchor_tail_threshold = float(
+            getattr(args, "stat_anchor_tail_threshold", 0.0)
+        )
+        if self.stat_anchor_tail_threshold < 0.0:
+            raise ValueError(
+                "stat_anchor_tail_threshold must be >= 0; got "
+                f"{self.stat_anchor_tail_threshold}."
+            )
         # --- Matched-GT stat anchor (stat_anchor_mode='target_matching') ---
         # In target_matching mode the stat anchor sources ALL its stats
         # (STD/M2/TV/SOS/M1) from the K closest GT chunks the GAN's matcher
@@ -10537,7 +10647,10 @@ class ActionForcingDMD(SelfForcingModel):
             int(getattr(self, "_last_current_step", 0))
         )
         if stat_anchor_w_resolved > 0.0 and pred_image is not None:
-            from model.anti_collapse import compute_stat_anchor_loss
+            from model.anti_collapse import (
+                attenuate_stat_anchor_tail,
+                compute_stat_anchor_loss,
+            )
             try:
                 _wk = dict(
                     STD_short_weight=self.stat_anchor_STD_short_weight,
@@ -10582,11 +10695,25 @@ class ActionForcingDMD(SelfForcingModel):
                 else:
                     stat_loss, stat_logs = None, {}
                 if stat_loss is not None:
-                    stat_loss = (
+                    stat_loss_raw = (
                         stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
+                    )
+                    stat_loss, stat_tail_scale, stat_tail_active = (
+                        attenuate_stat_anchor_tail(
+                            stat_loss_raw,
+                            self.stat_anchor_tail_threshold,
+                        )
                     )
                     dmd_loss = dmd_loss + stat_loss
                     dmd_log_dict["stat_anchor_total"] = stat_loss.detach()
+                    dmd_log_dict["stat_anchor_total_raw"] = (
+                        stat_loss_raw.detach()
+                    )
+                    dmd_log_dict["stat_anchor_tail_scale"] = stat_tail_scale
+                    dmd_log_dict["stat_anchor_tail_active"] = stat_tail_active
+                    dmd_log_dict["stat_anchor_tail_threshold"] = float(
+                        self.stat_anchor_tail_threshold
+                    )
                     dmd_log_dict["stat_anchor_weight_resolved"] = float(
                         stat_anchor_w_resolved
                     )
@@ -12887,6 +13014,156 @@ class ActionForcingDMD(SelfForcingModel):
             batch, n_chunks, npb, *z.shape[2:]
         ).reshape_as(z)
 
+    def _gan_carn_commit_aligned_slab(
+        self,
+        z_graph: torch.Tensor,
+        info: Dict[str, Any],
+        *,
+        current_step: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Exact-value proxy of the recurrent commit for GAN/action losses.
+
+        ``z_graph`` is the inference-parity ladder endpoint, not the Flash
+        t=60 auxiliary forward.  The pipeline publishes the literal
+        post-CARN tensor used by its context-noise commit forward.  Reusing
+        that value makes equality with recurrence structural.  Identity-ST
+        mode preserves the historical identity backward.  Frozen-Jacobian
+        mode replays the literal commit with CARN parameters frozen, retaining
+        d(commit)/d(generator output) while never updating CARN from these
+        auxiliary losses.
+        """
+        if not self.gan_carn_commit_align_enabled:
+            raise RuntimeError(
+                "GAN/CARN aligned slab requested while "
+                "gan_carn_commit_align_enabled=false."
+            )
+        if not z_graph.requires_grad:
+            raise RuntimeError(
+                "GAN/CARN aligned slab requires a graph-bearing ladder "
+                "endpoint; received a detached tensor."
+            )
+        committed = info.get("committed_ladder_endpoint_chunk")
+        if committed is None:
+            raise RuntimeError(
+                "GAN/CARN alignment requires the pipeline's exact "
+                "info['committed_ladder_endpoint_chunk']; refusing to "
+                "recompute or approximate the recurrent state."
+            )
+        if tuple(committed.shape) != tuple(z_graph.shape):
+            raise RuntimeError(
+                "GAN/CARN alignment shape mismatch: graph ladder endpoint "
+                f"{tuple(z_graph.shape)} vs actual committed tensor "
+                f"{tuple(committed.shape)}."
+            )
+        if committed.requires_grad:
+            raise RuntimeError(
+                "The actual recurrent commit must be graph-free; received "
+                "a committed_ladder_endpoint_chunk with requires_grad=true."
+            )
+
+        alpha = resolved_commit_alpha(
+            step=int(current_step),
+            target_alpha=float(self.reverse_noiser_commit_alpha),
+            start_step=int(self.reverse_noiser_commit_start_step),
+            ramp_steps=int(self.reverse_noiser_commit_ramp_steps),
+        )
+        raw = z_graph.detach()
+        commit_on = bool(self.reverse_noiser_dedrift_apply_to_commit)
+        committed = committed.to(device=z_graph.device, dtype=z_graph.dtype)
+        use_identity_st = bool(self.gan_carn_commit_straight_through)
+        replay_error = torch.zeros((), device=z_graph.device)
+        if use_identity_st:
+            aligned = straight_through_value(z_graph, committed)
+        else:
+            # Replay the exact per-block recurrent transform.  The pipeline
+            # helper freezes G's parameters internally while preserving its
+            # input Jacobian; it also owns the absolute level, dose schedule,
+            # cycle gate and per-block displacement cap.  CARN seam correction
+            # follows in the same order as the real KV commit.
+            pipe = getattr(self, "inference_pipeline", None)
+            if pipe is None:
+                raise RuntimeError(
+                    "frozen-Jacobian commit alignment requires the live "
+                    "inference pipeline."
+                )
+            if int(getattr(pipe, "context_noise", 0)) != 0:
+                raise RuntimeError(
+                    "frozen-Jacobian commit alignment currently requires "
+                    "context_noise=0."
+                )
+            npb = int(self.num_frame_per_block)
+            if int(z_graph.shape[1]) % npb != 0:
+                raise RuntimeError(
+                    "frozen-Jacobian commit alignment requires whole "
+                    f"chunks; F={int(z_graph.shape[1])}, npb={npb}."
+                )
+            abs_start = int(info.get("abs_frame_start", -1))
+            if abs_start < 0 or abs_start % npb != 0:
+                raise RuntimeError(
+                    "frozen-Jacobian commit alignment requires an absolute, "
+                    f"chunk-aligned info['abs_frame_start']; got {abs_start}."
+                )
+            replay_parts = []
+            for chunk_idx, chunk in enumerate(z_graph.split(npb, dim=1)):
+                replay = pipe._reverse_noiser_dedrift_commit(
+                    chunk,
+                    frame_start=abs_start + chunk_idx * npb,
+                )
+                replay = pipe._carn_seam_correct(replay, record=False)
+                replay_parts.append(replay)
+            replayed = torch.cat(replay_parts, dim=1)
+            replay_error = (
+                replayed.detach().float() - committed.float()
+            ).abs().max()
+            # Exact published recurrent value in the forward; true frozen-CARN
+            # input Jacobian in the backward.
+            aligned = committed.detach() + (
+                replayed - replayed.detach()
+            )
+        with torch.no_grad():
+            npb = int(self.num_frame_per_block)
+            if int(raw.shape[1]) % npb != 0:
+                raise RuntimeError(
+                    "GAN/CARN aligned slab must contain whole commit chunks: "
+                    f"F={int(raw.shape[1])}, npb={npb}."
+                )
+            batch = int(raw.shape[0])
+            n_chunks = int(raw.shape[1]) // npb
+            raw_rows = raw.reshape(
+                batch, n_chunks, npb, *raw.shape[2:]
+            ).reshape(batch * n_chunks, npb, *raw.shape[2:])
+            committed_rows = committed.reshape_as(raw_rows)
+            raw_norm = raw_rows.float().flatten(1).norm(dim=1).clamp_min(1.0e-12)
+            applied_rel = (
+                (committed_rows.float() - raw_rows.float()).flatten(1).norm(dim=1)
+                / raw_norm
+            )
+            value_err = (
+                aligned.detach().float() - committed.float()
+            ).abs().max()
+        logs = {
+            "train/gan_carn_commit_aligned": 1.0,
+            "train/gan_carn_commit_source_ladder": 1.0,
+            "train/gan_carn_commit_straight_through": float(use_identity_st),
+            "train/gan_carn_commit_frozen_jacobian": float(
+                not use_identity_st
+            ),
+            "train/gan_carn_commit_replay_max_error": float(replay_error),
+            "train/gan_carn_commit_enabled": 1.0 if commit_on else 0.0,
+            "train/gan_carn_commit_alpha_target": float(alpha),
+            "train/gan_carn_commit_relative_shift_mean": float(
+                applied_rel.mean()
+            ),
+            "train/gan_carn_commit_relative_shift_max": float(
+                applied_rel.max()
+            ),
+            "train/gan_carn_commit_relative_shift_cap": float(
+                self.reverse_noiser_commit_max_relative_shift
+            ),
+            "train/gan_carn_commit_forward_value_max_error": float(value_err),
+        }
+        return aligned, logs
+
     def _reverse_noiser_internalize_loss(
         self, z_raw, z_dedrifted, mask=None,
     ):
@@ -14484,6 +14761,10 @@ class ActionForcingDMD(SelfForcingModel):
         # inference (utils/eval_causal_AR.py) emits. Detached, whole-chunk,
         # ungated. Identical object to ``_clean_chunk`` when flash is off.
         info_ladder_endpoint = getattr(pipe, "_ladder_chunk", None)
+        # Exact post-CARN tensor that was handed to the context-noise KV
+        # commit forward.  Unlike ``info_ladder_endpoint`` this includes
+        # every correction that recurrence really consumed.
+        info_committed_endpoint = getattr(pipe, "_committed_chunk", None)
         # A23 grad twin (pipeline gate ``pix_finish_grad_enabled``).
         # The LADDER-ENDPOINT x0 WITH a graph back to the generator --
         # the tensor utils/eval_causal_AR.py commits and renders, i.e.
@@ -14702,6 +14983,10 @@ class ActionForcingDMD(SelfForcingModel):
             "ladder_endpoint_chunk": (
                 info_ladder_endpoint.detach()
                 if info_ladder_endpoint is not None else None
+            ),
+            "committed_ladder_endpoint_chunk": (
+                info_committed_endpoint.detach()
+                if info_committed_endpoint is not None else None
             ),
             # True when ``finish_denoised_chunk`` is the flash slab
             # rather than the ladder endpoint (i.e. flash is on and the
@@ -15363,7 +15648,20 @@ class ActionForcingDMD(SelfForcingModel):
         # Supervise ALL student chunks EXCEPT the newest (which lands at
         # the structurally-OOD slot RoPE [21,24) and is masked). For ns=1
         # there is only one chunk, so it IS supervised (the original 42f).
-        num_sup = 1 if ns == 1 else (ns - 1)
+        # The explicit experimental arm below includes that newest slot so
+        # the researcher can measure whether its nominal OOD status is still
+        # harmful in the now-reference-style seven-generated-chunk window.
+        supervise_last = bool(getattr(
+            self, "dmd_42f_supervise_last", False,
+        ))
+        if supervise_last and bool(getattr(
+            self, "dmd_42f_seed_last", False,
+        )):
+            raise ValueError(
+                "dmd_42f_supervise_last=true requires "
+                "dmd_42f_seed_last=false (S7 must be student content)."
+            )
+        num_sup = ns if supervise_last else (1 if ns == 1 else (ns - 1))
         sup_frames = num_sup * npb
         student_frames = ns * npb                  # rolled student frames
         seed_last = bool(getattr(self, "dmd_42f_seed_last", False))
@@ -15380,7 +15678,13 @@ class ActionForcingDMD(SelfForcingModel):
         # ``gt_after_chunks=2`` + ``seed_last=false`` = [4 GT | S | s s],
         # leaving the student rollout in instead of GT.
         gt_after_override = int(getattr(self, "dmd_42f_gt_after_chunks", 0))
-        if gt_after_override > 0:
+        if supervise_last:
+            # All N frames are student-supervised, hence there is neither a
+            # GT/context prefix nor an after/scaffold block in the noisy half.
+            # The clean half remains the same positional GT window shifted
+            # back by npb; only its newest noisy slot lacks a counterpart.
+            gt_after_frames = 0
+        elif gt_after_override > 0:
             gt_after_frames = gt_after_override * npb
         else:
             gt_after_frames = student_frames - sup_frames
@@ -15885,6 +16189,15 @@ class ActionForcingDMD(SelfForcingModel):
         gradient_mask[
             :, n_ctx + sup_offset : n_ctx + sup_offset + sup_span
         ] = True
+        if supervise_last and getattr(self, "_dmd_s7_dbg", 0) < 4:
+            self._dmd_s7_dbg = getattr(self, "_dmd_s7_dbg", 0) + 1
+            import sys as _sys
+            print(
+                f"[DMD-S7] ACTIVE: noisy student frames={int(noisy_x.shape[1])} "
+                f"supervised_frames={int(gradient_mask[:, :, 0, 0, 0].sum(dim=1).max())} "
+                f"last_chunk_requires_grad={bool(chunk[:, -npb:].requires_grad)}",
+                file=_sys.stderr, flush=True,
+            )
         import os as _os
         if _os.environ.get("ARRWM_ROPE_DEBUG"):
             try:
@@ -16729,7 +17042,10 @@ class ActionForcingDMD(SelfForcingModel):
         _mode = getattr(self, "stat_anchor_mode", "seed_anchor")
         if stat_anchor_w_resolved > 0.0:
             try:
-                from model.anti_collapse import compute_stat_anchor_loss
+                from model.anti_collapse import (
+                    attenuate_stat_anchor_tail,
+                    compute_stat_anchor_loss,
+                )
                 _wk = dict(
                     STD_short_weight=self.stat_anchor_STD_short_weight,
                     STD_long_weight=self.stat_anchor_STD_long_weight,
@@ -16798,11 +17114,23 @@ class ActionForcingDMD(SelfForcingModel):
                 else:
                     stat_loss, stat_logs = None, {}
                 if stat_loss is not None:
-                    stat_loss = (
+                    stat_loss_raw = (
                         stat_anchor_w_resolved * stat_loss.to(dmd_loss.dtype)
+                    )
+                    stat_loss, stat_tail_scale, stat_tail_active = (
+                        attenuate_stat_anchor_tail(
+                            stat_loss_raw,
+                            self.stat_anchor_tail_threshold,
+                        )
                     )
                     dmd_loss = dmd_loss + stat_loss
                     dmd_log["stat_anchor_total"] = stat_loss.detach()
+                    dmd_log["stat_anchor_total_raw"] = stat_loss_raw.detach()
+                    dmd_log["stat_anchor_tail_scale"] = stat_tail_scale
+                    dmd_log["stat_anchor_tail_active"] = stat_tail_active
+                    dmd_log["stat_anchor_tail_threshold"] = float(
+                        self.stat_anchor_tail_threshold
+                    )
                     dmd_log["stat_anchor_mode"] = float(
                         1.0 if _matched is not None else 0.0
                     )

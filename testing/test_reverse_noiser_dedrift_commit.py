@@ -263,6 +263,39 @@ class _Owner:
             setattr(self, k, v)
 
 
+class _AffineCycle(torch.nn.Module):
+    """Tiny forward CARN stand-in for commit reliability tests."""
+
+    def __init__(self, delta: float):
+        super().__init__()
+        self.register_parameter("dtype_anchor", torch.nn.Parameter(torch.zeros(())))
+        self.delta = float(delta)
+
+    def forward(self, x, _level, residual=True):
+        assert residual
+        return x + self.delta
+
+
+class _AffineOwner(_Owner):
+    """G(x)=x+1 with an independently selectable forward-cycle direction."""
+
+    def __init__(self, forward_delta: float, *, gate: bool):
+        super().__init__(
+            **{FLAG: True},
+            reverse_noiser_dedrift_enabled=True,
+            reverse_noiser_commit_cycle_probe_enabled=True,
+            reverse_noiser_commit_cycle_gate_enabled=gate,
+            reverse_noiser_commit_cycle_gate_tau=0.02,
+            reverse_noiser_commit_cycle_gate_mode="relative_closure",
+            reverse_noiser_commit_cycle_gate_min_cosine=0.0,
+            reverse_noiser_commit_max_relative_shift=0.0,
+            forward_noiser=_AffineCycle(forward_delta),
+        )
+
+    def _dedrift_with_reverse_noiser(self, z, _level):
+        return z + 1.0
+
+
 def _armed_owner(net=None, **kw):
     """Both gates on, cycle mode, non-identity reverse noiser."""
     return _Owner(**{FLAG: True}, reverse_noiser_dedrift_enabled=True,
@@ -302,6 +335,45 @@ def _run_iwt(pipe, *, frames=NPB, flash=False, requires_grad=False,
 
 RUNNERS = {"generate_chunk_with_cache": _run_gcwc,
            "inference_with_trajectory": _run_iwt}
+
+
+def test_commit_cycle_gate_preserves_a_locally_invertible_correction():
+    pipe, _ = _build()
+    owner = _AffineOwner(forward_delta=-1.0, gate=True)
+    owner._carn_commit_cycle_step_stats = {}
+    pipe._carn_commit_dedrift_owner = owner
+    raw = torch.randn(2, NPB, LAT_C, LAT_H, LAT_W)
+
+    got = pipe._reverse_noiser_dedrift_commit(raw, frame_start=3)
+
+    torch.testing.assert_close(got, raw + 1.0)
+    stats = owner._carn_commit_cycle_step_stats
+    assert sum(int(v.numel()) for v in stats["rel"]) == 2
+    assert max(float(v.max()) for v in stats["rel"]) == pytest.approx(
+        0.0, abs=1e-7
+    )
+    assert min(float(v.min()) for v in stats["cos"]) == pytest.approx(
+        1.0, abs=1e-6
+    )
+    assert min(float(v.min()) for v in stats["reliability"]) == pytest.approx(
+        1.0, abs=1e-7
+    )
+
+
+def test_commit_cycle_gate_rejects_a_noninverse_direction_but_probe_does_not():
+    raw = torch.randn(2, NPB, LAT_C, LAT_H, LAT_W)
+
+    pipe_gate, _ = _build()
+    owner_gate = _AffineOwner(forward_delta=1.0, gate=True)
+    pipe_gate._carn_commit_dedrift_owner = owner_gate
+    gated = pipe_gate._reverse_noiser_dedrift_commit(raw, frame_start=3)
+    torch.testing.assert_close(gated, raw)
+
+    pipe_probe, _ = _build()
+    owner_probe = _AffineOwner(forward_delta=1.0, gate=False)
+    pipe_probe._carn_commit_dedrift_owner = owner_probe
+    probed = pipe_probe._reverse_noiser_dedrift_commit(raw, frame_start=3)
+    torch.testing.assert_close(probed, raw + 1.0)
 
 
 def _commit_call(gen, context_noise=0):
@@ -578,6 +650,11 @@ def test_committed_tensor_equals_a_direct_helper_call(method, flash):
     pipe_on, gen_on = _build(**{OWNER_ATTR: _armed_owner(net)})
     run(pipe_on, flash=flash)
     got = _commit_call(gen_on)["in"]
+    assert pipe_on._committed_chunk is not None
+    assert torch.equal(pipe_on._committed_chunk, got), (
+        f"{method}: the published committed slab must be the literal tensor "
+        "passed to the context-noise KV forward."
+    )
 
     ref_owner = _armed_owner(net)
     with torch.no_grad():

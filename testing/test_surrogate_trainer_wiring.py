@@ -897,5 +897,55 @@ def test_gterm_passes_the_unwrapped_critic_never_a_module_attribute():
     assert ".module" not in snap_src
 
 
+# ---------------------------------------------------------------------------
+# GAN/CARN rehabilitation: exact recurrent value, seven live chunks.
+# ---------------------------------------------------------------------------
+class _CommitAlignModel:
+    ladd_fake_sample_source = "commit"
+
+    def _gan_carn_commit_aligned_slab(self, graph, info, *, current_step):
+        committed = info["committed_ladder_endpoint_chunk"]
+        return (
+            committed.detach() + (graph - graph.detach()),
+            {"train/gan_carn_commit_aligned": 1.0},
+        )
+
+
+def test_commit_fake_replaces_every_consumer_key_with_exact_st_value():
+    trainer = SimpleNamespace(model=_CommitAlignModel())
+    graph = torch.randn(1, 21, 2, 2, 2, requires_grad=True)
+    committed = torch.randn_like(graph)
+    info = {
+        "finish_denoised_chunk_grad": graph,
+        "finish_denoised_chunk_grad_mask": torch.ones(21, dtype=torch.bool),
+        "committed_ladder_endpoint_chunk": committed,
+    }
+    logs = Trainer._prepare_gan_carn_commit_fake(
+        trainer, info, current_step=200,
+    )
+    aligned = info["gan_carn_commit_aligned_x0"]
+    assert info["finish_denoised_chunk_grad"] is aligned
+    torch.testing.assert_close(aligned.detach(), committed, rtol=0, atol=0)
+    grad, = torch.autograd.grad(aligned.sum(), graph)
+    torch.testing.assert_close(grad, torch.ones_like(graph), rtol=0, atol=0)
+    assert logs["train/gan_carn_commit_live_frames"] == 21.0
+
+
+def test_commit_fake_fails_if_even_one_of_seven_chunks_is_detached():
+    trainer = SimpleNamespace(model=_CommitAlignModel())
+    graph = torch.randn(1, 21, 2, 2, 2, requires_grad=True)
+    mask = torch.ones(21, dtype=torch.bool)
+    mask[-3:] = False
+    info = {
+        "finish_denoised_chunk_grad": graph,
+        "finish_denoised_chunk_grad_mask": mask,
+        "committed_ladder_endpoint_chunk": torch.randn_like(graph),
+    }
+    with pytest.raises(RuntimeError, match="18/21"):
+        Trainer._prepare_gan_carn_commit_fake(
+            trainer, info, current_step=200,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

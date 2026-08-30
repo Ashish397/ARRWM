@@ -3,7 +3,7 @@
 # 8 nodes x 4 GPUs/node x one ride/rank = global batch size 32.
 #
 # Submit with exactly one PHASE3_AXIS:
-#   base | no_gan | no_commit | no_aux | no_action_critic | no_stat_anchor
+#   base | base_v2 | no_gan | no_commit | no_aux | no_action_critic | no_stat_anchor
 #
 # The existing two-node source is executed inside this allocation after a
 # final last-wins override block is injected immediately before run_name.
@@ -17,6 +17,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=03:00:00
+#SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --output=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.out
 #SBATCH --error=/scratch/u6ex/as1748.u6ex/ARRWM/logs/%x_%j.err
@@ -25,10 +26,10 @@ set -euo pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-: "${PHASE3_AXIS:?set PHASE3_AXIS=base|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor}"
+: "${PHASE3_AXIS:?set PHASE3_AXIS=base|base_v2|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor}"
 
 case "$PHASE3_AXIS" in
-  base|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor) ;;
+  base|base_v2|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor) ;;
   *)
     echo "[P3-8N] invalid PHASE3_AXIS=$PHASE3_AXIS" >&2
     exit 2
@@ -91,15 +92,24 @@ BASE_COMMON="max_steps=200 sample_interval=15 checkpoint_interval=100 keep_last_
 # and committed-memory correction staged 0 -> 0.25 over steps 100..200.
 CARN_COMMON="forward_noiser_enabled=true forward_noiser_train_source=rollout forward_noiser_rollout2_source=legacy forward_noiser_reverse=false forward_noiser_cycle_enabled=true cycle_rev_input_mode=paired_target cycle_freeze_g_in_cycle=true forward_noiser_pair_loss_weight=0.25 carn_recurse=false forward_noiser_apply_decoupled=false forward_noiser_apply_gt_former=false forward_noiser_apply_gt_both=false forward_noiser_apply_in_aux=false reverse_noiser_dedrift_enabled=true reverse_noiser_dedrift_level=1 reverse_noiser_dedrift_min_level=1 reverse_noiser_dedrift_steps=1 reverse_noiser_dedrift_alpha0=1.0 reverse_noiser_preserve_moments=true reverse_noiser_internalize_weight=0.25 reverse_noiser_dedrift_apply_to_train_score=false reverse_noiser_dedrift_apply_to_flash=false reverse_noiser_dedrift_apply_to_commit=true reverse_noiser_commit_use_absolute_level=true reverse_noiser_commit_alpha=0.25 reverse_noiser_commit_start_step=100 reverse_noiser_commit_ramp_steps=100 gen_aux_losses_x0_source=flash ladd_gt_vs_fake_enabled=true ladd_gt_vs_fake_weight=0.5 ladd_gt_transition_enabled=true ladd_gt_transition_weight=0.5 ladd_gt_transition_carn_bridge=true ladd_gt_transition_carn_former=false ladd_gt_transition_carn_latter_reverse=false ladd_gt_transition_carn_steps=1 ladd_gt_transition_gen_detach_former=true ladd_gt_transition_match=false stat_anchor_use_clean_match_offset=false stat_anchor_match_k=2 action_critic_aux_enabled=true action_critic_freeze=true action_teacher_mode=off teacher_action_encoder=pca_raw generator_action_z_guidance_weight=0.3 lora_action_critic_z_guidance_weight=0.0 critic_updates_per_step=1 action_critic_z_loss_weight=0.25 critic_lr=3e-4"
 
-# Generate a full seven-chunk student window. DMD supervises S1..S6 (18
-# frames); S7 stays in the 21-frame scoring context but is detached and masked.
+# Generate a full seven-chunk student window and retain the graph for every
+# block. DMD and the non-DMD CARN/GAN auxiliaries supervise S1..S7 (21 frames).
 # The clean side is positional GT only: no temporal clean-window matching.
-GEOMETRY_COMMON="num_training_frames=21 rollout_frames=21 streaming_chunk_size=21 max_rolls_per_ride=1 dmd_only_first_chunk_per_ride=true dmd_42f_enabled=true dmd_42f_num_chunks=7 dmd_42f_seed_last=false dmd_42f_gt_after_chunks=1 dmd_42f_gt_anchor=true dmd_42f_rand_sup_slot=false dmd_42f_allsup=false dmd_42f_rolling_sup_new=false dmd_42f_allroll_student_ctx=false dmd_42f_clean_match_enabled=false dmd_42f_clean_match_forward=false dmd_42f_clean_match_forward_only=false num_chunks_roll_forward=0 sample_7chunk_enabled=true max_ride_frames_random=false"
+GEOMETRY_COMMON="num_training_frames=21 rollout_frames=21 streaming_chunk_size=21 max_rolls_per_ride=1 dmd_only_first_chunk_per_ride=true dmd_42f_enabled=true dmd_42f_num_chunks=7 dmd_42f_seed_last=false dmd_42f_gt_after_chunks=1 dmd_42f_gt_anchor=true dmd_42f_rand_sup_slot=false dmd_42f_allsup=false dmd_42f_rolling_sup_new=false dmd_42f_allroll_student_ctx=false dmd_42f_clean_match_enabled=false dmd_42f_clean_match_forward=false dmd_42f_clean_match_forward_only=false aux_train_trailing_chunk=true dmd_42f_supervise_last=true num_chunks_roll_forward=0 sample_7chunk_enabled=true max_ride_frames_random=false"
 
 ABLATION_EXTRA=""
 COMMITDEDRIFT_ENV=true
 case "$PHASE3_AXIS" in
   base)
+    ;;
+  base_v2)
+    # Faithful stationary parent for the rehabilitated rolling base. Retire
+    # every transition-GAN route, give the full pair-mode budget to GT-vs-fake,
+    # and align both GAN and auxiliary guidance to the bounded post-CARN commit
+    # endpoint. This matches the current rolling base_v2 loss surface from the
+    # first stationary step instead of inheriting the historical transition
+    # bridge checkpoint.
+    ABLATION_EXTRA="pix_finish_grad_enabled=true ladd_fake_sample_source=commit reverse_noiser_commit_alpha=0.125 reverse_noiser_commit_start_step=150 reverse_noiser_commit_ramp_steps=100 reverse_noiser_commit_max_relative_shift=0.015 gan_carn_commit_align_enabled=true gan_carn_commit_straight_through=true gen_aux_losses_x0_source=commit ladd_gt_vs_fake_enabled=true ladd_gt_vs_fake_weight=1.0 ladd_gt_transition_enabled=false ladd_gt_transition_weight=0.0 ladd_gt_transition_carn_bridge=false ladd_gt_transition_carn_former=false ladd_gt_transition_carn_latter_reverse=false ladd_gt_transition_gen_detach_former=false ladd_gt_transition_match=false ladd_adjacent_chunks_enabled=false"
     ;;
   no_gan)
     # Remove the discriminator, decoder pullback, and every LADD pair loss.
@@ -118,8 +128,12 @@ case "$PHASE3_AXIS" in
     ;;
   no_action_critic)
     # Preserve ordinary generator action conditioning; remove only the frozen
-    # auxiliary action critic's generator guidance route.
-    ABLATION_EXTRA="action_critic_aux_enabled=false action_teacher_mode=off generator_action_z_guidance_weight=0.0 lora_action_critic_z_guidance_weight=0.0"
+    # auxiliary action critic's generator guidance route. The critic checkpoint
+    # path is also blanked so the loader skips its strict load: this dotlist is
+    # appended last and wins over the action_critic_checkpoint= set by
+    # carncommit_long.sbatch, which otherwise raises RuntimeError when the head
+    # is not instantiated (job 6176584 died at startup on exactly that).
+    ABLATION_EXTRA="action_critic_aux_enabled=false action_teacher_mode=off generator_action_z_guidance_weight=0.0 lora_action_critic_z_guidance_weight=0.0 action_critic_checkpoint="
     ;;
   no_stat_anchor)
     # Keep the per-stat recipe present but make its outer contribution zero.
@@ -137,7 +151,8 @@ if [ "${PHASE3_SMOKE:-0}" = "1" ]; then
   SMOKE_SAMPLE_INTERVAL="${PHASE3_SMOKE_SAMPLE_INTERVAL:-0}"
   SMOKE_DISABLE_WANDB="${PHASE3_SMOKE_DISABLE_WANDB:-true}"
   SMOKE_SAMPLE_7CHUNK="${PHASE3_SMOKE_SAMPLE_7CHUNK:-false}"
-  SMOKE_EXTRA="max_steps=$SMOKE_MAX_STEPS sample_interval=$SMOKE_SAMPLE_INTERVAL checkpoint_interval=999999 keep_last_n_checkpoints=1 auto_resume=false save_full_checkpoint=false disable_wandb=$SMOKE_DISABLE_WANDB log_interval=1 dmd_loss_warmup_steps=0 sample_7chunk_enabled=$SMOKE_SAMPLE_7CHUNK"
+  SMOKE_RECIPE_EXTRA="${PHASE3_SMOKE_RECIPE_EXTRA:-}"
+  SMOKE_EXTRA="max_steps=$SMOKE_MAX_STEPS sample_interval=$SMOKE_SAMPLE_INTERVAL checkpoint_interval=999999 keep_last_n_checkpoints=1 auto_resume=false save_full_checkpoint=false disable_wandb=$SMOKE_DISABLE_WANDB log_interval=1 dmd_loss_warmup_steps=0 sample_7chunk_enabled=$SMOKE_SAMPLE_7CHUNK $SMOKE_RECIPE_EXTRA"
 fi
 
 COMMON="$BASE_COMMON $CARN_COMMON $GEOMETRY_COMMON $ABLATION_EXTRA $SMOKE_EXTRA"
@@ -176,4 +191,48 @@ if [ "${PHASE3_PRINT_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-COMMITDEDRIFT=$COMMITDEDRIFT_ENV bash "$TMP_LAUNCH"
+# In-allocation launch-race retry. The GH200 launch race strands 38-75GB of
+# unattributable HBM on 1-3 GPUs and OOMs 2-7 min in; the stranded memory is
+# transient (freed when the failed attempt's processes die), so relaunching
+# torchrun on the SAME allocation with a fresh rendezvous port
+# (ARRWM_MASTER_PORT is read by carncommit_long.sbatch line ~186) usually
+# wins the next coin flip without losing the nodes. Only failures faster
+# than PHASE3_INPLACE_WINDOW qualify (race failures die in minutes; a late
+# crash is a real bug and a from-scratch rerun would waste GPU-hours).
+# After PHASE3_MAX_INPLACE_ATTEMPTS, fall back to scontrol requeue (fresh
+# nodes, same job id / run dir / afterok children), capped via
+# SLURM_RESTART_COUNT as before.
+attempt=0
+max_inplace="${PHASE3_MAX_INPLACE_ATTEMPTS:-3}"
+inplace_window="${PHASE3_INPLACE_WINDOW:-1500}"
+while :; do
+  attempt=$((attempt+1))
+  export ARRWM_MASTER_PORT=$((29500 + (SLURM_JOB_ID + attempt * 131) % 16000))
+  launch_t0=$SECONDS
+  set +e
+  COMMITDEDRIFT=$COMMITDEDRIFT_ENV bash "$TMP_LAUNCH"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] && break
+  launch_dt=$((SECONDS - launch_t0))
+  if [ "$launch_dt" -lt "$inplace_window" ] && [ "$attempt" -lt "$max_inplace" ]; then
+    echo "[P3-8N] attempt $attempt failed rc=$rc after ${launch_dt}s -> in-allocation relaunch with fresh rdzv port"
+    srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 bash -c 'pkill -9 -f "[c]ausal_action_forcing_train.py" 2>/dev/null; sleep 3; nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null | sed "s/^/[hbm-drain $(hostname)] /"' || true
+    sleep 45
+    continue
+  fi
+  if [ "$launch_dt" -ge "$inplace_window" ]; then
+    echo "[P3-8N] attempt $attempt failed rc=$rc after ${launch_dt}s (>= ${inplace_window}s window): not a launch race, giving up" >&2
+    exit "$rc"
+  fi
+  restarts="${SLURM_RESTART_COUNT:-0}"
+  max_requeue="${PHASE3_MAX_REQUEUE:-4}"
+  if [ -n "${SLURM_JOB_ID:-}" ] && [ "$restarts" -lt "$max_requeue" ]; then
+    echo "[P3-8N] $attempt in-allocation attempts exhausted; restart_count=$restarts/$max_requeue -> scontrol requeue for fresh nodes"
+    scontrol requeue "$SLURM_JOB_ID"
+    sleep 10
+    exit 0
+  fi
+  echo "[P3-8N] giving up after $attempt in-place attempts and $restarts requeues" >&2
+  exit "$rc"
+done

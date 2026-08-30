@@ -104,6 +104,11 @@ from torch.utils.checkpoint import checkpoint as _ckpt
 
 from utils.scheduler import SchedulerInterface
 from utils.wan_wrapper import WanDiffusionWrapper
+from model.carn_commit import (
+    absolute_carn_level,
+    blend_carn_commit,
+    resolved_commit_alpha,
+)
 
 
 _ACTION_STREAM_KEYS: Tuple[str, ...] = (
@@ -1426,11 +1431,12 @@ class ActionForcingTrainingPipeline:
                 )
                 m["carn_commit_dedrift_alpha"] = 0.0
             return x
-        ramp_frac = (
-            min(1.0, max(0.0, float(step - start) / float(ramp)))
-            if ramp > 0 else 1.0
+        commit_alpha = resolved_commit_alpha(
+            step=step,
+            target_alpha=target_alpha,
+            start_step=start,
+            ramp_steps=ramp,
         )
-        commit_alpha = target_alpha * ramp_frac
         if commit_alpha <= 0.0:
             m = getattr(self, "_last_extension_metrics", None)
             if isinstance(m, dict):
@@ -1465,9 +1471,11 @@ class ActionForcingTrainingPipeline:
             # Same absolute-position convention as
             # _dedrift_streaming_slab_with_reverse_noiser: the final clean
             # seed chunk is level 0 and the first generated chunk is level 1.
-            lvl = min(
-                max(0, (int(frame_start) // npb) - (num_seed - 1)),
-                max_level,
+            lvl = absolute_carn_level(
+                frame_start=int(frame_start),
+                frames_per_block=npb,
+                num_seed_chunks=num_seed,
+                max_level=max_level,
             )
         out = fn(x, lvl)
         if out is x:
@@ -1480,8 +1488,140 @@ class ActionForcingTrainingPipeline:
                     float(m.get("carn_commit_dedrift_noop", 0.0)) + 1.0
                 )
             return x
-        if commit_alpha != 1.0:
-            out = x + commit_alpha * (out - x)
+        # A correction used as recurrent memory must be locally invertible by
+        # the CARN pair that learned it.  Measure the literal closure
+        # F(G(x,l),l) ~= x and the direction agreement
+        # (G(x)-x) ~= -(F(G(x))-G(x)).  This is a model-internal reliability
+        # test: no GT, resampling, loss magnitude or visual heuristic enters.
+        # Probe-only mode leaves ``out`` untouched; gate mode scales the
+        # correction continuously, never drops or replaces the training
+        # window.  One small no-grad CARN forward per commit is the only cost.
+        _cycle_probe = bool(getattr(
+            owner, "reverse_noiser_commit_cycle_probe_enabled", False,
+        ))
+        _cycle_gate = bool(getattr(
+            owner, "reverse_noiser_commit_cycle_gate_enabled", False,
+        ))
+        if _cycle_probe or _cycle_gate:
+            F_net = getattr(owner, "forward_noiser", None)
+            if F_net is None:
+                raise RuntimeError(
+                    "CARN commit cycle audit requires forward_noiser."
+                )
+            F_inner = F_net.module if hasattr(F_net, "module") else F_net
+            with torch.no_grad():
+                f_dtype = next(F_inner.parameters()).dtype
+                cs = torch.full(
+                    (int(out.shape[0]),), int(lvl), dtype=torch.long,
+                    device=out.device,
+                )
+                closed = F_inner(
+                    out.detach().to(dtype=f_dtype), cs, residual=True,
+                ).to(dtype=x.dtype)
+                x_flat = x.detach().float().flatten(1)
+                g_delta = (out.detach() - x.detach()).float().flatten(1)
+                f_delta = (closed.detach() - out.detach()).float().flatten(1)
+                x_norm = x_flat.norm(dim=1).clamp_min(1.0e-12)
+                cycle_rel = (
+                    (closed.detach().float() - x.detach().float())
+                    .flatten(1).norm(dim=1) / x_norm
+                )
+                correction_rel = g_delta.norm(dim=1) / x_norm
+                cycle_ratio = cycle_rel / correction_rel.clamp_min(1.0e-12)
+                inv_cos = torch.nn.functional.cosine_similarity(
+                    g_delta, -f_delta, dim=1, eps=1.0e-12,
+                )
+                tau = float(getattr(
+                    owner, "reverse_noiser_commit_cycle_gate_tau", 0.02,
+                ))
+                min_cos = float(getattr(
+                    owner,
+                    "reverse_noiser_commit_cycle_gate_min_cosine", 0.0,
+                ))
+                gate_mode = str(getattr(
+                    owner, "reverse_noiser_commit_cycle_gate_mode",
+                    "relative_closure",
+                )).strip().lower()
+                if gate_mode == "relative_closure":
+                    # Dimensionless inverse-quality certificate.  A useful G
+                    # must make the F(G(x))->x closure error smaller than the
+                    # correction it proposes.  Retain the fraction by which
+                    # it improves that baseline; reject ratio>=1.  No dataset-
+                    # fitted threshold or loss scale enters this decision.
+                    cycle_quality = (1.0 - cycle_ratio).clamp_(0.0, 1.0)
+                elif gate_mode == "gaussian":
+                    cycle_quality = torch.exp(-torch.square(cycle_rel / tau))
+                else:
+                    raise RuntimeError(
+                        "unknown CARN commit cycle gate mode "
+                        f"{gate_mode!r}"
+                    )
+                direction_quality = (
+                    (inv_cos - min_cos) / max(1.0e-6, 1.0 - min_cos)
+                ).clamp_(0.0, 1.0)
+                reliability = cycle_quality * direction_quality
+                if _cycle_gate:
+                    rv = reliability.to(dtype=out.dtype).view(
+                        -1, *([1] * (out.dim() - 1))
+                    )
+                    out = x + rv * (out - x)
+            m = getattr(self, "_last_extension_metrics", None)
+            if isinstance(m, dict):
+                _ncy = float(m.get("carn_commit_cycle_probe_calls", 0.0))
+                _bcy = float(cycle_rel.numel())
+                m["carn_commit_cycle_probe_calls"] = _ncy + _bcy
+                m["carn_commit_cycle_rel_sum"] = float(
+                    m.get("carn_commit_cycle_rel_sum", 0.0)
+                ) + float(cycle_rel.sum())
+                m["carn_commit_cycle_rel_max"] = max(
+                    float(m.get("carn_commit_cycle_rel_max", 0.0)),
+                    float(cycle_rel.max()),
+                )
+                m["carn_commit_cycle_inverse_cos_sum"] = float(
+                    m.get("carn_commit_cycle_inverse_cos_sum", 0.0)
+                ) + float(inv_cos.sum())
+                m["carn_commit_cycle_inverse_cos_min"] = min(
+                    float(m.get("carn_commit_cycle_inverse_cos_min", 1.0)),
+                    float(inv_cos.min()),
+                )
+                m["carn_commit_cycle_reliability_sum"] = float(
+                    m.get("carn_commit_cycle_reliability_sum", 0.0)
+                ) + float(reliability.sum())
+                m["carn_commit_cycle_reliability_min"] = min(
+                    float(m.get("carn_commit_cycle_reliability_min", 1.0)),
+                    float(reliability.min()),
+                )
+                m["carn_commit_cycle_gate_enabled"] = float(_cycle_gate)
+                m["carn_commit_cycle_gate_tau"] = float(tau)
+                m["carn_commit_cycle_gate_min_cosine"] = float(min_cos)
+                m["carn_commit_cycle_gate_relative_closure"] = float(
+                    gate_mode == "relative_closure"
+                )
+            # Trainer-step aggregate spans setup's generated anchor, every
+            # no-grad context chunk and all seven terminal blocks.  Per-call
+            # extension metrics are reset by the pipeline and would otherwise
+            # hide the anchor -- precisely the recurrent transition under
+            # investigation.  Plain Python scalars only; no graph is retained.
+            agg = getattr(owner, "_carn_commit_cycle_step_stats", None)
+            if isinstance(agg, dict):
+                # Keep detached device scalars until the terminal call ends;
+                # the trainer reduces them once.  Calling .item() here would
+                # impose a CUDA synchronization on every committed chunk.
+                agg.setdefault("rel", []).append(cycle_rel.detach())
+                agg.setdefault("correction_rel", []).append(
+                    correction_rel.detach()
+                )
+                agg.setdefault("ratio", []).append(cycle_ratio.detach())
+                agg.setdefault("cos", []).append(inv_cos.detach())
+                agg.setdefault("reliability", []).append(
+                    reliability.detach()
+                )
+        max_rel = float(getattr(
+            owner, "reverse_noiser_commit_max_relative_shift", 0.0,
+        ))
+        out, effective_alpha = blend_carn_commit(
+            x, out, alpha=commit_alpha, max_relative_shift=max_rel,
+        )
         n = float(getattr(self, "_carn_commit_dedrift_calls", 0.0)) + 1.0
         self._carn_commit_dedrift_calls = n
         m = getattr(self, "_last_extension_metrics", None)
@@ -1491,6 +1631,8 @@ class ActionForcingTrainingPipeline:
                 float(m.get("carn_commit_dedrift_applied", 0.0)) + 1.0
             )
             m["carn_commit_dedrift_alpha"] = float(commit_alpha)
+            m["carn_commit_dedrift_alpha_target"] = float(commit_alpha)
+            m["carn_commit_dedrift_max_relative_shift"] = float(max_rel)
             m["carn_commit_dedrift_step"] = float(step)
             m["carn_commit_dedrift_level"] = float(lvl)
         # MILESTONE rank-0 proof line with the relative displacement.
@@ -1515,6 +1657,8 @@ class ActionForcingTrainingPipeline:
                         (out.detach().float() - x.detach().float()).norm()
                         / max(float(x.detach().float().norm()), 1e-8)
                     )
+                    effective_alpha_min = float(effective_alpha.min())
+                    effective_alpha_max = float(effective_alpha.max())
                 # Reuse the milestone sync above to make the displacement
                 # promotion gate queryable in W&B without adding a per-commit
                 # synchronization. Between milestones the key is absent, not
@@ -1522,11 +1666,19 @@ class ActionForcingTrainingPipeline:
                 if isinstance(m, dict):
                     m["carn_commit_dedrift_rel"] = float(rel)
                     m["carn_commit_dedrift_rel_step"] = float(step)
+                    m["carn_commit_dedrift_alpha_effective_min"] = (
+                        effective_alpha_min
+                    )
+                    m["carn_commit_dedrift_alpha_effective_max"] = (
+                        effective_alpha_max
+                    )
                 if (dist.get_rank() if dist.is_initialized() else 0) == 0:
                     print(
                         "[CARN][commit-dedrift] ACTIVE at the KV commit: "
                         f"call={int(n)} step={step} level={lvl} "
-                        f"alpha={commit_alpha:.6g} rel|dz|={rel:.6g} "
+                        f"alpha_target={commit_alpha:.6g} "
+                        f"alpha_effective={effective_alpha_min:.6g}.."
+                        f"{effective_alpha_max:.6g} rel|dz|={rel:.6g} "
                         "(the COMMITTED chunk is corrected in place; the "
                         "emitted/scored chunk is not. rel|dz|=0 at call=1 "
                         "is EXPECTED -- R is zero-init; watch it GROW)",
@@ -1628,6 +1780,11 @@ class ActionForcingTrainingPipeline:
         # ``flash_dmd_enabled=False`` so the aux pass falls back to
         # the legacy ``_streaming_build_clean_x_self`` path.
         self._clean_chunk: Optional[torch.Tensor] = None
+        # Exact graph-free tensor passed to the recurrent KV commit after
+        # every enabled CARN correction.  This is deliberately distinct
+        # from ``_ladder_chunk``: the latter is the raw ladder endpoint,
+        # while this buffer records what recurrence actually consumed.
+        self._committed_chunk: Optional[torch.Tensor] = None
         # A23: this path never builds the grad twin, so clear any stale
         # buffer left by a previous ``generate_chunk_with_cache`` call
         # rather than letting a consumer read a graph from a different
@@ -1819,6 +1976,7 @@ class ActionForcingTrainingPipeline:
         ladder_chunk = (
             torch.zeros_like(clean_chunk) if flash_dmd_enabled else None
         )
+        committed_chunk = torch.zeros_like(clean_chunk)
         # CF-parity #11: gradient-window gate. CF hardcodes a literal
         # 21 here (``Causal-Forcing/pipeline/self_forcing_training.py:
         # 120``: ``start_gradient_frame_index = num_output_frames - 21``)
@@ -1930,7 +2088,13 @@ class ActionForcingTrainingPipeline:
                     # rationale.
                     is_last_block = (block_index == len(all_num_frames) - 1)
                     is_multi_block = (len(all_num_frames) > 1)
-                    skip_last_block_grad = is_last_block and is_multi_block
+                    skip_last_block_grad = (
+                        is_last_block
+                        and is_multi_block
+                        and not bool(getattr(
+                            self, "aux_train_trailing_chunk", False,
+                        ))
+                    )
                     if current_start_frame < start_gradient_frame_index or skip_last_block_grad:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
@@ -2079,7 +2243,12 @@ class ActionForcingTrainingPipeline:
                 flash_grad_active = (
                     requires_grad
                     and current_start_frame >= start_gradient_frame_index
-                    and not (is_last_block and is_multi_block)
+                    and (
+                        bool(getattr(
+                            self, "aux_train_trailing_chunk", False,
+                        ))
+                        or not (is_last_block and is_multi_block)
+                    )
                 )
                 if flash_grad_active:
                     # Activation-checkpoint the per-block grad-on
@@ -2354,6 +2523,10 @@ class ActionForcingTrainingPipeline:
                     torch.randn_like(commit_input_clean.flatten(0, 1)),
                     context_timestep.flatten(0, 1),
                 ).unflatten(0, commit_input_clean.shape[:2])
+            committed_chunk[
+                :,
+                current_start_frame: current_start_frame + current_num_frames,
+            ] = cache_commit_input
             # Phase-LoRA dispatch for the context_noise commit forward.
             # This forward writes the KV cache at t=context_noise (~0)
             # — same logical position as _seed_prefill_chunk's commit
@@ -2422,6 +2595,9 @@ class ActionForcingTrainingPipeline:
                 ladder_chunk = ladder_chunk[
                     :, num_input_frames + num_seed_frames:
                 ]
+            committed_chunk = committed_chunk[
+                :, num_input_frames + num_seed_frames:
+            ]
 
         # Stash the Flash-DMD t=flash_dmd_gan_t output on the pipeline
         # instance so the model can read it without a return-tuple
@@ -2442,6 +2618,7 @@ class ActionForcingTrainingPipeline:
         self._ladder_chunk = (
             ladder_chunk if ladder_chunk is not None else clean_chunk
         )
+        self._committed_chunk = committed_chunk
 
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
@@ -2651,6 +2828,9 @@ class ActionForcingTrainingPipeline:
         # cache_pred, detached). See ``__init__`` docstring for
         # consumer details.
         self._clean_chunk: Optional[torch.Tensor] = None
+        # Exact post-CARN recurrent-commit values for this call. Reset so a
+        # consumer can never observe a stale slab from a prior rollout.
+        self._committed_chunk: Optional[torch.Tensor] = None
         # A23 / WP-PIXGAN. Reset per-call GRAD twin of ``_clean_chunk``
         # (gate ``pix_finish_grad_enabled``). Holds the LADDER-ENDPOINT
         # x0 -- the tensor ``utils/eval_causal_AR.py`` commits and
@@ -2755,6 +2935,7 @@ class ActionForcingTrainingPipeline:
         ladder_chunk = (
             torch.zeros_like(noise) if flash_dmd_enabled else None
         )
+        committed_chunk = torch.zeros_like(noise)
         # A23 grad twin of ``clean_chunk``. Allocated the same way but
         # ONLY under the gate (the retained one-rung graph is real
         # memory). Written with the GRAD-CARRYING ladder-endpoint
@@ -2909,7 +3090,13 @@ class ActionForcingTrainingPipeline:
                     # grad" (observed at production iter 6).
                     is_last_block = (block_index == len(all_num_frames) - 1)
                     is_multi_block = (len(all_num_frames) > 1)
-                    skip_last_block_grad = is_last_block and is_multi_block
+                    skip_last_block_grad = (
+                        is_last_block
+                        and is_multi_block
+                        and not bool(getattr(
+                            self, "aux_train_trailing_chunk", False,
+                        ))
+                    )
                     if (not requires_grad) or skip_last_block_grad:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
@@ -2995,7 +3182,12 @@ class ActionForcingTrainingPipeline:
             finish_grad_active = (
                 pix_finish_grad
                 and requires_grad
-                and not (_last_blk and _multi_blk)
+                and (
+                    bool(getattr(
+                        self, "aux_train_trailing_chunk", False,
+                    ))
+                    or not (_last_blk and _multi_blk)
+                )
             )
             finish_grad_pred: Optional[torch.Tensor] = None
             cache_pred = denoised_pred.detach()
@@ -3133,7 +3325,12 @@ class ActionForcingTrainingPipeline:
                 is_multi_block = (len(all_num_frames) > 1)
                 flash_grad_active = (
                     requires_grad
-                    and not (is_last_block and is_multi_block)
+                    and (
+                        bool(getattr(
+                            self, "aux_train_trailing_chunk", False,
+                        ))
+                        or not (is_last_block and is_multi_block)
+                    )
                 )
                 if flash_grad_active:
                     # Activation-checkpoint via default-args closure;
@@ -3417,6 +3614,11 @@ class ActionForcingTrainingPipeline:
                     torch.randn_like(commit_input_clean.flatten(0, 1)),
                     context_timestep.flatten(0, 1),
                 ).unflatten(0, commit_input_clean.shape[:2])
+            committed_chunk[
+                :,
+                block_start_in_noise:
+                block_start_in_noise + current_num_frames,
+            ] = cache_commit
             # Phase-LoRA dispatch for the context_noise commit forward.
             # See the equivalent block in inference_with_trajectory for
             # rationale: route through the lowest-t ODE rung (= K-1)
@@ -3485,6 +3687,7 @@ class ActionForcingTrainingPipeline:
         self._ladder_chunk = (
             ladder_chunk if ladder_chunk is not None else clean_chunk
         )
+        self._committed_chunk = committed_chunk
         # A23 stash. Published ONLY when the buffer actually carries a
         # graph -- a grad-less buffer here would be silently useless to
         # the pixel critic (its G-loss would have no path to the

@@ -182,8 +182,8 @@ export TMPDIR=/tmp
 unset LOCALDIR APPTAINER_CACHEDIR
 export ARRWM_MANIFEST_PICKLE=/scratch/u6ex/as1748.u6ex/ARRWM/analysis/.dmd_weunz_manifest_min69.pt
 mkdir -p "$LOGDIR" logs
-MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
-MASTER_PORT=$((29500 + SLURM_JOB_ID % 16000))
+MASTER_ADDR=${ARRWM_MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)}
+MASTER_PORT=${ARRWM_MASTER_PORT:-$((29500 + SLURM_JOB_ID % 16000))}
 export NCCL_CROSS_NIC=1 NCCL_SOCKET_IFNAME=hsn NCCL_DEBUG=WARN NCCL_IB_TIMEOUT=50
 # Several otherwise-clean two-node allocations exposed a large asymmetric
 # driver-unattributed reservation on rank 4 / node-2 GPU 0. Disabling NVLS
@@ -198,8 +198,12 @@ git status --porcelain | head -20
 echo "GANSIG arm=$DARM ckpt=$ODE_CKPT steps=$MAXSTEPS nodes=$SLURM_NNODES $(date)"
 echo "[CARNCOMMIT-PROV] DARM=$DARM COMMITDEDRIFT=${COMMITDEDRIFT:-<unset>} -> reverse_noiser_dedrift_apply_to_commit=${COMMITDEDRIFT:-true} (cross-check against the config dump line 'reverse_noiser_dedrift_apply_to_commit:')"
 echo "[GANSIG-KNOBS] arm=gansig_gtvf_dmd force_clean=true gtvf_only=true carn=decoupled critic=frozen src=dmd gan_loss_weight=1.0 gan_lr=2e-5 gan_updates_per_step=5 gan_warmup_steps=25 ladd_r1_gamma=10.0 ladd_r1_every_n_steps=1 ladd_r1_num_samples=3 ladd_fake_backbone_grad_scale=0.1 ladd_gt_transition_enabled=false ladd_gt_vs_fake_enabled=TRUE ladd_gt_vs_fake_all_pairs=false ladd_gt_vs_fake_wide_real=false ladd_adjacent_chunks_enabled=false ladd_fake_sample_source=DMD ladd_readout=ladd(default) ladd_disc_micro_batch_groups=8"
+echo "[S7-GRAPH] live source forces aux_train_trailing_chunk=true dmd_42f_supervise_last=true; resolved trainer config is authoritative"
 
-srun torchrun \
+# Holder experiments may supply a one-node/exclusive step placement through
+# ARRWM_SRUN_ARGS.  Production leaves it empty and retains the historical
+# allocation-wide srun byte-for-byte.
+srun ${ARRWM_SRUN_ARGS:-} torchrun \
   --nnodes=$SLURM_NNODES \
   --nproc_per_node=4 \
   --rdzv_id=$SLURM_JOB_ID \
@@ -413,6 +417,8 @@ srun torchrun \
     reverse_noiser_dedrift_steps=1 \
     reverse_noiser_dedrift_alpha0=1.0 \
     reverse_noiser_dedrift_alpha_decay=0.5 \
+    aux_train_trailing_chunk=true \
+    dmd_42f_supervise_last=true \
     run_name=dmd10k_${DARM}_j${SLURM_JOB_ID}
 
 echo "GANSIG $DARM completed $(date)"

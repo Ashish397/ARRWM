@@ -192,7 +192,7 @@ def test_sample_source_rejects_unknown_names():
         with pytest.raises(ValueError) as ei:
             resolve_ladd_fake_sample_source(
                 _args(ladd_fake_sample_source=bad))
-        assert "must be 'flash' or 'dmd'" in str(ei.value)
+        assert "must be 'flash', 'dmd' or 'commit'" in str(ei.value)
         assert repr(bad) in str(ei.value)
 
 
@@ -247,6 +247,28 @@ def test_sample_source_dmd_check_order_streaming_before_first_chunk():
     with pytest.raises(ValueError) as ei:
         resolve_ladd_fake_sample_source(a)
     assert "requires streaming_mode=true" in str(ei.value)
+
+
+def test_sample_source_commit_requires_all_alignment_contracts():
+    base = dict(
+        ladd_fake_sample_source="commit",
+        streaming_mode=True,
+        pix_finish_grad_enabled=True,
+        gan_carn_commit_align_enabled=True,
+    )
+    assert resolve_ladd_fake_sample_source(_args(**base)) == "commit"
+
+    for key, value, text in (
+        ("streaming_mode", False, "streaming_mode=true"),
+        ("pix_finish_grad_enabled", False, "pix_finish_grad_enabled=true"),
+        ("gan_carn_commit_align_enabled", False,
+         "gan_carn_commit_align_enabled=true"),
+    ):
+        bad = dict(base)
+        bad[key] = value
+        with pytest.raises(ValueError) as ei:
+            resolve_ladd_fake_sample_source(_args(**bad))
+        assert text in str(ei.value)
 
 
 def test_resolvers_do_not_mutate_the_config():
