@@ -6,7 +6,7 @@ import cv2, numpy as np, pandas as pd
 import fleet_common as fc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "out", "fleet_hf.csv")
+OUT = os.path.join(HERE, os.environ.get("EVAL_OUT_DIR", "out"), "fleet_hf.csv")
 SIZE = (832, 448)
 
 
@@ -22,7 +22,7 @@ def main():
         try:
             n, fps = fc.meta(scene, model); ctx = fc.ctx_of(model)
             b0 = ctx + int(round(fps))
-            end6 = min(n - 1, ctx + int(round(6.0 * fps)))          # 6s horizon cap
+            end6 = min(n - 1, ctx + int(round(float(os.environ.get("EVAL_HORIZON_S", "6")) * fps)))          # 6s horizon cap
             base_idx = [i for i in range(b0, b0 + 4) if i < n]
             end_idx = list(range(max(ctx, end6 - 14), end6 + 1, 2))
             if not base_idx or not end_idx:

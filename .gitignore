@@ -24,6 +24,11 @@ wandb/
 $LOGDIR/
 # Generated sample/eval videos anywhere in the tree.
 *.mp4
+*.m4v
+*.mov
+*.avi
+*.mkv
+*.webm
 pre_encode.log
 *.err
 *.out
@@ -43,6 +48,8 @@ action_analysis_results.md
 # Project logbook and working notes (not for version control)
 .claude/
 claude/
+CLAUDE.md
+docs/
 
 .codex
 
@@ -124,10 +131,28 @@ grids/eval/*.png
 grids/eval/*.pth
 grids/eval/*.pt
 grids/eval/out/
+grids/eval/out*/
 grids/eval/ours_stable_novel_reels/
 grids/eval/reels_pnovel/
 
-# AAAI submission bundle (paper zip + extraction) — large build artifact,
-# kept out of the code repo.
+# Local paper/submission trees and generated bundles. These contain large
+# videos and build artefacts and are backed up separately from the code repo.
+iclr/
 aaai/
+aaai_template/
 ARRWM_supplementary_code.zip
+
+# Generated experiment fleets and interactive runtime artefacts. Keep the
+# interactive Python/source files visible while excluding caches and outputs.
+experiments/
+interactive/.inductor_cache/
+interactive/external_models/
+interactive/seed_thumbs/
+interactive/*_out/
+interactive/decoder_weights/
+interactive/user_videos/
+interactive/video_seed_out/
+
+# Upstream baseline source checkouts (minWM, BiWM, Causal-Forcing/++) —
+# cloned for reference, not ours to redistribute.
+baselines/

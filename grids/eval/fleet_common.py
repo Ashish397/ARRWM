@@ -60,3 +60,8 @@ def frames_at(scene, model, idxs):
             out.append(np.asarray(r.get_data(int(i))))
     r.close()
     return out
+
+
+# ---- 30 s ICLR fleets (env FLEET=30s): same API over the E1 32-window x 9-command layout ----
+if os.environ.get("FLEET") == "30s":
+    from fleet30s_common import fleet_index, ctx_of, meta, frames_at, _path   # noqa: F401,E402

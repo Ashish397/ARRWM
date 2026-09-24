@@ -15,7 +15,7 @@ mask["model"] = mask.model.apply(lambda x: "ours_" + x if x in OURS else x)
 for c in ("feature_valid", "active"):
     mask[c] = mask[c].astype(bool)
 keep = mask[mask.feature_valid & mask.active][["model", "scene"]]
-hf = pd.read_csv(os.path.join(HERE, "out", "fleet_hf.csv"))
+hf = pd.read_csv(os.path.join(HERE, "out", "final_flags_v2.csv")).rename(columns={"B_v2": "B"})   # v2 reference-relative B
 d = keep.merge(hf[["model", "scene", "B"]], on=["model", "scene"])
 
 DISPLAY = {"ours_pca8": "Default", "ours_pca4": "pca4", "ours_pca2": "pca2",

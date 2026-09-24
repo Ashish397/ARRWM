@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "evaluation_id": "mixed-panel32-ode-v2",
+  "actions": ["F", "FR", "R", "BR", "B", "BL", "L", "FL", "N"],
+  "window_metrics": ["control", "style", "geometry", "hf"],
+  "onset_metrics": ["conjuration", "relocation"],
+  "window_starts_s": [0, 6, 12, 18, 24],
+  "window_duration_s": 6,
+  "family_seat_count": 6,
+  "models": [
+    {
+      "model_id": "ours_kl4rung",
+      "label": "Ours, local KL (ODE)",
+      "family": "ours",
+      "role": "ours"
+    },
+    {
+      "model_id": "ours_mse4rung",
+      "label": "Ours, pointwise MSE (ODE)",
+      "family": "ours",
+      "role": "ours"
+    },
+    {
+      "model_id": "minwm_ode",
+      "label": "minWM 1.3B (ODE)",
+      "family": "minwm",
+      "role": "external"
+    }
+  ]
+}

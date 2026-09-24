@@ -362,12 +362,27 @@ class ODEChainPipeline(ChainPipeline):
         config_path: str = "configs/action_ode_distill.yaml",
         *,
         use_action_tokens: bool = True,  # kept for CLI parity; always True for ODE student.
+        teacher_checkpoint: Optional[str] = None,
+        wan_model_root: Optional[str] = None,
+        build_evaluators: bool = True,
     ) -> None:
         from omegaconf import OmegaConf
+        import utils.wan_wrapper as wan_wrapper
         from utils.wan_wrapper import WanVAEWrapper
 
         log.info("[%s] Loading config %s", self.device, config_path)
         cfg = OmegaConf.load(config_path)
+        # Portable inference callers can override the two machine-local paths
+        # embedded in the historical training config.  This is deliberately a
+        # build-time override: the full-rank student checkpoint is still
+        # strict-overlaid by load_checkpoint(), while ODERegression needs the
+        # teacher once to construct and merge the compatible base topology.
+        if teacher_checkpoint is not None:
+            cfg.generator_ckpt = str(teacher_checkpoint)
+        if wan_model_root is not None:
+            wan_wrapper._default_wan_model_path = (
+                str(Path(wan_model_root).resolve()).rstrip("/") + "/"
+            )
         # VRFM: the eval config has no ode_vrfm key, so without this the probe
         # would build vrfm=None and serve a VRFM-trained student with the
         # z-AdaLN contribution identically ZERO -- reading exactly like "the
@@ -406,17 +421,32 @@ class ODEChainPipeline(ChainPipeline):
         # trains at 21 frames, so wrapper.seq_len is already correct;
         # nothing to adjust here (unlike ``ChainPipeline.build``).
 
-        log.info("[%s] Loading frozen VAE, CoTracker, ss_vae...", self.device)
+        log.info(
+            "[%s] Loading frozen VAE%s...",
+            self.device,
+            ", CoTracker, ss_vae" if build_evaluators else " (generation-only)",
+        )
         self.vae = WanVAEWrapper(); self.vae.to(self.device).eval()
-        self.cotracker = torch.hub.load(
-            "facebookresearch/co-tracker", "cotracker2", skip_validation=True,
-        ).to(self.device).eval()
-        ss_ckpt = cfg.get("ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt")
-        from action_query.ss_vae_model import load_ss_vae
-        self.ss_vae, self.ss_vae_scale = load_ss_vae(ss_ckpt, device=str(self.device))
+        if build_evaluators:
+            self.cotracker = torch.hub.load(
+                "facebookresearch/co-tracker", "cotracker2", skip_validation=True,
+            ).to(self.device).eval()
+            ss_ckpt = cfg.get(
+                "ss_vae_checkpoint", "action_query/checkpoints/ss_vae_8free.pt"
+            )
+            from action_query.ss_vae_model import load_ss_vae
+            self.ss_vae, self.ss_vae_scale = load_ss_vae(
+                ss_ckpt, device=str(self.device)
+            )
 
-        # Shared v12 eval critic (drawn on annotated video; same as ChainPipeline).
-        self._attach_shared_v12_eval_critic()
+            # Shared v12 eval critic (drawn on annotated video; same as
+            # ChainPipeline). Generation-only consumers do not need any of
+            # these three evaluation networks.
+            self._attach_shared_v12_eval_critic()
+        else:
+            self.cotracker = None
+            self.ss_vae = None
+            self.ss_vae_scale = None
         log.info("[%s] ODEChainPipeline ready.", self.device)
 
     # ---- load_checkpoint ---------------------------------------------

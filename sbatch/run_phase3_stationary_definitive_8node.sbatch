@@ -3,7 +3,7 @@
 # 8 nodes x 4 GPUs/node x one ride/rank = global batch size 32.
 #
 # Submit with exactly one PHASE3_AXIS:
-#   base | base_v2 | no_gan | no_commit | no_aux | no_action_critic | no_stat_anchor
+#   base | base_v2 | base_v3 | base_v3b | no_gan | no_commit | no_aux | no_action_critic | no_stat_anchor
 #
 # The existing two-node source is executed inside this allocation after a
 # final last-wins override block is injected immediately before run_name.
@@ -26,10 +26,10 @@ set -euo pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-: "${PHASE3_AXIS:?set PHASE3_AXIS=base|base_v2|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor}"
+: "${PHASE3_AXIS:?set PHASE3_AXIS=base|base_v2|base_v3|base_v3b|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor}"
 
 case "$PHASE3_AXIS" in
-  base|base_v2|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor) ;;
+  base|base_v2|base_v3|base_v3b|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor) ;;
   *)
     echo "[P3-8N] invalid PHASE3_AXIS=$PHASE3_AXIS" >&2
     exit 2
@@ -110,6 +110,18 @@ case "$PHASE3_AXIS" in
     # first stationary step instead of inheriting the historical transition
     # bridge checkpoint.
     ABLATION_EXTRA="pix_finish_grad_enabled=true ladd_fake_sample_source=commit reverse_noiser_commit_alpha=0.125 reverse_noiser_commit_start_step=150 reverse_noiser_commit_ramp_steps=100 reverse_noiser_commit_max_relative_shift=0.015 gan_carn_commit_align_enabled=true gan_carn_commit_straight_through=true gen_aux_losses_x0_source=commit ladd_gt_vs_fake_enabled=true ladd_gt_vs_fake_weight=1.0 ladd_gt_transition_enabled=false ladd_gt_transition_weight=0.0 ladd_gt_transition_carn_bridge=false ladd_gt_transition_carn_former=false ladd_gt_transition_carn_latter_reverse=false ladd_gt_transition_gen_detach_former=false ladd_gt_transition_match=false ladd_adjacent_chunks_enabled=false"
+    ;;
+  base_v3)
+    # Independent stationary run. Match base_v2 except for the target of
+    # internalisation: the exact post-CARN endpoint committed to the KV cache.
+    ABLATION_EXTRA="pix_finish_grad_enabled=true ladd_fake_sample_source=commit reverse_noiser_commit_alpha=0.125 reverse_noiser_commit_start_step=150 reverse_noiser_commit_ramp_steps=100 reverse_noiser_commit_max_relative_shift=0.015 gan_carn_commit_align_enabled=true gan_carn_commit_straight_through=true gen_aux_losses_x0_source=commit ladd_gt_vs_fake_enabled=true ladd_gt_vs_fake_weight=1.0 ladd_gt_transition_enabled=false ladd_gt_transition_weight=0.0 ladd_gt_transition_carn_bridge=false ladd_gt_transition_carn_former=false ladd_gt_transition_carn_latter_reverse=false ladd_gt_transition_gen_detach_former=false ladd_gt_transition_match=false ladd_adjacent_chunks_enabled=false reverse_noiser_internalize_post_commit_target=true"
+    ;;
+  base_v3b)
+    # Interaction-only revision: match the original no_aux commit schedule,
+    # GAN path and every other base/no_aux axis. Keep the original auxiliary
+    # weight/gate, but point it at the literal post-commit endpoint. The live
+    # final-rung tensor is needed only to carry that auxiliary gradient.
+    ABLATION_EXTRA="pix_finish_grad_enabled=true reverse_noiser_internalize_post_commit_target=true"
     ;;
   no_gan)
     # Remove the discriminator, decoder pullback, and every LADD pair loss.

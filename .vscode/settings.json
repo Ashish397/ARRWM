@@ -22,7 +22,6 @@
     "**/*.pt": true
   },
   "files.exclude": {
-    "logs": true,
     "wandb": true
   },
   "git.autorefresh": false,

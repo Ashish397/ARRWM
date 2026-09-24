@@ -7802,6 +7802,41 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
     # ------------------------------------------------------------------
     # §3.1 / A23 -- the FAKE, mask-selected.
     # ------------------------------------------------------------------
+    def _post_commit_internalize_tensors(
+        self, info: Dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the live final endpoint and the exact detached KV write."""
+        graph = info.get("finish_denoised_chunk_grad")
+        committed = info.get("committed_ladder_endpoint_chunk")
+        mask = info.get("finish_denoised_chunk_grad_mask")
+        if graph is None or not graph.requires_grad:
+            raise RuntimeError(
+                "post-commit internalization requires a graph-bearing "
+                "finish_denoised_chunk_grad (enable pix_finish_grad_enabled)."
+            )
+        if committed is None or committed.requires_grad:
+            raise RuntimeError(
+                "post-commit internalization requires the detached literal "
+                "committed_ladder_endpoint_chunk."
+            )
+        if graph.shape != committed.shape:
+            raise RuntimeError(
+                "post-commit internalization endpoint shape mismatch: "
+                f"{tuple(graph.shape)} vs {tuple(committed.shape)}."
+            )
+        if mask is None:
+            raise RuntimeError(
+                "post-commit internalization requires "
+                "finish_denoised_chunk_grad_mask."
+            )
+        live = torch.as_tensor(mask, device=graph.device).reshape(-1).bool()
+        if live.numel() != graph.shape[1] or not bool(live.all().item()):
+            raise RuntimeError(
+                "post-commit internalization requires every final endpoint "
+                "frame to be graph-live."
+            )
+        return graph, committed
+
     def _prepare_gan_carn_commit_fake(
         self,
         info: Dict[str, Any],
@@ -21246,6 +21281,9 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
         # loop). Only the SCORING path (DMD/GAN/critic) sees the de-drift. When
         # de-drift is OFF the helper returns the SAME object => byte-identical.
         _raw_train_chunk = train_chunk
+        _post_commit_int = bool(getattr(
+            self.model, "reverse_noiser_internalize_post_commit_target", False,
+        ))
         _need_dedrift_target = (
             bool(getattr(
                 self.model, "reverse_noiser_dedrift_enabled", False,
@@ -21257,7 +21295,7 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
                 ))
                 or float(getattr(
                     self.model, "reverse_noiser_internalize_weight", 0.0,
-                )) > 0.0
+                )) > 0.0 and not _post_commit_int
             )
         )
         _dedrifted_train_chunk = _raw_train_chunk
@@ -21375,16 +21413,29 @@ class ActionForcingDMDTrainer(RollingStaircaseDMDTrainer):
             out["student_pred_mean"] = float(_tc.mean().item())
 
         generator_loss = gen_loss_dmd
-        # v2-E: confidence-gated internalization — pull the RAW student toward
-        # its de-drifted version so the STUDENT ALONE becomes drift-free (not
-        # just G(student)). Grad to the student via _raw_train_chunk; target is
-        # the de-drifted train_chunk (stop-grad inside the helper). Skipped
-        # (byte-identical) when reverse_noiser_internalize_weight=0.
+        # Existing axes internalize the corrected random-exit slab. Base-v3
+        # instead supervises the FINAL ladder endpoint against the literal
+        # detached post-CARN cache commit; the commit itself stays unchanged.
         if float(getattr(self.model, "reverse_noiser_internalize_weight", 0.0)) > 0.0:
-            _l_int = self.model._reverse_noiser_internalize_loss(
-                _raw_train_chunk, _dedrifted_train_chunk,
-                mask=train_info.get("gradient_mask"),
-            )
+            if _post_commit_int:
+                if not bool(getattr(
+                    self.model, "reverse_noiser_dedrift_apply_to_commit", False,
+                )):
+                    raise RuntimeError(
+                        "post-commit internalization requires CARN commit on."
+                    )
+                _int_raw, _int_target = self._post_commit_internalize_tensors(
+                    train_info,
+                )
+                _l_int = self.model._reverse_noiser_internalize_loss(
+                    _int_raw, _int_target,
+                )
+                out["train/reverse_noiser_internalize_post_commit_target"] = 1.0
+            else:
+                _l_int = self.model._reverse_noiser_internalize_loss(
+                    _raw_train_chunk, _dedrifted_train_chunk,
+                    mask=train_info.get("gradient_mask"),
+                )
             generator_loss = generator_loss + _l_int
             out["reverse_noiser_internalize_loss"] = float(_l_int.detach().item())
             # Gate diagnostics (see _reverse_noiser_internalize_loss): gate_mean

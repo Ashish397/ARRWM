@@ -33,7 +33,7 @@ set -euo pipefail
 
 cd /scratch/u6ex/as1748.u6ex/ARRWM
 
-: "${PHASE3_AXIS:?set PHASE3_AXIS=base|base_v2|base_stabilized|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor}"
+: "${PHASE3_AXIS:?set PHASE3_AXIS=base|base_v2|base_v3|base_stabilized|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor}"
 SMOKE_MODE="${PHASE3_SMOKE:-0}"
 if [ "$SMOKE_MODE" = "1" ]; then
   PHASE3_PARENT_JOB="${PHASE3_PARENT_JOB:-holder-smoke}"
@@ -42,7 +42,7 @@ else
 fi
 
 case "$PHASE3_AXIS" in
-  base|base_v2|base_stabilized|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor) ;;
+  base|base_v2|base_v3|base_stabilized|no_gan|no_commit|no_aux|no_action_critic|no_stat_anchor) ;;
   *)
     echo "[P3-ROLL-4N] invalid PHASE3_AXIS=$PHASE3_AXIS" >&2
     exit 2
@@ -159,6 +159,10 @@ case "$PHASE3_AXIS" in
     # no increment override, so rolling_window_curriculum_increment=3 from
     # ROLLING_COMMON stands, exactly like every non-base axis.
     ABLATION_EXTRA=""
+    ;;
+  base_v3)
+    # Continue only from base_v3's own stationary step-200 checkpoint.
+    ABLATION_EXTRA="reverse_noiser_internalize_post_commit_target=true"
     ;;
   base_stabilized)
     # Main-only, post-hoc robustness continuation. Threshold 4.0 was fixed

@@ -47,6 +47,108 @@ def _extract_ride_rel(ride_dir_2k: str) -> Path:
             f"and is not under {_DATA_ROOT}"
         )
 
+
+# ---------------------------------------------------------------------------
+# Cross-project zarr path remapping
+# ---------------------------------------------------------------------------
+# The cached chunk files written by gen_lmdb_14e.py (and the window/manifest
+# JSONs) store the ABSOLUTE zarr path that was valid when the cache was built,
+# e.g. /projects/u6ex/fbots/frodobots_encoded_weunz/<ride>.zarr. Moving the
+# data to another project invalidates every one of those strings, and
+# rewriting them in place is not an option: the .pt files carry the trajectory
+# tensors, so a metadata edit would mean re-serialising terabytes. We remap at
+# read time instead, so the caches stay byte-identical.
+#
+#   ARRWM_ZARR_REMAP="/old/prefix=/new/prefix;/old2=/new2"
+#       Explicit prefix rewrites. Longest prefix wins, so nested roots
+#       (.../frodobots_encoded vs .../frodobots_encoded_weunz) resolve
+#       deterministically rather than by declaration order.
+#   ARRWM_ZARR_SEARCH_PATH="/dir1:/dir2"
+#       Fallback for rides that were gathered from several source roots:
+#       if the path (after any rewrite) does not exist, look for
+#       <dir>/<basename> in each directory in turn.
+#
+# Both are optional. With neither set this is a pure no-op and costs no
+# filesystem calls — important, because it sits in the dataloader hot path
+# and stat() on Lustre is expensive.
+_REMAP_RULES: Optional[List[Tuple[str, str]]] = None
+_SEARCH_DIRS: Optional[List[str]] = None
+_REMAP_CACHE: dict = {}
+
+
+def _remap_config() -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Parse and memoise the remap env vars (read once per process)."""
+    global _REMAP_RULES, _SEARCH_DIRS
+    if _REMAP_RULES is None:
+        rules: List[Tuple[str, str]] = []
+        for part in os.environ.get("ARRWM_ZARR_REMAP", "").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(
+                    f"ARRWM_ZARR_REMAP entry missing '=': {part!r} "
+                    f"(expected /old/prefix=/new/prefix)"
+                )
+            old, new = part.split("=", 1)
+            old, new = old.strip().rstrip("/"), new.strip().rstrip("/")
+            if not old or not new:
+                raise ValueError(
+                    f"ARRWM_ZARR_REMAP entry has an empty side: {part!r}"
+                )
+            rules.append((old, new))
+        rules.sort(key=lambda r: len(r[0]), reverse=True)
+        _REMAP_RULES = rules
+        _SEARCH_DIRS = [
+            d for d in os.environ.get("ARRWM_ZARR_SEARCH_PATH", "").split(os.pathsep)
+            if d.strip()
+        ]
+    return _REMAP_RULES, _SEARCH_DIRS
+
+
+def remap_zarr_path(zarr_path) -> str:
+    """Translate a stored absolute zarr path to where the ride lives now.
+
+    Returns ``zarr_path`` unchanged when no remapping is configured, so this
+    is safe to call unconditionally at every zarr open site.
+    """
+    zp = str(zarr_path)
+    rules, search_dirs = _remap_config()
+    if not rules and not search_dirs:
+        return zp
+    cached = _REMAP_CACHE.get(zp)
+    if cached is not None:
+        return cached
+
+    out = zp
+    for old, new in rules:
+        if out == old or out.startswith(old + os.sep):
+            out = new + out[len(old):]
+            break
+
+    if not os.path.exists(out):
+        base = os.path.basename(out.rstrip("/"))
+        for d in search_dirs:
+            cand = os.path.join(d, base)
+            if os.path.exists(cand):
+                out = cand
+                break
+        else:
+            # Fail loud: a silently unresolved path surfaces later as an
+            # opaque zarr error pointing at the OLD project, which is a
+            # confusing thing to debug on the far side of a data move.
+            raise FileNotFoundError(
+                f"zarr path could not be resolved after remapping:\n"
+                f"  stored:   {zp}\n"
+                f"  remapped: {out}\n"
+                f"  ARRWM_ZARR_REMAP={os.environ.get('ARRWM_ZARR_REMAP', '')!r}\n"
+                f"  ARRWM_ZARR_SEARCH_PATH={os.environ.get('ARRWM_ZARR_SEARCH_PATH', '')!r}"
+            )
+
+    _REMAP_CACHE[zp] = out
+    return out
+
+
 # Latent temporal compression: 1 latent frame corresponds to 4 video frames
 # in the Wan VAE — except for the SPECIAL HEAD LATENT (zarr index 0) which
 # encodes a single video frame. We drop that head latent in the loader so
@@ -382,7 +484,7 @@ def _index_single_zarr(
         ``(n_motion_chunks - chunk_offset) * 3`` latents is excluded so
         cmd_actions always reflect real, properly-aligned motion.
     """
-    g = zarr_lib.open_group(str(zpath), mode="r")
+    g = zarr_lib.open_group(remap_zarr_path(zpath), mode="r")
     attrs = dict(g.attrs)
     zarr_n_latents = int(g["latents"].shape[0])
 
@@ -967,7 +1069,7 @@ class ZarrRideDataset(Dataset):
         "first video frame dropped" convention aligns with our latent
         indexing 1:1. See module-level _LATENT_HEAD_DROP comment.
         """
-        g = zarr_lib.open_group(zarr_path, mode="r")
+        g = zarr_lib.open_group(remap_zarr_path(zarr_path), mode="r")
         lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
         return torch.from_numpy(lat_np.astype(np.float32))
 
@@ -998,7 +1100,7 @@ class ZarrRideDataset(Dataset):
                 "reverse gather hit unaligned (-1) frames; window not constrained "
                 "to the aligned span."
             )
-        g = zarr_lib.open_group(reverse_zarr_path, mode="r")
+        g = zarr_lib.open_group(remap_zarr_path(reverse_zarr_path), mode="r")
         n_rear = int(g["latents"].shape[0])
         idx = np.clip(idx, 0, n_rear - 1)
         rmin, rmax = int(idx.min()), int(idx.max())
@@ -1196,7 +1298,7 @@ class ZarrSequentialDataset(Dataset):
             z_actions_latent: (n_latent_frames, 8) float32, tanh-squashed
             n_latent_frames: number of latent frames in this ride
         """
-        g = zarr_lib.open_group(str(zpath), mode="r")
+        g = zarr_lib.open_group(remap_zarr_path(zpath), mode="r")
         attrs = dict(g.attrs)
         lat_ds = g["latents"]
         zarr_n_latents = int(lat_ds.shape[0])  # raw (T, 16, 60, 104)
@@ -1263,7 +1365,7 @@ class ZarrSequentialDataset(Dataset):
         # ``_LATENT_HEAD_DROP`` so frame i of the returned tensor
         # corresponds to the same time position as ``z_actions_latent[i]``
         # (= chunk i // 3's z, mapped to the post-drop video segment).
-        g = zarr_lib.open_group(str(zpath), mode="r")
+        g = zarr_lib.open_group(remap_zarr_path(zpath), mode="r")
         lat_np = g["latents"][start + _LATENT_HEAD_DROP : end + _LATENT_HEAD_DROP]
         latents = torch.from_numpy(lat_np.astype(np.float32))
 

@@ -47,16 +47,17 @@ def make_viewmats(direction, n_total, n_seed):
         elif direction == "B":
             d[2, 3] = -STEP_T
         elif direction in ("L", "R"):
-            a = STEP_R if direction == "L" else -STEP_R
+            # Released minWM camera yaw is opposite to our readout convention.
+            a = -STEP_R if direction == "L" else STEP_R
             d[0, 0] = np.cos(a); d[0, 2] = np.sin(a)
             d[2, 0] = -np.sin(a); d[2, 2] = np.cos(a)
         elif direction in ("FL", "FR"):
-            a = STEP_R if direction == "FL" else -STEP_R
+            a = -STEP_R if direction == "FL" else STEP_R
             d[0, 0] = np.cos(a); d[0, 2] = np.sin(a)
             d[2, 0] = -np.sin(a); d[2, 2] = np.cos(a)
             d[2, 3] = STEP_T
         elif direction in ("BL", "BR"):
-            a = STEP_R if direction == "BL" else -STEP_R
+            a = -STEP_R if direction == "BL" else STEP_R
             d[0, 0] = np.cos(a); d[0, 2] = np.sin(a)
             d[2, 0] = -np.sin(a); d[2, 2] = np.cos(a)
             d[2, 3] = -STEP_T
@@ -98,7 +99,7 @@ def main():
     Ks_np = np.array([[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]] * NUM_LAT, dtype=np.float32)
 
     for wi in WINDOWS:
-        src = f"{ARR}/logs/eval_final/A/pca8_8node/control_test/step05000_r{wi:02d}_F_raw.mp4"
+        src = os.environ.get("MW_SEED_FMT", f"{ARR}/logs/eval_final/A/pca8_8node/control_test/step05000_r{{wi:02d}}_F_raw.mp4").format(wi=wi)
         r = imageio.get_reader(src)
         frames = [np.asarray(r.get_data(i)) for i in range(13)]
         r.close()

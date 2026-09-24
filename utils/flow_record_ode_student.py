@@ -17,7 +17,11 @@ Env: FR_RUN, FR_CONFIG (student action_ode_* yaml), FR_CKPT, FR_WINDOW
 (def 8), FR_NSEEDS (def 4), FR_OUT, FR_TAG (suffix on the output dir, e.g.
 "_det"), FR_CHUNKS (def 2), FR_DET=1 (deterministic straight-path re-noise
 via the ODE_FLOW_DET hook), FR_VIDEO=1 (also decode the full rollout and
-save an mp4 under .motion_check/ for realized-egomotion checks).
+save an mp4 under .motion_check/ for realized-egomotion checks).  For
+multi-context checks, FR_MANIFEST selects an alternate manifest,
+FR_MANIFEST_INDEX selects a ride directly from it, FR_OFFSET selects its
+latent offset, and FR_WINDOW_LABEL sets the numeric rXX output label without
+changing phaseA_windows.json.
 """
 import os, json
 os.environ.setdefault("WORLD_SIZE", "1"); os.environ.setdefault("RANK", "0"); os.environ.setdefault("LOCAL_RANK", "0")
@@ -30,7 +34,7 @@ os.environ["ODE_EVAL_BUILD"] = "1"   # probe: eval config has no ode_rollout key
 os.environ.pop("AF_SNAPSHOT_STEPS", None); os.environ.pop("AF_EVAL_STEPS", None)
 import torch
 
-ARR = "/scratch/u6ex/as1748.u6ex/ARRWM"
+ARR = os.environ.get("ARR_ROOT", "/scratch/u6ex/as1748.u6ex/ARRWM")  # local runs: ARR_ROOT=/home/ashish/ARRWM
 RUN = os.environ["FR_RUN"]
 CONFIG = os.environ["FR_CONFIG"]
 CKPT = os.environ["FR_CKPT"]
@@ -82,19 +86,50 @@ def main():
     print(f"[rec-ode] {RUN}: loaded {CKPT} (step {step}), "
           f"denoise steps {pipe.denoising_step_list.tolist()}", flush=True)
 
-    windows = json.load(open(f"{ARR}/analysis/eval_final/phaseA_windows.json"))
-    w = windows[WINDOW]
-    zp, off = w["zarr_path"], int(w["offset"])
-    seed = ZarrRideDataset.load_latent_chunk(
-        zp, off, off + NFB * SEED_CHUNKS).unsqueeze(0).to(device, torch.float32)
-    manifest = torch.load(f"{ARR}/analysis/eval_final/manifest_unseen.pt", map_location="cpu")
-    pe = {r["zarr_path"]: r["prompt_embeds"] for r in manifest}[zp].unsqueeze(0)
+    seed_package = os.environ.get("FR_SEED_PT")
+    if seed_package:
+        # Portable matched-context probe when the source ride's Zarr is not
+        # present on this project. The package holds only the real seed and
+        # its original prompt embeddings; it never contains model outputs.
+        packaged = torch.load(seed_package, map_location="cpu", weights_only=False)
+        seed = packaged["seed"].to(device, torch.float32)
+        pe = packaged["prompt_embeds"]
+        assert seed.ndim == 5 and seed.shape[0] == 1
+        assert seed.shape[1] == NFB * SEED_CHUNKS
+        assert pe.ndim == 3 and pe.shape[0] == 1
+        window_label = int(os.environ.get("FR_WINDOW_LABEL", WINDOW))
+    else:
+        manifest_path = os.environ.get(
+            "FR_MANIFEST", f"{ARR}/analysis/eval_final/manifest_unseen.pt")
+        manifest_obj = torch.load(manifest_path, map_location="cpu", weights_only=False)
+        manifest = manifest_obj.get("rides", manifest_obj) if isinstance(manifest_obj, dict) else manifest_obj
+        manifest_index = os.environ.get("FR_MANIFEST_INDEX")
+        if manifest_index is None:
+            windows = json.load(open(f"{ARR}/analysis/eval_final/phaseA_windows.json"))
+            w = windows[WINDOW]
+            zp, off = w["zarr_path"], int(w["offset"])
+            manifest_row = next(r for r in manifest if r["zarr_path"] == zp)
+            window_label = WINDOW
+        else:
+            manifest_row = manifest[int(manifest_index)]
+            zp = manifest_row["zarr_path"]
+            off = int(os.environ.get("FR_OFFSET", "0"))
+            # Keep the established rXX filenames while allowing contexts that are
+            # not present in phaseA_windows.json.
+            window_label = int(os.environ.get("FR_WINDOW_LABEL", manifest_index))
+        # FR_ZARR_ROOT: local mirror of the encoded rides (same basenames); the
+        # manifest below is still keyed by the original cluster path.
+        zp_load = (os.path.join(os.environ["FR_ZARR_ROOT"], os.path.basename(zp))
+                   if os.environ.get("FR_ZARR_ROOT") else zp)
+        seed = ZarrRideDataset.load_latent_chunk(
+            zp_load, off, off + NFB * SEED_CHUNKS).unsqueeze(0).to(device, torch.float32)
+        pe = manifest_row["prompt_embeds"].unsqueeze(0)
 
     tot_f = NFB * (SEED_CHUNKS + GEN_CHUNKS)
     for dname, (thr, ste) in DIRS.items():
         for sd in range(NSEEDS):
-            dst = f"{OUT}/flow_{RUN}{TAG}/r{WINDOW:02d}_{dname}_s{sd}"
-            vid = f"{OUT}/.motion_check/{RUN}{TAG}/r{WINDOW:02d}_{dname}_s{sd}.mp4"
+            dst = f"{OUT}/flow_{RUN}{TAG}/r{window_label:02d}_{dname}_s{sd}"
+            vid = f"{OUT}/.motion_check/{RUN}{TAG}/r{window_label:02d}_{dname}_s{sd}.mp4"
             if os.path.exists(f"{dst}/steps.npz") and (not VIDEO or os.path.exists(vid)):
                 print(f"[rec-ode] {dst} exists, skipping", flush=True)
                 continue
@@ -123,7 +158,8 @@ def main():
                     full = pipe.generate_ar(prompt_embeds=pe, noisy_fa_full=z,
                                             initial_latents=seed,
                                             num_gen_chunks=GEN_CHUNKS,
-                                            cache_chunks=6)
+                                            cache_chunks=6,
+                                            ar_cache=not bool(os.environ.get("FR_CLEAN_FILL")))  # FR_CLEAN_FILL=1: all SEED_CHUNKS real chunks as context (eval protocol); default self-generates bootstrap chunks
             finally:
                 os.environ.pop("ODE_FLOW_REC", None)
             if VIDEO:

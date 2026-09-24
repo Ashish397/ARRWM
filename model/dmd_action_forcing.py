@@ -2950,6 +2950,12 @@ class ActionForcingDMD(SelfForcingModel):
         self.reverse_noiser_internalize_weight = float(
             getattr(args, "reverse_noiser_internalize_weight", 0.0)
         )
+        # Base-v3 only: supervise the graph-bearing final ladder endpoint
+        # against the literal post-CARN tensor written to recurrent memory.
+        # Default-off preserves all existing base/ablation loss routes.
+        self.reverse_noiser_internalize_post_commit_target = bool(
+            getattr(args, "reverse_noiser_internalize_post_commit_target", False)
+        )
         self.reverse_noiser_internalize_tau = float(
             getattr(args, "reverse_noiser_internalize_tau", 1.0)
         )

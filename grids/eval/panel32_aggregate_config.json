@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "evaluation_id": "mixed-panel32-six-family-v2",
+  "actions": [
+    "F",
+    "FR",
+    "R",
+    "BR",
+    "B",
+    "BL",
+    "L",
+    "FL",
+    "N"
+  ],
+  "window_metrics": [
+    "control",
+    "style",
+    "geometry",
+    "hf"
+  ],
+  "onset_metrics": [
+    "conjuration",
+    "relocation"
+  ],
+  "window_starts_s": [
+    0,
+    6,
+    12,
+    18,
+    24
+  ],
+  "window_duration_s": 6,
+  "family_seat_count": 6,
+  "models": [
+    {
+      "model_id": "ours_recovery_base",
+      "label": "Ours",
+      "family": "ours",
+      "role": "ours"
+    },
+    {
+      "model_id": "lingbot",
+      "label": "LingBot-World-V2 1.3B",
+      "family": "lingbot",
+      "role": "external"
+    },
+    {
+      "model_id": "dreamx",
+      "label": "DreamX-World 5B",
+      "family": "dreamx",
+      "role": "external"
+    },
+    {
+      "model_id": "matrixgame2",
+      "label": "Matrix-Game 2.0",
+      "family": "matrixgame2",
+      "role": "external"
+    },
+    {
+      "model_id": "minwm",
+      "label": "minWM 1.3B (DMD)",
+      "family": "minwm",
+      "role": "external"
+    },
+    {
+      "model_id": "yume5b",
+      "label": "YUME-5B",
+      "family": "yume5b",
+      "role": "external"
+    }
+  ]
+}

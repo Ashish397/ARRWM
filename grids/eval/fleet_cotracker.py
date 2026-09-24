@@ -8,13 +8,13 @@ import numpy as np, torch, cv2, pandas as pd
 import fleet_common as fc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "out", "fleet_cotracker.csv")
+OUT = os.path.join(HERE, os.environ.get("EVAL_OUT_DIR", "out"), "fleet_cotracker.csv")
 T, GRID, SIZE = 24, 30, (512, 288)
 
 
 def gen_frames(scene, model):
     n, fps = fc.meta(scene, model); ctx = fc.ctx_of(model)
-    end = min(n - 1, ctx + int(round(6.0 * fps)))
+    end = min(n - 1, ctx + int(round(float(os.environ.get("EVAL_HORIZON_S", "6")) * fps)))
     idx = list(np.linspace(min(ctx, n - 2), end, T).round().astype(int))
     fr = fc.frames_at(scene, model, idx)
     return np.stack([cv2.resize(f, SIZE) for f in fr])

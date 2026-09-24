@@ -30,6 +30,16 @@ from typing import Any, Dict, List
 import torch
 from torch.utils.data import Dataset
 
+try:
+    # The cached .pt files store the absolute zarr path from the project the
+    # LMDB was built in; remap_zarr_path translates it when the data has since
+    # moved (see utils/zarr_dataset.py). A no-op unless ARRWM_ZARR_REMAP /
+    # ARRWM_ZARR_SEARCH_PATH are set.
+    from utils.zarr_dataset import remap_zarr_path
+except Exception:                        # keep this module importable standalone
+    def remap_zarr_path(p):              # type: ignore[misc]
+        return str(p)
+
 NFB = 3
 CTX_CHUNKS = 6
 NUM_FRAMES = 21
@@ -152,7 +162,7 @@ class ChunkedODEDataset(Dataset):
         cpt = torch.load(clean_f, map_location="cpu", weights_only=False)
         fpt = cpt if (cf_f == clean_f) else \
             torch.load(cf_f, map_location="cpu", weights_only=False)
-        zp, off = str(cpt["zarr_path"]), int(cpt["window_offset"])
+        zp, off = remap_zarr_path(cpt["zarr_path"]), int(cpt["window_offset"])
         seed_chunks = int(cpt.get("seed_chunks", 3))
         seed_f = NFB * seed_chunks
         seed_lat = self.zarr_loader(zp, off, off + seed_f).to(torch.float32)
@@ -197,7 +207,7 @@ class ChunkedODEDataset(Dataset):
         cpt = torch.load(clean_f, map_location="cpu", weights_only=False)
         fpt = cpt if (cf_f == clean_f) else \
             torch.load(cf_f, map_location="cpu", weights_only=False)
-        zp, off = str(cpt["zarr_path"]), int(cpt["window_offset"])
+        zp, off = remap_zarr_path(cpt["zarr_path"]), int(cpt["window_offset"])
         seed_lat = self.zarr_loader(zp, off, off + 3 * NFB).to(torch.float32)
 
         traj_c, clean_x, lo = self._window(cpt, c, seed_lat)

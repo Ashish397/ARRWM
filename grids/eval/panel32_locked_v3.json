@@ -1,0 +1,515 @@
+{
+  "schema_version": 1,
+  "panel_id": "outdoor-balanced32-v3",
+  "description": "Author-corrected final balanced outdoor panel: eight contexts each from FrodoBots, Ego4D, Sekai, and SpatialVID.",
+  "selection_protocol": "Sources were selected by visual review before replacement-model generation. No model outputs or evaluation scores informed the lock.",
+  "created_utc": "2026-09-24T00:00:00Z",
+  "dataset_counts": {
+    "FrodoBots": 8,
+    "Ego4D": 8,
+    "Sekai": 8,
+    "SpatialVID": 8
+  },
+  "actions": [
+    "F",
+    "FR",
+    "R",
+    "BR",
+    "B",
+    "BL",
+    "L",
+    "FL",
+    "N"
+  ],
+  "canonical_source": {
+    "frame_count": 33,
+    "fps": 20.0,
+    "width": 832,
+    "height": 480,
+    "resize_mode": "center_crop",
+    "boundary_frame_index": 32,
+    "wan_latent_frames": 9
+  },
+  "contexts": [
+    {
+      "context_id": "frodobots-u31",
+      "dataset": "FrodoBots",
+      "source_id": "20240408003513.zarr:1362:u31",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_u31.mp4",
+      "source_sha256": "99fec855c34bab4a0bd3bcc96df8dbfda0848f9e3fea2d9f02b24c88deac3763",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 0: first item in the preregistered every-fourth FrodoBots subsample.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-u04",
+      "dataset": "FrodoBots",
+      "source_id": "20240220072255.zarr:320:u04",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_u04.mp4",
+      "source_sha256": "1eda150114cc372e7f8c43c02817cd1dad8a68e6b968d225d309595745ad23a5",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 4 in the preregistered 32-context order.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-a20",
+      "dataset": "FrodoBots",
+      "source_id": "20240327215949.zarr:480:a20",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_a20.mp4",
+      "source_sha256": "626a7a9371d0d79397b0a0d269ef4630e6c3c386aae8b150efeae8f49036f707",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 8 in the preregistered 32-context order; Tokyo morning.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-m30",
+      "dataset": "FrodoBots",
+      "source_id": "20240327053741.zarr:1116:m30",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_m30.mp4",
+      "source_sha256": "c08f8f1e915bac7255e5422d4e9746981d13d79c46725c5ac111b442af17aa01",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 12 in the preregistered 32-context order; Manila midday.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-m38",
+      "dataset": "FrodoBots",
+      "source_id": "20240405100242.zarr:1437:m38",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_m38.mp4",
+      "source_sha256": "c2c0015ffe10416e73ff9fc38e384d5307c6f3f8f59e5e82a0b8050e9fe1d615",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 16 in the preregistered 32-context order; Manila afternoon.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-m89",
+      "dataset": "FrodoBots",
+      "source_id": "20240320014308.zarr:366:m89",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_m89.mp4",
+      "source_sha256": "86dcc4ebcd948494a5a30fbf2171fd5883d001d80ed8aa5efb692d9d6da1d2b4",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 20 in the preregistered 32-context order; Taipei morning.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-m128",
+      "dataset": "FrodoBots",
+      "source_id": "20240326234828.zarr:1107:m128",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_m128.mp4",
+      "source_sha256": "3b9350d289ed74c8d936b3bdbb60cc92d1765c0131badc0f903c5e677f3ccecb",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 24 in the preregistered 32-context order; Wuhan morning.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "frodobots-b36",
+      "dataset": "FrodoBots",
+      "source_id": "20240312144620.zarr:1269:b36",
+      "source_video": "../../analysis/eval_final/seed65_e1/seed65_b36.mp4",
+      "source_sha256": "47734e5f69000b8facdfa296138c0d0cd8bf09aca3ed6ca7cfd87dc056b8795b",
+      "source_uri": "https://huggingface.co/datasets/frodobots/Berkeley-FrodoBots-7K",
+      "license": "CC-BY-SA-4.0",
+      "selection_note": "Index 28 in the preregistered 32-context order; New Hampshire morning.",
+      "boundary": {
+        "frame_index": 32
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Road-driving scene visibly outdoors; reviewed in frodobots_selected_contact.jpg."
+    },
+    {
+      "context_id": "ego4d-8ed9e028",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:8ed9e028-c417-4eda-9e31-f61f60e50ae9",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round2/045_8ed9e028-c417-4eda-9e31-f61f60e50ae9.mp4",
+      "source_sha256": "6853e1d1268399141900f3f94e74a497dfec1318667ec66bc6d9a5a0bd73d14c",
+      "source_uri": "https://drive.google.com/uc?id=1JyWxqS5aYIWlLKQmaD1yk2b9mS492Cal",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=8ed9e028-c417-4eda-9e31-f61f60e50ae9; Ego4D video_uid=9b34e344-494d-4664-8180-a8ff2a692ab2; source range=240--420 seconds; review file=../../iclr/replacement_candidates/ego4d_round2/045_8ed9e028-c417-4eda-9e31-f61f60e50ae9.mp4. Generation boundary author-corrected to 2.0 seconds.",
+      "boundary": {
+        "timestamp_s": 2.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "ego4d-bristol-05",
+      "dataset": "Ego4D",
+      "source_id": "bristol/5",
+      "source_video": "../../analysis/panel32_v1/sources/ego4d/candidates/bristol_5.mp4",
+      "source_sha256": "71e7b4d73001ea376b7e84e8c9b3891b3368c3e2e27a44024f0cbb18586b3880",
+      "source_uri": "https://assets.ego4d-data.org/videos/bristol/5.mp4",
+      "license": "Ego4D Dataset License Agreement; public project-page preview",
+      "selection_note": "Selected from 40 official preview clips without model-output inspection.",
+      "boundary": {
+        "timestamp_s": 7.5
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Visible outdoor suburban-street motion; reviewed in ego4d_selected_contact.jpg."
+    },
+    {
+      "context_id": "ego4d-fe3d59ac",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:fe3d59ac-9686-44d0-8b67-ddc08d36a615",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round2/008_fe3d59ac-9686-44d0-8b67-ddc08d36a615.mp4",
+      "source_sha256": "1aed56164d62387dbaf80150bb8d957a9a2e832167c64485961e4b6a76cff300",
+      "source_uri": "https://drive.google.com/uc?id=1qhGa3R6BStszZRzbf7mFAn3KUgtGfgp6",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=fe3d59ac-9686-44d0-8b67-ddc08d36a615; Ego4D video_uid=b849a2d6-3eff-4c64-aded-2d706ed1091e; source range=0--180 seconds; review file=../../iclr/replacement_candidates/ego4d_round2/008_fe3d59ac-9686-44d0-8b67-ddc08d36a615.mp4.",
+      "boundary": {
+        "timestamp_s": 15.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "ego4d-97fd209a",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:97fd209a-1de4-4c85-9815-cb6295b45fdb",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round3/005_97fd209a-1de4-4c85-9815-cb6295b45fdb.mp4",
+      "source_sha256": "7bcc2123eef8931da93f8a4095881ed538692e3cf265e3b5e911002e53d6858b",
+      "source_uri": "https://drive.google.com/uc?id=1idIoNGlfRAyfxNKc6zTs-R3tZUEq2y5h",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=97fd209a-1de4-4c85-9815-cb6295b45fdb; Ego4D video_uid=863011c8-ebf7-4900-87d1-3c7930f95dab; source range=3270--3450 seconds; review file=../../iclr/replacement_candidates/ego4d_round3/005_97fd209a-1de4-4c85-9815-cb6295b45fdb.mp4.",
+      "boundary": {
+        "timestamp_s": 15.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "ego4d-a07fc4f3",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:a07fc4f3-e5bc-4f2a-aa9f-a617f962ebdd",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round3/013_a07fc4f3-e5bc-4f2a-aa9f-a617f962ebdd.mp4",
+      "source_sha256": "120c6445b5a1c1b17d3f5fbfda820c050c5c3c409d01ea44a822a4fc846bc710",
+      "source_uri": "https://drive.google.com/uc?id=1DBbsItzEMmX9AjQBXbRDIM1p2bFuZsEd",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=a07fc4f3-e5bc-4f2a-aa9f-a617f962ebdd; Ego4D video_uid=f543a47a-c081-481b-a415-cfe732ad74fe; source range=1290--1470 seconds; review file=../../iclr/replacement_candidates/ego4d_round3/013_a07fc4f3-e5bc-4f2a-aa9f-a617f962ebdd.mp4.",
+      "boundary": {
+        "timestamp_s": 15.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "ego4d-de54e5c6",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:de54e5c6-711b-46a2-abeb-be8671870883",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round3/028_de54e5c6-711b-46a2-abeb-be8671870883.mp4",
+      "source_sha256": "ebbcbb41be402ab2b8669c0588fed34dcf8e895c5fbfc2b9124733bd0619a4f9",
+      "source_uri": "https://drive.google.com/uc?id=13gdInpW4616nXoKjxiFrBFo3t47QAgyW",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=de54e5c6-711b-46a2-abeb-be8671870883; Ego4D video_uid=f9c337af-fdf9-4737-b4c2-c5f68cd18d6a; source range=210--390 seconds; review file=../../iclr/replacement_candidates/ego4d_round3/028_de54e5c6-711b-46a2-abeb-be8671870883.mp4. Generation boundary author-corrected to 2.0 seconds.",
+      "boundary": {
+        "timestamp_s": 2.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "ego4d-6770cb70",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:6770cb70-0367-4b91-bf7a-211c8c7cb567",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round3/045_6770cb70-0367-4b91-bf7a-211c8c7cb567.mp4",
+      "source_sha256": "99014e4bb5e35bc6e7f18a2327c87ac497f14ba814f2cafe5f27ee269ed4a92b",
+      "source_uri": "https://drive.google.com/uc?id=1KUyuUIYfQPY7wigDxHSaDBC0AEdsXQEY",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=6770cb70-0367-4b91-bf7a-211c8c7cb567; Ego4D video_uid=1bfac46e-f957-4495-9583-dbd7fa683225; source range=6420--6600 seconds; review file=../../iclr/replacement_candidates/ego4d_round3/045_6770cb70-0367-4b91-bf7a-211c8c7cb567.mp4.",
+      "boundary": {
+        "timestamp_s": 15.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "ego4d-3abe265d",
+      "dataset": "Ego4D",
+      "source_id": "egoschema:3abe265d-9cad-4e47-856a-722e11997b07",
+      "source_video": "../../iclr/replacement_candidates/ego4d_round4/006_3abe265d-9cad-4e47-856a-722e11997b07.mp4",
+      "source_sha256": "e3bd7c14531ed660ce7b347bbb75dd8344d416631b9f2fba6d4c16daf3984fd4",
+      "source_uri": "https://drive.google.com/uc?id=1aMArBYEu5QogybFllbq04rHJe118kYU6",
+      "license": "Ego4D Dataset License Agreement; EgoSchema linked clip",
+      "selection_note": "Author-approved outdoor Ego4D replacement selected by visual review; no model output or metric was inspected during source selection. EgoSchema q_uid=3abe265d-9cad-4e47-856a-722e11997b07; Ego4D video_uid=b7a276c8-6763-45f2-9566-5b3801db70d7; source range=1440--1620 seconds; review file=../../iclr/replacement_candidates/ego4d_round4/006_3abe265d-9cad-4e47-856a-722e11997b07.mp4. Generation boundary author-corrected to 2.0 seconds.",
+      "boundary": {
+        "timestamp_s": 2.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Approved directly by the author on 2026-09-24 after visual review."
+    },
+    {
+      "context_id": "sekai-cheongju",
+      "dataset": "Sekai",
+      "source_id": "kqkUJZllt0U_0005550_0007350",
+      "source_video": "../../analysis/panel32_v1/sources/sekai_approved/cheongju.mp4",
+      "source_sha256": "cf46819202e8188ba20a9568da0795602b3761d1c9ab6e54d022b982c13d5af4",
+      "source_uri": "https://www.youtube.com/watch?v=kqkUJZllt0U#t=185.000000",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Author-approved replacement from official Sekai Walking-HQ row kqkUJZllt0U_0005550_0007350; outdoor-urban; Cheongju, Korea; only the 15-second review range was downloaded.",
+      "boundary": {
+        "timestamp_s": 7.5
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Visible forward-facing outdoor street throughout the reviewed range; approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "sekai-walk-02",
+      "dataset": "Sekai",
+      "source_id": "fOHLZPvMCaA_0037929_0039729",
+      "source_video": "../../analysis/panel32_v1/sources/sekai/fOHLZPvMCaA_0037929_0039729_excerpt.mp4",
+      "source_sha256": "f451c3b92d753dd554811f3745a563fb5b04753b2bb549ad49be38961ff5d65b",
+      "source_uri": "https://www.youtube.com/watch?v=fOHLZPvMCaA#t=1264.300000",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Official Walking-HQ row fOHLZPvMCaA_0037929_0039729; outdoor-natural; French Garden, Alden Biesen, Belgium; only 1264.300000--1270.300000 s downloaded.",
+      "boundary": {
+        "timestamp_s": 4.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Official scene label outdoor-natural and visible garden scene; reviewed in sekai_selected_contact.jpg."
+    },
+    {
+      "context_id": "sekai-walk-03",
+      "dataset": "Sekai",
+      "source_id": "VzvzFhyrW1Y_0107579_0109379",
+      "source_video": "../../analysis/panel32_v1/sources/sekai/VzvzFhyrW1Y_0107579_0109379_excerpt.mp4",
+      "source_sha256": "b14412ce5baf7c9b67987a66c059a20c8b622615ee54626b005d5f276d06e886",
+      "source_uri": "https://www.youtube.com/watch?v=VzvzFhyrW1Y#t=3585.966667",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Official Walking-HQ row VzvzFhyrW1Y_0107579_0109379; outdoor-natural; Wentworth Valley Falls, New Zealand; only 3585.966667--3591.966667 s downloaded.",
+      "boundary": {
+        "timestamp_s": 4.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Official scene label outdoor-natural and visible forest path; reviewed in sekai_selected_contact.jpg."
+    },
+    {
+      "context_id": "sekai-walk-04",
+      "dataset": "Sekai",
+      "source_id": "mphXykwut_8_0068550_0070350",
+      "source_video": "../../analysis/panel32_v1/sources/sekai/mphXykwut_8_0068550_0070350_excerpt.mp4",
+      "source_sha256": "6879011638fd042e99386fcdb6ffa74dba7d0d61d18afd30a9ae3d193f544894",
+      "source_uri": "https://www.youtube.com/watch?v=mphXykwut_8#t=2285.000000",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Official Walking-HQ row mphXykwut_8_0068550_0070350; outdoor-natural; Lauterbrunnen, Switzerland; only 2285.000000--2291.000000 s downloaded.",
+      "boundary": {
+        "timestamp_s": 4.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Official scene label outdoor-natural and visible snowy alpine path; reviewed in sekai_selected_contact.jpg."
+    },
+    {
+      "context_id": "sekai-walk-05",
+      "dataset": "Sekai",
+      "source_id": "Ov6HhTgkzqs_0064950_0066750",
+      "source_video": "../../analysis/panel32_v1/sources/sekai/Ov6HhTgkzqs_0064950_0066750_excerpt.mp4",
+      "source_sha256": "54114c6f9e13f6e2fb119c512b5dc6e8639b2da17a9840d52c8e05bd12aa981f",
+      "source_uri": "https://www.youtube.com/watch?v=Ov6HhTgkzqs#t=2165.000000",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Official Walking-HQ row Ov6HhTgkzqs_0064950_0066750; outdoor-urban; Hameenlinna, Finland; only 2165.000000--2171.000000 s downloaded.",
+      "boundary": {
+        "timestamp_s": 4.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Official scene label outdoor-urban and visible snowy street; reviewed in sekai_selected_contact.jpg."
+    },
+    {
+      "context_id": "sekai-walk-06",
+      "dataset": "Sekai",
+      "source_id": "VFY_YGbkt0U_0007350_0009150",
+      "source_video": "../../analysis/panel32_v1/sources/sekai/VFY_YGbkt0U_0007350_0009150_excerpt.mp4",
+      "source_sha256": "92fc4f2e01f6804285176dc5e8f100706e0d7206d0aba68c8fdee88b2d196b98",
+      "source_uri": "https://www.youtube.com/watch?v=VFY_YGbkt0U#t=245.000000",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Official Walking-HQ row VFY_YGbkt0U_0007350_0009150; outdoor-urban; Oxford Street, London; only 245.000000--251.000000 s downloaded.",
+      "boundary": {
+        "timestamp_s": 4.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Official scene label outdoor-urban and visible city street; reviewed in sekai_selected_contact.jpg."
+    },
+    {
+      "context_id": "sekai-krakow",
+      "dataset": "Sekai",
+      "source_id": "SpBSfZMoZYQ_0084087_0085887",
+      "source_video": "../../analysis/panel32_v1/sources/sekai_approved/krakow.mp4",
+      "source_sha256": "f306d5c38354aba94e3ae88982adb261392a536570be6b26d5c93f26ec09de60",
+      "source_uri": "https://www.youtube.com/watch?v=SpBSfZMoZYQ#t=2802.900000",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Author-approved replacement from official Sekai Walking-HQ row SpBSfZMoZYQ_0084087_0085887; outdoor-urban; Krakow, Poland; only the 15-second review range was downloaded.",
+      "boundary": {
+        "timestamp_s": 7.5
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Visible forward-facing outdoor street throughout the reviewed range; approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "sekai-yerevan",
+      "dataset": "Sekai",
+      "source_id": "cOKHJEvZmeE_0046763_0048563",
+      "source_video": "../../analysis/panel32_v1/sources/sekai_approved/yerevan.mp4",
+      "source_sha256": "774a714d218f449f63981cea904a028a39410db31062b126359095c3a8d67b4f",
+      "source_uri": "https://www.youtube.com/watch?v=cOKHJEvZmeE#t=1558.766667",
+      "license": "Sekai non-commercial research-only dataset license; underlying YouTube source terms also apply",
+      "selection_note": "Author-approved replacement from official Sekai Walking-HQ row cOKHJEvZmeE_0046763_0048563; outdoor-urban; Yerevan, Armenia; only the 15-second review range was downloaded.",
+      "boundary": {
+        "timestamp_s": 7.5
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Visible forward-facing outdoor street throughout the reviewed range; approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample04",
+      "dataset": "SpatialVID",
+      "source_id": "sample4",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample4_clip.mp4",
+      "source_sha256": "fff5dcad894869a7df975df0c88615f577461dd05492ab8c3b1140058928bf34",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample4/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample07",
+      "dataset": "SpatialVID",
+      "source_id": "sample7",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample7_clip.mp4",
+      "source_sha256": "3a5d22d32671e289919eb9b9929454848787c70aa500b1803eaa69ea2b4aa2aa",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample7/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample10",
+      "dataset": "SpatialVID",
+      "source_id": "sample10",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample10_clip.mp4",
+      "source_sha256": "4aabe3964c2128370bcbfd4f434c57569e055dba268662702bcc8d80376ef778",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample10/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample13",
+      "dataset": "SpatialVID",
+      "source_id": "sample13",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample13_clip.mp4",
+      "source_sha256": "af5dcf6e0275905c315cc1f4d9131d1b76cbd08d970eceabb0bf0876f01caa94",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample13/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample15",
+      "dataset": "SpatialVID",
+      "source_id": "sample15",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample15_clip.mp4",
+      "source_sha256": "a02e190181bc75c460bbc41561c2f1921b9717421e7d8e4c93b841d844fbadf8",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample15/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample18",
+      "dataset": "SpatialVID",
+      "source_id": "sample18",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample18_clip.mp4",
+      "source_sha256": "7981b43e36c1760a4e2ebadb7679d8d120010a67a98409d85d5e93cfe74d8a16",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample18/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample20",
+      "dataset": "SpatialVID",
+      "source_id": "sample20",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample20_clip.mp4",
+      "source_sha256": "2b33642380bec9f90a54553375b109050b5c168cba9ae0f323229c63859c6081",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample20/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    },
+    {
+      "context_id": "spatialvid-sample22",
+      "dataset": "SpatialVID",
+      "source_id": "sample22",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample22_clip.mp4",
+      "source_sha256": "e086cf76b5e3c7c9fc2e1cf9c29ef586390be67504b15bdf8ccf11c06c95dfd0",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample22/clip.mp4",
+      "license": "CC-BY-NC-SA-4.0",
+      "selection_note": "Author-approved clean official SpatialVID clip.mp4; the rendered output.mp4 with baked control symbols is invalid.",
+      "boundary": {
+        "timestamp_s": 8.0
+      },
+      "outdoor_verified": true,
+      "outdoor_verification_note": "Start, middle, and end frames were visually checked without control symbols and approved by the author on 2026-09-24."
+    }
+  ]
+}

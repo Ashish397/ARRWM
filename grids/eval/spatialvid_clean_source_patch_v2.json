@@ -1,0 +1,70 @@
+{
+  "status": "required_source_replacement",
+  "supersedes_spatialvid_entries_in": "panel32_locked_v1.json",
+  "reason": "The v1 SpatialVID source files were rendered output.mp4 demonstrations with control symbols baked into the pixels.",
+  "constraints": {
+    "asset_name": "clip.mp4",
+    "cropped": false,
+    "inpainted": false,
+    "old_generations_valid": false,
+    "old_metrics_valid": false
+  },
+  "contexts": [
+    {
+      "context_id": "spatialvid-sample04",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample4_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample4/clip.mp4",
+      "source_sha256": "fff5dcad894869a7df975df0c88615f577461dd05492ab8c3b1140058928bf34",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample07",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample7_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample7/clip.mp4",
+      "source_sha256": "3a5d22d32671e289919eb9b9929454848787c70aa500b1803eaa69ea2b4aa2aa",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample10",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample10_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample10/clip.mp4",
+      "source_sha256": "4aabe3964c2128370bcbfd4f434c57569e055dba268662702bcc8d80376ef778",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample13",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample13_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample13/clip.mp4",
+      "source_sha256": "af5dcf6e0275905c315cc1f4d9131d1b76cbd08d970eceabb0bf0876f01caa94",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample15",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample15_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample15/clip.mp4",
+      "source_sha256": "a02e190181bc75c460bbc41561c2f1921b9717421e7d8e4c93b841d844fbadf8",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample18",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample18_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample18/clip.mp4",
+      "source_sha256": "7981b43e36c1760a4e2ebadb7679d8d120010a67a98409d85d5e93cfe74d8a16",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample20",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample20_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample20/clip.mp4",
+      "source_sha256": "2b33642380bec9f90a54553375b109050b5c168cba9ae0f323229c63859c6081",
+      "boundary_timestamp_s": 8.0
+    },
+    {
+      "context_id": "spatialvid-sample22",
+      "source_video": "../../analysis/panel32_v1/sources/spatialvid_clean/sample22_clip.mp4",
+      "source_uri": "https://nju-3dv.github.io/projects/SpatialVID/samples/sample22/clip.mp4",
+      "source_sha256": "e086cf76b5e3c7c9fc2e1cf9c29ef586390be67504b15bdf8ccf11c06c95dfd0",
+      "boundary_timestamp_s": 8.0
+    }
+  ]
+}

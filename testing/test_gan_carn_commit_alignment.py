@@ -22,6 +22,9 @@ from model.carn_commit import (  # noqa: E402
 
 with patch.object(torch.cuda, "current_device", return_value=0):
     from model.dmd_action_forcing import ActionForcingDMD  # noqa: E402
+    from trainer.causal_action_forcing_train import (  # noqa: E402
+        ActionForcingDMDTrainer,
+    )
 
 
 def test_production_schedule_is_meaningful_but_staged():
@@ -84,6 +87,29 @@ def test_model_alignment_reuses_literal_pipeline_commit_without_recompute():
     torch.testing.assert_close(grad, 2 * committed, rtol=0, atol=0)
     assert logs["train/gan_carn_commit_alpha_target"] == pytest.approx(0.0625)
     assert logs["train/gan_carn_commit_forward_value_max_error"] == 0.0
+
+
+def test_post_commit_internalization_uses_final_live_endpoint_only():
+    raw = torch.full((1, 6, 2, 2, 2), 2.0, requires_grad=True)
+    committed = torch.full_like(raw, 1.5).detach()
+    info = {
+        "finish_denoised_chunk_grad": raw,
+        "committed_ladder_endpoint_chunk": committed,
+        "finish_denoised_chunk_grad_mask": torch.ones(6, dtype=torch.bool),
+    }
+    source, target = ActionForcingDMDTrainer._post_commit_internalize_tensors(
+        None, info,
+    )
+    assert source is raw
+    assert target is committed
+    loss = (source - target.detach()).abs().mean()
+    loss.backward()
+    torch.testing.assert_close(raw.grad, torch.full_like(raw, 1 / raw.numel()))
+    assert committed.grad is None
+
+    info["finish_denoised_chunk_grad_mask"][0] = False
+    with pytest.raises(RuntimeError, match="every final endpoint frame"):
+        ActionForcingDMDTrainer._post_commit_internalize_tensors(None, info)
 
 
 def test_frozen_jacobian_alignment_uses_commit_transform_backward():

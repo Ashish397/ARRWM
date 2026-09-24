@@ -7,7 +7,7 @@ import fleet_common as fc
 
 DEV = "cuda"
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "out", "fleet_dino.csv")
+OUT = os.path.join(HERE, os.environ.get("EVAL_OUT_DIR", "out"), "fleet_dino.csv")
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
@@ -36,7 +36,8 @@ def main():
         try:
             n, fps = fc.meta(scene, model); ctx = fc.ctx_of(model)
             a_idx = list(range(0, max(1, min(16, ctx))))
-            e_idx = list(range(max(0, n - 16), n))
+            hz = min(n, ctx + int(round(float(os.environ.get("EVAL_HORIZON_S", "1e9")) * fps)) + 1)   # end window ends at the horizon (clip end by default)
+            e_idx = list(range(max(0, hz - 16), hz))
             fr = fc.frames_at(scene, model, a_idx + e_idx)
             if not fr:
                 continue
